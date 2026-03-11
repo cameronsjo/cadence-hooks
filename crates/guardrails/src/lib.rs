@@ -13,5 +13,7 @@ pub mod guard_gh_write;
 pub mod guard_git_init;
 /// Block `git push` to remotes owned by others.
 pub mod guard_push_remote;
+/// Warn when creating a branch from a non-main base.
+pub mod warn_branch_base;
 /// Warn when editing files directly on main/master branch.
 pub mod warn_main_branch;

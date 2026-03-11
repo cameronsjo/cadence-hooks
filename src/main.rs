@@ -73,6 +73,8 @@ enum GuardrailsCommands {
     WarnMainBranch,
     /// Nudge after idle periods between edits
     CheckIdleReturn,
+    /// Warn when creating a branch from a non-main base
+    WarnBranchBase,
 }
 
 #[derive(Subcommand)]
@@ -146,6 +148,9 @@ fn main() {
             }
             GuardrailsCommands::CheckIdleReturn => {
                 run_check_from_stdin(&cadence_hooks_guardrails::check_idle_return::CheckIdleReturn)
+            }
+            GuardrailsCommands::WarnBranchBase => {
+                run_check_from_stdin(&cadence_hooks_guardrails::warn_branch_base::WarnBranchBase)
             }
         },
         Commands::Rules(cmd) => match cmd {
