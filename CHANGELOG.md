@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Initial implementation: 19 hooks across 4 plugin crates
-- Core protocol library (`claude-hooks-core`) with `Check` trait, JSON parsing, exit codes
+- Core protocol library (`cadence-hooks-core`) with `Check` trait, JSON parsing, exit codes
 - **cadence** hooks: terminology, orphaned-todos, prevent-secret-leaks, prevent-secret-writes, memory-guard, git-safety, line-endings, env-vars, warn-untracked, markdown-lint
 - **guardrails** hooks: guard-push-remote, guard-gh-write, guard-gh-dangerous, guard-git-init, warn-main-branch, check-idle-return
 - **rules** hooks: validate-frontmatter, security-patterns

@@ -1,12 +1,12 @@
 # Contributing
 
-Thank you for your interest in claude-hooks. This project is currently maintained as a personal tool, but contributions are welcome.
+Thank you for your interest in cadence-hooks. This project is currently maintained as a personal tool, but contributions are welcome.
 
 ## Getting Started
 
 ```bash
-git clone https://github.com/cameronsjo/claude-hooks.git
-cd claude-hooks
+git clone https://github.com/cameronsjo/cadence-hooks.git
+cd cadence-hooks
 make ci    # Run fmt check, clippy, and tests
 ```
 
@@ -24,7 +24,7 @@ Requires Rust 2024 edition (1.85+).
 - **Conventional Commits**: `type(scope): description` (e.g., `fix(cadence): scope safe-template check to target`)
 - **cargo fmt** and **cargo clippy** must pass with zero warnings
 - Tests are in-file `#[cfg(test)] mod tests` blocks, not separate files
-- Each check implements the `Check` trait from `claude-hooks-core`
+- Each check implements the `Check` trait from `cadence-hooks-core`
 
 ## Adding a New Hook
 

@@ -4,7 +4,7 @@
 //! verifies the repository owner is in the configured allowlist. Also blocks
 //! looped pushes and force-push to `main`.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::process::Command;
 use std::sync::LazyLock;
@@ -498,14 +498,14 @@ mod tests {
             cwd: None,
         };
         let result = PushRemoteGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn non_push_command_allowed() {
         let input = HookInput {
             tool_name: Some("Bash".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: None,
                 path: None,
                 command: Some("git status".into()),
@@ -516,6 +516,6 @@ mod tests {
             cwd: None,
         };
         let result = PushRemoteGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }

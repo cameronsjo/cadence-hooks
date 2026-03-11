@@ -1,8 +1,8 @@
-# claude-hooks — compiled Claude Code hooks
+# cadence-hooks — compiled Claude Code hooks
 # Run `make` or `make help` to see available targets
 
 CARGO := cargo
-BINARY := claude-hooks
+BINARY := cadence-hooks
 
 .DEFAULT_GOAL := help
 
@@ -61,6 +61,6 @@ install:
 .PHONY: help
 ## Show this help
 help:
-	@printf "\n\033[1mclaude-hooks\033[0m — compiled Claude Code hooks\n\n"
+	@printf "\n\033[1mcadence-hooks\033[0m — compiled Claude Code hooks\n\n"
 	@awk '/^## / { section = substr($$0, 4) } /^\.PHONY:/ { target = $$2 } /^## [^─]/ && target { printf "  \033[36m%-16s\033[0m %s\n", target, substr($$0, 4); target = "" }' $(MAKEFILE_LIST)
 	@printf "\n"

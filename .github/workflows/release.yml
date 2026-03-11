@@ -63,8 +63,8 @@ jobs:
           MATRIX_NAME: ${{ matrix.name }}
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          ARCHIVE="claude-hooks-${VERSION}-${MATRIX_NAME}.tar.gz"
-          tar -czf "${ARCHIVE}" -C "target/${TARGET}/release" claude-hooks
+          ARCHIVE="cadence-hooks-${VERSION}-${MATRIX_NAME}.tar.gz"
+          tar -czf "${ARCHIVE}" -C "target/${TARGET}/release" cadence-hooks
           echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
 
       - name: Upload artifact
@@ -84,17 +84,17 @@ jobs:
           merge-multiple: true
 
       - name: Generate checksums
-        run: sha256sum claude-hooks-*.tar.gz > checksums.txt
+        run: sha256sum cadence-hooks-*.tar.gz > checksums.txt
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: claude-hooks-*.tar.gz
+          subject-path: cadence-hooks-*.tar.gz
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            claude-hooks-*.tar.gz
+            cadence-hooks-*.tar.gz
             checksums.txt

@@ -1,4 +1,4 @@
-# claude-hooks
+# cadence-hooks
 
 Compiled [Claude Code](https://docs.anthropic.com/en/docs/claude-code) hooks in Rust. A single binary replaces dozens of shell and Node.js hook scripts across multiple plugins, with sub-millisecond cold starts and zero runtime dependencies.
 
@@ -65,29 +65,29 @@ Each subcommand reads this JSON, runs its check, and exits. No network calls, no
 
 ### From release (recommended)
 
-Download the latest binary from [Releases](https://github.com/cameronsjo/claude-hooks/releases):
+Download the latest binary from [Releases](https://github.com/cameronsjo/cadence-hooks/releases):
 
 ```bash
 # macOS (Apple Silicon)
-curl -sL https://github.com/cameronsjo/claude-hooks/releases/latest/download/claude-hooks-v0.1.0-macos-aarch64.tar.gz | tar xz
-mv claude-hooks ~/.local/bin/
+curl -sL https://github.com/cameronsjo/cadence-hooks/releases/latest/download/cadence-hooks-v0.1.0-macos-aarch64.tar.gz | tar xz
+mv cadence-hooks ~/.local/bin/
 
 # Linux (x86_64)
-curl -sL https://github.com/cameronsjo/claude-hooks/releases/latest/download/claude-hooks-v0.1.0-linux-x86_64.tar.gz | tar xz
-mv claude-hooks ~/.local/bin/
+curl -sL https://github.com/cameronsjo/cadence-hooks/releases/latest/download/cadence-hooks-v0.1.0-linux-x86_64.tar.gz | tar xz
+mv cadence-hooks ~/.local/bin/
 ```
 
 ### From source
 
 ```bash
-cargo install --git https://github.com/cameronsjo/claude-hooks.git
+cargo install --git https://github.com/cameronsjo/cadence-hooks.git
 ```
 
 ### Verify
 
 ```bash
-claude-hooks --version
-claude-hooks --help
+cadence-hooks --version
+cadence-hooks --help
 ```
 
 ## Usage
@@ -97,11 +97,11 @@ Each hook is a subcommand:
 ```bash
 # Run a specific hook (normally called by Claude Code, not manually)
 echo '{"tool_name":"Write","tool_input":{"file_path":"src/main.rs","content":"..."}}' \
-  | claude-hooks cadence terminology
+  | cadence-hooks cadence terminology
 
 # List available subcommands
-claude-hooks cadence --help
-claude-hooks guardrails --help
+cadence-hooks cadence --help
+cadence-hooks guardrails --help
 ```
 
 ### Configuring in Claude Code
@@ -114,12 +114,12 @@ Reference the binary in your plugin's `hooks.json`:
     {
       "type": "preToolUse",
       "matcher": "Write|Edit",
-      "command": "claude-hooks cadence terminology"
+      "command": "cadence-hooks cadence terminology"
     },
     {
       "type": "preToolUse",
       "matcher": "Bash",
-      "command": "claude-hooks guardrails guard-push-remote"
+      "command": "cadence-hooks guardrails guard-push-remote"
     }
   ]
 }
@@ -138,7 +138,7 @@ Some hooks require configuration:
 ## Architecture
 
 ```
-claude-hooks (binary)
+cadence-hooks (binary)
 ├── crates/core        — Hook protocol: JSON parsing, Check trait, exit codes
 ├── crates/cadence     — Cadence plugin hooks (10 checks)
 ├── crates/guardrails  — Git guardrails hooks (6 checks)

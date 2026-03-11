@@ -3,7 +3,7 @@
 //! Detects bare names like `DEBUG`, `PORT`, `VERBOSE` that should use
 //! tool-prefixed forms (`MYAPP_DEBUG`, `SERVICE_PORT`) to avoid collisions.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -94,7 +94,7 @@ mod tests {
     fn make_input(path: &str, content: &str) -> HookInput {
         HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some(path.into()),
                 path: None,
                 command: None,
@@ -110,42 +110,42 @@ mod tests {
     fn prefixed_env_var_passes() {
         let input = make_input("src/app.ts", "const debug = process.env.MYAPP_DEBUG;");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn generic_env_var_warns() {
         let input = make_input("src/app.ts", "const debug = process.env.DEBUG;");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
     fn non_code_files_skipped() {
         let input = make_input("README.md", "process.env.DEBUG");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn python_env_access_detected() {
         let input = make_input("src/main.py", "os.getenv(\"PORT\")");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
     fn ruby_env_access_detected() {
         let input = make_input("src/app.rb", "ENV['DEBUG']");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
     fn rust_env_var_detected() {
         let input = make_input("src/main.rs", "std::env::var(\"VERBOSE\")");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
@@ -156,14 +156,14 @@ mod tests {
             cwd: None,
         };
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn no_path_allowed() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: None,
                 path: None,
                 command: None,
@@ -174,14 +174,14 @@ mod tests {
             cwd: None,
         };
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn no_content_allowed() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("src/app.ts".into()),
                 path: None,
                 command: None,
@@ -192,7 +192,7 @@ mod tests {
             cwd: None,
         };
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -212,7 +212,7 @@ mod tests {
         let content = "const a = process.env.DEBUG;\nconst b = process.env.PORT;";
         let input = make_input("src/app.ts", content);
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
         let msg = result.message.unwrap();
         assert!(msg.contains("DEBUG"));
         assert!(msg.contains("PORT"));
@@ -222,7 +222,7 @@ mod tests {
     fn prefixed_var_not_matched() {
         let input = make_input("src/app.ts", "process.env.MYAPP_PORT");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     // --- Unhappy path: edge cases ---
@@ -235,7 +235,7 @@ mod tests {
             let result = EnvVarGuard.run(&input);
             assert_eq!(
                 result.outcome,
-                claude_hooks_core::Outcome::Warn,
+                cadence_hooks_core::Outcome::Warn,
                 "{var} should be detected"
             );
         }
@@ -249,7 +249,7 @@ mod tests {
             let result = EnvVarGuard.run(&input);
             assert_eq!(
                 result.outcome,
-                claude_hooks_core::Outcome::Warn,
+                cadence_hooks_core::Outcome::Warn,
                 "{var} should be detected in Python"
             );
         }
@@ -260,14 +260,14 @@ mod tests {
         // Non-code files should never warn
         let input = make_input("config.yaml", "DEBUG: true");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn dockerfile_skipped() {
         let input = make_input("Dockerfile", "ENV PORT=8080");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -304,21 +304,21 @@ mod tests {
         // as a substring of `process.env.DEBUGGING`.
         let input = make_input("src/app.ts", "process.env.DEBUGGING");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
     fn mjs_extension_detected() {
         let input = make_input("src/utils.mjs", "process.env.DEBUG");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
     fn cjs_extension_detected() {
         let input = make_input("src/config.cjs", "process.env.VERBOSE");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
@@ -326,7 +326,7 @@ mod tests {
         // Edit tool puts content in new_string — content() returns new_string when content is None
         let input = HookInput {
             tool_name: Some("Edit".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("src/app.ts".into()),
                 path: None,
                 command: None,
@@ -337,7 +337,7 @@ mod tests {
             cwd: None,
         };
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
@@ -345,6 +345,6 @@ mod tests {
         // .sh files are not in CODE_EXTENSIONS — env vars in scripts are fine
         let input = make_input("scripts/deploy.sh", "process.env.DEBUG");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }

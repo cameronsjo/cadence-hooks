@@ -3,7 +3,7 @@
 //! Enforces the format `MARKER(#issue): description` so every tracked item
 //! has a corresponding issue for discoverability and lifecycle management.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -197,7 +197,7 @@ mod tests {
     fn make_check_input(path: Option<&str>, content: &str) -> HookInput {
         HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: path.map(String::from),
                 path: None,
                 command: None,
@@ -213,21 +213,21 @@ mod tests {
     fn run_blocks_orphaned_in_code() {
         let input = make_check_input(Some("src/main.rs"), &make_marker("TODO", false));
         let result = OrphanedTodoGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn run_allows_exempt_path() {
         let input = make_check_input(Some("docs/guide.md"), &make_marker("TODO", false));
         let result = OrphanedTodoGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn run_allows_no_content() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("src/main.rs".into()),
                 path: None,
                 command: None,
@@ -238,14 +238,14 @@ mod tests {
             cwd: None,
         };
         let result = OrphanedTodoGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn run_allows_clean_code() {
         let input = make_check_input(Some("src/main.rs"), "fn main() {}");
         let result = OrphanedTodoGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -354,7 +354,7 @@ mod tests {
             "fn foo() {}\n// TODO: fix\nfn bar() {}\n// HACK: workaround\n",
         );
         let result = OrphanedTodoGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         let msg = result.message.unwrap();
         assert!(msg.contains("L2"));
         assert!(msg.contains("L4"));
@@ -365,7 +365,7 @@ mod tests {
         // No path but has orphaned markers — should still block
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: None,
                 path: None,
                 command: None,
@@ -376,7 +376,7 @@ mod tests {
             cwd: None,
         };
         let result = OrphanedTodoGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]

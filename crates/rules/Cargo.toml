@@ -1,10 +1,10 @@
 [package]
-name = "claude-hooks-rules"
+name = "cadence-hooks-rules"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Rules plugin hooks: skill frontmatter validation, security pattern scanning"
 
 [dependencies]
-claude-hooks-core.workspace = true
+cadence-hooks-core.workspace = true
 regex.workspace = true

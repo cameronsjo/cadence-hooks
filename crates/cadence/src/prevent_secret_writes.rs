@@ -4,7 +4,7 @@
 //! Blocks Bash commands that redirect to or `rm` secret files.
 //! Safe templates (.env.example, .env.test) are always allowed.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Safe template suffixes that are always allowed.
 const SAFE_SUFFIXES: &[&str] = &[
@@ -355,7 +355,7 @@ mod tests {
     fn make_write_input(path: &str) -> HookInput {
         HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some(path.into()),
                 path: None,
                 command: None,
@@ -370,7 +370,7 @@ mod tests {
     fn make_edit_input(path: &str) -> HookInput {
         HookInput {
             tool_name: Some("Edit".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some(path.into()),
                 path: None,
                 command: None,
@@ -385,7 +385,7 @@ mod tests {
     fn make_bash_input(command: &str) -> HookInput {
         HookInput {
             tool_name: Some("Bash".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: None,
                 path: None,
                 command: Some(command.into()),
@@ -400,50 +400,50 @@ mod tests {
     #[test]
     fn write_env_blocked() {
         let result = SecretWritesGuard.run(&make_write_input("/project/.env"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn edit_env_blocked() {
         let result = SecretWritesGuard.run(&make_edit_input("/project/.env.local"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn write_env_example_allowed() {
         let result = SecretWritesGuard.run(&make_write_input("/project/.env.example"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn write_pem_warned() {
         let result = SecretWritesGuard.run(&make_write_input("/etc/ssl/cert.pem"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
     fn write_normal_file_allowed() {
         let result = SecretWritesGuard.run(&make_write_input("/project/src/main.rs"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn bash_env_redirect_blocked_via_run() {
         let result = SecretWritesGuard.run(&make_bash_input("echo KEY=val > .env"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn bash_normal_command_allowed_via_run() {
         let result = SecretWritesGuard.run(&make_bash_input("cargo build"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn unknown_tool_allowed() {
         let input = HookInput {
             tool_name: Some("Read".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("/project/.env".into()),
                 path: None,
                 command: None,
@@ -454,7 +454,7 @@ mod tests {
             cwd: None,
         };
         let result = SecretWritesGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -465,7 +465,7 @@ mod tests {
             cwd: None,
         };
         let result = SecretWritesGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     // --- Unhappy path: bypass scenarios ---
@@ -475,14 +475,14 @@ mod tests {
         // Known gap: tee/cp/dd bypass not detected by current implementation
         let result = SecretWritesGuard.run(&make_bash_input("echo SECRET | tee .env"));
         // tee doesn't use > or rm, so it won't be caught
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn bash_cp_env_not_detected() {
         // Known gap: cp bypass
         let result = SecretWritesGuard.run(&make_bash_input("cp source.txt .env"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -498,92 +498,92 @@ mod tests {
     #[test]
     fn edit_key_file_blocked() {
         let result = SecretWritesGuard.run(&make_edit_input("/etc/ssl/server.key"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn edit_private_pem_blocked() {
         let result = SecretWritesGuard.run(&make_edit_input("/etc/ssl/server-key.pem"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn write_id_rsa_blocked() {
         let result = SecretWritesGuard.run(&make_write_input("/home/user/.ssh/id_rsa"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn write_credentials_json_blocked() {
         let result = SecretWritesGuard.run(&make_write_input("/project/credentials.json"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn write_secrets_json_blocked() {
         let result = SecretWritesGuard.run(&make_write_input("/project/secrets.json"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn write_jks_blocked() {
         let result = SecretWritesGuard.run(&make_write_input("/project/app.jks"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn write_p8_warned() {
         let result = SecretWritesGuard.run(&make_write_input("/etc/ssl/signing.p8"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
     }
 
     #[test]
     fn write_gcloud_credentials_blocked() {
         let result = SecretWritesGuard.run(&make_write_input("/project/gcloud-credentials.json"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn write_service_account_blocked() {
         let result = SecretWritesGuard.run(&make_write_input("/project/service-account.json"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn edit_env_example_allowed() {
         let result = SecretWritesGuard.run(&make_edit_input("/project/.env.example"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn edit_env_template_allowed() {
         let result = SecretWritesGuard.run(&make_edit_input("/project/.env.template"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn write_env_test_allowed() {
         let result = SecretWritesGuard.run(&make_write_input("/project/.env.test"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn write_env_ci_allowed() {
         let result = SecretWritesGuard.run(&make_write_input("/project/.env.ci"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn write_pub_key_allowed() {
         let result = SecretWritesGuard.run(&make_write_input("/home/user/.ssh/id_rsa.pub"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn bash_no_command_allowed() {
         let input = HookInput {
             tool_name: Some("Bash".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: None,
                 path: None,
                 command: None,
@@ -594,14 +594,14 @@ mod tests {
             cwd: None,
         };
         let result = SecretWritesGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn write_no_path_allowed() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: None,
                 path: None,
                 command: None,
@@ -612,7 +612,7 @@ mod tests {
             cwd: None,
         };
         let result = SecretWritesGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
