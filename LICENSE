@@ -1,0 +1,26 @@
+Business Source License 1.1
+
+License text copyright (c) 2017 MariaDB Corporation Ab, All Rights Reserved.
+"Business Source License" is a trademark of MariaDB Corporation Ab.
+
+Parameters
+
+Licensor:             Cameron Sjo
+Licensed Work:        claude-hooks
+                      The Licensed Work is (c) 2025 Cameron Sjo.
+Additional Use Grant: You may use the Licensed Work for personal,
+                      non-commercial purposes.
+Change Date:          Four years from the date the Licensed Work is
+                      published.
+Change License:       MIT
+
+For information about alternative licensing arrangements, contact
+the Licensor.
+
+Notice
+
+The Business Source License (this document, or the "License") is not
+an Open Source license. However, the Licensed Work will eventually be
+made available under an Open Source License, as stated in this License.
+
+License text: https://mariadb.com/bsl11/

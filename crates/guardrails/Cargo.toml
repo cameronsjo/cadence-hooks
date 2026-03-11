@@ -1,0 +1,10 @@
+[package]
+name = "claude-hooks-guardrails"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Git guardrails hooks: push protection, gh write guards, idle detection"
+
+[dependencies]
+claude-hooks-core.workspace = true
+regex.workspace = true

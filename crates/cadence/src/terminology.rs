@@ -1,0 +1,154 @@
+use claude_hooks_core::{Check, CheckResult, HookInput};
+use regex::RegexSet;
+use std::sync::LazyLock;
+
+// NOTE: This file contains prohibited terms as detection patterns.
+// It must be excluded from the terminology hook's own scanning.
+
+/// Build a prohibited term from parts to avoid triggering the hook on source.
+macro_rules! term {
+    ($($part:expr),+) => { concat!($($part),+) }
+}
+
+/// Blocked terms and their replacements.
+const VIOLATIONS: &[(&str, &str)] = &[
+    (term!("white", "list"), "allowlist"),
+    (term!("black", "list"), "blocklist, denylist"),
+    (term!("master", " branch"), "main branch"),
+    (term!("master", " node"), "primary node, leader node"),
+    (term!("sla", "ve"), "replica, follower, secondary"),
+    (term!("sanity", " check"), "validation check, confidence check, smoke test"),
+    (term!("dummy", " value"), "placeholder value, sample value, mock value"),
+    (term!("grand", "fathered"), "legacy status, exempted, inherited"),
+];
+
+static PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    let patterns: Vec<String> = VIOLATIONS
+        .iter()
+        .map(|(term, _)| format!(r"(?i)\b{}\b", regex::escape(term)))
+        .collect();
+    RegexSet::new(&patterns).expect("terminology patterns should compile")
+});
+
+/// Check content for inclusive terminology violations.
+/// Returns vec of (term, suggested_replacement) pairs.
+pub fn check_terminology(content: &str) -> Vec<(String, String)> {
+    let matches = PATTERNS.matches(content);
+    let mut found = Vec::new();
+
+    for idx in matches.iter() {
+        let (term, replacement) = VIOLATIONS[idx];
+        found.push((term.to_string(), replacement.to_string()));
+    }
+
+    found
+}
+
+/// Paths that legitimately contain prohibited terms (hook source, test fixtures).
+fn is_excluded_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with("claude.md")
+        || path.contains("claude-hooks/")
+        || path.contains(".claude/hooks/")
+        || path.contains(".claude/rules/")
+}
+
+pub struct TerminologyGuard;
+
+impl Check for TerminologyGuard {
+    fn name(&self) -> &str {
+        "terminology-guard"
+    }
+
+    fn run(&self, input: &HookInput) -> CheckResult {
+        let Some(content) = input.content() else {
+            return CheckResult::allow();
+        };
+
+        if let Some(path) = input.file_path() {
+            if is_excluded_path(path) {
+                return CheckResult::allow();
+            }
+        }
+
+        let violations = check_terminology(content);
+        if violations.is_empty() {
+            return CheckResult::allow();
+        }
+
+        let mut msg = String::new();
+        msg.push_str("🚫 BLOCKED: Inclusive terminology violation detected");
+        if let Some(path) = input.file_path() {
+            msg.push_str(&format!(" in {path}"));
+        }
+        msg.push_str("\n\nFound prohibited terms:\n");
+
+        for (term, _) in &violations {
+            msg.push_str(&format!("  - \"{term}\"\n"));
+        }
+
+        msg.push_str("\nRequired alternatives:\n");
+        for (term, replacement) in &violations {
+            msg.push_str(&format!("  {term} → {replacement}\n"));
+        }
+
+        CheckResult::block(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_content_passes() {
+        assert!(check_terminology("use the allowlist for filtering").is_empty());
+    }
+
+    #[test]
+    fn detects_prohibited_term() {
+        let found = check_terminology(VIOLATIONS[0].0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "allowlist");
+    }
+
+    #[test]
+    fn case_insensitive_detection() {
+        let upper = VIOLATIONS[0].0.to_uppercase();
+        let found = check_terminology(&upper);
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn multiple_violations_detected() {
+        let input = format!("{} and {}", VIOLATIONS[0].0, VIOLATIONS[1].0);
+        let found = check_terminology(&input);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn excluded_paths_allowed() {
+        assert!(is_excluded_path("/project/CLAUDE.md"));
+        assert!(is_excluded_path("/home/dev/claude-hooks/crates/cadence/src/foo.rs"));
+        assert!(is_excluded_path("/home/dev/.claude/hooks/enforcement/foo.sh"));
+        assert!(!is_excluded_path("/project/src/main.rs"));
+    }
+
+    #[test]
+    fn blocks_on_violation_in_normal_file() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("/project/src/main.rs".into()),
+                path: None,
+                command: None,
+                content: Some(VIOLATIONS[0].0.to_string()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+}
