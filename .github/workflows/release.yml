@@ -6,6 +6,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -83,6 +85,11 @@ jobs:
 
       - name: Generate checksums
         run: sha256sum claude-hooks-*.tar.gz > checksums.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: claude-hooks-*.tar.gz
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
