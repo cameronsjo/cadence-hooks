@@ -51,6 +51,8 @@ enum CadenceCommands {
     LineEndings,
     /// Warn about generic environment variable names
     EnvVars,
+    /// Nudge to review docs when creating a PR
+    WarnDocsUpdate,
     /// Warn about untracked files during git operations
     WarnUntracked,
     /// Run markdownlint on markdown files
@@ -115,6 +117,9 @@ fn main() {
             ),
             CadenceCommands::EnvVars => {
                 run_check_from_stdin(&cadence_hooks_cadence::validate_env_vars::EnvVarGuard)
+            }
+            CadenceCommands::WarnDocsUpdate => {
+                run_check_from_stdin(&cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate)
             }
             CadenceCommands::WarnUntracked => {
                 run_check_from_stdin(&cadence_hooks_cadence::warn_untracked::WarnUntrackedFiles)

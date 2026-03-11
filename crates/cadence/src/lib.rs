@@ -21,5 +21,7 @@ pub mod terminology;
 pub mod validate_env_vars;
 /// Block CRLF line endings in shell scripts.
 pub mod validate_line_endings;
+/// Nudge to review documentation when creating a pull request.
+pub mod warn_docs_update;
 /// Warn about untracked files during git commit operations.
 pub mod warn_untracked;
