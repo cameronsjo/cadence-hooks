@@ -194,4 +194,100 @@ mod tests {
         let result = EnvVarGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
+
+    // --- Unhappy path: edge cases ---
+
+    #[test]
+    fn all_generic_vars_detected_js() {
+        for var in GENERIC_VARS {
+            let content = format!("process.env.{var}");
+            let input = make_input("src/app.js", &content);
+            let result = EnvVarGuard.run(&input);
+            assert_eq!(
+                result.outcome,
+                claude_hooks_core::Outcome::Warn,
+                "{var} should be detected"
+            );
+        }
+    }
+
+    #[test]
+    fn all_generic_vars_detected_py() {
+        for var in GENERIC_VARS {
+            let content = format!("os.getenv(\"{var}\")");
+            let input = make_input("src/app.py", &content);
+            let result = EnvVarGuard.run(&input);
+            assert_eq!(
+                result.outcome,
+                claude_hooks_core::Outcome::Warn,
+                "{var} should be detected in Python"
+            );
+        }
+    }
+
+    #[test]
+    fn config_files_skipped() {
+        // Non-code files should never warn
+        let input = make_input("config.yaml", "DEBUG: true");
+        let result = EnvVarGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn dockerfile_skipped() {
+        let input = make_input("Dockerfile", "ENV PORT=8080");
+        let result = EnvVarGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn all_code_extensions_classified() {
+        for ext in CODE_EXTENSIONS {
+            assert!(
+                is_code_file(&format!("file.{ext}")),
+                "{ext} should be a code extension"
+            );
+        }
+    }
+
+    #[test]
+    fn header_files_are_code() {
+        assert!(is_code_file("types.h"));
+        assert!(is_code_file("utils.hpp"));
+    }
+
+    #[test]
+    fn kotlin_is_code() {
+        assert!(is_code_file("App.kt"));
+    }
+
+    #[test]
+    fn csharp_is_code() {
+        assert!(is_code_file("Program.cs"));
+    }
+
+    #[test]
+    fn substring_match_is_known_limitation() {
+        // DEBUGGING matches because the regex captures DEBUG as part of the
+        // property access — no word boundary after the var name in the pattern.
+        // This is a known false positive; the regex matches `process.env.DEBUG`
+        // as a substring of `process.env.DEBUGGING`.
+        let input = make_input("src/app.ts", "process.env.DEBUGGING");
+        let result = EnvVarGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn mjs_extension_detected() {
+        let input = make_input("src/utils.mjs", "process.env.DEBUG");
+        let result = EnvVarGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn cjs_extension_detected() {
+        let input = make_input("src/config.cjs", "process.env.VERBOSE");
+        let result = EnvVarGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
 }

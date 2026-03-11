@@ -399,4 +399,128 @@ mod tests {
     fn loop_pattern_no_match_normal() {
         assert!(!LOOP_PATTERN.is_match("git push origin main"));
     }
+
+    // --- Unhappy path: URL edge cases ---
+
+    #[test]
+    fn parse_url_with_port() {
+        // ssh://git@github.com:22/owner/repo.git
+        // Has ://, so splits on that → "git@github.com:22/owner/repo.git"
+        // Then splits on first / → "owner/repo.git" — port is part of host segment
+        // This actually parses correctly because the port stays with the host
+        assert_eq!(
+            repo_from_url("ssh://git@github.com:22/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_url_with_credentials() {
+        // https://token:x-oauth-basic@github.com/owner/repo.git
+        assert_eq!(
+            repo_from_url("https://token:x-oauth-basic@github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_empty_url() {
+        assert_eq!(repo_from_url(""), None);
+    }
+
+    #[test]
+    fn parse_whitespace_url() {
+        assert_eq!(repo_from_url("   "), None);
+    }
+
+    #[test]
+    fn parse_url_no_repo() {
+        // Only has owner, no repo
+        assert_eq!(repo_from_url("https://github.com/owner"), None);
+    }
+
+    #[test]
+    fn parse_url_trailing_slash() {
+        assert_eq!(
+            repo_from_url("https://github.com/owner/repo/"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_url_with_subpath() {
+        // URL with additional path segments
+        assert_eq!(
+            repo_from_url("https://github.com/owner/repo/tree/main"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_scp_with_slash_path_returns_none() {
+        // Colon followed by / is not SCP-style, it's likely a port
+        assert_eq!(repo_from_url("host:/absolute/path"), None);
+    }
+
+    #[test]
+    fn owner_check_case_sensitive() {
+        assert!(!check_owner(
+            "https://github.com/CameronSjo/repo.git",
+            &["cameronsjo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn strip_quotes_nested() {
+        assert_eq!(
+            strip_quotes("echo 'it\"s' \"done\""),
+            "echo  "
+        );
+    }
+
+    #[test]
+    fn parse_cd_with_quoted_path() {
+        assert_eq!(
+            parse_work_dir("cd \"/path with spaces\" && git push", "/home"),
+            "/path with spaces"
+        );
+    }
+
+    #[test]
+    fn parse_cd_with_pipe() {
+        // cd before a pipe
+        assert_eq!(
+            parse_work_dir("cd /project || git push", "/home"),
+            "/project"
+        );
+    }
+
+    #[test]
+    fn no_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = PushRemoteGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn non_push_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: Some("git status".into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = PushRemoteGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
 }

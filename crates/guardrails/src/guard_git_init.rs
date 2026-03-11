@@ -106,4 +106,35 @@ mod tests {
         let result = GuardGitInit.run(&make_bash("mkdir proj && git init"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
     }
+
+    // --- Unhappy path: edge cases ---
+
+    #[test]
+    fn git_and_init_non_adjacent_allowed() {
+        // "git" and "init" both present but not adjacent
+        let result = GuardGitInit.run(&make_bash("git submodule init"));
+        // "git" and "submodule" are adjacent, then "submodule" and "init"
+        // windows(2) checks: [git, submodule], [submodule, init] — neither is [git, init]
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn terraform_init_not_detected() {
+        // "init" without "git" — should pass the !contains("git") check
+        let result = GuardGitInit.run(&make_bash("terraform init"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn git_init_bare_warned() {
+        let result = GuardGitInit.run(&make_bash("git init --bare"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn git_reinit_warned() {
+        // Re-init existing repo
+        let result = GuardGitInit.run(&make_bash("cd /project && git init"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
 }

@@ -177,4 +177,68 @@ mod tests {
         let result = strip_quotes("echo \"unterminated");
         assert_eq!(result, "echo ");
     }
+
+    // --- Unhappy path: evasion scenarios ---
+
+    #[test]
+    fn repo_delete_in_single_quotes_not_blocked() {
+        let result =
+            GhDangerousGuard.run(&make_bash("echo 'gh repo delete is dangerous'"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn repo_delete_with_confirm_blocked() {
+        let result = GhDangerousGuard.run(&make_bash("gh repo delete my-repo --confirm"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn repo_delete_full_path_blocked() {
+        let result = GhDangerousGuard.run(&make_bash("gh repo delete owner/my-repo --yes"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn gh_repo_list_allowed() {
+        let result = GhDangerousGuard.run(&make_bash("gh repo list"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn gh_repo_create_allowed() {
+        let result = GhDangerousGuard.run(&make_bash("gh repo create my-new-repo"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn gh_repo_view_allowed() {
+        let result = GhDangerousGuard.run(&make_bash("gh repo view owner/repo"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn repo_delete_in_chain_blocked() {
+        let result =
+            GhDangerousGuard.run(&make_bash("echo done && gh repo delete my-repo --yes"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn no_tool_name_allowed() {
+        let input = HookInput {
+            tool_name: None,
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: Some("gh repo delete".into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = GhDangerousGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
 }

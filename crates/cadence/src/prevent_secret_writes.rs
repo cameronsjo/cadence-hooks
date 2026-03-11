@@ -395,4 +395,161 @@ mod tests {
         let result = SecretWritesGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
+
+    // --- Unhappy path: bypass scenarios ---
+
+    #[test]
+    fn bash_tee_env_not_detected() {
+        // Known gap: tee/cp/dd bypass not detected by current implementation
+        let result = SecretWritesGuard.run(&make_bash_input("echo SECRET | tee .env"));
+        // tee doesn't use > or rm, so it won't be caught
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_cp_env_not_detected() {
+        // Known gap: cp bypass
+        let result = SecretWritesGuard.run(&make_bash_input("cp source.txt .env"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_redirect_env_staging_blocked() {
+        assert!(bash_targets_env_file("echo KEY=val > .env.staging"));
+    }
+
+    #[test]
+    fn bash_rm_rf_env_blocked() {
+        assert!(bash_targets_env_file("rm -rf .env"));
+    }
+
+    #[test]
+    fn edit_key_file_blocked() {
+        let result = SecretWritesGuard.run(&make_edit_input("/etc/ssl/server.key"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_private_pem_blocked() {
+        let result = SecretWritesGuard.run(&make_edit_input("/etc/ssl/server-key.pem"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_id_rsa_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/home/user/.ssh/id_rsa"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_credentials_json_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/credentials.json"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_secrets_json_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/secrets.json"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_jks_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/app.jks"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_p8_warned() {
+        let result = SecretWritesGuard.run(&make_write_input("/etc/ssl/signing.p8"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn write_gcloud_credentials_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/gcloud-credentials.json"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_service_account_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/service-account.json"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_env_example_allowed() {
+        let result = SecretWritesGuard.run(&make_edit_input("/project/.env.example"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn edit_env_template_allowed() {
+        let result = SecretWritesGuard.run(&make_edit_input("/project/.env.template"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn write_env_test_allowed() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/.env.test"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn write_env_ci_allowed() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/.env.ci"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn write_pub_key_allowed() {
+        let result = SecretWritesGuard.run(&make_write_input("/home/user/.ssh/id_rsa.pub"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_no_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: None,
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = SecretWritesGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn write_no_path_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: None,
+                content: Some("content".into()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = SecretWritesGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_env_template_redirect_allowed() {
+        assert!(!bash_targets_env_file("echo KEY=val > .env.example"));
+    }
+
+    #[test]
+    fn bash_no_env_in_command_allowed() {
+        assert!(!bash_targets_env_file("echo hello > output.txt"));
+    }
 }

@@ -122,4 +122,58 @@ mod tests {
         let result = LineEndingsGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
+
+    // --- Unhappy path: edge cases ---
+
+    #[test]
+    fn lone_cr_blocked() {
+        // Just \r without \n — still contains \r
+        let input = make_input("script.sh", "#!/bin/bash\recho hello\r");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn python_crlf_not_checked() {
+        // Non-shell files are not checked
+        let input = make_input("script.py", "#!/usr/bin/env python\r\nprint('hello')\r\n");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn makefile_crlf_not_checked() {
+        let input = make_input("Makefile", "all:\r\n\techo hello\r\n");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn empty_shell_script_allowed() {
+        let input = make_input("script.sh", "");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn shell_script_single_line_lf() {
+        let input = make_input("script.sh", "#!/bin/bash\n");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn shell_script_no_newline() {
+        let input = make_input("script.sh", "#!/bin/bash");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn zsh_extension_not_checked() {
+        // Only .sh and .bash are checked — .zsh is not
+        let input = make_input("script.zsh", "#!/bin/zsh\r\necho hello\r\n");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
 }

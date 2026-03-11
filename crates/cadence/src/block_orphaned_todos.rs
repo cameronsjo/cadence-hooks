@@ -243,4 +243,139 @@ mod tests {
             assert!(is_exempt(&format!("file.{ext}")), "{ext} should be exempt");
         }
     }
+
+    // --- Unhappy path: edge cases ---
+
+    #[test]
+    fn marker_in_string_still_detected() {
+        // Markers inside string literals are still flagged — no AST awareness
+        let content = "let msg = \"TODO: fix this later\";";
+        let orphans = find_orphaned(content);
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn marker_without_colon_not_detected() {
+        // "TODO fix this" without colon should NOT match
+        let orphans = find_orphaned("// TODO fix this");
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn marker_lowercase_not_detected() {
+        // Markers must be uppercase
+        let orphans = find_orphaned("// todo: fix this");
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn marker_with_space_before_colon() {
+        // "TODO :" with space before colon
+        let orphans = find_orphaned("// TODO : fix this");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn referenced_with_different_issue_number() {
+        assert!(find_orphaned("// TODO(#1): first").is_empty());
+        assert!(find_orphaned("// TODO(#999): large number").is_empty());
+        assert!(find_orphaned("// TODO(#12345): very large").is_empty());
+    }
+
+    #[test]
+    fn marker_at_end_of_line() {
+        let orphans = find_orphaned("code(); // FIXME: broken");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn multiple_markers_same_line() {
+        // Two markers on one line — only counts as one orphan line
+        let orphans = find_orphaned("// TODO: first FIXME: second");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn referenced_and_orphaned_same_line() {
+        // If a line has TODO(#1) and also FIXME:, the referenced pattern match
+        // means the line passes (both patterns checked per-line)
+        let content = "// TODO(#1): referenced FIXME: orphaned";
+        let orphans = find_orphaned(content);
+        // ORPHANED_PATTERN matches, REFERENCED_PATTERN also matches → passes
+        // Wait — find_orphaned checks if ORPHANED matches AND REFERENCED does NOT
+        // But both match on the same line, so the whole line passes
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn exempt_path_with_docs_prefix() {
+        assert!(is_exempt("docs/api-guide.html"));
+    }
+
+    #[test]
+    fn exempt_documentation_path() {
+        assert!(is_exempt("/project/documentation/setup.html"));
+    }
+
+    #[test]
+    fn non_exempt_docs_in_filename() {
+        // "docs" in a filename but not as a path segment
+        assert!(!is_exempt("src/docs_handler.rs"));
+    }
+
+    #[test]
+    fn block_message_includes_line_numbers() {
+        let input = make_check_input(
+            Some("src/lib.rs"),
+            "fn foo() {}\n// TODO: fix\nfn bar() {}\n// HACK: workaround\n",
+        );
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        let msg = result.message.unwrap();
+        assert!(msg.contains("L2"));
+        assert!(msg.contains("L4"));
+    }
+
+    #[test]
+    fn run_no_path_with_orphan_blocks() {
+        // No path but has orphaned markers — should still block
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: None,
+                content: Some(make_marker("TODO", false)),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn optimize_marker_detected() {
+        let orphans = find_orphaned("// OPTIMIZE: use a HashMap here");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn xxx_marker_detected() {
+        let orphans = find_orphaned("// XXX: this needs attention");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn refactor_marker_detected() {
+        let orphans = find_orphaned("// REFACTOR: extract method");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn bug_marker_detected() {
+        let orphans = find_orphaned("// BUG: off-by-one error");
+        assert_eq!(orphans.len(), 1);
+    }
 }

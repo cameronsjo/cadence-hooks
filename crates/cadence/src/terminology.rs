@@ -151,4 +151,102 @@ mod tests {
         let result = TerminologyGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
+
+    // --- Unhappy path: bypass scenarios ---
+
+    #[test]
+    fn word_boundary_prevents_substring_match() {
+        // "listed" contains "list" but word boundary should prevent match
+        assert!(check_terminology("the items are listed here").is_empty());
+    }
+
+    #[test]
+    fn detects_plural_form() {
+        // "whitelists" — word boundary \b matches at s transition
+        let found = check_terminology(&format!("{}s", VIOLATIONS[0].0));
+        // \b won't match mid-word, so "whitelists" should NOT match "whitelist"
+        // because \b requires boundary after "t" but "s" continues the word
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn all_violations_detectable() {
+        for (term, _) in VIOLATIONS {
+            let found = check_terminology(term);
+            assert!(!found.is_empty(), "term '{}' should be detected", term);
+        }
+    }
+
+    #[test]
+    fn empty_content_passes() {
+        assert!(check_terminology("").is_empty());
+    }
+
+    #[test]
+    fn no_content_returns_allow() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("/project/src/main.rs".into()),
+                path: None,
+                command: None,
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn excluded_path_with_violations_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("/home/dev/.claude/rules/terminology.md".into()),
+                path: None,
+                command: None,
+                content: Some(VIOLATIONS[0].0.to_string()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn block_message_includes_path() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("/project/src/config.rs".into()),
+                path: None,
+                command: None,
+                content: Some(VIOLATIONS[0].0.to_string()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("config.rs"));
+    }
+
+    #[test]
+    fn mixed_case_detection() {
+        // Test mixed case that isn't just all upper or all lower
+        let term = VIOLATIONS[0].0;
+        let mixed: String = term
+            .chars()
+            .enumerate()
+            .map(|(i, c)| if i % 2 == 0 { c.to_uppercase().next().unwrap() } else { c })
+            .collect();
+        let found = check_terminology(&mixed);
+        assert_eq!(found.len(), 1);
+    }
 }

@@ -193,4 +193,88 @@ mod tests {
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
+
+    // --- Unhappy path: edge cases ---
+
+    #[test]
+    fn path_with_memory_substring_but_not_dir() {
+        // "memory" in filename but not as /memory/ dir segment
+        let input = make_input("/project/src/in_memory_cache.rs", 500);
+        let result = MemoryGuard.run(&input);
+        // Contains "/memory/" check — "in_memory_cache" does NOT contain "/memory/"
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn memory_md_at_exact_boundary() {
+        // 200 lines is > soft limit (180), so it warns
+        // But is NOT > hard limit (200), so no block
+        let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 200);
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn topic_file_under_limit_allowed() {
+        let input = make_input(
+            "/home/user/.claude/projects/foo/memory/patterns.md",
+            100,
+        );
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn topic_file_exactly_at_limit_allowed() {
+        let input = make_input(
+            "/home/user/.claude/projects/foo/memory/patterns.md",
+            300,
+        );
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn different_memory_path_formats() {
+        // Various valid memory paths
+        assert!(MemoryGuard::is_memory_path(
+            "/home/user/.claude/projects/foo/memory/MEMORY.md"
+        ));
+        assert!(MemoryGuard::is_memory_path(
+            "/home/user/.claude/projects/bar/memory/topic.md"
+        ));
+        assert!(!MemoryGuard::is_memory_path(
+            "/home/user/.claude/projects/foo/src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn is_memory_md_detection() {
+        assert!(MemoryGuard::is_memory_md(
+            "/home/user/.claude/projects/foo/memory/MEMORY.md"
+        ));
+        assert!(!MemoryGuard::is_memory_md(
+            "/home/user/.claude/projects/foo/memory/topic.md"
+        ));
+        assert!(!MemoryGuard::is_memory_md(
+            "/home/user/.claude/projects/foo/memory/MEMORY.txt"
+        ));
+    }
+
+    #[test]
+    fn single_line_memory_md() {
+        let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 1);
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn large_topic_file() {
+        let input = make_input(
+            "/home/user/.claude/projects/foo/memory/debugging.md",
+            1000,
+        );
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
 }

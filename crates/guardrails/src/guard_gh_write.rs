@@ -411,4 +411,177 @@ mod tests {
         assert!(caps.is_some());
         assert_eq!(caps.unwrap().get(1).unwrap().as_str(), "cameronsjo/test");
     }
+
+    // --- Unhappy path: edge cases ---
+
+    #[test]
+    fn loop_pattern_detects_for_loop() {
+        assert!(LOOP_PATTERN.is_match("for repo in list; do gh pr create; done"));
+    }
+
+    #[test]
+    fn loop_pattern_detects_while_loop() {
+        assert!(LOOP_PATTERN.is_match("while true; do gh pr merge; done"));
+    }
+
+    #[test]
+    fn loop_pattern_no_match_normal() {
+        assert!(!LOOP_PATTERN.is_match("gh pr create --title test"));
+    }
+
+    #[test]
+    fn workflow_run_is_write() {
+        assert!(is_write_command("gh workflow run deploy.yml"));
+    }
+
+    #[test]
+    fn workflow_enable_is_write() {
+        assert!(is_write_command("gh workflow enable deploy.yml"));
+    }
+
+    #[test]
+    fn workflow_disable_is_write() {
+        assert!(is_write_command("gh workflow disable deploy.yml"));
+    }
+
+    #[test]
+    fn label_create_is_write() {
+        assert!(is_write_command("gh label create bug"));
+    }
+
+    #[test]
+    fn gist_create_is_write() {
+        assert!(is_write_command("gh gist create file.txt"));
+    }
+
+    #[test]
+    fn issue_edit_is_write() {
+        assert!(is_write_command("gh issue edit 123 --title new"));
+    }
+
+    #[test]
+    fn pr_review_is_write() {
+        assert!(is_write_command("gh pr review 123 --approve"));
+    }
+
+    #[test]
+    fn pr_ready_is_write() {
+        assert!(is_write_command("gh pr ready 123"));
+    }
+
+    #[test]
+    fn issue_reopen_is_write() {
+        assert!(is_write_command("gh issue reopen 123"));
+    }
+
+    #[test]
+    fn issue_lock_is_write() {
+        assert!(is_write_command("gh issue lock 123"));
+    }
+
+    #[test]
+    fn repo_archive_is_write() {
+        assert!(is_write_command("gh repo archive owner/repo"));
+    }
+
+    #[test]
+    fn repo_rename_is_write() {
+        assert!(is_write_command("gh repo rename new-name"));
+    }
+
+    #[test]
+    fn release_delete_is_write() {
+        assert!(is_write_command("gh release delete v1.0.0"));
+    }
+
+    #[test]
+    fn api_patch_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar -X PATCH -f title=new"));
+    }
+
+    #[test]
+    fn api_method_patch_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar --method PATCH"));
+    }
+
+    #[test]
+    fn repo_view_is_not_write() {
+        assert!(!is_write_command("gh repo view owner/repo"));
+    }
+
+    #[test]
+    fn release_list_is_not_write() {
+        assert!(!is_write_command("gh release list"));
+    }
+
+    #[test]
+    fn is_allowed_empty_lists() {
+        assert!(!is_allowed("owner/repo", &[], &[]));
+    }
+
+    #[test]
+    fn is_allowed_exact_repo_match() {
+        assert!(is_allowed(
+            "external/specific-repo",
+            &[],
+            &["external/specific-repo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn is_allowed_owner_and_repo() {
+        // Both match — should still return true
+        assert!(is_allowed(
+            "cameronsjo/repo",
+            &["cameronsjo".to_string()],
+            &["cameronsjo/repo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn strip_quotes_mixed() {
+        assert_eq!(
+            strip_quotes("gh pr create --title 'test' --body \"desc\""),
+            "gh pr create --title  --body "
+        );
+    }
+
+    #[test]
+    fn repo_from_ssh_url_known_limitation() {
+        // guard_gh_write's repo_from_url uses a simpler parser than guard_push_remote's.
+        // SCP-style URLs (git@host:owner/repo) are not properly handled here —
+        // it splits on "://" (no match), then splits on "/" getting the wrong segments.
+        let result = repo_from_url("git@github.com:cameronsjo/repo.git");
+        // "git@github.com:cameronsjo" / "repo" → only gets "repo"
+        assert_eq!(result, "repo");
+    }
+
+    #[test]
+    fn no_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = GhWriteGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_gh_in_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: Some("ls -la".into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = GhWriteGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
 }

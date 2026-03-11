@@ -269,4 +269,142 @@ mod tests {
         let result = GitSafetyGuard.run(&make_bash_input("cd /tmp && git reset --hard"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
+
+    // --- Unhappy path: bypass scenarios ---
+
+    #[test]
+    fn force_push_flag_after_remote_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push origin main --force"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn force_push_short_flag_after_remote_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push origin main -f"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn force_push_master_short_flag_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push -f origin master"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn force_push_master_flag_after_remote_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push origin master --force"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn force_push_master_short_after_remote_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push origin master -f"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn clean_df_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git clean -df"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rebase_master_interactive_blocked() {
+        // Contains both "git rebase" and "master"
+        let result = GitSafetyGuard.run(&make_bash_input("git rebase -i master"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn all_caps_git_bypasses_early_check() {
+        // "GIT" (all caps) doesn't contain lowercase "git", so the early-exit
+        // `!command.contains("git")` returns Allow before lowercasing happens
+        let result = GitSafetyGuard.run(&make_bash_input("GIT PUSH --FORCE ORIGIN MAIN"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn reset_soft_warned() {
+        // "git reset" without --hard is a warning, not a block
+        let result = GitSafetyGuard.run(&make_bash_input("git reset HEAD~1"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn rebase_feature_warned() {
+        // Rebase on a non-main branch is warned
+        let result = GitSafetyGuard.run(&make_bash_input("git rebase feature-branch"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn remote_rm_warned() {
+        let result = GitSafetyGuard.run(&make_bash_input("git remote rm origin"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn branch_delete_uppercase_d_blocked() {
+        // -D is lowercased to -d, matching the blocked command
+        let result = GitSafetyGuard.run(&make_bash_input("git branch -D main"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn branch_delete_master_uppercase_d_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git branch -D master"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn reflog_expire_in_chain_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git reflog expire --expire=now --all && git gc --prune=now",
+        ));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn git_log_allowed() {
+        let result = GitSafetyGuard.run(&make_bash_input("git log --oneline -10"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn git_diff_allowed() {
+        let result = GitSafetyGuard.run(&make_bash_input("git diff HEAD~1"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn git_fetch_allowed() {
+        let result = GitSafetyGuard.run(&make_bash_input("git fetch origin"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn git_pull_allowed() {
+        let result = GitSafetyGuard.run(&make_bash_input("git pull origin main"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn git_add_allowed() {
+        let result = GitSafetyGuard.run(&make_bash_input("git add src/main.rs"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn blocked_precedes_warn() {
+        // When a command matches both block and warn patterns, block wins
+        let result = GitSafetyGuard.run(&make_bash_input("git push --force origin main"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn checkout_specific_file_allowed() {
+        // Only "git checkout -- ." is blocked, not file-specific checkout
+        let result = GitSafetyGuard.run(&make_bash_input("git checkout -- src/main.rs"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
 }
