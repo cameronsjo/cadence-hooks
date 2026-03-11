@@ -101,15 +101,13 @@ mod tests {
 
     #[test]
     fn repo_delete_in_exec_wrapper_blocked() {
-        let result =
-            GhDangerousGuard.run(&make_bash("bash -c \"gh repo delete my-repo --yes\""));
+        let result = GhDangerousGuard.run(&make_bash("bash -c \"gh repo delete my-repo --yes\""));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn repo_delete_in_quotes_not_blocked() {
-        let result =
-            GhDangerousGuard.run(&make_bash("echo \"don't gh repo delete anything\""));
+        let result = GhDangerousGuard.run(&make_bash("echo \"don't gh repo delete anything\""));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
 
@@ -138,15 +136,13 @@ mod tests {
 
     #[test]
     fn zsh_wrapper_blocked() {
-        let result =
-            GhDangerousGuard.run(&make_bash("zsh -c \"gh repo delete my-repo --yes\""));
+        let result = GhDangerousGuard.run(&make_bash("zsh -c \"gh repo delete my-repo --yes\""));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn sh_wrapper_blocked() {
-        let result =
-            GhDangerousGuard.run(&make_bash("sh -c \"gh repo delete my-repo --yes\""));
+        let result = GhDangerousGuard.run(&make_bash("sh -c \"gh repo delete my-repo --yes\""));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 
@@ -182,8 +178,7 @@ mod tests {
 
     #[test]
     fn repo_delete_in_single_quotes_not_blocked() {
-        let result =
-            GhDangerousGuard.run(&make_bash("echo 'gh repo delete is dangerous'"));
+        let result = GhDangerousGuard.run(&make_bash("echo 'gh repo delete is dangerous'"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
 
@@ -219,8 +214,7 @@ mod tests {
 
     #[test]
     fn repo_delete_in_chain_blocked() {
-        let result =
-            GhDangerousGuard.run(&make_bash("echo done && gh repo delete my-repo --yes"));
+        let result = GhDangerousGuard.run(&make_bash("echo done && gh repo delete my-repo --yes"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 

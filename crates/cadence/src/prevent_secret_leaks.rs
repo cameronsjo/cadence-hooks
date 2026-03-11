@@ -2,7 +2,13 @@ use claude_hooks_core::{Check, CheckResult, HookInput};
 
 /// Safe template suffixes that are always allowed to read.
 const SAFE_SUFFIXES: &[&str] = &[
-    ".example", ".template", ".sample", ".defaults", ".test", ".ci", ".pub",
+    ".example",
+    ".template",
+    ".sample",
+    ".defaults",
+    ".test",
+    ".ci",
+    ".pub",
 ];
 
 /// Files that must never be read into context.
@@ -54,9 +60,10 @@ fn is_blocked(filename: &str, path: &str) -> bool {
     }
 
     if let Some(ext) = lower.rsplit('.').next()
-        && BLOCKED_EXTENSIONS.contains(&ext) {
-            return true;
-        }
+        && BLOCKED_EXTENSIONS.contains(&ext)
+    {
+        return true;
+    }
 
     if lower.starts_with("service-account") && lower.ends_with(".json") {
         return true;
@@ -76,31 +83,58 @@ fn is_ambiguous(filename: &str) -> bool {
     false
 }
 
+/// Extract the operand (file argument) for a read command like `cat`, `head`, etc.
+/// Returns the first non-flag argument after the command.
+fn read_operand(command: &str, cmd_prefix: &str) -> Option<String> {
+    let lower = command.to_lowercase();
+    let after = lower.split(cmd_prefix).nth(1)?;
+    after
+        .split_whitespace()
+        .find(|t| !t.starts_with('-'))
+        .map(|s| s.to_string())
+}
+
+/// Check if a specific file token is a dangerous .env target.
+fn is_dangerous_env_operand(operand: &str) -> bool {
+    let lower = operand.to_lowercase();
+    if !lower.contains(".env") {
+        return false;
+    }
+    !SAFE_SUFFIXES.iter().any(|s| lower.ends_with(s))
+}
+
 /// Check if a bash command would dump secrets to stdout.
 fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     let lower = command.to_lowercase();
 
-    // Block: cat/head/tail .env files
+    // Block: cat/head/tail .env files — check operand, not whole command
     if lower.contains(".env") {
-        let reads_env = ["cat ", "head ", "tail ", "less ", "more ", "bat "]
-            .iter()
-            .any(|cmd| lower.contains(cmd));
+        let read_cmds = ["cat ", "head ", "tail ", "less ", "more ", "bat "];
 
-        if reads_env && !SAFE_SUFFIXES.iter().any(|s| lower.contains(s)) {
-            return Some(CheckResult::block(
-                "🚫 BLOCKED: Command would read .env file contents into context. \
-                 Secrets are available to commands via direnv — run programs directly."
-            ));
-        }
-
-        // Block: source .env
-        if (lower.contains("source") || lower.contains(". "))
-            && !SAFE_SUFFIXES.iter().any(|s| lower.contains(s)) {
+        for cmd in &read_cmds {
+            if lower.contains(cmd)
+                && let Some(operand) = read_operand(&lower, cmd)
+                && is_dangerous_env_operand(&operand)
+            {
                 return Some(CheckResult::block(
-                    "🚫 BLOCKED: Command would source .env file, exposing secrets. \
-                     Secrets are available via direnv — run programs directly."
+                    "🚫 BLOCKED: Command would read .env file contents into context. \
+                         Secrets are available to commands via direnv — run programs directly.",
                 ));
             }
+        }
+
+        // Block: source .env — check operand
+        for src_cmd in &["source ", ". "] {
+            if lower.contains(src_cmd)
+                && let Some(operand) = read_operand(&lower, src_cmd)
+                && is_dangerous_env_operand(&operand)
+            {
+                return Some(CheckResult::block(
+                    "🚫 BLOCKED: Command would source .env file, exposing secrets. \
+                         Secrets are available via direnv — run programs directly.",
+                ));
+            }
+        }
     }
 
     // Warn: env dump commands (match as standalone commands, not substrings)
@@ -109,7 +143,7 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
         if lower.contains(dump) || lower == "env" {
             return Some(CheckResult::warn(
                 "⚠️  Command would dump environment variables, which may include secrets. \
-                 Run programs that use env vars directly instead."
+                 Run programs that use env vars directly instead.",
             ));
         }
     }
@@ -122,7 +156,7 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     {
         return Some(CheckResult::warn(
             "⚠️  Command may print a secret environment variable. \
-             Run programs that use env vars directly instead."
+             Run programs that use env vars directly instead.",
         ));
     }
 
@@ -414,8 +448,7 @@ mod tests {
 
     #[test]
     fn read_docker_config_blocked() {
-        let result =
-            SecretLeaksGuard.run(&make_read_input("/home/user/.docker/config.json"));
+        let result = SecretLeaksGuard.run(&make_read_input("/home/user/.docker/config.json"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 
@@ -710,5 +743,19 @@ mod tests {
         // File without extension should not be flagged as ambiguous
         let result = SecretLeaksGuard.run(&make_read_input("/project/Makefile"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_cat_env_example_pipe_allowed() {
+        // Operand is .env.example (safe template), even though command mentions .env
+        let result = SecretLeaksGuard.run(&make_bash_input("cat .env.example | grep KEY"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_cat_env_with_example_in_pipe_blocked() {
+        // cat .env piped to grep — operand is .env which is dangerous
+        let result = SecretLeaksGuard.run(&make_bash_input("cat .env | grep example"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 }

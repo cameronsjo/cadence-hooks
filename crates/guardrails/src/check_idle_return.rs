@@ -23,9 +23,7 @@ impl CheckIdleReturn {
         repo_root.hash(&mut hasher);
         let hash = hasher.finish();
 
-        Some(PathBuf::from(format!(
-            "/tmp/.claude-last-edit-{hash:x}"
-        )))
+        Some(PathBuf::from(format!("/tmp/.claude-last-edit-{hash:x}")))
     }
 
     fn now_secs() -> u64 {

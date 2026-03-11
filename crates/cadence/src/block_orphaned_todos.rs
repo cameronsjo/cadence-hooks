@@ -3,7 +3,9 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Markers that require GitHub issue references.
-const MARKERS: &[&str] = &["TODO", "FIXME", "HACK", "XXX", "REFACTOR", "BUG", "OPTIMIZE"];
+const MARKERS: &[&str] = &[
+    "TODO", "FIXME", "HACK", "XXX", "REFACTOR", "BUG", "OPTIMIZE",
+];
 
 /// File extensions exempt from orphaned marker checks.
 const EXEMPT_EXTENSIONS: &[&str] = &["md", "txt", "json", "yml", "yaml", "toml", "ini", "env"];
@@ -17,23 +19,24 @@ static ORPHANED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r"\b({markers})\s*:")).expect("pattern should compile")
 });
 
-// Matches MARKER with proper reference format
+// Matches MARKER with proper reference format: MARKER(#NNN):
 static REFERENCED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     let markers = MARKERS.join("|");
-    Regex::new(&format!(r"\b({markers})\(#\d+\)")).expect("pattern should compile")
+    Regex::new(&format!(r"\b({markers})\(#\d+\):")).expect("pattern should compile")
 });
 
 /// Check if a file path is exempt from marker checking.
 fn is_exempt(path: &str) -> bool {
     if let Some(ext) = path.rsplit('.').next()
-        && EXEMPT_EXTENSIONS.contains(&ext) {
-            return true;
-        }
+        && EXEMPT_EXTENSIONS.contains(&ext)
+    {
+        return true;
+    }
 
     let normalized = path.replace('\\', "/");
-    EXEMPT_PATHS.iter().any(|prefix| {
-        normalized.contains(&format!("/{prefix}")) || normalized.starts_with(prefix)
-    })
+    EXEMPT_PATHS
+        .iter()
+        .any(|prefix| normalized.contains(&format!("/{prefix}")) || normalized.starts_with(prefix))
 }
 
 /// Find orphaned markers in content. Returns list of (line_number, line_text) pairs.
@@ -62,9 +65,10 @@ impl Check for OrphanedTodoGuard {
         };
 
         if let Some(path) = input.file_path()
-            && is_exempt(path) {
-                return CheckResult::allow();
-            }
+            && is_exempt(path)
+        {
+            return CheckResult::allow();
+        }
 
         let orphans = find_orphaned(content);
         if orphans.is_empty() {
@@ -94,7 +98,7 @@ mod tests {
 
     fn make_marker(kind: &str, has_ref: bool) -> String {
         if has_ref {
-            format!("// {kind}(#123): description")
+            format!("// {kind}(#123): description") // colon after (#NNN) is required
         } else {
             format!("// {kind}: description")
         }
@@ -158,7 +162,10 @@ mod tests {
     fn all_markers_pass_when_referenced() {
         for marker in MARKERS {
             let orphans = find_orphaned(&make_marker(marker, true));
-            assert!(orphans.is_empty(), "marker {marker} should pass when referenced");
+            assert!(
+                orphans.is_empty(),
+                "marker {marker} should pass when referenced"
+            );
         }
     }
 
@@ -281,6 +288,22 @@ mod tests {
     }
 
     #[test]
+    fn reference_without_colon_detected_as_orphan() {
+        // TODO(#123) without trailing colon is NOT a valid reference
+        let orphans = find_orphaned("// TODO(#123) missing colon after ref");
+        // No colon after marker at all → ORPHANED_PATTERN won't match either
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn reference_without_colon_but_with_marker_colon() {
+        // "TODO: something TODO(#123) something" — has orphaned TODO: but
+        // the reference lacks its own colon, so it doesn't cancel the orphan
+        let orphans = find_orphaned("// TODO: fix TODO(#123) partial ref");
+        assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
     fn marker_at_end_of_line() {
         let orphans = find_orphaned("code(); // FIXME: broken");
         assert_eq!(orphans.len(), 1);
@@ -295,13 +318,10 @@ mod tests {
 
     #[test]
     fn referenced_and_orphaned_same_line() {
-        // If a line has TODO(#1) and also FIXME:, the referenced pattern match
-        // means the line passes (both patterns checked per-line)
+        // Line has TODO(#1): (valid ref) and also FIXME: (orphan)
+        // Both ORPHANED and REFERENCED match on the same line → line passes
         let content = "// TODO(#1): referenced FIXME: orphaned";
         let orphans = find_orphaned(content);
-        // ORPHANED_PATTERN matches, REFERENCED_PATTERN also matches → passes
-        // Wait — find_orphaned checks if ORPHANED matches AND REFERENCED does NOT
-        // But both match on the same line, so the whole line passes
         assert!(orphans.is_empty());
     }
 

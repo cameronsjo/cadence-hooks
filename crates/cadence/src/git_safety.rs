@@ -24,10 +24,8 @@ const BLOCKED_COMMANDS: &[&str] = &[
 ];
 
 /// Regex-style patterns for blocked commands (rebase main/master).
-const BLOCKED_REGEX_FRAGMENTS: &[(&str, &str)] = &[
-    ("git rebase", "main"),
-    ("git rebase", "master"),
-];
+const BLOCKED_REGEX_FRAGMENTS: &[(&str, &str)] =
+    &[("git rebase", "main"), ("git rebase", "master")];
 
 /// Commands that trigger a warning but are allowed.
 const WARNING_PATTERNS: &[&str] = &[
@@ -39,6 +37,7 @@ const WARNING_PATTERNS: &[&str] = &[
     "git stash drop",
     "git stash clear",
     "git branch -d",
+    "git branch --delete",
     "git remote remove",
     "git remote rm",
 ];
@@ -419,5 +418,11 @@ mod tests {
         // Only "git checkout -- ." is blocked, not file-specific checkout
         let result = GitSafetyGuard.run(&make_bash_input("git checkout -- src/main.rs"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn branch_delete_long_form_feature_warned() {
+        let result = GitSafetyGuard.run(&make_bash_input("git branch --delete my-feature"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
     }
 }

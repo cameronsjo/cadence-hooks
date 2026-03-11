@@ -78,7 +78,9 @@ impl HookInput {
 
     /// The bash command, if this is a Bash tool invocation.
     pub fn command(&self) -> Option<&str> {
-        self.tool_input.as_ref().and_then(|ti| ti.command.as_deref())
+        self.tool_input
+            .as_ref()
+            .and_then(|ti| ti.command.as_deref())
     }
 
     /// The content being written (Write tool) or the replacement text (Edit tool).

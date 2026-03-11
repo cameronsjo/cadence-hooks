@@ -24,10 +24,7 @@ impl Check for WarnUntrackedFiles {
         }
 
         // Get untracked files from git
-        let output = match Command::new("git")
-            .args(["status", "--porcelain"])
-            .output()
-        {
+        let output = match Command::new("git").args(["status", "--porcelain"]).output() {
             Ok(out) => out,
             Err(_) => return CheckResult::allow(),
         };

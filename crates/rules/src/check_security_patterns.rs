@@ -9,26 +9,106 @@ struct SecurityPattern {
 }
 
 const PATTERNS: &[SecurityPattern] = &[
-    SecurityPattern { extensions: &["py"], pattern: r"pickle[.]loads", message: "RCE risk: use json or msgpack instead of pickle" },
-    SecurityPattern { extensions: &["py"], pattern: r"yaml[.]load[(]", message: "Use yaml.safe_load()" },
-    SecurityPattern { extensions: &["py"], pattern: r"shell\s*=\s*True", message: "Command injection risk: pass arg list to subprocess" },
-    SecurityPattern { extensions: &["py"], pattern: r"trust_remote_code\s*=\s*True", message: "Runs arbitrary code from model repos" },
-    SecurityPattern { extensions: &["py"], pattern: r"__import__[(]", message: "Arbitrary module loading" },
-    SecurityPattern { extensions: &["js", "jsx", "mjs", "cjs"], pattern: r"new\s+Function[(]", message: "Function() constructor can run arbitrary code" },
-    SecurityPattern { extensions: &["js", "jsx", "mjs", "cjs"], pattern: r"[.]innerHTML\s*=", message: "XSS risk: use textContent or sanitize first" },
-    SecurityPattern { extensions: &["js", "jsx", "mjs", "cjs"], pattern: r"Math[.]random[(][)]", message: "Not cryptographically secure" },
-    SecurityPattern { extensions: &["ts", "tsx"], pattern: r"\s+as\s+[A-Z]", message: "Type assertion bypasses validation" },
-    SecurityPattern { extensions: &["go"], pattern: r#""text/template""#, message: "Use html/template for HTML output" },
-    SecurityPattern { extensions: &["go"], pattern: r#""math/rand""#, message: "Use crypto/rand for security-sensitive randomness" },
-    SecurityPattern { extensions: &["go"], pattern: r#""unsafe""#, message: "unsafe package -- document safety invariants" },
-    SecurityPattern { extensions: &["rs"], pattern: r"unsafe\s*[{]", message: "Ensure // SAFETY: comment and test with Miri" },
-    SecurityPattern { extensions: &["rs"], pattern: r"from_utf8_unchecked", message: "UB risk on external input" },
-    SecurityPattern { extensions: &["java"], pattern: r"ObjectInputStream", message: "Deserialization RCE -- use ObjectInputFilter" },
-    SecurityPattern { extensions: &["java"], pattern: r"java[.]util[.]Random[^N]", message: "Use SecureRandom for security-sensitive values" },
-    SecurityPattern { extensions: &["cs"], pattern: r"BinaryFormatter", message: "RCE vector, removed in .NET 9" },
-    SecurityPattern { extensions: &["cs"], pattern: r"TypeNameHandling", message: "Deserialization attack -- ensure TypeNameHandling.None" },
-    SecurityPattern { extensions: &["cs"], pattern: r"DtdProcessing[.]Parse", message: "XXE risk -- use DtdProcessing.Prohibit" },
-    SecurityPattern { extensions: &["swift"], pattern: r"UserDefaults.*(password|secret|token|apiKey)", message: "Store secrets in Keychain" },
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"pickle[.]loads",
+        message: "RCE risk: use json or msgpack instead of pickle",
+    },
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"yaml[.]load[(]",
+        message: "Use yaml.safe_load()",
+    },
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"shell\s*=\s*True",
+        message: "Command injection risk: pass arg list to subprocess",
+    },
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"trust_remote_code\s*=\s*True",
+        message: "Runs arbitrary code from model repos",
+    },
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"__import__[(]",
+        message: "Arbitrary module loading",
+    },
+    SecurityPattern {
+        extensions: &["js", "jsx", "mjs", "cjs"],
+        pattern: r"new\s+Function[(]",
+        message: "Function() constructor can run arbitrary code",
+    },
+    SecurityPattern {
+        extensions: &["js", "jsx", "mjs", "cjs"],
+        pattern: r"[.]innerHTML\s*=",
+        message: "XSS risk: use textContent or sanitize first",
+    },
+    SecurityPattern {
+        extensions: &["js", "jsx", "mjs", "cjs"],
+        pattern: r"Math[.]random[(][)]",
+        message: "Not cryptographically secure",
+    },
+    SecurityPattern {
+        extensions: &["ts", "tsx"],
+        pattern: r"\s+as\s+[A-Z]",
+        message: "Type assertion bypasses validation",
+    },
+    SecurityPattern {
+        extensions: &["go"],
+        pattern: r#""text/template""#,
+        message: "Use html/template for HTML output",
+    },
+    SecurityPattern {
+        extensions: &["go"],
+        pattern: r#""math/rand""#,
+        message: "Use crypto/rand for security-sensitive randomness",
+    },
+    SecurityPattern {
+        extensions: &["go"],
+        pattern: r#""unsafe""#,
+        message: "unsafe package -- document safety invariants",
+    },
+    SecurityPattern {
+        extensions: &["rs"],
+        pattern: r"unsafe\s*[{]",
+        message: "Ensure // SAFETY: comment and test with Miri",
+    },
+    SecurityPattern {
+        extensions: &["rs"],
+        pattern: r"from_utf8_unchecked",
+        message: "UB risk on external input",
+    },
+    SecurityPattern {
+        extensions: &["java"],
+        pattern: r"ObjectInputStream",
+        message: "Deserialization RCE -- use ObjectInputFilter",
+    },
+    SecurityPattern {
+        extensions: &["java"],
+        pattern: r"java[.]util[.]Random[^N]",
+        message: "Use SecureRandom for security-sensitive values",
+    },
+    SecurityPattern {
+        extensions: &["cs"],
+        pattern: r"BinaryFormatter",
+        message: "RCE vector, removed in .NET 9",
+    },
+    SecurityPattern {
+        extensions: &["cs"],
+        pattern: r"TypeNameHandling",
+        message: "Deserialization attack -- ensure TypeNameHandling.None",
+    },
+    SecurityPattern {
+        extensions: &["cs"],
+        pattern: r"DtdProcessing[.]Parse",
+        message: "XXE risk -- use DtdProcessing.Prohibit",
+    },
+    SecurityPattern {
+        extensions: &["swift"],
+        pattern: r"UserDefaults.*(password|secret|token|apiKey)",
+        message: "Store secrets in Keychain",
+    },
 ];
 
 pub struct SecurityPatternScanner;
@@ -71,11 +151,12 @@ impl Check for SecurityPatternScanner {
             }
 
             if let Ok(re) = Regex::new(sp.pattern)
-                && let Some(m) = re.find(&content) {
-                    // Find line number
-                    let line_num = content[..m.start()].lines().count() + 1;
-                    warnings.push(format!("  L{line_num}: {}", sp.message));
-                }
+                && let Some(m) = re.find(&content)
+            {
+                // Find line number
+                let line_num = content[..m.start()].lines().count() + 1;
+                warnings.push(format!("  L{line_num}: {}", sp.message));
+            }
         }
 
         if warnings.is_empty() {

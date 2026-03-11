@@ -2,7 +2,13 @@ use claude_hooks_core::{Check, CheckResult, HookInput};
 
 /// Safe template suffixes that are always allowed.
 const SAFE_SUFFIXES: &[&str] = &[
-    ".example", ".template", ".sample", ".defaults", ".test", ".ci", ".pub",
+    ".example",
+    ".template",
+    ".sample",
+    ".defaults",
+    ".test",
+    ".ci",
+    ".pub",
 ];
 
 /// Files that must never be written by Claude Code.
@@ -51,14 +57,18 @@ fn is_blocked(filename: &str, path: &str) -> bool {
         return true;
     }
 
-    if BLOCKED_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix)) {
+    if BLOCKED_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
         return true;
     }
 
     if let Some(ext) = lower.rsplit('.').next()
-        && BLOCKED_EXTENSIONS.contains(&ext) {
-            return true;
-        }
+        && BLOCKED_EXTENSIONS.contains(&ext)
+    {
+        return true;
+    }
 
     if lower.starts_with("service-account") && lower.ends_with(".json") {
         return true;
@@ -79,27 +89,71 @@ fn is_ambiguous(filename: &str) -> bool {
     false
 }
 
+/// Extract the redirect target from a command (the token after > or >>).
+fn redirect_target(command: &str) -> Option<&str> {
+    // Find > or >> and grab the next whitespace-delimited token
+    let lower = command;
+    let rest = if let Some(pos) = lower.find(">>") {
+        &lower[pos + 2..]
+    } else if let Some(pos) = lower.find('>') {
+        &lower[pos + 1..]
+    } else {
+        return None;
+    };
+    rest.split_whitespace().next()
+}
+
+/// Extract rm targets from a command (tokens after rm that aren't flags).
+fn rm_targets(command: &str) -> Vec<&str> {
+    let mut targets = Vec::new();
+    let mut in_rm = false;
+    for token in command.split_whitespace() {
+        if token == "rm" {
+            in_rm = true;
+            continue;
+        }
+        if in_rm {
+            if token.starts_with('-') {
+                continue;
+            }
+            targets.push(token);
+        }
+    }
+    targets
+}
+
+/// Check if a specific file token is a dangerous .env target.
+fn is_dangerous_env_target(target: &str) -> bool {
+    let lower = target.to_lowercase();
+    if !lower.contains(".env") {
+        return false;
+    }
+    !SAFE_SUFFIXES.iter().any(|s| lower.ends_with(s))
+}
+
 /// Check if a bash command targets .env files destructively.
 fn bash_targets_env_file(command: &str) -> bool {
-    // Match: > .env, >> .env, rm .env, rm -f .env
     let lower = command.to_lowercase();
 
-    let has_env_target = lower.contains(".env");
-    if !has_env_target {
+    if !lower.contains(".env") {
         return false;
     }
 
-    // Check it's not targeting a safe template
-    if SAFE_SUFFIXES.iter().any(|s| lower.contains(s)) {
-        return false;
+    // Check redirect target specifically
+    if let Some(target) = redirect_target(&lower)
+        && is_dangerous_env_target(target)
+    {
+        return true;
     }
 
-    // Redirect or rm targeting .env (with or without space before .env)
-    lower.contains(">.env")
-        || lower.contains("> .env")
-        || lower.contains(">>.env")
-        || lower.contains(">> .env")
-        || lower.contains("rm ")
+    // Check rm targets specifically
+    for target in rm_targets(&lower) {
+        if is_dangerous_env_target(target) {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub struct SecretWritesGuard;
@@ -228,10 +282,12 @@ mod tests {
 
     #[test]
     fn docker_config_path_blocked() {
-        assert!(is_blocked(
-            "config.json",
-            "/home/user/.docker/config.json"
-        ));
+        assert!(is_blocked("config.json", "/home/user/.docker/config.json"));
+    }
+
+    #[test]
+    fn docker_config_path_mixed_case_blocked() {
+        assert!(is_blocked("config.json", "/home/user/.Docker/config.json"));
     }
 
     #[test]
@@ -261,7 +317,10 @@ mod tests {
 
     #[test]
     fn private_pem_suffix_blocked() {
-        assert!(is_blocked("server.private.pem", "/etc/ssl/server.private.pem"));
+        assert!(is_blocked(
+            "server.private.pem",
+            "/etc/ssl/server.private.pem"
+        ));
     }
 
     #[test]
@@ -567,5 +626,29 @@ mod tests {
     #[test]
     fn bash_no_env_in_command_allowed() {
         assert!(!bash_targets_env_file("echo hello > output.txt"));
+    }
+
+    #[test]
+    fn bash_cat_example_redirect_to_env_blocked() {
+        // Safe template in source but dangerous target — must block
+        assert!(bash_targets_env_file("cat .env.example > .env"));
+    }
+
+    #[test]
+    fn bash_cp_example_to_env_not_detected() {
+        // cp bypass — known gap (no redirect/rm)
+        assert!(!bash_targets_env_file("cp .env.example .env"));
+    }
+
+    #[test]
+    fn bash_redirect_to_env_example_allowed() {
+        // Redirect target is a safe template
+        assert!(!bash_targets_env_file("echo KEY=val > .env.example"));
+    }
+
+    #[test]
+    fn bash_rm_env_example_allowed() {
+        // rm target is a safe template
+        assert!(!bash_targets_env_file("rm .env.example"));
     }
 }

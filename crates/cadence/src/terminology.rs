@@ -17,9 +17,18 @@ const VIOLATIONS: &[(&str, &str)] = &[
     (term!("master", " branch"), "main branch"),
     (term!("master", " node"), "primary node, leader node"),
     (term!("sla", "ve"), "replica, follower, secondary"),
-    (term!("sanity", " check"), "validation check, confidence check, smoke test"),
-    (term!("dummy", " value"), "placeholder value, sample value, mock value"),
-    (term!("grand", "fathered"), "legacy status, exempted, inherited"),
+    (
+        term!("sanity", " check"),
+        "validation check, confidence check, smoke test",
+    ),
+    (
+        term!("dummy", " value"),
+        "placeholder value, sample value, mock value",
+    ),
+    (
+        term!("grand", "fathered"),
+        "legacy status, exempted, inherited",
+    ),
 ];
 
 static PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
@@ -66,9 +75,10 @@ impl Check for TerminologyGuard {
         };
 
         if let Some(path) = input.file_path()
-            && is_excluded_path(path) {
-                return CheckResult::allow();
-            }
+            && is_excluded_path(path)
+        {
+            return CheckResult::allow();
+        }
 
         let violations = check_terminology(content);
         if violations.is_empty() {
@@ -128,8 +138,12 @@ mod tests {
     #[test]
     fn excluded_paths_allowed() {
         assert!(is_excluded_path("/project/CLAUDE.md"));
-        assert!(is_excluded_path("/home/dev/claude-hooks/crates/cadence/src/foo.rs"));
-        assert!(is_excluded_path("/home/dev/.claude/hooks/enforcement/foo.sh"));
+        assert!(is_excluded_path(
+            "/home/dev/claude-hooks/crates/cadence/src/foo.rs"
+        ));
+        assert!(is_excluded_path(
+            "/home/dev/.claude/hooks/enforcement/foo.sh"
+        ));
         assert!(!is_excluded_path("/project/src/main.rs"));
     }
 
@@ -242,7 +256,13 @@ mod tests {
         let mixed: String = term
             .chars()
             .enumerate()
-            .map(|(i, c)| if i % 2 == 0 { c.to_uppercase().next().unwrap() } else { c })
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    c.to_uppercase().next().unwrap()
+                } else {
+                    c
+                }
+            })
             .collect();
         let found = check_terminology(&mixed);
         assert_eq!(found.len(), 1);

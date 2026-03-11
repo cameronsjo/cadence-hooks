@@ -4,7 +4,13 @@ use std::sync::LazyLock;
 
 /// Generic env var names that should be prefixed with the tool name.
 const GENERIC_VARS: &[&str] = &[
-    "DEBUG", "DISABLE", "NO_SPLASH", "PORT", "VERBOSE", "QUIET", "SILENT",
+    "DEBUG",
+    "DISABLE",
+    "NO_SPLASH",
+    "PORT",
+    "VERBOSE",
+    "QUIET",
+    "SILENT",
 ];
 
 /// File extensions that are code (not config/docs).
@@ -307,5 +313,32 @@ mod tests {
         let input = make_input("src/config.cjs", "process.env.VERBOSE");
         let result = EnvVarGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn new_string_branch_warns() {
+        // Edit tool puts content in new_string — content() returns new_string when content is None
+        let input = HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("src/app.ts".into()),
+                path: None,
+                command: None,
+                content: None,
+                new_string: Some("process.env.DEBUG".into()),
+                old_string: Some("old".into()),
+            }),
+            cwd: None,
+        };
+        let result = EnvVarGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn shell_script_not_code() {
+        // .sh files are not in CODE_EXTENSIONS — env vars in scripts are fine
+        let input = make_input("scripts/deploy.sh", "process.env.DEBUG");
+        let result = EnvVarGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
 }

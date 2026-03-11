@@ -119,10 +119,7 @@ mod tests {
 
     #[test]
     fn topic_file_over_soft_limit_warns() {
-        let input = make_input(
-            "/home/user/.claude/projects/foo/memory/debugging.md",
-            350,
-        );
+        let input = make_input("/home/user/.claude/projects/foo/memory/debugging.md", 350);
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
     }
@@ -158,20 +155,14 @@ mod tests {
 
     #[test]
     fn topic_file_at_300_allowed() {
-        let input = make_input(
-            "/home/user/.claude/projects/foo/memory/debugging.md",
-            300,
-        );
+        let input = make_input("/home/user/.claude/projects/foo/memory/debugging.md", 300);
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn topic_file_at_301_warns() {
-        let input = make_input(
-            "/home/user/.claude/projects/foo/memory/debugging.md",
-            301,
-        );
+        let input = make_input("/home/user/.claude/projects/foo/memory/debugging.md", 301);
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
     }
@@ -207,10 +198,7 @@ mod tests {
 
     #[test]
     fn topic_file_under_limit_allowed() {
-        let input = make_input(
-            "/home/user/.claude/projects/foo/memory/patterns.md",
-            100,
-        );
+        let input = make_input("/home/user/.claude/projects/foo/memory/patterns.md", 100);
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
@@ -251,10 +239,7 @@ mod tests {
 
     #[test]
     fn large_topic_file() {
-        let input = make_input(
-            "/home/user/.claude/projects/foo/memory/debugging.md",
-            1000,
-        );
+        let input = make_input("/home/user/.claude/projects/foo/memory/debugging.md", 1000);
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
     }

@@ -110,10 +110,7 @@ fn parse_work_dir(command: &str, cwd: &str) -> String {
 
     let mut last_target: Option<String> = None;
     for caps in re.captures_iter(command) {
-        let target = caps
-            .get(1)
-            .or(caps.get(2))
-            .map(|m| m.as_str().to_string());
+        let target = caps.get(1).or(caps.get(2)).map(|m| m.as_str().to_string());
         if target.is_some() {
             last_target = target;
         }
@@ -285,10 +282,7 @@ mod tests {
 
     #[test]
     fn parse_cd_target() {
-        assert_eq!(
-            parse_work_dir("cd /tmp && git push", "/home/user"),
-            "/tmp"
-        );
+        assert_eq!(parse_work_dir("cd /tmp && git push", "/home/user"), "/tmp");
     }
 
     #[test]
@@ -332,10 +326,7 @@ mod tests {
 
     #[test]
     fn owner_check_empty_list() {
-        assert!(!check_owner(
-            "https://github.com/cameronsjo/repo.git",
-            &[]
-        ));
+        assert!(!check_owner("https://github.com/cameronsjo/repo.git", &[]));
     }
 
     // strip_quotes tests
@@ -472,10 +463,7 @@ mod tests {
 
     #[test]
     fn strip_quotes_nested() {
-        assert_eq!(
-            strip_quotes("echo 'it\"s' \"done\""),
-            "echo  "
-        );
+        assert_eq!(strip_quotes("echo 'it\"s' \"done\""), "echo  ");
     }
 
     #[test]

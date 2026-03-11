@@ -18,9 +18,7 @@ impl Check for GuardGitInit {
 
         // Simple regex-free check: "git init" as a standalone command
         let words: Vec<&str> = command.split_whitespace().collect();
-        let has_git_init = words
-            .windows(2)
-            .any(|w| w[0] == "git" && w[1] == "init");
+        let has_git_init = words.windows(2).any(|w| w[0] == "git" && w[1] == "init");
 
         if has_git_init {
             return CheckResult::warn(

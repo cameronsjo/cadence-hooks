@@ -17,8 +17,7 @@ static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*\s(-f\s|--field\s|-F\s|--raw-field\s)")
-        .expect("pattern should compile")
+    Regex::new(r"gh\s+api.*\s(-f\s|--field\s|-F\s|--raw-field\s)").expect("pattern should compile")
 });
 
 static API_INPUT_FLAG: LazyLock<Regex> =
@@ -28,16 +27,14 @@ static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bfor\s+\w+\s+in\b|\bwhile\b.*;\s*do\b").expect("pattern should compile")
 });
 
-static REPO_FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(-R|--repo)\s+([^ ]+)").expect("pattern should compile")
-});
+static REPO_FLAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(-R|--repo)\s+([^ ]+)").expect("pattern should compile"));
 
 static REPO_CREATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+repo\s+create\b").expect("pattern should compile"));
 
-static API_REPOS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile")
-});
+static API_REPOS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
 
 fn is_write_command(command: &str) -> bool {
     WRITE_ACTIONS.is_match(command)
@@ -54,13 +51,17 @@ fn strip_quotes(s: &str) -> String {
             '"' => {
                 while let Some(&nc) = chars.peek() {
                     chars.next();
-                    if nc == '"' { break; }
+                    if nc == '"' {
+                        break;
+                    }
                 }
             }
             '\'' => {
                 while let Some(&nc) = chars.peek() {
                     chars.next();
-                    if nc == '\'' { break; }
+                    if nc == '\'' {
+                        break;
+                    }
                 }
             }
             _ => result.push(c),
@@ -69,24 +70,44 @@ fn strip_quotes(s: &str) -> String {
     result
 }
 
+/// Extract owner/repo from any git remote URL format.
+///
+/// Handles:
+/// - `https://github.com/owner/repo.git`
+/// - `ssh://git@github.com/owner/repo.git`
+/// - `git@github.com:owner/repo.git` (SCP-style)
 fn repo_from_url(url: &str) -> String {
-    url.trim()
-        .split("://")
-        .last()
-        .unwrap_or(url)
-        .splitn(2, '/')
-        .last()
-        .unwrap_or(url)
-        .trim_end_matches(".git")
-        .splitn(3, '/')
-        .take(2)
-        .collect::<Vec<&str>>()
-        .join("/")
+    let trimmed = url.trim();
+
+    let path = if let Some(after_scheme) = trimmed.split("://").nth(1) {
+        // Has scheme (https://, ssh://) — skip host, take path after first /
+        match after_scheme.split_once('/') {
+            Some((_, rest)) => rest,
+            None => return String::new(),
+        }
+    } else if let Some((_, after_colon)) = trimmed.split_once(':') {
+        // SCP-style: git@host:owner/repo.git
+        if after_colon.starts_with('/') {
+            return String::new();
+        }
+        after_colon
+    } else {
+        return String::new();
+    };
+
+    let path = path.trim_end_matches(".git");
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        String::new()
+    }
 }
 
 fn git_cmd(work_dir: &str, args: &[&str]) -> Option<String> {
     Command::new("git")
-        .arg("-C").arg(work_dir)
+        .arg("-C")
+        .arg(work_dir)
         .args(args)
         .output()
         .ok()
@@ -105,9 +126,10 @@ enum RepoResolution {
 fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String]) -> RepoResolution {
     // 1. Explicit -R / --repo flag
     if let Some(caps) = REPO_FLAG.captures(command)
-        && let Some(repo) = caps.get(2) {
-            return RepoResolution::Resolved(repo.as_str().to_string());
-        }
+        && let Some(repo) = caps.get(2)
+    {
+        return RepoResolution::Resolved(repo.as_str().to_string());
+    }
 
     // 2. gh repo create <name>
     if REPO_CREATE.is_match(command) {
@@ -124,9 +146,10 @@ fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String])
 
     // 3. gh api repos/OWNER/REPO
     if let Some(caps) = API_REPOS.captures(command)
-        && let Some(repo) = caps.get(1) {
-            return RepoResolution::Resolved(repo.as_str().to_string());
-        }
+        && let Some(repo) = caps.get(1)
+    {
+        return RepoResolution::Resolved(repo.as_str().to_string());
+    }
 
     // 4. Git remotes (with fork detection)
     if let Some(upstream_url) = git_cmd(work_dir, &["remote", "get-url", "upstream"]) {
@@ -358,11 +381,7 @@ mod tests {
 
     #[test]
     fn is_allowed_by_repo() {
-        assert!(is_allowed(
-            "other/repo",
-            &[],
-            &["other/repo".to_string()]
-        ));
+        assert!(is_allowed("other/repo", &[], &["other/repo".to_string()]));
     }
 
     #[test]
@@ -489,7 +508,9 @@ mod tests {
 
     #[test]
     fn api_patch_is_write() {
-        assert!(is_write_command("gh api repos/foo/bar -X PATCH -f title=new"));
+        assert!(is_write_command(
+            "gh api repos/foo/bar -X PATCH -f title=new"
+        ));
     }
 
     #[test]
@@ -540,13 +561,24 @@ mod tests {
     }
 
     #[test]
-    fn repo_from_ssh_url_known_limitation() {
-        // guard_gh_write's repo_from_url uses a simpler parser than guard_push_remote's.
-        // SCP-style URLs (git@host:owner/repo) are not properly handled here —
-        // it splits on "://" (no match), then splits on "/" getting the wrong segments.
-        let result = repo_from_url("git@github.com:cameronsjo/repo.git");
-        // "git@github.com:cameronsjo" / "repo" → only gets "repo"
-        assert_eq!(result, "repo");
+    fn repo_from_ssh_scp_url() {
+        assert_eq!(
+            repo_from_url("git@github.com:cameronsjo/repo.git"),
+            "cameronsjo/repo"
+        );
+    }
+
+    #[test]
+    fn repo_from_ssh_scheme_url() {
+        assert_eq!(
+            repo_from_url("ssh://git@github.com/cameronsjo/repo.git"),
+            "cameronsjo/repo"
+        );
+    }
+
+    #[test]
+    fn repo_from_malformed_url() {
+        assert_eq!(repo_from_url("not-a-url"), "");
     }
 
     #[test]

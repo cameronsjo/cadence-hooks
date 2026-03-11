@@ -123,11 +123,12 @@ impl Check for ValidateSkillFrontmatter {
 
                     // Check name matches directory
                     if let Some(dir_name) = skill_dir_name(path)
-                        && name_value != dir_name {
-                            errors.push(format!(
-                                "name '{name_value}' must match directory '{dir_name}'"
-                            ));
-                        }
+                        && name_value != dir_name
+                    {
+                        errors.push(format!(
+                            "name '{name_value}' must match directory '{dir_name}'"
+                        ));
+                    }
                 }
             }
             FileType::Command => {
@@ -254,10 +255,7 @@ mod tests {
 
     #[test]
     fn run_skill_missing_frontmatter_blocks() {
-        let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
-            "# No frontmatter",
-        );
+        let input = make_write_input("/plugins/skills/my-skill/SKILL.md", "# No frontmatter");
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
@@ -281,7 +279,12 @@ mod tests {
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
-        assert!(result.message.unwrap().contains("Missing required 'description'"));
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("Missing required 'description'")
+        );
     }
 
     #[test]
@@ -345,7 +348,12 @@ mod tests {
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
-        assert!(result.message.unwrap().contains("Unknown frontmatter field"));
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("Unknown frontmatter field")
+        );
     }
 
     #[test]
@@ -482,10 +490,7 @@ mod tests {
     #[test]
     fn classify_skill_md_not_in_skills_dir() {
         // SKILL.md but not under /skills/
-        assert_eq!(
-            classify_path("/project/SKILL.md"),
-            FileType::Other
-        );
+        assert_eq!(classify_path("/project/SKILL.md"), FileType::Other);
     }
 
     #[test]

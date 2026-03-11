@@ -28,7 +28,11 @@ impl Check for MarkdownLint {
         };
 
         // Check if markdownlint is available
-        if Command::new("markdownlint").arg("--version").output().is_err() {
+        if Command::new("markdownlint")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return CheckResult::allow(); // Skip if not installed
         }
 
@@ -42,10 +46,7 @@ impl Check for MarkdownLint {
             return CheckResult::allow();
         }
 
-        let output = match Command::new("markdownlint")
-            .arg(tmp.path())
-            .output()
-        {
+        let output = match Command::new("markdownlint").arg(tmp.path()).output() {
             Ok(out) => out,
             Err(_) => return CheckResult::allow(),
         };
