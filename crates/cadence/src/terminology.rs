@@ -3,7 +3,7 @@
 //! Detects prohibited terms and suggests neutral alternatives.
 //! Case-insensitive with word-boundary matching to avoid false positives.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::RegexSet;
 use std::sync::LazyLock;
 
@@ -62,7 +62,7 @@ pub fn check_terminology(content: &str) -> Vec<(String, String)> {
 fn is_excluded_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     lower.ends_with("claude.md")
-        || path.contains("claude-hooks/")
+        || path.contains("cadence-hooks/")
         || path.contains(".claude/hooks/")
         || path.contains(".claude/rules/")
 }
@@ -145,7 +145,7 @@ mod tests {
     fn excluded_paths_allowed() {
         assert!(is_excluded_path("/project/CLAUDE.md"));
         assert!(is_excluded_path(
-            "/home/dev/claude-hooks/crates/cadence/src/foo.rs"
+            "/home/dev/cadence-hooks/crates/cadence/src/foo.rs"
         ));
         assert!(is_excluded_path(
             "/home/dev/.claude/hooks/enforcement/foo.sh"
@@ -157,7 +157,7 @@ mod tests {
     fn blocks_on_violation_in_normal_file() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("/project/src/main.rs".into()),
                 path: None,
                 command: None,
@@ -168,7 +168,7 @@ mod tests {
             cwd: None,
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     // --- Unhappy path: bypass scenarios ---
@@ -204,7 +204,7 @@ mod tests {
     fn no_content_returns_allow() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("/project/src/main.rs".into()),
                 path: None,
                 command: None,
@@ -215,14 +215,14 @@ mod tests {
             cwd: None,
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn excluded_path_with_violations_allowed() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("/home/dev/.claude/rules/terminology.md".into()),
                 path: None,
                 command: None,
@@ -233,14 +233,14 @@ mod tests {
             cwd: None,
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn block_message_includes_path() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("/project/src/config.rs".into()),
                 path: None,
                 command: None,
@@ -251,7 +251,7 @@ mod tests {
             cwd: None,
         };
         let result = TerminologyGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(result.message.unwrap().contains("config.rs"));
     }
 

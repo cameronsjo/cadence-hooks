@@ -74,6 +74,59 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "cadence-hooks"
+version = "0.1.0"
+dependencies = [
+ "cadence-hooks-cadence",
+ "cadence-hooks-core",
+ "cadence-hooks-guardrails",
+ "cadence-hooks-obsidian",
+ "cadence-hooks-rules",
+ "clap",
+]
+
+[[package]]
+name = "cadence-hooks-cadence"
+version = "0.1.0"
+dependencies = [
+ "cadence-hooks-core",
+ "regex",
+ "tempfile",
+]
+
+[[package]]
+name = "cadence-hooks-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cadence-hooks-guardrails"
+version = "0.1.0"
+dependencies = [
+ "cadence-hooks-core",
+ "regex",
+]
+
+[[package]]
+name = "cadence-hooks-obsidian"
+version = "0.1.0"
+dependencies = [
+ "cadence-hooks-core",
+ "serde_json",
+]
+
+[[package]]
+name = "cadence-hooks-rules"
+version = "0.1.0"
+dependencies = [
+ "cadence-hooks-core",
+ "regex",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -118,59 +171,6 @@ name = "clap_lex"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
-
-[[package]]
-name = "claude-hooks"
-version = "0.1.0"
-dependencies = [
- "clap",
- "claude-hooks-cadence",
- "claude-hooks-core",
- "claude-hooks-guardrails",
- "claude-hooks-obsidian",
- "claude-hooks-rules",
-]
-
-[[package]]
-name = "claude-hooks-cadence"
-version = "0.1.0"
-dependencies = [
- "claude-hooks-core",
- "regex",
- "tempfile",
-]
-
-[[package]]
-name = "claude-hooks-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "claude-hooks-guardrails"
-version = "0.1.0"
-dependencies = [
- "claude-hooks-core",
- "regex",
-]
-
-[[package]]
-name = "claude-hooks-obsidian"
-version = "0.1.0"
-dependencies = [
- "claude-hooks-core",
- "serde_json",
-]
-
-[[package]]
-name = "claude-hooks-rules"
-version = "0.1.0"
-dependencies = [
- "claude-hooks-core",
- "regex",
-]
 
 [[package]]
 name = "colorchoice"

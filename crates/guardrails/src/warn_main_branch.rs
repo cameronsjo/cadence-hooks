@@ -3,7 +3,7 @@
 //! Fires once per session (tracked via a temp-file marker) to nudge the
 //! user toward creating a feature branch before making changes.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;

@@ -3,7 +3,7 @@
 //! Checks that `SKILL.md` and command `.md` files have valid frontmatter
 //! with required fields, kebab-case names, and no unknown keys.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -240,7 +240,7 @@ mod tests {
     fn make_write_input(path: &str, content: &str) -> HookInput {
         HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some(path.into()),
                 path: None,
                 command: None,
@@ -256,14 +256,14 @@ mod tests {
     fn run_other_file_allowed() {
         let input = make_write_input("/project/src/main.rs", "fn main() {}");
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn run_skill_missing_frontmatter_blocks() {
         let input = make_write_input("/plugins/skills/my-skill/SKILL.md", "# No frontmatter");
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
@@ -273,7 +273,7 @@ mod tests {
             "---\ndescription: A test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(result.message.unwrap().contains("Missing required 'name'"));
     }
 
@@ -284,7 +284,7 @@ mod tests {
             "---\nname: my-skill\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(
             result
                 .message
@@ -300,7 +300,7 @@ mod tests {
             "---\nname: My-Skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(result.message.unwrap().contains("lowercase"));
     }
 
@@ -311,7 +311,7 @@ mod tests {
             "---\nname: other-name\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(result.message.unwrap().contains("must match directory"));
     }
 
@@ -322,7 +322,7 @@ mod tests {
             "---\nname: my-skill\ndescription: A test skill\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -332,7 +332,7 @@ mod tests {
             "---\nname: my-cmd\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(result.message.unwrap().contains("Remove 'name:'"));
     }
 
@@ -343,7 +343,7 @@ mod tests {
             "---\ndescription: A command\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -353,7 +353,7 @@ mod tests {
             "---\nname: my-skill\ndescription: test\nunknown-field: value\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(
             result
                 .message
@@ -370,14 +370,14 @@ mod tests {
             cwd: None,
         };
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn run_no_content_allowed() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("/plugins/skills/my-skill/SKILL.md".into()),
                 path: None,
                 command: None,
@@ -388,7 +388,7 @@ mod tests {
             cwd: None,
         };
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     // --- Unhappy path: edge cases ---
@@ -437,7 +437,7 @@ mod tests {
             "---\nunknown1: val\nunknown2: val\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         let msg = result.message.unwrap();
         assert!(msg.contains("unknown1"));
         assert!(msg.contains("unknown2"));
@@ -451,7 +451,7 @@ mod tests {
         // regardless of tool_name
         let input = HookInput {
             tool_name: Some("Edit".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("/plugins/skills/my-skill/SKILL.md".into()),
                 path: None,
                 command: None,
@@ -462,7 +462,7 @@ mod tests {
             cwd: None,
         };
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
@@ -472,7 +472,7 @@ mod tests {
             "---\nname: my-skill\ndescription: A skill\nmodel: opus\nallowed-tools: Read,Grep\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod tests {
             "---\ndescription: Deploy the app\nallowed-tools: Bash\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]

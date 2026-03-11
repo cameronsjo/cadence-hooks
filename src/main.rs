@@ -4,11 +4,11 @@
 //! Each subcommand reads JSON from stdin (the hook protocol) and exits with
 //! 0 (allow), 1 (warn), or 2 (block).
 
+use cadence_hooks_core::run_check_from_stdin;
 use clap::{Parser, Subcommand};
-use claude_hooks_core::run_check_from_stdin;
 
 #[derive(Parser)]
-#[command(name = "claude-hooks", version, about = "Compiled Claude Code hooks")]
+#[command(name = "cadence-hooks", version, about = "Compiled Claude Code hooks")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -93,67 +93,67 @@ fn main() {
     match cli.command {
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => {
-                run_check_from_stdin(&claude_hooks_cadence::terminology::TerminologyGuard)
+                run_check_from_stdin(&cadence_hooks_cadence::terminology::TerminologyGuard)
             }
-            CadenceCommands::OrphanedTodos => {
-                run_check_from_stdin(&claude_hooks_cadence::block_orphaned_todos::OrphanedTodoGuard)
-            }
+            CadenceCommands::OrphanedTodos => run_check_from_stdin(
+                &cadence_hooks_cadence::block_orphaned_todos::OrphanedTodoGuard,
+            ),
             CadenceCommands::PreventSecretLeaks => {
-                run_check_from_stdin(&claude_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard)
+                run_check_from_stdin(&cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard)
             }
             CadenceCommands::PreventSecretWrites => run_check_from_stdin(
-                &claude_hooks_cadence::prevent_secret_writes::SecretWritesGuard,
+                &cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard,
             ),
             CadenceCommands::MemoryGuard => {
-                run_check_from_stdin(&claude_hooks_cadence::memory_guard::MemoryGuard)
+                run_check_from_stdin(&cadence_hooks_cadence::memory_guard::MemoryGuard)
             }
             CadenceCommands::GitSafety => {
-                run_check_from_stdin(&claude_hooks_cadence::git_safety::GitSafetyGuard)
+                run_check_from_stdin(&cadence_hooks_cadence::git_safety::GitSafetyGuard)
             }
-            CadenceCommands::LineEndings => {
-                run_check_from_stdin(&claude_hooks_cadence::validate_line_endings::LineEndingsGuard)
-            }
+            CadenceCommands::LineEndings => run_check_from_stdin(
+                &cadence_hooks_cadence::validate_line_endings::LineEndingsGuard,
+            ),
             CadenceCommands::EnvVars => {
-                run_check_from_stdin(&claude_hooks_cadence::validate_env_vars::EnvVarGuard)
+                run_check_from_stdin(&cadence_hooks_cadence::validate_env_vars::EnvVarGuard)
             }
             CadenceCommands::WarnUntracked => {
-                run_check_from_stdin(&claude_hooks_cadence::warn_untracked::WarnUntrackedFiles)
+                run_check_from_stdin(&cadence_hooks_cadence::warn_untracked::WarnUntrackedFiles)
             }
             CadenceCommands::MarkdownLint => {
-                run_check_from_stdin(&claude_hooks_cadence::markdown_lint::MarkdownLint)
+                run_check_from_stdin(&cadence_hooks_cadence::markdown_lint::MarkdownLint)
             }
         },
         Commands::Guardrails(cmd) => match cmd {
             GuardrailsCommands::GuardPushRemote => {
-                run_check_from_stdin(&claude_hooks_guardrails::guard_push_remote::PushRemoteGuard)
+                run_check_from_stdin(&cadence_hooks_guardrails::guard_push_remote::PushRemoteGuard)
             }
-            GuardrailsCommands::GuardGhDangerous => {
-                run_check_from_stdin(&claude_hooks_guardrails::guard_gh_dangerous::GhDangerousGuard)
-            }
+            GuardrailsCommands::GuardGhDangerous => run_check_from_stdin(
+                &cadence_hooks_guardrails::guard_gh_dangerous::GhDangerousGuard,
+            ),
             GuardrailsCommands::GuardGhWrite => {
-                run_check_from_stdin(&claude_hooks_guardrails::guard_gh_write::GhWriteGuard)
+                run_check_from_stdin(&cadence_hooks_guardrails::guard_gh_write::GhWriteGuard)
             }
             GuardrailsCommands::GuardGitInit => {
-                run_check_from_stdin(&claude_hooks_guardrails::guard_git_init::GuardGitInit)
+                run_check_from_stdin(&cadence_hooks_guardrails::guard_git_init::GuardGitInit)
             }
             GuardrailsCommands::WarnMainBranch => {
-                run_check_from_stdin(&claude_hooks_guardrails::warn_main_branch::WarnMainBranch)
+                run_check_from_stdin(&cadence_hooks_guardrails::warn_main_branch::WarnMainBranch)
             }
             GuardrailsCommands::CheckIdleReturn => {
-                run_check_from_stdin(&claude_hooks_guardrails::check_idle_return::CheckIdleReturn)
+                run_check_from_stdin(&cadence_hooks_guardrails::check_idle_return::CheckIdleReturn)
             }
         },
         Commands::Rules(cmd) => match cmd {
             RulesCommands::ValidateFrontmatter => run_check_from_stdin(
-                &claude_hooks_rules::validate_skill_frontmatter::ValidateSkillFrontmatter,
+                &cadence_hooks_rules::validate_skill_frontmatter::ValidateSkillFrontmatter,
             ),
             RulesCommands::SecurityPatterns => run_check_from_stdin(
-                &claude_hooks_rules::check_security_patterns::SecurityPatternScanner,
+                &cadence_hooks_rules::check_security_patterns::SecurityPatternScanner,
             ),
         },
         Commands::Obsidian(cmd) => match cmd {
             ObsidianCommands::TrashGuard => {
-                run_check_from_stdin(&claude_hooks_obsidian::trash_guard::ObsidianTrashGuard)
+                run_check_from_stdin(&cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard)
             }
         },
     }

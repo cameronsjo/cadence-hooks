@@ -3,7 +3,7 @@
 //! Shells out to `markdownlint` CLI if available. Skips silently when
 //! the tool is not installed, so this hook degrades gracefully.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::io::Write;
 use std::process::Command;
 

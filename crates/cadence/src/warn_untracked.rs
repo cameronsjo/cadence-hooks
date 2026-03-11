@@ -3,7 +3,7 @@
 //! Shells out to `git ls-files --others --exclude-standard` to detect
 //! files that might have been forgotten. Filters out build artifacts.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::process::Command;
 
 /// Build artifact extensions to filter from untracked file warnings.

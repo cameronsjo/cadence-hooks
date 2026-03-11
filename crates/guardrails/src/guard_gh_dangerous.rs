@@ -3,7 +3,7 @@
 //! `gh repo delete` is permanently destructive with no undo. This guard
 //! blocks it in direct invocations and inside shell exec wrappers (`bash -c`).
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -87,7 +87,7 @@ mod tests {
     fn make_bash(cmd: &str) -> HookInput {
         HookInput {
             tool_name: Some("Bash".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: None,
                 path: None,
                 command: Some(cmd.into()),
@@ -102,25 +102,25 @@ mod tests {
     #[test]
     fn direct_repo_delete_blocked() {
         let result = GhDangerousGuard.run(&make_bash("gh repo delete my-repo --yes"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn repo_delete_in_exec_wrapper_blocked() {
         let result = GhDangerousGuard.run(&make_bash("bash -c \"gh repo delete my-repo --yes\""));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn repo_delete_in_quotes_not_blocked() {
         let result = GhDangerousGuard.run(&make_bash("echo \"don't gh repo delete anything\""));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn normal_gh_command_allowed() {
         let result = GhDangerousGuard.run(&make_bash("gh pr list"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -131,25 +131,25 @@ mod tests {
             cwd: None,
         };
         let result = GhDangerousGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn no_gh_in_command_allowed() {
         let result = GhDangerousGuard.run(&make_bash("ls -la"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn zsh_wrapper_blocked() {
         let result = GhDangerousGuard.run(&make_bash("zsh -c \"gh repo delete my-repo --yes\""));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn sh_wrapper_blocked() {
         let result = GhDangerousGuard.run(&make_bash("sh -c \"gh repo delete my-repo --yes\""));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     // strip_quotes tests
@@ -185,50 +185,50 @@ mod tests {
     #[test]
     fn repo_delete_in_single_quotes_not_blocked() {
         let result = GhDangerousGuard.run(&make_bash("echo 'gh repo delete is dangerous'"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn repo_delete_with_confirm_blocked() {
         let result = GhDangerousGuard.run(&make_bash("gh repo delete my-repo --confirm"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn repo_delete_full_path_blocked() {
         let result = GhDangerousGuard.run(&make_bash("gh repo delete owner/my-repo --yes"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn gh_repo_list_allowed() {
         let result = GhDangerousGuard.run(&make_bash("gh repo list"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn gh_repo_create_allowed() {
         let result = GhDangerousGuard.run(&make_bash("gh repo create my-new-repo"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn gh_repo_view_allowed() {
         let result = GhDangerousGuard.run(&make_bash("gh repo view owner/repo"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn repo_delete_in_chain_blocked() {
         let result = GhDangerousGuard.run(&make_bash("echo done && gh repo delete my-repo --yes"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn no_tool_name_allowed() {
         let input = HookInput {
             tool_name: None,
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: None,
                 path: None,
                 command: Some("gh repo delete".into()),
@@ -239,6 +239,6 @@ mod tests {
             cwd: None,
         };
         let result = GhDangerousGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 }

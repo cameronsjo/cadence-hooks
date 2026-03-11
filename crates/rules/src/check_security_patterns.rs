@@ -3,7 +3,7 @@
 //! Maintains a table of language-specific anti-patterns (pickle, innerHTML,
 //! `shell=True`, unsafe Go imports, etc.) and warns when written code matches.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 
 /// A security pattern to check for in a specific file extension.

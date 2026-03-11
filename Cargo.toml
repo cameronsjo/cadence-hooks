@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "BSL-1.1"
 authors = ["Cameron Sjo"]
-repository = "https://github.com/cameronsjo/claude-hooks"
+repository = "https://github.com/cameronsjo/cadence-hooks"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -15,14 +15,14 @@ serde_json = "1"
 regex = "1"
 clap = { version = "4", features = ["derive"] }
 
-claude-hooks-core = { path = "crates/core" }
-claude-hooks-cadence = { path = "crates/cadence" }
-claude-hooks-guardrails = { path = "crates/guardrails" }
-claude-hooks-rules = { path = "crates/rules" }
-claude-hooks-obsidian = { path = "crates/obsidian" }
+cadence-hooks-core = { path = "crates/core" }
+cadence-hooks-cadence = { path = "crates/cadence" }
+cadence-hooks-guardrails = { path = "crates/guardrails" }
+cadence-hooks-rules = { path = "crates/rules" }
+cadence-hooks-obsidian = { path = "crates/obsidian" }
 
 [package]
-name = "claude-hooks"
+name = "cadence-hooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -31,13 +31,13 @@ repository.workspace = true
 description = "Compiled Claude Code hooks for cadence, git-guardrails, rules, and obsidian plugins"
 
 [[bin]]
-name = "claude-hooks"
+name = "cadence-hooks"
 path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-claude-hooks-core.workspace = true
-claude-hooks-cadence.workspace = true
-claude-hooks-guardrails.workspace = true
-claude-hooks-rules.workspace = true
-claude-hooks-obsidian.workspace = true
+cadence-hooks-core.workspace = true
+cadence-hooks-cadence.workspace = true
+cadence-hooks-guardrails.workspace = true
+cadence-hooks-rules.workspace = true
+cadence-hooks-obsidian.workspace = true

@@ -3,7 +3,7 @@
 //! Windows-style `\r\n` endings cause `env: bash\r: No such file or directory`
 //! errors. This check blocks writing `.sh` and `.bash` files with `\r` bytes.
 
-use claude_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Blocks shell scripts that contain carriage return bytes.
 pub struct LineEndingsGuard;
@@ -46,7 +46,7 @@ mod tests {
     fn make_input(path: &str, content: &str) -> HookInput {
         HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some(path.into()),
                 path: None,
                 command: None,
@@ -62,35 +62,35 @@ mod tests {
     fn lf_endings_pass() {
         let input = make_input("script.sh", "#!/bin/bash\necho hello\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn crlf_endings_blocked() {
         let input = make_input("script.sh", "#!/bin/bash\r\necho hello\r\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn non_shell_files_skipped() {
         let input = make_input("file.txt", "hello\r\nworld\r\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn bash_extension_checked() {
         let input = make_input("script.bash", "#!/bin/bash\r\necho hello\r\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn bash_extension_lf_passes() {
         let input = make_input("script.bash", "#!/bin/bash\necho hello\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -101,14 +101,14 @@ mod tests {
             cwd: None,
         };
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn no_content_allowed() {
         let input = HookInput {
             tool_name: Some("Write".into()),
-            tool_input: Some(claude_hooks_core::ToolInput {
+            tool_input: Some(cadence_hooks_core::ToolInput {
                 file_path: Some("script.sh".into()),
                 path: None,
                 command: None,
@@ -119,14 +119,14 @@ mod tests {
             cwd: None,
         };
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn mixed_endings_blocked() {
         let input = make_input("script.sh", "#!/bin/bash\necho hello\r\necho world\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     // --- Unhappy path: edge cases ---
@@ -136,7 +136,7 @@ mod tests {
         // Just \r without \n — still contains \r
         let input = make_input("script.sh", "#!/bin/bash\recho hello\r");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
@@ -144,35 +144,35 @@ mod tests {
         // Non-shell files are not checked
         let input = make_input("script.py", "#!/usr/bin/env python\r\nprint('hello')\r\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn makefile_crlf_not_checked() {
         let input = make_input("Makefile", "all:\r\n\techo hello\r\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn empty_shell_script_allowed() {
         let input = make_input("script.sh", "");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn shell_script_single_line_lf() {
         let input = make_input("script.sh", "#!/bin/bash\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn shell_script_no_newline() {
         let input = make_input("script.sh", "#!/bin/bash");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -180,6 +180,6 @@ mod tests {
         // Only .sh and .bash are checked — .zsh is not
         let input = make_input("script.zsh", "#!/bin/zsh\r\necho hello\r\n");
         let result = LineEndingsGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }

@@ -151,7 +151,7 @@ pub fn run_check_from_stdin(check: &dyn Check) -> ! {
     match HookInput::from_stdin() {
         Ok(input) => run_check(check, &input),
         Err(e) => {
-            eprintln!("claude-hooks: {e}");
+            eprintln!("cadence-hooks: {e}");
             process::exit(0); // Fail open on parse errors
         }
     }
