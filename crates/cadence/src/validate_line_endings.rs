@@ -72,4 +72,54 @@ mod tests {
         let result = LineEndingsGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
+
+    #[test]
+    fn bash_extension_checked() {
+        let input = make_input("script.bash", "#!/bin/bash\r\necho hello\r\n");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_extension_lf_passes() {
+        let input = make_input("script.bash", "#!/bin/bash\necho hello\n");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_path_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_content_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("script.sh".into()),
+                path: None,
+                command: None,
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn mixed_endings_blocked() {
+        let input = make_input("script.sh", "#!/bin/bash\necho hello\r\necho world\n");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
 }

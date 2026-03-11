@@ -298,4 +298,105 @@ mod tests {
             "/home/user"
         );
     }
+
+    // Additional repo_from_url tests
+    #[test]
+    fn parse_https_no_git_suffix() {
+        assert_eq!(
+            repo_from_url("https://github.com/cameronsjo/cadence"),
+            Some("cameronsjo/cadence".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_malformed_url_returns_none() {
+        assert_eq!(repo_from_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn parse_ssh_scheme_url() {
+        assert_eq!(
+            repo_from_url("ssh://git@github.com/cameronsjo/repo.git"),
+            Some("cameronsjo/repo".to_string())
+        );
+    }
+
+    // check_owner tests
+    #[test]
+    fn owner_check_multiple_owners() {
+        assert!(check_owner(
+            "https://github.com/cameronsjo/repo.git",
+            &["other".to_string(), "cameronsjo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn owner_check_empty_list() {
+        assert!(!check_owner(
+            "https://github.com/cameronsjo/repo.git",
+            &[]
+        ));
+    }
+
+    // strip_quotes tests
+    #[test]
+    fn strip_single_quotes() {
+        assert_eq!(
+            strip_quotes("echo 'hello world' && git push"),
+            "echo  && git push"
+        );
+    }
+
+    #[test]
+    fn strip_empty_string() {
+        assert_eq!(strip_quotes(""), "");
+    }
+
+    // parse_work_dir tests
+    #[test]
+    fn parse_relative_cd() {
+        assert_eq!(
+            parse_work_dir("cd subdir && git push", "/home/user"),
+            "/home/user/subdir"
+        );
+    }
+
+    #[test]
+    fn parse_tilde_cd() {
+        // ~ expansion depends on HOME env var
+        let result = parse_work_dir("cd ~/projects && git push", "/tmp");
+        assert!(result.contains("projects"));
+    }
+
+    #[test]
+    fn parse_multiple_cd_uses_last() {
+        assert_eq!(
+            parse_work_dir("cd /first && cd /second && git push", "/home/user"),
+            "/second"
+        );
+    }
+
+    #[test]
+    fn parse_cd_with_semicolons() {
+        assert_eq!(
+            parse_work_dir("cd /project; git push", "/home/user"),
+            "/project"
+        );
+    }
+
+    // LOOP_PATTERN tests
+    #[test]
+    fn loop_pattern_detects_for() {
+        assert!(LOOP_PATTERN.is_match("for repo in list; do git push; done"));
+    }
+
+    #[test]
+    fn loop_pattern_detects_while() {
+        assert!(LOOP_PATTERN.is_match("while true; do git push; done"));
+    }
+
+    #[test]
+    fn loop_pattern_no_match_normal() {
+        assert!(!LOOP_PATTERN.is_match("git push origin main"));
+    }
 }

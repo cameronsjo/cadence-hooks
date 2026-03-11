@@ -146,4 +146,101 @@ mod tests {
         let orphans = find_orphaned(&content);
         assert_eq!(orphans.len(), 2);
     }
+
+    // All marker types
+    #[test]
+    fn all_markers_detected_when_orphaned() {
+        for marker in MARKERS {
+            let orphans = find_orphaned(&make_marker(marker, false));
+            assert_eq!(orphans.len(), 1, "marker {marker} should be detected");
+        }
+    }
+
+    #[test]
+    fn all_markers_pass_when_referenced() {
+        for marker in MARKERS {
+            let orphans = find_orphaned(&make_marker(marker, true));
+            assert!(orphans.is_empty(), "marker {marker} should pass when referenced");
+        }
+    }
+
+    #[test]
+    fn empty_content_passes() {
+        assert!(find_orphaned("").is_empty());
+    }
+
+    #[test]
+    fn no_markers_passes() {
+        assert!(find_orphaned("fn main() { println!(\"hello\"); }").is_empty());
+    }
+
+    #[test]
+    fn line_numbers_accurate() {
+        let content = "line 1\nline 2\n// TODO: fix this\nline 4";
+        let orphans = find_orphaned(content);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].0, 3);
+    }
+
+    // Check::run() integration
+    fn make_check_input(path: Option<&str>, content: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: path.map(String::from),
+                path: None,
+                command: None,
+                content: Some(content.into()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn run_blocks_orphaned_in_code() {
+        let input = make_check_input(Some("src/main.rs"), &make_marker("TODO", false));
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn run_allows_exempt_path() {
+        let input = make_check_input(Some("docs/guide.md"), &make_marker("TODO", false));
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_allows_no_content() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("src/main.rs".into()),
+                path: None,
+                command: None,
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_allows_clean_code() {
+        let input = make_check_input(Some("src/main.rs"), "fn main() {}");
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn all_exempt_extensions() {
+        for ext in EXEMPT_EXTENSIONS {
+            assert!(is_exempt(&format!("file.{ext}")), "{ext} should be exempt");
+        }
+    }
 }

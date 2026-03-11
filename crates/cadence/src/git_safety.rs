@@ -17,8 +17,8 @@ const BLOCKED_COMMANDS: &[&str] = &[
     "git clean -f",
     "git reflog expire --expire=now --all",
     "git gc --prune=now",
-    "git branch -D main",
-    "git branch -D master",
+    "git branch -d main",
+    "git branch -d master",
 ];
 
 /// Regex-style patterns for blocked commands (rebase main/master).
@@ -37,7 +37,6 @@ const WARNING_PATTERNS: &[&str] = &[
     "git stash drop",
     "git stash clear",
     "git branch -d",
-    "git branch -D",
     "git remote remove",
     "git remote rm",
 ];
@@ -156,5 +155,118 @@ mod tests {
     fn non_git_command_allowed() {
         let result = GitSafetyGuard.run(&make_bash_input("ls -la"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = GitSafetyGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn force_push_master_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push --force origin master"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn force_push_short_flag_main_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push -f origin main"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn checkout_dot_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git checkout -- ."));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn clean_fd_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git clean -fd"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn clean_f_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git clean -f"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn branch_delete_main_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git branch -D main"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn branch_delete_master_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git branch -D master"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rebase_master_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git rebase master"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn reflog_expire_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git reflog expire --expire=now --all"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn gc_prune_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git gc --prune=now"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn stash_drop_warned() {
+        let result = GitSafetyGuard.run(&make_bash_input("git stash drop"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn stash_clear_warned() {
+        let result = GitSafetyGuard.run(&make_bash_input("git stash clear"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn branch_delete_feature_warned() {
+        let result = GitSafetyGuard.run(&make_bash_input("git branch -D my-feature"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn remote_remove_warned() {
+        let result = GitSafetyGuard.run(&make_bash_input("git remote remove upstream"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn normal_push_allowed() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push origin main"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn normal_commit_allowed() {
+        let result = GitSafetyGuard.run(&make_bash_input("git commit -m 'feat: add thing'"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn embedded_in_chain_detected() {
+        let result = GitSafetyGuard.run(&make_bash_input("cd /tmp && git reset --hard"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 }

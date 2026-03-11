@@ -206,4 +206,177 @@ mod tests {
             Some("my-skill")
         );
     }
+
+    #[test]
+    fn skill_dir_name_none_for_non_skill() {
+        assert_eq!(skill_dir_name("/plugins/commands/my-cmd.md"), None);
+    }
+
+    #[test]
+    fn classify_other_path() {
+        assert_eq!(classify_path("/project/src/main.rs"), FileType::Other);
+    }
+
+    #[test]
+    fn empty_frontmatter() {
+        let content = "---\n---\n# Content";
+        let fields = extract_frontmatter(content).unwrap();
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn frontmatter_with_extra_colons() {
+        let content = "---\nname: my-skill\ndescription: A skill: for testing\n---\n";
+        let fields = extract_frontmatter(content).unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[1].1, "A skill: for testing");
+    }
+
+    // Full Check::run() integration tests
+    fn make_write_input(path: &str, content: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some(path.into()),
+                path: None,
+                command: None,
+                content: Some(content.into()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn run_other_file_allowed() {
+        let input = make_write_input("/project/src/main.rs", "fn main() {}");
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_missing_frontmatter_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "# No frontmatter",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn run_skill_missing_name_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\ndescription: A test\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("Missing required 'name'"));
+    }
+
+    #[test]
+    fn run_skill_missing_description_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("Missing required 'description'"));
+    }
+
+    #[test]
+    fn run_skill_invalid_name_format_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: My-Skill\ndescription: test\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("lowercase"));
+    }
+
+    #[test]
+    fn run_skill_name_dir_mismatch_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: other-name\ndescription: test\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("must match directory"));
+    }
+
+    #[test]
+    fn run_valid_skill_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_command_with_name_field_blocks() {
+        let input = make_write_input(
+            "/plugins/commands/my-cmd.md",
+            "---\nname: my-cmd\ndescription: test\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("Remove 'name:'"));
+    }
+
+    #[test]
+    fn run_command_without_name_passes() {
+        let input = make_write_input(
+            "/plugins/commands/my-cmd.md",
+            "---\ndescription: A command\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_unknown_field_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\nunknown-field: value\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("Unknown frontmatter field"));
+    }
+
+    #[test]
+    fn run_no_path_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_no_content_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("/plugins/skills/my-skill/SKILL.md".into()),
+                path: None,
+                command: None,
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
 }

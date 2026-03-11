@@ -69,4 +69,41 @@ mod tests {
         let result = GuardGitInit.run(&make_bash("git status"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
+
+    #[test]
+    fn no_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = GuardGitInit.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn init_without_git_allowed() {
+        let result = GuardGitInit.run(&make_bash("npm init"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn git_without_init_allowed() {
+        let result = GuardGitInit.run(&make_bash("git commit -m 'initial'"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn git_init_with_branch() {
+        let result = GuardGitInit.run(&make_bash("git init -b main"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn git_init_in_chain() {
+        // "git" and "init" both present but not adjacent as "git init"
+        // The command is "mkdir proj && git init" — "git init" IS adjacent here
+        let result = GuardGitInit.run(&make_bash("mkdir proj && git init"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
 }

@@ -265,4 +265,156 @@ mod tests {
         let result = SecretLeaksGuard.run(&make_bash_input("printenv"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
     }
+
+    fn make_grep_input(path: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Grep".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some(path.into()),
+                path: None,
+                command: None,
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn grep_env_blocked() {
+        let result = SecretLeaksGuard.run(&make_grep_input("/project/.env"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn grep_env_example_allowed() {
+        let result = SecretLeaksGuard.run(&make_grep_input("/project/.env.example"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn grep_normal_file_allowed() {
+        let result = SecretLeaksGuard.run(&make_grep_input("/project/src/main.rs"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn read_credentials_json_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/project/credentials.json"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_id_rsa_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/home/user/.ssh/id_rsa"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_id_ed25519_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/home/user/.ssh/id_ed25519"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_key_file_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/etc/ssl/server.key"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_pem_ambiguous_warned() {
+        let result = SecretLeaksGuard.run(&make_read_input("/etc/ssl/cert.pem"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn read_private_pem_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/etc/ssl/server-key.pem"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_pub_key_allowed() {
+        let result = SecretLeaksGuard.run(&make_read_input("/home/user/.ssh/id_rsa.pub"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_source_env_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("source .env"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_head_env_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("head -5 .env"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_tail_env_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("tail .env.local"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_echo_secret_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("echo $SECRET_TOKEN"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn bash_echo_password_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("printf '%s' $PASSWORD"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn bash_export_p_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("export -p"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn bash_normal_command_allowed() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cargo test"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_tool_input_allowed() {
+        let input = HookInput {
+            tool_name: Some("Read".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = SecretLeaksGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn unknown_tool_allowed() {
+        let input = HookInput {
+            tool_name: Some("Agent".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = SecretLeaksGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn read_service_account_json_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/project/service-account-prod.json"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_docker_config_blocked() {
+        let result =
+            SecretLeaksGuard.run(&make_read_input("/home/user/.docker/config.json"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
 }

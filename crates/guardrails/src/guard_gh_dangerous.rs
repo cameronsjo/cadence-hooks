@@ -118,4 +118,63 @@ mod tests {
         let result = GhDangerousGuard.run(&make_bash("gh pr list"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
+
+    #[test]
+    fn no_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = GhDangerousGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_gh_in_command_allowed() {
+        let result = GhDangerousGuard.run(&make_bash("ls -la"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn zsh_wrapper_blocked() {
+        let result =
+            GhDangerousGuard.run(&make_bash("zsh -c \"gh repo delete my-repo --yes\""));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn sh_wrapper_blocked() {
+        let result =
+            GhDangerousGuard.run(&make_bash("sh -c \"gh repo delete my-repo --yes\""));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    // strip_quotes tests
+    #[test]
+    fn strip_double_quotes() {
+        assert_eq!(strip_quotes("echo \"hello\" world"), "echo  world");
+    }
+
+    #[test]
+    fn strip_single_quotes() {
+        assert_eq!(strip_quotes("echo 'hello' world"), "echo  world");
+    }
+
+    #[test]
+    fn strip_empty_quotes() {
+        assert_eq!(strip_quotes("echo \"\" world"), "echo  world");
+    }
+
+    #[test]
+    fn strip_no_quotes() {
+        assert_eq!(strip_quotes("echo hello"), "echo hello");
+    }
+
+    #[test]
+    fn strip_unmatched_quote_consumes_rest() {
+        // Unmatched quote consumes everything after it
+        let result = strip_quotes("echo \"unterminated");
+        assert_eq!(result, "echo ");
+    }
 }

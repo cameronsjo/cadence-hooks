@@ -201,4 +201,198 @@ mod tests {
     fn bash_env_template_allowed() {
         assert!(!bash_targets_env_file("cat .env.example"));
     }
+
+    #[test]
+    fn bash_append_env_blocked() {
+        assert!(bash_targets_env_file("echo SECRET >> .env"));
+    }
+
+    #[test]
+    fn bash_rm_env_no_flag_blocked() {
+        assert!(bash_targets_env_file("rm .env"));
+    }
+
+    #[test]
+    fn service_account_json_blocked() {
+        assert!(is_blocked(
+            "service-account-prod.json",
+            "/project/service-account-prod.json"
+        ));
+    }
+
+    #[test]
+    fn docker_config_path_blocked() {
+        assert!(is_blocked(
+            "config.json",
+            "/home/user/.docker/config.json"
+        ));
+    }
+
+    #[test]
+    fn p12_extension_blocked() {
+        assert!(is_blocked("cert.p12", "/etc/ssl/cert.p12"));
+    }
+
+    #[test]
+    fn pfx_extension_blocked() {
+        assert!(is_blocked("cert.pfx", "/etc/ssl/cert.pfx"));
+    }
+
+    #[test]
+    fn keystore_extension_blocked() {
+        assert!(is_blocked("app.keystore", "/project/app.keystore"));
+    }
+
+    #[test]
+    fn npmrc_blocked() {
+        assert!(is_blocked(".npmrc", "/home/user/.npmrc"));
+    }
+
+    #[test]
+    fn netrc_blocked() {
+        assert!(is_blocked(".netrc", "/home/user/.netrc"));
+    }
+
+    #[test]
+    fn private_pem_suffix_blocked() {
+        assert!(is_blocked("server.private.pem", "/etc/ssl/server.private.pem"));
+    }
+
+    #[test]
+    fn underscore_key_pem_blocked() {
+        assert!(is_blocked("server_key.pem", "/etc/ssl/server_key.pem"));
+    }
+
+    #[test]
+    fn case_insensitivity_blocked() {
+        assert!(is_blocked(".ENV", "/project/.ENV"));
+    }
+
+    #[test]
+    fn case_insensitivity_safe() {
+        assert!(is_safe_template(".ENV.EXAMPLE"));
+    }
+
+    #[test]
+    fn no_extension_not_ambiguous() {
+        assert!(!is_ambiguous("Makefile"));
+    }
+
+    // Full Check::run() integration tests
+
+    fn make_write_input(path: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some(path.into()),
+                path: None,
+                command: None,
+                content: Some("content".into()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        }
+    }
+
+    fn make_edit_input(path: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some(path.into()),
+                path: None,
+                command: None,
+                content: None,
+                new_string: Some("new".into()),
+                old_string: Some("old".into()),
+            }),
+            cwd: None,
+        }
+    }
+
+    fn make_bash_input(command: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: Some(command.into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn write_env_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/.env"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_env_blocked() {
+        let result = SecretWritesGuard.run(&make_edit_input("/project/.env.local"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_env_example_allowed() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/.env.example"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn write_pem_warned() {
+        let result = SecretWritesGuard.run(&make_write_input("/etc/ssl/cert.pem"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn write_normal_file_allowed() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/src/main.rs"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_env_redirect_blocked_via_run() {
+        let result = SecretWritesGuard.run(&make_bash_input("echo KEY=val > .env"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_normal_command_allowed_via_run() {
+        let result = SecretWritesGuard.run(&make_bash_input("cargo build"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn unknown_tool_allowed() {
+        let input = HookInput {
+            tool_name: Some("Read".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: Some("/project/.env".into()),
+                path: None,
+                command: None,
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = SecretWritesGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_tool_input_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = SecretWritesGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
 }

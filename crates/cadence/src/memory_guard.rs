@@ -126,4 +126,71 @@ mod tests {
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
     }
+
+    #[test]
+    fn memory_md_exactly_at_hard_limit_allowed() {
+        let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 200);
+        let result = MemoryGuard.run(&input);
+        // 200 lines is AT the limit, not over
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn memory_md_exactly_at_soft_limit_warns() {
+        let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 180);
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn memory_md_one_under_soft_limit_allowed() {
+        let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 179);
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn memory_md_at_201_blocked() {
+        let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 201);
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn topic_file_at_300_allowed() {
+        let input = make_input(
+            "/home/user/.claude/projects/foo/memory/debugging.md",
+            300,
+        );
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn topic_file_at_301_warns() {
+        let input = make_input(
+            "/home/user/.claude/projects/foo/memory/debugging.md",
+            301,
+        );
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
+    }
+
+    #[test]
+    fn empty_memory_md_allowed() {
+        let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 0);
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_path_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = MemoryGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
 }

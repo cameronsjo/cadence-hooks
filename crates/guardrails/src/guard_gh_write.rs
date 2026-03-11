@@ -274,4 +274,141 @@ mod tests {
         assert!(caps.is_some());
         assert_eq!(caps.unwrap().get(2).unwrap().as_str(), "cameronsjo/test");
     }
+
+    #[test]
+    fn repo_flag_long_form() {
+        let caps = REPO_FLAG.captures("gh issue create --repo cameronsjo/test --title hi");
+        assert!(caps.is_some());
+        assert_eq!(caps.unwrap().get(2).unwrap().as_str(), "cameronsjo/test");
+    }
+
+    // Write detection patterns
+    #[test]
+    fn issue_create_is_write() {
+        assert!(is_write_command("gh issue create --title test"));
+    }
+
+    #[test]
+    fn release_create_is_write() {
+        assert!(is_write_command("gh release create v1.0.0"));
+    }
+
+    #[test]
+    fn pr_merge_is_write() {
+        assert!(is_write_command("gh pr merge 123"));
+    }
+
+    #[test]
+    fn pr_close_is_write() {
+        assert!(is_write_command("gh pr close 123"));
+    }
+
+    #[test]
+    fn pr_comment_is_write() {
+        assert!(is_write_command("gh issue comment 123 --body 'hello'"));
+    }
+
+    #[test]
+    fn repo_fork_is_write() {
+        assert!(is_write_command("gh repo fork owner/repo"));
+    }
+
+    #[test]
+    fn api_put_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar -X PUT"));
+    }
+
+    #[test]
+    fn api_delete_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar --method DELETE"));
+    }
+
+    #[test]
+    fn api_with_field_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar -f title=test"));
+    }
+
+    #[test]
+    fn api_with_input_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar --input data.json"));
+    }
+
+    #[test]
+    fn pr_list_is_not_write_2() {
+        assert!(!is_write_command("gh pr list --state open"));
+    }
+
+    #[test]
+    fn issue_list_is_not_write() {
+        assert!(!is_write_command("gh issue list"));
+    }
+
+    #[test]
+    fn pr_view_is_not_write() {
+        assert!(!is_write_command("gh pr view 123"));
+    }
+
+    #[test]
+    fn api_get_is_not_write() {
+        assert!(!is_write_command("gh api repos/foo/bar"));
+    }
+
+    // is_allowed
+    #[test]
+    fn is_allowed_by_owner() {
+        assert!(is_allowed(
+            "cameronsjo/repo",
+            &["cameronsjo".to_string()],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_allowed_by_repo() {
+        assert!(is_allowed(
+            "other/repo",
+            &[],
+            &["other/repo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn is_not_allowed_unknown() {
+        assert!(!is_allowed(
+            "stranger/repo",
+            &["cameronsjo".to_string()],
+            &[]
+        ));
+    }
+
+    // strip_quotes
+    #[test]
+    fn strip_quotes_preserves_unquoted() {
+        assert_eq!(strip_quotes("gh pr create"), "gh pr create");
+    }
+
+    // repo_from_url
+    #[test]
+    fn repo_from_https_url() {
+        assert_eq!(
+            repo_from_url("https://github.com/cameronsjo/repo.git"),
+            "cameronsjo/repo"
+        );
+    }
+
+    #[test]
+    fn repo_from_https_url_no_git() {
+        assert_eq!(
+            repo_from_url("https://github.com/cameronsjo/repo"),
+            "cameronsjo/repo"
+        );
+    }
+
+    // API repos pattern
+    #[test]
+    fn api_repos_pattern_matches() {
+        let caps = API_REPOS.captures("gh api repos/cameronsjo/test/pulls");
+        assert!(caps.is_some());
+        assert_eq!(caps.unwrap().get(1).unwrap().as_str(), "cameronsjo/test");
+    }
 }
