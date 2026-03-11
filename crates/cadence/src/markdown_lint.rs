@@ -1,7 +1,13 @@
+//! Run markdownlint on markdown files being written.
+//!
+//! Shells out to `markdownlint` CLI if available. Skips silently when
+//! the tool is not installed, so this hook degrades gracefully.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use std::io::Write;
 use std::process::Command;
 
+/// Warns when markdownlint reports issues in written markdown content.
 pub struct MarkdownLint;
 
 impl Check for MarkdownLint {

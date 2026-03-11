@@ -1,3 +1,9 @@
+//! Guard against unintended `gh` write operations.
+//!
+//! Detects `gh` sub-commands that mutate GitHub state (create, merge, close,
+//! comment, edit, delete, etc.) and verifies the target repository belongs to
+//! an allowed owner list. Also blocks looped writes and cross-repo mutations.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::process::Command;
@@ -175,6 +181,7 @@ fn is_allowed(repo: &str, allowed_owners: &[String], allowed_repos: &[String]) -
     allowed_owners.iter().any(|a| a == owner)
 }
 
+/// Guards against unintended `gh` CLI write operations on unauthorized repositories.
 pub struct GhWriteGuard;
 
 impl Check for GhWriteGuard {

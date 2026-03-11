@@ -1,3 +1,8 @@
+//! Warn on generic environment variable names in code.
+//!
+//! Detects bare names like `DEBUG`, `PORT`, `VERBOSE` that should use
+//! tool-prefixed forms (`MYAPP_DEBUG`, `SERVICE_PORT`) to avoid collisions.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -34,6 +39,7 @@ fn is_code_file(path: &str) -> bool {
     false
 }
 
+/// Warns when code accesses generic environment variable names without a tool prefix.
 pub struct EnvVarGuard;
 
 impl Check for EnvVarGuard {

@@ -1,3 +1,9 @@
+//! Validate `git push` targets against an owner allowlist.
+//!
+//! Resolves the push URL for the current branch (or explicit remote) and
+//! verifies the repository owner is in the configured allowlist. Also blocks
+//! looped pushes and force-push to `main`.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::process::Command;
@@ -153,6 +159,7 @@ fn extract_remote(command: &str, work_dir: &str) -> Option<String> {
     }
 }
 
+/// Validates `git push` targets against an allowed owner list.
 pub struct PushRemoteGuard;
 
 impl Check for PushRemoteGuard {

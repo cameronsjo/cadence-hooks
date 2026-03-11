@@ -1,5 +1,11 @@
+//! Block CRLF line endings in shell scripts.
+//!
+//! Windows-style `\r\n` endings cause `env: bash\r: No such file or directory`
+//! errors. This check blocks writing `.sh` and `.bash` files with `\r` bytes.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 
+/// Blocks shell scripts that contain carriage return bytes.
 pub struct LineEndingsGuard;
 
 impl Check for LineEndingsGuard {

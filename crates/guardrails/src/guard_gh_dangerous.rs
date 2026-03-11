@@ -1,3 +1,8 @@
+//! Block irreversible `gh` operations.
+//!
+//! `gh repo delete` is permanently destructive with no undo. This guard
+//! blocks it in direct invocations and inside shell exec wrappers (`bash -c`).
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -8,6 +13,7 @@ static GH_REPO_DELETE: LazyLock<Regex> =
 static EXEC_WRAPPER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(bash|sh|zsh)\s+-c\b").expect("pattern should compile"));
 
+/// Blocks `gh repo delete` and other irreversible GitHub CLI operations.
 pub struct GhDangerousGuard;
 
 impl Check for GhDangerousGuard {

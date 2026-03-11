@@ -1,3 +1,9 @@
+//! Redirect `rm` commands inside an Obsidian vault to `.trash/`.
+//!
+//! Obsidian has a built-in `.trash/` recycle bin. Deleting vault files with
+//! `rm` bypasses it and loses recoverability. This guard blocks `rm` inside
+//! the vault directory and suggests `mv` to `.trash/` instead.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 
 /// Check if an rm command targets the Obsidian vault.
@@ -32,6 +38,7 @@ fn check_rm_in_vault(command: &str, cwd: &str, vault: &str) -> CheckResult {
     ))
 }
 
+/// Blocks `rm` inside an Obsidian vault and suggests `.trash/` instead.
 pub struct ObsidianTrashGuard;
 
 impl Check for ObsidianTrashGuard {

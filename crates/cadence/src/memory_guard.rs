@@ -1,9 +1,15 @@
+//! Enforce line limits on auto-memory files.
+//!
+//! MEMORY.md is loaded into every session's context window, so it must stay
+//! under 200 lines. Topic files have a softer 300-line guideline.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 
 const MEMORY_HARD_LIMIT: usize = 200;
 const MEMORY_SOFT_LIMIT: usize = 180;
 const TOPIC_SOFT_LIMIT: usize = 300;
 
+/// Blocks writes that push MEMORY.md past 200 lines, warns as it approaches the limit.
 pub struct MemoryGuard;
 
 impl MemoryGuard {

@@ -1,3 +1,9 @@
+//! Detect idle returns and suggest re-orientation.
+//!
+//! Tracks the last edit timestamp via a temp-file marker. When the user
+//! returns after 5+ minutes of inactivity, warns them to review context.
+//! After 8+ hours, suggests starting a fresh session.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -8,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const IDLE_THRESHOLD_SECS: u64 = 300; // 5 minutes
 const NEW_SESSION_THRESHOLD_SECS: u64 = 28800; // 8 hours
 
+/// Warns when the user returns after extended idle time.
 pub struct CheckIdleReturn;
 
 impl CheckIdleReturn {

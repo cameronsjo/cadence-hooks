@@ -1,3 +1,9 @@
+//! Prevent secrets from leaking into the conversation context.
+//!
+//! Blocks Read/Grep on .env files, credentials, and private keys.
+//! Blocks Bash commands that would cat/source/dump secrets.
+//! Safe templates (.env.example, .env.test) are always allowed.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 
 /// Safe template suffixes that are always allowed to read.
@@ -163,6 +169,7 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     None
 }
 
+/// Blocks reading secrets into context via Read, Grep, or Bash.
 pub struct SecretLeaksGuard;
 
 impl Check for SecretLeaksGuard {

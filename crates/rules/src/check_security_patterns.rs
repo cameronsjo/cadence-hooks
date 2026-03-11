@@ -1,3 +1,8 @@
+//! Scan code for known insecure patterns.
+//!
+//! Maintains a table of language-specific anti-patterns (pickle, innerHTML,
+//! `shell=True`, unsafe Go imports, etc.) and warns when written code matches.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 
@@ -111,6 +116,7 @@ const PATTERNS: &[SecurityPattern] = &[
     },
 ];
 
+/// Scans written code for known insecure patterns across multiple languages.
 pub struct SecurityPatternScanner;
 
 impl Check for SecurityPatternScanner {

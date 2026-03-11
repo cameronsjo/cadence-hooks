@@ -1,3 +1,9 @@
+//! Block or warn on dangerous git operations.
+//!
+//! Force-push to main/master, `reset --hard`, `clean -f`, and similar
+//! destructive commands are blocked. Less dangerous operations like
+//! `rebase`, `reset`, and `branch -d` trigger warnings.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 
 /// Commands that are always blocked — destructive with no undo.
@@ -42,6 +48,7 @@ const WARNING_PATTERNS: &[&str] = &[
     "git remote rm",
 ];
 
+/// Blocks destructive git commands and warns on history-modifying operations.
 pub struct GitSafetyGuard;
 
 impl Check for GitSafetyGuard {

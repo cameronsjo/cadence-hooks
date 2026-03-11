@@ -1,3 +1,9 @@
+//! Prevent writing or deleting secret files.
+//!
+//! Blocks Write/Edit on .env files, credentials, private keys, and keystores.
+//! Blocks Bash commands that redirect to or `rm` secret files.
+//! Safe templates (.env.example, .env.test) are always allowed.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 
 /// Safe template suffixes that are always allowed.
@@ -156,6 +162,7 @@ fn bash_targets_env_file(command: &str) -> bool {
     false
 }
 
+/// Blocks writing, editing, or deleting secret files via Write, Edit, or Bash.
 pub struct SecretWritesGuard;
 
 impl Check for SecretWritesGuard {

@@ -1,3 +1,8 @@
+//! Block inclusive terminology violations in written content.
+//!
+//! Detects prohibited terms and suggests neutral alternatives.
+//! Case-insensitive with word-boundary matching to avoid false positives.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::RegexSet;
 use std::sync::LazyLock;
@@ -62,6 +67,7 @@ fn is_excluded_path(path: &str) -> bool {
         || path.contains(".claude/rules/")
 }
 
+/// Blocks content containing prohibited terminology and suggests alternatives.
 pub struct TerminologyGuard;
 
 impl Check for TerminologyGuard {

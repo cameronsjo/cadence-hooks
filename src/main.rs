@@ -1,3 +1,9 @@
+//! CLI entry point for compiled Claude Code hooks.
+//!
+//! Dispatches to per-crate check implementations via `clap` subcommands.
+//! Each subcommand reads JSON from stdin (the hook protocol) and exits with
+//! 0 (allow), 1 (warn), or 2 (block).
+
 use clap::{Parser, Subcommand};
 use claude_hooks_core::run_check_from_stdin;
 

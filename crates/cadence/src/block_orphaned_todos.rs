@@ -1,3 +1,8 @@
+//! Block code markers (TODO, FIXME, HACK, etc.) that lack a GitHub issue reference.
+//!
+//! Enforces the format `MARKER(#issue): description` so every tracked item
+//! has a corresponding issue for discoverability and lifecycle management.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -52,6 +57,7 @@ pub fn find_orphaned(content: &str) -> Vec<(usize, String)> {
     orphans
 }
 
+/// Blocks writes containing orphaned code markers without issue references.
 pub struct OrphanedTodoGuard;
 
 impl Check for OrphanedTodoGuard {

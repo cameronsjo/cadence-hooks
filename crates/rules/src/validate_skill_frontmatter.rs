@@ -1,3 +1,8 @@
+//! Validate YAML frontmatter in skill and command markdown files.
+//!
+//! Checks that `SKILL.md` and command `.md` files have valid frontmatter
+//! with required fields, kebab-case names, and no unknown keys.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -67,6 +72,7 @@ fn skill_dir_name(path: &str) -> Option<&str> {
     parent.rsplit('/').next()
 }
 
+/// Validates YAML frontmatter in skill and command markdown files.
 pub struct ValidateSkillFrontmatter;
 
 impl Check for ValidateSkillFrontmatter {

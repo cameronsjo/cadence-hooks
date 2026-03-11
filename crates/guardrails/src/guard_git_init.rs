@@ -1,5 +1,11 @@
+//! Detect `git init` and prompt for project scaffolding.
+//!
+//! When a new repository is initialised, this check reminds the user to run
+//! `/a-star-is-born` so the repo starts with standard project files.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 
+/// Warns when `git init` is detected so the user can scaffold project standards.
 pub struct GuardGitInit;
 
 impl Check for GuardGitInit {
