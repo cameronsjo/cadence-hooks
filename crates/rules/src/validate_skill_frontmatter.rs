@@ -89,9 +89,7 @@ impl Check for ValidateSkillFrontmatter {
         };
 
         let Some(fields) = extract_frontmatter(content) else {
-            return CheckResult::block(format!(
-                "Frontmatter validation failed: file missing YAML frontmatter (must start with ---)"
-            ));
+            return CheckResult::block("Frontmatter validation failed: file missing YAML frontmatter (must start with ---)".to_string());
         };
 
         let mut errors = Vec::new();
@@ -124,13 +122,12 @@ impl Check for ValidateSkillFrontmatter {
                     }
 
                     // Check name matches directory
-                    if let Some(dir_name) = skill_dir_name(path) {
-                        if name_value != dir_name {
+                    if let Some(dir_name) = skill_dir_name(path)
+                        && name_value != dir_name {
                             errors.push(format!(
                                 "name '{name_value}' must match directory '{dir_name}'"
                             ));
                         }
-                    }
                 }
             }
             FileType::Command => {
@@ -435,8 +432,9 @@ mod tests {
     }
 
     #[test]
-    fn run_edit_tool_not_checked() {
-        // Only Write is checked, not Edit
+    fn run_edit_tool_also_validated() {
+        // Edit tool is also validated — the guard checks file_path and content
+        // regardless of tool_name
         let input = HookInput {
             tool_name: Some("Edit".into()),
             tool_input: Some(claude_hooks_core::ToolInput {
@@ -450,8 +448,6 @@ mod tests {
             cwd: None,
         };
         let result = ValidateSkillFrontmatter.run(&input);
-        // The check uses input.content() which falls through to new_string
-        // Since content is Some, it will be used but the file_path is checked
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 

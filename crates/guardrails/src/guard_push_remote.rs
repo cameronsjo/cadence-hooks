@@ -19,8 +19,8 @@ fn repo_from_url(url: &str) -> Option<String> {
     // Extract the path portion (owner/repo.git) from the URL
     let path = if let Some(after_scheme) = trimmed.split("://").nth(1) {
         // Has scheme (https://, ssh://) — skip host, take path after first /
-        after_scheme.splitn(2, '/').nth(1)?
-    } else if let Some(after_colon) = trimmed.splitn(2, ':').nth(1) {
+        after_scheme.split_once('/')?.1
+    } else if let Some(after_colon) = trimmed.split_once(':').map(|x| x.1) {
         // SCP-style: git@host:owner/repo.git — path is after the colon
         // Guard: if it starts with / it's a port or absolute path, not SCP
         if after_colon.starts_with('/') {

@@ -128,10 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn memory_md_exactly_at_hard_limit_allowed() {
+    fn memory_md_exactly_at_hard_limit_warns() {
         let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 200);
         let result = MemoryGuard.run(&input);
-        // 200 lines is AT the limit, not over
+        // 200 >= MEMORY_SOFT_LIMIT (180), so warns
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
     }
 
@@ -206,29 +206,10 @@ mod tests {
     }
 
     #[test]
-    fn memory_md_at_exact_boundary() {
-        // 200 lines is > soft limit (180), so it warns
-        // But is NOT > hard limit (200), so no block
-        let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 200);
-        let result = MemoryGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Warn);
-    }
-
-    #[test]
     fn topic_file_under_limit_allowed() {
         let input = make_input(
             "/home/user/.claude/projects/foo/memory/patterns.md",
             100,
-        );
-        let result = MemoryGuard.run(&input);
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
-    }
-
-    #[test]
-    fn topic_file_exactly_at_limit_allowed() {
-        let input = make_input(
-            "/home/user/.claude/projects/foo/memory/patterns.md",
-            300,
         );
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);

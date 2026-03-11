@@ -53,17 +53,19 @@ fn is_blocked(filename: &str, path: &str) -> bool {
         return true;
     }
 
-    if let Some(ext) = lower.rsplit('.').next() {
-        if BLOCKED_EXTENSIONS.contains(&ext) {
+    if let Some(ext) = lower.rsplit('.').next()
+        && BLOCKED_EXTENSIONS.contains(&ext) {
             return true;
         }
-    }
 
     if lower.starts_with("service-account") && lower.ends_with(".json") {
         return true;
     }
 
-    BLOCKED_PATH_FRAGMENTS.iter().any(|frag| path.contains(frag))
+    let lower_path = path.to_lowercase();
+    BLOCKED_PATH_FRAGMENTS
+        .iter()
+        .any(|frag| lower_path.contains(frag))
 }
 
 fn is_ambiguous(filename: &str) -> bool {
@@ -92,14 +94,13 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
         }
 
         // Block: source .env
-        if lower.contains("source") || lower.contains(". ") {
-            if !SAFE_SUFFIXES.iter().any(|s| lower.contains(s)) {
+        if (lower.contains("source") || lower.contains(". "))
+            && !SAFE_SUFFIXES.iter().any(|s| lower.contains(s)) {
                 return Some(CheckResult::block(
                     "🚫 BLOCKED: Command would source .env file, exposing secrets. \
                      Secrets are available via direnv — run programs directly."
                 ));
             }
-        }
     }
 
     // Warn: env dump commands (match as standalone commands, not substrings)

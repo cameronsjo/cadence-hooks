@@ -65,11 +65,10 @@ impl Check for TerminologyGuard {
             return CheckResult::allow();
         };
 
-        if let Some(path) = input.file_path() {
-            if is_excluded_path(path) {
+        if let Some(path) = input.file_path()
+            && is_excluded_path(path) {
                 return CheckResult::allow();
             }
-        }
 
         let violations = check_terminology(content);
         if violations.is_empty() {
@@ -161,11 +160,10 @@ mod tests {
     }
 
     #[test]
-    fn detects_plural_form() {
-        // "whitelists" — word boundary \b matches at s transition
+    fn plural_form_not_detected() {
+        // "whitelists" — word boundary \b requires boundary after "t" but "s"
+        // continues the word, so the plural form is NOT matched
         let found = check_terminology(&format!("{}s", VIOLATIONS[0].0));
-        // \b won't match mid-word, so "whitelists" should NOT match "whitelist"
-        // because \b requires boundary after "t" but "s" continues the word
         assert!(found.is_empty());
     }
 

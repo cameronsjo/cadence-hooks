@@ -55,17 +55,19 @@ fn is_blocked(filename: &str, path: &str) -> bool {
         return true;
     }
 
-    if let Some(ext) = lower.rsplit('.').next() {
-        if BLOCKED_EXTENSIONS.contains(&ext) {
+    if let Some(ext) = lower.rsplit('.').next()
+        && BLOCKED_EXTENSIONS.contains(&ext) {
             return true;
         }
-    }
 
     if lower.starts_with("service-account") && lower.ends_with(".json") {
         return true;
     }
 
-    BLOCKED_PATH_FRAGMENTS.iter().any(|frag| path.contains(frag))
+    let lower_path = path.to_lowercase();
+    BLOCKED_PATH_FRAGMENTS
+        .iter()
+        .any(|frag| lower_path.contains(frag))
 }
 
 /// Check if a filename is ambiguous (warn, not block).
@@ -92,8 +94,12 @@ fn bash_targets_env_file(command: &str) -> bool {
         return false;
     }
 
-    // Redirect or rm targeting .env
-    lower.contains("> .env") || lower.contains(">> .env") || lower.contains("rm ")
+    // Redirect or rm targeting .env (with or without space before .env)
+    lower.contains(">.env")
+        || lower.contains("> .env")
+        || lower.contains(">>.env")
+        || lower.contains(">> .env")
+        || lower.contains("rm ")
 }
 
 pub struct SecretWritesGuard;
@@ -546,6 +552,16 @@ mod tests {
     #[test]
     fn bash_env_template_redirect_allowed() {
         assert!(!bash_targets_env_file("echo KEY=val > .env.example"));
+    }
+
+    #[test]
+    fn bash_redirect_no_space_blocked() {
+        assert!(bash_targets_env_file("echo KEY=val>.env"));
+    }
+
+    #[test]
+    fn bash_append_no_space_blocked() {
+        assert!(bash_targets_env_file("echo KEY=val>>.env"));
     }
 
     #[test]

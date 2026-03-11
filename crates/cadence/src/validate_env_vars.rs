@@ -137,10 +137,28 @@ mod tests {
     }
 
     #[test]
-    fn no_path_allowed() {
+    fn no_tool_input_allowed() {
         let input = HookInput {
             tool_name: Some("Write".into()),
             tool_input: None,
+            cwd: None,
+        };
+        let result = EnvVarGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_path_allowed() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: None,
+                content: Some("process.env.DEBUG".into()),
+                new_string: None,
+                old_string: None,
+            }),
             cwd: None,
         };
         let result = EnvVarGuard.run(&input);

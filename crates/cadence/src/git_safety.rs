@@ -19,6 +19,8 @@ const BLOCKED_COMMANDS: &[&str] = &[
     "git gc --prune=now",
     "git branch -d main",
     "git branch -d master",
+    "git branch --delete main",
+    "git branch --delete master",
 ];
 
 /// Regex-style patterns for blocked commands (rebase main/master).
@@ -53,11 +55,11 @@ impl Check for GitSafetyGuard {
             return CheckResult::allow();
         };
 
-        if !command.contains("git") {
+        let lower = command.to_lowercase();
+
+        if !lower.contains("git") {
             return CheckResult::allow();
         }
-
-        let lower = command.to_lowercase();
 
         // Check absolute blocks first
         for blocked in BLOCKED_COMMANDS {
@@ -316,11 +318,10 @@ mod tests {
     }
 
     #[test]
-    fn all_caps_git_bypasses_early_check() {
-        // "GIT" (all caps) doesn't contain lowercase "git", so the early-exit
-        // `!command.contains("git")` returns Allow before lowercasing happens
+    fn case_insensitive_force_push_blocked() {
+        // Early exit now lowercases before checking for "git"
         let result = GitSafetyGuard.run(&make_bash_input("GIT PUSH --FORCE ORIGIN MAIN"));
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 
     #[test]
@@ -353,6 +354,18 @@ mod tests {
     #[test]
     fn branch_delete_master_uppercase_d_blocked() {
         let result = GitSafetyGuard.run(&make_bash_input("git branch -D master"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn branch_delete_long_form_main_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git branch --delete main"));
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn branch_delete_long_form_master_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git branch --delete master"));
         assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 

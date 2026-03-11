@@ -53,7 +53,7 @@ impl Check for CheckIdleReturn {
             if let Ok(last_ts) = contents.trim().parse::<u64>() {
                 let gap = now.saturating_sub(last_ts);
 
-                if gap >= IDLE_THRESHOLD_SECS && gap < NEW_SESSION_THRESHOLD_SECS {
+                if (IDLE_THRESHOLD_SECS..NEW_SESSION_THRESHOLD_SECS).contains(&gap) {
                     let mins = gap / 60;
                     result = CheckResult::warn(format!(
                         "It's been {mins}m since your last edit. Before continuing: \

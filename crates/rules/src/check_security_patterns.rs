@@ -70,13 +70,12 @@ impl Check for SecurityPatternScanner {
                 continue;
             }
 
-            if let Ok(re) = Regex::new(sp.pattern) {
-                if let Some(m) = re.find(&content) {
+            if let Ok(re) = Regex::new(sp.pattern)
+                && let Some(m) = re.find(&content) {
                     // Find line number
                     let line_num = content[..m.start()].lines().count() + 1;
                     warnings.push(format!("  L{line_num}: {}", sp.message));
                 }
-            }
         }
 
         if warnings.is_empty() {

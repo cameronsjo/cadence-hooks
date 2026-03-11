@@ -25,11 +25,10 @@ static REFERENCED_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Check if a file path is exempt from marker checking.
 fn is_exempt(path: &str) -> bool {
-    if let Some(ext) = path.rsplit('.').next() {
-        if EXEMPT_EXTENSIONS.contains(&ext) {
+    if let Some(ext) = path.rsplit('.').next()
+        && EXEMPT_EXTENSIONS.contains(&ext) {
             return true;
         }
-    }
 
     let normalized = path.replace('\\', "/");
     EXEMPT_PATHS.iter().any(|prefix| {
@@ -62,11 +61,10 @@ impl Check for OrphanedTodoGuard {
             return CheckResult::allow();
         };
 
-        if let Some(path) = input.file_path() {
-            if is_exempt(path) {
+        if let Some(path) = input.file_path()
+            && is_exempt(path) {
                 return CheckResult::allow();
             }
-        }
 
         let orphans = find_orphaned(content);
         if orphans.is_empty() {

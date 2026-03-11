@@ -6,11 +6,8 @@ fn check_rm_in_vault(command: &str, cwd: &str, vault: &str) -> CheckResult {
         return CheckResult::allow();
     }
 
-    let vault_prefix = if vault.ends_with('/') {
-        vault.to_string()
-    } else {
-        format!("{vault}/")
-    };
+    let vault = vault.trim_end_matches('/');
+    let vault_prefix = format!("{vault}/");
 
     let mut in_vault = cwd == vault || cwd.starts_with(&vault_prefix);
 
@@ -157,12 +154,10 @@ mod tests {
     }
 
     #[test]
-    fn vault_exact_match_with_trailing_slash_edge_case() {
-        // When vault is "/vault/" and cwd is "/vault", cwd != vault ("/vault" != "/vault/")
-        // and cwd.starts_with("/vault/") is false because "/vault" doesn't start with "/vault/"
-        // This is a known edge case — vault env var should not have trailing slash
+    fn vault_trailing_slash_normalized() {
+        // Trailing slash on vault is stripped before comparison
         let result = check_rm_in_vault("rm note.md", "/vault", "/vault/");
-        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Block);
     }
 
     #[test]

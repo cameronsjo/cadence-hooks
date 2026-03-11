@@ -104,11 +104,10 @@ enum RepoResolution {
 
 fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String]) -> RepoResolution {
     // 1. Explicit -R / --repo flag
-    if let Some(caps) = REPO_FLAG.captures(command) {
-        if let Some(repo) = caps.get(2) {
+    if let Some(caps) = REPO_FLAG.captures(command)
+        && let Some(repo) = caps.get(2) {
             return RepoResolution::Resolved(repo.as_str().to_string());
         }
-    }
 
     // 2. gh repo create <name>
     if REPO_CREATE.is_match(command) {
@@ -124,11 +123,10 @@ fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String])
     }
 
     // 3. gh api repos/OWNER/REPO
-    if let Some(caps) = API_REPOS.captures(command) {
-        if let Some(repo) = caps.get(1) {
+    if let Some(caps) = API_REPOS.captures(command)
+        && let Some(repo) = caps.get(1) {
             return RepoResolution::Resolved(repo.as_str().to_string());
         }
-    }
 
     // 4. Git remotes (with fork detection)
     if let Some(upstream_url) = git_cmd(work_dir, &["remote", "get-url", "upstream"]) {
@@ -304,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn pr_comment_is_write() {
+    fn issue_comment_is_write() {
         assert!(is_write_command("gh issue comment 123 --body 'hello'"));
     }
 
@@ -331,11 +329,6 @@ mod tests {
     #[test]
     fn api_with_input_is_write() {
         assert!(is_write_command("gh api repos/foo/bar --input data.json"));
-    }
-
-    #[test]
-    fn pr_list_is_not_write_2() {
-        assert!(!is_write_command("gh pr list --state open"));
     }
 
     #[test]
