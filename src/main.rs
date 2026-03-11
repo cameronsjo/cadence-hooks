@@ -1,3 +1,9 @@
+//! CLI entry point for compiled Claude Code hooks.
+//!
+//! Dispatches to per-crate check implementations via `clap` subcommands.
+//! Each subcommand reads JSON from stdin (the hook protocol) and exits with
+//! 0 (allow), 1 (warn), or 2 (block).
+
 use clap::{Parser, Subcommand};
 use claude_hooks_core::run_check_from_stdin;
 
@@ -95,9 +101,9 @@ fn main() {
             CadenceCommands::PreventSecretLeaks => {
                 run_check_from_stdin(&claude_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard)
             }
-            CadenceCommands::PreventSecretWrites => {
-                run_check_from_stdin(&claude_hooks_cadence::prevent_secret_writes::SecretWritesGuard)
-            }
+            CadenceCommands::PreventSecretWrites => run_check_from_stdin(
+                &claude_hooks_cadence::prevent_secret_writes::SecretWritesGuard,
+            ),
             CadenceCommands::MemoryGuard => {
                 run_check_from_stdin(&claude_hooks_cadence::memory_guard::MemoryGuard)
             }
@@ -105,9 +111,7 @@ fn main() {
                 run_check_from_stdin(&claude_hooks_cadence::git_safety::GitSafetyGuard)
             }
             CadenceCommands::LineEndings => {
-                run_check_from_stdin(
-                    &claude_hooks_cadence::validate_line_endings::LineEndingsGuard,
-                )
+                run_check_from_stdin(&claude_hooks_cadence::validate_line_endings::LineEndingsGuard)
             }
             CadenceCommands::EnvVars => {
                 run_check_from_stdin(&claude_hooks_cadence::validate_env_vars::EnvVarGuard)
@@ -121,14 +125,10 @@ fn main() {
         },
         Commands::Guardrails(cmd) => match cmd {
             GuardrailsCommands::GuardPushRemote => {
-                run_check_from_stdin(
-                    &claude_hooks_guardrails::guard_push_remote::PushRemoteGuard,
-                )
+                run_check_from_stdin(&claude_hooks_guardrails::guard_push_remote::PushRemoteGuard)
             }
             GuardrailsCommands::GuardGhDangerous => {
-                run_check_from_stdin(
-                    &claude_hooks_guardrails::guard_gh_dangerous::GhDangerousGuard,
-                )
+                run_check_from_stdin(&claude_hooks_guardrails::guard_gh_dangerous::GhDangerousGuard)
             }
             GuardrailsCommands::GuardGhWrite => {
                 run_check_from_stdin(&claude_hooks_guardrails::guard_gh_write::GhWriteGuard)
@@ -140,22 +140,16 @@ fn main() {
                 run_check_from_stdin(&claude_hooks_guardrails::warn_main_branch::WarnMainBranch)
             }
             GuardrailsCommands::CheckIdleReturn => {
-                run_check_from_stdin(
-                    &claude_hooks_guardrails::check_idle_return::CheckIdleReturn,
-                )
+                run_check_from_stdin(&claude_hooks_guardrails::check_idle_return::CheckIdleReturn)
             }
         },
         Commands::Rules(cmd) => match cmd {
-            RulesCommands::ValidateFrontmatter => {
-                run_check_from_stdin(
-                    &claude_hooks_rules::validate_skill_frontmatter::ValidateSkillFrontmatter,
-                )
-            }
-            RulesCommands::SecurityPatterns => {
-                run_check_from_stdin(
-                    &claude_hooks_rules::check_security_patterns::SecurityPatternScanner,
-                )
-            }
+            RulesCommands::ValidateFrontmatter => run_check_from_stdin(
+                &claude_hooks_rules::validate_skill_frontmatter::ValidateSkillFrontmatter,
+            ),
+            RulesCommands::SecurityPatterns => run_check_from_stdin(
+                &claude_hooks_rules::check_security_patterns::SecurityPatternScanner,
+            ),
         },
         Commands::Obsidian(cmd) => match cmd {
             ObsidianCommands::TrashGuard => {

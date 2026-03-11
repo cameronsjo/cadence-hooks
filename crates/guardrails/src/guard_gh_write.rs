@@ -1,3 +1,9 @@
+//! Guard against unintended `gh` write operations.
+//!
+//! Detects `gh` sub-commands that mutate GitHub state (create, merge, close,
+//! comment, edit, delete, etc.) and verifies the target repository belongs to
+//! an allowed owner list. Also blocks looped writes and cross-repo mutations.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::process::Command;
@@ -17,8 +23,7 @@ static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*\s(-f\s|--field\s|-F\s|--raw-field\s)")
-        .expect("pattern should compile")
+    Regex::new(r"gh\s+api.*\s(-f\s|--field\s|-F\s|--raw-field\s)").expect("pattern should compile")
 });
 
 static API_INPUT_FLAG: LazyLock<Regex> =
@@ -28,16 +33,14 @@ static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bfor\s+\w+\s+in\b|\bwhile\b.*;\s*do\b").expect("pattern should compile")
 });
 
-static REPO_FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(-R|--repo)\s+([^ ]+)").expect("pattern should compile")
-});
+static REPO_FLAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(-R|--repo)\s+([^ ]+)").expect("pattern should compile"));
 
 static REPO_CREATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+repo\s+create\b").expect("pattern should compile"));
 
-static API_REPOS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile")
-});
+static API_REPOS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
 
 fn is_write_command(command: &str) -> bool {
     WRITE_ACTIONS.is_match(command)
@@ -54,13 +57,17 @@ fn strip_quotes(s: &str) -> String {
             '"' => {
                 while let Some(&nc) = chars.peek() {
                     chars.next();
-                    if nc == '"' { break; }
+                    if nc == '"' {
+                        break;
+                    }
                 }
             }
             '\'' => {
                 while let Some(&nc) = chars.peek() {
                     chars.next();
-                    if nc == '\'' { break; }
+                    if nc == '\'' {
+                        break;
+                    }
                 }
             }
             _ => result.push(c),
@@ -69,24 +76,44 @@ fn strip_quotes(s: &str) -> String {
     result
 }
 
+/// Extract owner/repo from any git remote URL format.
+///
+/// Handles:
+/// - `https://github.com/owner/repo.git`
+/// - `ssh://git@github.com/owner/repo.git`
+/// - `git@github.com:owner/repo.git` (SCP-style)
 fn repo_from_url(url: &str) -> String {
-    url.trim()
-        .split("://")
-        .last()
-        .unwrap_or(url)
-        .splitn(2, '/')
-        .last()
-        .unwrap_or(url)
-        .trim_end_matches(".git")
-        .splitn(3, '/')
-        .take(2)
-        .collect::<Vec<&str>>()
-        .join("/")
+    let trimmed = url.trim();
+
+    let path = if let Some(after_scheme) = trimmed.split("://").nth(1) {
+        // Has scheme (https://, ssh://) — skip host, take path after first /
+        match after_scheme.split_once('/') {
+            Some((_, rest)) => rest,
+            None => return String::new(),
+        }
+    } else if let Some((_, after_colon)) = trimmed.split_once(':') {
+        // SCP-style: git@host:owner/repo.git
+        if after_colon.starts_with('/') {
+            return String::new();
+        }
+        after_colon
+    } else {
+        return String::new();
+    };
+
+    let path = path.trim_end_matches(".git");
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        String::new()
+    }
 }
 
 fn git_cmd(work_dir: &str, args: &[&str]) -> Option<String> {
     Command::new("git")
-        .arg("-C").arg(work_dir)
+        .arg("-C")
+        .arg(work_dir)
         .args(args)
         .output()
         .ok()
@@ -104,10 +131,10 @@ enum RepoResolution {
 
 fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String]) -> RepoResolution {
     // 1. Explicit -R / --repo flag
-    if let Some(caps) = REPO_FLAG.captures(command) {
-        if let Some(repo) = caps.get(2) {
-            return RepoResolution::Resolved(repo.as_str().to_string());
-        }
+    if let Some(caps) = REPO_FLAG.captures(command)
+        && let Some(repo) = caps.get(2)
+    {
+        return RepoResolution::Resolved(repo.as_str().to_string());
     }
 
     // 2. gh repo create <name>
@@ -124,10 +151,10 @@ fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String])
     }
 
     // 3. gh api repos/OWNER/REPO
-    if let Some(caps) = API_REPOS.captures(command) {
-        if let Some(repo) = caps.get(1) {
-            return RepoResolution::Resolved(repo.as_str().to_string());
-        }
+    if let Some(caps) = API_REPOS.captures(command)
+        && let Some(repo) = caps.get(1)
+    {
+        return RepoResolution::Resolved(repo.as_str().to_string());
     }
 
     // 4. Git remotes (with fork detection)
@@ -154,6 +181,7 @@ fn is_allowed(repo: &str, allowed_owners: &[String], allowed_repos: &[String]) -
     allowed_owners.iter().any(|a| a == owner)
 }
 
+/// Guards against unintended `gh` CLI write operations on unauthorized repositories.
 pub struct GhWriteGuard;
 
 impl Check for GhWriteGuard {
@@ -273,5 +301,319 @@ mod tests {
         let caps = REPO_FLAG.captures("gh pr create -R cameronsjo/test --title hi");
         assert!(caps.is_some());
         assert_eq!(caps.unwrap().get(2).unwrap().as_str(), "cameronsjo/test");
+    }
+
+    #[test]
+    fn repo_flag_long_form() {
+        let caps = REPO_FLAG.captures("gh issue create --repo cameronsjo/test --title hi");
+        assert!(caps.is_some());
+        assert_eq!(caps.unwrap().get(2).unwrap().as_str(), "cameronsjo/test");
+    }
+
+    // Write detection patterns
+    #[test]
+    fn issue_create_is_write() {
+        assert!(is_write_command("gh issue create --title test"));
+    }
+
+    #[test]
+    fn release_create_is_write() {
+        assert!(is_write_command("gh release create v1.0.0"));
+    }
+
+    #[test]
+    fn pr_merge_is_write() {
+        assert!(is_write_command("gh pr merge 123"));
+    }
+
+    #[test]
+    fn pr_close_is_write() {
+        assert!(is_write_command("gh pr close 123"));
+    }
+
+    #[test]
+    fn issue_comment_is_write() {
+        assert!(is_write_command("gh issue comment 123 --body 'hello'"));
+    }
+
+    #[test]
+    fn repo_fork_is_write() {
+        assert!(is_write_command("gh repo fork owner/repo"));
+    }
+
+    #[test]
+    fn api_put_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar -X PUT"));
+    }
+
+    #[test]
+    fn api_delete_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar --method DELETE"));
+    }
+
+    #[test]
+    fn api_with_field_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar -f title=test"));
+    }
+
+    #[test]
+    fn api_with_input_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar --input data.json"));
+    }
+
+    #[test]
+    fn issue_list_is_not_write() {
+        assert!(!is_write_command("gh issue list"));
+    }
+
+    #[test]
+    fn pr_view_is_not_write() {
+        assert!(!is_write_command("gh pr view 123"));
+    }
+
+    #[test]
+    fn api_get_is_not_write() {
+        assert!(!is_write_command("gh api repos/foo/bar"));
+    }
+
+    // is_allowed
+    #[test]
+    fn is_allowed_by_owner() {
+        assert!(is_allowed(
+            "cameronsjo/repo",
+            &["cameronsjo".to_string()],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_allowed_by_repo() {
+        assert!(is_allowed("other/repo", &[], &["other/repo".to_string()]));
+    }
+
+    #[test]
+    fn is_not_allowed_unknown() {
+        assert!(!is_allowed(
+            "stranger/repo",
+            &["cameronsjo".to_string()],
+            &[]
+        ));
+    }
+
+    // strip_quotes
+    #[test]
+    fn strip_quotes_preserves_unquoted() {
+        assert_eq!(strip_quotes("gh pr create"), "gh pr create");
+    }
+
+    // repo_from_url
+    #[test]
+    fn repo_from_https_url() {
+        assert_eq!(
+            repo_from_url("https://github.com/cameronsjo/repo.git"),
+            "cameronsjo/repo"
+        );
+    }
+
+    #[test]
+    fn repo_from_https_url_no_git() {
+        assert_eq!(
+            repo_from_url("https://github.com/cameronsjo/repo"),
+            "cameronsjo/repo"
+        );
+    }
+
+    // API repos pattern
+    #[test]
+    fn api_repos_pattern_matches() {
+        let caps = API_REPOS.captures("gh api repos/cameronsjo/test/pulls");
+        assert!(caps.is_some());
+        assert_eq!(caps.unwrap().get(1).unwrap().as_str(), "cameronsjo/test");
+    }
+
+    // --- Unhappy path: edge cases ---
+
+    #[test]
+    fn loop_pattern_detects_for_loop() {
+        assert!(LOOP_PATTERN.is_match("for repo in list; do gh pr create; done"));
+    }
+
+    #[test]
+    fn loop_pattern_detects_while_loop() {
+        assert!(LOOP_PATTERN.is_match("while true; do gh pr merge; done"));
+    }
+
+    #[test]
+    fn loop_pattern_no_match_normal() {
+        assert!(!LOOP_PATTERN.is_match("gh pr create --title test"));
+    }
+
+    #[test]
+    fn workflow_run_is_write() {
+        assert!(is_write_command("gh workflow run deploy.yml"));
+    }
+
+    #[test]
+    fn workflow_enable_is_write() {
+        assert!(is_write_command("gh workflow enable deploy.yml"));
+    }
+
+    #[test]
+    fn workflow_disable_is_write() {
+        assert!(is_write_command("gh workflow disable deploy.yml"));
+    }
+
+    #[test]
+    fn label_create_is_write() {
+        assert!(is_write_command("gh label create bug"));
+    }
+
+    #[test]
+    fn gist_create_is_write() {
+        assert!(is_write_command("gh gist create file.txt"));
+    }
+
+    #[test]
+    fn issue_edit_is_write() {
+        assert!(is_write_command("gh issue edit 123 --title new"));
+    }
+
+    #[test]
+    fn pr_review_is_write() {
+        assert!(is_write_command("gh pr review 123 --approve"));
+    }
+
+    #[test]
+    fn pr_ready_is_write() {
+        assert!(is_write_command("gh pr ready 123"));
+    }
+
+    #[test]
+    fn issue_reopen_is_write() {
+        assert!(is_write_command("gh issue reopen 123"));
+    }
+
+    #[test]
+    fn issue_lock_is_write() {
+        assert!(is_write_command("gh issue lock 123"));
+    }
+
+    #[test]
+    fn repo_archive_is_write() {
+        assert!(is_write_command("gh repo archive owner/repo"));
+    }
+
+    #[test]
+    fn repo_rename_is_write() {
+        assert!(is_write_command("gh repo rename new-name"));
+    }
+
+    #[test]
+    fn release_delete_is_write() {
+        assert!(is_write_command("gh release delete v1.0.0"));
+    }
+
+    #[test]
+    fn api_patch_is_write() {
+        assert!(is_write_command(
+            "gh api repos/foo/bar -X PATCH -f title=new"
+        ));
+    }
+
+    #[test]
+    fn api_method_patch_is_write() {
+        assert!(is_write_command("gh api repos/foo/bar --method PATCH"));
+    }
+
+    #[test]
+    fn repo_view_is_not_write() {
+        assert!(!is_write_command("gh repo view owner/repo"));
+    }
+
+    #[test]
+    fn release_list_is_not_write() {
+        assert!(!is_write_command("gh release list"));
+    }
+
+    #[test]
+    fn is_allowed_empty_lists() {
+        assert!(!is_allowed("owner/repo", &[], &[]));
+    }
+
+    #[test]
+    fn is_allowed_exact_repo_match() {
+        assert!(is_allowed(
+            "external/specific-repo",
+            &[],
+            &["external/specific-repo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn is_allowed_owner_and_repo() {
+        // Both match — should still return true
+        assert!(is_allowed(
+            "cameronsjo/repo",
+            &["cameronsjo".to_string()],
+            &["cameronsjo/repo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn strip_quotes_mixed() {
+        assert_eq!(
+            strip_quotes("gh pr create --title 'test' --body \"desc\""),
+            "gh pr create --title  --body "
+        );
+    }
+
+    #[test]
+    fn repo_from_ssh_scp_url() {
+        assert_eq!(
+            repo_from_url("git@github.com:cameronsjo/repo.git"),
+            "cameronsjo/repo"
+        );
+    }
+
+    #[test]
+    fn repo_from_ssh_scheme_url() {
+        assert_eq!(
+            repo_from_url("ssh://git@github.com/cameronsjo/repo.git"),
+            "cameronsjo/repo"
+        );
+    }
+
+    #[test]
+    fn repo_from_malformed_url() {
+        assert_eq!(repo_from_url("not-a-url"), "");
+    }
+
+    #[test]
+    fn no_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = GhWriteGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn no_gh_in_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: Some("ls -la".into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = GhWriteGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
 }

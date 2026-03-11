@@ -1,3 +1,8 @@
+//! Warn about untracked files during git commit operations.
+//!
+//! Shells out to `git ls-files --others --exclude-standard` to detect
+//! files that might have been forgotten. Filters out build artifacts.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use std::process::Command;
 
@@ -6,6 +11,7 @@ const BUILD_ARTIFACT_EXTENSIONS: &[&str] = &[
     "log", "tmp", "cache", "pyc", "class", "o", "a", "so", "dylib",
 ];
 
+/// Warns when git commit runs with untracked files that may have been forgotten.
 pub struct WarnUntrackedFiles;
 
 impl Check for WarnUntrackedFiles {
@@ -24,10 +30,7 @@ impl Check for WarnUntrackedFiles {
         }
 
         // Get untracked files from git
-        let output = match Command::new("git")
-            .args(["status", "--porcelain"])
-            .output()
-        {
+        let output = match Command::new("git").args(["status", "--porcelain"]).output() {
             Ok(out) => out,
             Err(_) => return CheckResult::allow(),
         };

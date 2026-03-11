@@ -78,7 +78,9 @@ impl HookInput {
 
     /// The bash command, if this is a Bash tool invocation.
     pub fn command(&self) -> Option<&str> {
-        self.tool_input.as_ref().and_then(|ti| ti.command.as_deref())
+        self.tool_input
+            .as_ref()
+            .and_then(|ti| ti.command.as_deref())
     }
 
     /// The content being written (Write tool) or the replacement text (Edit tool).
@@ -152,5 +154,192 @@ pub fn run_check_from_stdin(check: &dyn Check) -> ! {
             eprintln!("claude-hooks: {e}");
             process::exit(0); // Fail open on parse errors
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Outcome ---
+
+    #[test]
+    fn outcome_codes() {
+        assert_eq!(Outcome::Allow.code(), 0);
+        assert_eq!(Outcome::Warn.code(), 1);
+        assert_eq!(Outcome::Block.code(), 2);
+    }
+
+    #[test]
+    fn outcome_merge_block_wins() {
+        assert_eq!(Outcome::Block.merge(Outcome::Allow), Outcome::Block);
+        assert_eq!(Outcome::Allow.merge(Outcome::Block), Outcome::Block);
+        assert_eq!(Outcome::Block.merge(Outcome::Warn), Outcome::Block);
+        assert_eq!(Outcome::Warn.merge(Outcome::Block), Outcome::Block);
+        assert_eq!(Outcome::Block.merge(Outcome::Block), Outcome::Block);
+    }
+
+    #[test]
+    fn outcome_merge_warn_over_allow() {
+        assert_eq!(Outcome::Warn.merge(Outcome::Allow), Outcome::Warn);
+        assert_eq!(Outcome::Allow.merge(Outcome::Warn), Outcome::Warn);
+        assert_eq!(Outcome::Warn.merge(Outcome::Warn), Outcome::Warn);
+    }
+
+    #[test]
+    fn outcome_merge_allow_only_when_both_allow() {
+        assert_eq!(Outcome::Allow.merge(Outcome::Allow), Outcome::Allow);
+    }
+
+    // --- HookInput accessors ---
+
+    fn make_input(
+        tool_name: Option<&str>,
+        file_path: Option<&str>,
+        path: Option<&str>,
+        command: Option<&str>,
+        content: Option<&str>,
+        new_string: Option<&str>,
+    ) -> HookInput {
+        HookInput {
+            tool_name: tool_name.map(String::from),
+            tool_input: Some(ToolInput {
+                file_path: file_path.map(String::from),
+                path: path.map(String::from),
+                command: command.map(String::from),
+                content: content.map(String::from),
+                new_string: new_string.map(String::from),
+                old_string: None,
+            }),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn file_path_prefers_file_path_over_path() {
+        let input = make_input(None, Some("/a.rs"), Some("/b.rs"), None, None, None);
+        assert_eq!(input.file_path(), Some("/a.rs"));
+    }
+
+    #[test]
+    fn file_path_falls_back_to_path() {
+        let input = make_input(None, None, Some("/b.rs"), None, None, None);
+        assert_eq!(input.file_path(), Some("/b.rs"));
+    }
+
+    #[test]
+    fn file_path_none_when_both_absent() {
+        let input = make_input(None, None, None, None, None, None);
+        assert_eq!(input.file_path(), None);
+    }
+
+    #[test]
+    fn file_path_none_when_no_tool_input() {
+        let input = HookInput {
+            tool_name: None,
+            tool_input: None,
+            cwd: None,
+        };
+        assert_eq!(input.file_path(), None);
+    }
+
+    #[test]
+    fn command_accessor() {
+        let input = make_input(None, None, None, Some("git push"), None, None);
+        assert_eq!(input.command(), Some("git push"));
+    }
+
+    #[test]
+    fn command_none_when_absent() {
+        let input = make_input(None, None, None, None, None, None);
+        assert_eq!(input.command(), None);
+    }
+
+    #[test]
+    fn content_prefers_content_over_new_string() {
+        let input = make_input(None, None, None, None, Some("content"), Some("new_string"));
+        assert_eq!(input.content(), Some("content"));
+    }
+
+    #[test]
+    fn content_falls_back_to_new_string() {
+        let input = make_input(None, None, None, None, None, Some("replacement"));
+        assert_eq!(input.content(), Some("replacement"));
+    }
+
+    #[test]
+    fn content_none_when_both_absent() {
+        let input = make_input(None, None, None, None, None, None);
+        assert_eq!(input.content(), None);
+    }
+
+    #[test]
+    fn tool_name_accessor() {
+        let input = make_input(Some("Bash"), None, None, None, None, None);
+        assert_eq!(input.tool_name(), Some("Bash"));
+    }
+
+    #[test]
+    fn tool_name_none_when_absent() {
+        let input = HookInput {
+            tool_name: None,
+            tool_input: None,
+            cwd: None,
+        };
+        assert_eq!(input.tool_name(), None);
+    }
+
+    // --- CheckResult constructors ---
+
+    #[test]
+    fn check_result_allow() {
+        let r = CheckResult::allow();
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(r.message.is_none());
+    }
+
+    #[test]
+    fn check_result_warn() {
+        let r = CheckResult::warn("caution");
+        assert_eq!(r.outcome, Outcome::Warn);
+        assert_eq!(r.message.as_deref(), Some("caution"));
+    }
+
+    #[test]
+    fn check_result_block() {
+        let r = CheckResult::block("stopped");
+        assert_eq!(r.outcome, Outcome::Block);
+        assert_eq!(r.message.as_deref(), Some("stopped"));
+    }
+
+    #[test]
+    fn check_result_accepts_string() {
+        let r = CheckResult::warn(String::from("owned"));
+        assert_eq!(r.message.as_deref(), Some("owned"));
+    }
+
+    // --- JSON deserialization ---
+
+    #[test]
+    fn deserialize_full_input() {
+        let json = r#"{"tool_name":"Read","tool_input":{"file_path":"/a.rs","command":null}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.tool_name(), Some("Read"));
+        assert_eq!(input.file_path(), Some("/a.rs"));
+    }
+
+    #[test]
+    fn deserialize_minimal_input() {
+        let json = r#"{}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.tool_name(), None);
+        assert_eq!(input.file_path(), None);
+    }
+
+    #[test]
+    fn deserialize_bash_input() {
+        let json = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.command(), Some("git status"));
     }
 }

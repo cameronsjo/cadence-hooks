@@ -1,3 +1,9 @@
+//! Validate `git push` targets against an owner allowlist.
+//!
+//! Resolves the push URL for the current branch (or explicit remote) and
+//! verifies the repository owner is in the configured allowlist. Also blocks
+//! looped pushes and force-push to `main`.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::process::Command;
@@ -19,8 +25,8 @@ fn repo_from_url(url: &str) -> Option<String> {
     // Extract the path portion (owner/repo.git) from the URL
     let path = if let Some(after_scheme) = trimmed.split("://").nth(1) {
         // Has scheme (https://, ssh://) — skip host, take path after first /
-        after_scheme.splitn(2, '/').nth(1)?
-    } else if let Some(after_colon) = trimmed.splitn(2, ':').nth(1) {
+        after_scheme.split_once('/')?.1
+    } else if let Some(after_colon) = trimmed.split_once(':').map(|x| x.1) {
         // SCP-style: git@host:owner/repo.git — path is after the colon
         // Guard: if it starts with / it's a port or absolute path, not SCP
         if after_colon.starts_with('/') {
@@ -110,10 +116,7 @@ fn parse_work_dir(command: &str, cwd: &str) -> String {
 
     let mut last_target: Option<String> = None;
     for caps in re.captures_iter(command) {
-        let target = caps
-            .get(1)
-            .or(caps.get(2))
-            .map(|m| m.as_str().to_string());
+        let target = caps.get(1).or(caps.get(2)).map(|m| m.as_str().to_string());
         if target.is_some() {
             last_target = target;
         }
@@ -156,6 +159,7 @@ fn extract_remote(command: &str, work_dir: &str) -> Option<String> {
     }
 }
 
+/// Validates `git push` targets against an allowed owner list.
 pub struct PushRemoteGuard;
 
 impl Check for PushRemoteGuard {
@@ -285,10 +289,7 @@ mod tests {
 
     #[test]
     fn parse_cd_target() {
-        assert_eq!(
-            parse_work_dir("cd /tmp && git push", "/home/user"),
-            "/tmp"
-        );
+        assert_eq!(parse_work_dir("cd /tmp && git push", "/home/user"), "/tmp");
     }
 
     #[test]
@@ -297,5 +298,224 @@ mod tests {
             parse_work_dir("git push origin main", "/home/user"),
             "/home/user"
         );
+    }
+
+    // Additional repo_from_url tests
+    #[test]
+    fn parse_https_no_git_suffix() {
+        assert_eq!(
+            repo_from_url("https://github.com/cameronsjo/cadence"),
+            Some("cameronsjo/cadence".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_malformed_url_returns_none() {
+        assert_eq!(repo_from_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn parse_ssh_scheme_url() {
+        assert_eq!(
+            repo_from_url("ssh://git@github.com/cameronsjo/repo.git"),
+            Some("cameronsjo/repo".to_string())
+        );
+    }
+
+    // check_owner tests
+    #[test]
+    fn owner_check_multiple_owners() {
+        assert!(check_owner(
+            "https://github.com/cameronsjo/repo.git",
+            &["other".to_string(), "cameronsjo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn owner_check_empty_list() {
+        assert!(!check_owner("https://github.com/cameronsjo/repo.git", &[]));
+    }
+
+    // strip_quotes tests
+    #[test]
+    fn strip_single_quotes() {
+        assert_eq!(
+            strip_quotes("echo 'hello world' && git push"),
+            "echo  && git push"
+        );
+    }
+
+    #[test]
+    fn strip_empty_string() {
+        assert_eq!(strip_quotes(""), "");
+    }
+
+    // parse_work_dir tests
+    #[test]
+    fn parse_relative_cd() {
+        assert_eq!(
+            parse_work_dir("cd subdir && git push", "/home/user"),
+            "/home/user/subdir"
+        );
+    }
+
+    #[test]
+    fn parse_tilde_cd() {
+        // ~ expansion depends on HOME env var
+        let result = parse_work_dir("cd ~/projects && git push", "/tmp");
+        assert!(result.contains("projects"));
+    }
+
+    #[test]
+    fn parse_multiple_cd_uses_last() {
+        assert_eq!(
+            parse_work_dir("cd /first && cd /second && git push", "/home/user"),
+            "/second"
+        );
+    }
+
+    #[test]
+    fn parse_cd_with_semicolons() {
+        assert_eq!(
+            parse_work_dir("cd /project; git push", "/home/user"),
+            "/project"
+        );
+    }
+
+    // LOOP_PATTERN tests
+    #[test]
+    fn loop_pattern_detects_for() {
+        assert!(LOOP_PATTERN.is_match("for repo in list; do git push; done"));
+    }
+
+    #[test]
+    fn loop_pattern_detects_while() {
+        assert!(LOOP_PATTERN.is_match("while true; do git push; done"));
+    }
+
+    #[test]
+    fn loop_pattern_no_match_normal() {
+        assert!(!LOOP_PATTERN.is_match("git push origin main"));
+    }
+
+    // --- Unhappy path: URL edge cases ---
+
+    #[test]
+    fn parse_url_with_port() {
+        // ssh://git@github.com:22/owner/repo.git
+        // Has ://, so splits on that → "git@github.com:22/owner/repo.git"
+        // Then splits on first / → "owner/repo.git" — port is part of host segment
+        // This actually parses correctly because the port stays with the host
+        assert_eq!(
+            repo_from_url("ssh://git@github.com:22/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_url_with_credentials() {
+        // https://token:x-oauth-basic@github.com/owner/repo.git
+        assert_eq!(
+            repo_from_url("https://token:x-oauth-basic@github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_empty_url() {
+        assert_eq!(repo_from_url(""), None);
+    }
+
+    #[test]
+    fn parse_whitespace_url() {
+        assert_eq!(repo_from_url("   "), None);
+    }
+
+    #[test]
+    fn parse_url_no_repo() {
+        // Only has owner, no repo
+        assert_eq!(repo_from_url("https://github.com/owner"), None);
+    }
+
+    #[test]
+    fn parse_url_trailing_slash() {
+        assert_eq!(
+            repo_from_url("https://github.com/owner/repo/"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_url_with_subpath() {
+        // URL with additional path segments
+        assert_eq!(
+            repo_from_url("https://github.com/owner/repo/tree/main"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_scp_with_slash_path_returns_none() {
+        // Colon followed by / is not SCP-style, it's likely a port
+        assert_eq!(repo_from_url("host:/absolute/path"), None);
+    }
+
+    #[test]
+    fn owner_check_case_sensitive() {
+        assert!(!check_owner(
+            "https://github.com/CameronSjo/repo.git",
+            &["cameronsjo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn strip_quotes_nested() {
+        assert_eq!(strip_quotes("echo 'it\"s' \"done\""), "echo  ");
+    }
+
+    #[test]
+    fn parse_cd_with_quoted_path() {
+        assert_eq!(
+            parse_work_dir("cd \"/path with spaces\" && git push", "/home"),
+            "/path with spaces"
+        );
+    }
+
+    #[test]
+    fn parse_cd_with_pipe() {
+        // cd before a pipe
+        assert_eq!(
+            parse_work_dir("cd /project || git push", "/home"),
+            "/project"
+        );
+    }
+
+    #[test]
+    fn no_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        let result = PushRemoteGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn non_push_command_allowed() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(claude_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: Some("git status".into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = PushRemoteGuard.run(&input);
+        assert_eq!(result.outcome, claude_hooks_core::Outcome::Allow);
     }
 }

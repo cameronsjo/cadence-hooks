@@ -1,9 +1,15 @@
+//! Warn when editing on the main branch without a feature branch.
+//!
+//! Fires once per session (tracked via a temp-file marker) to nudge the
+//! user toward creating a feature branch before making changes.
+
 use claude_hooks_core::{Check, CheckResult, HookInput};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Warns once per session when the current branch is `main` or `master`.
 pub struct WarnMainBranch;
 
 impl WarnMainBranch {
