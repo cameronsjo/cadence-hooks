@@ -36,8 +36,8 @@ impl Check for WarnBranchBase {
             ));
         }
 
-        // No explicit base — check current branch
-        let current = match current_branch() {
+        // No explicit base — check current branch in the hook's working directory
+        let current = match current_branch(input.cwd.as_deref()) {
             Some(b) => b,
             None => return CheckResult::allow(),
         };
@@ -77,16 +77,15 @@ fn is_branch_create(command: &str) -> bool {
 fn explicit_base(command: &str) -> Option<String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
-    // Find the -b or -c/--create flag, then the branch name is next, and base is after that
+    // Find the -b or -c/--create flag, then the branch name is next.
+    // After that, skip any flags (e.g. --track, -t) to find the base.
     for (i, token) in tokens.iter().enumerate() {
         if (*token == "-b" || *token == "-c" || *token == "--create")
             && i >= 1
             && (tokens[i - 1] == "checkout" || tokens[i - 1] == "switch")
         {
-            // tokens[i+1] = new branch name, tokens[i+2] = base (if present)
-            if i + 2 < tokens.len() {
-                let candidate = tokens[i + 2];
-                // Skip if it looks like a flag
+            // tokens[i+1] = new branch name; scan past flags (--track, -t) to find base
+            for candidate in tokens.iter().skip(i + 2) {
                 if !candidate.starts_with('-') {
                     return Some(candidate.to_string());
                 }
@@ -98,14 +97,18 @@ fn explicit_base(command: &str) -> Option<String> {
 }
 
 fn is_main_branch(name: &str) -> bool {
-    let name = name.strip_prefix("origin/").unwrap_or(name);
-    name == "main" || name == "master"
+    // Strip any remote prefix (origin/main, upstream/main, fork/master, etc.)
+    let leaf = name.rsplit_once('/').map_or(name, |(_, leaf)| leaf);
+    leaf == "main" || leaf == "master"
 }
 
-fn current_branch() -> Option<String> {
-    Command::new("git")
-        .args(["branch", "--show-current"])
-        .output()
+fn current_branch(cwd: Option<&str>) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["branch", "--show-current"]);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -199,6 +202,22 @@ mod tests {
         assert_eq!(explicit_base("git checkout -b feature --track"), None);
     }
 
+    #[test]
+    fn explicit_base_after_track_flag() {
+        assert_eq!(
+            explicit_base("git checkout -b feature --track origin/develop"),
+            Some("origin/develop".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_base_after_short_track_flag() {
+        assert_eq!(
+            explicit_base("git switch -c feature -t origin/main"),
+            Some("origin/main".to_string())
+        );
+    }
+
     // --- is_main_branch ---
 
     #[test]
@@ -219,6 +238,16 @@ mod tests {
     #[test]
     fn feature_is_not_main() {
         assert!(!is_main_branch("feature/cool-stuff"));
+    }
+
+    #[test]
+    fn upstream_main_is_main() {
+        assert!(is_main_branch("upstream/main"));
+    }
+
+    #[test]
+    fn fork_master_is_main() {
+        assert!(is_main_branch("fork/master"));
     }
 
     // --- Check::run ---
