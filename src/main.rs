@@ -6,6 +6,7 @@
 
 use cadence_hooks_core::run_check_from_stdin;
 use clap::{Parser, Subcommand};
+use std::process;
 
 #[derive(Parser)]
 #[command(name = "cadence-hooks", version, about = "Compiled Claude Code hooks")]
@@ -92,7 +93,39 @@ enum ObsidianCommands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // Clap errors (unknown subcommand, missing args, etc.) must NOT block
+            // operations. Exit code 2 from clap would be interpreted as "block" by
+            // the hook protocol. Instead, fail open with a warning so the user
+            // knows their cadence-hooks binary may be out of date.
+            let installed = env!("CARGO_PKG_VERSION");
+            match e.kind() {
+                // --help and --version are intentional exits, pass through as-is
+                clap::error::ErrorKind::DisplayHelp
+                | clap::error::ErrorKind::DisplayVersion => e.exit(),
+                _ => {
+                    eprintln!(
+                        "cadence-hooks v{installed}: unrecognized command or arguments.\n\
+                         \n\
+                         This usually means a plugin expects a newer version of cadence-hooks.\n\
+                         \n\
+                         To update:\n\
+                         \x20 cargo install --git https://github.com/cameronsjo/cadence-hooks.git\n\
+                         \n\
+                         Or download the latest release:\n\
+                         \x20 https://github.com/cameronsjo/cadence-hooks/releases/latest\n\
+                         \n\
+                         Underlying error: {e}"
+                    );
+                    // Exit 1 (warn) — fail open, show the message so the user
+                    // knows there may be a version mismatch, but don't block.
+                    process::exit(1);
+                }
+            }
+        }
+    };
 
     match cli.command {
         Commands::Cadence(cmd) => match cmd {
