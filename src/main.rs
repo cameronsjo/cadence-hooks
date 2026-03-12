@@ -102,10 +102,11 @@ fn main() {
             // knows their cadence-hooks binary may be out of date.
             let installed = env!("CARGO_PKG_VERSION");
             match e.kind() {
-                // --help and --version are intentional exits, pass through as-is
-                clap::error::ErrorKind::DisplayHelp
-                | clap::error::ErrorKind::DisplayVersion => e.exit(),
-                _ => {
+                // Unknown subcommand or argument — likely a version mismatch
+                // between the plugin and the installed binary. Warn (exit 1)
+                // instead of blocking so the operation can proceed.
+                clap::error::ErrorKind::InvalidSubcommand
+                | clap::error::ErrorKind::UnknownArgument => {
                     eprintln!(
                         "cadence-hooks v{installed}: unrecognized command or arguments.\n\
                          \n\
@@ -119,10 +120,11 @@ fn main() {
                          \n\
                          Underlying error: {e}"
                     );
-                    // Exit 1 (warn) — fail open, show the message so the user
-                    // knows there may be a version mismatch, but don't block.
                     process::exit(1);
                 }
+                // Everything else (--help, --version, other clap errors) uses
+                // clap's default behavior.
+                _ => e.exit(),
             }
         }
     };

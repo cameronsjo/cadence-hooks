@@ -1,5 +1,5 @@
 //! Integration tests verifying that unknown subcommands and arguments
-//! fail open (exit 0) instead of blocking (exit 2).
+//! fail open (exit 1, warn) instead of blocking (exit 2).
 //!
 //! This prevents version mismatches between the cadence-hooks binary and
 //! plugins from accidentally blocking legitimate operations.
