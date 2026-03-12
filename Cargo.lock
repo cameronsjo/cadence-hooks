@@ -75,7 +75,7 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
 name = "cadence-hooks"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cadence-hooks-cadence",
  "cadence-hooks-core",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-cadence"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cadence-hooks-core",
  "regex",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-guardrails"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cadence-hooks-core",
  "regex",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-obsidian"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cadence-hooks-core",
  "serde_json",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-rules"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cadence-hooks-core",
  "regex",
