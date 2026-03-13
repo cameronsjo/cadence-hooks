@@ -81,7 +81,7 @@ fn unknown_guardrails_subcommand_fails_open() {
 }
 
 #[test]
-fn stderr_includes_installed_version() {
+fn stderr_includes_version_and_release_url() {
     let output = cadence_hooks()
         .args(["cadence", "nonexistent-hook"])
         .output()
@@ -92,16 +92,6 @@ fn stderr_includes_installed_version() {
         stderr.contains("cadence-hooks v"),
         "should show installed version: {stderr}"
     );
-}
-
-#[test]
-fn stderr_includes_release_url() {
-    let output = cadence_hooks()
-        .args(["cadence", "nonexistent-hook"])
-        .output()
-        .expect("failed to execute binary");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("github.com/cameronsjo/cadence-hooks/releases"),
         "should include release URL: {stderr}"
