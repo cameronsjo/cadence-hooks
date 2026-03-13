@@ -49,6 +49,13 @@ fmt-check:
 ## Run all CI checks (fmt, clippy, test)
 ci: fmt-check clippy test
 
+## Release ────────────────────────────────────
+
+.PHONY: bump
+## Bump workspace version (usage: make bump VERSION=0.4.0)
+bump:
+	@scripts/bump-version.sh $(VERSION)
+
 ## Installation ────────────────────────────────
 
 .PHONY: install

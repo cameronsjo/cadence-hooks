@@ -1,8 +1,11 @@
-//! Integration tests verifying that unknown subcommands and arguments
-//! fail open (exit 1, warn) instead of blocking (exit 2).
+//! Integration tests verifying that deployment errors fail open (exit 1, warn)
+//! instead of blocking (exit 2).
 //!
-//! This prevents version mismatches between the cadence-hooks binary and
-//! plugins from accidentally blocking legitimate operations.
+//! Covers ADR 0008 failure modes:
+//! - Unknown subcommand/argument (clap interception) — tested below
+//! - Panic in check logic (panic handler) — exits 1 via set_hook in main();
+//!   not directly testable through CLI args without a synthetic panic path
+//! - Missing binary (exit 127) — handled by consuming plugins' shell guards
 
 use std::process::Command;
 
@@ -69,6 +72,12 @@ fn unknown_guardrails_subcommand_fails_open() {
         "unknown guardrails subcommand should exit 1 (warn), not block.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized command"),
+        "should mention unrecognized command: {stderr}"
+    );
 }
 
 #[test]
@@ -131,7 +140,31 @@ fn version_flag_still_works() {
 }
 
 #[test]
-fn valid_subcommand_still_works() {
+fn distant_name_subcommand_fails_open() {
+    // A name that is far from any existing subcommand — ensures clap doesn't
+    // treat it as a typo with a "did you mean?" suggestion that bypasses our
+    // InvalidSubcommand catch.
+    let output = cadence_hooks()
+        .args(["cadence", "zzz-future-hook"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "distant-name subcommand should exit 1 (warn), not block.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized command"),
+        "should mention unrecognized command: {stderr}"
+    );
+}
+
+#[test]
+fn valid_subcommand_with_empty_input_allows() {
     // A valid subcommand with valid JSON on stdin should work normally.
     // Send a minimal allow-case input to terminology.
     let output = cadence_hooks()

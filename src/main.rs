@@ -93,6 +93,23 @@ enum ObsidianCommands {
 }
 
 fn main() {
+    // Catch panics and exit 1 (warn) instead of the default exit 101.
+    // A panic means a bug in a check — it should not block the user's operation.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(msg) = info.payload().downcast_ref::<&str>() {
+            (*msg).to_string()
+        } else if let Some(msg) = info.payload().downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        eprintln!(
+            "cadence-hooks: internal error (panic). This hook will not block your operation.\n\
+             {payload}"
+        );
+        process::exit(1);
+    }));
+
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
@@ -102,9 +119,12 @@ fn main() {
             // knows their cadence-hooks binary may be out of date.
             let installed = env!("CARGO_PKG_VERSION");
             match e.kind() {
-                // Unknown subcommand or argument — likely a version mismatch
-                // between the plugin and the installed binary. Warn (exit 1)
-                // instead of blocking so the operation can proceed.
+                // InvalidSubcommand: entirely unknown subcommand name
+                //   (e.g., `cadence-hooks future-plugin some-hook`)
+                // UnknownArgument: known subcommand but with unrecognized flags/args
+                //   (e.g., `cadence-hooks cadence terminology --new-flag`)
+                // Both indicate a version mismatch between the plugin's hooks.json
+                // and the installed binary. Warn (exit 1) instead of blocking.
                 clap::error::ErrorKind::InvalidSubcommand
                 | clap::error::ErrorKind::UnknownArgument => {
                     eprintln!(
