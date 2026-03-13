@@ -149,7 +149,7 @@ fn valid_subcommand_still_works() {
         })
         .expect("failed to execute binary");
 
-    // Empty input => no tool_input => allow
+    // Empty JSON object => no tool_input => allow
     assert_eq!(
         output.status.code(),
         Some(0),
