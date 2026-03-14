@@ -82,4 +82,20 @@ mod tests {
         let result = WarnCronDatetime.run(&input);
         assert_eq!(result.outcome, Outcome::Allow);
     }
+
+    // --- edge case hardening ---
+
+    #[test]
+    fn empty_tool_name_allowed() {
+        let result = WarnCronDatetime.run(&make_input(""));
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn warn_message_mentions_date_rollover() {
+        let result = WarnCronDatetime.run(&make_input("CronCreate"));
+        let msg = result.message.unwrap();
+        assert!(msg.contains("date"));
+        assert!(msg.contains("rollover"));
+    }
 }

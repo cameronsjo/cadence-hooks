@@ -155,4 +155,25 @@ mod tests {
         assert!(!is_default_branch("main-backup"));
         assert!(!is_default_branch("hotfix/master-fix"));
     }
+
+    // --- edge case hardening ---
+
+    #[test]
+    fn release_branch_allows() {
+        let result = should_warn("release/1.0", false);
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn warn_message_contains_branch() {
+        let result = should_warn("master", false);
+        assert!(result.message.as_deref().unwrap().contains("master"));
+    }
+
+    #[test]
+    fn main_with_prefix_allows() {
+        // "fix/main-page" is not the main branch
+        let result = should_warn("fix/main-page", false);
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
 }

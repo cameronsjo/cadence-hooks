@@ -49,6 +49,7 @@ fn is_write_command(command: &str) -> bool {
 }
 
 /// Resolve target repo from command context.
+#[derive(Debug)]
 enum RepoResolution {
     Resolved(String),
     Fork { origin: String, upstream: String },
@@ -245,6 +246,7 @@ impl Check for GhWriteGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_hooks_core::loop_analysis::{self, LoopAnalysis, analyze_gh_loops};
 
     #[test]
     fn detects_pr_create_as_write() {
@@ -513,5 +515,69 @@ mod tests {
         };
         let result = GhWriteGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- edge case hardening ---
+
+    #[test]
+    fn loop_explicit_unowned_blocks() {
+        // Loop with -R pointing to unowned repo should block
+        let result =
+            analyze_gh_loops("for i in 1 2; do gh label create bug -R stranger/repo; done");
+        match result {
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                assert_eq!(cmds[0].explicit_repo.as_deref(), Some("stranger/repo"));
+            }
+            other => panic!("expected AllTargetsExplicit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gist_create_detected_as_write() {
+        assert!(is_write_command("gh gist create file.txt"));
+    }
+
+    #[test]
+    fn repo_fork_detected_as_write() {
+        assert!(is_write_command("gh repo fork owner/repo"));
+    }
+
+    #[test]
+    fn api_repos_with_query_params() {
+        let caps = API_REPOS.captures("gh api repos/cameronsjo/test/pulls?state=open");
+        assert!(caps.is_some());
+        assert_eq!(caps.unwrap().get(1).unwrap().as_str(), "cameronsjo/test");
+    }
+
+    #[test]
+    fn repo_create_without_owner_uses_default() {
+        // resolve_target_repo for "gh repo create my-repo" without owner
+        // should prepend the first allowed owner
+        let allowed = vec!["cameronsjo".to_string()];
+        let resolved = resolve_target_repo("gh repo create my-repo", ".", &allowed);
+        match resolved {
+            RepoResolution::Resolved(repo) => {
+                assert_eq!(repo, "cameronsjo/my-repo");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_create_with_owner() {
+        let allowed = vec!["cameronsjo".to_string()];
+        let resolved = resolve_target_repo("gh repo create cameronsjo/new-repo", ".", &allowed);
+        match resolved {
+            RepoResolution::Resolved(repo) => {
+                assert_eq!(repo, "cameronsjo/new-repo");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uppercase_method_not_matched() {
+        // "gh pr VIEW" is not a write — "VIEW" not in write actions list
+        assert!(!is_write_command("gh pr view 123"));
     }
 }

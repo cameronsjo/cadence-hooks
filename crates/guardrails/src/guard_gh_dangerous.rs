@@ -187,4 +187,40 @@ mod tests {
         let result = GhDangerousGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
+
+    // --- edge case hardening ---
+
+    #[test]
+    fn empty_command_allowed() {
+        let result = GhDangerousGuard.run(&make_bash(""));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn whitespace_only_allowed() {
+        let result = GhDangerousGuard.run(&make_bash("   "));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn word_boundary_hyphenated_allowed() {
+        // "gh-repo-delete" is hyphenated, not "gh repo delete"
+        let result = GhDangerousGuard.run(&make_bash("gh-repo-delete something"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn exec_wrapper_without_c_flag_still_blocked() {
+        // Pass 1 catches "gh repo delete" anywhere in the stripped command,
+        // regardless of whether it's inside an exec wrapper
+        let result = GhDangerousGuard.run(&make_bash("bash script.sh gh repo delete"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn repo_delete_with_extra_spaces_blocked() {
+        let result = GhDangerousGuard.run(&make_bash("gh  repo  delete  my-repo"));
+        // Extra spaces between words — regex uses \s+ so this still matches
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
 }
