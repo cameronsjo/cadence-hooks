@@ -110,41 +110,38 @@ fn collect_gh_in_loops_from_item(item: &CompoundListItem, out: &mut Vec<LoopedCo
 
 fn collect_gh_in_loops_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>) {
     for cmd in &pipeline.seq {
-        match cmd {
-            Command::Compound(compound, _) => {
-                match compound {
-                    CompoundCommand::ForClause(for_cmd) => {
-                        collect_gh_from_body(&for_cmd.body.list, out);
-                    }
-                    CompoundCommand::WhileClause(while_cmd) => {
-                        collect_gh_from_body(&while_cmd.1.list, out);
-                    }
-                    CompoundCommand::UntilClause(until_cmd) => {
-                        collect_gh_from_body(&until_cmd.1.list, out);
-                    }
-                    // Recurse into brace groups and subshells
-                    CompoundCommand::BraceGroup(bg) => {
-                        collect_gh_in_loops_from_list(&bg.list, out);
-                    }
-                    CompoundCommand::Subshell(sub) => {
-                        collect_gh_in_loops_from_list(&sub.list, out);
-                    }
-                    CompoundCommand::IfClause(if_cmd) => {
-                        collect_gh_in_loops_from_list(&if_cmd.condition, out);
-                        collect_gh_in_loops_from_list(&if_cmd.then, out);
-                        if let Some(elses) = &if_cmd.elses {
-                            for else_clause in elses {
-                                if let Some(cond) = &else_clause.condition {
-                                    collect_gh_in_loops_from_list(cond, out);
-                                }
-                                collect_gh_in_loops_from_list(&else_clause.body, out);
+        if let Command::Compound(compound, _) = cmd {
+            match compound {
+                CompoundCommand::ForClause(for_cmd) => {
+                    collect_gh_from_body(&for_cmd.body.list, out);
+                }
+                CompoundCommand::WhileClause(while_cmd) => {
+                    collect_gh_from_body(&while_cmd.1.list, out);
+                }
+                CompoundCommand::UntilClause(until_cmd) => {
+                    collect_gh_from_body(&until_cmd.1.list, out);
+                }
+                // Recurse into brace groups and subshells
+                CompoundCommand::BraceGroup(bg) => {
+                    collect_gh_in_loops_from_list(&bg.list, out);
+                }
+                CompoundCommand::Subshell(sub) => {
+                    collect_gh_in_loops_from_list(&sub.list, out);
+                }
+                CompoundCommand::IfClause(if_cmd) => {
+                    collect_gh_in_loops_from_list(&if_cmd.condition, out);
+                    collect_gh_in_loops_from_list(&if_cmd.then, out);
+                    if let Some(elses) = &if_cmd.elses {
+                        for else_clause in elses {
+                            if let Some(cond) = &else_clause.condition {
+                                collect_gh_in_loops_from_list(cond, out);
                             }
+                            collect_gh_in_loops_from_list(&else_clause.body, out);
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -250,6 +247,18 @@ fn collect_push_in_loops_from_pipeline(pipeline: &Pipeline, out: &mut Vec<Looped
                 CompoundCommand::Subshell(sub) => {
                     collect_push_in_loops_from_list(&sub.list, out);
                 }
+                CompoundCommand::IfClause(if_cmd) => {
+                    collect_push_in_loops_from_list(&if_cmd.condition, out);
+                    collect_push_in_loops_from_list(&if_cmd.then, out);
+                    if let Some(elses) = &if_cmd.elses {
+                        for else_clause in elses {
+                            if let Some(cond) = &else_clause.condition {
+                                collect_push_in_loops_from_list(cond, out);
+                            }
+                            collect_push_in_loops_from_list(&else_clause.body, out);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -296,6 +305,18 @@ fn collect_push_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>)
                 CompoundCommand::Subshell(sub) => {
                     collect_push_from_body(&sub.list, out);
                 }
+                CompoundCommand::IfClause(if_cmd) => {
+                    collect_push_from_body(&if_cmd.condition, out);
+                    collect_push_from_body(&if_cmd.then, out);
+                    if let Some(elses) = &if_cmd.elses {
+                        for else_clause in elses {
+                            if let Some(cond) = &else_clause.condition {
+                                collect_push_from_body(cond, out);
+                            }
+                            collect_push_from_body(&else_clause.body, out);
+                        }
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -329,10 +350,8 @@ fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
             return iter.next().cloned();
         }
         // Handle -Rowner/repo (no space)
-        if let Some(repo) = word.strip_prefix("-R") {
-            if !repo.is_empty() {
-                return Some(repo.to_string());
-            }
+        if let Some(repo) = word.strip_prefix("-R").filter(|r| !r.is_empty()) {
+            return Some(repo.to_string());
         }
         if let Some(repo) = word.strip_prefix("--repo=") {
             return Some(repo.to_string());

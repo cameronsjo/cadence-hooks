@@ -15,32 +15,55 @@ macro_rules! term {
     ($($part:expr),+) => { concat!($($part),+) }
 }
 
-/// Blocked terms and their replacements.
-const VIOLATIONS: &[(&str, &str)] = &[
-    (term!("white", "list"), "allowlist"),
-    (term!("black", "list"), "blocklist, denylist"),
-    (term!("master", " branch"), "main branch"),
-    (term!("master", " node"), "primary node, leader node"),
-    (term!("sla", "ve"), "replica, follower, secondary"),
+/// Blocked terms: (display_term, regex_pattern, replacement).
+///
+/// Patterns use left word boundary + suffix alternation to catch derived forms
+/// (plurals, past tense, gerunds) without false positives from substrings.
+const VIOLATIONS: &[(&str, &str, &str)] = &[
+    (
+        term!("white", "list"),
+        r"(?i)\bwhitelist(s|ed|ing)?\b",
+        "allowlist",
+    ),
+    (
+        term!("black", "list"),
+        r"(?i)\bblacklist(s|ed|ing)?\b",
+        "blocklist, denylist",
+    ),
+    (
+        term!("master", " branch"),
+        r"(?i)\bmaster\s+branch(es)?\b",
+        "main branch",
+    ),
+    (
+        term!("master", " node"),
+        r"(?i)\bmaster\s+node(s)?\b",
+        "primary node, leader node",
+    ),
+    (
+        term!("sla", "ve"),
+        r"(?i)\bslave(s|d|ry)?\b",
+        "replica, follower, secondary",
+    ),
     (
         term!("sanity", " check"),
+        r"(?i)\bsanity\s+check(s|ing)?\b",
         "validation check, confidence check, smoke test",
     ),
     (
         term!("dummy", " value"),
+        r"(?i)\bdummy\s+value(s)?\b",
         "placeholder value, sample value, mock value",
     ),
     (
         term!("grand", "fathered"),
+        r"(?i)\bgrandfather(ed|ing)?\b",
         "legacy status, exempted, inherited",
     ),
 ];
 
 static PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
-    let patterns: Vec<String> = VIOLATIONS
-        .iter()
-        .map(|(term, _)| format!(r"(?i)\b{}\b", regex::escape(term)))
-        .collect();
+    let patterns: Vec<&str> = VIOLATIONS.iter().map(|(_, pattern, _)| *pattern).collect();
     RegexSet::new(&patterns).expect("terminology patterns should compile")
 });
 
@@ -51,7 +74,7 @@ pub fn check_terminology(content: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
 
     for idx in matches.iter() {
-        let (term, replacement) = VIOLATIONS[idx];
+        let (term, _, replacement) = VIOLATIONS[idx];
         found.push((term.to_string(), replacement.to_string()));
     }
 
@@ -128,6 +151,82 @@ mod tests {
     }
 
     #[test]
+    fn detects_whitelist_derived_forms() {
+        for form in ["whitelists", "whitelisted", "whitelisting"] {
+            let found = check_terminology(form);
+            assert_eq!(found.len(), 1, "should detect '{form}'");
+            assert_eq!(found[0].1, "allowlist");
+        }
+    }
+
+    #[test]
+    fn detects_blacklist_derived_forms() {
+        for form in ["blacklists", "blacklisted", "blacklisting"] {
+            let found = check_terminology(form);
+            assert_eq!(found.len(), 1, "should detect '{form}'");
+            assert_eq!(found[0].1, "blocklist, denylist");
+        }
+    }
+
+    #[test]
+    fn detects_slave_derived_forms() {
+        for form in ["slaves", "slaved", "slavery"] {
+            let found = check_terminology(form);
+            assert_eq!(found.len(), 1, "should detect '{form}'");
+            assert_eq!(found[0].1, "replica, follower, secondary");
+        }
+    }
+
+    #[test]
+    fn detects_sanity_check_plural() {
+        let found = check_terminology("sanity checks");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].1,
+            "validation check, confidence check, smoke test"
+        );
+    }
+
+    #[test]
+    fn detects_sanity_checking() {
+        let found = check_terminology("sanity checking");
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn detects_dummy_values_plural() {
+        let found = check_terminology("dummy values");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].1,
+            "placeholder value, sample value, mock value"
+        );
+    }
+
+    #[test]
+    fn detects_grandfather_forms() {
+        for form in ["grandfather", "grandfathered", "grandfathering"] {
+            let found = check_terminology(form);
+            assert_eq!(found.len(), 1, "should detect '{form}'");
+            assert_eq!(found[0].1, "legacy status, exempted, inherited");
+        }
+    }
+
+    #[test]
+    fn detects_master_branch_plural() {
+        let found = check_terminology("master branches");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "main branch");
+    }
+
+    #[test]
+    fn detects_master_nodes_plural() {
+        let found = check_terminology("master nodes");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "primary node, leader node");
+    }
+
+    #[test]
     fn case_insensitive_detection() {
         let upper = VIOLATIONS[0].0.to_uppercase();
         let found = check_terminology(&upper);
@@ -180,16 +279,14 @@ mod tests {
     }
 
     #[test]
-    fn plural_form_not_detected() {
-        // "whitelists" — word boundary \b requires boundary after "t" but "s"
-        // continues the word, so the plural form is NOT matched
+    fn plural_form_detected() {
         let found = check_terminology(&format!("{}s", VIOLATIONS[0].0));
-        assert!(found.is_empty());
+        assert_eq!(found.len(), 1, "plural form should be detected");
     }
 
     #[test]
     fn all_violations_detectable() {
-        for (term, _) in VIOLATIONS {
+        for (term, _, _) in VIOLATIONS {
             let found = check_terminology(term);
             assert!(!found.is_empty(), "term '{}' should be detected", term);
         }

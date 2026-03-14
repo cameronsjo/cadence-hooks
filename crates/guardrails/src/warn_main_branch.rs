@@ -83,10 +83,10 @@ impl Check for WarnMainBranch {
         let result = should_warn(&branch, already_warned);
 
         // Create marker on warn to suppress future warnings this session
-        if result.outcome == Outcome::Warn {
-            if let Some(marker) = Self::marker_path() {
-                let _ = std::fs::write(&marker, "");
-            }
+        if result.outcome == Outcome::Warn
+            && let Some(marker) = Self::marker_path()
+        {
+            let _ = std::fs::write(&marker, "");
         }
 
         result

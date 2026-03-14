@@ -21,7 +21,7 @@ static WRITE_ACTIONS: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*(-X|--method)\s+(POST|PUT|PATCH|DELETE)")
+    Regex::new(r"gh\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
         .expect("pattern should compile")
 });
 
@@ -589,5 +589,21 @@ mod tests {
     fn uppercase_method_not_matched() {
         // "gh pr VIEW" is not a write — "VIEW" not in write actions list
         assert!(!is_write_command("gh pr view 123"));
+    }
+
+    #[test]
+    fn api_lowercase_post_is_write() {
+        assert!(
+            is_write_command("gh api repos/stranger/repo -X post"),
+            "lowercase HTTP method should be detected as write"
+        );
+    }
+
+    #[test]
+    fn api_mixed_case_delete_is_write() {
+        assert!(
+            is_write_command("gh api repos/foo/bar --method Delete"),
+            "mixed-case HTTP method should be detected as write"
+        );
     }
 }

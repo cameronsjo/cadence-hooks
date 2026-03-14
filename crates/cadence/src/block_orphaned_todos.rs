@@ -45,11 +45,27 @@ fn is_exempt(path: &str) -> bool {
 }
 
 /// Find orphaned markers in content. Returns list of (line_number, line_text) pairs.
+///
+/// A marker is orphaned if it matches `MARKER:` without a `MARKER(#NNN):` at the same
+/// byte offset. This prevents a referenced marker on the same line from masking an
+/// unrelated orphaned marker at a different position.
 pub fn find_orphaned(content: &str) -> Vec<(usize, String)> {
     let mut orphans = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
-        if ORPHANED_PATTERN.is_match(line) && !REFERENCED_PATTERN.is_match(line) {
+        // Collect byte offsets of all referenced markers on this line
+        let referenced_offsets: Vec<usize> = REFERENCED_PATTERN
+            .find_iter(line)
+            .map(|m| m.start())
+            .collect();
+
+        // Check each orphaned match — only truly orphaned if no referenced match
+        // starts at the same byte offset
+        let has_orphan = ORPHANED_PATTERN.find_iter(line).any(|m| {
+            !referenced_offsets.contains(&m.start())
+        });
+
+        if has_orphan {
             orphans.push((idx + 1, line.trim().to_string()));
         }
     }
@@ -325,10 +341,10 @@ mod tests {
     #[test]
     fn referenced_and_orphaned_same_line() {
         // Line has TODO(#1): (valid ref) and also FIXME: (orphan)
-        // Both ORPHANED and REFERENCED match on the same line → line passes
+        // The FIXME at a different offset is orphaned even though TODO is referenced
         let content = "// TODO(#1): referenced FIXME: orphaned";
         let orphans = find_orphaned(content);
-        assert!(orphans.is_empty());
+        assert_eq!(orphans.len(), 1, "FIXME: should be detected as orphaned");
     }
 
     #[test]
@@ -401,5 +417,32 @@ mod tests {
     fn bug_marker_detected() {
         let orphans = find_orphaned("// BUG: off-by-one error");
         assert_eq!(orphans.len(), 1);
+    }
+
+    #[test]
+    fn fixme_orphan_not_masked_by_referenced_todo_same_line() {
+        // FIXME: is orphaned even though TODO(#1): is referenced on the same line
+        let content = "// FIXME: broken TODO(#1): tracked";
+        let orphans = find_orphaned(content);
+        assert_eq!(
+            orphans.len(),
+            1,
+            "FIXME: should block despite TODO(#1): being referenced"
+        );
+        assert!(orphans[0].1.contains("FIXME"));
+    }
+
+    #[test]
+    fn two_referenced_markers_same_line_passes() {
+        let content = "// TODO(#1): first FIXME(#2): second";
+        let orphans = find_orphaned(content);
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn two_orphaned_markers_same_line_detected() {
+        let content = "// TODO: first FIXME: second";
+        let orphans = find_orphaned(content);
+        assert_eq!(orphans.len(), 1, "line should appear once even with two orphans");
     }
 }

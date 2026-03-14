@@ -56,7 +56,7 @@ const PATTERNS: &[SecurityPattern] = &[
     },
     SecurityPattern {
         extensions: &["ts", "tsx"],
-        pattern: r"\s+as\s+[A-Z]",
+        pattern: r"[)\]}]\s+as\s+[A-Z]",
         message: "Type assertion bypasses validation",
     },
     SecurityPattern {
@@ -91,7 +91,7 @@ const PATTERNS: &[SecurityPattern] = &[
     },
     SecurityPattern {
         extensions: &["java"],
-        pattern: r"java[.]util[.]Random[^N]",
+        pattern: r"java\.util\.Random(?:$|[^A-Za-z])",
         message: "Use SecureRandom for security-sensitive values",
     },
     SecurityPattern {
@@ -261,14 +261,15 @@ mod tests {
 
     #[test]
     fn ts_type_assertion() {
-        let results = scan_content("const x = input as UserData;", "ts");
+        // Pattern requires preceding ), ], }, or word char — typical assertion context
+        let results = scan_content("const x = getInput() as UserData;", "ts");
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("assertion"));
     }
 
     #[test]
     fn tsx_type_assertion() {
-        let results = scan_content("const y = value as Props;", "tsx");
+        let results = scan_content("const y = getValue() as Props;", "tsx");
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("assertion"));
     }
@@ -392,6 +393,75 @@ mod tests {
     fn clean_content_no_warnings() {
         let results = scan_content("fn safe_code() { println!(\"hello\"); }", "rs");
         assert!(results.is_empty());
+    }
+
+    // --- false positive regression tests ---
+
+    #[test]
+    fn ts_import_alias_not_flagged() {
+        let results = scan_content("import { foo as Bar } from 'module';", "ts");
+        assert!(results.is_empty(), "import alias should not trigger type assertion warning");
+    }
+
+    #[test]
+    fn ts_comment_as_not_flagged() {
+        let results = scan_content("// known as Unknown type in the system", "ts");
+        assert!(results.is_empty(), "prose 'as' in comments should not trigger");
+    }
+
+    #[test]
+    fn ts_paren_as_assertion_flagged() {
+        // `)` before `as` — typical type assertion after function call
+        let results = scan_content("const x = getInput() as UserData;", "ts");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("assertion"));
+    }
+
+    #[test]
+    fn ts_bracket_as_assertion_flagged() {
+        let results = scan_content("const x = items[0] as Config;", "ts");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("assertion"));
+    }
+
+    #[test]
+    fn ts_brace_as_assertion_flagged() {
+        let results = scan_content("const x = { foo: 1 } as Record<string, number>;", "ts");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("assertion"));
+    }
+
+    #[test]
+    fn ts_bare_variable_as_not_flagged() {
+        // Bare `variable as Type` is ambiguous — we accept this false negative
+        // to avoid false positives on import aliases and comments
+        let results = scan_content("const x = input as UserData;", "ts");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn java_random_access_not_flagged() {
+        let results = scan_content("implements RandomAccess {", "java");
+        assert!(results.is_empty(), "RandomAccess should not trigger java.util.Random warning");
+    }
+
+    #[test]
+    fn java_random_event_not_flagged() {
+        let results = scan_content("class RandomEventGenerator {", "java");
+        assert!(results.is_empty(), "RandomEventGenerator should not trigger");
+    }
+
+    #[test]
+    fn java_util_random_still_flagged() {
+        let results = scan_content("java.util.Random r = new java.util.Random();", "java");
+        assert!(!results.is_empty(), "java.util.Random should still be flagged");
+        assert!(results[0].1.contains("SecureRandom"));
+    }
+
+    #[test]
+    fn java_util_random_at_eol_flagged() {
+        let results = scan_content("import java.util.Random\nnext line", "java");
+        assert!(!results.is_empty(), "java.util.Random at end of line should be flagged");
     }
 
     // --- run() guard clauses ---

@@ -109,6 +109,25 @@ fn is_dangerous_env_operand(operand: &str) -> bool {
     !SAFE_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
+/// Check if `. ` appears in a command position (start of command or after a chain
+/// operator), not as an argument to another command like `grep . .env`.
+fn is_dot_source_command(lower: &str) -> bool {
+    let trimmed = lower.trim_start();
+    if trimmed.starts_with(". ") {
+        return true;
+    }
+    // Check after chain operators: &&, ;, ||
+    for sep in &["&&", ";", "||"] {
+        for segment in lower.split(sep) {
+            let seg = segment.trim_start();
+            if seg.starts_with(". ") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Check if a bash command would dump secrets to stdout.
 fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     let lower = command.to_lowercase();
@@ -130,16 +149,27 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
         }
 
         // Block: source .env — check operand
-        for src_cmd in &["source ", ". "] {
-            if lower.contains(src_cmd)
-                && let Some(operand) = read_operand(&lower, src_cmd)
-                && is_dangerous_env_operand(&operand)
-            {
-                return Some(CheckResult::block(
-                    "🚫 BLOCKED: Command would source .env file, exposing secrets. \
-                         Secrets are available via direnv — run programs directly.",
-                ));
-            }
+        // "source " is unambiguous, but ". " matches any substring containing ". "
+        // (e.g., "grep . .env", "find . -name .env"). Only match ". " at command
+        // start or after chain operators (&&, ;, ||).
+        if lower.contains("source ")
+            && let Some(operand) = read_operand(&lower, "source ")
+            && is_dangerous_env_operand(&operand)
+        {
+            return Some(CheckResult::block(
+                "🚫 BLOCKED: Command would source .env file, exposing secrets. \
+                     Secrets are available via direnv — run programs directly.",
+            ));
+        }
+
+        if is_dot_source_command(&lower)
+            && let Some(operand) = read_operand(&lower, ". ")
+            && is_dangerous_env_operand(&operand)
+        {
+            return Some(CheckResult::block(
+                "🚫 BLOCKED: Command would source .env file, exposing secrets. \
+                     Secrets are available via direnv — run programs directly.",
+            ));
         }
     }
 
@@ -798,6 +828,49 @@ mod tests {
     fn bash_cat_env_with_example_in_pipe_blocked() {
         // cat .env piped to grep — operand is .env which is dangerous
         let result = SecretLeaksGuard.run(&make_bash_input("cat .env | grep example"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // --- Regression: dot-source false positives ---
+
+    #[test]
+    fn bash_grep_dot_env_allowed() {
+        // `grep . .env` uses `. ` as a regex pattern argument, not dot-source
+        // The read_cmds check handles grep separately; `. ` must not false-positive
+        let result = SecretLeaksGuard.run(&make_bash_input("grep . .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_find_dot_env_allowed() {
+        // `find . -name .env` uses `.` as a directory, not dot-source
+        let result = SecretLeaksGuard.run(&make_bash_input("find . -name .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_dot_source_env_still_blocked() {
+        // `. .env` at start of command is genuine dot-source
+        let result = SecretLeaksGuard.run(&make_bash_input(". .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_dot_source_after_chain_blocked() {
+        // `. .env` after && is genuine dot-source
+        let result = SecretLeaksGuard.run(&make_bash_input("cd /app && . .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_dot_source_after_semicolon_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cd /app; . .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_dot_source_after_or_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("test -f .env || . .env.local"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 }

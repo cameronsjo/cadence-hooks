@@ -88,7 +88,7 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 }
 
 static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|([^ &;|]+))"#)
+    Regex::new(r#"(?:^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^ &;|]+))"#)
         .expect("pattern should compile")
 });
 
@@ -102,7 +102,11 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut last_target: Option<String> = None;
     for caps in CD_PATTERN.captures_iter(command) {
-        let target = caps.get(1).or(caps.get(2)).map(|m| m.as_str().to_string());
+        let target = caps
+            .get(1)
+            .or(caps.get(2))
+            .or(caps.get(3))
+            .map(|m| m.as_str().to_string());
         if target.is_some() {
             last_target = target;
         }
@@ -322,6 +326,14 @@ mod tests {
         assert_eq!(
             parse_work_dir("cd /project || git push", "/home"),
             "/project"
+        );
+    }
+
+    #[test]
+    fn cd_with_single_quoted_path() {
+        assert_eq!(
+            parse_work_dir("cd '/path with spaces' && git push", "/home"),
+            "/path with spaces"
         );
     }
 

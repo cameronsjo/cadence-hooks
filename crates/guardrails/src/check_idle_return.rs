@@ -22,13 +22,19 @@ const NEW_SESSION_THRESHOLD_SECS: u64 = 28800; // 8 hours
 /// - `None`: no previous marker (first edit) — allow
 /// - gap < 5 min: allow (active session)
 /// - gap 5 min to 8 hr: warn (idle return)
-/// - gap >= 8 hr: allow (stale session, effectively new)
+/// - gap >= 8 hr: warn (stale session, suggest fresh session)
 fn idle_outcome(gap: Option<u64>) -> CheckResult {
     let Some(gap) = gap else {
         return CheckResult::allow();
     };
 
-    if (IDLE_THRESHOLD_SECS..NEW_SESSION_THRESHOLD_SECS).contains(&gap) {
+    if gap >= NEW_SESSION_THRESHOLD_SECS {
+        let hours = gap / 3600;
+        CheckResult::warn(format!(
+            "It's been {hours}h since your last edit. Consider starting a \
+             fresh session and re-orienting before continuing."
+        ))
+    } else if gap >= IDLE_THRESHOLD_SECS {
         let mins = gap / 60;
         CheckResult::warn(format!(
             "It's been {mins}m since your last edit. Before continuing: \
@@ -152,15 +158,27 @@ mod tests {
     }
 
     #[test]
-    fn exactly_at_new_session_allows() {
-        // 8 hours — stale session, effectively new
+    fn exactly_at_new_session_warns_fresh_session() {
+        // 8 hours — stale session, suggest fresh start
         let result = idle_outcome(Some(28800));
-        assert_eq!(result.outcome, Outcome::Allow);
+        assert_eq!(result.outcome, Outcome::Warn);
+        assert!(result.message.as_deref().unwrap().contains("8h"));
+        assert!(result.message.as_deref().unwrap().contains("fresh session"));
     }
 
     #[test]
-    fn day_old_session_allows() {
+    fn day_old_session_warns_fresh_session() {
         let result = idle_outcome(Some(86400));
-        assert_eq!(result.outcome, Outcome::Allow);
+        assert_eq!(result.outcome, Outcome::Warn);
+        assert!(result.message.as_deref().unwrap().contains("24h"));
+        assert!(result.message.as_deref().unwrap().contains("fresh session"));
+    }
+
+    #[test]
+    fn twelve_hour_gap_warns_fresh_session() {
+        let result = idle_outcome(Some(43200));
+        assert_eq!(result.outcome, Outcome::Warn);
+        assert!(result.message.as_deref().unwrap().contains("12h"));
+        assert!(result.message.as_deref().unwrap().contains("fresh session"));
     }
 }

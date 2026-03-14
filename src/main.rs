@@ -125,10 +125,13 @@ fn main() {
                 //   (e.g., `cadence-hooks future-plugin some-hook`)
                 // UnknownArgument: known subcommand but with unrecognized flags/args
                 //   (e.g., `cadence-hooks cadence terminology --new-flag`)
-                // Both indicate a version mismatch between the plugin's hooks.json
-                // and the installed binary. Warn (exit 1) instead of blocking.
+                // MissingSubcommand / DisplayHelpOnMissingArgumentOrSubcommand:
+                //   no subcommand provided (e.g., bare `cadence-hooks` or `cadence-hooks cadence`)
+                // All indicate misconfiguration or version mismatch. Warn (exit 1) instead of blocking.
                 clap::error::ErrorKind::InvalidSubcommand
-                | clap::error::ErrorKind::UnknownArgument => {
+                | clap::error::ErrorKind::UnknownArgument
+                | clap::error::ErrorKind::MissingSubcommand
+                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
                     eprintln!(
                         "cadence-hooks v{installed}: unrecognized command or arguments.\n\
                          \n\
