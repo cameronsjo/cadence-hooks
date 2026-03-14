@@ -75,19 +75,8 @@ impl Check for PushRemoteGuard {
             return CheckResult::allow();
         }
 
-        // Read allowed owners from env
-        let allowed_owners: Vec<String> = std::env::var("GIT_GUARDRAILS_ALLOWED_OWNERS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
-
-        if allowed_owners.is_empty() {
-            return CheckResult::block(
-                "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
-                 GIT_GUARDRAILS_ALLOWED_OWNERS is not set.",
-            );
-        }
+        // Structural safety checks first — these don't need the owner list
+        // and must block even when unconfigured.
 
         // Complexity gate: block batch pushes (strip quotes to avoid false positives)
         let push_count = strip_quotes(command).matches("git push").count();
@@ -98,29 +87,9 @@ impl Check for PushRemoteGuard {
             );
         }
 
-        // AST-based loop detection with regex fallback
-        match loop_analysis::analyze_push_loops(command) {
-            LoopAnalysis::AllTargetsExplicit(cmds) => {
-                // All pushes in loops have explicit remotes — validate each
-                let cwd_fallback_loop = std::env::current_dir()
-                    .ok()
-                    .and_then(|p| p.to_str().map(String::from))
-                    .unwrap_or_else(|| ".".to_string());
-                let cwd_loop = input.cwd.as_deref().unwrap_or(&cwd_fallback_loop);
-                let work_dir_loop = parse_work_dir(command, cwd_loop);
-
-                for cmd in &cmds {
-                    if let Some(remote) = &cmd.explicit_repo
-                        && let Some(url) = resolve_push_url(&work_dir_loop, Some(remote))
-                        && !check_owner(&url, &allowed_owners)
-                    {
-                        return CheckResult::block(format!(
-                            "🚫 git-guardrails: Push loop targets remote you don't own\n   \
-                             Remote: {remote}\n   URL: {url}"
-                        ));
-                    }
-                }
-            }
+        // AST-based loop detection (MissingTargets and ParseFailed don't need owners)
+        let loop_result = loop_analysis::analyze_push_loops(command);
+        match &loop_result {
             LoopAnalysis::MissingTargets(_) => {
                 return CheckResult::block(
                     "🚫 git-guardrails: git push in loop without explicit remote\n   \
@@ -136,7 +105,43 @@ impl Check for PushRemoteGuard {
                     );
                 }
             }
-            LoopAnalysis::NoLoops => {}
+            LoopAnalysis::AllTargetsExplicit(_) | LoopAnalysis::NoLoops => {}
+        }
+
+        // Owner-based checks require configuration
+        let allowed_owners: Vec<String> = std::env::var("GIT_GUARDRAILS_ALLOWED_OWNERS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+
+        if allowed_owners.is_empty() {
+            return CheckResult::block(
+                "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
+                 GIT_GUARDRAILS_ALLOWED_OWNERS is not set.",
+            );
+        }
+
+        // Validate ownership of explicit remotes in loops
+        if let LoopAnalysis::AllTargetsExplicit(cmds) = &loop_result {
+            let cwd_fallback_loop = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| ".".to_string());
+            let cwd_loop = input.cwd.as_deref().unwrap_or(&cwd_fallback_loop);
+            let work_dir_loop = parse_work_dir(command, cwd_loop);
+
+            for cmd in cmds {
+                if let Some(remote) = &cmd.explicit_repo
+                    && let Some(url) = resolve_push_url(&work_dir_loop, Some(remote))
+                    && !check_owner(&url, &allowed_owners)
+                {
+                    return CheckResult::block(format!(
+                        "🚫 git-guardrails: Push loop targets remote you don't own\n   \
+                         Remote: {remote}\n   URL: {url}"
+                    ));
+                }
+            }
         }
 
         // Resolve working directory
