@@ -4,6 +4,7 @@
 //! comment, edit, delete, etc.) and verifies the target repository belongs to
 //! an allowed owner list. Also blocks looped writes and cross-repo mutations.
 
+use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     git_command, parse_work_dir, repo_from_url, strip_quotes, LOOP_PATTERN,
 };
@@ -138,13 +139,48 @@ impl Check for GhWriteGuard {
             .map(String::from)
             .collect();
 
-        // Loop detection
-        let stripped = strip_quotes(command);
-        if LOOP_PATTERN.is_match(&stripped) && command.contains("gh") {
-            return CheckResult::block(
-                "🚫 git-guardrails: gh command in loop — cannot verify targets\n   \
-                 Run each gh command individually.",
-            );
+        // AST-based loop detection with regex fallback
+        match loop_analysis::analyze_gh_loops(command) {
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                // All gh commands in loops have explicit -R flags — check ownership
+                let all_owned = cmds.iter().all(|c| {
+                    c.explicit_repo
+                        .as_ref()
+                        .is_some_and(|r| is_allowed(r, &allowed_owners, &allowed_repos))
+                });
+                if !all_owned {
+                    let targets: Vec<&str> = cmds
+                        .iter()
+                        .filter_map(|c| c.explicit_repo.as_deref())
+                        .collect();
+                    return CheckResult::block(format!(
+                        "🚫 git-guardrails: gh loop targets repo you don't own\n   \
+                         Targets: {}\n   \
+                         Allowed: owners=[{}] repos=[{}]",
+                        targets.join(", "),
+                        allowed_owners.join(" "),
+                        allowed_repos.join(" "),
+                    ));
+                }
+                // All targets owned — allow the loop
+            }
+            LoopAnalysis::MissingTargets(_) => {
+                return CheckResult::block(
+                    "🚫 git-guardrails: gh command in loop without explicit -R flag\n   \
+                     Use -R owner/repo on each gh command, or run them individually.",
+                );
+            }
+            LoopAnalysis::ParseFailed => {
+                // Regex fallback when AST parser can't handle the syntax
+                let stripped = strip_quotes(command);
+                if LOOP_PATTERN.is_match(&stripped) {
+                    return CheckResult::block(
+                        "🚫 git-guardrails: gh command in loop — cannot verify targets\n   \
+                         Run each gh command individually.",
+                    );
+                }
+            }
+            LoopAnalysis::NoLoops => {} // Continue to write detection
         }
 
         // Only guard write operations

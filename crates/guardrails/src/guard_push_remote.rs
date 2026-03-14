@@ -4,6 +4,7 @@
 //! verifies the repository owner is in the configured allowlist. Also blocks
 //! looped pushes and force-push to `main`.
 
+use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     git_command, parse_work_dir, repo_from_url, strip_quotes, LOOP_PATTERN,
 };
@@ -90,14 +91,35 @@ impl Check for PushRemoteGuard {
 
         // Complexity gate: block batch pushes
         let push_count = command.matches("git push").count();
-        let stripped = strip_quotes(command);
-        let has_loop = LOOP_PATTERN.is_match(&stripped);
-
-        if push_count > 1 || has_loop {
+        if push_count > 1 {
             return CheckResult::block(
-                "🚫 git-guardrails: git push in batch/loop command — cannot verify targets\n   \
+                "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
                  Run each push individually so remotes can be validated.",
             );
+        }
+
+        // AST-based loop detection with regex fallback
+        match loop_analysis::analyze_push_loops(command) {
+            LoopAnalysis::AllTargetsExplicit(_) => {
+                // All pushes in loops have explicit remotes — allow
+                // (individual remote ownership is checked below)
+            }
+            LoopAnalysis::MissingTargets(_) => {
+                return CheckResult::block(
+                    "🚫 git-guardrails: git push in loop without explicit remote\n   \
+                     Specify the remote explicitly, or run each push individually.",
+                );
+            }
+            LoopAnalysis::ParseFailed => {
+                let stripped = strip_quotes(command);
+                if LOOP_PATTERN.is_match(&stripped) {
+                    return CheckResult::block(
+                        "🚫 git-guardrails: git push in loop — cannot verify targets\n   \
+                         Run each push individually so remotes can be validated.",
+                    );
+                }
+            }
+            LoopAnalysis::NoLoops => {}
         }
 
         // Resolve working directory

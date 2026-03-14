@@ -4,7 +4,10 @@
 //! returns after 5+ minutes of inactivity, warns them to review context.
 //! After 8+ hours, suggests starting a fresh session.
 
-use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
+
+#[cfg(test)]
+use cadence_hooks_core::Outcome;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
