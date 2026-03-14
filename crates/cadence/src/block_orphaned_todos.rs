@@ -70,7 +70,7 @@ impl Check for OrphanedTodoGuard {
             return CheckResult::allow();
         };
 
-        if let Some(path) = input.file_path()
+        if let Some(ref path) = input.file_path()
             && is_exempt(path)
         {
             return CheckResult::allow();
@@ -83,7 +83,7 @@ impl Check for OrphanedTodoGuard {
 
         let mut msg = String::new();
         msg.push_str("🚫 BLOCKED: Orphaned code markers detected");
-        if let Some(path) = input.file_path() {
+        if let Some(ref path) = input.file_path() {
             msg.push_str(&format!(" in {path}"));
         }
         msg.push_str("\n\nFound markers without GitHub issue references:\n");

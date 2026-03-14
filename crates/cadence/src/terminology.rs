@@ -80,7 +80,7 @@ impl Check for TerminologyGuard {
             return CheckResult::allow();
         };
 
-        if let Some(path) = input.file_path()
+        if let Some(ref path) = input.file_path()
             && is_excluded_path(path)
         {
             return CheckResult::allow();
@@ -93,7 +93,7 @@ impl Check for TerminologyGuard {
 
         let mut msg = String::new();
         msg.push_str("🚫 BLOCKED: Inclusive terminology violation detected");
-        if let Some(path) = input.file_path() {
+        if let Some(ref path) = input.file_path() {
             msg.push_str(&format!(" in {path}"));
         }
         msg.push_str("\n\nFound prohibited terms:\n");

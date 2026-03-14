@@ -85,7 +85,7 @@ impl Check for ValidateSkillFrontmatter {
             return CheckResult::allow();
         };
 
-        let file_type = classify_path(path);
+        let file_type = classify_path(&path);
         if file_type == FileType::Other {
             return CheckResult::allow();
         }
@@ -128,7 +128,7 @@ impl Check for ValidateSkillFrontmatter {
                     }
 
                     // Check name matches directory
-                    if let Some(dir_name) = skill_dir_name(path)
+                    if let Some(dir_name) = skill_dir_name(&path)
                         && name_value != dir_name
                     {
                         errors.push(format!(

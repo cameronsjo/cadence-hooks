@@ -33,7 +33,7 @@ impl Check for MarkdownLint {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        if !should_lint(input.file_path(), input.tool_name(), input.content()) {
+        if !should_lint(input.file_path().as_deref(), input.tool_name(), input.content()) {
             return CheckResult::allow();
         }
 
@@ -69,7 +69,7 @@ impl Check for MarkdownLint {
         }
 
         let lint_output = String::from_utf8_lossy(&output.stdout);
-        let filename = path.rsplit('/').next().unwrap_or(path);
+        let filename = path.rsplit('/').next().unwrap_or(&path);
 
         CheckResult::warn(format!(
             "⚠️  Markdown linting issues detected in {filename}\n\n{lint_output}\n\

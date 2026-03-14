@@ -185,13 +185,13 @@ impl Check for SecretLeaksGuard {
                 let Some(path) = input.file_path() else {
                     return CheckResult::allow();
                 };
-                let filename = path.rsplit('/').next().unwrap_or(path);
+                let filename = path.rsplit('/').next().unwrap_or(&path);
 
                 if is_safe_template(filename) {
                     return CheckResult::allow();
                 }
 
-                if is_blocked(filename, path) {
+                if is_blocked(filename, &path) {
                     return CheckResult::block(format!(
                         "🚫 BLOCKED (Read): '{filename}' contains secrets. \
                          Use direnv or shell env to make secrets available."
@@ -211,13 +211,13 @@ impl Check for SecretLeaksGuard {
                 let Some(path) = input.file_path() else {
                     return CheckResult::allow();
                 };
-                let filename = path.rsplit('/').next().unwrap_or(path);
+                let filename = path.rsplit('/').next().unwrap_or(&path);
 
                 if is_safe_template(filename) {
                     return CheckResult::allow();
                 }
 
-                if is_blocked(filename, path) {
+                if is_blocked(filename, &path) {
                     return CheckResult::block(format!(
                         "🚫 BLOCKED (Grep): '{filename}' contains secrets. \
                          Use direnv or shell env to make secrets available."
@@ -743,6 +743,41 @@ mod tests {
     fn case_insensitive_safe_template() {
         let result = SecretLeaksGuard.run(&make_read_input("/project/.ENV.EXAMPLE"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- Regression: path normalization bypass prevention ---
+
+    #[test]
+    fn trailing_slash_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/project/.env/"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn trailing_whitespace_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/project/.env "));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn null_byte_injection_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input("/project/.env\0.txt"));
+        // After null byte removal: "/project/.env.txt" - not a blocked name
+        // But the key is that \0 doesn't help bypass — ".env" files still blocked
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn null_byte_in_env_blocked() {
+        // Null byte at end — after removal it's just "/project/.env"
+        let result = SecretLeaksGuard.run(&make_read_input("/project/.env\0"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn backslash_path_blocked() {
+        let result = SecretLeaksGuard.run(&make_read_input(r"C:\Users\dev\.env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]

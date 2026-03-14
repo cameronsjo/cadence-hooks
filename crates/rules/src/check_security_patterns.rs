@@ -161,15 +161,15 @@ impl Check for SecurityPatternScanner {
             return CheckResult::allow();
         }
 
-        // Must be a real file to scan
-        if !std::path::Path::new(path).is_file() {
-            return CheckResult::allow();
-        }
-
         let ext = path.rsplit('.').next().unwrap_or("");
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return CheckResult::allow(),
+
+        // Prefer content from the tool input (Write/Edit); fall back to disk (Read/Grep)
+        let content = match input.content() {
+            Some(c) => c.to_string(),
+            None => match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => return CheckResult::allow(),
+            },
         };
 
         let warnings = scan_content(&content, ext);
@@ -177,7 +177,7 @@ impl Check for SecurityPatternScanner {
             return CheckResult::allow();
         }
 
-        let filename = path.rsplit('/').next().unwrap_or(path);
+        let filename = path.rsplit('/').next().unwrap_or(&path);
         let mut msg = format!("Security hints for {filename}:\n");
         for (line_num, message) in &warnings {
             msg.push_str(&format!("  L{line_num}: {message}\n"));
