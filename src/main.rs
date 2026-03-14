@@ -76,6 +76,8 @@ enum GuardrailsCommands {
     CheckIdleReturn,
     /// Warn when creating a branch from a non-main base
     WarnBranchBase,
+    /// Remind to check datetime before scheduling cron jobs
+    WarnCronDatetime,
 }
 
 #[derive(Subcommand)]
@@ -207,6 +209,9 @@ fn main() {
             GuardrailsCommands::WarnBranchBase => {
                 run_check_from_stdin(&cadence_hooks_guardrails::warn_branch_base::WarnBranchBase)
             }
+            GuardrailsCommands::WarnCronDatetime => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_cron_datetime::WarnCronDatetime,
+            ),
         },
         Commands::Rules(cmd) => match cmd {
             RulesCommands::ValidateFrontmatter => run_check_from_stdin(

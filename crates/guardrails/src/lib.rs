@@ -15,5 +15,7 @@ pub mod guard_git_init;
 pub mod guard_push_remote;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
+/// Remind to check datetime before scheduling cron jobs.
+pub mod warn_cron_datetime;
 /// Warn when editing files directly on main/master branch.
 pub mod warn_main_branch;
