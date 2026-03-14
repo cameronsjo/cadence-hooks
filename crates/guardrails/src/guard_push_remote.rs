@@ -6,7 +6,7 @@
 
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    git_command, parse_work_dir, repo_from_url, strip_quotes, LOOP_PATTERN,
+    LOOP_PATTERN, git_command, parse_work_dir, repo_from_url, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 

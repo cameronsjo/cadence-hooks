@@ -280,26 +280,24 @@ fn collect_push_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>)
                     });
                 }
             }
-            Command::Compound(compound, _) => {
-                match compound {
-                    CompoundCommand::ForClause(for_cmd) => {
-                        collect_push_from_body(&for_cmd.body.list, out);
-                    }
-                    CompoundCommand::WhileClause(while_cmd) => {
-                        collect_push_from_body(&while_cmd.1.list, out);
-                    }
-                    CompoundCommand::UntilClause(until_cmd) => {
-                        collect_push_from_body(&until_cmd.1.list, out);
-                    }
-                    CompoundCommand::BraceGroup(bg) => {
-                        collect_push_from_body(&bg.list, out);
-                    }
-                    CompoundCommand::Subshell(sub) => {
-                        collect_push_from_body(&sub.list, out);
-                    }
-                    _ => {}
+            Command::Compound(compound, _) => match compound {
+                CompoundCommand::ForClause(for_cmd) => {
+                    collect_push_from_body(&for_cmd.body.list, out);
                 }
-            }
+                CompoundCommand::WhileClause(while_cmd) => {
+                    collect_push_from_body(&while_cmd.1.list, out);
+                }
+                CompoundCommand::UntilClause(until_cmd) => {
+                    collect_push_from_body(&until_cmd.1.list, out);
+                }
+                CompoundCommand::BraceGroup(bg) => {
+                    collect_push_from_body(&bg.list, out);
+                }
+                CompoundCommand::Subshell(sub) => {
+                    collect_push_from_body(&sub.list, out);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -308,9 +306,7 @@ fn collect_push_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>)
 // --- Command identification helpers ---
 
 fn is_gh_command(cmd: &SimpleCommand) -> bool {
-    cmd.word_or_name
-        .as_ref()
-        .is_some_and(|w| w.value == "gh")
+    cmd.word_or_name.as_ref().is_some_and(|w| w.value == "gh")
 }
 
 fn is_git_push_command(cmd: &SimpleCommand) -> bool {
@@ -349,7 +345,8 @@ fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
 fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
     let words = suffix_words(cmd);
     // Skip "push", then skip flags, take first positional arg
-    let after_push: Vec<&str> = words.iter()
+    let after_push: Vec<&str> = words
+        .iter()
         .skip_while(|w| *w != "push")
         .skip(1) // skip "push" itself
         .filter(|w| !w.starts_with('-'))
@@ -388,7 +385,7 @@ mod tests {
     #[test]
     fn for_loop_with_explicit_repo_is_safe() {
         let result = analyze_gh_loops(
-            "for label in bug feat; do gh label create $label -R cameronsjo/repo; done"
+            "for label in bug feat; do gh label create $label -R cameronsjo/repo; done",
         );
         match result {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
@@ -401,17 +398,14 @@ mod tests {
 
     #[test]
     fn for_loop_without_repo_flag_is_unsafe() {
-        let result = analyze_gh_loops(
-            "for repo in a b; do gh pr create; done"
-        );
+        let result = analyze_gh_loops("for repo in a b; do gh pr create; done");
         assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
     }
 
     #[test]
     fn while_loop_with_gh_is_detected() {
-        let result = analyze_gh_loops(
-            "while read -r issue; do gh issue close $issue; done < issues.txt"
-        );
+        let result =
+            analyze_gh_loops("while read -r issue; do gh issue close $issue; done < issues.txt");
         assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
     }
 
@@ -419,7 +413,7 @@ mod tests {
     fn pipe_to_python_loop_not_a_gh_loop() {
         // The "for" is inside python, not a shell loop containing gh
         let result = analyze_gh_loops(
-            "gh api repos/owner/repo/issues | python3 -c \"import json,sys; [print(i['number']) for i in json.load(sys.stdin)]\""
+            "gh api repos/owner/repo/issues | python3 -c \"import json,sys; [print(i['number']) for i in json.load(sys.stdin)]\"",
         );
         assert!(matches!(result, LoopAnalysis::NoLoops));
     }
@@ -427,7 +421,7 @@ mod tests {
     #[test]
     fn for_loop_with_repo_flag_long_form() {
         let result = analyze_gh_loops(
-            "for i in 1 2 3; do gh issue comment $i --repo cameronsjo/test --body 'done'; done"
+            "for i in 1 2 3; do gh issue comment $i --repo cameronsjo/test --body 'done'; done",
         );
         match result {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
@@ -441,23 +435,21 @@ mod tests {
     fn mixed_loop_some_with_some_without_repo() {
         // Two gh commands in one loop body — one with -R, one without
         let result = analyze_gh_loops(
-            "for i in 1 2; do gh issue close $i -R cameronsjo/repo && gh pr create; done"
+            "for i in 1 2; do gh issue close $i -R cameronsjo/repo && gh pr create; done",
         );
         assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
     }
 
     #[test]
     fn no_gh_in_loop_body() {
-        let result = analyze_gh_loops(
-            "for f in *.txt; do echo $f; done"
-        );
+        let result = analyze_gh_loops("for f in *.txt; do echo $f; done");
         assert!(matches!(result, LoopAnalysis::NoLoops));
     }
 
     #[test]
     fn nested_loop_detects_gh() {
         let result = analyze_gh_loops(
-            "for repo in a b; do for label in bug feat; do gh label create $label; done; done"
+            "for repo in a b; do for label in bug feat; do gh label create $label; done; done",
         );
         assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
     }
@@ -472,9 +464,8 @@ mod tests {
 
     #[test]
     fn for_loop_push_with_explicit_remote() {
-        let result = analyze_push_loops(
-            "for branch in feat1 feat2; do git push origin $branch; done"
-        );
+        let result =
+            analyze_push_loops("for branch in feat1 feat2; do git push origin $branch; done");
         match result {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
                 assert_eq!(cmds[0].explicit_repo.as_deref(), Some("origin"));
@@ -485,9 +476,7 @@ mod tests {
 
     #[test]
     fn for_loop_push_without_remote() {
-        let result = analyze_push_loops(
-            "for branch in feat1 feat2; do git push; done"
-        );
+        let result = analyze_push_loops("for branch in feat1 feat2; do git push; done");
         assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
     }
 
@@ -495,9 +484,8 @@ mod tests {
 
     #[test]
     fn repo_flag_no_space() {
-        let result = analyze_gh_loops(
-            "for i in 1 2; do gh label create bug -Rcameronsjo/repo; done"
-        );
+        let result =
+            analyze_gh_loops("for i in 1 2; do gh label create bug -Rcameronsjo/repo; done");
         match result {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
                 assert_eq!(cmds[0].explicit_repo.as_deref(), Some("cameronsjo/repo"));
@@ -508,9 +496,8 @@ mod tests {
 
     #[test]
     fn repo_flag_equals_form() {
-        let result = analyze_gh_loops(
-            "for i in 1 2; do gh issue close $i --repo=cameronsjo/repo; done"
-        );
+        let result =
+            analyze_gh_loops("for i in 1 2; do gh issue close $i --repo=cameronsjo/repo; done");
         match result {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
                 assert_eq!(cmds[0].explicit_repo.as_deref(), Some("cameronsjo/repo"));

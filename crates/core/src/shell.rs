@@ -88,7 +88,8 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 }
 
 static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|([^ &;|]+))"#).expect("pattern should compile")
+    Regex::new(r#"(?:^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|([^ &;|]+))"#)
+        .expect("pattern should compile")
 });
 
 /// Extract the effective working directory from `cd` chains in a command.

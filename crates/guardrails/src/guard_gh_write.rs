@@ -6,7 +6,7 @@
 
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    git_command, parse_work_dir, repo_from_url, strip_quotes, LOOP_PATTERN,
+    LOOP_PATTERN, git_command, parse_work_dir, repo_from_url, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -85,7 +85,8 @@ fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String])
 
     // 4. Git remotes (with fork detection)
     if let Some(upstream_url) = git_command(work_dir, &["remote", "get-url", "upstream"]) {
-        let origin_url = git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
+        let origin_url =
+            git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
         return RepoResolution::Fork {
             origin: repo_from_url(&origin_url).unwrap_or_default(),
             upstream: repo_from_url(&upstream_url).unwrap_or_default(),

@@ -72,9 +72,7 @@ impl Check for WarnMainBranch {
             _ => return CheckResult::allow(),
         };
 
-        let already_warned = Self::marker_path()
-            .as_ref()
-            .is_some_and(|p| p.exists());
+        let already_warned = Self::marker_path().as_ref().is_some_and(|p| p.exists());
 
         let result = should_warn(&branch, already_warned);
 
