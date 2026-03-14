@@ -109,6 +109,47 @@ fn is_doc_file(path: &str) -> bool {
     DOC_FILES.contains(&name) || path.starts_with("docs/")
 }
 
+/// Result of analyzing a diff for documentation coverage.
+pub struct DiffAnalysis {
+    /// Number of code files changed.
+    pub code_count: usize,
+    /// Whether any documentation files were changed.
+    pub has_doc_changes: bool,
+    /// Doc files that weren't updated.
+    pub missing_docs: Vec<&'static str>,
+    /// Whether dependency manifest files were changed.
+    pub has_dependency_changes: bool,
+    /// Whether public API files were changed.
+    pub has_api_changes: bool,
+}
+
+/// Analyze a list of changed file paths for documentation gaps.
+///
+/// Pure function — no I/O. Takes the output of `git diff --name-only`.
+pub fn analyze_diff(changed_files: &[String]) -> DiffAnalysis {
+    let code_count = changed_files.iter().filter(|f| is_code_file(f)).count();
+    let has_doc_changes = changed_files.iter().any(|f| is_doc_file(f));
+    let missing_docs: Vec<&str> = DOC_FILES
+        .iter()
+        .copied()
+        .filter(|doc| !changed_files.iter().any(|f| f.ends_with(doc)))
+        .collect();
+    let has_dependency_changes = changed_files.iter().any(|f| {
+        f.contains("Cargo.toml") || f.contains("package.json") || f.contains("pyproject.toml")
+    });
+    let has_api_changes = changed_files
+        .iter()
+        .any(|f| f.starts_with("src/main") || f.contains("lib.rs") || f.contains("mod.rs"));
+
+    DiffAnalysis {
+        code_count,
+        has_doc_changes,
+        missing_docs,
+        has_dependency_changes,
+        has_api_changes,
+    }
+}
+
 fn diff_against_base() -> Option<Vec<String>> {
     // Try to find the base branch
     let base = find_base_branch()?;
@@ -229,5 +270,81 @@ mod tests {
     fn issue_create_not_matched() {
         let result = WarnDocsUpdate.run(&make_bash("gh issue create --title test"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- analyze_diff: pure function tests ---
+
+    #[test]
+    fn code_only_diff() {
+        let files = vec!["src/main.rs".into(), "src/lib.rs".into()];
+        let analysis = analyze_diff(&files);
+        assert_eq!(analysis.code_count, 2);
+        assert!(!analysis.has_doc_changes);
+        assert_eq!(analysis.missing_docs.len(), 3);
+    }
+
+    #[test]
+    fn code_and_docs_diff() {
+        let files = vec!["src/main.rs".into(), "README.md".into()];
+        let analysis = analyze_diff(&files);
+        assert_eq!(analysis.code_count, 1);
+        assert!(analysis.has_doc_changes);
+    }
+
+    #[test]
+    fn docs_only_diff() {
+        let files = vec!["README.md".into(), "CHANGELOG.md".into()];
+        let analysis = analyze_diff(&files);
+        assert_eq!(analysis.code_count, 0);
+        assert!(analysis.has_doc_changes);
+    }
+
+    #[test]
+    fn cargo_toml_signals_dependency() {
+        let files = vec!["Cargo.toml".into(), "src/main.rs".into()];
+        let analysis = analyze_diff(&files);
+        assert!(analysis.has_dependency_changes);
+    }
+
+    #[test]
+    fn package_json_signals_dependency() {
+        let files = vec!["package.json".into(), "src/index.ts".into()];
+        let analysis = analyze_diff(&files);
+        assert!(analysis.has_dependency_changes);
+    }
+
+    #[test]
+    fn lib_rs_signals_api() {
+        let files = vec!["src/lib.rs".into()];
+        let analysis = analyze_diff(&files);
+        assert!(analysis.has_api_changes);
+    }
+
+    #[test]
+    fn mod_rs_signals_api() {
+        let files = vec!["src/handlers/mod.rs".into()];
+        let analysis = analyze_diff(&files);
+        assert!(analysis.has_api_changes);
+    }
+
+    #[test]
+    fn empty_diff() {
+        let files: Vec<String> = vec![];
+        let analysis = analyze_diff(&files);
+        assert_eq!(analysis.code_count, 0);
+        assert!(!analysis.has_doc_changes);
+        assert!(!analysis.has_dependency_changes);
+    }
+
+    // --- is_code_file / is_doc_file edge cases ---
+
+    #[test]
+    fn is_code_file_no_extension() {
+        assert!(!is_code_file("Makefile"));
+    }
+
+    #[test]
+    fn is_doc_file_nested_readme() {
+        assert!(is_doc_file("packages/core/README.md"));
     }
 }

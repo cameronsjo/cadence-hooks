@@ -273,4 +273,89 @@ mod tests {
         let found = check_terminology(&mixed);
         assert_eq!(found.len(), 1);
     }
+
+    // --- additional edge cases ---
+
+    #[test]
+    fn violation_with_punctuation() {
+        // Term followed by punctuation should still match (word boundary at comma)
+        let input = format!("{}, which we use daily", VIOLATIONS[0].0);
+        let found = check_terminology(&input);
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn violation_at_line_start() {
+        let input = format!("{} is configured", VIOLATIONS[0].0);
+        let found = check_terminology(&input);
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn repeated_term_counted_once() {
+        // RegexSet reports each pattern once, not per-occurrence
+        let input = format!("{} and also {} again", VIOLATIONS[0].0, VIOLATIONS[0].0);
+        let found = check_terminology(&input);
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn no_path_allows_run() {
+        // No file_path but content has violation — should still block
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: None,
+                content: Some(VIOLATIONS[0].0.to_string()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn multiple_violations_in_run() {
+        let content = format!("{} and {}", VIOLATIONS[0].0, VIOLATIONS[1].0);
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some("/project/src/config.rs".into()),
+                path: None,
+                command: None,
+                content: Some(content),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        let msg = result.message.unwrap();
+        assert!(msg.contains(VIOLATIONS[0].0));
+        assert!(msg.contains(VIOLATIONS[1].0));
+    }
+
+    #[test]
+    fn settings_json_not_excluded() {
+        // settings.json is NOT an excluded path
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some("/home/dev/.claude/settings.json".into()),
+                path: None,
+                command: None,
+                content: Some(VIOLATIONS[0].0.to_string()),
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
 }
