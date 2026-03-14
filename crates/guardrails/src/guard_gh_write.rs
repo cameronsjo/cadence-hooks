@@ -630,7 +630,10 @@ mod tests {
                     let reconstructed = format!("gh {}", c.args.join(" "));
                     is_write_command(&reconstructed)
                 });
-                assert!(!has_write, "read-only gh loop should not be flagged as write");
+                assert!(
+                    !has_write,
+                    "read-only gh loop should not be flagged as write"
+                );
             }
             LoopAnalysis::NoLoops => panic!("should detect loop"),
             _ => {} // AllTargetsExplicit or ParseFailed are fine
@@ -656,9 +659,7 @@ mod tests {
     #[test]
     fn loop_mixed_read_write_without_repo_blocked() {
         // gh pr list (read) + gh issue close (write) in a loop — should block
-        let result = analyze_gh_loops(
-            "for i in 1 2; do gh pr list && gh issue close $i; done",
-        );
+        let result = analyze_gh_loops("for i in 1 2; do gh pr list && gh issue close $i; done");
         match result {
             LoopAnalysis::MissingTargets(cmds) => {
                 let has_write = cmds.iter().any(|c| {

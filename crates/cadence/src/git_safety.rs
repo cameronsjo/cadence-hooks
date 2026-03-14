@@ -94,9 +94,7 @@ fn normalize_git_command(command: &str) -> String {
 /// Check whether a short flag cluster (e.g., `-fu`, `-xfd`) contains a
 /// specific flag character.
 fn short_flags_contain(token: &str, flag: char) -> bool {
-    token.starts_with('-')
-        && !token.starts_with("--")
-        && token[1..].contains(flag)
+    token.starts_with('-') && !token.starts_with("--") && token[1..].contains(flag)
 }
 
 /// Return true if `branch` matches a protected branch name as a standalone
@@ -131,9 +129,7 @@ fn is_delete_refspec_for_protected_branch(token: &str) -> bool {
 /// Check if a command is an alias definition (should not be blocked).
 fn is_alias_definition(command: &str) -> bool {
     let trimmed = command.trim_start();
-    trimmed.starts_with("alias ")
-        || trimmed.starts_with("git config")
-            && command.contains("alias.")
+    trimmed.starts_with("alias ") || trimmed.starts_with("git config") && command.contains("alias.")
 }
 
 /// Blocks destructive git commands and warns on history-modifying operations.
@@ -177,9 +173,9 @@ impl GitSafetyGuard {
         // Check for force push to protected branch
         if has_force {
             // Check if any arg is a protected branch name
-            let targets_protected = args.iter().any(|a| {
-                is_protected_branch(a) || is_refspec_to_protected_branch(a)
-            });
+            let targets_protected = args
+                .iter()
+                .any(|a| is_protected_branch(a) || is_refspec_to_protected_branch(a));
             if targets_protected {
                 return Some("Force push to protected branch".into());
             }
@@ -194,18 +190,16 @@ impl GitSafetyGuard {
         }
 
         // Check for colon-prefixed delete refspec (:main, :refs/heads/main)
-        let has_delete_refspec = args.iter().any(|a| {
-            is_delete_refspec_for_protected_branch(a)
-        });
+        let has_delete_refspec = args
+            .iter()
+            .any(|a| is_delete_refspec_for_protected_branch(a));
         if has_delete_refspec {
             return Some("Delete of protected branch via colon refspec".into());
         }
 
         // Check for refspec targeting protected branch (HEAD:main, etc.)
         // even without --force (this is a push that overwrites a protected branch)
-        let has_protected_refspec = args.iter().any(|a| {
-            is_refspec_to_protected_branch(a)
-        });
+        let has_protected_refspec = args.iter().any(|a| is_refspec_to_protected_branch(a));
         if has_protected_refspec && has_force {
             return Some("Force push via refspec to protected branch".into());
         }
@@ -230,11 +224,9 @@ impl GitSafetyGuard {
 
     fn check_clean_blocked(&self, args: &[&str]) -> Option<String> {
         // git clean is dangerous when it has -f/--force (required to actually delete)
-        let has_force = args.iter().any(|a| {
-            *a == "--force"
-                || *a == "-f"
-                || short_flags_contain(a, 'f')
-        });
+        let has_force = args
+            .iter()
+            .any(|a| *a == "--force" || *a == "-f" || short_flags_contain(a, 'f'));
         if has_force {
             return Some("git clean with force flag".into());
         }
@@ -256,11 +248,9 @@ impl GitSafetyGuard {
     }
 
     fn check_branch_blocked(&self, args: &[&str]) -> Option<String> {
-        let has_delete = args.iter().any(|a| {
-            *a == "-d"
-                || *a == "--delete"
-                || short_flags_contain(a, 'd')
-        });
+        let has_delete = args
+            .iter()
+            .any(|a| *a == "-d" || *a == "--delete" || short_flags_contain(a, 'd'));
         if has_delete {
             let targets_protected = args.iter().any(|a| is_protected_branch(a));
             if targets_protected {
@@ -272,9 +262,9 @@ impl GitSafetyGuard {
 
     fn check_rebase_blocked(&self, args: &[&str]) -> Option<String> {
         // Check if any non-flag argument is exactly a protected branch name
-        let targets_protected = args.iter().any(|a| {
-            !a.starts_with('-') && is_protected_branch(a)
-        });
+        let targets_protected = args
+            .iter()
+            .any(|a| !a.starts_with('-') && is_protected_branch(a));
         if targets_protected {
             return Some("Rebase onto protected branch".into());
         }
@@ -320,11 +310,9 @@ impl GitSafetyGuard {
                 None
             }
             "branch" => {
-                let has_delete = args.iter().any(|a| {
-                    *a == "-d"
-                        || *a == "--delete"
-                        || short_flags_contain(a, 'd')
-                });
+                let has_delete = args
+                    .iter()
+                    .any(|a| *a == "-d" || *a == "--delete" || short_flags_contain(a, 'd'));
                 if has_delete {
                     return Some("git branch delete".into());
                 }
@@ -460,7 +448,9 @@ mod tests {
     #[test]
     fn normalize_strips_multiple_global_flags() {
         assert_eq!(
-            normalize_git_command("git --no-pager -C /repo --git-dir=/repo/.git push -f origin main"),
+            normalize_git_command(
+                "git --no-pager -C /repo --git-dir=/repo/.git push -f origin main"
+            ),
             "git push -f origin main"
         );
     }
@@ -798,13 +788,16 @@ mod tests {
 
     #[test]
     fn no_pager_force_push_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input("git --no-pager push --force origin main"));
+        let result =
+            GitSafetyGuard.run(&make_bash_input("git --no-pager push --force origin main"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn c_flag_force_push_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input("git -C /some/path push --force origin main"));
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git -C /some/path push --force origin main",
+        ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
@@ -1003,9 +996,8 @@ mod tests {
 
     #[test]
     fn alias_definition_containing_force_push_allowed() {
-        let result = GitSafetyGuard.run(&make_bash_input(
-            "alias gfp='git push --force origin main'",
-        ));
+        let result =
+            GitSafetyGuard.run(&make_bash_input("alias gfp='git push --force origin main'"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
@@ -1060,9 +1052,8 @@ mod tests {
 
     #[test]
     fn force_with_lease_main_blocked() {
-        let result = GitSafetyGuard.run(&make_bash_input(
-            "git push --force-with-lease origin main",
-        ));
+        let result =
+            GitSafetyGuard.run(&make_bash_input("git push --force-with-lease origin main"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 

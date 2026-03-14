@@ -61,9 +61,9 @@ pub fn find_orphaned(content: &str) -> Vec<(usize, String)> {
 
         // Check each orphaned match — only truly orphaned if no referenced match
         // starts at the same byte offset
-        let has_orphan = ORPHANED_PATTERN.find_iter(line).any(|m| {
-            !referenced_offsets.contains(&m.start())
-        });
+        let has_orphan = ORPHANED_PATTERN
+            .find_iter(line)
+            .any(|m| !referenced_offsets.contains(&m.start()));
 
         if has_orphan {
             orphans.push((idx + 1, line.trim().to_string()));
@@ -443,6 +443,10 @@ mod tests {
     fn two_orphaned_markers_same_line_detected() {
         let content = "// TODO: first FIXME: second";
         let orphans = find_orphaned(content);
-        assert_eq!(orphans.len(), 1, "line should appear once even with two orphans");
+        assert_eq!(
+            orphans.len(),
+            1,
+            "line should appear once even with two orphans"
+        );
     }
 }

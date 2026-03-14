@@ -181,10 +181,7 @@ mod tests {
     fn detects_sanity_check_plural() {
         let found = check_terminology("sanity checks");
         assert_eq!(found.len(), 1);
-        assert_eq!(
-            found[0].1,
-            "validation check, confidence check, smoke test"
-        );
+        assert_eq!(found[0].1, "validation check, confidence check, smoke test");
     }
 
     #[test]
@@ -197,10 +194,7 @@ mod tests {
     fn detects_dummy_values_plural() {
         let found = check_terminology("dummy values");
         assert_eq!(found.len(), 1);
-        assert_eq!(
-            found[0].1,
-            "placeholder value, sample value, mock value"
-        );
+        assert_eq!(found[0].1, "placeholder value, sample value, mock value");
     }
 
     #[test]

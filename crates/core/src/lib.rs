@@ -386,23 +386,20 @@ mod tests {
 
     #[test]
     fn normalize_converts_backslashes() {
-        assert_eq!(
-            normalize_path(r"C:\Users\dev\.env"),
-            "C:/Users/dev/.env"
-        );
+        assert_eq!(normalize_path(r"C:\Users\dev\.env"), "C:/Users/dev/.env");
     }
 
     #[test]
     fn normalize_combined_attack() {
-        assert_eq!(
-            normalize_path(" /project/.env\0/ "),
-            "/project/.env"
-        );
+        assert_eq!(normalize_path(" /project/.env\0/ "), "/project/.env");
     }
 
     #[test]
     fn normalize_preserves_clean_path() {
-        assert_eq!(normalize_path("/project/src/main.rs"), "/project/src/main.rs");
+        assert_eq!(
+            normalize_path("/project/src/main.rs"),
+            "/project/src/main.rs"
+        );
     }
 
     #[test]

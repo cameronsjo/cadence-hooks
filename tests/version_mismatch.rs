@@ -157,9 +157,7 @@ fn distant_name_subcommand_fails_open() {
 fn missing_subcommand_fails_open() {
     // Running `cadence-hooks` with no arguments triggers MissingSubcommand.
     // This must exit 1 (warn), not 2 (block).
-    let output = cadence_hooks()
-        .output()
-        .expect("failed to execute binary");
+    let output = cadence_hooks().output().expect("failed to execute binary");
 
     assert_eq!(
         output.status.code(),

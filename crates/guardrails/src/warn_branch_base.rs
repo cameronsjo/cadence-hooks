@@ -65,9 +65,7 @@ fn is_branch_create(command: &str) -> bool {
 
     // git switch -c/-C/--create <name>
     let has_switch_c = tokens.windows(3).any(|w| {
-        w[0] == "git"
-            && w[1] == "switch"
-            && (w[2] == "-c" || w[2] == "-C" || w[2] == "--create")
+        w[0] == "git" && w[1] == "switch" && (w[2] == "-c" || w[2] == "-C" || w[2] == "--create")
     });
 
     has_checkout_b || has_switch_c

@@ -353,10 +353,7 @@ mod tests {
     fn cd_before_or_does_not_apply() {
         // cd before || only runs on success; git push runs on failure,
         // so the push executes from the original cwd, not /project.
-        assert_eq!(
-            parse_work_dir("cd /project || git push", "/home"),
-            "/home"
-        );
+        assert_eq!(parse_work_dir("cd /project || git push", "/home"), "/home");
     }
 
     #[test]
