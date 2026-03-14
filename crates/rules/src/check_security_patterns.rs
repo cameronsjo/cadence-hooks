@@ -128,11 +128,11 @@ pub fn scan_content(content: &str, ext: &str) -> Vec<(usize, &'static str)> {
             continue;
         }
 
-        if let Ok(re) = Regex::new(sp.pattern)
-            && let Some(m) = re.find(content)
-        {
-            let line_num = content[..m.start()].lines().count() + 1;
-            warnings.push((line_num, sp.message));
+        if let Ok(re) = Regex::new(sp.pattern) {
+            for m in re.find_iter(content) {
+                let line_num = content[..m.start()].lines().count() + 1;
+                warnings.push((line_num, sp.message));
+            }
         }
     }
 
@@ -331,8 +331,9 @@ mod tests {
 
     #[test]
     fn cs_type_name_handling() {
+        // Pattern matches every occurrence — both TypeNameHandling references flagged
         let results = scan_content("TypeNameHandling = TypeNameHandling.All", "cs");
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         assert!(results[0].1.contains("Deserialization"));
     }
 
@@ -364,6 +365,19 @@ mod tests {
         let content = "pickle.loads(x)\nyaml.load(f)\nshell = True";
         let results = scan_content(content, "py");
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn same_pattern_multiple_occurrences() {
+        // Bug: scan_content uses re.find() which returns only the first match.
+        // Multiple occurrences of the same pattern are silently dropped.
+        let content = "yaml.load(a)\nok_line()\nyaml.load(b)";
+        let results = scan_content(content, "py");
+        assert_eq!(
+            results.len(),
+            2,
+            "should report both yaml.load occurrences, got {results:?}"
+        );
     }
 
     #[test]

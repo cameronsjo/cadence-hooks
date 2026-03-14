@@ -26,7 +26,8 @@ static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*\s(-f\s|--field\s|-F\s|--raw-field\s)").expect("pattern should compile")
+    Regex::new(r"gh\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
+        .expect("pattern should compile")
 });
 
 static API_INPUT_FLAG: LazyLock<Regex> =
@@ -246,7 +247,7 @@ impl Check for GhWriteGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadence_hooks_core::loop_analysis::{self, LoopAnalysis, analyze_gh_loops};
+    use cadence_hooks_core::loop_analysis::{LoopAnalysis, analyze_gh_loops};
 
     #[test]
     fn detects_pr_create_as_write() {
@@ -573,6 +574,15 @@ mod tests {
             }
             other => panic!("expected Resolved, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn api_compact_field_flag_detected() {
+        // Bug: -fkey=value (no space after -f) evades write detection
+        assert!(
+            is_write_command("gh api repos/foo/bar -ftitle=test"),
+            "compact -f flag should be detected as write"
+        );
     }
 
     #[test]

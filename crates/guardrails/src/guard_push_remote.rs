@@ -89,8 +89,8 @@ impl Check for PushRemoteGuard {
             );
         }
 
-        // Complexity gate: block batch pushes
-        let push_count = command.matches("git push").count();
+        // Complexity gate: block batch pushes (strip quotes to avoid false positives)
+        let push_count = strip_quotes(command).matches("git push").count();
         if push_count > 1 {
             return CheckResult::block(
                 "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
@@ -336,6 +336,21 @@ mod tests {
         // Should NOT block as "multiple" — only one push
         let msg = result.message.as_deref().unwrap_or("");
         assert!(!msg.contains("multiple"));
+    }
+
+    #[test]
+    fn multi_push_false_positive_in_quotes() {
+        // Bug: push_count uses substring match, not command-boundary match
+        // "git push" inside an echo string should not count as a second push
+        let result = PushRemoteGuard.run(&make_bash(
+            "echo 'do not git push this' && git push origin main",
+        ));
+        // Should NOT block as "multiple" — only one actual git push command
+        let msg = result.message.as_deref().unwrap_or("");
+        assert!(
+            !msg.contains("multiple"),
+            "false positive: quoted 'git push' counted as second push"
+        );
     }
 
     #[test]

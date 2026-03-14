@@ -68,11 +68,11 @@ impl Check for MarkdownLint {
             return CheckResult::allow();
         }
 
-        let stderr = String::from_utf8_lossy(&output.stdout);
+        let lint_output = String::from_utf8_lossy(&output.stdout);
         let filename = path.rsplit('/').next().unwrap_or(path);
 
         CheckResult::warn(format!(
-            "⚠️  Markdown linting issues detected in {filename}\n\n{stderr}\n\
+            "⚠️  Markdown linting issues detected in {filename}\n\n{lint_output}\n\
              Fix: markdownlint --fix {path}"
         ))
     }

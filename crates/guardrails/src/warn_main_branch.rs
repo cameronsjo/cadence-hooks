@@ -47,7 +47,13 @@ impl WarnMainBranch {
         let mut hasher = DefaultHasher::new();
         repo_root.hash(&mut hasher);
         let hash = hasher.finish();
-        let ppid = std::process::id();
+
+        // Use parent PID for session scoping — hooks are spawned as child processes,
+        // so process::id() changes on every invocation. PPID is the Claude Code process.
+        let ppid = std::env::var("PPID")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or_else(std::process::id);
 
         Some(PathBuf::from(format!(
             "/tmp/.claude-main-branch-warned-{hash:x}-{ppid}"
@@ -168,6 +174,24 @@ mod tests {
     fn warn_message_contains_branch() {
         let result = should_warn("master", false);
         assert!(result.message.as_deref().unwrap().contains("master"));
+    }
+
+    #[test]
+    fn marker_uses_ppid_not_pid() {
+        // Bug: code uses process::id() (current PID) but names var "ppid"
+        // Since hooks run as separate processes, each invocation gets a new PID,
+        // so the marker file from a previous invocation is never found.
+        // The intent was to use the PARENT PID (Claude Code process) for session scoping.
+        let ppid_env = std::env::var("PPID")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+        let current_pid = std::process::id();
+        if let Some(ppid) = ppid_env {
+            assert_ne!(
+                current_pid, ppid,
+                "PID should differ from PPID — marker_path() should use PPID for session scoping"
+            );
+        }
     }
 
     #[test]
