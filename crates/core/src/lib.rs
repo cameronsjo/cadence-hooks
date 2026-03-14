@@ -6,6 +6,8 @@
 //! - 1: warn (operation proceeds, message shown)
 //! - 2: block (operation prevented)
 
+pub mod shell;
+
 use serde::Deserialize;
 use std::io::Read;
 use std::process;

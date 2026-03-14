@@ -3,6 +3,7 @@
 //! `gh repo delete` is permanently destructive with no undo. This guard
 //! blocks it in direct invocations and inside shell exec wrappers (`bash -c`).
 
+use cadence_hooks_core::shell::strip_quotes;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -51,33 +52,6 @@ impl Check for GhDangerousGuard {
 
         CheckResult::allow()
     }
-}
-
-fn strip_quotes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if nc == '"' {
-                        break;
-                    }
-                }
-            }
-            '\'' => {
-                while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if nc == '\'' {
-                        break;
-                    }
-                }
-            }
-            _ => result.push(c),
-        }
-    }
-    result
 }
 
 #[cfg(test)]
@@ -150,34 +124,6 @@ mod tests {
     fn sh_wrapper_blocked() {
         let result = GhDangerousGuard.run(&make_bash("sh -c \"gh repo delete my-repo --yes\""));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-    }
-
-    // strip_quotes tests
-    #[test]
-    fn strip_double_quotes() {
-        assert_eq!(strip_quotes("echo \"hello\" world"), "echo  world");
-    }
-
-    #[test]
-    fn strip_single_quotes() {
-        assert_eq!(strip_quotes("echo 'hello' world"), "echo  world");
-    }
-
-    #[test]
-    fn strip_empty_quotes() {
-        assert_eq!(strip_quotes("echo \"\" world"), "echo  world");
-    }
-
-    #[test]
-    fn strip_no_quotes() {
-        assert_eq!(strip_quotes("echo hello"), "echo hello");
-    }
-
-    #[test]
-    fn strip_unmatched_quote_consumes_rest() {
-        // Unmatched quote consumes everything after it
-        let result = strip_quotes("echo \"unterminated");
-        assert_eq!(result, "echo ");
     }
 
     // --- Unhappy path: evasion scenarios ---
