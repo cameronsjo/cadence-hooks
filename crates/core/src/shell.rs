@@ -341,4 +341,115 @@ mod tests {
     fn no_match_normal_command() {
         assert!(!LOOP_PATTERN.is_match("git push origin main"));
     }
+
+    // --- adversarial: repo_from_url ---
+
+    #[test]
+    fn git_protocol_url() {
+        assert_eq!(
+            repo_from_url("git://github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_owner_returns_none() {
+        assert_eq!(repo_from_url("https://github.com//repo.git"), None);
+    }
+
+    #[test]
+    fn owner_only_no_repo() {
+        assert_eq!(repo_from_url("https://github.com/owner"), None);
+    }
+
+    #[test]
+    fn deep_path_takes_first_two() {
+        assert_eq!(
+            repo_from_url("https://github.com/owner/repo/tree/main/src"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn url_with_query_string() {
+        // Query string is part of the path after splitn — repo extracts cleanly
+        // because splitn(3, '/') captures at most 3 segments
+        let result = repo_from_url("https://github.com/owner/repo?tab=readme");
+        assert_eq!(result, Some("owner/repo?tab=readme".to_string()));
+    }
+
+    #[test]
+    fn url_with_fragment() {
+        let result = repo_from_url("https://github.com/owner/repo#section");
+        assert_eq!(result, Some("owner/repo#section".to_string()));
+    }
+
+    #[test]
+    fn empty_string_returns_none() {
+        assert_eq!(repo_from_url(""), None);
+    }
+
+    // --- adversarial: strip_quotes ---
+
+    #[test]
+    fn unicode_smart_quotes_not_stripped() {
+        // Smart quotes (U+201C, U+201D) are not stripped — only ASCII quotes
+        assert_eq!(
+            strip_quotes("echo \u{201c}hello\u{201d}"),
+            "echo \u{201c}hello\u{201d}"
+        );
+    }
+
+    // --- adversarial: parse_work_dir ---
+
+    #[test]
+    fn semicolon_no_space() {
+        assert_eq!(parse_work_dir("cd /project;git push", "/home"), "/project");
+    }
+
+    #[test]
+    fn relative_parent_path() {
+        assert_eq!(
+            parse_work_dir("cd ../sibling && git push", "/home/user/project"),
+            "/home/user/project/../sibling"
+        );
+    }
+
+    #[test]
+    fn mixed_separators() {
+        assert_eq!(
+            parse_work_dir("cd /first && cd /second; cd /third && git push", "/home"),
+            "/third"
+        );
+    }
+
+    #[test]
+    fn no_cd_returns_cwd() {
+        assert_eq!(
+            parse_work_dir("git push origin main", "/workspace"),
+            "/workspace"
+        );
+    }
+
+    #[test]
+    fn cd_in_double_quotes_not_executed() {
+        // cd inside quotes should still be captured by the regex if quoted path
+        let result = parse_work_dir("cd \"/some/path\" && git push", "/home");
+        assert_eq!(result, "/some/path");
+    }
+
+    // --- adversarial: LOOP_PATTERN ---
+
+    #[test]
+    fn incomplete_for_without_do_still_matches() {
+        // LOOP_PATTERN is intentionally broad — matches "for x in" even without "do"
+        // The AST parser handles syntactic validation; regex is a safety net
+        assert!(LOOP_PATTERN.is_match("for x in 1 2 3"));
+    }
+
+    #[test]
+    fn for_in_word_boundary() {
+        // "information" contains "for" but not as a word boundary
+        assert!(!LOOP_PATTERN.is_match("echo information about this"));
+    }
 }

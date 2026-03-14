@@ -505,4 +505,117 @@ mod tests {
             other => panic!("expected AllTargetsExplicit, got {other:?}"),
         }
     }
+
+    // --- adversarial: nested and complex structures ---
+
+    #[test]
+    fn nested_for_loops_with_inner_target() {
+        let result = analyze_gh_loops(
+            "for repo in a b; do for label in bug feat; do gh label create $label -R $repo; done; done",
+        );
+        match result {
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                assert_eq!(cmds.len(), 1);
+            }
+            other => panic!("expected AllTargetsExplicit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn until_loop_with_gh() {
+        let result = analyze_gh_loops("until false; do gh issue list; done");
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    #[test]
+    fn subshell_inside_loop() {
+        let result = analyze_gh_loops("for i in 1 2; do (gh pr create --title test); done");
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    #[test]
+    fn brace_group_inside_loop() {
+        let result = analyze_gh_loops("for i in 1 2; do { gh pr create --title test; }; done");
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    #[test]
+    fn mixed_explicit_implicit_targets() {
+        let result = analyze_gh_loops(
+            "for i in 1 2; do gh issue close $i -R cameronsjo/repo && gh pr create; done",
+        );
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    #[test]
+    fn empty_command_no_loops() {
+        let result = analyze_gh_loops("");
+        assert!(matches!(result, LoopAnalysis::NoLoops));
+    }
+
+    #[test]
+    fn three_deep_nesting() {
+        let result = analyze_gh_loops(
+            "for a in 1; do for b in 2; do for c in 3; do gh issue comment $c; done; done; done",
+        );
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    #[test]
+    fn pipe_chain_in_loop() {
+        let result = analyze_gh_loops("for r in a b; do gh issue list -R $r | head -5; done");
+        // gh issue list is not a write but is detected inside loop
+        match result {
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                assert_eq!(cmds.len(), 1);
+            }
+            other => panic!("expected AllTargetsExplicit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn and_chain_in_loop() {
+        let result = analyze_gh_loops("for i in 1 2; do echo start && gh pr close $i; done");
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    #[test]
+    fn or_chain_in_loop() {
+        let result = analyze_gh_loops("for i in 1 2; do gh pr close $i || echo failed; done");
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    // --- adversarial: push loop variants ---
+
+    #[test]
+    fn push_with_flags_in_loop() {
+        let result =
+            analyze_push_loops("for b in feat1 feat2; do git push --force origin $b; done");
+        match result {
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                assert_eq!(cmds[0].explicit_repo.as_deref(), Some("origin"));
+            }
+            other => panic!("expected AllTargetsExplicit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_bare_in_until_loop() {
+        let result = analyze_push_loops("until false; do git push; done");
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    #[test]
+    fn push_empty_command() {
+        let result = analyze_push_loops("");
+        assert!(matches!(result, LoopAnalysis::NoLoops));
+    }
+
+    #[test]
+    fn push_three_deep_nesting() {
+        let result = analyze_push_loops(
+            "for a in 1; do for b in 2; do for c in 3; do git push; done; done; done",
+        );
+        assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
 }
