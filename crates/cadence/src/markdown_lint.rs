@@ -7,6 +7,23 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::io::Write;
 use std::process::Command;
 
+/// Determine if the input represents a markdown Write operation worth linting.
+///
+/// Returns `true` when: path ends with `.md`, tool is `Write`, and content exists.
+/// Pure guard-clause logic — no I/O.
+pub fn should_lint(path: Option<&str>, tool_name: Option<&str>, content: Option<&str>) -> bool {
+    let Some(p) = path else {
+        return false;
+    };
+    if !p.ends_with(".md") {
+        return false;
+    }
+    if tool_name != Some("Write") {
+        return false;
+    }
+    content.is_some()
+}
+
 /// Warns when markdownlint reports issues in written markdown content.
 pub struct MarkdownLint;
 
@@ -16,22 +33,12 @@ impl Check for MarkdownLint {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let Some(path) = input.file_path() else {
-            return CheckResult::allow();
-        };
-
-        if !path.ends_with(".md") {
+        if !should_lint(input.file_path(), input.tool_name(), input.content()) {
             return CheckResult::allow();
         }
 
-        // Only check Write operations (Edit is validated at final Write)
-        if input.tool_name() != Some("Write") {
-            return CheckResult::allow();
-        }
-
-        let Some(content) = input.content() else {
-            return CheckResult::allow();
-        };
+        let content = input.content().unwrap();
+        let path = input.file_path().unwrap();
 
         // Check if markdownlint is available
         if Command::new("markdownlint")
@@ -68,5 +75,79 @@ impl Check for MarkdownLint {
             "⚠️  Markdown linting issues detected in {filename}\n\n{stderr}\n\
              Fix: markdownlint --fix {path}"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_path_returns_false() {
+        assert!(!should_lint(None, Some("Write"), Some("# Hello")));
+    }
+
+    #[test]
+    fn non_md_returns_false() {
+        assert!(!should_lint(
+            Some("/project/src/main.rs"),
+            Some("Write"),
+            Some("code")
+        ));
+    }
+
+    #[test]
+    fn non_write_tool_returns_false() {
+        assert!(!should_lint(
+            Some("/project/README.md"),
+            Some("Edit"),
+            Some("# Hi")
+        ));
+    }
+
+    #[test]
+    fn no_content_returns_false() {
+        assert!(!should_lint(
+            Some("/project/README.md"),
+            Some("Write"),
+            None
+        ));
+    }
+
+    #[test]
+    fn md_write_with_content_returns_true() {
+        assert!(should_lint(
+            Some("/project/README.md"),
+            Some("Write"),
+            Some("# Hello\n\nWorld")
+        ));
+    }
+
+    #[test]
+    fn nested_path_md_returns_true() {
+        assert!(should_lint(
+            Some("/project/docs/guide/setup.md"),
+            Some("Write"),
+            Some("content")
+        ));
+    }
+
+    #[test]
+    fn uppercase_md_returns_false() {
+        // .MD is not .md — case sensitive extension check
+        assert!(!should_lint(
+            Some("/project/README.MD"),
+            Some("Write"),
+            Some("# Hi")
+        ));
+    }
+
+    #[test]
+    fn read_tool_returns_false() {
+        assert!(!should_lint(
+            Some("/project/README.md"),
+            Some("Read"),
+            Some("# Hi")
+        ));
     }
 }

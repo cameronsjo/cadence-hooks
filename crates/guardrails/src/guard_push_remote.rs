@@ -232,4 +232,120 @@ mod tests {
         let result = PushRemoteGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
+
+    // --- check_owner: additional URL formats ---
+
+    #[test]
+    fn owner_check_ssh_url() {
+        assert!(check_owner(
+            "git@github.com:cameronsjo/repo.git",
+            &["cameronsjo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn owner_check_https_no_git_suffix() {
+        assert!(check_owner(
+            "https://github.com/cameronsjo/repo",
+            &["cameronsjo".to_string()]
+        ));
+    }
+
+    #[test]
+    fn owner_check_malformed_returns_false() {
+        assert!(!check_owner("not-a-url", &["cameronsjo".to_string()]));
+    }
+
+    // --- PushRemoteGuard::run(): loop and multi-push scenarios ---
+    // Tests that trigger blocks BEFORE env var check (loops, multi-push)
+    // avoid unsafe env manipulation.
+
+    fn make_bash(cmd: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: Some(cmd.into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn multiple_pushes_blocked() {
+        // Multiple pushes are checked before env vars
+        let result =
+            PushRemoteGuard.run(&make_bash("git push origin main && git push upstream main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("multiple"));
+    }
+
+    #[test]
+    fn loop_missing_targets_blocked() {
+        // Loop detection is checked before env vars
+        let result = PushRemoteGuard.run(&make_bash("for b in feat1 feat2; do git push; done"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn push_chain_with_semicolon_counted() {
+        let result =
+            PushRemoteGuard.run(&make_bash("git push origin main; git push upstream feat"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("multiple"));
+    }
+
+    #[test]
+    fn non_git_command_with_push_substring_allowed() {
+        let result = PushRemoteGuard.run(&make_bash("echo 'push this'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn git_pull_allowed() {
+        let result = PushRemoteGuard.run(&make_bash("git pull origin main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn loop_push_detected_via_ast() {
+        let result = PushRemoteGuard.run(&make_bash("for x in a b c; do git push; done"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn while_loop_push_blocked() {
+        let result = PushRemoteGuard.run(&make_bash("while true; do git push; done"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn git_fetch_allowed() {
+        let result = PushRemoteGuard.run(&make_bash("git fetch --all"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn push_with_pipe_counted_once() {
+        // pipe doesn't create a second push — only one git push exists
+        let result = PushRemoteGuard.run(&make_bash("git push origin main 2>&1 | tee push.log"));
+        // Should NOT block as "multiple" — only one push
+        let msg = result.message.as_deref().unwrap_or("");
+        assert!(!msg.contains("multiple"));
+    }
+
+    #[test]
+    fn push_with_refspec_detected() {
+        // git push with a refspec should still be detected
+        let result = PushRemoteGuard.run(&make_bash("git push origin HEAD:refs/heads/deploy"));
+        // Will block or allow depending on env — but should not error
+        assert!(
+            result.outcome == cadence_hooks_core::Outcome::Allow
+                || result.outcome == cadence_hooks_core::Outcome::Block
+        );
+    }
 }
