@@ -17,6 +17,9 @@ pub struct LoopedCommand {
     pub name: String,
     /// The explicit repo target, if one was specified via -R/--repo flag
     pub explicit_repo: Option<String>,
+    /// Suffix arguments (subcommands, flags) — enables downstream consumers to
+    /// distinguish reads from writes without coupling analysis to action lists.
+    pub args: Vec<String>,
 }
 
 /// Result of analyzing loops in a shell command.
@@ -172,6 +175,7 @@ fn collect_gh_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>) {
                     out.push(LoopedCommand {
                         name: "gh".to_string(),
                         explicit_repo: extract_repo_flag(simple),
+                        args: suffix_words(simple),
                     });
                 }
             }
@@ -286,6 +290,7 @@ fn collect_push_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>)
                     out.push(LoopedCommand {
                         name: "git push".to_string(),
                         explicit_repo: extract_push_remote(simple),
+                        args: suffix_words(simple),
                     });
                 }
             }

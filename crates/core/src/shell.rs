@@ -88,38 +88,58 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 }
 
 static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^ &;|]+))"#)
+    // Group 1: separator (&&, ;, ||, or empty for start-of-string)
+    // Group 2: double-quoted path, Group 3: single-quoted path, Group 4: bare path
+    Regex::new(r#"(^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^ &;|]+))"#)
         .expect("pattern should compile")
 });
 
 /// Extract the effective working directory from `cd` chains in a command.
 ///
-/// Finds the last `cd <target>` before other commands and resolves it:
-/// - Absolute paths returned as-is
+/// Walks the command left-to-right, splitting by operators (`&&`, `;`, `||`),
+/// and accumulates directory changes:
+/// - `cd a && cd b` → `cwd/a/b` (both apply on success path)
+/// - `cd /abs && cd rel` → `/abs/rel`
+/// - `cd a || cmd` → `cwd` (cd before `||` only runs on failure path)
 /// - `~` expanded via `$HOME`
-/// - Relative paths joined with `cwd`
 /// - No `cd` found returns `cwd` unchanged
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
-    let mut last_target: Option<String> = None;
+    let mut effective = cwd.to_string();
+
     for caps in CD_PATTERN.captures_iter(command) {
-        let target = caps
-            .get(1)
-            .or(caps.get(2))
-            .or(caps.get(3))
-            .map(|m| m.as_str().to_string());
-        if target.is_some() {
-            last_target = target;
+        let full_match = caps.get(0).unwrap();
+        let after = command[full_match.end()..].trim_start();
+
+        // If this cd is followed by `||`, the commands after `||` only run
+        // when the cd fails — so the cd doesn't change the effective directory
+        // for those commands.
+        if after.starts_with("||") {
+            continue;
         }
+
+        let target = caps
+            .get(2)
+            .or(caps.get(3))
+            .or(caps.get(4))
+            .map(|m| m.as_str().to_string());
+
+        let Some(target) = target else { continue };
+
+        effective = resolve_cd_target(&target, &effective);
     }
 
-    match last_target {
-        None => cwd.to_string(),
-        Some(target) if target.starts_with('/') => target,
-        Some(target) if target.starts_with('~') => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            target.replacen('~', &home, 1)
-        }
-        Some(target) => format!("{cwd}/{target}"),
+    effective
+}
+
+/// Resolve a single cd target against the current effective directory.
+fn resolve_cd_target(target: &str, effective: &str) -> String {
+    if target.starts_with('/') {
+        target.to_string()
+    } else if target.starts_with('~') {
+        let home = std::env::var("HOME").unwrap_or_default();
+        target.replacen('~', &home, 1)
+    } else {
+        format!("{effective}/{target}")
     }
 }
 
@@ -298,10 +318,18 @@ mod tests {
     }
 
     #[test]
-    fn multiple_cd_uses_last() {
+    fn multiple_absolute_cd_uses_last() {
         assert_eq!(
             parse_work_dir("cd /first && cd /second && git push", "/home/user"),
             "/second"
+        );
+    }
+
+    #[test]
+    fn chained_relative_cds_accumulate() {
+        assert_eq!(
+            parse_work_dir("cd repo && cd nested && git push", "/home/user"),
+            "/home/user/repo/nested"
         );
     }
 
@@ -322,10 +350,12 @@ mod tests {
     }
 
     #[test]
-    fn cd_with_pipe() {
+    fn cd_before_or_does_not_apply() {
+        // cd before || only runs on success; git push runs on failure,
+        // so the push executes from the original cwd, not /project.
         assert_eq!(
             parse_work_dir("cd /project || git push", "/home"),
-            "/project"
+            "/home"
         );
     }
 
@@ -429,9 +459,20 @@ mod tests {
 
     #[test]
     fn mixed_separators() {
+        // All three cds are on && or ; path — each absolute overrides
         assert_eq!(
             parse_work_dir("cd /first && cd /second; cd /third && git push", "/home"),
             "/third"
+        );
+    }
+
+    #[test]
+    fn cd_or_then_and_cd() {
+        // cd /fail || cd /recover && git push
+        // cd /fail is before ||, so skipped; cd /recover is on success path
+        assert_eq!(
+            parse_work_dir("cd /fail || cd /recover && git push", "/home"),
+            "/recover"
         );
     }
 

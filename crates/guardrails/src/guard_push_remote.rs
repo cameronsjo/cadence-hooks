@@ -100,9 +100,26 @@ impl Check for PushRemoteGuard {
 
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_push_loops(command) {
-            LoopAnalysis::AllTargetsExplicit(_) => {
-                // All pushes in loops have explicit remotes — allow
-                // (individual remote ownership is checked below)
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                // All pushes in loops have explicit remotes — validate each
+                let cwd_fallback_loop = std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+                    .unwrap_or_else(|| ".".to_string());
+                let cwd_loop = input.cwd.as_deref().unwrap_or(&cwd_fallback_loop);
+                let work_dir_loop = parse_work_dir(command, cwd_loop);
+
+                for cmd in &cmds {
+                    if let Some(remote) = &cmd.explicit_repo
+                        && let Some(url) = resolve_push_url(&work_dir_loop, Some(remote))
+                        && !check_owner(&url, &allowed_owners)
+                    {
+                        return CheckResult::block(format!(
+                            "🚫 git-guardrails: Push loop targets remote you don't own\n   \
+                             Remote: {remote}\n   URL: {url}"
+                        ));
+                    }
+                }
             }
             LoopAnalysis::MissingTargets(_) => {
                 return CheckResult::block(

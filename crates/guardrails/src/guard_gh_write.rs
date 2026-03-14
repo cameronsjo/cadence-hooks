@@ -167,11 +167,20 @@ impl Check for GhWriteGuard {
                 }
                 // All targets owned — allow the loop
             }
-            LoopAnalysis::MissingTargets(_) => {
-                return CheckResult::block(
-                    "🚫 git-guardrails: gh command in loop without explicit -R flag\n   \
-                     Use -R owner/repo on each gh command, or run them individually.",
-                );
+            LoopAnalysis::MissingTargets(cmds) => {
+                // Only block if any looped gh command is a write — read-only
+                // commands (gh pr list, gh issue view) are safe without -R.
+                let has_write = cmds.iter().any(|c| {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    is_write_command(&reconstructed)
+                });
+                if has_write {
+                    return CheckResult::block(
+                        "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
+                         Use -R owner/repo on each gh command, or run them individually.",
+                    );
+                }
+                // All looped gh commands are read-only — allow
             }
             LoopAnalysis::ParseFailed => {
                 // Regex fallback when AST parser can't handle the syntax
@@ -605,5 +614,74 @@ mod tests {
             is_write_command("gh api repos/foo/bar --method Delete"),
             "mixed-case HTTP method should be detected as write"
         );
+    }
+
+    // --- CodeRabbit #6: read-only gh loops should not block ---
+
+    #[test]
+    fn loop_read_only_gh_not_blocked() {
+        // gh pr list in a loop is read-only — should NOT trigger MissingTargets block
+        let result = analyze_gh_loops("for r in repo1 repo2; do gh pr list; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                // MissingTargets returned, but guard_gh_write should allow because
+                // none of the looped commands are writes
+                let has_write = cmds.iter().any(|c| {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    is_write_command(&reconstructed)
+                });
+                assert!(!has_write, "read-only gh loop should not be flagged as write");
+            }
+            LoopAnalysis::NoLoops => panic!("should detect loop"),
+            _ => {} // AllTargetsExplicit or ParseFailed are fine
+        }
+    }
+
+    #[test]
+    fn loop_write_gh_without_repo_blocked() {
+        // gh pr create in a loop without -R should still block
+        let result = analyze_gh_loops("for i in 1 2; do gh pr create --title test; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                let has_write = cmds.iter().any(|c| {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    is_write_command(&reconstructed)
+                });
+                assert!(has_write, "write gh loop without -R should be blocked");
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_mixed_read_write_without_repo_blocked() {
+        // gh pr list (read) + gh issue close (write) in a loop — should block
+        let result = analyze_gh_loops(
+            "for i in 1 2; do gh pr list && gh issue close $i; done",
+        );
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                let has_write = cmds.iter().any(|c| {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    is_write_command(&reconstructed)
+                });
+                assert!(has_write, "mixed read/write loop should block on the write");
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn looped_command_preserves_args() {
+        // Verify LoopedCommand.args contains the subcommand info
+        let result = analyze_gh_loops("for i in 1 2; do gh pr list --state open; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                assert_eq!(cmds.len(), 1);
+                assert!(cmds[0].args.contains(&"pr".to_string()));
+                assert!(cmds[0].args.contains(&"list".to_string()));
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
     }
 }
