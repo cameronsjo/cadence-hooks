@@ -4,7 +4,9 @@
 //! comment, edit, delete, etc.) and verifies the target repository belongs to
 //! an allowed owner list. Also blocks looped writes and cross-repo mutations.
 
-use cadence_hooks_core::shell::{git_command, repo_from_url, strip_quotes, LOOP_PATTERN};
+use cadence_hooks_core::shell::{
+    git_command, parse_work_dir, repo_from_url, strip_quotes, LOOP_PATTERN,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -169,9 +171,9 @@ impl Check for GhWriteGuard {
         }
 
         let cwd = input.cwd.as_deref().unwrap_or(".");
-        let work_dir = cwd; // Simplified — full cd parsing in guard_push_remote
+        let work_dir = parse_work_dir(command, cwd);
 
-        match resolve_target_repo(command, work_dir, &allowed_owners) {
+        match resolve_target_repo(command, &work_dir, &allowed_owners) {
             RepoResolution::Fork { origin, upstream } => CheckResult::block(format!(
                 "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
                  Fork:     {origin}\n   \
