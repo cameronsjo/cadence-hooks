@@ -19,7 +19,9 @@ impl Check for LineEndingsGuard {
         };
 
         // Only check shell scripts
-        if !path.ends_with(".sh") && !path.ends_with(".bash") {
+        // Case-insensitive extension check for shell scripts
+        let lower_path = path.to_lowercase();
+        if !lower_path.ends_with(".sh") && !lower_path.ends_with(".bash") {
             return CheckResult::allow();
         }
 

@@ -154,6 +154,26 @@ fn distant_name_subcommand_fails_open() {
 }
 
 #[test]
+fn missing_subcommand_fails_open() {
+    // Running `cadence-hooks` with no arguments triggers MissingSubcommand.
+    // This must exit 1 (warn), not 2 (block).
+    let output = cadence_hooks().output().expect("failed to execute binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing subcommand should exit 1 (warn), not block.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized command"),
+        "should mention unrecognized command: {stderr}"
+    );
+}
+
+#[test]
 fn valid_subcommand_with_empty_input_allows() {
     // A valid subcommand with valid JSON on stdin should work normally.
     // Send a minimal allow-case input to terminology.

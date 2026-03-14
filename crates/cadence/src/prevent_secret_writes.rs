@@ -178,13 +178,13 @@ impl Check for SecretWritesGuard {
                 let Some(path) = input.file_path() else {
                     return CheckResult::allow();
                 };
-                let filename = path.rsplit('/').next().unwrap_or(path);
+                let filename = path.rsplit('/').next().unwrap_or(&path);
 
                 if is_safe_template(filename) {
                     return CheckResult::allow();
                 }
 
-                if is_blocked(filename, path) {
+                if is_blocked(filename, &path) {
                     return CheckResult::block(format!(
                         "🚫 BLOCKED: '{filename}' is a protected file (secrets/credentials). \
                          Modify manually outside Claude Code."
@@ -577,6 +577,26 @@ mod tests {
     fn write_pub_key_allowed() {
         let result = SecretWritesGuard.run(&make_write_input("/home/user/.ssh/id_rsa.pub"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- Regression: path normalization bypass prevention ---
+
+    #[test]
+    fn write_env_trailing_slash_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/.env/"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_env_trailing_whitespace_blocked() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/.env "));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_env_backslash_path_blocked() {
+        let result = SecretWritesGuard.run(&make_edit_input(r"C:\Users\dev\.env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]

@@ -52,7 +52,7 @@ impl Check for EnvVarGuard {
             return CheckResult::allow();
         };
 
-        if !is_code_file(path) {
+        if !is_code_file(&path) {
             return CheckResult::allow();
         }
 
@@ -69,7 +69,7 @@ impl Check for EnvVarGuard {
             return CheckResult::allow();
         }
 
-        let filename = path.rsplit('/').next().unwrap_or(path);
+        let filename = path.rsplit('/').next().unwrap_or(&path);
         let mut msg = format!(
             "⚠️  Generic environment variable usage detected in {filename}\n\n\
              Found potentially problematic usage:\n"

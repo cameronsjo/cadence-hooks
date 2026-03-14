@@ -6,6 +6,9 @@
 //! - 1: warn (operation proceeds, message shown)
 //! - 2: block (operation prevented)
 
+pub mod loop_analysis;
+pub mod shell;
+
 use serde::Deserialize;
 use std::io::Read;
 use std::process;
@@ -40,6 +43,20 @@ impl Outcome {
     }
 }
 
+/// Normalize a file path for consistent matching:
+/// - Replace backslashes with forward slashes (Windows compatibility)
+/// - Strip null bytes (C string truncation attack prevention)
+/// - Trim trailing slashes and whitespace
+fn normalize_path(path: &str) -> String {
+    let cleaned: String = path
+        .replace('\\', "/")
+        .replace('\0', "")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    cleaned
+}
+
 /// The JSON structure Claude Code sends to PreToolUse/PostToolUse hooks on stdin.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
@@ -70,10 +87,12 @@ impl HookInput {
     }
 
     /// Resolved file path — checks file_path first, then path.
-    pub fn file_path(&self) -> Option<&str> {
+    /// Returns a normalized path (trimmed, slashes normalized, null bytes removed).
+    pub fn file_path(&self) -> Option<String> {
         self.tool_input
             .as_ref()
             .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()))
+            .map(normalize_path)
     }
 
     /// The bash command, if this is a Bash tool invocation.
@@ -218,19 +237,19 @@ mod tests {
     #[test]
     fn file_path_prefers_file_path_over_path() {
         let input = make_input(None, Some("/a.rs"), Some("/b.rs"), None, None, None);
-        assert_eq!(input.file_path(), Some("/a.rs"));
+        assert_eq!(input.file_path().as_deref(), Some("/a.rs"));
     }
 
     #[test]
     fn file_path_falls_back_to_path() {
         let input = make_input(None, None, Some("/b.rs"), None, None, None);
-        assert_eq!(input.file_path(), Some("/b.rs"));
+        assert_eq!(input.file_path().as_deref(), Some("/b.rs"));
     }
 
     #[test]
     fn file_path_none_when_both_absent() {
         let input = make_input(None, None, None, None, None, None);
-        assert_eq!(input.file_path(), None);
+        assert!(input.file_path().is_none());
     }
 
     #[test]
@@ -240,7 +259,7 @@ mod tests {
             tool_input: None,
             cwd: None,
         };
-        assert_eq!(input.file_path(), None);
+        assert!(input.file_path().is_none());
     }
 
     #[test]
@@ -325,7 +344,7 @@ mod tests {
         let json = r#"{"tool_name":"Read","tool_input":{"file_path":"/a.rs","command":null}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.tool_name(), Some("Read"));
-        assert_eq!(input.file_path(), Some("/a.rs"));
+        assert_eq!(input.file_path().as_deref(), Some("/a.rs"));
     }
 
     #[test]
@@ -333,7 +352,7 @@ mod tests {
         let json = r#"{}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.tool_name(), None);
-        assert_eq!(input.file_path(), None);
+        assert!(input.file_path().is_none());
     }
 
     #[test]
@@ -341,5 +360,57 @@ mod tests {
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.command(), Some("git status"));
+    }
+
+    // --- Path normalization ---
+
+    #[test]
+    fn normalize_strips_trailing_slash() {
+        assert_eq!(normalize_path("/project/.env/"), "/project/.env");
+    }
+
+    #[test]
+    fn normalize_strips_trailing_whitespace() {
+        assert_eq!(normalize_path("/project/.env "), "/project/.env");
+    }
+
+    #[test]
+    fn normalize_strips_leading_whitespace() {
+        assert_eq!(normalize_path("  /project/.env"), "/project/.env");
+    }
+
+    #[test]
+    fn normalize_strips_null_bytes() {
+        assert_eq!(normalize_path("/project/.env\0.txt"), "/project/.env.txt");
+    }
+
+    #[test]
+    fn normalize_converts_backslashes() {
+        assert_eq!(normalize_path(r"C:\Users\dev\.env"), "C:/Users/dev/.env");
+    }
+
+    #[test]
+    fn normalize_combined_attack() {
+        assert_eq!(normalize_path(" /project/.env\0/ "), "/project/.env");
+    }
+
+    #[test]
+    fn normalize_preserves_clean_path() {
+        assert_eq!(
+            normalize_path("/project/src/main.rs"),
+            "/project/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn file_path_normalizes_trailing_slash() {
+        let input = make_input(None, Some("/project/.env/"), None, None, None, None);
+        assert_eq!(input.file_path().as_deref(), Some("/project/.env"));
+    }
+
+    #[test]
+    fn file_path_normalizes_backslash() {
+        let input = make_input(None, Some(r"C:\Users\.env"), None, None, None, None);
+        assert_eq!(input.file_path().as_deref(), Some("C:/Users/.env"));
     }
 }

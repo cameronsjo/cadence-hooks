@@ -4,9 +4,12 @@
 //! comment, edit, delete, etc.) and verifies the target repository belongs to
 //! an allowed owner list. Also blocks looped writes and cross-repo mutations.
 
+use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
+use cadence_hooks_core::shell::{
+    LOOP_PATTERN, git_command, parse_work_dir, repo_from_url, strip_quotes,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
-use std::process::Command;
 use std::sync::LazyLock;
 
 // --- Write detection patterns ---
@@ -18,20 +21,17 @@ static WRITE_ACTIONS: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*(-X|--method)\s+(POST|PUT|PATCH|DELETE)")
+    Regex::new(r"gh\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
         .expect("pattern should compile")
 });
 
 static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*\s(-f\s|--field\s|-F\s|--raw-field\s)").expect("pattern should compile")
+    Regex::new(r"gh\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
+        .expect("pattern should compile")
 });
 
 static API_INPUT_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+api.*\s--input\s").expect("pattern should compile"));
-
-static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bfor\s+\w+\s+in\b|\bwhile\b.*;\s*do\b").expect("pattern should compile")
-});
 
 static REPO_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(-R|--repo)\s+([^ ]+)").expect("pattern should compile"));
@@ -49,80 +49,8 @@ fn is_write_command(command: &str) -> bool {
         || API_INPUT_FLAG.is_match(command)
 }
 
-fn strip_quotes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if nc == '"' {
-                        break;
-                    }
-                }
-            }
-            '\'' => {
-                while let Some(&nc) = chars.peek() {
-                    chars.next();
-                    if nc == '\'' {
-                        break;
-                    }
-                }
-            }
-            _ => result.push(c),
-        }
-    }
-    result
-}
-
-/// Extract owner/repo from any git remote URL format.
-///
-/// Handles:
-/// - `https://github.com/owner/repo.git`
-/// - `ssh://git@github.com/owner/repo.git`
-/// - `git@github.com:owner/repo.git` (SCP-style)
-fn repo_from_url(url: &str) -> String {
-    let trimmed = url.trim();
-
-    let path = if let Some(after_scheme) = trimmed.split("://").nth(1) {
-        // Has scheme (https://, ssh://) — skip host, take path after first /
-        match after_scheme.split_once('/') {
-            Some((_, rest)) => rest,
-            None => return String::new(),
-        }
-    } else if let Some((_, after_colon)) = trimmed.split_once(':') {
-        // SCP-style: git@host:owner/repo.git
-        if after_colon.starts_with('/') {
-            return String::new();
-        }
-        after_colon
-    } else {
-        return String::new();
-    };
-
-    let path = path.trim_end_matches(".git");
-    let parts: Vec<&str> = path.splitn(3, '/').collect();
-    if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-        format!("{}/{}", parts[0], parts[1])
-    } else {
-        String::new()
-    }
-}
-
-fn git_cmd(work_dir: &str, args: &[&str]) -> Option<String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(work_dir)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// Resolve target repo from command context.
+#[derive(Debug)]
 enum RepoResolution {
     Resolved(String),
     Fork { origin: String, upstream: String },
@@ -158,16 +86,20 @@ fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String])
     }
 
     // 4. Git remotes (with fork detection)
-    if let Some(upstream_url) = git_cmd(work_dir, &["remote", "get-url", "upstream"]) {
-        let origin_url = git_cmd(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
+    if let Some(upstream_url) = git_command(work_dir, &["remote", "get-url", "upstream"]) {
+        let origin_url =
+            git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
         return RepoResolution::Fork {
-            origin: repo_from_url(&origin_url),
-            upstream: repo_from_url(&upstream_url),
+            origin: repo_from_url(&origin_url).unwrap_or_default(),
+            upstream: repo_from_url(&upstream_url).unwrap_or_default(),
         };
     }
 
-    if let Some(origin_url) = git_cmd(work_dir, &["remote", "get-url", "origin"]) {
-        return RepoResolution::Resolved(repo_from_url(&origin_url));
+    if let Some(origin_url) = git_command(work_dir, &["remote", "get-url", "origin"]) {
+        match repo_from_url(&origin_url) {
+            Some(repo) => return RepoResolution::Resolved(repo),
+            None => return RepoResolution::Unresolvable,
+        }
     }
 
     RepoResolution::Unresolvable
@@ -210,13 +142,57 @@ impl Check for GhWriteGuard {
             .map(String::from)
             .collect();
 
-        // Loop detection
-        let stripped = strip_quotes(command);
-        if LOOP_PATTERN.is_match(&stripped) && command.contains("gh") {
-            return CheckResult::block(
-                "🚫 git-guardrails: gh command in loop — cannot verify targets\n   \
-                 Run each gh command individually.",
-            );
+        // AST-based loop detection with regex fallback
+        match loop_analysis::analyze_gh_loops(command) {
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                // All gh commands in loops have explicit -R flags — check ownership
+                let all_owned = cmds.iter().all(|c| {
+                    c.explicit_repo
+                        .as_ref()
+                        .is_some_and(|r| is_allowed(r, &allowed_owners, &allowed_repos))
+                });
+                if !all_owned {
+                    let targets: Vec<&str> = cmds
+                        .iter()
+                        .filter_map(|c| c.explicit_repo.as_deref())
+                        .collect();
+                    return CheckResult::block(format!(
+                        "🚫 git-guardrails: gh loop targets repo you don't own\n   \
+                         Targets: {}\n   \
+                         Allowed: owners=[{}] repos=[{}]",
+                        targets.join(", "),
+                        allowed_owners.join(" "),
+                        allowed_repos.join(" "),
+                    ));
+                }
+                // All targets owned — allow the loop
+            }
+            LoopAnalysis::MissingTargets(cmds) => {
+                // Only block if any looped gh command is a write — read-only
+                // commands (gh pr list, gh issue view) are safe without -R.
+                let has_write = cmds.iter().any(|c| {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    is_write_command(&reconstructed)
+                });
+                if has_write {
+                    return CheckResult::block(
+                        "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
+                         Use -R owner/repo on each gh command, or run them individually.",
+                    );
+                }
+                // All looped gh commands are read-only — allow
+            }
+            LoopAnalysis::ParseFailed => {
+                // Regex fallback when AST parser can't handle the syntax
+                let stripped = strip_quotes(command);
+                if LOOP_PATTERN.is_match(&stripped) {
+                    return CheckResult::block(
+                        "🚫 git-guardrails: gh command in loop — cannot verify targets\n   \
+                         Run each gh command individually.",
+                    );
+                }
+            }
+            LoopAnalysis::NoLoops => {} // Continue to write detection
         }
 
         // Only guard write operations
@@ -243,9 +219,9 @@ impl Check for GhWriteGuard {
         }
 
         let cwd = input.cwd.as_deref().unwrap_or(".");
-        let work_dir = cwd; // Simplified — full cd parsing in guard_push_remote
+        let work_dir = parse_work_dir(command, cwd);
 
-        match resolve_target_repo(command, work_dir, &allowed_owners) {
+        match resolve_target_repo(command, &work_dir, &allowed_owners) {
             RepoResolution::Fork { origin, upstream } => CheckResult::block(format!(
                 "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
                  Fork:     {origin}\n   \
@@ -280,6 +256,7 @@ impl Check for GhWriteGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_hooks_core::loop_analysis::{LoopAnalysis, analyze_gh_loops};
 
     #[test]
     fn detects_pr_create_as_write() {
@@ -400,29 +377,6 @@ mod tests {
         ));
     }
 
-    // strip_quotes
-    #[test]
-    fn strip_quotes_preserves_unquoted() {
-        assert_eq!(strip_quotes("gh pr create"), "gh pr create");
-    }
-
-    // repo_from_url
-    #[test]
-    fn repo_from_https_url() {
-        assert_eq!(
-            repo_from_url("https://github.com/cameronsjo/repo.git"),
-            "cameronsjo/repo"
-        );
-    }
-
-    #[test]
-    fn repo_from_https_url_no_git() {
-        assert_eq!(
-            repo_from_url("https://github.com/cameronsjo/repo"),
-            "cameronsjo/repo"
-        );
-    }
-
     // API repos pattern
     #[test]
     fn api_repos_pattern_matches() {
@@ -432,21 +386,6 @@ mod tests {
     }
 
     // --- Unhappy path: edge cases ---
-
-    #[test]
-    fn loop_pattern_detects_for_loop() {
-        assert!(LOOP_PATTERN.is_match("for repo in list; do gh pr create; done"));
-    }
-
-    #[test]
-    fn loop_pattern_detects_while_loop() {
-        assert!(LOOP_PATTERN.is_match("while true; do gh pr merge; done"));
-    }
-
-    #[test]
-    fn loop_pattern_no_match_normal() {
-        assert!(!LOOP_PATTERN.is_match("gh pr create --title test"));
-    }
 
     #[test]
     fn workflow_run_is_write() {
@@ -560,35 +499,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_quotes_mixed() {
-        assert_eq!(
-            strip_quotes("gh pr create --title 'test' --body \"desc\""),
-            "gh pr create --title  --body "
-        );
-    }
-
-    #[test]
-    fn repo_from_ssh_scp_url() {
-        assert_eq!(
-            repo_from_url("git@github.com:cameronsjo/repo.git"),
-            "cameronsjo/repo"
-        );
-    }
-
-    #[test]
-    fn repo_from_ssh_scheme_url() {
-        assert_eq!(
-            repo_from_url("ssh://git@github.com/cameronsjo/repo.git"),
-            "cameronsjo/repo"
-        );
-    }
-
-    #[test]
-    fn repo_from_malformed_url() {
-        assert_eq!(repo_from_url("not-a-url"), "");
-    }
-
-    #[test]
     fn no_command_allowed() {
         let input = HookInput {
             tool_name: Some("Bash".into()),
@@ -615,5 +525,164 @@ mod tests {
         };
         let result = GhWriteGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- edge case hardening ---
+
+    #[test]
+    fn loop_explicit_unowned_blocks() {
+        // Loop with -R pointing to unowned repo should block
+        let result =
+            analyze_gh_loops("for i in 1 2; do gh label create bug -R stranger/repo; done");
+        match result {
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                assert_eq!(cmds[0].explicit_repo.as_deref(), Some("stranger/repo"));
+            }
+            other => panic!("expected AllTargetsExplicit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gist_create_detected_as_write() {
+        assert!(is_write_command("gh gist create file.txt"));
+    }
+
+    #[test]
+    fn repo_fork_detected_as_write() {
+        assert!(is_write_command("gh repo fork owner/repo"));
+    }
+
+    #[test]
+    fn api_repos_with_query_params() {
+        let caps = API_REPOS.captures("gh api repos/cameronsjo/test/pulls?state=open");
+        assert!(caps.is_some());
+        assert_eq!(caps.unwrap().get(1).unwrap().as_str(), "cameronsjo/test");
+    }
+
+    #[test]
+    fn repo_create_without_owner_uses_default() {
+        // resolve_target_repo for "gh repo create my-repo" without owner
+        // should prepend the first allowed owner
+        let allowed = vec!["cameronsjo".to_string()];
+        let resolved = resolve_target_repo("gh repo create my-repo", ".", &allowed);
+        match resolved {
+            RepoResolution::Resolved(repo) => {
+                assert_eq!(repo, "cameronsjo/my-repo");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_create_with_owner() {
+        let allowed = vec!["cameronsjo".to_string()];
+        let resolved = resolve_target_repo("gh repo create cameronsjo/new-repo", ".", &allowed);
+        match resolved {
+            RepoResolution::Resolved(repo) => {
+                assert_eq!(repo, "cameronsjo/new-repo");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_compact_field_flag_detected() {
+        // Bug: -fkey=value (no space after -f) evades write detection
+        assert!(
+            is_write_command("gh api repos/foo/bar -ftitle=test"),
+            "compact -f flag should be detected as write"
+        );
+    }
+
+    #[test]
+    fn uppercase_method_not_matched() {
+        // "gh pr VIEW" is not a write — "VIEW" not in write actions list
+        assert!(!is_write_command("gh pr view 123"));
+    }
+
+    #[test]
+    fn api_lowercase_post_is_write() {
+        assert!(
+            is_write_command("gh api repos/stranger/repo -X post"),
+            "lowercase HTTP method should be detected as write"
+        );
+    }
+
+    #[test]
+    fn api_mixed_case_delete_is_write() {
+        assert!(
+            is_write_command("gh api repos/foo/bar --method Delete"),
+            "mixed-case HTTP method should be detected as write"
+        );
+    }
+
+    // --- CodeRabbit #6: read-only gh loops should not block ---
+
+    #[test]
+    fn loop_read_only_gh_not_blocked() {
+        // gh pr list in a loop is read-only — should NOT trigger MissingTargets block
+        let result = analyze_gh_loops("for r in repo1 repo2; do gh pr list; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                // MissingTargets returned, but guard_gh_write should allow because
+                // none of the looped commands are writes
+                let has_write = cmds.iter().any(|c| {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    is_write_command(&reconstructed)
+                });
+                assert!(
+                    !has_write,
+                    "read-only gh loop should not be flagged as write"
+                );
+            }
+            LoopAnalysis::NoLoops => panic!("should detect loop"),
+            _ => {} // AllTargetsExplicit or ParseFailed are fine
+        }
+    }
+
+    #[test]
+    fn loop_write_gh_without_repo_blocked() {
+        // gh pr create in a loop without -R should still block
+        let result = analyze_gh_loops("for i in 1 2; do gh pr create --title test; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                let has_write = cmds.iter().any(|c| {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    is_write_command(&reconstructed)
+                });
+                assert!(has_write, "write gh loop without -R should be blocked");
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_mixed_read_write_without_repo_blocked() {
+        // gh pr list (read) + gh issue close (write) in a loop — should block
+        let result = analyze_gh_loops("for i in 1 2; do gh pr list && gh issue close $i; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                let has_write = cmds.iter().any(|c| {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    is_write_command(&reconstructed)
+                });
+                assert!(has_write, "mixed read/write loop should block on the write");
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn looped_command_preserves_args() {
+        // Verify LoopedCommand.args contains the subcommand info
+        let result = analyze_gh_loops("for i in 1 2; do gh pr list --state open; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                assert_eq!(cmds.len(), 1);
+                assert!(cmds[0].args.contains(&"pr".to_string()));
+                assert!(cmds[0].args.contains(&"list".to_string()));
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
     }
 }

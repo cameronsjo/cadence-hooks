@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "BSL-1.1"
 authors = ["Cameron Sjo"]
@@ -14,6 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
 clap = { version = "4", features = ["derive"] }
+brush-parser = "0.3"
 
 cadence-hooks-core = { path = "crates/core" }
 cadence-hooks-cadence = { path = "crates/cadence" }

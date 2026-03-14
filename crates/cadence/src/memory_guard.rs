@@ -32,14 +32,14 @@ impl Check for MemoryGuard {
             return CheckResult::allow();
         };
 
-        if !Self::is_memory_path(path) {
+        if !Self::is_memory_path(&path) {
             return CheckResult::allow();
         }
 
         // Try to get content from the write operation, fall back to reading the file
         let content = match input.content() {
             Some(c) => c.to_string(),
-            None => match std::fs::read_to_string(path) {
+            None => match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => return CheckResult::allow(),
             },
@@ -47,7 +47,7 @@ impl Check for MemoryGuard {
 
         let line_count = content.lines().count();
 
-        if Self::is_memory_md(path) {
+        if Self::is_memory_md(&path) {
             if line_count > MEMORY_HARD_LIMIT {
                 return CheckResult::block(format!(
                     "🚫 MEMORY.md is {line_count} lines (limit: {MEMORY_HARD_LIMIT}).\n\

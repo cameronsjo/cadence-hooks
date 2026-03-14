@@ -58,15 +58,15 @@ impl Check for WarnBranchBase {
 fn is_branch_create(command: &str) -> bool {
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
-    // git checkout -b <name>
+    // git checkout -b/-B <name>
     let has_checkout_b = tokens
         .windows(3)
-        .any(|w| w[0] == "git" && w[1] == "checkout" && w[2] == "-b");
+        .any(|w| w[0] == "git" && w[1] == "checkout" && (w[2] == "-b" || w[2] == "-B"));
 
-    // git switch -c <name> or git switch --create <name>
-    let has_switch_c = tokens
-        .windows(3)
-        .any(|w| w[0] == "git" && w[1] == "switch" && (w[2] == "-c" || w[2] == "--create"));
+    // git switch -c/-C/--create <name>
+    let has_switch_c = tokens.windows(3).any(|w| {
+        w[0] == "git" && w[1] == "switch" && (w[2] == "-c" || w[2] == "-C" || w[2] == "--create")
+    });
 
     has_checkout_b || has_switch_c
 }
@@ -77,10 +77,14 @@ fn is_branch_create(command: &str) -> bool {
 fn explicit_base(command: &str) -> Option<String> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
-    // Find the -b or -c/--create flag, then the branch name is next.
+    // Find the -b/-B or -c/-C/--create flag, then the branch name is next.
     // After that, skip any flags (e.g. --track, -t) to find the base.
     for (i, token) in tokens.iter().enumerate() {
-        if (*token == "-b" || *token == "-c" || *token == "--create")
+        if (*token == "-b"
+            || *token == "-B"
+            || *token == "-c"
+            || *token == "-C"
+            || *token == "--create")
             && i >= 1
             && (tokens[i - 1] == "checkout" || tokens[i - 1] == "switch")
         {
@@ -96,10 +100,19 @@ fn explicit_base(command: &str) -> Option<String> {
     None
 }
 
+/// Recognized main branch refs. Only exact matches are accepted to avoid
+/// false positives like `origin/feature/main`.
+const MAIN_BRANCH_REFS: &[&str] = &[
+    "main",
+    "master",
+    "origin/main",
+    "origin/master",
+    "upstream/main",
+    "upstream/master",
+];
+
 fn is_main_branch(name: &str) -> bool {
-    // Strip any remote prefix (origin/main, upstream/main, fork/master, etc.)
-    let leaf = name.rsplit_once('/').map_or(name, |(_, leaf)| leaf);
-    leaf == "main" || leaf == "master"
+    MAIN_BRANCH_REFS.contains(&name)
 }
 
 fn current_branch(cwd: Option<&str>) -> Option<String> {
@@ -246,8 +259,9 @@ mod tests {
     }
 
     #[test]
-    fn fork_master_is_main() {
-        assert!(is_main_branch("fork/master"));
+    fn arbitrary_remote_master_is_not_main() {
+        // Only origin/ and upstream/ prefixes are recognized
+        assert!(!is_main_branch("fork/master"));
     }
 
     // --- Check::run ---
@@ -292,5 +306,51 @@ mod tests {
     fn switch_explicit_master_allowed() {
         let result = WarnBranchBase.run(&make_bash("git switch -c feature master"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- Bug 5a: -B and -C (force variants) ---
+
+    #[test]
+    fn checkout_force_b_detected() {
+        assert!(is_branch_create("git checkout -B feature"));
+    }
+
+    #[test]
+    fn switch_force_c_detected() {
+        assert!(is_branch_create("git switch -C feature"));
+    }
+
+    #[test]
+    fn explicit_base_with_force_b() {
+        assert_eq!(
+            explicit_base("git checkout -B feature main"),
+            Some("main".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_base_with_force_c() {
+        assert_eq!(
+            explicit_base("git switch -C feature origin/main"),
+            Some("origin/main".to_string())
+        );
+    }
+
+    // --- Bug 5b: is_main_branch over-match ---
+
+    #[test]
+    fn feature_main_is_not_main() {
+        // origin/feature/main should NOT be treated as a main branch
+        assert!(!is_main_branch("origin/feature/main"));
+    }
+
+    #[test]
+    fn feature_slash_master_is_not_main() {
+        assert!(!is_main_branch("origin/hotfix/master"));
+    }
+
+    #[test]
+    fn upstream_master_is_main() {
+        assert!(is_main_branch("upstream/master"));
     }
 }
