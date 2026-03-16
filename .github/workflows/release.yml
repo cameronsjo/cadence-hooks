@@ -108,9 +108,17 @@ jobs:
             echo "sha_${KEY}=${SHA}" >> "$GITHUB_OUTPUT"
           done
 
+      - name: Generate Forge Bellows token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: homebrew-tap
+
       - name: Update Homebrew tap
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           VERSION: ${{ github.ref_name }}
           SHA_MACOS_X86_64: ${{ steps.shas.outputs.sha_macos_x86_64 }}
           SHA_MACOS_AARCH64: ${{ steps.shas.outputs.sha_macos_aarch64 }}
