@@ -808,8 +808,7 @@ mod tests {
     #[test]
     fn chain_does_not_count_pushes_inside_loops() {
         // The loop push should be handled by analyze_push_loops, not chain analysis
-        let result =
-            analyze_push_chain("git push origin main && for b in a b; do git push; done");
+        let result = analyze_push_chain("git push origin main && for b in a b; do git push; done");
         // Only the top-level push is counted — loop body is excluded
         assert!(matches!(result, ChainAnalysis::SingleOrNone));
     }
@@ -829,32 +828,28 @@ mod tests {
     #[test]
     fn chain_push_hidden_in_subshell() {
         // Push to different remote inside ( ) should be caught
-        let result =
-            analyze_push_chain("git push origin main && (git push upstream main)");
+        let result = analyze_push_chain("git push origin main && (git push upstream main)");
         assert!(matches!(result, ChainAnalysis::DifferentRemotes(_)));
     }
 
     #[test]
     fn chain_push_hidden_in_brace_group() {
         // Push to different remote inside { } should be caught
-        let result =
-            analyze_push_chain("git push origin main && { git push upstream main; }");
+        let result = analyze_push_chain("git push origin main && { git push upstream main; }");
         assert!(matches!(result, ChainAnalysis::DifferentRemotes(_)));
     }
 
     #[test]
     fn chain_or_operator_different_remotes() {
         // || chain — fallback push to different remote should block
-        let result =
-            analyze_push_chain("git push origin main || git push upstream main");
+        let result = analyze_push_chain("git push origin main || git push upstream main");
         assert!(matches!(result, ChainAnalysis::DifferentRemotes(_)));
     }
 
     #[test]
     fn chain_or_operator_same_remote() {
         // || chain — retry to same remote should be allowed
-        let result =
-            analyze_push_chain("git push origin main || git push origin main");
+        let result = analyze_push_chain("git push origin main || git push origin main");
         match result {
             ChainAnalysis::SameRemote(remote) => assert_eq!(remote, "origin"),
             other => panic!("expected SameRemote, got {other:?}"),
@@ -864,8 +859,7 @@ mod tests {
     #[test]
     fn chain_variable_as_remote_treated_as_missing() {
         // $REMOTE is not a literal remote name — should be caught as missing
-        let result =
-            analyze_push_chain("git push $REMOTE main && git push origin main");
+        let result = analyze_push_chain("git push $REMOTE main && git push origin main");
         // $REMOTE won't match any known remote in extract_push_remote,
         // but at the chain level it's a non-flag positional arg
         // The key question: does brush-parser preserve $REMOTE as a word?
@@ -883,16 +877,15 @@ mod tests {
     fn chain_push_in_if_then_else() {
         // Pushes in different branches of an if statement to different remotes
         let result = analyze_push_chain(
-            "if true; then git push origin main; else git push upstream main; fi"
+            "if true; then git push origin main; else git push upstream main; fi",
         );
         assert!(matches!(result, ChainAnalysis::DifferentRemotes(_)));
     }
 
     #[test]
     fn chain_push_in_if_same_remote() {
-        let result = analyze_push_chain(
-            "if true; then git push origin main; else git push origin feat; fi"
-        );
+        let result =
+            analyze_push_chain("if true; then git push origin main; else git push origin feat; fi");
         match result {
             ChainAnalysis::SameRemote(remote) => assert_eq!(remote, "origin"),
             other => panic!("expected SameRemote, got {other:?}"),
@@ -904,7 +897,7 @@ mod tests {
         // The loop push should be ignored by chain analysis (handled by loop analysis)
         // Only the top-level push counts
         let result = analyze_push_chain(
-            "git push origin main && for b in a b; do git push upstream $b; done"
+            "git push origin main && for b in a b; do git push upstream $b; done",
         );
         // Only one top-level push — loop body excluded
         assert!(matches!(result, ChainAnalysis::SingleOrNone));
@@ -914,9 +907,7 @@ mod tests {
     fn chain_command_substitution_in_remote() {
         // $(echo upstream) — parser should still produce a word node
         // but it won't be a simple literal remote name
-        let result = analyze_push_chain(
-            "git push origin main && git push $(echo upstream) main"
-        );
+        let result = analyze_push_chain("git push origin main && git push $(echo upstream) main");
         // Command substitution as remote — should not match "origin"
         assert!(!matches!(result, ChainAnalysis::SameRemote(ref r) if r == "origin"));
     }
@@ -924,18 +915,14 @@ mod tests {
     #[test]
     fn chain_quoted_git_push_not_counted() {
         // "git push" inside echo string should not be treated as a push command
-        let result = analyze_push_chain(
-            r#"echo "running git push" && git push origin main"#
-        );
+        let result = analyze_push_chain(r#"echo "running git push" && git push origin main"#);
         assert!(matches!(result, ChainAnalysis::SingleOrNone));
     }
 
     #[test]
     fn chain_force_push_same_remote_still_same() {
         // Force push is a separate concern (not chain analysis's job) — same remote is same remote
-        let result = analyze_push_chain(
-            "git push origin main && git push --force origin feat"
-        );
+        let result = analyze_push_chain("git push origin main && git push --force origin feat");
         match result {
             ChainAnalysis::SameRemote(remote) => assert_eq!(remote, "origin"),
             other => panic!("expected SameRemote, got {other:?}"),
@@ -945,9 +932,7 @@ mod tests {
     #[test]
     fn chain_push_tags_same_remote() {
         // Common pattern: push branch then push tags
-        let result = analyze_push_chain(
-            "git push origin main && git push origin --tags"
-        );
+        let result = analyze_push_chain("git push origin main && git push origin --tags");
         match result {
             ChainAnalysis::SameRemote(remote) => assert_eq!(remote, "origin"),
             other => panic!("expected SameRemote, got {other:?}"),
@@ -957,7 +942,7 @@ mod tests {
     #[test]
     fn chain_three_different_remotes() {
         let result = analyze_push_chain(
-            "git push origin main && git push upstream main && git push backup main"
+            "git push origin main && git push upstream main && git push backup main",
         );
         assert!(matches!(result, ChainAnalysis::DifferentRemotes(_)));
     }
@@ -965,7 +950,7 @@ mod tests {
     #[test]
     fn chain_two_same_one_different() {
         let result = analyze_push_chain(
-            "git push origin main && git push origin v1.0 && git push upstream main"
+            "git push origin main && git push origin v1.0 && git push upstream main",
         );
         assert!(matches!(result, ChainAnalysis::DifferentRemotes(_)));
     }
