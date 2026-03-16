@@ -56,6 +56,14 @@ ci: fmt-check clippy test
 bump:
 	@scripts/bump-version.sh $(VERSION)
 
+## Setup ──────────────────────────────────────
+
+.PHONY: setup
+## Configure git hooks and install the binary
+setup:
+	git config core.hooksPath .githooks
+	$(CARGO) install --path .
+
 ## Installation ────────────────────────────────
 
 .PHONY: install

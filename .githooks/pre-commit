@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Pre-commit hook: auto-format with cargo fmt
+# If formatting changes are needed, applies them and amends the staged files.
+set -euo pipefail
+
+# Only run if Rust files are staged
+if ! git diff --cached --name-only | grep -qE '\.rs$'; then
+  exit 0
+fi
+
+# Run cargo fmt and stage any changes
+cargo fmt --all --quiet
+git diff --name-only | grep -E '\.rs$' | xargs -r git add
