@@ -13,9 +13,17 @@ jobs:
     name: Tag version bump
     runs-on: ubuntu-latest
     steps:
+      - name: Generate Forge Bellows token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Extract version and check for existing tag
         id: check
