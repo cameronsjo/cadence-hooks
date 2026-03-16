@@ -31,7 +31,11 @@ echo "Bumping version: $CURRENT -> $VERSION"
 
 # Update workspace version in Cargo.toml
 # The workspace.package version line follows [workspace.package]
-sed -i '' "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" "$CARGO_TOML"
+if [[ "$(uname)" == "Darwin" ]]; then
+  sed -i '' "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" "$CARGO_TOML"
+else
+  sed -i "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" "$CARGO_TOML"
+fi
 
 # Verify the change took effect
 UPDATED=$(grep -A1 '^\[workspace\.package\]' "$CARGO_TOML" | grep '^version' | sed 's/.*= *"\(.*\)"/\1/')

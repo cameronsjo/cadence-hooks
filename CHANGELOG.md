@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-16
+
+### Added
+
+- AST-based chain analysis for `git push` — chained pushes to the same remote (e.g. `git push origin main && git push origin v1.0`) are now allowed instead of blanket-blocked
+- 15 adversarial tests for chain analysis bypass attempts
+
+### Fixed
+
+- Cross-platform `bump-version.sh` — works on both macOS and Linux
+
 ## [0.4.0] - 2026-03-16
 
 ### Added
