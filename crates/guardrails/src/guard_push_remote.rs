@@ -4,7 +4,7 @@
 //! verifies the repository owner is in the configured allowlist. Also blocks
 //! looped pushes and force-push to `main`.
 
-use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
+use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, git_command, parse_work_dir, repo_from_url, strip_quotes,
 };
@@ -78,13 +78,34 @@ impl Check for PushRemoteGuard {
         // Structural safety checks first — these don't need the owner list
         // and must block even when unconfigured.
 
-        // Complexity gate: block batch pushes (strip quotes to avoid false positives)
-        let push_count = strip_quotes(command).matches("git push").count();
-        if push_count > 1 {
-            return CheckResult::block(
-                "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
-                 Run each push individually so remotes can be validated.",
-            );
+        // Chain analysis: multiple pushes in && / ; chains
+        match loop_analysis::analyze_push_chain(command) {
+            ChainAnalysis::SameRemote(_) => {
+                // All chained pushes target the same remote — safe to proceed
+            }
+            ChainAnalysis::DifferentRemotes(_) => {
+                return CheckResult::block(
+                    "🚫 git-guardrails: chained git push to different remotes\n   \
+                     Run each push individually so remotes can be validated.",
+                );
+            }
+            ChainAnalysis::MissingRemotes(_) => {
+                return CheckResult::block(
+                    "🚫 git-guardrails: chained git push without explicit remotes\n   \
+                     Specify the remote explicitly on each push, or run them individually.",
+                );
+            }
+            ChainAnalysis::ParseFailed => {
+                // Fall back to substring count
+                let push_count = strip_quotes(command).matches("git push").count();
+                if push_count > 1 {
+                    return CheckResult::block(
+                        "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
+                         Run each push individually so remotes can be validated.",
+                    );
+                }
+            }
+            ChainAnalysis::SingleOrNone => {}
         }
 
         // AST-based loop detection (MissingTargets and ParseFailed don't need owners)
@@ -298,12 +319,31 @@ mod tests {
     }
 
     #[test]
-    fn multiple_pushes_blocked() {
-        // Multiple pushes are checked before env vars
+    fn chained_pushes_different_remotes_blocked() {
         let result =
             PushRemoteGuard.run(&make_bash("git push origin main && git push upstream main"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert!(result.message.unwrap().contains("multiple"));
+        assert!(result.message.unwrap().contains("different remotes"));
+    }
+
+    #[test]
+    fn chained_pushes_same_remote_allowed() {
+        // git push origin main && git push origin v1.0.0 — same remote, safe
+        let result =
+            PushRemoteGuard.run(&make_bash("git push origin main && git push origin v1.0.0"));
+        // Should NOT block at the chain stage — continues to owner validation
+        let msg = result.message.as_deref().unwrap_or("");
+        assert!(
+            !msg.contains("different remotes") && !msg.contains("multiple"),
+            "same-remote chain should not be blocked as batch: {msg}"
+        );
+    }
+
+    #[test]
+    fn chained_pushes_missing_remote_blocked() {
+        let result = PushRemoteGuard.run(&make_bash("git push && git push origin main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("without explicit remotes"));
     }
 
     #[test]
@@ -314,11 +354,11 @@ mod tests {
     }
 
     #[test]
-    fn push_chain_with_semicolon_counted() {
+    fn push_chain_with_semicolon_different_remotes_blocked() {
         let result =
             PushRemoteGuard.run(&make_bash("git push origin main; git push upstream feat"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
-        assert!(result.message.unwrap().contains("multiple"));
+        assert!(result.message.unwrap().contains("different remotes"));
     }
 
     #[test]
