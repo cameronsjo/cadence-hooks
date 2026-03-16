@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-16
+
+### Added
+
+- AST-based loop analysis via `brush-parser` — loops with explicit targets pointing to owned repos are now permitted instead of blanket-blocked
+- `warn-cron-datetime` guardrail for CronCreate hooks
+- Unit tests for `warn-main-branch` (10 tests) and `check-idle-return` (11 tests)
+- Adversarial input tests and edge case hardening across all hooks
+- Panic handler for graceful failure reporting
+
+### Changed
+
+- Extracted shared shell utilities (`strip_quotes`, `repo_from_url`, `git_command`, `parse_work_dir`) into `cadence-hooks-core::shell`
+- `guard-gh-write` now resolves `cd` chains via `parse_work_dir`
+- Reordered `guard-push-remote` checks so structural blocks precede env var checks
+- Narrowed version-mismatch catch-all to specific clap error kinds
+- 551 tests (up from 486)
+
+### Fixed
+
+- Normalized file paths to prevent bypass attacks
+- Reduced false positives from CodeRabbit review findings
+- Fail open with warning on plugin version mismatch
+
+## [0.3.0] - 2026-03-12
+
 ### Added
 
 - Initial implementation: 19 hooks across 4 plugin crates
