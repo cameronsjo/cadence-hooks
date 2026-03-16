@@ -98,3 +98,30 @@ jobs:
           files: |
             cadence-hooks-*.tar.gz
             checksums.txt
+
+      - name: Parse checksums for Homebrew
+        id: shas
+        run: |
+          for platform in macos-x86_64 macos-aarch64 linux-x86_64 linux-aarch64; do
+            SHA=$(grep "${platform}" checksums.txt | awk '{print $1}')
+            KEY=$(echo "$platform" | tr '-' '_')
+            echo "sha_${KEY}=${SHA}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+          SHA_MACOS_X86_64: ${{ steps.shas.outputs.sha_macos_x86_64 }}
+          SHA_MACOS_AARCH64: ${{ steps.shas.outputs.sha_macos_aarch64 }}
+          SHA_LINUX_X86_64: ${{ steps.shas.outputs.sha_linux_x86_64 }}
+          SHA_LINUX_AARCH64: ${{ steps.shas.outputs.sha_linux_aarch64 }}
+        run: |
+          gh api repos/cameronsjo/homebrew-tap/dispatches \
+            -f event_type=update-formula \
+            -f "client_payload[formula]=cadence-hooks" \
+            -f "client_payload[version]=${VERSION#v}" \
+            -f "client_payload[sha_macos_x86_64]=${SHA_MACOS_X86_64}" \
+            -f "client_payload[sha_macos_aarch64]=${SHA_MACOS_AARCH64}" \
+            -f "client_payload[sha_linux_x86_64]=${SHA_LINUX_X86_64}" \
+            -f "client_payload[sha_linux_aarch64]=${SHA_LINUX_AARCH64}"
