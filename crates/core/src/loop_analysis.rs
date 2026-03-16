@@ -61,6 +61,113 @@ pub fn analyze_gh_loops(command: &str) -> LoopAnalysis {
     }
 }
 
+/// Result of analyzing chained (non-loop) push commands.
+#[derive(Debug)]
+pub enum ChainAnalysis {
+    /// Zero or one push command — no chain to analyze.
+    SingleOrNone,
+    /// Multiple pushes, all with the same explicit remote.
+    SameRemote(String),
+    /// Multiple pushes targeting different remotes.
+    DifferentRemotes(Vec<LoopedCommand>),
+    /// Multiple pushes but some lack explicit remotes.
+    MissingRemotes(Vec<LoopedCommand>),
+    /// Parser failed — caller should fall back to counting.
+    ParseFailed,
+}
+
+/// Parse a shell command and analyze chained `git push` commands outside loops.
+///
+/// Extracts all top-level (non-looped) `git push` commands from `&&`/`;` chains
+/// and determines if they all target the same remote.
+pub fn analyze_push_chain(command: &str) -> ChainAnalysis {
+    let program = match parse_command(command) {
+        Some(p) => p,
+        None => return ChainAnalysis::ParseFailed,
+    };
+
+    let mut push_commands = Vec::new();
+    for complete_cmd in &program.complete_commands {
+        collect_top_level_pushes(complete_cmd, &mut push_commands);
+    }
+
+    if push_commands.len() <= 1 {
+        return ChainAnalysis::SingleOrNone;
+    }
+
+    if push_commands.iter().any(|c| c.explicit_repo.is_none()) {
+        return ChainAnalysis::MissingRemotes(push_commands);
+    }
+
+    let remotes: Vec<&str> = push_commands
+        .iter()
+        .filter_map(|c| c.explicit_repo.as_deref())
+        .collect();
+
+    if remotes.windows(2).all(|w| w[0] == w[1]) {
+        ChainAnalysis::SameRemote(remotes[0].to_string())
+    } else {
+        ChainAnalysis::DifferentRemotes(push_commands)
+    }
+}
+
+/// Collect `git push` commands from top-level (non-loop) positions in a compound list.
+fn collect_top_level_pushes(list: &CompoundList, out: &mut Vec<LoopedCommand>) {
+    for item in &list.0 {
+        let and_or = &item.0;
+        collect_top_level_pushes_from_pipeline(&and_or.first, out);
+        for additional in &and_or.additional {
+            let pipeline = match additional {
+                brush_parser::ast::AndOr::And(p) | brush_parser::ast::AndOr::Or(p) => p,
+            };
+            collect_top_level_pushes_from_pipeline(pipeline, out);
+        }
+    }
+}
+
+/// Collect `git push` from pipelines, but do NOT recurse into loop bodies.
+fn collect_top_level_pushes_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>) {
+    for cmd in &pipeline.seq {
+        match cmd {
+            Command::Simple(simple) => {
+                if is_git_push_command(simple) {
+                    out.push(LoopedCommand {
+                        name: "git push".to_string(),
+                        explicit_repo: extract_push_remote(simple),
+                        args: suffix_words(simple),
+                    });
+                }
+            }
+            Command::Compound(compound, _) => {
+                // Recurse into brace groups and subshells but NOT loops
+                match compound {
+                    CompoundCommand::BraceGroup(bg) => {
+                        collect_top_level_pushes(&bg.list, out);
+                    }
+                    CompoundCommand::Subshell(sub) => {
+                        collect_top_level_pushes(&sub.list, out);
+                    }
+                    CompoundCommand::IfClause(if_cmd) => {
+                        collect_top_level_pushes(&if_cmd.condition, out);
+                        collect_top_level_pushes(&if_cmd.then, out);
+                        if let Some(elses) = &if_cmd.elses {
+                            for else_clause in elses {
+                                if let Some(cond) = &else_clause.condition {
+                                    collect_top_level_pushes(cond, out);
+                                }
+                                collect_top_level_pushes(&else_clause.body, out);
+                            }
+                        }
+                    }
+                    // Skip loops — those are handled by analyze_push_loops
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Parse a shell command and analyze any loops for `git push` commands.
 pub fn analyze_push_loops(command: &str) -> LoopAnalysis {
     let program = match parse_command(command) {
@@ -641,5 +748,79 @@ mod tests {
             "for a in 1; do for b in 2; do for c in 3; do git push; done; done; done",
         );
         assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    // --- analyze_push_chain ---
+
+    #[test]
+    fn chain_single_push_returns_single() {
+        let result = analyze_push_chain("git push origin main");
+        assert!(matches!(result, ChainAnalysis::SingleOrNone));
+    }
+
+    #[test]
+    fn chain_no_push_returns_single() {
+        let result = analyze_push_chain("git status && git log");
+        assert!(matches!(result, ChainAnalysis::SingleOrNone));
+    }
+
+    #[test]
+    fn chain_same_remote_detected() {
+        let result = analyze_push_chain("git push origin main && git push origin v1.0.0");
+        match result {
+            ChainAnalysis::SameRemote(remote) => assert_eq!(remote, "origin"),
+            other => panic!("expected SameRemote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_different_remotes_detected() {
+        let result = analyze_push_chain("git push origin main && git push upstream main");
+        assert!(matches!(result, ChainAnalysis::DifferentRemotes(_)));
+    }
+
+    #[test]
+    fn chain_missing_remote_detected() {
+        let result = analyze_push_chain("git push && git push origin main");
+        assert!(matches!(result, ChainAnalysis::MissingRemotes(_)));
+    }
+
+    #[test]
+    fn chain_semicolon_same_remote() {
+        let result = analyze_push_chain("git push origin main; git push origin v2.0.0");
+        match result {
+            ChainAnalysis::SameRemote(remote) => assert_eq!(remote, "origin"),
+            other => panic!("expected SameRemote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_three_pushes_same_remote() {
+        let result = analyze_push_chain(
+            "git push origin main && git push origin v1.0.0 && git push origin --tags",
+        );
+        match result {
+            ChainAnalysis::SameRemote(remote) => assert_eq!(remote, "origin"),
+            other => panic!("expected SameRemote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_does_not_count_pushes_inside_loops() {
+        // The loop push should be handled by analyze_push_loops, not chain analysis
+        let result =
+            analyze_push_chain("git push origin main && for b in a b; do git push; done");
+        // Only the top-level push is counted — loop body is excluded
+        assert!(matches!(result, ChainAnalysis::SingleOrNone));
+    }
+
+    #[test]
+    fn chain_with_non_push_commands_interleaved() {
+        let result =
+            analyze_push_chain("git tag v1.0.0 && git push origin main && git push origin v1.0.0");
+        match result {
+            ChainAnalysis::SameRemote(remote) => assert_eq!(remote, "origin"),
+            other => panic!("expected SameRemote, got {other:?}"),
+        }
     }
 }
