@@ -6,6 +6,7 @@
 //! - 1: warn (operation proceeds, message shown)
 //! - 2: block (operation prevented)
 
+pub mod config;
 pub mod loop_analysis;
 pub mod shell;
 

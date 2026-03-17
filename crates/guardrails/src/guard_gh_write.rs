@@ -4,9 +4,10 @@
 //! comment, edit, delete, etc.) and verifies the target repository belongs to
 //! an allowed owner list. Also blocks looped writes and cross-repo mutations.
 
+use cadence_hooks_core::config::{self, AllowEntry, default_host, env_allow_entries};
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, git_command, parse_work_dir, repo_from_url, strip_quotes,
+    LOOP_PATTERN, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -52,17 +53,29 @@ fn is_write_command(command: &str) -> bool {
 /// Resolve target repo from command context.
 #[derive(Debug)]
 enum RepoResolution {
-    Resolved(String),
+    /// Fully resolved: host + "owner/repo"
+    Resolved { host: String, repo: String },
+    /// Fork detected: both remotes present, need -R to disambiguate
     Fork { origin: String, upstream: String },
+    /// Cannot determine target
     Unresolvable,
 }
 
-fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String]) -> RepoResolution {
-    // 1. Explicit -R / --repo flag
+fn resolve_target_repo(
+    command: &str,
+    work_dir: &str,
+    allowed_owners: &[AllowEntry],
+) -> RepoResolution {
+    let dh = default_host();
+
+    // 1. Explicit -R / --repo flag (gh CLI always targets GH_HOST or github.com)
     if let Some(caps) = REPO_FLAG.captures(command)
         && let Some(repo) = caps.get(2)
     {
-        return RepoResolution::Resolved(repo.as_str().to_string());
+        return RepoResolution::Resolved {
+            host: dh,
+            repo: repo.as_str().to_string(),
+        };
     }
 
     // 2. gh repo create <name>
@@ -71,10 +84,20 @@ fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String])
         let first_arg = after.split_whitespace().next().unwrap_or("");
         if !first_arg.is_empty() && !first_arg.starts_with('-') {
             if first_arg.contains('/') {
-                return RepoResolution::Resolved(first_arg.to_string());
+                return RepoResolution::Resolved {
+                    host: dh,
+                    repo: first_arg.to_string(),
+                };
             }
-            let default_owner = allowed_owners.first().map(|s| s.as_str()).unwrap_or("");
-            return RepoResolution::Resolved(format!("{default_owner}/{first_arg}"));
+            let default_owner = allowed_owners
+                .iter()
+                .find(|e| e.host.is_none() || e.host.as_deref() == Some(&dh))
+                .map(|e| e.owner.as_str())
+                .unwrap_or("");
+            return RepoResolution::Resolved {
+                host: dh,
+                repo: format!("{default_owner}/{first_arg}"),
+            };
         }
     }
 
@@ -82,22 +105,28 @@ fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String])
     if let Some(caps) = API_REPOS.captures(command)
         && let Some(repo) = caps.get(1)
     {
-        return RepoResolution::Resolved(repo.as_str().to_string());
+        return RepoResolution::Resolved {
+            host: dh,
+            repo: repo.as_str().to_string(),
+        };
     }
 
     // 4. Git remotes (with fork detection)
     if let Some(upstream_url) = git_command(work_dir, &["remote", "get-url", "upstream"]) {
         let origin_url =
             git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
-        return RepoResolution::Fork {
-            origin: repo_from_url(&origin_url).unwrap_or_default(),
-            upstream: repo_from_url(&upstream_url).unwrap_or_default(),
-        };
+        let origin = host_and_repo_from_url(&origin_url)
+            .map(|(_, r)| r)
+            .unwrap_or_default();
+        let upstream = host_and_repo_from_url(&upstream_url)
+            .map(|(_, r)| r)
+            .unwrap_or_default();
+        return RepoResolution::Fork { origin, upstream };
     }
 
     if let Some(origin_url) = git_command(work_dir, &["remote", "get-url", "origin"]) {
-        match repo_from_url(&origin_url) {
-            Some(repo) => return RepoResolution::Resolved(repo),
+        match host_and_repo_from_url(&origin_url) {
+            Some((host, repo)) => return RepoResolution::Resolved { host, repo },
             None => return RepoResolution::Unresolvable,
         }
     }
@@ -105,12 +134,16 @@ fn resolve_target_repo(command: &str, work_dir: &str, allowed_owners: &[String])
     RepoResolution::Unresolvable
 }
 
-fn is_allowed(repo: &str, allowed_owners: &[String], allowed_repos: &[String]) -> bool {
-    if allowed_repos.iter().any(|r| r == repo) {
-        return true;
-    }
-    let owner = repo.split('/').next().unwrap_or("");
-    allowed_owners.iter().any(|a| a == owner)
+fn is_allowed(
+    host: &str,
+    repo: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+) -> bool {
+    let mut parts = repo.splitn(2, '/');
+    let owner = parts.next().unwrap_or("");
+    let repo_name = parts.next().unwrap_or("");
+    config::is_allowed(host, owner, repo_name, allowed_owners, allowed_repos)
 }
 
 /// Guards against unintended `gh` CLI write operations on unauthorized repositories.
@@ -130,39 +163,36 @@ impl Check for GhWriteGuard {
             return CheckResult::allow();
         }
 
-        let allowed_owners: Vec<String> = std::env::var("GIT_GUARDRAILS_ALLOWED_OWNERS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
-
-        let allowed_repos: Vec<String> = std::env::var("GIT_GUARDRAILS_ALLOWED_REPOS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
+        let allowed_owners = env_allow_entries("GIT_GUARDRAILS_ALLOWED_OWNERS");
+        let allowed_repos = env_allow_entries("GIT_GUARDRAILS_ALLOWED_REPOS");
 
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_gh_loops(command) {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
                 // All gh commands in loops have explicit -R flags — check ownership
+                // -R targets are always on the default host (gh CLI convention)
+                let dh = default_host();
                 let all_owned = cmds.iter().all(|c| {
                     c.explicit_repo
                         .as_ref()
-                        .is_some_and(|r| is_allowed(r, &allowed_owners, &allowed_repos))
+                        .is_some_and(|r| is_allowed(&dh, r, &allowed_owners, &allowed_repos))
                 });
                 if !all_owned {
                     let targets: Vec<&str> = cmds
                         .iter()
                         .filter_map(|c| c.explicit_repo.as_deref())
                         .collect();
+                    let all_entries: Vec<String> = allowed_owners
+                        .iter()
+                        .chain(allowed_repos.iter())
+                        .map(|e| e.to_string())
+                        .collect();
                     return CheckResult::block(format!(
                         "🚫 git-guardrails: gh loop targets repo you don't own\n   \
                          Targets: {}\n   \
-                         Allowed: owners=[{}] repos=[{}]",
+                         Allowed: {}",
                         targets.join(", "),
-                        allowed_owners.join(" "),
-                        allowed_repos.join(" "),
+                        all_entries.join(" "),
                     ));
                 }
                 // All targets owned — allow the loop
@@ -233,19 +263,23 @@ impl Check for GhWriteGuard {
                 "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
                  Use -R owner/repo to specify target explicitly.",
             ),
-            RepoResolution::Resolved(repo) => {
-                if is_allowed(&repo, &allowed_owners, &allowed_repos) {
+            RepoResolution::Resolved { host, repo } => {
+                if is_allowed(&host, &repo, &allowed_owners, &allowed_repos) {
                     CheckResult::allow()
                 } else {
+                    let all_entries: Vec<String> = allowed_owners
+                        .iter()
+                        .chain(allowed_repos.iter())
+                        .map(|e| e.to_string())
+                        .collect();
                     CheckResult::block(format!(
                         "🚫 git-guardrails: gh write targets repo you don't own\n   \
                          Target:  {repo}\n   \
-                         Allowed: owners=[{}] repos=[{}]\n\n   \
+                         Allowed: {}\n\n   \
                          DO NOT override with env vars. Instead:\n   \
                          1. Confirm the user intends to write to this repo\n   \
                          2. Write a shell script the user can execute manually",
-                        allowed_owners.join(" "),
-                        allowed_repos.join(" ")
+                        all_entries.join(" ")
                     ))
                 }
             }
@@ -256,7 +290,12 @@ impl Check for GhWriteGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_hooks_core::config::parse_allow_entry;
     use cadence_hooks_core::loop_analysis::{LoopAnalysis, analyze_gh_loops};
+
+    fn owners(entries: &[&str]) -> Vec<AllowEntry> {
+        entries.iter().map(|e| parse_allow_entry(e)).collect()
+    }
 
     #[test]
     fn detects_pr_create_as_write() {
@@ -357,23 +396,50 @@ mod tests {
     #[test]
     fn is_allowed_by_owner() {
         assert!(is_allowed(
+            "github.com",
             "cameronsjo/repo",
-            &["cameronsjo".to_string()],
-            &[]
+            &owners(&["cameronsjo"]),
+            &[],
         ));
     }
 
     #[test]
     fn is_allowed_by_repo() {
-        assert!(is_allowed("other/repo", &[], &["other/repo".to_string()]));
+        assert!(is_allowed(
+            "github.com",
+            "other/repo",
+            &[],
+            &owners(&["other/repo"]),
+        ));
     }
 
     #[test]
     fn is_not_allowed_unknown() {
         assert!(!is_allowed(
+            "github.com",
             "stranger/repo",
-            &["cameronsjo".to_string()],
-            &[]
+            &owners(&["cameronsjo"]),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn is_allowed_host_qualified_owner() {
+        assert!(is_allowed(
+            "git.sjo.lol",
+            "cameron/repo",
+            &owners(&["git.sjo.lol/cameron"]),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn is_not_allowed_wrong_host() {
+        assert!(!is_allowed(
+            "github.com",
+            "cameron/repo",
+            &owners(&["git.sjo.lol/cameron"]),
+            &[],
         ));
     }
 
@@ -476,15 +542,16 @@ mod tests {
 
     #[test]
     fn is_allowed_empty_lists() {
-        assert!(!is_allowed("owner/repo", &[], &[]));
+        assert!(!is_allowed("github.com", "owner/repo", &[], &[]));
     }
 
     #[test]
     fn is_allowed_exact_repo_match() {
         assert!(is_allowed(
+            "github.com",
             "external/specific-repo",
             &[],
-            &["external/specific-repo".to_string()]
+            &owners(&["external/specific-repo"]),
         ));
     }
 
@@ -492,9 +559,10 @@ mod tests {
     fn is_allowed_owner_and_repo() {
         // Both match — should still return true
         assert!(is_allowed(
+            "github.com",
             "cameronsjo/repo",
-            &["cameronsjo".to_string()],
-            &["cameronsjo/repo".to_string()]
+            &owners(&["cameronsjo"]),
+            &owners(&["cameronsjo/repo"]),
         ));
     }
 
@@ -563,10 +631,10 @@ mod tests {
     fn repo_create_without_owner_uses_default() {
         // resolve_target_repo for "gh repo create my-repo" without owner
         // should prepend the first allowed owner
-        let allowed = vec!["cameronsjo".to_string()];
+        let allowed = owners(&["cameronsjo"]);
         let resolved = resolve_target_repo("gh repo create my-repo", ".", &allowed);
         match resolved {
-            RepoResolution::Resolved(repo) => {
+            RepoResolution::Resolved { repo, .. } => {
                 assert_eq!(repo, "cameronsjo/my-repo");
             }
             other => panic!("expected Resolved, got {other:?}"),
@@ -575,10 +643,10 @@ mod tests {
 
     #[test]
     fn repo_create_with_owner() {
-        let allowed = vec!["cameronsjo".to_string()];
+        let allowed = owners(&["cameronsjo"]);
         let resolved = resolve_target_repo("gh repo create cameronsjo/new-repo", ".", &allowed);
         match resolved {
-            RepoResolution::Resolved(repo) => {
+            RepoResolution::Resolved { repo, .. } => {
                 assert_eq!(repo, "cameronsjo/new-repo");
             }
             other => panic!("expected Resolved, got {other:?}"),

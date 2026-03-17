@@ -4,19 +4,22 @@
 //! verifies the repository owner is in the configured allowlist. Also blocks
 //! looped pushes and force-push to `main`.
 
+use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries};
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, git_command, parse_work_dir, repo_from_url, strip_quotes,
+    LOOP_PATTERN, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
-/// Check if owner is in the allowed list.
-fn check_owner(url: &str, allowed_owners: &[String]) -> bool {
-    let Some(repo) = repo_from_url(url) else {
+/// Check if a URL's owner is in the allowed list.
+fn check_owner(url: &str, allowed_owners: &[AllowEntry], allowed_repos: &[AllowEntry]) -> bool {
+    let Some((host, repo_path)) = host_and_repo_from_url(url) else {
         return false;
     };
-    let owner = repo.split('/').next().unwrap_or("");
-    allowed_owners.iter().any(|a| a == owner)
+    let mut parts = repo_path.splitn(2, '/');
+    let owner = parts.next().unwrap_or("");
+    let repo = parts.next().unwrap_or("");
+    config::is_allowed(&host, owner, repo, allowed_owners, allowed_repos)
 }
 
 /// Resolve the push URL for a git repo.
@@ -130,11 +133,8 @@ impl Check for PushRemoteGuard {
         }
 
         // Owner-based checks require configuration
-        let allowed_owners: Vec<String> = std::env::var("GIT_GUARDRAILS_ALLOWED_OWNERS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(String::from)
-            .collect();
+        let allowed_owners = env_allow_entries("GIT_GUARDRAILS_ALLOWED_OWNERS");
+        let allowed_repos = env_allow_entries("GIT_GUARDRAILS_ALLOWED_REPOS");
 
         if allowed_owners.is_empty() {
             return CheckResult::block(
@@ -155,7 +155,7 @@ impl Check for PushRemoteGuard {
             for cmd in cmds {
                 if let Some(remote) = &cmd.explicit_repo
                     && let Some(url) = resolve_push_url(&work_dir_loop, Some(remote))
-                    && !check_owner(&url, &allowed_owners)
+                    && !check_owner(&url, &allowed_owners, &allowed_repos)
                 {
                     return CheckResult::block(format!(
                         "🚫 git-guardrails: Push loop targets remote you don't own\n   \
@@ -190,7 +190,12 @@ impl Check for PushRemoteGuard {
             ));
         };
 
-        if !check_owner(&url, &allowed_owners) {
+        if !check_owner(&url, &allowed_owners, &allowed_repos) {
+            let all_entries: Vec<String> = allowed_owners
+                .iter()
+                .chain(allowed_repos.iter())
+                .map(|e| e.to_string())
+                .collect();
             return CheckResult::block(format!(
                 "🚫 git-guardrails: Push target is not yours\n   \
                  Would push to: {url}\n   \
@@ -198,7 +203,7 @@ impl Check for PushRemoteGuard {
                  Allowed:       {}\n\n   \
                  Fix tracking:  git branch -u origin/main\n   \
                  Push explicit: git push origin main",
-                allowed_owners.join(" ")
+                all_entries.join(" ")
             ));
         }
 
@@ -210,11 +215,18 @@ impl Check for PushRemoteGuard {
 mod tests {
     use super::*;
 
+    use cadence_hooks_core::config::parse_allow_entry;
+
+    fn owners(entries: &[&str]) -> Vec<AllowEntry> {
+        entries.iter().map(|e| parse_allow_entry(e)).collect()
+    }
+
     #[test]
     fn owner_check_passes() {
         assert!(check_owner(
             "https://github.com/cameronsjo/repo.git",
-            &["cameronsjo".to_string()]
+            &owners(&["cameronsjo"]),
+            &[],
         ));
     }
 
@@ -222,7 +234,8 @@ mod tests {
     fn owner_check_fails() {
         assert!(!check_owner(
             "https://github.com/other/repo.git",
-            &["cameronsjo".to_string()]
+            &owners(&["cameronsjo"]),
+            &[],
         ));
     }
 
@@ -230,20 +243,78 @@ mod tests {
     fn owner_check_multiple_owners() {
         assert!(check_owner(
             "https://github.com/cameronsjo/repo.git",
-            &["other".to_string(), "cameronsjo".to_string()]
+            &owners(&["other", "cameronsjo"]),
+            &[],
         ));
     }
 
     #[test]
     fn owner_check_empty_list() {
-        assert!(!check_owner("https://github.com/cameronsjo/repo.git", &[]));
+        assert!(!check_owner(
+            "https://github.com/cameronsjo/repo.git",
+            &[],
+            &[],
+        ));
     }
 
     #[test]
     fn owner_check_case_sensitive() {
         assert!(!check_owner(
             "https://github.com/CameronSjo/repo.git",
-            &["cameronsjo".to_string()]
+            &owners(&["cameronsjo"]),
+            &[],
+        ));
+    }
+
+    // --- host-aware matching ---
+
+    #[test]
+    fn owner_check_host_qualified() {
+        assert!(check_owner(
+            "https://git.sjo.lol/cameron/cadence.git",
+            &owners(&["git.sjo.lol/cameron"]),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn owner_check_host_mismatch_blocked() {
+        // bare "cameron" defaults to github.com — should NOT match git.sjo.lol
+        assert!(!check_owner(
+            "https://git.sjo.lol/cameron/cadence.git",
+            &owners(&["cameron"]),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn owner_check_mixed_hosts() {
+        let o = owners(&["cameronsjo", "git.sjo.lol/cameron"]);
+        // github.com/cameronsjo → allowed
+        assert!(check_owner(
+            "https://github.com/cameronsjo/repo.git",
+            &o,
+            &[],
+        ));
+        // git.sjo.lol/cameron → allowed
+        assert!(check_owner("git@git.sjo.lol:cameron/repo.git", &o, &[],));
+        // git.sjo.lol/cameronsjo → blocked
+        assert!(!check_owner(
+            "https://git.sjo.lol/cameronsjo/repo.git",
+            &o,
+            &[],
+        ));
+        // github.com/cameron → blocked
+        assert!(!check_owner("https://github.com/cameron/repo.git", &o, &[],));
+    }
+
+    #[test]
+    fn owner_check_allowed_repo() {
+        let repos = owners(&["external/shared-repo"]);
+        assert!(check_owner(
+            "https://github.com/external/shared-repo.git",
+            &[],
+            &repos,
         ));
     }
 
@@ -282,7 +353,8 @@ mod tests {
     fn owner_check_ssh_url() {
         assert!(check_owner(
             "git@github.com:cameronsjo/repo.git",
-            &["cameronsjo".to_string()]
+            &owners(&["cameronsjo"]),
+            &[],
         ));
     }
 
@@ -290,13 +362,14 @@ mod tests {
     fn owner_check_https_no_git_suffix() {
         assert!(check_owner(
             "https://github.com/cameronsjo/repo",
-            &["cameronsjo".to_string()]
+            &owners(&["cameronsjo"]),
+            &[],
         ));
     }
 
     #[test]
     fn owner_check_malformed_returns_false() {
-        assert!(!check_owner("not-a-url", &["cameronsjo".to_string()]));
+        assert!(!check_owner("not-a-url", &owners(&["cameronsjo"]), &[]));
     }
 
     // --- PushRemoteGuard::run(): loop and multi-push scenarios ---

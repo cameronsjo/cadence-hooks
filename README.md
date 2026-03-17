@@ -131,8 +131,8 @@ Some hooks require configuration:
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
-| `GIT_GUARDRAILS_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space-separated GitHub usernames |
-| `GIT_GUARDRAILS_ALLOWED_REPOS` | `guard-gh-write` | Space-separated `owner/repo` pairs |
+| `GIT_GUARDRAILS_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space or comma-separated usernames |
+| `GIT_GUARDRAILS_ALLOWED_REPOS` | `guard-gh-write` | Space or comma-separated `owner/repo` pairs |
 | `OBSIDIAN_VAULT` | `trash-guard` | Absolute path to Obsidian vault |
 
 ## Architecture

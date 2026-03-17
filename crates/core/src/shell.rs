@@ -38,38 +38,56 @@ pub fn strip_quotes(s: &str) -> String {
     result
 }
 
-/// Extract `owner/repo` from any git remote URL format.
+/// Extract `(host, "owner/repo")` from any git remote URL format.
 ///
 /// Handles:
 /// - `https://github.com/owner/repo.git`
 /// - `ssh://git@github.com/owner/repo.git`
 /// - `git@github.com:owner/repo.git` (SCP-style)
 /// - URLs with ports, credentials, trailing slashes, and subpaths
-pub fn repo_from_url(url: &str) -> Option<String> {
+pub fn host_and_repo_from_url(url: &str) -> Option<(String, String)> {
     let trimmed = url.trim();
 
-    let path = if let Some(after_scheme) = trimmed.split("://").nth(1) {
-        // Has scheme (https://, ssh://) — skip host, take path after first /
-        after_scheme.split_once('/')?.1
-    } else if let Some(after_colon) = trimmed.split_once(':').map(|x| x.1) {
+    let (host, path) = if let Some(after_scheme) = trimmed.split("://").nth(1) {
+        // Has scheme (https://, ssh://) — extract host, then path after first /
+        let (host_part, path) = after_scheme.split_once('/')?;
+        // Strip credentials: user@host or token:x-oauth@host
+        let host_part = host_part.rsplit('@').next().unwrap_or(host_part);
+        // Strip port: host:22
+        let host_part = host_part.split(':').next().unwrap_or(host_part);
+        (host_part, path)
+    } else if let Some((before_colon, after_colon)) = trimmed.split_once(':') {
         // SCP-style: git@host:owner/repo.git — path is after the colon
         // Guard: if it starts with / it's a port or absolute path, not SCP
         if after_colon.starts_with('/') {
             return None;
         }
-        after_colon
+        // Strip user: git@host
+        let host = before_colon.rsplit('@').next().unwrap_or(before_colon);
+        (host, after_colon)
     } else {
         return None;
     };
+
+    if host.is_empty() {
+        return None;
+    }
 
     let path = path.trim_end_matches(".git");
 
     let parts: Vec<&str> = path.splitn(3, '/').collect();
     if parts.len() >= 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-        Some(format!("{}/{}", parts[0], parts[1]))
+        Some((host.to_lowercase(), format!("{}/{}", parts[0], parts[1])))
     } else {
         None
     }
+}
+
+/// Extract `owner/repo` from any git remote URL format.
+///
+/// Convenience wrapper around [`host_and_repo_from_url`] that discards the host.
+pub fn repo_from_url(url: &str) -> Option<String> {
+    host_and_repo_from_url(url).map(|(_, repo)| repo)
 }
 
 /// Run a git command in a specific working directory.
@@ -379,6 +397,74 @@ mod tests {
     #[test]
     fn no_match_normal_command() {
         assert!(!LOOP_PATTERN.is_match("git push origin main"));
+    }
+
+    // --- host_and_repo_from_url ---
+
+    #[test]
+    fn host_and_repo_https() {
+        assert_eq!(
+            host_and_repo_from_url("https://github.com/cameronsjo/repo.git"),
+            Some(("github.com".to_string(), "cameronsjo/repo".to_string()))
+        );
+    }
+
+    #[test]
+    fn host_and_repo_ssh_scp() {
+        assert_eq!(
+            host_and_repo_from_url("git@git.sjo.lol:cameron/cadence.git"),
+            Some(("git.sjo.lol".to_string(), "cameron/cadence".to_string()))
+        );
+    }
+
+    #[test]
+    fn host_and_repo_ssh_scheme() {
+        assert_eq!(
+            host_and_repo_from_url("ssh://git@github.com/owner/repo.git"),
+            Some(("github.com".to_string(), "owner/repo".to_string()))
+        );
+    }
+
+    #[test]
+    fn host_and_repo_with_port() {
+        assert_eq!(
+            host_and_repo_from_url("ssh://git@github.com:22/owner/repo.git"),
+            Some(("github.com".to_string(), "owner/repo".to_string()))
+        );
+    }
+
+    #[test]
+    fn host_and_repo_with_credentials() {
+        assert_eq!(
+            host_and_repo_from_url("https://token:x-oauth-basic@github.com/owner/repo.git"),
+            Some(("github.com".to_string(), "owner/repo".to_string()))
+        );
+    }
+
+    #[test]
+    fn host_and_repo_custom_host() {
+        assert_eq!(
+            host_and_repo_from_url("https://git.sjo.lol/cameron/cadence"),
+            Some(("git.sjo.lol".to_string(), "cameron/cadence".to_string()))
+        );
+    }
+
+    #[test]
+    fn host_and_repo_normalizes_host_case() {
+        assert_eq!(
+            host_and_repo_from_url("https://GitHub.COM/owner/repo"),
+            Some(("github.com".to_string(), "owner/repo".to_string()))
+        );
+    }
+
+    #[test]
+    fn host_and_repo_malformed_returns_none() {
+        assert_eq!(host_and_repo_from_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn host_and_repo_no_repo_segment() {
+        assert_eq!(host_and_repo_from_url("https://github.com/owner"), None);
     }
 
     // --- adversarial: repo_from_url ---
