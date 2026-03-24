@@ -93,7 +93,7 @@ impl Check for WarnDocsUpdate {
             msg.push_str("\n  Public API changes detected — README.md may need updating.\n");
         }
 
-        CheckResult::warn(msg)
+        CheckResult::nudge(msg)
     }
 }
 
@@ -256,7 +256,7 @@ mod tests {
         // Allow or Warn are both acceptable — depends on git state
         assert!(
             result.outcome == cadence_hooks_core::Outcome::Allow
-                || result.outcome == cadence_hooks_core::Outcome::Warn
+                || result.outcome == cadence_hooks_core::Outcome::Nudge
         );
     }
 

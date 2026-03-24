@@ -27,7 +27,7 @@ impl Check for GuardGitInit {
         let has_git_init = words.windows(2).any(|w| w[0] == "git" && w[1] == "init");
 
         if has_git_init {
-            return CheckResult::warn(
+            return CheckResult::nudge(
                 "New repo detected. Run /a-star-is-born to scaffold project standards \
                  (.gitignore, README, CONTRIBUTING, CHANGELOG, LICENSE, Makefile, linting, CI/CD).",
             );
@@ -59,13 +59,13 @@ mod tests {
     #[test]
     fn git_init_detected() {
         let result = GuardGitInit.run(&make_bash("git init"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn git_init_with_path() {
         let result = GuardGitInit.run(&make_bash("git init my-project"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn git_init_with_branch() {
         let result = GuardGitInit.run(&make_bash("git init -b main"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -108,7 +108,7 @@ mod tests {
         // "git" and "init" both present but not adjacent as "git init"
         // The command is "mkdir proj && git init" — "git init" IS adjacent here
         let result = GuardGitInit.run(&make_bash("mkdir proj && git init"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // --- Unhappy path: edge cases ---
@@ -132,13 +132,13 @@ mod tests {
     #[test]
     fn git_init_bare_warned() {
         let result = GuardGitInit.run(&make_bash("git init --bare"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn git_reinit_warned() {
         // Re-init existing repo
         let result = GuardGitInit.run(&make_bash("cd /project && git init"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 }

@@ -30,13 +30,13 @@ fn idle_outcome(gap: Option<u64>) -> CheckResult {
 
     if gap >= NEW_SESSION_THRESHOLD_SECS {
         let hours = gap / 3600;
-        CheckResult::warn(format!(
+        CheckResult::nudge(format!(
             "It's been {hours}h since your last edit. Consider starting a \
              fresh session and re-orienting before continuing."
         ))
     } else if gap >= IDLE_THRESHOLD_SECS {
         let mins = gap / 60;
-        CheckResult::warn(format!(
+        CheckResult::nudge(format!(
             "It's been {mins}m since your last edit. Before continuing: \
              check for uncommitted changes worth committing, and consider \
              saving any learnings to auto memory."
@@ -131,28 +131,28 @@ mod tests {
     #[test]
     fn exactly_at_threshold_warns() {
         let result = idle_outcome(Some(300));
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.as_deref().unwrap().contains("5m"));
     }
 
     #[test]
     fn ten_minutes_idle_warns() {
         let result = idle_outcome(Some(600));
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.as_deref().unwrap().contains("10m"));
     }
 
     #[test]
     fn one_hour_idle_warns() {
         let result = idle_outcome(Some(3600));
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.as_deref().unwrap().contains("60m"));
     }
 
     #[test]
     fn just_under_new_session_warns() {
         let result = idle_outcome(Some(28799));
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         // 28799 / 60 = 479 minutes
         assert!(result.message.as_deref().unwrap().contains("479m"));
     }
@@ -161,7 +161,7 @@ mod tests {
     fn exactly_at_new_session_warns_fresh_session() {
         // 8 hours — stale session, suggest fresh start
         let result = idle_outcome(Some(28800));
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.as_deref().unwrap().contains("8h"));
         assert!(result.message.as_deref().unwrap().contains("fresh session"));
     }
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn day_old_session_warns_fresh_session() {
         let result = idle_outcome(Some(86400));
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.as_deref().unwrap().contains("24h"));
         assert!(result.message.as_deref().unwrap().contains("fresh session"));
     }
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn twelve_hour_gap_warns_fresh_session() {
         let result = idle_outcome(Some(43200));
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.as_deref().unwrap().contains("12h"));
         assert!(result.message.as_deref().unwrap().contains("fresh session"));
     }

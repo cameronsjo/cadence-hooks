@@ -83,7 +83,7 @@ impl Check for EnvVarGuard {
              ❌ DEBUG, PORT\n",
         );
 
-        CheckResult::warn(msg)
+        CheckResult::nudge(msg)
     }
 }
 
@@ -117,7 +117,7 @@ mod tests {
     fn generic_env_var_warns() {
         let input = make_input("src/app.ts", "const debug = process.env.DEBUG;");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -131,21 +131,21 @@ mod tests {
     fn python_env_access_detected() {
         let input = make_input("src/main.py", "os.getenv(\"PORT\")");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn ruby_env_access_detected() {
         let input = make_input("src/app.rb", "ENV['DEBUG']");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn rust_env_var_detected() {
         let input = make_input("src/main.rs", "std::env::var(\"VERBOSE\")");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -212,7 +212,7 @@ mod tests {
         let content = "const a = process.env.DEBUG;\nconst b = process.env.PORT;";
         let input = make_input("src/app.ts", content);
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
         let msg = result.message.unwrap();
         assert!(msg.contains("DEBUG"));
         assert!(msg.contains("PORT"));
@@ -235,7 +235,7 @@ mod tests {
             let result = EnvVarGuard.run(&input);
             assert_eq!(
                 result.outcome,
-                cadence_hooks_core::Outcome::Warn,
+                cadence_hooks_core::Outcome::Nudge,
                 "{var} should be detected"
             );
         }
@@ -249,7 +249,7 @@ mod tests {
             let result = EnvVarGuard.run(&input);
             assert_eq!(
                 result.outcome,
-                cadence_hooks_core::Outcome::Warn,
+                cadence_hooks_core::Outcome::Nudge,
                 "{var} should be detected in Python"
             );
         }
@@ -304,21 +304,21 @@ mod tests {
         // as a substring of `process.env.DEBUGGING`.
         let input = make_input("src/app.ts", "process.env.DEBUGGING");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn mjs_extension_detected() {
         let input = make_input("src/utils.mjs", "process.env.DEBUG");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn cjs_extension_detected() {
         let input = make_input("src/config.cjs", "process.env.VERBOSE");
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -337,7 +337,7 @@ mod tests {
             cwd: None,
         };
         let result = EnvVarGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl Check for WarnUntrackedFiles {
             msg.push_str(&format!("  ?? {file}\n"));
         }
 
-        CheckResult::warn(msg)
+        CheckResult::nudge(msg)
     }
 }
 

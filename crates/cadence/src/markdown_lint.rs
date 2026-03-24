@@ -75,7 +75,7 @@ impl Check for MarkdownLint {
         let lint_output = String::from_utf8_lossy(&output.stdout);
         let filename = path.rsplit('/').next().unwrap_or(&path);
 
-        CheckResult::warn(format!(
+        CheckResult::nudge(format!(
             "⚠️  Markdown linting issues detected in {filename}\n\n{lint_output}\n\
              Fix: markdownlint --fix {path}"
         ))

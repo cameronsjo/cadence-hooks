@@ -192,7 +192,7 @@ impl Check for SecretWritesGuard {
                 }
 
                 if is_ambiguous(filename) {
-                    return CheckResult::warn(format!(
+                    return CheckResult::nudge(format!(
                         "⚠️  '{filename}' may contain private key material. \
                          Approve only if you know this is a public cert."
                     ));
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn write_pem_warned() {
         let result = SecretWritesGuard.run(&make_write_input("/etc/ssl/cert.pem"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn write_p8_warned() {
         let result = SecretWritesGuard.run(&make_write_input("/etc/ssl/signing.p8"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]

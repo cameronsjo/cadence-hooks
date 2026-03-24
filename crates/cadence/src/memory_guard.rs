@@ -56,7 +56,7 @@ impl Check for MemoryGuard {
                 ));
             }
             if line_count >= MEMORY_SOFT_LIMIT {
-                return CheckResult::warn(format!(
+                return CheckResult::nudge(format!(
                     "⚠️  MEMORY.md is {line_count}/{MEMORY_HARD_LIMIT} lines. \
                      Consider moving details to topic files."
                 ));
@@ -64,7 +64,7 @@ impl Check for MemoryGuard {
         } else {
             // Topic file
             if line_count > TOPIC_SOFT_LIMIT {
-                return CheckResult::warn(format!(
+                return CheckResult::nudge(format!(
                     "⚠️  Topic file is {line_count} lines (soft limit: {TOPIC_SOFT_LIMIT}). \
                      Consider splitting into smaller topic files."
                 ));
@@ -113,7 +113,7 @@ mod tests {
     fn memory_md_at_soft_limit_warns() {
         let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 185);
         let result = MemoryGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -127,7 +127,7 @@ mod tests {
     fn topic_file_over_soft_limit_warns() {
         let input = make_input("/home/user/.claude/projects/foo/memory/debugging.md", 350);
         let result = MemoryGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -135,14 +135,14 @@ mod tests {
         let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 200);
         let result = MemoryGuard.run(&input);
         // 200 >= MEMORY_SOFT_LIMIT (180), so warns
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn memory_md_exactly_at_soft_limit_warns() {
         let input = make_input("/home/user/.claude/projects/foo/memory/MEMORY.md", 180);
         let result = MemoryGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
     fn topic_file_at_301_warns() {
         let input = make_input("/home/user/.claude/projects/foo/memory/debugging.md", 301);
         let result = MemoryGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -247,6 +247,6 @@ mod tests {
     fn large_topic_file() {
         let input = make_input("/home/user/.claude/projects/foo/memory/debugging.md", 1000);
         let result = MemoryGuard.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 }

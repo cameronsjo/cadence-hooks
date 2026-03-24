@@ -1,10 +1,9 @@
 //! Core protocol for Claude Code hooks.
 //!
-//! All hooks receive JSON on stdin describing the tool invocation,
-//! write diagnostics to stderr, and exit with a status code:
-//! - 0: allow (operation proceeds)
-//! - 1: warn (operation proceeds, message shown)
-//! - 2: block (operation prevented)
+//! All hooks receive JSON on stdin describing the tool invocation
+//! and exit with a status code:
+//! - 0: allow / nudge (operation proceeds, stdout included in transcript)
+//! - 2: block (operation prevented, stderr fed back to Claude)
 
 pub mod config;
 pub mod loop_analysis;
@@ -15,13 +14,21 @@ use std::io::Read;
 use std::process;
 
 /// Exit codes matching Claude Code's hook contract.
+///
+/// Claude Code recognises two exit codes:
+///   0 — success (stdout included in transcript)
+///   2 — block  (stderr fed back to Claude, tool call prevented)
+/// Any other code is a non-blocking error (stderr shown only in verbose mode).
+///
+/// `Nudge` exits 0 so its message lands in the transcript as context
+/// without interrupting the operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     /// Operation allowed, no message.
     Allow,
-    /// Operation allowed, advisory message shown.
-    Warn,
-    /// Operation blocked, error message shown.
+    /// Operation allowed, contextual message shown in transcript (exit 0, stdout).
+    Nudge,
+    /// Operation blocked, error message shown (exit 2, stderr).
     Block,
 }
 
@@ -29,7 +36,7 @@ impl Outcome {
     pub fn code(self) -> i32 {
         match self {
             Outcome::Allow => 0,
-            Outcome::Warn => 1,
+            Outcome::Nudge => 0,
             Outcome::Block => 2,
         }
     }
@@ -38,7 +45,7 @@ impl Outcome {
     pub fn merge(self, other: Outcome) -> Outcome {
         match (self, other) {
             (Outcome::Block, _) | (_, Outcome::Block) => Outcome::Block,
-            (Outcome::Warn, _) | (_, Outcome::Warn) => Outcome::Warn,
+            (Outcome::Nudge, _) | (_, Outcome::Nudge) => Outcome::Nudge,
             _ => Outcome::Allow,
         }
     }
@@ -130,9 +137,9 @@ impl CheckResult {
         }
     }
 
-    pub fn warn(message: impl Into<String>) -> Self {
+    pub fn nudge(message: impl Into<String>) -> Self {
         Self {
-            outcome: Outcome::Warn,
+            outcome: Outcome::Nudge,
             message: Some(message.into()),
         }
     }
@@ -155,12 +162,26 @@ pub trait Check {
 }
 
 /// Run a single check, emit output, and exit.
+///
+/// Routing: Nudge messages go to stdout (included in transcript at exit 0).
+/// Block messages go to stderr (fed back to Claude at exit 2).
 pub fn run_check(check: &dyn Check, input: &HookInput) -> ! {
     let result = check.run(input);
     if let Some(msg) = &result.message {
-        eprint!("{msg}");
-        if !msg.ends_with('\n') {
-            eprintln!();
+        match result.outcome {
+            Outcome::Nudge => {
+                print!("{msg}");
+                if !msg.ends_with('\n') {
+                    println!();
+                }
+            }
+            Outcome::Block => {
+                eprint!("{msg}");
+                if !msg.ends_with('\n') {
+                    eprintln!();
+                }
+            }
+            Outcome::Allow => {} // Allow never has a message, but handle gracefully
         }
     }
     process::exit(result.outcome.code());
@@ -186,7 +207,7 @@ mod tests {
     #[test]
     fn outcome_codes() {
         assert_eq!(Outcome::Allow.code(), 0);
-        assert_eq!(Outcome::Warn.code(), 1);
+        assert_eq!(Outcome::Nudge.code(), 0);
         assert_eq!(Outcome::Block.code(), 2);
     }
 
@@ -194,16 +215,16 @@ mod tests {
     fn outcome_merge_block_wins() {
         assert_eq!(Outcome::Block.merge(Outcome::Allow), Outcome::Block);
         assert_eq!(Outcome::Allow.merge(Outcome::Block), Outcome::Block);
-        assert_eq!(Outcome::Block.merge(Outcome::Warn), Outcome::Block);
-        assert_eq!(Outcome::Warn.merge(Outcome::Block), Outcome::Block);
+        assert_eq!(Outcome::Block.merge(Outcome::Nudge), Outcome::Block);
+        assert_eq!(Outcome::Nudge.merge(Outcome::Block), Outcome::Block);
         assert_eq!(Outcome::Block.merge(Outcome::Block), Outcome::Block);
     }
 
     #[test]
     fn outcome_merge_warn_over_allow() {
-        assert_eq!(Outcome::Warn.merge(Outcome::Allow), Outcome::Warn);
-        assert_eq!(Outcome::Allow.merge(Outcome::Warn), Outcome::Warn);
-        assert_eq!(Outcome::Warn.merge(Outcome::Warn), Outcome::Warn);
+        assert_eq!(Outcome::Nudge.merge(Outcome::Allow), Outcome::Nudge);
+        assert_eq!(Outcome::Allow.merge(Outcome::Nudge), Outcome::Nudge);
+        assert_eq!(Outcome::Nudge.merge(Outcome::Nudge), Outcome::Nudge);
     }
 
     #[test]
@@ -320,8 +341,8 @@ mod tests {
 
     #[test]
     fn check_result_warn() {
-        let r = CheckResult::warn("caution");
-        assert_eq!(r.outcome, Outcome::Warn);
+        let r = CheckResult::nudge("caution");
+        assert_eq!(r.outcome, Outcome::Nudge);
         assert_eq!(r.message.as_deref(), Some("caution"));
     }
 
@@ -334,7 +355,7 @@ mod tests {
 
     #[test]
     fn check_result_accepts_string() {
-        let r = CheckResult::warn(String::from("owned"));
+        let r = CheckResult::nudge(String::from("owned"));
         assert_eq!(r.message.as_deref(), Some("owned"));
     }
 

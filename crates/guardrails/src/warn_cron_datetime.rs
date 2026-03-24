@@ -1,14 +1,27 @@
-//! Remind to check current datetime before scheduling cron jobs.
+//! Inject current datetime before scheduling cron jobs.
 //!
 //! CronCreate pins to exact calendar dates via 5-field cron expressions.
 //! A timer set for "10 minutes from now" at 23:55 will silently expire
-//! when the date rolls over at midnight. This guard warns the agent to
-//! confirm the current date and time before scheduling.
+//! when the date rolls over at midnight. This nudge injects the current
+//! date and time into the transcript so the agent can schedule accurately.
+
+use std::process::Command;
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
-/// Warns on CronCreate to prompt datetime awareness.
+/// Nudges on CronCreate with current datetime context.
 pub struct WarnCronDatetime;
+
+/// Run `date` with the given format string, trimming the trailing newline.
+fn date_fmt(args: &[&str]) -> String {
+    Command::new("date")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
 
 impl Check for WarnCronDatetime {
     fn name(&self) -> &str {
@@ -18,11 +31,13 @@ impl Check for WarnCronDatetime {
     fn run(&self, input: &HookInput) -> CheckResult {
         let tool = input.tool_name().unwrap_or("");
         if tool == "CronCreate" {
-            return CheckResult::warn(
-                "⏰ Cron expressions pin to exact calendar dates. \
-                 Before scheduling, confirm the current date and time \
-                 to avoid timers that silently expire on date rollover.",
-            );
+            let local = date_fmt(&["+%Y-%m-%d %H:%M:%S %Z"]);
+            let utc = date_fmt(&["-u", "+%Y-%m-%d %H:%M:%S UTC"]);
+            let day = date_fmt(&["+%A"]);
+            return CheckResult::nudge(format!(
+                "Current date/time: {local} ({utc})\n\
+                 Day of week: {day}"
+            ));
         }
         CheckResult::allow()
     }
@@ -42,16 +57,13 @@ mod tests {
     }
 
     #[test]
-    fn cron_create_warns() {
+    fn cron_create_nudges_with_datetime() {
         let result = WarnCronDatetime.run(&make_input("CronCreate"));
-        assert_eq!(result.outcome, Outcome::Warn);
-        assert!(
-            result
-                .message
-                .as_deref()
-                .unwrap()
-                .contains("current date and time")
-        );
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap();
+        assert!(msg.contains("Current date/time:"));
+        assert!(msg.contains("UTC"));
+        assert!(msg.contains("Day of week:"));
     }
 
     #[test]
@@ -92,10 +104,9 @@ mod tests {
     }
 
     #[test]
-    fn warn_message_mentions_date_rollover() {
+    fn nudge_message_includes_day_of_week() {
         let result = WarnCronDatetime.run(&make_input("CronCreate"));
         let msg = result.message.unwrap();
-        assert!(msg.contains("date"));
-        assert!(msg.contains("rollover"));
+        assert!(msg.contains("Day of week:"));
     }
 }

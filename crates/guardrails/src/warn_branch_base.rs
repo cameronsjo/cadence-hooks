@@ -29,7 +29,7 @@ impl Check for WarnBranchBase {
             if is_main_branch(&base) {
                 return CheckResult::allow();
             }
-            return CheckResult::warn(format!(
+            return CheckResult::nudge(format!(
                 "⚠️  Creating branch from `{base}`, not main.\n   \
                  If this is intentional (stacked branch), proceed.\n   \
                  Otherwise: `git checkout main && git pull` first."
@@ -46,7 +46,7 @@ impl Check for WarnBranchBase {
             return CheckResult::allow();
         }
 
-        CheckResult::warn(format!(
+        CheckResult::nudge(format!(
             "⚠️  Creating branch from `{current}`, not main.\n   \
              If this is intentional (stacked branch), proceed.\n   \
              Otherwise: `git checkout main && git pull` first."
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn explicit_non_main_base_warned() {
         let result = WarnBranchBase.run(&make_bash("git checkout -b feature develop"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
         assert!(result.message.unwrap().contains("develop"));
     }
 

@@ -184,7 +184,7 @@ impl Check for SecurityPatternScanner {
         }
 
         // Advisory only — never block
-        CheckResult::warn(msg)
+        CheckResult::nudge(msg)
     }
 }
 

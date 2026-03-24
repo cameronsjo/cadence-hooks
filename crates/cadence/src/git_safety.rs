@@ -365,7 +365,7 @@ impl Check for GitSafetyGuard {
 
         // Check warnings
         if let Some(_reason) = self.check_warned(&tokens) {
-            return CheckResult::warn(format!(
+            return CheckResult::nudge(format!(
                 "Git operation may modify history or lose work: {command}"
             ));
         }
@@ -486,13 +486,13 @@ mod tests {
     #[test]
     fn amend_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git commit --amend"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn force_push_feature_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git push --force origin feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -575,25 +575,25 @@ mod tests {
     #[test]
     fn stash_drop_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git stash drop"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn stash_clear_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git stash clear"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn branch_delete_feature_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git branch -D my-feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn remote_remove_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git remote remove upstream"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -665,19 +665,19 @@ mod tests {
     #[test]
     fn reset_soft_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git reset HEAD~1"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn rebase_feature_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git rebase feature-branch"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn remote_rm_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git remote rm origin"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -757,7 +757,7 @@ mod tests {
     #[test]
     fn branch_delete_long_form_feature_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git branch --delete my-feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // ---------------------------------------------------------------
@@ -887,7 +887,7 @@ mod tests {
     fn push_fu_feature_warned() {
         // Force push to non-protected branch: warn, not block
         let result = GitSafetyGuard.run(&make_bash_input("git push -fu origin feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // ---------------------------------------------------------------
@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn force_push_upstream_feature_warned() {
         let result = GitSafetyGuard.run(&make_bash_input("git push --force upstream feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // ---------------------------------------------------------------
@@ -987,7 +987,7 @@ mod tests {
     fn push_force_refspec_feature_warned() {
         // Force push refspec to non-protected branch: warn
         let result = GitSafetyGuard.run(&make_bash_input("git push -f origin HEAD:feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // ---------------------------------------------------------------
@@ -1017,33 +1017,33 @@ mod tests {
     fn rebase_maintain_state_not_blocked() {
         let result = GitSafetyGuard.run(&make_bash_input("git rebase feat/maintain-state"));
         // Should be warned (rebase) but NOT blocked (maintain != main)
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn rebase_domain_main_not_blocked() {
         let result = GitSafetyGuard.run(&make_bash_input("git rebase fix/domain-maintenance"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn rebase_mainly_not_blocked() {
         let result = GitSafetyGuard.run(&make_bash_input("git rebase mainly-refactor"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn branch_delete_main_feature_warned_not_blocked() {
         // "main-feature" is not "main"
         let result = GitSafetyGuard.run(&make_bash_input("git branch -D main-feature"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn force_push_maintain_warned_not_blocked() {
         // "maintain" is not "main"
         let result = GitSafetyGuard.run(&make_bash_input("git push --force origin maintain"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // ---------------------------------------------------------------
@@ -1062,7 +1062,7 @@ mod tests {
         let result = GitSafetyGuard.run(&make_bash_input(
             "git push --force-with-lease origin feature",
         ));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     // ---------------------------------------------------------------

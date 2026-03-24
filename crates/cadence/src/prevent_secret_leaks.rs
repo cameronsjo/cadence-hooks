@@ -177,7 +177,7 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     let env_dumps = [" env", "env ", "printenv", "export -p", "declare -x"];
     for dump in &env_dumps {
         if lower.contains(dump) || lower == "env" {
-            return Some(CheckResult::warn(
+            return Some(CheckResult::nudge(
                 "⚠️  Command would dump environment variables, which may include secrets. \
                  Run programs that use env vars directly instead.",
             ));
@@ -190,7 +190,7 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
             .iter()
             .any(|s| command.contains(s))
     {
-        return Some(CheckResult::warn(
+        return Some(CheckResult::nudge(
             "⚠️  Command may print a secret environment variable. \
              Run programs that use env vars directly instead.",
         ));
@@ -229,7 +229,7 @@ impl Check for SecretLeaksGuard {
                 }
 
                 if is_ambiguous(filename) {
-                    return CheckResult::warn(format!(
+                    return CheckResult::nudge(format!(
                         "⚠️  (Read) '{filename}' may contain private key material. \
                          Approve only if you know this is a public cert."
                     ));
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn bash_env_dump_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("printenv"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     fn make_grep_input(path: &str) -> HookInput {
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn read_pem_ambiguous_warned() {
         let result = SecretLeaksGuard.run(&make_read_input("/etc/ssl/cert.pem"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -434,19 +434,19 @@ mod tests {
     #[test]
     fn bash_echo_secret_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("echo $SECRET_TOKEN"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn bash_echo_password_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("printf '%s' $PASSWORD"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn bash_export_p_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("export -p"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -525,31 +525,31 @@ mod tests {
     #[test]
     fn bash_env_as_standalone_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("env"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn bash_declare_x_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("declare -x"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn bash_echo_credential_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("echo $CREDENTIAL"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn bash_echo_auth_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("echo $AUTH_TOKEN"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
     fn bash_printf_key_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("printf '%s' $API_KEY"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn read_p8_ambiguous_warned() {
         let result = SecretLeaksGuard.run(&make_read_input("/etc/ssl/signing.p8"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Warn);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]

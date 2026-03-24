@@ -26,7 +26,7 @@ fn should_warn(branch: &str, already_warned: bool) -> CheckResult {
         return CheckResult::allow();
     }
 
-    CheckResult::warn(format!(
+    CheckResult::nudge(format!(
         "You're editing files directly on '{branch}'. \
          Ask the user: should this work be on a feature branch instead?"
     ))
@@ -83,7 +83,7 @@ impl Check for WarnMainBranch {
         let result = should_warn(&branch, already_warned);
 
         // Create marker on warn to suppress future warnings this session
-        if result.outcome == Outcome::Warn
+        if result.outcome == Outcome::Nudge
             && let Some(marker) = Self::marker_path()
         {
             let _ = std::fs::write(&marker, "");
@@ -100,14 +100,14 @@ mod tests {
     #[test]
     fn main_branch_warns() {
         let result = should_warn("main", false);
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.as_deref().unwrap().contains("main"));
     }
 
     #[test]
     fn master_branch_warns() {
         let result = should_warn("master", false);
-        assert_eq!(result.outcome, Outcome::Warn);
+        assert_eq!(result.outcome, Outcome::Nudge);
         assert!(result.message.as_deref().unwrap().contains("master"));
     }
 
