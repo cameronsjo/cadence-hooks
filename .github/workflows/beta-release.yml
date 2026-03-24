@@ -1,0 +1,134 @@
+name: Beta Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check for [beta] keyword
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commit message
+        id: check
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          if [[ "$COMMIT_MSG" =~ \[beta\] ]]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine version
+        id: version
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          BASE_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          LAST_TAG=$(git tag -l --sort=-v:refname 'v*' | head -1)
+          if [ -n "$LAST_TAG" ]; then
+            COMMIT_COUNT=$(git rev-list --count "${LAST_TAG}..HEAD")
+          else
+            COMMIT_COUNT=$(git rev-list --count HEAD)
+          fi
+          echo "version=${BASE_VERSION}-beta.${COMMIT_COUNT}+${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use-cross: false
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use-cross: true
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            use-cross: false
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            use-cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        run: cargo install cross --locked
+
+      - name: Build release binary
+        env:
+          USE_CROSS: ${{ matrix.use-cross }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ "${USE_CROSS}" = "true" ]; then
+            cross build --release --target "${TARGET}"
+          else
+            cargo build --release --target "${TARGET}"
+          fi
+
+      - name: Create tarball
+        env:
+          TARGET: ${{ matrix.target }}
+          MATRIX_NAME: ${{ matrix.name }}
+        run: |
+          VERSION="v${{ needs.check.outputs.version }}"
+          ARCHIVE="cadence-hooks-${VERSION}-${MATRIX_NAME}.tar.gz"
+          tar -czf "${ARCHIVE}" -C "target/${TARGET}/release" cadence-hooks
+          echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Create Beta Release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum cadence-hooks-*.tar.gz > checksums.txt
+
+      - name: Create GitHub Prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: v${{ needs.check.outputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Beta $VERSION" \
+            --notes "**Beta release for testing.** Install with: \`cargo install --git https://github.com/cameronsjo/cadence-hooks.git\`" \
+            --prerelease \
+            cadence-hooks-*.tar.gz checksums.txt

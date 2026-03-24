@@ -99,6 +99,15 @@ jobs:
             cadence-hooks-*.tar.gz
             checksums.txt
 
+      - name: Clean up beta prereleases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release list --limit 50 | grep "${VERSION}-beta" | awk '{print $1}' | while read -r tag; do
+            gh release delete "$tag" --yes --cleanup-tag || true
+          done
+
       - name: Parse checksums for Homebrew
         id: shas
         run: |
