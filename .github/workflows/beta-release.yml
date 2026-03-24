@@ -129,6 +129,41 @@ jobs:
           gh release create "$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Beta $VERSION" \
-            --notes "**Beta release for testing.** Install with: \`cargo install --git https://github.com/cameronsjo/cadence-hooks.git\`" \
+            --notes "**Beta release for testing.** Install with: \`brew install cameronsjo/tap/cadence-hooks-beta\`" \
             --prerelease \
             cadence-hooks-*.tar.gz checksums.txt
+
+      - name: Parse checksums for Homebrew
+        id: shas
+        run: |
+          for platform in macos-x86_64 macos-aarch64 linux-x86_64 linux-aarch64; do
+            SHA=$(grep "${platform}" checksums.txt | awk '{print $1}')
+            KEY=$(echo "$platform" | tr '-' '_')
+            echo "sha_${KEY}=${SHA}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Generate Forge Bellows token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          repositories: homebrew-tap
+
+      - name: Update Homebrew beta tap
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          SHA_MACOS_X86_64: ${{ steps.shas.outputs.sha_macos_x86_64 }}
+          SHA_MACOS_AARCH64: ${{ steps.shas.outputs.sha_macos_aarch64 }}
+          SHA_LINUX_X86_64: ${{ steps.shas.outputs.sha_linux_x86_64 }}
+          SHA_LINUX_AARCH64: ${{ steps.shas.outputs.sha_linux_aarch64 }}
+        run: |
+          gh api repos/cameronsjo/homebrew-tap/dispatches \
+            -f event_type=update-formula \
+            -f "client_payload[formula]=cadence-hooks-beta" \
+            -f "client_payload[version]=${VERSION}" \
+            -f "client_payload[sha_macos_x86_64]=${SHA_MACOS_X86_64}" \
+            -f "client_payload[sha_macos_aarch64]=${SHA_MACOS_AARCH64}" \
+            -f "client_payload[sha_linux_x86_64]=${SHA_LINUX_X86_64}" \
+            -f "client_payload[sha_linux_aarch64]=${SHA_LINUX_AARCH64}"
