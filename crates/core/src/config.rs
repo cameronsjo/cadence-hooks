@@ -135,10 +135,10 @@ pub fn is_allowed(
         let entry_host = entry.host.as_deref().unwrap_or(&default);
         if entry_host == host_lower && entry.owner == owner_lower {
             // If entry has a repo constraint, it must match
-            if let Some(entry_repo) = &entry.repo {
-                if *entry_repo != repo_lower {
-                    continue;
-                }
+            if let Some(entry_repo) = &entry.repo
+                && *entry_repo != repo_lower
+            {
+                continue;
             }
             return true;
         }
