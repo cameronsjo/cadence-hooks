@@ -412,8 +412,8 @@ mod tests {
     #[test]
     fn host_and_repo_ssh_scp() {
         assert_eq!(
-            host_and_repo_from_url("git@git.sjo.lol:cameron/cadence.git"),
-            Some(("git.sjo.lol".to_string(), "cameron/cadence".to_string()))
+            host_and_repo_from_url("git@gitea.internal:cameron/cadence.git"),
+            Some(("gitea.internal".to_string(), "cameron/cadence".to_string()))
         );
     }
 
@@ -444,8 +444,8 @@ mod tests {
     #[test]
     fn host_and_repo_custom_host() {
         assert_eq!(
-            host_and_repo_from_url("https://git.sjo.lol/cameron/cadence"),
-            Some(("git.sjo.lol".to_string(), "cameron/cadence".to_string()))
+            host_and_repo_from_url("https://gitea.internal/cameron/cadence"),
+            Some(("gitea.internal".to_string(), "cameron/cadence".to_string()))
         );
     }
 

@@ -426,9 +426,9 @@ mod tests {
     #[test]
     fn is_allowed_host_qualified_owner() {
         assert!(is_allowed(
-            "git.sjo.lol",
+            "gitea.internal",
             "cameron/repo",
-            &owners(&["git.sjo.lol/cameron"]),
+            &owners(&["gitea.internal/cameron"]),
             &[],
         ));
     }
@@ -438,7 +438,7 @@ mod tests {
         assert!(!is_allowed(
             "github.com",
             "cameron/repo",
-            &owners(&["git.sjo.lol/cameron"]),
+            &owners(&["gitea.internal/cameron"]),
             &[],
         ));
     }

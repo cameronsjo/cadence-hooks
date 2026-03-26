@@ -34,9 +34,9 @@ pub fn env_list(var: &str) -> Vec<String> {
 /// | Entry | Interpretation |
 /// |---|---|
 /// | `cameron` | bare owner — matches `{default_host}/cameron/*` |
-/// | `git.sjo.lol/cameron` | host/owner — matches `git.sjo.lol/cameron/*` |
+/// | `gitea.internal/cameron` | host/owner — matches `gitea.internal/cameron/*` |
 /// | `cameronsjo/cadence` | owner/repo — matches `{default_host}/cameronsjo/cadence` |
-/// | `git.sjo.lol/cameron/cadence` | exact host/owner/repo |
+/// | `gitea.internal/cameron/cadence` | exact host/owner/repo |
 ///
 /// Disambiguation: when an entry has exactly one `/`, the first segment
 /// containing a `.` means host/owner; no dot means owner/repo.
@@ -61,7 +61,7 @@ pub fn parse_allow_entry(entry: &str) -> AllowEntry {
     match parts.len() {
         1 => AllowEntry {
             host: None,
-            owner: parts[0].to_string(),
+            owner: parts[0].to_lowercase(),
             repo: None,
         },
         2 => {
@@ -69,15 +69,15 @@ pub fn parse_allow_entry(entry: &str) -> AllowEntry {
                 // host/owner
                 AllowEntry {
                     host: Some(parts[0].to_lowercase()),
-                    owner: parts[1].to_string(),
+                    owner: parts[1].to_lowercase(),
                     repo: None,
                 }
             } else {
                 // owner/repo
                 AllowEntry {
                     host: None,
-                    owner: parts[0].to_string(),
-                    repo: Some(parts[1].to_string()),
+                    owner: parts[0].to_lowercase(),
+                    repo: Some(parts[1].to_lowercase()),
                 }
             }
         }
@@ -85,8 +85,8 @@ pub fn parse_allow_entry(entry: &str) -> AllowEntry {
             // host/owner/repo
             AllowEntry {
                 host: Some(parts[0].to_lowercase()),
-                owner: parts[1].to_string(),
-                repo: Some(parts[2].to_string()),
+                owner: parts[1].to_lowercase(),
+                repo: Some(parts[2].to_lowercase()),
             }
         }
     }
@@ -116,11 +116,16 @@ pub fn is_allowed(
 ) -> bool {
     let default = default_host();
     let host_lower = host.to_lowercase();
+    let owner_lower = owner.to_lowercase();
+    let repo_lower = repo.to_lowercase();
 
     // Check repo entries first (more specific)
     for entry in repo_entries {
         let entry_host = entry.host.as_deref().unwrap_or(&default);
-        if entry_host == host_lower && entry.owner == owner && entry.repo.as_deref() == Some(repo) {
+        if entry_host == host_lower
+            && entry.owner == owner_lower
+            && entry.repo.as_deref() == Some(repo_lower.as_str())
+        {
             return true;
         }
     }
@@ -128,10 +133,10 @@ pub fn is_allowed(
     // Check owner entries
     for entry in owner_entries {
         let entry_host = entry.host.as_deref().unwrap_or(&default);
-        if entry_host == host_lower && entry.owner == owner {
+        if entry_host == host_lower && entry.owner == owner_lower {
             // If entry has a repo constraint, it must match
             if let Some(entry_repo) = &entry.repo {
-                if entry_repo != repo {
+                if *entry_repo != repo_lower {
                     continue;
                 }
             }
@@ -228,9 +233,9 @@ mod tests {
     #[test]
     fn parse_host_owner() {
         assert_eq!(
-            parse_allow_entry("git.sjo.lol/cameron"),
+            parse_allow_entry("gitea.internal/cameron"),
             AllowEntry {
-                host: Some("git.sjo.lol".to_string()),
+                host: Some("gitea.internal".to_string()),
                 owner: "cameron".to_string(),
                 repo: None,
             }
@@ -252,9 +257,9 @@ mod tests {
     #[test]
     fn parse_host_owner_repo() {
         assert_eq!(
-            parse_allow_entry("git.sjo.lol/cameron/cadence"),
+            parse_allow_entry("gitea.internal/cameron/cadence"),
             AllowEntry {
-                host: Some("git.sjo.lol".to_string()),
+                host: Some("gitea.internal".to_string()),
                 owner: "cameron".to_string(),
                 repo: Some("cadence".to_string()),
             }
@@ -267,15 +272,36 @@ mod tests {
         assert_eq!(entry.host, Some("github.com".to_string()));
     }
 
+    #[test]
+    fn parse_owner_normalizes_case() {
+        let entry = parse_allow_entry("CameronSjo");
+        assert_eq!(entry.owner, "cameronsjo");
+    }
+
+    #[test]
+    fn parse_owner_repo_normalizes_case() {
+        let entry = parse_allow_entry("CameronSjo/Cadence");
+        assert_eq!(entry.owner, "cameronsjo");
+        assert_eq!(entry.repo, Some("cadence".to_string()));
+    }
+
+    #[test]
+    fn parse_host_owner_repo_normalizes_all() {
+        let entry = parse_allow_entry("GitHub.COM/CameronSjo/Cadence");
+        assert_eq!(entry.host, Some("github.com".to_string()));
+        assert_eq!(entry.owner, "cameronsjo");
+        assert_eq!(entry.repo, Some("cadence".to_string()));
+    }
+
     // --- parse_allow_entries ---
 
     #[test]
     fn parse_entries_mixed() {
-        let entries = parse_allow_entries("cameronsjo git.sjo.lol/cameron");
+        let entries = parse_allow_entries("cameronsjo gitea.internal/cameron");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].owner, "cameronsjo");
         assert!(entries[0].host.is_none());
-        assert_eq!(entries[1].host, Some("git.sjo.lol".to_string()));
+        assert_eq!(entries[1].host, Some("gitea.internal".to_string()));
         assert_eq!(entries[1].owner, "cameron");
     }
 
@@ -291,7 +317,7 @@ mod tests {
     fn blocked_bare_owner_wrong_host() {
         let owners = vec![parse_allow_entry("cameronsjo")];
         assert!(!is_allowed(
-            "git.sjo.lol",
+            "gitea.internal",
             "cameronsjo",
             "repo",
             &owners,
@@ -301,9 +327,9 @@ mod tests {
 
     #[test]
     fn allowed_host_owner() {
-        let owners = vec![parse_allow_entry("git.sjo.lol/cameron")];
+        let owners = vec![parse_allow_entry("gitea.internal/cameron")];
         assert!(is_allowed(
-            "git.sjo.lol",
+            "gitea.internal",
             "cameron",
             "anything",
             &owners,
@@ -313,7 +339,7 @@ mod tests {
 
     #[test]
     fn blocked_host_owner_wrong_host() {
-        let owners = vec![parse_allow_entry("git.sjo.lol/cameron")];
+        let owners = vec![parse_allow_entry("gitea.internal/cameron")];
         assert!(!is_allowed(
             "github.com",
             "cameron",
@@ -349,24 +375,24 @@ mod tests {
 
     #[test]
     fn allowed_host_owner_repo_exact() {
-        let repos = vec![parse_allow_entry("git.sjo.lol/cameron/cadence")];
-        assert!(is_allowed("git.sjo.lol", "cameron", "cadence", &[], &repos));
+        let repos = vec![parse_allow_entry("gitea.internal/cameron/cadence")];
+        assert!(is_allowed("gitea.internal", "cameron", "cadence", &[], &repos));
     }
 
     #[test]
     fn blocked_host_owner_repo_wrong_host() {
-        let repos = vec![parse_allow_entry("git.sjo.lol/cameron/cadence")];
+        let repos = vec![parse_allow_entry("gitea.internal/cameron/cadence")];
         assert!(!is_allowed("github.com", "cameron", "cadence", &[], &repos));
     }
 
     #[test]
     fn allowed_mixed_owners_and_repos() {
-        let owners = parse_allow_entries("cameronsjo git.sjo.lol/cameron");
+        let owners = parse_allow_entries("cameronsjo gitea.internal/cameron");
         let repos = parse_allow_entries("external/shared-repo");
         // github.com/cameronsjo/anything → allowed
         assert!(is_allowed("github.com", "cameronsjo", "x", &owners, &repos));
-        // git.sjo.lol/cameron/anything → allowed
-        assert!(is_allowed("git.sjo.lol", "cameron", "y", &owners, &repos));
+        // gitea.internal/cameron/anything → allowed
+        assert!(is_allowed("gitea.internal", "cameron", "y", &owners, &repos));
         // github.com/external/shared-repo → allowed via repos
         assert!(is_allowed(
             "github.com",
@@ -375,22 +401,46 @@ mod tests {
             &owners,
             &repos
         ));
-        // git.sjo.lol/cameronsjo/x → blocked (bare cameronsjo only matches github.com)
+        // gitea.internal/cameronsjo/x → blocked (bare cameronsjo only matches github.com)
         assert!(!is_allowed(
-            "git.sjo.lol",
+            "gitea.internal",
             "cameronsjo",
             "x",
             &owners,
             &repos
         ));
-        // github.com/cameron/x → blocked (cameron only matches git.sjo.lol)
+        // github.com/cameron/x → blocked (cameron only matches gitea.internal)
         assert!(!is_allowed("github.com", "cameron", "x", &owners, &repos));
     }
 
     #[test]
     fn is_allowed_case_insensitive_host() {
-        let owners = vec![parse_allow_entry("git.sjo.lol/cameron")];
-        assert!(is_allowed("GIT.SJO.LOL", "cameron", "repo", &owners, &[]));
+        let owners = vec![parse_allow_entry("gitea.internal/cameron")];
+        assert!(is_allowed("GITEA.INTERNAL", "cameron", "repo", &owners, &[]));
+    }
+
+    #[test]
+    fn is_allowed_case_insensitive_owner() {
+        let owners = vec![parse_allow_entry("cameronsjo")];
+        assert!(is_allowed(
+            "github.com",
+            "CameronSjo",
+            "repo",
+            &owners,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_allowed_case_insensitive_repo() {
+        let repos = vec![parse_allow_entry("external/Shared-Repo")];
+        assert!(is_allowed(
+            "github.com",
+            "External",
+            "shared-repo",
+            &[],
+            &repos
+        ));
     }
 
     // --- Display ---
@@ -403,8 +453,8 @@ mod tests {
     #[test]
     fn display_host_owner() {
         assert_eq!(
-            parse_allow_entry("git.sjo.lol/cameron").to_string(),
-            "git.sjo.lol/cameron"
+            parse_allow_entry("gitea.internal/cameron").to_string(),
+            "gitea.internal/cameron"
         );
     }
 
@@ -419,8 +469,8 @@ mod tests {
     #[test]
     fn display_host_owner_repo() {
         assert_eq!(
-            parse_allow_entry("git.sjo.lol/cameron/cadence").to_string(),
-            "git.sjo.lol/cameron/cadence"
+            parse_allow_entry("gitea.internal/cameron/cadence").to_string(),
+            "gitea.internal/cameron/cadence"
         );
     }
 }

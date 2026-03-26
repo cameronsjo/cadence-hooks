@@ -258,8 +258,8 @@ mod tests {
     }
 
     #[test]
-    fn owner_check_case_sensitive() {
-        assert!(!check_owner(
+    fn owner_check_case_insensitive() {
+        assert!(check_owner(
             "https://github.com/CameronSjo/repo.git",
             &owners(&["cameronsjo"]),
             &[],
@@ -271,17 +271,17 @@ mod tests {
     #[test]
     fn owner_check_host_qualified() {
         assert!(check_owner(
-            "https://git.sjo.lol/cameron/cadence.git",
-            &owners(&["git.sjo.lol/cameron"]),
+            "https://gitea.internal/cameron/cadence.git",
+            &owners(&["gitea.internal/cameron"]),
             &[],
         ));
     }
 
     #[test]
     fn owner_check_host_mismatch_blocked() {
-        // bare "cameron" defaults to github.com — should NOT match git.sjo.lol
+        // bare "cameron" defaults to github.com — should NOT match gitea.internal
         assert!(!check_owner(
-            "https://git.sjo.lol/cameron/cadence.git",
+            "https://gitea.internal/cameron/cadence.git",
             &owners(&["cameron"]),
             &[],
         ));
@@ -289,18 +289,18 @@ mod tests {
 
     #[test]
     fn owner_check_mixed_hosts() {
-        let o = owners(&["cameronsjo", "git.sjo.lol/cameron"]);
+        let o = owners(&["cameronsjo", "gitea.internal/cameron"]);
         // github.com/cameronsjo → allowed
         assert!(check_owner(
             "https://github.com/cameronsjo/repo.git",
             &o,
             &[],
         ));
-        // git.sjo.lol/cameron → allowed
-        assert!(check_owner("git@git.sjo.lol:cameron/repo.git", &o, &[],));
-        // git.sjo.lol/cameronsjo → blocked
+        // gitea.internal/cameron → allowed
+        assert!(check_owner("git@gitea.internal:cameron/repo.git", &o, &[],));
+        // gitea.internal/cameronsjo → blocked
         assert!(!check_owner(
-            "https://git.sjo.lol/cameronsjo/repo.git",
+            "https://gitea.internal/cameronsjo/repo.git",
             &o,
             &[],
         ));
