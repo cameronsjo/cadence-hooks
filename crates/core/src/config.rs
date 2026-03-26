@@ -376,7 +376,13 @@ mod tests {
     #[test]
     fn allowed_host_owner_repo_exact() {
         let repos = vec![parse_allow_entry("gitea.internal/cameron/cadence")];
-        assert!(is_allowed("gitea.internal", "cameron", "cadence", &[], &repos));
+        assert!(is_allowed(
+            "gitea.internal",
+            "cameron",
+            "cadence",
+            &[],
+            &repos
+        ));
     }
 
     #[test]
@@ -392,7 +398,13 @@ mod tests {
         // github.com/cameronsjo/anything → allowed
         assert!(is_allowed("github.com", "cameronsjo", "x", &owners, &repos));
         // gitea.internal/cameron/anything → allowed
-        assert!(is_allowed("gitea.internal", "cameron", "y", &owners, &repos));
+        assert!(is_allowed(
+            "gitea.internal",
+            "cameron",
+            "y",
+            &owners,
+            &repos
+        ));
         // github.com/external/shared-repo → allowed via repos
         assert!(is_allowed(
             "github.com",
@@ -416,19 +428,19 @@ mod tests {
     #[test]
     fn is_allowed_case_insensitive_host() {
         let owners = vec![parse_allow_entry("gitea.internal/cameron")];
-        assert!(is_allowed("GITEA.INTERNAL", "cameron", "repo", &owners, &[]));
+        assert!(is_allowed(
+            "GITEA.INTERNAL",
+            "cameron",
+            "repo",
+            &owners,
+            &[]
+        ));
     }
 
     #[test]
     fn is_allowed_case_insensitive_owner() {
         let owners = vec![parse_allow_entry("cameronsjo")];
-        assert!(is_allowed(
-            "github.com",
-            "CameronSjo",
-            "repo",
-            &owners,
-            &[]
-        ));
+        assert!(is_allowed("github.com", "CameronSjo", "repo", &owners, &[]));
     }
 
     #[test]
