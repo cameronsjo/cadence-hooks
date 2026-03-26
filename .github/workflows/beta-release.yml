@@ -12,29 +12,17 @@ env:
 
 jobs:
   check:
-    name: Check for [beta] keyword
+    name: Determine beta version
     runs-on: ubuntu-latest
     outputs:
-      should_release: ${{ steps.check.outputs.should_release }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check commit message
-        id: check
-        run: |
-          COMMIT_MSG=$(git log -1 --pretty=%B)
-          if [[ "$COMMIT_MSG" =~ \[beta\] ]]; then
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Determine version
         id: version
-        if: steps.check.outputs.should_release == 'true'
         run: |
           BASE_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           SHORT_SHA=$(git rev-parse --short HEAD)
@@ -49,7 +37,6 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     needs: check
-    if: needs.check.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
