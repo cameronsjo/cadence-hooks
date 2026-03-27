@@ -163,17 +163,24 @@ pub trait Check {
 
 /// Run a single check, emit output, and exit.
 ///
-/// Routing: Nudge messages go to stdout (included in transcript at exit 0).
-/// Block messages go to stderr (fed back to Claude at exit 2).
+/// Routing:
+/// - Nudge → JSON to stdout with `additionalContext` (exit 0).
+///   Claude Code parses this and injects the message into Claude's context.
+/// - Block → plain text to stderr (exit 2).
+///   Claude Code feeds stderr back to Claude as an error.
+/// - Allow → silent exit 0.
 pub fn run_check(check: &dyn Check, input: &HookInput) -> ! {
     let result = check.run(input);
     if let Some(msg) = &result.message {
         match result.outcome {
             Outcome::Nudge => {
-                print!("{msg}");
-                if !msg.ends_with('\n') {
-                    println!();
-                }
+                let json = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "additionalContext": msg
+                    }
+                });
+                println!("{json}");
             }
             Outcome::Block => {
                 eprint!("{msg}");
@@ -181,7 +188,7 @@ pub fn run_check(check: &dyn Check, input: &HookInput) -> ! {
                     eprintln!();
                 }
             }
-            Outcome::Allow => {} // Allow never has a message, but handle gracefully
+            Outcome::Allow => {}
         }
     }
     process::exit(result.outcome.code());

@@ -95,6 +95,13 @@ enum ObsidianCommands {
 }
 
 fn main() {
+    // Maintenance bypass — set CADENCE_HOOKS_BYPASS=1 to skip all enforcement.
+    // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
+    if std::env::var("CADENCE_HOOKS_BYPASS").as_deref() == Ok("1") {
+        eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_HOOKS_BYPASS=1)");
+        process::exit(0);
+    }
+
     // Catch panics and exit 1 (warn) instead of the default exit 101.
     // A panic means a bug in a check — it should not block the user's operation.
     std::panic::set_hook(Box::new(|info| {

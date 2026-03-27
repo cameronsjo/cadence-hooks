@@ -11,6 +11,8 @@ pub mod git_safety;
 pub mod markdown_lint;
 /// Enforce line limits on MEMORY.md and topic files.
 pub mod memory_guard;
+/// Shared secret file patterns for both secret guards.
+pub mod secret_patterns;
 /// Block reading secrets (.env, credentials, private keys) into context.
 pub mod prevent_secret_leaks;
 /// Block writing or deleting secrets (.env, credentials, private keys).
