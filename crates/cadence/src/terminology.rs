@@ -59,21 +59,25 @@ const BLOCK_VIOLATIONS: &[(&str, &str, &str)] = &[
 ];
 
 /// Tier 2: Nudges — legitimate in prose, legal, and family contexts.
-const NUDGE_VIOLATIONS: &[(&str, &str, &str)] = &[
-    (
-        term!("grand", "fathered"),
-        r"(?i)\bgrandfather(ed|ing)?\b",
-        "legacy status, exempted, inherited",
-    ),
-];
+const NUDGE_VIOLATIONS: &[(&str, &str, &str)] = &[(
+    term!("grand", "fathered"),
+    r"(?i)\bgrandfather(ed|ing)?\b",
+    "legacy status, exempted, inherited",
+)];
 
 static BLOCK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
-    let patterns: Vec<&str> = BLOCK_VIOLATIONS.iter().map(|(_, pattern, _)| *pattern).collect();
+    let patterns: Vec<&str> = BLOCK_VIOLATIONS
+        .iter()
+        .map(|(_, pattern, _)| *pattern)
+        .collect();
     RegexSet::new(&patterns).expect("block terminology patterns should compile")
 });
 
 static NUDGE_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
-    let patterns: Vec<&str> = NUDGE_VIOLATIONS.iter().map(|(_, pattern, _)| *pattern).collect();
+    let patterns: Vec<&str> = NUDGE_VIOLATIONS
+        .iter()
+        .map(|(_, pattern, _)| *pattern)
+        .collect();
     RegexSet::new(&patterns).expect("nudge terminology patterns should compile")
 });
 
@@ -186,7 +190,8 @@ mod tests {
 
     #[test]
     fn clean_content_passes() {
-        let r = check_terminology("use the allowlist for filtering"); assert!(r.blocks.is_empty() && r.nudges.is_empty());
+        let r = check_terminology("use the allowlist for filtering");
+        assert!(r.blocks.is_empty() && r.nudges.is_empty());
     }
 
     #[test]
@@ -227,7 +232,10 @@ mod tests {
     fn detects_sanity_check_plural() {
         let r = check_terminology("sanity checks");
         assert_eq!(r.blocks.len(), 1);
-        assert_eq!(r.blocks[0].1, "validation check, confidence check, smoke test");
+        assert_eq!(
+            r.blocks[0].1,
+            "validation check, confidence check, smoke test"
+        );
     }
 
     #[test]
@@ -316,7 +324,11 @@ mod tests {
     #[test]
     fn word_boundary_prevents_substring_match() {
         // "listed" contains "list" but word boundary should prevent match
-        assert!(check_terminology("the items are listed here").blocks.is_empty());
+        assert!(
+            check_terminology("the items are listed here")
+                .blocks
+                .is_empty()
+        );
     }
 
     #[test]
@@ -329,13 +341,20 @@ mod tests {
     fn all_violations_detectable() {
         for (term, _, _) in BLOCK_VIOLATIONS.iter().chain(NUDGE_VIOLATIONS.iter()) {
             let r = check_terminology(term);
-            assert!(!r.blocks.is_empty() || !r.nudges.is_empty(), "term '{}' should be detected", term);
+            assert!(
+                !r.blocks.is_empty() || !r.nudges.is_empty(),
+                "term '{}' should be detected",
+                term
+            );
         }
     }
 
     #[test]
     fn empty_content_passes() {
-        assert!({ let r = check_terminology(""); r.blocks.is_empty() && r.nudges.is_empty() });
+        assert!({
+            let r = check_terminology("");
+            r.blocks.is_empty() && r.nudges.is_empty()
+        });
     }
 
     #[test]
@@ -432,7 +451,10 @@ mod tests {
     #[test]
     fn repeated_term_counted_once() {
         // RegexSet reports each pattern once, not per-occurrence
-        let input = format!("{} and also {} again", BLOCK_VIOLATIONS[0].0, BLOCK_VIOLATIONS[0].0);
+        let input = format!(
+            "{} and also {} again",
+            BLOCK_VIOLATIONS[0].0, BLOCK_VIOLATIONS[0].0
+        );
         let r = check_terminology(&input);
         assert_eq!(r.blocks.len(), 1);
     }

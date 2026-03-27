@@ -25,14 +25,14 @@ jobs:
         id: version
         run: |
           BASE_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          LAST_TAG=$(git tag -l --sort=-v:refname 'v*' | head -1)
-          if [ -n "$LAST_TAG" ]; then
-            COMMIT_COUNT=$(git rev-list --count "${LAST_TAG}..HEAD")
+          LAST_BETA=$(git tag -l "v${BASE_VERSION}-beta.*" --sort=-v:refname | head -1)
+          if [ -n "$LAST_BETA" ]; then
+            LAST_NUM=$(echo "$LAST_BETA" | sed 's/.*-beta\.\([0-9]*\).*/\1/')
+            NEXT_NUM=$((LAST_NUM + 1))
           else
-            COMMIT_COUNT=$(git rev-list --count HEAD)
+            NEXT_NUM=1
           fi
-          echo "version=${BASE_VERSION}-beta.${COMMIT_COUNT}+${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASE_VERSION}-beta.${NEXT_NUM}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.name }}

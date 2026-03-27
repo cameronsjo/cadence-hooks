@@ -4,7 +4,7 @@
 //! Blocks Bash commands that would cat/source/dump secrets.
 //! Safe templates (.env.example, .env.test) are always allowed.
 
-use crate::secret_patterns::{is_ambiguous, is_blocked, is_safe_template, SAFE_SUFFIXES};
+use crate::secret_patterns::{SAFE_SUFFIXES, is_ambiguous, is_blocked, is_safe_template};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Extract the operand (file argument) for a read command like `cat`, `head`, etc.

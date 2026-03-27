@@ -120,7 +120,10 @@ mod tests {
     fn blocked_suffixes_detected() {
         assert!(is_blocked("server-key.pem", "/etc/ssl/server-key.pem"));
         assert!(is_blocked("server_key.pem", "/etc/ssl/server_key.pem"));
-        assert!(is_blocked("server.private.pem", "/etc/ssl/server.private.pem"));
+        assert!(is_blocked(
+            "server.private.pem",
+            "/etc/ssl/server.private.pem"
+        ));
     }
 
     #[test]
