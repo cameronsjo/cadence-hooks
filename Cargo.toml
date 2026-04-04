@@ -35,6 +35,9 @@ description = "Compiled Claude Code hooks for cadence, git-guardrails, rules, an
 name = "cadence-hooks"
 path = "src/main.rs"
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [dependencies]
 clap.workspace = true
 cadence-hooks-core.workspace = true

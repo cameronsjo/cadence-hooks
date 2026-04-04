@@ -54,8 +54,6 @@ enum CadenceCommands {
     EnvVars,
     /// Nudge to review docs when creating a PR
     WarnDocsUpdate,
-    /// Warn about untracked files during git operations
-    WarnUntracked,
     /// Run markdownlint on markdown files
     MarkdownLint,
 }
@@ -78,6 +76,8 @@ enum GuardrailsCommands {
     WarnBranchBase,
     /// Remind to check datetime before scheduling cron jobs
     WarnCronDatetime,
+    /// Warn about untracked files during git commit operations
+    WarnUntracked,
 }
 
 #[derive(Subcommand)]
@@ -190,9 +190,6 @@ fn main() {
             CadenceCommands::WarnDocsUpdate => {
                 run_check_from_stdin(&cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate)
             }
-            CadenceCommands::WarnUntracked => {
-                run_check_from_stdin(&cadence_hooks_cadence::warn_untracked::WarnUntrackedFiles)
-            }
             CadenceCommands::MarkdownLint => {
                 run_check_from_stdin(&cadence_hooks_cadence::markdown_lint::MarkdownLint)
             }
@@ -221,6 +218,9 @@ fn main() {
             }
             GuardrailsCommands::WarnCronDatetime => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_cron_datetime::WarnCronDatetime,
+            ),
+            GuardrailsCommands::WarnUntracked => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles,
             ),
         },
         Commands::Rules(cmd) => match cmd {

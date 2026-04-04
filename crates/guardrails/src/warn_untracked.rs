@@ -4,6 +4,7 @@
 //! files that might have been forgotten. Filters out build artifacts.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+use std::path::Path;
 use std::process::Command;
 
 /// Build artifact extensions to filter from untracked file warnings.
@@ -50,8 +51,15 @@ impl Check for WarnUntrackedFiles {
             return CheckResult::allow();
         }
 
-        // Get untracked files from git
-        let output = match Command::new("git").args(["status", "--porcelain"]).output() {
+        // Get untracked files from git (respect cwd from hook payload)
+        let mut cmd = Command::new("git");
+        cmd.args(["status", "--porcelain"]);
+        if let Some(dir) = input.cwd.as_deref() {
+            if Path::new(dir).is_dir() {
+                cmd.current_dir(dir);
+            }
+        }
+        let output = match cmd.output() {
             Ok(out) => out,
             Err(_) => return CheckResult::allow(),
         };

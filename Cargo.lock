@@ -186,6 +186,7 @@ dependencies = [
  "cadence-hooks-obsidian",
  "cadence-hooks-rules",
  "clap",
+ "serde_json",
 ]
 
 [[package]]
