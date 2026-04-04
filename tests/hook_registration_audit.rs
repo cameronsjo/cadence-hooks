@@ -69,6 +69,8 @@ struct HookRef {
     is_bash_matcher: bool,
     /// Whether this hook has an `if` filter
     has_if_filter: bool,
+    /// The hook event type from hooks.json (e.g., "PreToolUse", "PostToolUse")
+    event_type: String,
 }
 
 /// Plugin directories that dispatch to the cadence-hooks binary via run-cadence-hooks.sh.
@@ -135,7 +137,7 @@ fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> 
         return refs;
     };
 
-    for (_event, matchers) in hooks_obj {
+    for (event, matchers) in hooks_obj {
         let Some(matchers) = matchers.as_array() else {
             continue;
         };
@@ -169,6 +171,7 @@ fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> 
                     expected_plugin: expected_plugin.to_string(),
                     is_bash_matcher: is_bash,
                     has_if_filter: has_if,
+                    event_type: event.clone(),
                 });
             }
         }
@@ -418,6 +421,132 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
         "settings.json duplicates hooks already provided by plugins:\n{}\n\n\
          Remove from settings.json — plugins handle these via hooks.json.",
         duplicates.join("\n")
+    );
+}
+
+/// Parse main.rs to extract which HookEvent each subcommand uses.
+/// Returns a map of "plugin subcommand" -> "PreToolUse" or "PostToolUse".
+fn main_rs_event_types() -> BTreeMap<String, String> {
+    let main_rs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let content = std::fs::read_to_string(&main_rs)
+        .unwrap_or_else(|e| panic!("failed to read main.rs: {e}"));
+
+    let mut result = BTreeMap::new();
+
+    // Find `run_check_from_stdin(&module::Check, pre)` or `post)` patterns.
+    // The callsite format is: run_check_from_stdin(&..., pre) or run_check_from_stdin(&..., post)
+    // We need to correlate with the match arm above it to get the subcommand name.
+    //
+    // Strategy: scan for lines containing `run_check_from_stdin` and extract the event
+    // variable (`pre` or `post`), then look backwards for the enum variant.
+
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if !line.contains("run_check_from_stdin") {
+            continue;
+        }
+
+        // Determine event type from the last argument
+        let event = if line.contains(", post") || line.ends_with("post)") || line.ends_with("post,")
+        {
+            "PostToolUse"
+        } else if line.contains(", pre") || line.ends_with("pre)") || line.ends_with("pre,") {
+            "PreToolUse"
+        } else {
+            // Check continuation line (might be on next line due to formatting)
+            let next = lines.get(i + 1).unwrap_or(&"");
+            if next.contains("post") {
+                "PostToolUse"
+            } else if next.contains("pre") {
+                "PreToolUse"
+            } else {
+                continue;
+            }
+        };
+
+        // Look backwards for the enum variant (e.g., `GuardrailsCommands::WarnUntracked`)
+        for j in (0..=i).rev() {
+            let prev = lines[j];
+            if prev.contains("Commands::") {
+                // Extract variant name, convert to kebab-case subcommand
+                if let Some(variant) = prev.split("::").last() {
+                    let variant = variant
+                        .trim()
+                        .trim_end_matches(" => {")
+                        .trim_end_matches(" =>");
+                    let subcmd = to_kebab_case(variant);
+
+                    // Determine plugin group from the Commands enum
+                    let plugin = if prev.contains("CadenceCommands") {
+                        "cadence"
+                    } else if prev.contains("GuardrailsCommands") {
+                        "guardrails"
+                    } else if prev.contains("RulesCommands") {
+                        "rules"
+                    } else if prev.contains("ObsidianCommands") {
+                        "obsidian"
+                    } else {
+                        continue;
+                    };
+
+                    result.insert(format!("{plugin} {subcmd}"), event.to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    assert!(
+        result.len() > 10,
+        "expected at least 10 event type mappings, found {}: {result:?}",
+        result.len()
+    );
+    result
+}
+
+/// Convert PascalCase to kebab-case (e.g., "WarnMainBranch" -> "warn-main-branch").
+fn to_kebab_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('-');
+            }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+#[test]
+fn hook_event_types_match_hooks_json() {
+    let main_events = main_rs_event_types();
+    let all_refs = hooks_json_references();
+
+    let mut mismatches = Vec::new();
+    for (_dir, refs) in &all_refs {
+        for r in refs {
+            if let Some(main_event) = main_events.get(&r.command) {
+                if main_event != &r.event_type {
+                    mismatches.push(format!(
+                        "  `{}`: hooks.json says {} but main.rs passes HookEvent::{}",
+                        r.command, r.event_type, main_event
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "Hook event type mismatch between hooks.json and main.rs:\n{}\n\n\
+         The HookEvent passed to run_check_from_stdin must match the event key \
+         in hooks.json. PreToolUse hooks emit PreToolUse JSON, PostToolUse hooks \
+         emit PostToolUse JSON — using the wrong one means additionalContext \
+         won't reach the model.",
+        mismatches.join("\n")
     );
 }
 
