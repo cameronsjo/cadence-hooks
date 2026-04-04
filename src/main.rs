@@ -76,6 +76,8 @@ enum GuardrailsCommands {
     WarnBranchBase,
     /// Remind to check datetime before scheduling cron jobs
     WarnCronDatetime,
+    /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main
+    NudgeUpgradeAfterPush,
     /// Warn about untracked files during git commit operations
     WarnUntracked,
 }
@@ -218,6 +220,9 @@ fn main() {
             }
             GuardrailsCommands::WarnCronDatetime => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_cron_datetime::WarnCronDatetime,
+            ),
+            GuardrailsCommands::NudgeUpgradeAfterPush => run_check_from_stdin(
+                &cadence_hooks_guardrails::nudge_upgrade_after_push::NudgeUpgradeAfterPush,
             ),
             GuardrailsCommands::WarnUntracked => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles,

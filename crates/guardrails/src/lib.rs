@@ -19,5 +19,7 @@ pub mod warn_branch_base;
 pub mod warn_cron_datetime;
 /// Warn when editing files directly on main/master branch.
 pub mod warn_main_branch;
+/// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
+pub mod nudge_upgrade_after_push;
 /// Warn about untracked files during git commit operations.
 pub mod warn_untracked;
