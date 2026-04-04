@@ -189,8 +189,9 @@ impl Check for GhWriteGuard {
                         .collect();
                     return CheckResult::block(format!(
                         "🚫 git-guardrails: gh loop targets repo you don't own\n   \
-                         Targets: {}\n   \
-                         Allowed: {}",
+                         Found: {}\n   \
+                         Allowed: {}\n   \
+                         Fix: use `-R owner/repo` to target an owned repo",
                         targets.join(", "),
                         all_entries.join(" "),
                     ));
@@ -205,10 +206,24 @@ impl Check for GhWriteGuard {
                     is_write_command(&reconstructed)
                 });
                 if has_write {
-                    return CheckResult::block(
+                    let writes: Vec<String> = cmds
+                        .iter()
+                        .filter(|c| {
+                            let reconstructed = format!("gh {}", c.args.join(" "));
+                            c.explicit_repo.is_none() && is_write_command(&reconstructed)
+                        })
+                        .map(|c| format!("`gh {}`", c.args.join(" ")))
+                        .collect();
+                    let found = if writes.is_empty() {
+                        "gh write command(s) without -R".to_string()
+                    } else {
+                        writes.join(", ")
+                    };
+                    return CheckResult::block(&format!(
                         "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
-                         Use -R owner/repo on each gh command, or run them individually.",
-                    );
+                         Found: {found}\n   \
+                         Fix: add `-R owner/repo` to each command",
+                    ));
                 }
                 // All looped gh commands are read-only — allow
             }
@@ -218,7 +233,7 @@ impl Check for GhWriteGuard {
                 if LOOP_PATTERN.is_match(&stripped) {
                     return CheckResult::block(
                         "🚫 git-guardrails: gh command in loop — cannot verify targets\n   \
-                         Run each gh command individually.",
+                         Fix: run each gh command individually with `-R owner/repo`",
                     );
                 }
             }

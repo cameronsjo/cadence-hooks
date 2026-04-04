@@ -86,17 +86,31 @@ impl Check for PushRemoteGuard {
             ChainAnalysis::SameRemote(_) => {
                 // All chained pushes target the same remote — safe to proceed
             }
-            ChainAnalysis::DifferentRemotes(_) => {
-                return CheckResult::block(
+            ChainAnalysis::DifferentRemotes(cmds) => {
+                let remotes: Vec<String> = cmds
+                    .iter()
+                    .filter_map(|c| c.explicit_repo.as_ref())
+                    .map(|r| format!("`{r}`"))
+                    .collect();
+                return CheckResult::block(&format!(
                     "🚫 git-guardrails: chained git push to different remotes\n   \
-                     Run each push individually so remotes can be validated.",
-                );
+                     Found: remotes {}\n   \
+                     Fix: run each push individually, e.g. `git push origin main`",
+                    remotes.join(", "),
+                ));
             }
-            ChainAnalysis::MissingRemotes(_) => {
-                return CheckResult::block(
+            ChainAnalysis::MissingRemotes(cmds) => {
+                let bare: Vec<String> = cmds
+                    .iter()
+                    .filter(|c| c.explicit_repo.is_none())
+                    .map(|c| format!("`git {}`", c.args.join(" ")))
+                    .collect();
+                return CheckResult::block(&format!(
                     "🚫 git-guardrails: chained git push without explicit remotes\n   \
-                     Specify the remote explicitly on each push, or run them individually.",
-                );
+                     Found: {}\n   \
+                     Fix: add explicit remote, e.g. `git push origin main`",
+                    bare.join(", "),
+                ));
             }
             ChainAnalysis::ParseFailed => {
                 // Fall back to substring count
@@ -104,7 +118,7 @@ impl Check for PushRemoteGuard {
                 if push_count > 1 {
                     return CheckResult::block(
                         "🚫 git-guardrails: multiple git push commands — cannot verify targets\n   \
-                         Run each push individually so remotes can be validated.",
+                         Fix: run each push separately, e.g. `git push origin main && git push origin dev`",
                     );
                 }
             }
@@ -114,18 +128,25 @@ impl Check for PushRemoteGuard {
         // AST-based loop detection (MissingTargets and ParseFailed don't need owners)
         let loop_result = loop_analysis::analyze_push_loops(command);
         match &loop_result {
-            LoopAnalysis::MissingTargets(_) => {
-                return CheckResult::block(
+            LoopAnalysis::MissingTargets(cmds) => {
+                let bare_pushes: Vec<String> = cmds
+                    .iter()
+                    .filter(|c| c.explicit_repo.is_none())
+                    .map(|c| format!("git {}", c.args.join(" ")))
+                    .collect();
+                let example = bare_pushes.first().cloned().unwrap_or_default();
+                return CheckResult::block(&format!(
                     "🚫 git-guardrails: git push in loop without explicit remote\n   \
-                     Specify the remote explicitly, or run each push individually.",
-                );
+                     Found: `{example}`\n   \
+                     Fix: add the remote, e.g. `git push origin` or `git push origin main`",
+                ));
             }
             LoopAnalysis::ParseFailed => {
                 let stripped = strip_quotes(command);
                 if LOOP_PATTERN.is_match(&stripped) {
                     return CheckResult::block(
                         "🚫 git-guardrails: git push in loop — cannot verify targets\n   \
-                         Run each push individually so remotes can be validated.",
+                         Fix: run each push individually with explicit remote, e.g. `git push origin main`",
                     );
                 }
             }
@@ -159,7 +180,8 @@ impl Check for PushRemoteGuard {
                 {
                     return CheckResult::block(format!(
                         "🚫 git-guardrails: Push loop targets remote you don't own\n   \
-                         Remote: {remote}\n   URL: {url}"
+                         Found: remote `{remote}` → {url}\n   \
+                         Fix: push to an owned remote instead, or run each push individually"
                     ));
                 }
             }

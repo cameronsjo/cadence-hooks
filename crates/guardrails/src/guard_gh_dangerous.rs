@@ -35,19 +35,25 @@ impl Check for GhDangerousGuard {
         let stripped = strip_quotes(command);
 
         // Pass 1: direct invocation (after stripping quotes)
-        if GH_REPO_DELETE.is_match(&stripped) {
-            return CheckResult::block(
+        if let Some(m) = GH_REPO_DELETE.find(&stripped) {
+            return CheckResult::block(&format!(
                 "🚫 git-guardrails: gh repo delete is blocked\n   \
-                 Repository deletion is irreversible — delete manually via github.com",
-            );
+                 Found: `{}`\n   \
+                 Fix: delete manually via github.com — this is irreversible",
+                m.as_str().trim(),
+            ));
         }
 
         // Pass 2: inside exec wrappers (bash -c "gh repo delete ...")
-        if EXEC_WRAPPER.is_match(&stripped) && GH_REPO_DELETE.is_match(command) {
-            return CheckResult::block(
-                "🚫 git-guardrails: gh repo delete is blocked\n   \
-                 Repository deletion is irreversible — delete manually via github.com",
-            );
+        if EXEC_WRAPPER.is_match(&stripped) {
+            if let Some(m) = GH_REPO_DELETE.find(command) {
+                return CheckResult::block(&format!(
+                    "🚫 git-guardrails: gh repo delete is blocked\n   \
+                     Found: `{}`\n   \
+                     Fix: delete manually via github.com — this is irreversible",
+                    m.as_str().trim(),
+                ));
+            }
         }
 
         CheckResult::allow()
