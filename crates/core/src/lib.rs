@@ -13,6 +13,19 @@ use serde::Deserialize;
 use std::io::Read;
 use std::process;
 
+/// The hook event type determines output format for nudges.
+///
+/// PreToolUse and PostToolUse use different JSON structures in the
+/// Claude Code hook protocol. The event type must be passed to
+/// [`run_check`] so nudge messages are formatted correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEvent {
+    /// PreToolUse — fires before a tool executes.
+    PreToolUse,
+    /// PostToolUse — fires after a tool executes.
+    PostToolUse,
+}
+
 /// Exit codes matching Claude Code's hook contract.
 ///
 /// Claude Code recognises two exit codes:
@@ -166,17 +179,22 @@ pub trait Check {
 /// Routing:
 /// - Nudge → JSON to stdout with `additionalContext` (exit 0).
 ///   Claude Code parses this and injects the message into Claude's context.
+///   The JSON format differs by event type (PreToolUse vs PostToolUse).
 /// - Block → plain text to stderr (exit 2).
 ///   Claude Code feeds stderr back to Claude as an error.
 /// - Allow → silent exit 0.
-pub fn run_check(check: &dyn Check, input: &HookInput) -> ! {
+pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
     let result = check.run(input);
     if let Some(msg) = &result.message {
         match result.outcome {
             Outcome::Nudge => {
+                let event_name = match event {
+                    HookEvent::PreToolUse => "PreToolUse",
+                    HookEvent::PostToolUse => "PostToolUse",
+                };
                 let json = serde_json::json!({
                     "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
+                        "hookEventName": event_name,
                         "additionalContext": msg
                     }
                 });
@@ -195,9 +213,9 @@ pub fn run_check(check: &dyn Check, input: &HookInput) -> ! {
 }
 
 /// Run a single check from stdin. Convenience wrapper for subcommands.
-pub fn run_check_from_stdin(check: &dyn Check) -> ! {
+pub fn run_check_from_stdin(check: &dyn Check, event: HookEvent) -> ! {
     match HookInput::from_stdin() {
-        Ok(input) => run_check(check, &input),
+        Ok(input) => run_check(check, &input, event),
         Err(e) => {
             eprintln!("cadence-hooks: {e}");
             process::exit(0); // Fail open on parse errors
