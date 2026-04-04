@@ -132,11 +132,28 @@ mod tests {
 
     #[test]
     fn push_from_other_repo_allows() {
-        // This will resolve to whatever CWD the test runs in,
-        // which won't be cameronsjo/cadence-hooks
-        let result = NudgeUpgradeAfterPush.run(&make_bash("git push origin main"));
+        // Use /tmp as CWD — not a git repo, so remote lookup returns None → allow
+        let input = make_bash_with_cwd("git push origin main", "/tmp");
+        let result = NudgeUpgradeAfterPush.run(&input);
         assert_eq!(result.outcome, Outcome::Allow);
     }
+
+    fn make_bash_with_cwd(cmd: &str, cwd: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(ToolInput {
+                file_path: None,
+                path: None,
+                command: Some(cmd.into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: Some(cwd.into()),
+        }
+    }
+
+    // --- is_push_to_main tests ---
 
     #[test]
     fn is_push_to_main_explicit_refspec() {
@@ -145,17 +162,104 @@ mod tests {
     }
 
     #[test]
+    fn is_push_to_main_master_branch() {
+        assert!(is_push_to_main("git push origin master", "/tmp"));
+        assert!(is_push_to_main("git push origin master:master", "/tmp"));
+    }
+
+    #[test]
     fn is_push_to_main_feature_branch() {
         assert!(!is_push_to_main("git push origin feature/foo", "/tmp"));
     }
 
     #[test]
-    fn is_push_to_main_bare_push_non_main() {
-        // Bare push without refspec — falls back to current branch.
-        // In test env, current branch is unlikely "main", so this should be false.
-        // (We can't mock git_command easily, so just verify it doesn't panic.)
-        let result = is_push_to_main("git push origin", "/tmp/nonexistent");
-        // Could be true or false depending on test env — just verify no panic
-        let _ = result;
+    fn is_push_to_main_tag_push() {
+        assert!(!is_push_to_main("git push origin v1.0.0", "/tmp"));
+    }
+
+    #[test]
+    fn is_push_to_main_with_flags() {
+        assert!(is_push_to_main("git push --force origin main", "/tmp"));
+        assert!(is_push_to_main("git push -u origin main", "/tmp"));
+    }
+
+    #[test]
+    fn is_push_to_main_chained_command() {
+        // Only checks segment before & or ;
+        assert!(is_push_to_main(
+            "git push origin main && echo done",
+            "/tmp"
+        ));
+    }
+
+    #[test]
+    fn is_push_to_main_bare_push_nonexistent_dir() {
+        // Bare push to nonexistent dir — git_command returns None, falls to false
+        assert!(!is_push_to_main("git push origin", "/tmp/nonexistent"));
+    }
+
+    // --- Check::run() integration: repo detection ---
+
+    #[test]
+    fn push_from_cadence_hooks_repo_nudges() {
+        // Use the actual cadence-hooks repo directory
+        let cwd = env!("CARGO_MANIFEST_DIR")
+            .rsplit_once("/crates")
+            .map(|(root, _)| root)
+            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
+        let input = make_bash_with_cwd("git push origin main", cwd);
+        let result = NudgeUpgradeAfterPush.run(&input);
+        assert_eq!(result.outcome, Outcome::Nudge, "should nudge for cadence-hooks repo");
+        assert!(
+            result.message.is_some(),
+            "nudge should include scheduling instructions"
+        );
+    }
+
+    #[test]
+    fn push_from_cadence_hooks_feature_branch_allows() {
+        let cwd = env!("CARGO_MANIFEST_DIR")
+            .rsplit_once("/crates")
+            .map(|(root, _)| root)
+            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
+        let input = make_bash_with_cwd("git push origin feature/test", cwd);
+        let result = NudgeUpgradeAfterPush.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Allow,
+            "should not nudge for non-main branch"
+        );
+    }
+
+    #[test]
+    fn push_from_other_repo_with_explicit_cwd_allows() {
+        // git-guardrails is a sibling repo — different remote
+        let cwd = format!(
+            "{}/../../git-guardrails",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let input = make_bash_with_cwd("git push origin main", &cwd);
+        let result = NudgeUpgradeAfterPush.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Allow,
+            "should not nudge for non-cadence-hooks repo"
+        );
+    }
+
+    #[test]
+    fn push_with_cd_to_cadence_hooks_nudges() {
+        let repo_root = env!("CARGO_MANIFEST_DIR")
+            .rsplit_once("/crates")
+            .map(|(root, _)| root)
+            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
+        let cmd = format!("cd {repo_root} && git push origin main");
+        let input = make_bash_with_cwd(&cmd, "/tmp");
+        let result = NudgeUpgradeAfterPush.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Nudge,
+            "cd + push should detect cadence-hooks repo via parse_work_dir"
+        );
     }
 }
