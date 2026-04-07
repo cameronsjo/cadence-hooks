@@ -37,8 +37,10 @@ static API_INPUT_FLAG: LazyLock<Regex> =
 static REPO_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(-R|--repo)\s+([^ ]+)").expect("pattern should compile"));
 
-static REPO_CREATE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"gh\s+repo\s+create\b").expect("pattern should compile"));
+static REPO_SUBCOMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"gh\s+repo\s+(archive|delete|rename|unarchive|fork|clone|create)\b")
+        .expect("pattern should compile")
+});
 
 static API_REPOS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
@@ -78,9 +80,11 @@ fn resolve_target_repo(
         };
     }
 
-    // 2. gh repo create <name>
-    if REPO_CREATE.is_match(command) {
-        let after = command.split("gh repo create").nth(1).unwrap_or("").trim();
+    // 2. gh repo <subcommand> <owner/repo> (positional arg)
+    if let Some(caps) = REPO_SUBCOMMAND.captures(command) {
+        let subcommand = caps.get(1).unwrap().as_str();
+        let split_key = format!("gh repo {subcommand}");
+        let after = command.split(&split_key).nth(1).unwrap_or("").trim();
         let first_arg = after.split_whitespace().next().unwrap_or("");
         if !first_arg.is_empty() && !first_arg.starts_with('-') {
             if first_arg.contains('/') {
@@ -89,15 +93,18 @@ fn resolve_target_repo(
                     repo: first_arg.to_string(),
                 };
             }
-            let default_owner = allowed_owners
-                .iter()
-                .find(|e| e.host.is_none() || e.host.as_deref() == Some(&dh))
-                .map(|e| e.owner.as_str())
-                .unwrap_or("");
-            return RepoResolution::Resolved {
-                host: dh,
-                repo: format!("{default_owner}/{first_arg}"),
-            };
+            // Only `create` can infer owner from a bare name (no `/`)
+            if subcommand == "create" {
+                let default_owner = allowed_owners
+                    .iter()
+                    .find(|e| e.host.is_none() || e.host.as_deref() == Some(&dh))
+                    .map(|e| e.owner.as_str())
+                    .unwrap_or("");
+                return RepoResolution::Resolved {
+                    host: dh,
+                    repo: format!("{default_owner}/{first_arg}"),
+                };
+            }
         }
     }
 
@@ -663,6 +670,71 @@ mod tests {
         match resolved {
             RepoResolution::Resolved { repo, .. } => {
                 assert_eq!(repo, "cameronsjo/new-repo");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_archive_positional_resolves() {
+        let allowed = owners(&["cameronsjo"]);
+        let resolved =
+            resolve_target_repo("gh repo archive cameronsjo/some-repo --yes", ".", &allowed);
+        match resolved {
+            RepoResolution::Resolved { repo, .. } => {
+                assert_eq!(repo, "cameronsjo/some-repo");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_delete_positional_resolves() {
+        let allowed = owners(&["cameronsjo"]);
+        let resolved =
+            resolve_target_repo("gh repo delete cameronsjo/old-repo --yes", ".", &allowed);
+        match resolved {
+            RepoResolution::Resolved { repo, .. } => {
+                assert_eq!(repo, "cameronsjo/old-repo");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_rename_bare_name_falls_through() {
+        // rename takes a bare name (new name), not owner/repo — should NOT resolve
+        // from the positional arg. It falls through to git remote resolution instead.
+        let allowed = owners(&["cameronsjo"]);
+        let resolved = resolve_target_repo("gh repo rename new-name", "/nonexistent", &allowed);
+        // With no git remote available, should be Unresolvable
+        match resolved {
+            RepoResolution::Unresolvable => {}
+            other => panic!("expected Unresolvable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_unarchive_positional_resolves() {
+        let allowed = owners(&["cameronsjo"]);
+        let resolved =
+            resolve_target_repo("gh repo unarchive cameronsjo/archived-repo", ".", &allowed);
+        match resolved {
+            RepoResolution::Resolved { repo, .. } => {
+                assert_eq!(repo, "cameronsjo/archived-repo");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_clone_positional_resolves() {
+        let allowed = owners(&["cameronsjo"]);
+        let resolved =
+            resolve_target_repo("gh repo clone cameronsjo/my-repo", ".", &allowed);
+        match resolved {
+            RepoResolution::Resolved { repo, .. } => {
+                assert_eq!(repo, "cameronsjo/my-repo");
             }
             other => panic!("expected Resolved, got {other:?}"),
         }
