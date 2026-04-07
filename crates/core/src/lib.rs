@@ -9,6 +9,9 @@ pub mod config;
 pub mod loop_analysis;
 pub mod shell;
 
+#[cfg(feature = "test-builders")]
+pub mod test_builders;
+
 use serde::Deserialize;
 use std::io::Read;
 use std::process;

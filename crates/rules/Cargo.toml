@@ -8,3 +8,6 @@ description = "Rules plugin hooks: skill frontmatter validation, security patter
 [dependencies]
 cadence-hooks-core.workspace = true
 regex.workspace = true
+
+[dev-dependencies]
+cadence-hooks-core = { workspace = true, features = ["test-builders"] }

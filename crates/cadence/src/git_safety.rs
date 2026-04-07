@@ -377,21 +377,7 @@ impl Check for GitSafetyGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_bash_input(command: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Bash".into()),
-            tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: None,
-                path: None,
-                command: Some(command.into()),
-                content: None,
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: None,
-        }
-    }
+    use cadence_hooks_core::test_builders::make_bash as make_bash_input;
 
     // ---------------------------------------------------------------
     // normalize_git_command tests

@@ -237,20 +237,7 @@ mod tests {
     }
 
     // Full Check::run() integration tests
-    fn make_write_input(path: &str, content: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Write".into()),
-            tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: Some(path.into()),
-                path: None,
-                command: None,
-                content: Some(content.into()),
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: None,
-        }
-    }
+    use cadence_hooks_core::test_builders::make_write as make_write_input;
 
     #[test]
     fn run_other_file_allowed() {

@@ -264,49 +264,11 @@ mod tests {
 
     // Full Check::run() integration tests
 
+    use cadence_hooks_core::test_builders::make_bash as make_bash_input;
+    use cadence_hooks_core::test_builders::make_edit as make_edit_input;
+
     fn make_write_input(path: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Write".into()),
-            tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: Some(path.into()),
-                path: None,
-                command: None,
-                content: Some("content".into()),
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: None,
-        }
-    }
-
-    fn make_edit_input(path: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Edit".into()),
-            tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: Some(path.into()),
-                path: None,
-                command: None,
-                content: None,
-                new_string: Some("new".into()),
-                old_string: Some("old".into()),
-            }),
-            cwd: None,
-        }
-    }
-
-    fn make_bash_input(command: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Bash".into()),
-            tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: None,
-                path: None,
-                command: Some(command.into()),
-                content: None,
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: None,
-        }
+        cadence_hooks_core::test_builders::make_write(path, "content")
     }
 
     #[test]

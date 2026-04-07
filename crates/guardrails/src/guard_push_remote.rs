@@ -398,20 +398,7 @@ mod tests {
     // Tests that trigger blocks BEFORE env var check (loops, multi-push)
     // avoid unsafe env manipulation.
 
-    fn make_bash(cmd: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Bash".into()),
-            tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: None,
-                path: None,
-                command: Some(cmd.into()),
-                content: None,
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: None,
-        }
-    }
+    use cadence_hooks_core::test_builders::make_bash;
 
     #[test]
     fn chained_pushes_different_remotes_blocked() {

@@ -8,3 +8,6 @@ description = "Git guardrails hooks: push protection, gh write guards, idle dete
 [dependencies]
 cadence-hooks-core.workspace = true
 regex.workspace = true
+
+[dev-dependencies]
+cadence-hooks-core = { workspace = true, features = ["test-builders"] }

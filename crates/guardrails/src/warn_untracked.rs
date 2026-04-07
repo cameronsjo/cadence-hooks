@@ -160,20 +160,7 @@ mod tests {
 
     // --- run() guard clauses ---
 
-    fn make_bash(cmd: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Bash".into()),
-            tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: None,
-                path: None,
-                command: Some(cmd.into()),
-                content: None,
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: None,
-        }
-    }
+    use cadence_hooks_core::test_builders::make_bash;
 
     #[test]
     fn no_command_allows() {

@@ -96,22 +96,8 @@ impl Check for NudgeUpgradeAfterPush {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadence_hooks_core::{HookInput, Outcome, ToolInput};
-
-    fn make_bash(cmd: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Bash".into()),
-            tool_input: Some(ToolInput {
-                file_path: None,
-                path: None,
-                command: Some(cmd.into()),
-                content: None,
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: None,
-        }
-    }
+    use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
+    use cadence_hooks_core::{HookInput, Outcome};
 
     #[test]
     fn no_command_allows() {
@@ -138,20 +124,6 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
-    fn make_bash_with_cwd(cmd: &str, cwd: &str) -> HookInput {
-        HookInput {
-            tool_name: Some("Bash".into()),
-            tool_input: Some(ToolInput {
-                file_path: None,
-                path: None,
-                command: Some(cmd.into()),
-                content: None,
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: Some(cwd.into()),
-        }
-    }
 
     // --- is_push_to_main tests ---
 

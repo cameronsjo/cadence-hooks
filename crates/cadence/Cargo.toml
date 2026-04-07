@@ -9,3 +9,6 @@ description = "Cadence plugin hooks: enforcement, memory guard, session manageme
 cadence-hooks-core.workspace = true
 regex.workspace = true
 tempfile = "3"
+
+[dev-dependencies]
+cadence-hooks-core = { workspace = true, features = ["test-builders"] }
