@@ -92,7 +92,7 @@ impl Check for PushRemoteGuard {
                     .filter_map(|c| c.explicit_repo.as_ref())
                     .map(|r| format!("`{r}`"))
                     .collect();
-                return CheckResult::block(&format!(
+                return CheckResult::block(format!(
                     "🚫 git-guardrails: chained git push to different remotes\n   \
                      Found: remotes {}\n   \
                      Fix: run each push individually, e.g. `git push origin main`",
@@ -105,7 +105,7 @@ impl Check for PushRemoteGuard {
                     .filter(|c| c.explicit_repo.is_none())
                     .map(|c| format!("`git {}`", c.args.join(" ")))
                     .collect();
-                return CheckResult::block(&format!(
+                return CheckResult::block(format!(
                     "🚫 git-guardrails: chained git push without explicit remotes\n   \
                      Found: {}\n   \
                      Fix: add explicit remote, e.g. `git push origin main`",
@@ -135,7 +135,7 @@ impl Check for PushRemoteGuard {
                     .map(|c| format!("git {}", c.args.join(" ")))
                     .collect();
                 let example = bare_pushes.first().cloned().unwrap_or_default();
-                return CheckResult::block(&format!(
+                return CheckResult::block(format!(
                     "🚫 git-guardrails: git push in loop without explicit remote\n   \
                      Found: `{example}`\n   \
                      Fix: add the remote, e.g. `git push origin` or `git push origin main`",

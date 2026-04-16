@@ -226,7 +226,7 @@ impl Check for GhWriteGuard {
                     } else {
                         writes.join(", ")
                     };
-                    return CheckResult::block(&format!(
+                    return CheckResult::block(format!(
                         "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
                          Found: {found}\n   \
                          Fix: add `-R owner/repo` to each command",

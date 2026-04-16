@@ -36,7 +36,7 @@ impl Check for GhDangerousGuard {
 
         // Pass 1: direct invocation (after stripping quotes)
         if let Some(m) = GH_REPO_DELETE.find(&stripped) {
-            return CheckResult::block(&format!(
+            return CheckResult::block(format!(
                 "🚫 git-guardrails: gh repo delete is blocked\n   \
                  Found: `{}`\n   \
                  Fix: delete manually via github.com — this is irreversible",
@@ -45,16 +45,15 @@ impl Check for GhDangerousGuard {
         }
 
         // Pass 2: inside exec wrappers (bash -c "gh repo delete ...")
-        if EXEC_WRAPPER.is_match(&stripped) {
-            if let Some(m) = GH_REPO_DELETE.find(command) {
-                return CheckResult::block(&format!(
+        if EXEC_WRAPPER.is_match(&stripped)
+            && let Some(m) = GH_REPO_DELETE.find(command) {
+                return CheckResult::block(format!(
                     "🚫 git-guardrails: gh repo delete is blocked\n   \
                      Found: `{}`\n   \
                      Fix: delete manually via github.com — this is irreversible",
                     m.as_str().trim(),
                 ));
             }
-        }
 
         CheckResult::allow()
     }

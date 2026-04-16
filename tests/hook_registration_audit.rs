@@ -522,16 +522,15 @@ fn hook_event_types_match_hooks_json() {
     let all_refs = hooks_json_references();
 
     let mut mismatches = Vec::new();
-    for (_dir, refs) in &all_refs {
+    for refs in all_refs.values() {
         for r in refs {
-            if let Some(main_event) = main_events.get(&r.command) {
-                if main_event != &r.event_type {
+            if let Some(main_event) = main_events.get(&r.command)
+                && main_event != &r.event_type {
                     mismatches.push(format!(
                         "  `{}`: hooks.json says {} but main.rs passes HookEvent::{}",
                         r.command, r.event_type, main_event
                     ));
                 }
-            }
         }
     }
 

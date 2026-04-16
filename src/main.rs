@@ -383,13 +383,11 @@ fn main() {
     // Selective disable — skip specific hooks by name via CADENCE_HOOKS_DISABLE.
     // Comma-separated list of hook names (e.g., "git-safety,warn-main-branch").
     // Set per-project in .claude/settings.json `env` block, or ad-hoc in shell.
-    if let Ok(disabled) = std::env::var("CADENCE_HOOKS_DISABLE") {
-        if let Some(name) = hook_name(&cli.command) {
-            if disabled.split(',').any(|h| h.trim() == name) {
+    if let Ok(disabled) = std::env::var("CADENCE_HOOKS_DISABLE")
+        && let Some(name) = hook_name(&cli.command)
+            && disabled.split(',').any(|h| h.trim() == name) {
                 process::exit(0);
             }
-        }
-    }
 
     // Event type aliases for readability at callsites.
     let pre = HookEvent::PreToolUse;
