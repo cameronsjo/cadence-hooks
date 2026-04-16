@@ -129,14 +129,12 @@ fn collect_top_level_pushes(list: &CompoundList, out: &mut Vec<LoopedCommand>) {
 fn collect_top_level_pushes_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>) {
     for cmd in &pipeline.seq {
         match cmd {
-            Command::Simple(simple) => {
-                if is_git_push_command(simple) {
-                    out.push(LoopedCommand {
-                        name: "git push".to_string(),
-                        explicit_repo: extract_push_remote(simple),
-                        args: suffix_words(simple),
-                    });
-                }
+            Command::Simple(simple) if is_git_push_command(simple) => {
+                out.push(LoopedCommand {
+                    name: "git push".to_string(),
+                    explicit_repo: extract_push_remote(simple),
+                    args: suffix_words(simple),
+                });
             }
             Command::Compound(compound, _) => {
                 // Recurse into brace groups and subshells but NOT loops
@@ -277,14 +275,12 @@ fn collect_gh_from_and_or_item(item: &CompoundListItem, out: &mut Vec<LoopedComm
 fn collect_gh_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>) {
     for cmd in &pipeline.seq {
         match cmd {
-            Command::Simple(simple) => {
-                if is_gh_command(simple) {
-                    out.push(LoopedCommand {
-                        name: "gh".to_string(),
-                        explicit_repo: extract_repo_flag(simple),
-                        args: suffix_words(simple),
-                    });
-                }
+            Command::Simple(simple) if is_gh_command(simple) => {
+                out.push(LoopedCommand {
+                    name: "gh".to_string(),
+                    explicit_repo: extract_repo_flag(simple),
+                    args: suffix_words(simple),
+                });
             }
             Command::Compound(compound, _) => {
                 // Recurse into nested compounds (nested loops, brace groups, etc.)
@@ -392,14 +388,12 @@ fn collect_push_from_body(body: &CompoundList, out: &mut Vec<LoopedCommand>) {
 fn collect_push_from_pipeline(pipeline: &Pipeline, out: &mut Vec<LoopedCommand>) {
     for cmd in &pipeline.seq {
         match cmd {
-            Command::Simple(simple) => {
-                if is_git_push_command(simple) {
-                    out.push(LoopedCommand {
-                        name: "git push".to_string(),
-                        explicit_repo: extract_push_remote(simple),
-                        args: suffix_words(simple),
-                    });
-                }
+            Command::Simple(simple) if is_git_push_command(simple) => {
+                out.push(LoopedCommand {
+                    name: "git push".to_string(),
+                    explicit_repo: extract_push_remote(simple),
+                    args: suffix_words(simple),
+                });
             }
             Command::Compound(compound, _) => match compound {
                 CompoundCommand::ForClause(for_cmd) => {
