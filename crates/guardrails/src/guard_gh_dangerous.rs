@@ -46,14 +46,15 @@ impl Check for GhDangerousGuard {
 
         // Pass 2: inside exec wrappers (bash -c "gh repo delete ...")
         if EXEC_WRAPPER.is_match(&stripped)
-            && let Some(m) = GH_REPO_DELETE.find(command) {
-                return CheckResult::block(format!(
-                    "🚫 git-guardrails: gh repo delete is blocked\n   \
+            && let Some(m) = GH_REPO_DELETE.find(command)
+        {
+            return CheckResult::block(format!(
+                "🚫 git-guardrails: gh repo delete is blocked\n   \
                      Found: `{}`\n   \
                      Fix: delete manually via github.com — this is irreversible",
-                    m.as_str().trim(),
-                ));
-            }
+                m.as_str().trim(),
+            ));
+        }
 
         CheckResult::allow()
     }

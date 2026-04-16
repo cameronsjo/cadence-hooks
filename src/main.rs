@@ -385,9 +385,10 @@ fn main() {
     // Set per-project in .claude/settings.json `env` block, or ad-hoc in shell.
     if let Ok(disabled) = std::env::var("CADENCE_HOOKS_DISABLE")
         && let Some(name) = hook_name(&cli.command)
-            && disabled.split(',').any(|h| h.trim() == name) {
-                process::exit(0);
-            }
+        && disabled.split(',').any(|h| h.trim() == name)
+    {
+        process::exit(0);
+    }
 
     // Event type aliases for readability at callsites.
     let pre = HookEvent::PreToolUse;

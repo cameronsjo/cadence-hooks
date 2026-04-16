@@ -55,9 +55,10 @@ impl Check for WarnUntrackedFiles {
         let mut cmd = Command::new("git");
         cmd.args(["status", "--porcelain"]);
         if let Some(dir) = input.cwd.as_deref()
-            && Path::new(dir).is_dir() {
-                cmd.current_dir(dir);
-            }
+            && Path::new(dir).is_dir()
+        {
+            cmd.current_dir(dir);
+        }
         let output = match cmd.output() {
             Ok(out) => out,
             Err(_) => return CheckResult::allow(),
