@@ -730,8 +730,7 @@ mod tests {
     #[test]
     fn repo_clone_positional_resolves() {
         let allowed = owners(&["cameronsjo"]);
-        let resolved =
-            resolve_target_repo("gh repo clone cameronsjo/my-repo", ".", &allowed);
+        let resolved = resolve_target_repo("gh repo clone cameronsjo/my-repo", ".", &allowed);
         match resolved {
             RepoResolution::Resolved { repo, .. } => {
                 assert_eq!(repo, "cameronsjo/my-repo");

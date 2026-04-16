@@ -13,13 +13,13 @@ pub mod guard_gh_write;
 pub mod guard_git_init;
 /// Block `git push` to remotes owned by others.
 pub mod guard_push_remote;
+/// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
+pub mod nudge_upgrade_after_push;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
 /// Remind to check datetime before scheduling cron jobs.
 pub mod warn_cron_datetime;
 /// Warn when editing files directly on main/master branch.
 pub mod warn_main_branch;
-/// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
-pub mod nudge_upgrade_after_push;
 /// Warn about untracked files during git commit operations.
 pub mod warn_untracked;

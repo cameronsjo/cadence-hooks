@@ -132,21 +132,39 @@ mod tests {
     fn exactly_at_threshold_warns() {
         let result = idle_outcome(Some(300));
         assert_eq!(result.outcome, Outcome::Nudge);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("5m"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("5m")
+        );
     }
 
     #[test]
     fn ten_minutes_idle_warns() {
         let result = idle_outcome(Some(600));
         assert_eq!(result.outcome, Outcome::Nudge);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("10m"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("10m")
+        );
     }
 
     #[test]
     fn one_hour_idle_warns() {
         let result = idle_outcome(Some(3600));
         assert_eq!(result.outcome, Outcome::Nudge);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("60m"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("60m")
+        );
     }
 
     #[test]
@@ -154,7 +172,13 @@ mod tests {
         let result = idle_outcome(Some(28799));
         assert_eq!(result.outcome, Outcome::Nudge);
         // 28799 / 60 = 479 minutes
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("479m"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("479m")
+        );
     }
 
     #[test]
@@ -162,23 +186,59 @@ mod tests {
         // 8 hours — stale session, suggest fresh start
         let result = idle_outcome(Some(28800));
         assert_eq!(result.outcome, Outcome::Nudge);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("8h"));
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("fresh session"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("8h")
+        );
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("fresh session")
+        );
     }
 
     #[test]
     fn day_old_session_warns_fresh_session() {
         let result = idle_outcome(Some(86400));
         assert_eq!(result.outcome, Outcome::Nudge);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("24h"));
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("fresh session"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("24h")
+        );
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("fresh session")
+        );
     }
 
     #[test]
     fn twelve_hour_gap_warns_fresh_session() {
         let result = idle_outcome(Some(43200));
         assert_eq!(result.outcome, Outcome::Nudge);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("12h"));
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("fresh session"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("12h")
+        );
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("fresh session")
+        );
     }
 }

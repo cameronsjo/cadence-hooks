@@ -124,7 +124,6 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
-
     // --- is_push_to_main tests ---
 
     #[test]
@@ -158,10 +157,7 @@ mod tests {
     #[test]
     fn is_push_to_main_chained_command() {
         // Only checks segment before & or ;
-        assert!(is_push_to_main(
-            "git push origin main && echo done",
-            "/tmp"
-        ));
+        assert!(is_push_to_main("git push origin main && echo done", "/tmp"));
     }
 
     #[test]
@@ -181,7 +177,11 @@ mod tests {
             .unwrap_or(env!("CARGO_MANIFEST_DIR"));
         let input = make_bash_with_cwd("git push origin main", cwd);
         let result = NudgeUpgradeAfterPush.run(&input);
-        assert_eq!(result.outcome, Outcome::Nudge, "should nudge for cadence-hooks repo");
+        assert_eq!(
+            result.outcome,
+            Outcome::Nudge,
+            "should nudge for cadence-hooks repo"
+        );
         assert!(
             result.message.is_some(),
             "nudge should include scheduling instructions"
@@ -206,10 +206,7 @@ mod tests {
     #[test]
     fn push_from_other_repo_with_explicit_cwd_allows() {
         // git-guardrails is a sibling repo — different remote
-        let cwd = format!(
-            "{}/../../git-guardrails",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let cwd = format!("{}/../../git-guardrails", env!("CARGO_MANIFEST_DIR"));
         let input = make_bash_with_cwd("git push origin main", &cwd);
         let result = NudgeUpgradeAfterPush.run(&input);
         assert_eq!(

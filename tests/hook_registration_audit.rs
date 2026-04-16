@@ -75,22 +75,17 @@ struct HookRef {
 
 /// Plugin directories that dispatch to the cadence-hooks binary via run-cadence-hooks.sh.
 /// (dir_name, expected_plugin_group)
-const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
-    ("cadence", "cadence"),
-    ("git-guardrails", "guardrails"),
-];
+const BINARY_PLUGIN_DIRS: &[(&str, &str)] =
+    &[("cadence", "cadence"), ("git-guardrails", "guardrails")];
 
 /// Plugin directories that still use shell script wrappers (not yet migrated to binary).
 /// These are tracked so the "all subcommands registered" test knows they exist.
-const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[
-    ("rules", "rules"),
-    ("cadence-obsidian", "obsidian"),
-];
+const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("rules", "rules"), ("cadence-obsidian", "obsidian")];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
 const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
-    "cadence git-safety",          // catches force-push, reset --hard, etc.
+    "cadence git-safety",            // catches force-push, reset --hard, etc.
     "cadence prevent-secret-writes", // catches writes to .env, credentials, etc.
     "cadence prevent-secret-leaks",  // catches reads of secrets
     "cadence warn-docs-update",      // catches gh pr create
@@ -262,7 +257,10 @@ fn all_registered_hooks_exist_in_binary() {
     for (dir, refs) in &all_refs {
         for r in refs {
             if !binary_cmds.contains(&r.command) {
-                missing.push(format!("  {dir}/hooks.json -> `{}` (not in binary)", r.command));
+                missing.push(format!(
+                    "  {dir}/hooks.json -> `{}` (not in binary)",
+                    r.command
+                ));
             }
         }
     }
@@ -286,10 +284,8 @@ fn all_binary_subcommands_are_registered() {
 
     // Subcommands for plugins still using shell wrappers are expected to be unregistered.
     // They'll be migrated to binary dispatch later.
-    let shell_plugin_groups: BTreeSet<&str> = SHELL_PLUGIN_DIRS
-        .iter()
-        .map(|(_, group)| *group)
-        .collect();
+    let shell_plugin_groups: BTreeSet<&str> =
+        SHELL_PLUGIN_DIRS.iter().map(|(_, group)| *group).collect();
 
     let unregistered: Vec<&String> = binary_cmds
         .iter()
@@ -428,8 +424,8 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
 /// Returns a map of "plugin subcommand" -> "PreToolUse" or "PostToolUse".
 fn main_rs_event_types() -> BTreeMap<String, String> {
     let main_rs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    let content = std::fs::read_to_string(&main_rs)
-        .unwrap_or_else(|e| panic!("failed to read main.rs: {e}"));
+    let content =
+        std::fs::read_to_string(&main_rs).unwrap_or_else(|e| panic!("failed to read main.rs: {e}"));
 
     let mut result = BTreeMap::new();
 

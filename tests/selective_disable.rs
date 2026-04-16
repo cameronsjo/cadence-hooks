@@ -68,7 +68,10 @@ fn disabled_hook_produces_no_output() {
 fn comma_separated_list_disables_multiple() {
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "git-safety"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "terminology,git-safety,line-endings");
+    cmd.env(
+        "CADENCE_HOOKS_DISABLE",
+        "terminology,git-safety,line-endings",
+    );
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -83,7 +86,10 @@ fn comma_separated_list_disables_multiple() {
 fn spaces_around_commas_tolerated() {
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "git-safety"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "terminology , git-safety , line-endings");
+    cmd.env(
+        "CADENCE_HOOKS_DISABLE",
+        "terminology , git-safety , line-endings",
+    );
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -225,7 +231,10 @@ fn list_shows_all_plugin_groups() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cadence:"), "should show cadence group");
-    assert!(stdout.contains("guardrails:"), "should show guardrails group");
+    assert!(
+        stdout.contains("guardrails:"),
+        "should show guardrails group"
+    );
     assert!(stdout.contains("rules:"), "should show rules group");
     assert!(stdout.contains("obsidian:"), "should show obsidian group");
 }

@@ -4,7 +4,7 @@
 //! Each subcommand reads JSON from stdin (the hook protocol) and exits with
 //! 0 (allow), 1 (warn), or 2 (block).
 
-use cadence_hooks_core::{run_check_from_stdin, HookEvent};
+use cadence_hooks_core::{HookEvent, run_check_from_stdin};
 use clap::{Parser, Subcommand};
 use std::process;
 
@@ -110,32 +110,124 @@ struct HookEntry {
 /// and `hook_name()` resolution. Keep in sync with the enum variants above.
 const HOOKS: &[HookEntry] = &[
     // cadence
-    HookEntry { name: "terminology", description: "Block inclusive terminology violations", plugin: "cadence" },
-    HookEntry { name: "orphaned-todos", description: "Block orphaned code markers without issue references", plugin: "cadence" },
-    HookEntry { name: "prevent-secret-leaks", description: "Guard against reading/ingesting secrets", plugin: "cadence" },
-    HookEntry { name: "prevent-secret-writes", description: "Guard against writing/editing/deleting secrets", plugin: "cadence" },
-    HookEntry { name: "memory-guard", description: "Enforce MEMORY.md line limits", plugin: "cadence" },
-    HookEntry { name: "git-safety", description: "Block dangerous git operations", plugin: "cadence" },
-    HookEntry { name: "line-endings", description: "Validate shell script line endings", plugin: "cadence" },
-    HookEntry { name: "env-vars", description: "Warn about generic environment variable names", plugin: "cadence" },
-    HookEntry { name: "warn-docs-update", description: "Nudge to review docs when creating a PR", plugin: "cadence" },
-    HookEntry { name: "markdown-lint", description: "Run markdownlint on markdown files", plugin: "cadence" },
+    HookEntry {
+        name: "terminology",
+        description: "Block inclusive terminology violations",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "orphaned-todos",
+        description: "Block orphaned code markers without issue references",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "prevent-secret-leaks",
+        description: "Guard against reading/ingesting secrets",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "prevent-secret-writes",
+        description: "Guard against writing/editing/deleting secrets",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "memory-guard",
+        description: "Enforce MEMORY.md line limits",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "git-safety",
+        description: "Block dangerous git operations",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "line-endings",
+        description: "Validate shell script line endings",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "env-vars",
+        description: "Warn about generic environment variable names",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "warn-docs-update",
+        description: "Nudge to review docs when creating a PR",
+        plugin: "cadence",
+    },
+    HookEntry {
+        name: "markdown-lint",
+        description: "Run markdownlint on markdown files",
+        plugin: "cadence",
+    },
     // guardrails
-    HookEntry { name: "guard-push-remote", description: "Block git push to non-owned remotes", plugin: "guardrails" },
-    HookEntry { name: "guard-gh-dangerous", description: "Block irreversible gh operations (repo delete)", plugin: "guardrails" },
-    HookEntry { name: "guard-gh-write", description: "Block gh write operations to non-owned repos", plugin: "guardrails" },
-    HookEntry { name: "guard-git-init", description: "Nudge to scaffold after git init", plugin: "guardrails" },
-    HookEntry { name: "warn-main-branch", description: "Warn when editing on main/master branch", plugin: "guardrails" },
-    HookEntry { name: "check-idle-return", description: "Nudge after idle periods between edits", plugin: "guardrails" },
-    HookEntry { name: "warn-branch-base", description: "Warn when creating a branch from a non-main base", plugin: "guardrails" },
-    HookEntry { name: "warn-cron-datetime", description: "Remind to check datetime before scheduling cron jobs", plugin: "guardrails" },
-    HookEntry { name: "nudge-upgrade-after-push", description: "Nudge to schedule a brew upgrade after pushing cadence-hooks to main", plugin: "guardrails" },
-    HookEntry { name: "warn-untracked", description: "Warn about untracked files during git commit operations", plugin: "guardrails" },
+    HookEntry {
+        name: "guard-push-remote",
+        description: "Block git push to non-owned remotes",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "guard-gh-dangerous",
+        description: "Block irreversible gh operations (repo delete)",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "guard-gh-write",
+        description: "Block gh write operations to non-owned repos",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "guard-git-init",
+        description: "Nudge to scaffold after git init",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "warn-main-branch",
+        description: "Warn when editing on main/master branch",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "check-idle-return",
+        description: "Nudge after idle periods between edits",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "warn-branch-base",
+        description: "Warn when creating a branch from a non-main base",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "warn-cron-datetime",
+        description: "Remind to check datetime before scheduling cron jobs",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "nudge-upgrade-after-push",
+        description: "Nudge to schedule a brew upgrade after pushing cadence-hooks to main",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "warn-untracked",
+        description: "Warn about untracked files during git commit operations",
+        plugin: "guardrails",
+    },
     // rules
-    HookEntry { name: "validate-frontmatter", description: "Validate SKILL.md and command frontmatter", plugin: "rules" },
-    HookEntry { name: "security-patterns", description: "Scan for security anti-patterns", plugin: "rules" },
+    HookEntry {
+        name: "validate-frontmatter",
+        description: "Validate SKILL.md and command frontmatter",
+        plugin: "rules",
+    },
+    HookEntry {
+        name: "security-patterns",
+        description: "Scan for security anti-patterns",
+        plugin: "rules",
+    },
     // obsidian
-    HookEntry { name: "trash-guard", description: "Block rm in Obsidian vault (use .trash/ instead)", plugin: "obsidian" },
+    HookEntry {
+        name: "trash-guard",
+        description: "Block rm in Obsidian vault (use .trash/ instead)",
+        plugin: "obsidian",
+    },
 ];
 
 /// Returns the kebab-case hook name for the resolved subcommand.
@@ -337,9 +429,10 @@ fn main() {
             CadenceCommands::EnvVars => {
                 run_check_from_stdin(&cadence_hooks_cadence::validate_env_vars::EnvVarGuard, pre)
             }
-            CadenceCommands::WarnDocsUpdate => {
-                run_check_from_stdin(&cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate, pre)
-            }
+            CadenceCommands::WarnDocsUpdate => run_check_from_stdin(
+                &cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate,
+                pre,
+            ),
             CadenceCommands::MarkdownLint => {
                 run_check_from_stdin(&cadence_hooks_cadence::markdown_lint::MarkdownLint, pre)
             }
@@ -356,9 +449,10 @@ fn main() {
             GuardrailsCommands::GuardGhWrite => {
                 run_check_from_stdin(&cadence_hooks_guardrails::guard_gh_write::GhWriteGuard, pre)
             }
-            GuardrailsCommands::GuardGitInit => {
-                run_check_from_stdin(&cadence_hooks_guardrails::guard_git_init::GuardGitInit, post)
-            }
+            GuardrailsCommands::GuardGitInit => run_check_from_stdin(
+                &cadence_hooks_guardrails::guard_git_init::GuardGitInit,
+                post,
+            ),
             GuardrailsCommands::WarnMainBranch => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_main_branch::WarnMainBranch,
                 pre,
@@ -395,9 +489,10 @@ fn main() {
             ),
         },
         Commands::Obsidian(cmd) => match cmd {
-            ObsidianCommands::TrashGuard => {
-                run_check_from_stdin(&cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard, pre)
-            }
+            ObsidianCommands::TrashGuard => run_check_from_stdin(
+                &cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard,
+                pre,
+            ),
         },
     }
 }

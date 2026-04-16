@@ -101,14 +101,26 @@ mod tests {
     fn main_branch_warns() {
         let result = should_warn("main", false);
         assert_eq!(result.outcome, Outcome::Nudge);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("main"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("main")
+        );
     }
 
     #[test]
     fn master_branch_warns() {
         let result = should_warn("master", false);
         assert_eq!(result.outcome, Outcome::Nudge);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("master"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("master")
+        );
     }
 
     #[test]
@@ -173,7 +185,13 @@ mod tests {
     #[test]
     fn warn_message_contains_branch() {
         let result = should_warn("master", false);
-        assert!(result.message.as_deref().expect("nudge should have a message").contains("master"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("nudge should have a message")
+                .contains("master")
+        );
     }
 
     #[test]
