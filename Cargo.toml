@@ -15,6 +15,7 @@ serde_json = "1"
 regex = "1"
 clap = { version = "4", features = ["derive"] }
 brush-parser = "0.3"
+dialoguer = "0.11"
 
 cadence-hooks-core = { path = "crates/core" }
 cadence-hooks-cadence = { path = "crates/cadence" }
@@ -37,9 +38,12 @@ path = "src/main.rs"
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
 
 [dependencies]
 clap.workspace = true
+dialoguer.workspace = true
+serde_json.workspace = true
 cadence-hooks-core.workspace = true
 cadence-hooks-cadence.workspace = true
 cadence-hooks-guardrails.workspace = true

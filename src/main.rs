@@ -8,6 +8,8 @@ use cadence_hooks_core::{HookEvent, run_check_from_stdin};
 use clap::{Parser, Subcommand};
 use std::process;
 
+mod configure;
+
 #[derive(Parser)]
 #[command(name = "cadence-hooks", version, about = "Compiled Claude Code hooks")]
 struct Cli {
@@ -35,6 +37,13 @@ enum Commands {
 
     /// List all hooks with descriptions and disable status
     List,
+
+    /// Interactively configure which hooks to disable for this project
+    Configure {
+        /// Print current configuration without interactive mode
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -265,7 +274,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         Commands::Obsidian(o) => Some(match o {
             ObsidianCommands::TrashGuard => "trash-guard",
         }),
-        Commands::List => None,
+        Commands::List | Commands::Configure { .. } => None,
     }
 }
 
@@ -314,9 +323,9 @@ fn print_hook_list() {
 fn main() {
     // Maintenance bypass — set CADENCE_HOOKS_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
-    // Note: `list` subcommand is exempt — it needs to show bypass status.
+    // Note: `list` and `configure` subcommands are exempt — they need to work always.
     let bypassed = std::env::var("CADENCE_HOOKS_BYPASS").as_deref() == Ok("1");
-    if bypassed && !std::env::args().any(|a| a == "list") {
+    if bypassed && !std::env::args().any(|a| a == "list" || a == "configure") {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_HOOKS_BYPASS=1)");
         process::exit(0);
     }
@@ -398,6 +407,9 @@ fn main() {
         Commands::List => {
             print_hook_list();
             process::exit(0);
+        }
+        Commands::Configure { list } => {
+            configure::run(list, HOOKS);
         }
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => {
