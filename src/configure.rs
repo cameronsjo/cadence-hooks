@@ -64,8 +64,7 @@ fn write_disabled_hooks(settings_path: &Path, disabled: &[String]) -> Result<(),
         match serde_json::from_str(&content) {
             Ok(Value::Object(map)) => map,
             Ok(_) => return Err(format!("{} is not a JSON object", settings_path.display())),
-            // Empty or invalid — start fresh
-            Err(_) => Map::new(),
+            Err(e) => return Err(format!("Failed to parse {}: {e}", settings_path.display())),
         }
     } else {
         Map::new()
