@@ -170,8 +170,8 @@ impl Check for GhWriteGuard {
             return CheckResult::allow();
         }
 
-        let allowed_owners = env_allow_entries("GIT_GUARDRAILS_ALLOWED_OWNERS");
-        let allowed_repos = env_allow_entries("GIT_GUARDRAILS_ALLOWED_REPOS");
+        let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
+        let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
 
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_gh_loops(command) {
@@ -256,7 +256,7 @@ impl Check for GhWriteGuard {
         if allowed_owners.is_empty() {
             return CheckResult::block(
                 "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
-                 GIT_GUARDRAILS_ALLOWED_OWNERS is not set.",
+                 CADENCE_ALLOWED_OWNERS is not set.",
             );
         }
 

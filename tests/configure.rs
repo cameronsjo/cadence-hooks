@@ -9,8 +9,9 @@ use std::process::Command;
 
 fn cadence_hooks() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
-    cmd.env_remove("CADENCE_HOOKS_BYPASS");
-    cmd.env_remove("CADENCE_HOOKS_DISABLE");
+    cmd.env_remove("CADENCE_BYPASS");
+    cmd.env_remove("CADENCE_DISABLE");
+    cmd.env_remove("CLAUDECODE");
     cmd
 }
 
@@ -41,7 +42,7 @@ fn configure_list_shows_disabled_hooks() {
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(
         claude_dir.join("settings.json"),
-        r#"{"env":{"CADENCE_HOOKS_DISABLE":"git-safety,warn-main-branch"}}"#,
+        r#"{"env":{"CADENCE_DISABLE":"git-safety,warn-main-branch"}}"#,
     )
     .unwrap();
 
@@ -91,7 +92,7 @@ fn configure_list_shows_hook_count() {
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(
         claude_dir.join("settings.json"),
-        r#"{"env":{"CADENCE_HOOKS_DISABLE":"git-safety"}}"#,
+        r#"{"env":{"CADENCE_DISABLE":"git-safety"}}"#,
     )
     .unwrap();
 
@@ -142,7 +143,7 @@ fn configure_list_handles_empty_disable_value() {
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(
         claude_dir.join("settings.json"),
-        r#"{"env":{"CADENCE_HOOKS_DISABLE":""}}"#,
+        r#"{"env":{"CADENCE_DISABLE":""}}"#,
     )
     .unwrap();
 
@@ -167,7 +168,7 @@ fn configure_list_preserves_unknown_hooks() {
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(
         claude_dir.join("settings.json"),
-        r#"{"env":{"CADENCE_HOOKS_DISABLE":"future-hook,git-safety"}}"#,
+        r#"{"env":{"CADENCE_DISABLE":"future-hook,git-safety"}}"#,
     )
     .unwrap();
 
@@ -196,7 +197,7 @@ fn configure_works_during_bypass() {
 
     let mut cmd = cadence_hooks();
     cmd.args(["configure", "--list"]);
-    cmd.env("CADENCE_HOOKS_BYPASS", "1");
+    cmd.env("CADENCE_BYPASS", "1");
     cmd.current_dir(tmp.path());
 
     let output = cmd.output().expect("failed to execute binary");
@@ -220,7 +221,7 @@ fn configure_finds_git_root_settings() {
     fs::create_dir_all(&claude_dir).unwrap();
     fs::write(
         claude_dir.join("settings.json"),
-        r#"{"env":{"CADENCE_HOOKS_DISABLE":"terminology"}}"#,
+        r#"{"env":{"CADENCE_DISABLE":"terminology"}}"#,
     )
     .unwrap();
 
@@ -239,5 +240,95 @@ fn configure_finds_git_root_settings() {
     assert!(
         stdout.contains("terminology"),
         "should find settings from git root when run from subdir: {stdout}"
+    );
+}
+
+// ── configure blocked under Claude Code ──────────────────────────────
+
+#[test]
+fn configure_interactive_refused_under_claude_code() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure"]);
+    cmd.env("CLAUDECODE", "1");
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "configure should exit 1 under Claude Code. stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("disabled under Claude Code"),
+        "should explain why it refused: {stderr}"
+    );
+}
+
+#[test]
+fn configure_list_allowed_under_claude_code() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure", "--list"]);
+    cmd.env("CLAUDECODE", "1");
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "configure --list is read-only and should still work under Claude Code"
+    );
+}
+
+#[test]
+fn configure_hidden_from_help_under_claude_code() {
+    let mut cmd = cadence_hooks();
+    cmd.args(["--help"]);
+    cmd.env("CLAUDECODE", "1");
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stdout.contains("configure"),
+        "configure should not appear in --help under Claude Code: {stdout}"
+    );
+}
+
+#[test]
+fn configure_visible_in_help_without_claude_code() {
+    let mut cmd = cadence_hooks();
+    cmd.args(["--help"]);
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("configure"),
+        "configure should appear in --help when not under Claude Code: {stdout}"
+    );
+}
+
+#[test]
+fn configure_empty_claudecode_does_not_block() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["configure", "--list"]);
+    cmd.env("CLAUDECODE", "");
+    cmd.current_dir(tmp.path());
+
+    let output = cmd.output().expect("failed to execute binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "empty CLAUDECODE should not trigger the guard"
     );
 }

@@ -127,13 +127,17 @@ Reference the binary in your plugin's `hooks.json`:
 
 ### Environment Variables
 
-Some hooks require configuration:
+All cadence-hooks config lives under the `CADENCE_*` prefix. `OBSIDIAN_VAULT` is kept unprefixed because it's a cross-tool convention.
 
 | Variable | Used by | Purpose |
 |----------|---------|---------|
-| `GIT_GUARDRAILS_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space or comma-separated usernames |
-| `GIT_GUARDRAILS_ALLOWED_REPOS` | `guard-gh-write` | Space or comma-separated `owner/repo` pairs |
+| `CADENCE_DISABLE` | all hooks | Comma-separated hook names to skip (e.g., `git-safety,warn-main-branch`) |
+| `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass) |
+| `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space or comma-separated usernames |
+| `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space or comma-separated `owner/repo` pairs |
 | `OBSIDIAN_VAULT` | `trash-guard` | Absolute path to Obsidian vault |
+
+Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is hidden from `--help` and refuses to run interactively. `configure --list` remains available. Run `configure` from a real terminal to change hook state.
 
 ## Architecture
 

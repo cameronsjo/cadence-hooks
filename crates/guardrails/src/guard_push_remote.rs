@@ -154,13 +154,13 @@ impl Check for PushRemoteGuard {
         }
 
         // Owner-based checks require configuration
-        let allowed_owners = env_allow_entries("GIT_GUARDRAILS_ALLOWED_OWNERS");
-        let allowed_repos = env_allow_entries("GIT_GUARDRAILS_ALLOWED_REPOS");
+        let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
+        let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
 
         if allowed_owners.is_empty() {
             return CheckResult::block(
                 "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
-                 GIT_GUARDRAILS_ALLOWED_OWNERS is not set.",
+                 CADENCE_ALLOWED_OWNERS is not set.",
             );
         }
 

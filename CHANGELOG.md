@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-21
+
+### Changed (breaking)
+
+- Renamed all configuration env vars under a unified `CADENCE_*` prefix:
+  - `CADENCE_HOOKS_DISABLE` → `CADENCE_DISABLE`
+  - `CADENCE_HOOKS_BYPASS` → `CADENCE_BYPASS`
+  - `GIT_GUARDRAILS_ALLOWED_OWNERS` → `CADENCE_ALLOWED_OWNERS`
+  - `GIT_GUARDRAILS_ALLOWED_REPOS` → `CADENCE_ALLOWED_REPOS`
+- `OBSIDIAN_VAULT` stays unprefixed (cross-tool convention).
+
+### Added
+
+- Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is hidden from `--help` and refuses to run interactively. `configure --list` stays available. This closes a bypass route where an agent could silently disable guardrails by launching the interactive wizard.
+
+### Migration
+
+Update `.claude/settings.json` or any shell rc where you set the old vars:
+
+```diff
+- "CADENCE_HOOKS_DISABLE": "guard-push-remote"
++ "CADENCE_DISABLE": "guard-push-remote"
+- "GIT_GUARDRAILS_ALLOWED_OWNERS": "cameronsjo cameron"
++ "CADENCE_ALLOWED_OWNERS": "cameronsjo cameron"
+```
+
 ## [0.4.1] - 2026-03-16
 
 ### Added

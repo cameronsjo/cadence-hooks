@@ -5,8 +5,16 @@
 //! 0 (allow), 1 (warn), or 2 (block).
 
 use cadence_hooks_core::{HookEvent, run_check_from_stdin};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::process;
+
+/// Return true when running inside Claude Code. Detected via `CLAUDECODE=1`,
+/// which Claude Code exports for every spawned shell. Empty/unset means no.
+fn under_claude_code() -> bool {
+    std::env::var("CLAUDECODE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
 
 mod configure;
 
@@ -280,17 +288,17 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
 
 /// Prints all hooks grouped by plugin, showing disable status.
 fn print_hook_list() {
-    let disable_var = std::env::var("CADENCE_HOOKS_DISABLE").unwrap_or_default();
+    let disable_var = std::env::var("CADENCE_DISABLE").unwrap_or_default();
     let disabled: Vec<&str> = disable_var
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
 
-    let bypassed = std::env::var("CADENCE_HOOKS_BYPASS").as_deref() == Ok("1");
+    let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
 
     if bypassed {
-        println!("CADENCE_HOOKS_BYPASS=1 — all hooks bypassed\n");
+        println!("CADENCE_BYPASS=1 — all hooks bypassed\n");
     }
 
     let mut current_plugin = "";
@@ -313,20 +321,17 @@ fn print_hook_list() {
     }
 
     if !disabled.is_empty() {
-        println!(
-            "\nDisabled via CADENCE_HOOKS_DISABLE: {}",
-            disabled.join(", ")
-        );
+        println!("\nDisabled via CADENCE_DISABLE: {}", disabled.join(", "));
     }
 }
 
 fn main() {
-    // Maintenance bypass — set CADENCE_HOOKS_BYPASS=1 to skip all enforcement.
+    // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
     // Note: `list` and `configure` subcommands are exempt — they need to work always.
-    let bypassed = std::env::var("CADENCE_HOOKS_BYPASS").as_deref() == Ok("1");
+    let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
     if bypassed && !std::env::args().any(|a| a == "list" || a == "configure") {
-        eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_HOOKS_BYPASS=1)");
+        eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
     }
 
@@ -347,8 +352,22 @@ fn main() {
         process::exit(1);
     }));
 
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
+    // Build the clap Command. Under Claude Code, hide `configure` from --help
+    // so the agent can't discover it as a bypass route. The runtime check below
+    // also refuses to run it — defense in depth.
+    let mut cmd = Cli::command();
+    if under_claude_code() {
+        cmd = cmd.mut_subcommand("configure", |sc| sc.hide(true));
+    }
+
+    let cli = match cmd.try_get_matches() {
+        Ok(matches) => match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(e) => {
+                eprintln!("cadence-hooks: internal error hydrating args: {e}");
+                process::exit(1);
+            }
+        },
         Err(e) => {
             // Clap errors (unknown subcommand, missing args, etc.) must NOT block
             // operations. Exit code 2 from clap would be interpreted as "block" by
@@ -389,10 +408,10 @@ fn main() {
         }
     };
 
-    // Selective disable — skip specific hooks by name via CADENCE_HOOKS_DISABLE.
+    // Selective disable — skip specific hooks by name via CADENCE_DISABLE.
     // Comma-separated list of hook names (e.g., "git-safety,warn-main-branch").
     // Set per-project in .claude/settings.json `env` block, or ad-hoc in shell.
-    if let Ok(disabled) = std::env::var("CADENCE_HOOKS_DISABLE")
+    if let Ok(disabled) = std::env::var("CADENCE_DISABLE")
         && let Some(name) = hook_name(&cli.command)
         && disabled.split(',').any(|h| h.trim() == name)
     {
@@ -409,6 +428,19 @@ fn main() {
             process::exit(0);
         }
         Commands::Configure { list } => {
+            // Under Claude Code, refuse the interactive wizard — it edits settings.json
+            // and would let the agent silently disable guardrails. `--list` is read-only
+            // and stays available for visibility.
+            if under_claude_code() && !list {
+                eprintln!(
+                    "cadence-hooks: `configure` is disabled under Claude Code.\n\
+                     \n\
+                     This would let the agent edit .claude/settings.json and disable hooks.\n\
+                     Run it yourself from a terminal, or use `configure --list` to see\n\
+                     current state."
+                );
+                process::exit(1);
+            }
             configure::run(list, HOOKS);
         }
         Commands::Cadence(cmd) => match cmd {

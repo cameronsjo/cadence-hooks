@@ -1,4 +1,4 @@
-//! Integration tests for CADENCE_HOOKS_DISABLE selective hook disabling
+//! Integration tests for CADENCE_DISABLE selective hook disabling
 //! and the `list` subcommand.
 //!
 //! Verifies that individual hooks can be skipped via the env var, while
@@ -10,8 +10,9 @@ use std::process::Command;
 fn cadence_hooks() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     // Ensure tests don't inherit env vars from the test runner's session
-    cmd.env_remove("CADENCE_HOOKS_BYPASS");
-    cmd.env_remove("CADENCE_HOOKS_DISABLE");
+    cmd.env_remove("CADENCE_BYPASS");
+    cmd.env_remove("CADENCE_DISABLE");
+    cmd.env_remove("CLAUDECODE");
     cmd
 }
 
@@ -32,7 +33,7 @@ fn run_with_stdin(mut cmd: Command, input: &str) -> std::process::Output {
 fn disabled_hook_exits_zero() {
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "terminology"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "terminology");
+    cmd.env("CADENCE_DISABLE", "terminology");
 
     // Even without valid stdin, a disabled hook should exit 0 before reading input.
     let output = cmd.output().expect("failed to execute binary");
@@ -49,7 +50,7 @@ fn disabled_hook_exits_zero() {
 fn disabled_hook_produces_no_output() {
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "git-safety"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "git-safety");
+    cmd.env("CADENCE_DISABLE", "git-safety");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -68,10 +69,7 @@ fn disabled_hook_produces_no_output() {
 fn comma_separated_list_disables_multiple() {
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "git-safety"]);
-    cmd.env(
-        "CADENCE_HOOKS_DISABLE",
-        "terminology,git-safety,line-endings",
-    );
+    cmd.env("CADENCE_DISABLE", "terminology,git-safety,line-endings");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -86,10 +84,7 @@ fn comma_separated_list_disables_multiple() {
 fn spaces_around_commas_tolerated() {
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "git-safety"]);
-    cmd.env(
-        "CADENCE_HOOKS_DISABLE",
-        "terminology , git-safety , line-endings",
-    );
+    cmd.env("CADENCE_DISABLE", "terminology , git-safety , line-endings");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -106,7 +101,7 @@ fn non_disabled_hook_still_runs() {
 
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "terminology"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "git-safety,line-endings");
+    cmd.env("CADENCE_DISABLE", "git-safety,line-endings");
 
     let output = run_with_stdin(cmd, input);
 
@@ -124,7 +119,7 @@ fn env_var_unset_does_not_disable() {
 
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "terminology"]);
-    cmd.env_remove("CADENCE_HOOKS_DISABLE");
+    cmd.env_remove("CADENCE_DISABLE");
 
     let output = run_with_stdin(cmd, input);
 
@@ -142,7 +137,7 @@ fn empty_env_var_does_not_disable() {
 
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "terminology"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "");
+    cmd.env("CADENCE_DISABLE", "");
 
     let output = run_with_stdin(cmd, input);
 
@@ -161,7 +156,7 @@ fn partial_name_match_does_not_disable() {
     // "git" is a substring of "git-safety" but not an exact match
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "git-safety"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "git");
+    cmd.env("CADENCE_DISABLE", "git");
 
     let output = run_with_stdin(cmd, input);
 
@@ -177,7 +172,7 @@ fn partial_name_match_does_not_disable() {
 fn guardrails_hook_can_be_disabled() {
     let mut cmd = cadence_hooks();
     cmd.args(["guardrails", "warn-main-branch"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "warn-main-branch");
+    cmd.env("CADENCE_DISABLE", "warn-main-branch");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -192,7 +187,7 @@ fn guardrails_hook_can_be_disabled() {
 fn obsidian_hook_can_be_disabled() {
     let mut cmd = cadence_hooks();
     cmd.args(["obsidian", "trash-guard"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "trash-guard");
+    cmd.env("CADENCE_DISABLE", "trash-guard");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -207,7 +202,7 @@ fn obsidian_hook_can_be_disabled() {
 fn rules_hook_can_be_disabled() {
     let mut cmd = cadence_hooks();
     cmd.args(["rules", "validate-frontmatter"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "validate-frontmatter");
+    cmd.env("CADENCE_DISABLE", "validate-frontmatter");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -258,7 +253,7 @@ fn list_shows_hook_names_and_descriptions() {
 fn list_shows_disabled_status() {
     let mut cmd = cadence_hooks();
     cmd.args(["list"]);
-    cmd.env("CADENCE_HOOKS_DISABLE", "git-safety,warn-main-branch");
+    cmd.env("CADENCE_DISABLE", "git-safety,warn-main-branch");
 
     let output = cmd.output().expect("failed to execute binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -282,7 +277,7 @@ fn list_shows_disabled_status() {
 fn list_works_during_bypass() {
     let mut cmd = cadence_hooks();
     cmd.args(["list"]);
-    cmd.env("CADENCE_HOOKS_BYPASS", "1");
+    cmd.env("CADENCE_BYPASS", "1");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -294,7 +289,7 @@ fn list_works_during_bypass() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("CADENCE_HOOKS_BYPASS=1"),
+        stdout.contains("CADENCE_BYPASS=1"),
         "should show bypass status"
     );
     assert!(

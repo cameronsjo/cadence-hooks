@@ -1,7 +1,7 @@
 //! Interactive configuration wizard for per-project hook disabling.
 //!
 //! Reads/writes `.claude/settings.json` in the project root, merging the
-//! `CADENCE_HOOKS_DISABLE` env var into the existing `env` block without
+//! `CADENCE_DISABLE` env var into the existing `env` block without
 //! clobbering other settings.
 
 use crate::HookEntry;
@@ -31,7 +31,7 @@ fn find_settings_path() -> PathBuf {
     start.join(".claude/settings.json")
 }
 
-/// Read the current `CADENCE_HOOKS_DISABLE` value from settings.json.
+/// Read the current `CADENCE_DISABLE` value from settings.json.
 fn read_disabled_hooks(settings_path: &Path) -> Vec<String> {
     let content = match fs::read_to_string(settings_path) {
         Ok(c) => c,
@@ -44,7 +44,7 @@ fn read_disabled_hooks(settings_path: &Path) -> Vec<String> {
     };
 
     json.get("env")
-        .and_then(|env| env.get("CADENCE_HOOKS_DISABLE"))
+        .and_then(|env| env.get("CADENCE_DISABLE"))
         .and_then(|v| v.as_str())
         .map(|s| {
             s.split(',')
@@ -79,14 +79,14 @@ fn write_disabled_hooks(settings_path: &Path, disabled: &[String]) -> Result<(),
         .ok_or_else(|| format!("`env` in {} is not an object", settings_path.display()))?;
 
     if disabled.is_empty() {
-        env_map.remove("CADENCE_HOOKS_DISABLE");
+        env_map.remove("CADENCE_DISABLE");
         // Clean up empty env block
         if env_map.is_empty() {
             root.remove("env");
         }
     } else {
         env_map.insert(
-            "CADENCE_HOOKS_DISABLE".to_string(),
+            "CADENCE_DISABLE".to_string(),
             Value::String(disabled.join(",")),
         );
     }
@@ -187,7 +187,7 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
     match write_disabled_hooks(&settings_path, &new_disabled) {
         Ok(()) => {
             if new_disabled.is_empty() {
-                println!("\nAll hooks enabled. Removed CADENCE_HOOKS_DISABLE from settings.");
+                println!("\nAll hooks enabled. Removed CADENCE_DISABLE from settings.");
             } else {
                 println!(
                     "\nDisabled {} hook(s): {}",
