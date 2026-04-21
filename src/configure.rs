@@ -148,28 +148,17 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
 
     let currently_disabled = read_disabled_hooks(&settings_path);
 
-    // Build grouped items for the multi-select.
-    // Each item is a formatted string; we track which are pre-selected.
+    // Build items for the multi-select — only real hooks, no separators.
+    // Plugin name is prefixed to each item for visual grouping.
     let mut items: Vec<String> = Vec::new();
     let mut defaults: Vec<bool> = Vec::new();
     let mut hook_names: Vec<&str> = Vec::new();
-    let mut current_plugin = "";
 
     for hook in hooks {
-        if hook.plugin != current_plugin {
-            if !current_plugin.is_empty() {
-                // Separator between groups
-                items.push(String::new());
-                defaults.push(false);
-                hook_names.push("");
-            }
-            items.push(format!("── {} ──", hook.plugin));
-            defaults.push(false);
-            hook_names.push("");
-            current_plugin = hook.plugin;
-        }
-
-        items.push(format!("{:<28} {}", hook.name, hook.description));
+        items.push(format!(
+            "[{:<10}] {:<28} {}",
+            hook.plugin, hook.name, hook.description
+        ));
         // Pre-select hooks that are currently DISABLED (user is selecting what to disable)
         defaults.push(currently_disabled.iter().any(|d| d == hook.name));
         hook_names.push(hook.name);
@@ -190,17 +179,9 @@ pub fn run(list_only: bool, hooks: &[HookEntry]) -> ! {
         }
     };
 
-    // Map selections back to hook names (skip separator/header entries)
     let new_disabled: Vec<String> = selections
         .into_iter()
-        .filter_map(|i| {
-            let name = hook_names[i];
-            if name.is_empty() {
-                None
-            } else {
-                Some(name.to_string())
-            }
-        })
+        .map(|i| hook_names[i].to_string())
         .collect();
 
     // Write result
