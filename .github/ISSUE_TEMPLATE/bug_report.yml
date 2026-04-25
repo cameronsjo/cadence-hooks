@@ -1,0 +1,103 @@
+name: Bug report
+description: Something the binary does wrong — a hook that misfires, blocks the wrong action, or returns the wrong exit code.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. The more reproducible the report, the faster the fix.
+
+        Sensitive paths, hostnames, and emails should be redacted before posting.
+
+  - type: input
+    id: version
+    attributes:
+      label: cadence-hooks version
+      description: Output of `cadence-hooks --version`. If installed via Homebrew, also note the formula tap (e.g., `cadence-hooks-beta`).
+      placeholder: "cadence-hooks 0.5.0 (homebrew: cadence-hooks-beta)"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      description: macOS / Linux / WSL plus version (e.g., `macOS 15.2 (Darwin 25.2.0)`).
+      placeholder: "macOS 15.2 (Darwin 25.2.0)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: subcommand
+    attributes:
+      label: Subcommand / hook
+      description: Which hook is misbehaving? Pick the closest plugin namespace.
+      options:
+        - cadence (terminology, orphaned-todos, prevent-secret-leaks, prevent-secret-writes, memory-guard, git-safety, line-endings, env-vars, warn-untracked, markdown-lint)
+        - guardrails (guard-push-remote, guard-gh-write, guard-gh-dangerous, guard-git-init, warn-main-branch, check-idle-return)
+        - rules (validate-frontmatter, security-patterns)
+        - obsidian (trash-guard)
+        - configure / version / other
+    validations:
+      required: true
+
+  - type: input
+    id: hook
+    attributes:
+      label: Specific hook name
+      description: The exact subcommand name (e.g., `guard-push-remote`).
+      placeholder: "guard-push-remote"
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment snapshot
+      description: Relevant `CADENCE_*` env vars and any plugin-specific config from `~/.claude/settings.json`. Redact tokens, paths, and personal info.
+      render: shell
+      placeholder: |
+        CADENCE_ALLOWED_OWNERS="cameronsjo cameron"
+        CADENCE_DISABLE=""
+        CADENCE_BYPASS=""
+    validations:
+      required: false
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal steps to reproduce. A console transcript is ideal — include the command and the full hook output.
+      render: shell
+      placeholder: |
+        $ git push origin main
+        🚫 git-guardrails: Push target is not yours
+           Would push to: ...
+           Allowed:       ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: Push proceeds because the path owner matches the allow-list.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: Push is blocked even though the URL path owner is in the allow-list.
+    validations:
+      required: true
+
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis or notes
+      description: Any guesses about root cause, related code paths, or workarounds you found. Optional.
+      placeholder: Owner-match logic seems to special-case `github.com`...
+    validations:
+      required: false

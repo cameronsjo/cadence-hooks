@@ -175,6 +175,12 @@ make install       # Install to ~/.cargo/bin
 
 Requires Rust 2024 edition (1.85+).
 
+## Reporting issues
+
+Bug reports and feature requests for the binary belong here: [Issues](https://github.com/cameronsjo/cadence-hooks/issues/new/choose).
+
+Two templates are available — Bug report (capture version, OS, subcommand, env, and repro) and Feature request. Issues about plugin distribution, marketplace metadata, or `hooks.json` wiring belong in [claude-configurations](https://github.com/cameronsjo/claude-configurations/issues) instead.
+
 ## License
 
 [BSL-1.1](LICENSE) — free for personal, non-commercial use. Converts to MIT after four years.
