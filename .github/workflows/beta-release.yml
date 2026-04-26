@@ -7,6 +7,14 @@ on:
 permissions:
   contents: write
 
+# Serialize beta releases. When multiple commits land in quick succession,
+# we only want a beta for the latest main — earlier in-flight runs get
+# cancelled. Without this, parallel runs read the same tag state, all
+# compute the same NEXT_NUM, and all but one collide on `gh release create`.
+concurrency:
+  group: beta-release
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
