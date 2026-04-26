@@ -183,7 +183,7 @@ Requires Rust 2024 edition (1.85+).
 
 Bug reports and feature requests for the binary belong here: [Issues](https://github.com/cameronsjo/cadence-hooks/issues/new/choose).
 
-Two templates are available — Bug report (capture version, OS, subcommand, env, and repro) and Feature request. Issues about plugin distribution, marketplace metadata, or `hooks.json` wiring belong in [claude-configurations](https://github.com/cameronsjo/claude-configurations/issues) instead.
+Two templates are available — Bug report (capture version, OS, plugin namespace, hook name, env, and repro) and Feature request. Issues about plugin distribution, marketplace metadata, or `hooks.json` wiring belong in [claude-configurations](https://github.com/cameronsjo/claude-configurations/issues) instead.
 
 ## License
 

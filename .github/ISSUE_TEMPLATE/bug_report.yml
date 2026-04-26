@@ -45,7 +45,7 @@ body:
     id: hook
     attributes:
       label: Specific hook name
-      description: The exact subcommand name. Run `cadence-hooks <namespace> --help` to list available hooks.
+      description: The exact subcommand name. For a namespace, run `cadence-hooks <namespace> --help` to list its hooks. For top-level options, see `cadence-hooks --help`.
       placeholder: "guard-push-remote"
     validations:
       required: true
