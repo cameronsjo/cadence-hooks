@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/cameronsjo/cadence-hooks#readme
+    about: Hook reference, environment variables, and architecture overview.
+  - name: Plugin distribution issues
+    url: https://github.com/cameronsjo/claude-configurations/issues
+    about: Marketplace, plugin metadata, or hooks.json wiring (not binary behavior).
