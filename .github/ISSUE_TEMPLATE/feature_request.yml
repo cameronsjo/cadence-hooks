@@ -1,0 +1,71 @@
+name: Feature request
+description: Suggest a new hook, a new flag on an existing hook, or a behavior change.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please describe the use case before the implementation — it makes the trade-offs easier to discuss.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: Which surface does this touch?
+      options:
+        - New hook (cadence)
+        - New hook (guardrails)
+        - New hook (rules)
+        - New hook (obsidian)
+        - Change to existing hook
+        - CLI / configure / packaging
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: hook
+    attributes:
+      label: Affected hook(s)
+      description: If this changes existing behavior, which subcommand?
+      placeholder: "guardrails warn-main-branch"
+    validations:
+      required: false
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: What are you trying to do, and what currently gets in the way?
+      placeholder: |
+        During session wrap-up I often work directly on main for small config edits...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How should it work? Be concrete about the user-facing behavior — flags, env vars, exit codes, hook output.
+      placeholder: |
+        Add `dismiss-main-branch-warn --for 30m` that writes a marker file...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed. Helps narrow the design space.
+      placeholder: |
+        Option A — env var timeout: simpler but no per-repo scope...
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Related issues, prior art in other tools, links to discussion. Optional.
+    validations:
+      required: false
