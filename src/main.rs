@@ -100,6 +100,12 @@ enum GuardrailsCommands {
     NudgeUpgradeAfterPush,
     /// Warn about untracked files during git commit operations
     WarnUntracked,
+    /// Snooze warn-main-branch for this repo for the given duration
+    DismissMainBranchWarn {
+        /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
+        #[arg(long = "for", default_value = "30m", value_name = "DURATION")]
+        for_: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -274,6 +280,11 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
             GuardrailsCommands::WarnUntracked => "warn-untracked",
+            // dismiss-main-branch-warn is a CLI action, not a hook —
+            // it has no PreToolUse/PostToolUse wiring and isn't subject
+            // to CADENCE_DISABLE. Falling out of the Some(...) here is
+            // intentional; handle it specially below.
+            GuardrailsCommands::DismissMainBranchWarn { .. } => return None,
         }),
         Commands::Rules(r) => Some(match r {
             RulesCommands::ValidateFrontmatter => "validate-frontmatter",
@@ -520,6 +531,9 @@ fn main() {
                 &cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles,
                 pre,
             ),
+            GuardrailsCommands::DismissMainBranchWarn { for_ } => {
+                cadence_hooks_guardrails::dismiss_main_branch_warn::run_dismiss(&for_);
+            }
         },
         Commands::Rules(cmd) => match cmd {
             RulesCommands::ValidateFrontmatter => run_check_from_stdin(

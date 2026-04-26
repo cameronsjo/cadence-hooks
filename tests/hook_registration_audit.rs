@@ -91,6 +91,13 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     "cadence warn-docs-update",      // catches gh pr create
 ];
 
+/// Binary subcommands that are user-facing CLI actions, not hooks. They have
+/// no PreToolUse/PostToolUse wiring and should not appear in any hooks.json.
+const NON_HOOK_BINARY_SUBCOMMANDS: &[&str] = &[
+    // Per-repo snooze writer for warn-main-branch — invoked by hand, not by Claude Code.
+    "guardrails dismiss-main-branch-warn",
+];
+
 /// Plugin name -> list of `<plugin> <subcommand>` strings referenced in its hooks.json.
 fn hooks_json_references() -> BTreeMap<String, Vec<HookRef>> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -304,6 +311,7 @@ fn all_binary_subcommands_are_registered() {
             let group = cmd.split_whitespace().next().unwrap_or("");
             !shell_plugin_groups.contains(group)
         })
+        .filter(|cmd| !NON_HOOK_BINARY_SUBCOMMANDS.contains(&cmd.as_str()))
         .collect();
 
     assert!(
