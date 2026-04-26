@@ -139,7 +139,8 @@ pub fn is_allowed(
 /// match any host in `extra_hosts` in addition to [`default_host`].
 ///
 /// Host-qualified entries (`gitea.internal/cameron`) are unaffected — they
-/// continue to match only their declared host.
+/// continue to match only their declared host. `extra_hosts` is normalized
+/// to lowercase internally, so callers may pass mixed-case values safely.
 pub fn is_allowed_with_extra_hosts(
     host: &str,
     owner: &str,
@@ -152,11 +153,12 @@ pub fn is_allowed_with_extra_hosts(
     let host_lower = host.to_lowercase();
     let owner_lower = owner.to_lowercase();
     let repo_lower = repo.to_lowercase();
+    let extra_hosts_lower: Vec<String> = extra_hosts.iter().map(|h| h.to_lowercase()).collect();
 
     let host_matches_bare_entry = |entry_host: Option<&str>| -> bool {
         match entry_host {
             Some(h) => h == host_lower,
-            None => host_lower == default || extra_hosts.iter().any(|h| h == &host_lower),
+            None => host_lower == default || extra_hosts_lower.iter().any(|h| h == &host_lower),
         }
     };
 
@@ -566,6 +568,22 @@ mod tests {
         let extras = vec!["git.sjo.lol".to_string()];
         assert!(!is_allowed_with_extra_hosts(
             "evil.example",
+            "cameron",
+            "repo",
+            &owners,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn extra_hosts_case_insensitive() {
+        // The function must tolerate mixed-case extra_hosts values from
+        // callers that don't go through env_extra_hosts() for normalization.
+        let owners = parse_allow_entries("cameron");
+        let extras = vec!["Git.SJO.Lol".to_string()];
+        assert!(is_allowed_with_extra_hosts(
+            "git.sjo.lol",
             "cameron",
             "repo",
             &owners,
