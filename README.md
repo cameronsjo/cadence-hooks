@@ -22,7 +22,7 @@ Hooks are organized by the plugin they serve:
 | `git-safety` | PreToolUse (Bash) | Block force-push to main, reset --hard, etc. |
 | `line-endings` | PreToolUse (Write) | Validate shell script line endings (LF, not CRLF) |
 | `env-vars` | PreToolUse (Write, Edit) | Warn on generic env var names (DEBUG, PORT) |
-| `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
+| `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
 
 ### guardrails (git-guardrails)
@@ -34,7 +34,11 @@ Hooks are organized by the plugin they serve:
 | `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) |
 | `guard-git-init` | PreToolUse (Bash) | Nudge to scaffold after git init |
 | `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch |
+| `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base |
+| `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs |
+| `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
 | `check-idle-return` | PreToolUse | Nudge after idle periods between edits |
+| `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main |
 
 ### rules
 
@@ -145,7 +149,7 @@ Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is h
 cadence-hooks (binary)
 ├── crates/core        — Hook protocol: JSON parsing, Check trait, exit codes
 ├── crates/cadence     — Cadence plugin hooks (10 checks)
-├── crates/guardrails  — Git guardrails hooks (6 checks)
+├── crates/guardrails  — Git guardrails hooks (10 checks)
 ├── crates/rules       — Rules plugin hooks (2 checks)
 ├── crates/obsidian    — Obsidian plugin hooks (1 check)
 └── src/main.rs        — CLI: routes subcommands to checks

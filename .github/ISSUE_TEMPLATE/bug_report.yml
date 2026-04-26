@@ -28,15 +28,15 @@ body:
       required: true
 
   - type: dropdown
-    id: subcommand
+    id: namespace
     attributes:
-      label: Subcommand / hook
-      description: Which hook is misbehaving? Pick the closest plugin namespace.
+      label: Plugin namespace
+      description: Which plugin family does the misbehaving hook belong to?
       options:
-        - cadence (terminology, orphaned-todos, prevent-secret-leaks, prevent-secret-writes, memory-guard, git-safety, line-endings, env-vars, warn-untracked, markdown-lint)
-        - guardrails (guard-push-remote, guard-gh-write, guard-gh-dangerous, guard-git-init, warn-main-branch, check-idle-return)
-        - rules (validate-frontmatter, security-patterns)
-        - obsidian (trash-guard)
+        - cadence
+        - guardrails
+        - rules
+        - obsidian
         - configure / version / other
     validations:
       required: true
@@ -45,7 +45,7 @@ body:
     id: hook
     attributes:
       label: Specific hook name
-      description: The exact subcommand name (e.g., `guard-push-remote`).
+      description: The exact subcommand name. Run `cadence-hooks <namespace> --help` to list available hooks.
       placeholder: "guard-push-remote"
     validations:
       required: true
