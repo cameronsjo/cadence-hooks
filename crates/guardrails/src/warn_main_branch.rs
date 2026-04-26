@@ -1,8 +1,12 @@
 //! Warn when editing on the main branch without a feature branch.
 //!
 //! Fires once per session (tracked via a temp-file marker) to nudge the
-//! user toward creating a feature branch before making changes.
+//! user toward creating a feature branch before making changes. Users who
+//! intentionally work on main can silence the warning per-repo with
+//! `cadence-hooks guardrails dismiss-main-branch-warn --for <duration>` —
+//! see [`crate::dismiss_main_branch_warn`].
 
+use crate::dismiss_main_branch_warn;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -16,19 +20,21 @@ fn is_default_branch(branch: &str) -> bool {
 
 /// Pure decision: should we warn about editing on this branch?
 ///
-/// Returns `Warn` if on a default branch and not already warned this session.
-fn should_warn(branch: &str, already_warned: bool) -> CheckResult {
+/// Returns `Nudge` if on a default branch, not already warned this session,
+/// and not currently snoozed via `dismiss-main-branch-warn`.
+fn should_warn(branch: &str, already_warned: bool, snoozed: bool) -> CheckResult {
     if !is_default_branch(branch) {
         return CheckResult::allow();
     }
 
-    if already_warned {
+    if snoozed || already_warned {
         return CheckResult::allow();
     }
 
     CheckResult::nudge(format!(
         "You're editing files directly on '{branch}'. \
-         Ask the user: should this work be on a feature branch instead?"
+         Ask the user: should this work be on a feature branch instead?\n\
+         To silence for this repo: cadence-hooks guardrails dismiss-main-branch-warn --for 30m"
     ))
 }
 
@@ -79,8 +85,9 @@ impl Check for WarnMainBranch {
         };
 
         let already_warned = Self::marker_path().as_ref().is_some_and(|p| p.exists());
+        let snoozed = dismiss_main_branch_warn::is_snoozed_now();
 
-        let result = should_warn(&branch, already_warned);
+        let result = should_warn(&branch, already_warned, snoozed);
 
         // Create marker on warn to suppress future warnings this session
         if result.outcome == Outcome::Nudge
@@ -99,7 +106,7 @@ mod tests {
 
     #[test]
     fn main_branch_warns() {
-        let result = should_warn("main", false);
+        let result = should_warn("main", false, false);
         assert_eq!(result.outcome, Outcome::Nudge);
         assert!(
             result
@@ -112,7 +119,7 @@ mod tests {
 
     #[test]
     fn master_branch_warns() {
-        let result = should_warn("master", false);
+        let result = should_warn("master", false, false);
         assert_eq!(result.outcome, Outcome::Nudge);
         assert!(
             result
@@ -125,31 +132,31 @@ mod tests {
 
     #[test]
     fn feature_branch_allows() {
-        let result = should_warn("feat/new-feature", false);
+        let result = should_warn("feat/new-feature", false, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
     fn develop_branch_allows() {
-        let result = should_warn("develop", false);
+        let result = should_warn("develop", false, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
     fn already_warned_allows() {
-        let result = should_warn("main", true);
+        let result = should_warn("main", true, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
     fn already_warned_master_allows() {
-        let result = should_warn("master", true);
+        let result = should_warn("master", true, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
     fn empty_branch_allows() {
-        let result = should_warn("", false);
+        let result = should_warn("", false, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
@@ -178,13 +185,13 @@ mod tests {
 
     #[test]
     fn release_branch_allows() {
-        let result = should_warn("release/1.0", false);
+        let result = should_warn("release/1.0", false, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
     fn warn_message_contains_branch() {
-        let result = should_warn("master", false);
+        let result = should_warn("master", false, false);
         assert!(
             result
                 .message
@@ -215,7 +222,42 @@ mod tests {
     #[test]
     fn main_with_prefix_allows() {
         // "fix/main-page" is not the main branch
-        let result = should_warn("fix/main-page", false);
+        let result = should_warn("fix/main-page", false, false);
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    // --- snooze (issue #16) ---
+
+    #[test]
+    fn snoozed_main_allows() {
+        // Active snooze suppresses the nudge even on a fresh session.
+        let result = should_warn("main", false, true);
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn snoozed_master_allows() {
+        let result = should_warn("master", false, true);
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn snoozed_takes_precedence_over_already_warned() {
+        // Both flags set is still allow — order doesn't matter.
+        let result = should_warn("main", true, true);
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn warn_message_mentions_dismiss_command() {
+        let result = should_warn("main", false, false);
+        let msg = result
+            .message
+            .as_deref()
+            .expect("nudge should have a message");
+        assert!(
+            msg.contains("dismiss-main-branch-warn"),
+            "warn message should hint at the dismiss command: {msg}"
+        );
     }
 }
