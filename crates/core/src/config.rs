@@ -55,6 +55,21 @@ pub fn default_host() -> String {
         .to_lowercase()
 }
 
+/// Read `CADENCE_EXTRA_HOSTS` env var as a list of additional hosts that bare
+/// allowlist entries (e.g., `cameron` rather than `git.sjo.lol/cameron`) should
+/// match in addition to [`default_host`].
+///
+/// Use this for self-hosted forges where you reuse the same username across
+/// hosts you control (Gitea, Forgejo, GitLab CE, Bitbucket Server). It does
+/// not widen host-qualified entries — `git.sjo.lol/cameron` still matches
+/// only that host.
+pub fn env_extra_hosts() -> Vec<String> {
+    env_list("CADENCE_EXTRA_HOSTS")
+        .into_iter()
+        .map(|h| h.to_lowercase())
+        .collect()
+}
+
 /// Parse a single allowlist entry string into an [`AllowEntry`].
 pub fn parse_allow_entry(entry: &str) -> AllowEntry {
     let parts: Vec<&str> = entry.splitn(3, '/').collect();
@@ -106,7 +121,10 @@ pub fn env_allow_entries(var: &str) -> Vec<AllowEntry> {
 }
 
 /// Check if a `(host, owner, repo)` triple is allowed by either the owner
-/// or repo allowlists. Bare entries (no host) match against `default_host`.
+/// or repo allowlists. Bare entries (no host) match against [`default_host`].
+///
+/// Use [`is_allowed_with_extra_hosts`] when you need bare entries to also
+/// match self-hosted forges (Gitea, Forgejo, GitLab CE, Bitbucket Server).
 pub fn is_allowed(
     host: &str,
     owner: &str,
@@ -114,15 +132,39 @@ pub fn is_allowed(
     owner_entries: &[AllowEntry],
     repo_entries: &[AllowEntry],
 ) -> bool {
+    is_allowed_with_extra_hosts(host, owner, repo, owner_entries, repo_entries, &[])
+}
+
+/// Like [`is_allowed`], but bare allowlist entries (e.g., `cameron`) also
+/// match any host in `extra_hosts` in addition to [`default_host`].
+///
+/// Host-qualified entries (`gitea.internal/cameron`) are unaffected — they
+/// continue to match only their declared host. `extra_hosts` is normalized
+/// to lowercase internally, so callers may pass mixed-case values safely.
+pub fn is_allowed_with_extra_hosts(
+    host: &str,
+    owner: &str,
+    repo: &str,
+    owner_entries: &[AllowEntry],
+    repo_entries: &[AllowEntry],
+    extra_hosts: &[String],
+) -> bool {
     let default = default_host();
     let host_lower = host.to_lowercase();
     let owner_lower = owner.to_lowercase();
     let repo_lower = repo.to_lowercase();
+    let extra_hosts_lower: Vec<String> = extra_hosts.iter().map(|h| h.to_lowercase()).collect();
+
+    let host_matches_bare_entry = |entry_host: Option<&str>| -> bool {
+        match entry_host {
+            Some(h) => h == host_lower,
+            None => host_lower == default || extra_hosts_lower.iter().any(|h| h == &host_lower),
+        }
+    };
 
     // Check repo entries first (more specific)
     for entry in repo_entries {
-        let entry_host = entry.host.as_deref().unwrap_or(&default);
-        if entry_host == host_lower
+        if host_matches_bare_entry(entry.host.as_deref())
             && entry.owner == owner_lower
             && entry.repo.as_deref() == Some(repo_lower.as_str())
         {
@@ -132,8 +174,7 @@ pub fn is_allowed(
 
     // Check owner entries
     for entry in owner_entries {
-        let entry_host = entry.host.as_deref().unwrap_or(&default);
-        if entry_host == host_lower && entry.owner == owner_lower {
+        if host_matches_bare_entry(entry.host.as_deref()) && entry.owner == owner_lower {
             // If entry has a repo constraint, it must match
             if let Some(entry_repo) = &entry.repo
                 && *entry_repo != repo_lower
@@ -452,6 +493,117 @@ mod tests {
             "shared-repo",
             &[],
             &repos
+        ));
+    }
+
+    // --- is_allowed_with_extra_hosts ---
+
+    #[test]
+    fn extra_hosts_matches_bare_owner_on_self_hosted_forge() {
+        // Repro for cadence-hooks#15: bare `cameron` should match git.sjo.lol
+        // when that host is in CADENCE_EXTRA_HOSTS.
+        let owners = parse_allow_entries("cameron");
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(is_allowed_with_extra_hosts(
+            "git.sjo.lol",
+            "cameron",
+            "runelite-plugins",
+            &owners,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn extra_hosts_does_not_widen_qualified_entries() {
+        // Host-qualified entries stay scoped to their declared host even when
+        // extra_hosts is populated. Otherwise a `github.com/cameron` entry
+        // could leak into self-hosted matching, defeating the safety property.
+        let owners = parse_allow_entries("github.com/cameron");
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(!is_allowed_with_extra_hosts(
+            "git.sjo.lol",
+            "cameron",
+            "repo",
+            &owners,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn extra_hosts_preserves_default_host_match() {
+        // Bare entries continue to match default_host even with extras present.
+        let owners = parse_allow_entries("cameron");
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(is_allowed_with_extra_hosts(
+            "github.com",
+            "cameron",
+            "repo",
+            &owners,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn empty_extra_hosts_preserves_old_safety_property() {
+        // Regression guard for `owner_check_host_mismatch_blocked` semantics:
+        // with no extras, bare owner must NOT match a non-default host.
+        let owners = parse_allow_entries("cameron");
+        assert!(!is_allowed_with_extra_hosts(
+            "git.sjo.lol",
+            "cameron",
+            "repo",
+            &owners,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn extra_hosts_does_not_match_unlisted_host() {
+        // Only hosts in extra_hosts unlock; others stay blocked.
+        let owners = parse_allow_entries("cameron");
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(!is_allowed_with_extra_hosts(
+            "evil.example",
+            "cameron",
+            "repo",
+            &owners,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn extra_hosts_case_insensitive() {
+        // The function must tolerate mixed-case extra_hosts values from
+        // callers that don't go through env_extra_hosts() for normalization.
+        let owners = parse_allow_entries("cameron");
+        let extras = vec!["Git.SJO.Lol".to_string()];
+        assert!(is_allowed_with_extra_hosts(
+            "git.sjo.lol",
+            "cameron",
+            "repo",
+            &owners,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn extra_hosts_with_bare_repo_entry() {
+        // Bare owner/repo entries (`external/shared-repo`) also widen to extras.
+        let repos = parse_allow_entries("cameron/runelite-plugins");
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(is_allowed_with_extra_hosts(
+            "git.sjo.lol",
+            "cameron",
+            "runelite-plugins",
+            &[],
+            &repos,
+            &extras,
         ));
     }
 
