@@ -135,7 +135,24 @@ All cadence-hooks config lives under the `CADENCE_*` prefix. `OBSIDIAN_VAULT` is
 | `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass) |
 | `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space or comma-separated usernames |
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space or comma-separated `owner/repo` pairs |
+| `CADENCE_EXTRA_HOSTS` | `guard-push-remote` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host |
 | `OBSIDIAN_VAULT` | `trash-guard` | Absolute path to Obsidian vault |
+
+#### Allowlist host scoping
+
+Bare entries in `CADENCE_ALLOWED_OWNERS` and `CADENCE_ALLOWED_REPOS` match only the default host (`github.com`, or `GH_HOST` if set). For self-hosted forges (Gitea, Forgejo, GitLab CE, Bitbucket Server), use one of:
+
+- **Host-qualified entries** — `git.sjo.lol/cameron` matches only that host
+- **`CADENCE_EXTRA_HOSTS`** — opt additional hosts into the bare-entry flow when you reuse the same username across forges you control
+
+```bash
+# Match `cameron` on github.com AND git.sjo.lol
+export CADENCE_ALLOWED_OWNERS="cameron"
+export CADENCE_EXTRA_HOSTS="git.sjo.lol"
+
+# Or scope the entry explicitly without widening
+export CADENCE_ALLOWED_OWNERS="cameron git.sjo.lol/cameron"
+```
 
 Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is hidden from `--help` and refuses to run interactively. `configure --list` remains available. Run `configure` from a real terminal to change hook state.
 
