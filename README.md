@@ -139,6 +139,20 @@ All cadence-hooks config lives under the `CADENCE_*` prefix. `OBSIDIAN_VAULT` is
 
 Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is hidden from `--help` and refuses to run interactively. `configure --list` remains available. Run `configure` from a real terminal to change hook state.
 
+### Snoozing warn-main-branch
+
+`warn-main-branch` fires once per session — but during quick wrap-up edits on a repo that's intentionally on `main`, even one nudge per session is noise. Silence it for a time-bound window per-repo:
+
+```bash
+# Default: 30 minutes
+cadence-hooks guardrails dismiss-main-branch-warn
+
+# Explicit duration: 2h, 1d, 45s, etc. Capped at 24h.
+cadence-hooks guardrails dismiss-main-branch-warn --for 2h
+```
+
+The snooze marker lives at `<repo>/.git/cadence-hooks/main-branch-snoozed-until`, so it's per-repo and ignored by default (`.git/` is never committed). The hook's own warn output also points at the command, so it's discoverable when the warning fires.
+
 ## Architecture
 
 ```
