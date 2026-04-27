@@ -12,6 +12,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Serialize runs. Each tag is a unique artifact (different version,
+# different release, different homebrew dispatch) so cancel-in-progress
+# is false — we queue rather than drop work.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build ${{ matrix.name }}
