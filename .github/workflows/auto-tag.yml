@@ -8,6 +8,13 @@ on:
 permissions:
   contents: write
 
+# Serialize runs. Each run produces a unique artifact (a distinct git tag,
+# release, or formula update) so cancel-in-progress is false — we want
+# both to land in order, not lose the second to a cancellation.
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
 jobs:
   tag:
     name: Tag version bump
