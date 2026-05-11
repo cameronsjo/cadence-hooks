@@ -15,8 +15,27 @@ use crate::dismiss_main_branch_warn;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Resolve the directory to pass to `git -C` for a given hook input.
+///
+/// When the hook fires for an Edit/Write, returns the parent directory of
+/// the edited file. `git -C <dir>` walks upward to find `.git`, so this
+/// routes branch detection to the file's enclosing repo — even when CWD
+/// belongs to an outer parent repo (the nested-repo case).
+///
+/// For Bash hooks (no file path), falls back to `.` (CWD).
+fn git_dir_for_input(input: &HookInput) -> PathBuf {
+    let Some(file_path) = input.file_path() else {
+        return PathBuf::from(".");
+    };
+    Path::new(&file_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
 /// Returns true if the branch name is a default branch (`main` or `master`).
 fn is_default_branch(branch: &str) -> bool {
@@ -35,22 +54,17 @@ fn is_main_allowed() -> bool {
 
 /// Pure: classify a `CADENCE_ALLOW_MAIN` value as truthy or falsy.
 fn is_main_allowed_value(value: Option<&str>) -> bool {
-    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("1" | "true" | "yes") => true,
-        _ => false,
-    }
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes")
+    )
 }
 
 /// Pure decision: should we warn about editing on this branch?
 ///
 /// Returns `Nudge` if on a default branch, not already warned this session,
 /// not currently snoozed, and not permanently allowed via env var.
-fn should_warn(
-    branch: &str,
-    already_warned: bool,
-    snoozed: bool,
-    allowed: bool,
-) -> CheckResult {
+fn should_warn(branch: &str, already_warned: bool, snoozed: bool, allowed: bool) -> CheckResult {
     if !is_default_branch(branch) {
         return CheckResult::allow();
     }
@@ -71,28 +85,23 @@ fn should_warn(
 pub struct WarnMainBranch;
 
 impl WarnMainBranch {
-    fn marker_path() -> Option<PathBuf> {
-        let repo_root = Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
-
+    /// Build the per-session marker path scoped to a specific repo root.
+    ///
+    /// Hashes the repo root so two repos with the same name don't share
+    /// markers. The PPID component ties the marker to the Claude Code
+    /// session — hooks run as separate child processes so `process::id()`
+    /// would change every invocation.
+    fn marker_path(repo_root: &str) -> PathBuf {
         let mut hasher = DefaultHasher::new();
         repo_root.hash(&mut hasher);
         let hash = hasher.finish();
 
-        // Use parent PID for session scoping — hooks are spawned as child processes,
-        // so process::id() changes on every invocation. PPID is the Claude Code process.
         let ppid = std::env::var("PPID")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or_else(std::process::id);
 
-        Some(PathBuf::from(format!(
-            "/tmp/.claude-main-branch-warned-{hash:x}-{ppid}"
-        )))
+        PathBuf::from(format!("/tmp/.claude-main-branch-warned-{hash:x}-{ppid}"))
     }
 }
 
@@ -101,10 +110,16 @@ impl Check for WarnMainBranch {
         "warn-main-branch"
     }
 
-    fn run(&self, _input: &HookInput) -> CheckResult {
-        // Get current branch
+    fn run(&self, input: &HookInput) -> CheckResult {
+        let dir = git_dir_for_input(input);
+        let dir_arg = dir.to_string_lossy();
+
+        // Branch detection scoped to the edited file's repo, not CWD's repo.
+        // `git -C` walks upward to find `.git`, picking the nearest enclosing
+        // repository — which is what we want when editing inside a nested
+        // checkout from a session whose CWD is the outer parent.
         let branch = match Command::new("git")
-            .args(["symbolic-ref", "--short", "HEAD"])
+            .args(["-C", &dir_arg, "symbolic-ref", "--short", "HEAD"])
             .output()
         {
             Ok(out) if out.status.success() => {
@@ -113,16 +128,26 @@ impl Check for WarnMainBranch {
             _ => return CheckResult::allow(),
         };
 
-        let already_warned = Self::marker_path().as_ref().is_some_and(|p| p.exists());
+        // Repo root for marker — same source as the branch query so the
+        // once-per-session suppression actually keys off the same repo.
+        let repo_root = match Command::new("git")
+            .args(["-C", &dir_arg, "rev-parse", "--show-toplevel"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            _ => return CheckResult::allow(),
+        };
+
+        let marker = Self::marker_path(&repo_root);
+        let already_warned = marker.exists();
         let snoozed = dismiss_main_branch_warn::is_snoozed_now();
         let allowed = is_main_allowed();
 
         let result = should_warn(&branch, already_warned, snoozed, allowed);
 
-        // Create marker on warn to suppress future warnings this session
-        if result.outcome == Outcome::Nudge
-            && let Some(marker) = Self::marker_path()
-        {
+        if result.outcome == Outcome::Nudge {
             let _ = std::fs::write(&marker, "");
         }
 
@@ -247,6 +272,93 @@ mod tests {
                 "PID should differ from PPID — marker_path() should use PPID for session scoping"
             );
         }
+    }
+
+    // --- Regression: nested-repo branch resolution (issue #26) ---
+    // When CWD is an outer repo and the edited file is in a nested inner repo,
+    // branch resolution must follow the file path, not CWD. Using `git -C
+    // <file_parent>` lets git walk upward to find the nearest .git.
+
+    fn make_edit_input(file_path: Option<&str>) -> HookInput {
+        HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: file_path.map(Into::into),
+                path: None,
+                command: None,
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn git_dir_uses_file_parent_for_nested_path() {
+        let input = make_edit_input(Some("/tmp/outer/inner/file.txt"));
+        assert_eq!(
+            git_dir_for_input(&input),
+            PathBuf::from("/tmp/outer/inner"),
+            "git -C target should be the directory containing the edited file"
+        );
+    }
+
+    #[test]
+    fn git_dir_falls_back_to_cwd_for_bash() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: None,
+                path: None,
+                command: Some("git status".into()),
+                content: None,
+                new_string: None,
+                old_string: None,
+            }),
+            cwd: None,
+        };
+        assert_eq!(
+            git_dir_for_input(&input),
+            PathBuf::from("."),
+            "Bash hooks have no file path; should fall back to CWD"
+        );
+    }
+
+    #[test]
+    fn git_dir_falls_back_for_bare_filename() {
+        // Path with no parent (or empty parent) should fall back to CWD
+        // rather than passing an empty string to `git -C`.
+        let input = make_edit_input(Some("file.txt"));
+        assert_eq!(git_dir_for_input(&input), PathBuf::from("."));
+    }
+
+    #[test]
+    fn git_dir_handles_no_tool_input() {
+        let input = HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: None,
+            cwd: None,
+        };
+        assert_eq!(git_dir_for_input(&input), PathBuf::from("."));
+    }
+
+    #[test]
+    fn marker_path_differs_per_repo() {
+        // Two different repo roots should produce distinct marker paths
+        // so a snooze in one repo doesn't suppress warnings in another.
+        let a = WarnMainBranch::marker_path("/tmp/repo-a");
+        let b = WarnMainBranch::marker_path("/tmp/repo-b");
+        assert_ne!(a, b, "marker path must include a repo-specific hash");
+    }
+
+    #[test]
+    fn marker_path_stable_for_same_repo() {
+        // Same repo root, called twice in the same process, should produce
+        // the same marker path so suppression works.
+        let a = WarnMainBranch::marker_path("/tmp/repo");
+        let b = WarnMainBranch::marker_path("/tmp/repo");
+        assert_eq!(a, b);
     }
 
     #[test]
