@@ -410,9 +410,15 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
     }
 
     // Check if settings.json shell scripts overlap with binary subcommands by name.
-    // e.g., "nudge-untracked-on-commit.sh" overlaps with "warn-untracked"
-    // This is a fuzzy check — flag any shell script whose filename contains a keyword
-    // that also appears in a plugin-registered command.
+    // e.g., "nudge-untracked-on-commit.sh" overlaps with "warn-untracked" via the
+    // keyword `untracked`.
+    //
+    // Tokenize the filename on word boundaries and require **exact-token** matches
+    // against plugin keywords. Substring matching produced false positives where
+    // unrelated subcommands shared a stem — e.g. `block-vault-git-writes.sh`
+    // matched both `writes` (from `prevent-secret-writes`) and `write` (from
+    // `guard-gh-write`) as substrings, even though `write` is not a token in
+    // the filename.
     let plugin_keywords: BTreeSet<&str> = plugin_commands
         .iter()
         .flat_map(|cmd| {
@@ -426,9 +432,14 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
 
     for script in &shell_scripts {
         let filename = script.rsplit('/').next().unwrap_or(script).to_lowercase();
+        let filename_tokens: BTreeSet<String> = filename
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
         let matching_keywords: Vec<&&str> = plugin_keywords
             .iter()
-            .filter(|kw| filename.contains(**kw))
+            .filter(|kw| filename_tokens.contains(**kw))
             .collect();
         if matching_keywords.len() >= 2 {
             duplicates.push(format!(

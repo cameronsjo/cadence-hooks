@@ -8,6 +8,9 @@ if ! git diff --cached --name-only | grep -qE '\.rs$'; then
   exit 0
 fi
 
-# Run cargo fmt and stage any changes
+# Run cargo fmt and stage any changes.
+# `grep` returns 1 when there are no fmt-induced changes; with `pipefail` that
+# would abort the hook even though nothing went wrong. Tolerate the empty
+# pipeline so a clean commit isn't blocked.
 cargo fmt --all --quiet
-git diff --name-only | grep -E '\.rs$' | xargs -r git add
+git diff --name-only | { grep -E '\.rs$' || true; } | xargs -r git add
