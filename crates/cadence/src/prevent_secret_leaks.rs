@@ -27,51 +27,80 @@ fn is_dangerous_env_operand(operand: &str) -> bool {
     !SAFE_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
+/// Split `s` on shell chain operators (`;`, `|`, `&`) that occur outside of
+/// quoted strings. Tracks single-quote, double-quote, and backslash-escape
+/// state so a separator inside `"..."` or `'...'` does NOT split a segment.
+///
+/// Heredoc bodies are NOT handled explicitly — but the common case
+/// `"$(cat <<EOF ... EOF)"` is protected by the surrounding double quotes.
+/// Bare heredocs outside any quote are an out-of-scope edge case; if they
+/// ever become a real source of false positives, lift to a real shell
+/// tokenizer.
+fn split_chain_operators(s: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && !in_single {
+            escape = true;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if !in_single && !in_double && (b == b';' || b == b'|' || b == b'&') {
+            segments.push(&s[start..i]);
+            start = i + 1;
+        }
+    }
+    segments.push(&s[start..]);
+    segments
+}
+
 /// Check if a command token sequence appears as the first executed command
-/// of any segment when split on chain operators (`&&`, `||`, `;`, `|`).
+/// of any segment when split on chain operators (`&&`, `||`, `;`, `|`)
+/// outside quotes.
 ///
 /// `cmd` is a slice of tokens that must match in order at the start of a
 /// segment — e.g., `&["env"]` matches `env`, `env -i bash`, `cd /tmp && env`,
 /// but not `gh env`, `direnv env`, or `grep env_dump`. `&["export", "-p"]`
 /// matches `export -p` but not `export FOO=bar`.
 ///
-/// This prevents the substring-match false positives that fire on any
-/// command containing the token as a literal substring inside an
-/// argument, path, heredoc body, or compound binary name.
+/// Quote-aware splitting prevents substring/heredoc false positives like
+/// `gh issue create --body "$(cat <<EOF ... env ... EOF)"` or
+/// `git commit -m "docs: foo; env usage"`.
 fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
-    for segment in lower.split(['|', ';', '&']) {
+    for segment in split_chain_operators(lower) {
         let mut tokens = segment.split_whitespace();
         match cmd {
-            [a] => {
-                if tokens.next() == Some(a) {
-                    return true;
-                }
-            }
-            [a, b] => {
-                if tokens.next() == Some(a) && tokens.next() == Some(b) {
-                    return true;
-                }
-            }
+            [a] if tokens.next() == Some(a) => return true,
+            [a, b] if tokens.next() == Some(a) && tokens.next() == Some(b) => return true,
             _ => {}
         }
     }
     false
 }
 
-/// Check if `. ` appears in a command position (start of command or after a chain
-/// operator), not as an argument to another command like `grep . .env`.
+/// Check if `. ` appears in a command position (start of command or after a
+/// chain operator), not as an argument to another command like
+/// `grep . .env`. Quote-aware so `. ` inside a quoted string doesn't fire.
 fn is_dot_source_command(lower: &str) -> bool {
-    let trimmed = lower.trim_start();
-    if trimmed.starts_with(". ") {
-        return true;
-    }
-    // Check after chain operators: &&, ;, ||
-    for sep in &["&&", ";", "||"] {
-        for segment in lower.split(sep) {
-            let seg = segment.trim_start();
-            if seg.starts_with(". ") {
-                return true;
-            }
+    for segment in split_chain_operators(lower) {
+        if segment.trim_start().starts_with(". ") {
+            return true;
         }
     }
     false
@@ -918,5 +947,50 @@ mod tests {
     fn bash_declare_x_after_chain_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("set -a && declare -x"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    // --- quote-aware splitter false-positive guards ---
+    //
+    // Separators inside quoted strings must NOT split the segment. Otherwise
+    // a commit message, issue body, or heredoc that legitimately mentions
+    // `env` after a `;` or `|` re-fires the substring class this PR removed.
+
+    #[test]
+    fn bash_semicolon_inside_double_quotes_does_not_split() {
+        // CodeRabbit's case: `;` inside the message would naively split into
+        // a segment starting with `env`. Quote-aware splitter keeps it whole.
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "git commit -m \"docs: foo; env usage notes\"",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_pipe_inside_double_quotes_does_not_split() {
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "git commit -m \"refactor: pipe | env tokens\"",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_env_inside_heredoc_in_command_substitution_allowed() {
+        // The heredoc body is inside the outer `"$(...)"`, so quote-aware
+        // splitting protects the whole substitution from being broken up.
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "gh issue create --body \"$(cat <<EOF\nrun programs that use env vars\nEOF\n)\"",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_branch_name_ending_in_env_allowed() {
+        // cadence-hooks#22: branch names that happen to end with `-env`
+        // tripped the previous substring matcher via the trailing `&` from
+        // `2>&1` or similar.
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "git push -u origin feat/allow-main-branch-env 2>&1",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }
