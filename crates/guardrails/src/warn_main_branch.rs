@@ -25,16 +25,33 @@ use std::process::Command;
 /// routes branch detection to the file's enclosing repo — even when CWD
 /// belongs to an outer parent repo (the nested-repo case).
 ///
-/// For Bash hooks (no file path), falls back to `.` (CWD).
+/// Relative `file_path` values are joined against `input.cwd` so we resolve
+/// against the hook event's CWD, not the hook process's CWD. For Bash hooks
+/// (no file path), falls back to `input.cwd` then `.` so we still target the
+/// session's working directory rather than wherever the hook process started.
 fn git_dir_for_input(input: &HookInput) -> PathBuf {
+    let cwd = input
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
     let Some(file_path) = input.file_path() else {
-        return PathBuf::from(".");
+        return cwd;
     };
-    Path::new(&file_path)
+
+    let path = Path::new(&file_path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    resolved
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or(cwd)
 }
 
 /// Returns true if the branch name is a default branch (`main` or `master`).
@@ -142,7 +159,7 @@ impl Check for WarnMainBranch {
 
         let marker = Self::marker_path(&repo_root);
         let already_warned = marker.exists();
-        let snoozed = dismiss_main_branch_warn::is_snoozed_now();
+        let snoozed = dismiss_main_branch_warn::is_snoozed_now(Path::new(&repo_root));
         let allowed = is_main_allowed();
 
         let result = should_warn(&branch, already_warned, snoozed, allowed);
