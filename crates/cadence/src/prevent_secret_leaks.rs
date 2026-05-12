@@ -27,20 +27,80 @@ fn is_dangerous_env_operand(operand: &str) -> bool {
     !SAFE_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
-/// Check if `. ` appears in a command position (start of command or after a chain
-/// operator), not as an argument to another command like `grep . .env`.
-fn is_dot_source_command(lower: &str) -> bool {
-    let trimmed = lower.trim_start();
-    if trimmed.starts_with(". ") {
-        return true;
+/// Split `s` on shell chain operators (`;`, `|`, `&`) that occur outside of
+/// quoted strings. Tracks single-quote, double-quote, and backslash-escape
+/// state so a separator inside `"..."` or `'...'` does NOT split a segment.
+///
+/// Heredoc bodies are NOT handled explicitly — but the common case
+/// `"$(cat <<EOF ... EOF)"` is protected by the surrounding double quotes.
+/// Bare heredocs outside any quote are an out-of-scope edge case; if they
+/// ever become a real source of false positives, lift to a real shell
+/// tokenizer.
+fn split_chain_operators(s: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && !in_single {
+            escape = true;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if !in_single && !in_double && (b == b';' || b == b'|' || b == b'&') {
+            segments.push(&s[start..i]);
+            start = i + 1;
+        }
     }
-    // Check after chain operators: &&, ;, ||
-    for sep in &["&&", ";", "||"] {
-        for segment in lower.split(sep) {
-            let seg = segment.trim_start();
-            if seg.starts_with(". ") {
-                return true;
-            }
+    segments.push(&s[start..]);
+    segments
+}
+
+/// Check if a command token sequence appears as the first executed command
+/// of any segment when split on chain operators (`&&`, `||`, `;`, `|`)
+/// outside quotes.
+///
+/// `cmd` is a slice of tokens that must match in order at the start of a
+/// segment — e.g., `&["env"]` matches `env`, `env -i bash`, `cd /tmp && env`,
+/// but not `gh env`, `direnv env`, or `grep env_dump`. `&["export", "-p"]`
+/// matches `export -p` but not `export FOO=bar`.
+///
+/// Quote-aware splitting prevents substring/heredoc false positives like
+/// `gh issue create --body "$(cat <<EOF ... env ... EOF)"` or
+/// `git commit -m "docs: foo; env usage"`.
+fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
+    for segment in split_chain_operators(lower) {
+        let mut tokens = segment.split_whitespace();
+        match cmd {
+            [a] if tokens.next() == Some(a) => return true,
+            [a, b] if tokens.next() == Some(a) && tokens.next() == Some(b) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Check if `. ` appears in a command position (start of command or after a
+/// chain operator), not as an argument to another command like
+/// `grep . .env`. Quote-aware so `. ` inside a quoted string doesn't fire.
+fn is_dot_source_command(lower: &str) -> bool {
+    for segment in split_chain_operators(lower) {
+        if segment.trim_start().starts_with(". ") {
+            return true;
         }
     }
     false
@@ -91,10 +151,17 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
         }
     }
 
-    // Warn: env dump commands (match as standalone commands, not substrings)
-    let env_dumps = [" env", "env ", "printenv", "export -p", "declare -x"];
-    for dump in &env_dumps {
-        if lower.contains(dump) || lower == "env" {
+    // Warn: env dump commands. Must appear as the executed command at the
+    // start of a segment (or after a chain operator), not as a substring of
+    // an argument, path, or compound binary name like `direnv`/`envoy`/`gh env`.
+    let env_dump_commands: &[&[&str]] = &[
+        &["env"],
+        &["printenv"],
+        &["export", "-p"],
+        &["declare", "-x"],
+    ];
+    for cmd in env_dump_commands {
+        if is_executed_command(&lower, cmd) {
             return Some(CheckResult::nudge(
                 "⚠️  Command would dump environment variables, which may include secrets. \
                  Run programs that use env vars directly instead.",
@@ -777,5 +844,153 @@ mod tests {
     fn bash_dot_source_after_or_blocked() {
         let result = SecretLeaksGuard.run(&make_bash_input("test -f .env || . .env.local"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // --- Regression: env-dump heuristic must position-check, not substring-match ---
+    // The previous `" env"` / `"env "` substring patterns false-positived on any
+    // command containing `env` as a substring — `gh env list`, `direnv env`,
+    // `grep env_dump`, `find . -name 'env*'`, body files with `env` in the path,
+    // and heredoc bodies that merely mention env vars. See cadence-hooks#25.
+
+    #[test]
+    fn bash_gh_env_subcommand_allowed() {
+        // `env` is a subcommand of gh, not the executed command
+        let result = SecretLeaksGuard.run(&make_bash_input("gh env list"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_aws_vault_env_allowed() {
+        let result = SecretLeaksGuard.run(&make_bash_input("aws-vault env dev"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_direnv_env_allowed() {
+        // `direnv` shares an `env` substring but is a different binary
+        let result = SecretLeaksGuard.run(&make_bash_input("direnv env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_grep_env_substring_allowed() {
+        let result = SecretLeaksGuard.run(&make_bash_input("grep env_dump src/lib.rs"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_find_env_pattern_allowed() {
+        let result = SecretLeaksGuard.run(&make_bash_input("find . -name 'env*'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_envoy_command_allowed() {
+        let result = SecretLeaksGuard.run(&make_bash_input("envoy run --config envoy.yaml"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_body_file_with_env_in_path_allowed() {
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "gh issue create --body-file /tmp/issue-env-dump-fp.md",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_commit_message_mentioning_env_allowed() {
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "git commit -m 'docs: explain env-var handling in readme'",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_export_with_value_allowed() {
+        // `export FOO=bar` sets an env var — different from `export -p` which dumps
+        let result = SecretLeaksGuard.run(&make_bash_input("export FOO=bar"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_env_with_args_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("env -i bash"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn bash_env_in_pipeline_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("env | grep PATH"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn bash_env_after_chain_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cd /tmp && env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn bash_env_after_semicolon_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cd /tmp; env > out.sh"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn bash_export_p_in_pipeline_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("export -p | sort"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn bash_declare_x_after_chain_warned() {
+        let result = SecretLeaksGuard.run(&make_bash_input("set -a && declare -x"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    // --- quote-aware splitter false-positive guards ---
+    //
+    // Separators inside quoted strings must NOT split the segment. Otherwise
+    // a commit message, issue body, or heredoc that legitimately mentions
+    // `env` after a `;` or `|` re-fires the substring class this PR removed.
+
+    #[test]
+    fn bash_semicolon_inside_double_quotes_does_not_split() {
+        // CodeRabbit's case: `;` inside the message would naively split into
+        // a segment starting with `env`. Quote-aware splitter keeps it whole.
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "git commit -m \"docs: foo; env usage notes\"",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_pipe_inside_double_quotes_does_not_split() {
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "git commit -m \"refactor: pipe | env tokens\"",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_env_inside_heredoc_in_command_substitution_allowed() {
+        // The heredoc body is inside the outer `"$(...)"`, so quote-aware
+        // splitting protects the whole substitution from being broken up.
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "gh issue create --body \"$(cat <<EOF\nrun programs that use env vars\nEOF\n)\"",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_branch_name_ending_in_env_allowed() {
+        // cadence-hooks#22: branch names that happen to end with `-env`
+        // tripped the previous substring matcher via the trailing `&` from
+        // `2>&1` or similar.
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "git push -u origin feat/allow-main-branch-env 2>&1",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }
