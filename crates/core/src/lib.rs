@@ -175,11 +175,34 @@ pub trait Check {
 
     /// Run the check against the given input.
     fn run(&self, input: &HookInput) -> CheckResult;
+
+    /// Effort levels at which this check should short-circuit to Allow
+    /// without running. Reads `$CLAUDE_EFFORT` (set by Claude Code per
+    /// dispatch; defaults to `"medium"` when unset).
+    ///
+    /// Empty (default) means "always run". Most cadence-hooks checks are
+    /// security/correctness invariants and should run at every effort
+    /// level — opt in here only when the check is genuinely optional at
+    /// the listed levels.
+    fn skip_at_effort(&self) -> &[&str] {
+        &[]
+    }
+}
+
+/// Pure: should `run_check` short-circuit for the given effort level?
+///
+/// `current` is `$CLAUDE_EFFORT` from the hook payload; `None` is
+/// treated as `"medium"` (Claude Code's documented default).
+fn should_skip_for_effort(skip_levels: &[&str], current: Option<&str>) -> bool {
+    let effective = current.unwrap_or("medium");
+    skip_levels.contains(&effective)
 }
 
 /// Run a single check, emit output, and exit.
 ///
 /// Routing:
+/// - `skip_at_effort()` matches `$CLAUDE_EFFORT` → silent Allow (exit 0),
+///   `check.run()` is not called.
 /// - Nudge → JSON to stdout with `additionalContext` (exit 0).
 ///   Claude Code parses this and injects the message into Claude's context.
 ///   The JSON format differs by event type (PreToolUse vs PostToolUse).
@@ -187,6 +210,11 @@ pub trait Check {
 ///   Claude Code feeds stderr back to Claude as an error.
 /// - Allow → silent exit 0.
 pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
+    let current_effort = std::env::var("CLAUDE_EFFORT").ok();
+    if should_skip_for_effort(check.skip_at_effort(), current_effort.as_deref()) {
+        process::exit(Outcome::Allow.code());
+    }
+
     let result = check.run(input);
     if let Some(msg) = &result.message {
         match result.outcome {
@@ -462,5 +490,70 @@ mod tests {
     fn file_path_normalizes_backslash() {
         let input = make_input(None, Some(r"C:\Users\.env"), None, None, None, None);
         assert_eq!(input.file_path().as_deref(), Some("C:/Users/.env"));
+    }
+
+    // --- effort gating ---
+
+    #[test]
+    fn effort_skip_empty_list_runs_at_every_level() {
+        assert!(!should_skip_for_effort(&[], Some("low")));
+        assert!(!should_skip_for_effort(&[], Some("medium")));
+        assert!(!should_skip_for_effort(&[], Some("high")));
+        assert!(!should_skip_for_effort(&[], None));
+    }
+
+    #[test]
+    fn effort_skip_matches_current_level() {
+        assert!(should_skip_for_effort(&["low"], Some("low")));
+        assert!(should_skip_for_effort(&["low", "medium"], Some("medium")));
+        assert!(should_skip_for_effort(&["high", "xhigh"], Some("xhigh")));
+    }
+
+    #[test]
+    fn effort_skip_does_not_match_other_levels() {
+        assert!(!should_skip_for_effort(&["low"], Some("medium")));
+        assert!(!should_skip_for_effort(&["low"], Some("high")));
+        assert!(!should_skip_for_effort(&["high"], Some("low")));
+    }
+
+    #[test]
+    fn effort_skip_unset_treats_as_medium() {
+        // Claude Code's documented default is "medium" when the field is
+        // absent from the payload, so the env var being unset should be
+        // equivalent to medium.
+        assert!(should_skip_for_effort(&["medium"], None));
+        assert!(!should_skip_for_effort(&["low"], None));
+        assert!(!should_skip_for_effort(&["high"], None));
+    }
+
+    #[test]
+    fn check_trait_default_skip_at_effort_is_empty() {
+        struct Stub;
+        impl Check for Stub {
+            fn name(&self) -> &str {
+                "stub"
+            }
+            fn run(&self, _input: &HookInput) -> CheckResult {
+                CheckResult::allow()
+            }
+        }
+        assert!(Stub.skip_at_effort().is_empty());
+    }
+
+    #[test]
+    fn check_trait_skip_at_effort_overridable() {
+        struct LowSkip;
+        impl Check for LowSkip {
+            fn name(&self) -> &str {
+                "low-skip"
+            }
+            fn run(&self, _input: &HookInput) -> CheckResult {
+                CheckResult::allow()
+            }
+            fn skip_at_effort(&self) -> &[&str] {
+                &["low"]
+            }
+        }
+        assert_eq!(LowSkip.skip_at_effort(), &["low"]);
     }
 }
