@@ -76,7 +76,7 @@ struct HookRef {
 /// Plugin directories that dispatch to the cadence-hooks binary via run-cadence-hooks.sh.
 /// (dir_name, expected_plugin_group)
 const BINARY_PLUGIN_DIRS: &[(&str, &str)] =
-    &[("cadence", "cadence"), ("git-guardrails", "guardrails")];
+    &[("cadence", "cadence"), ("cadence-guardrails", "guardrails")];
 
 /// Plugin directories that still use shell script wrappers (not yet migrated to binary).
 /// These are tracked so the "all subcommands registered" test knows they exist.
@@ -180,12 +180,17 @@ fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> 
 
 /// Extract `<plugin> <subcommand>` from a hook command string like:
 /// `'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails warn-untracked`
+/// or `"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails warn-untracked`.
+///
+/// Strips both single and double trailing shell-quote characters so the
+/// audit works regardless of which quoting style the plugin's hooks.json
+/// uses around `${CLAUDE_PLUGIN_ROOT}`.
 fn extract_dispatch(command: &str) -> Option<String> {
     if !command.contains("run-cadence-hooks") {
         return None;
     }
     let after = command.split("run-cadence-hooks.sh").last()?;
-    let trimmed = after.trim().trim_start_matches('\'').trim();
+    let trimmed = after.trim().trim_start_matches(['\'', '"']).trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -402,9 +407,15 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
     }
 
     // Check if settings.json shell scripts overlap with binary subcommands by name.
-    // e.g., "nudge-untracked-on-commit.sh" overlaps with "warn-untracked"
-    // This is a fuzzy check — flag any shell script whose filename contains a keyword
-    // that also appears in a plugin-registered command.
+    // e.g., "nudge-untracked-on-commit.sh" overlaps with "warn-untracked" via the
+    // keyword `untracked`.
+    //
+    // Tokenize the filename on word boundaries and require **exact-token** matches
+    // against plugin keywords. Substring matching produced false positives where
+    // unrelated subcommands shared a stem — e.g. `block-vault-git-writes.sh`
+    // matched both `writes` (from `prevent-secret-writes`) and `write` (from
+    // `guard-gh-write`) as substrings, even though `write` is not a token in
+    // the filename.
     let plugin_keywords: BTreeSet<&str> = plugin_commands
         .iter()
         .flat_map(|cmd| {
@@ -418,9 +429,14 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
 
     for script in &shell_scripts {
         let filename = script.rsplit('/').next().unwrap_or(script).to_lowercase();
+        let filename_tokens: BTreeSet<String> = filename
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
         let matching_keywords: Vec<&&str> = plugin_keywords
             .iter()
-            .filter(|kw| filename.contains(**kw))
+            .filter(|kw| filename_tokens.contains(**kw))
             .collect();
         if matching_keywords.len() >= 2 {
             duplicates.push(format!(

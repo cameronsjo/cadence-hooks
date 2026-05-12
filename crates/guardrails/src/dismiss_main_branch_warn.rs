@@ -79,13 +79,16 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-/// Convenience: read the marker for the current repo and decide if it's still
+/// Convenience: read the marker for the given repo and decide if it's still
 /// active. Used by `warn-main-branch` before evaluating its own logic.
-pub fn is_snoozed_now() -> bool {
-    let Some(root) = repo_root() else {
-        return false;
-    };
-    let path = marker_path(&root);
+///
+/// The caller is responsible for resolving `repo_root` — typically via the
+/// same `git -C` query that drove branch detection. This keeps the snooze
+/// lookup keyed to the same repo as the marker write, which matters when the
+/// hook fires inside a nested repo (the outer CWD's repo would be the wrong
+/// key).
+pub fn is_snoozed_now(repo_root: &Path) -> bool {
+    let path = marker_path(repo_root);
     let Ok(contents) = fs::read_to_string(&path) else {
         return false;
     };
