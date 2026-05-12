@@ -160,6 +160,20 @@ export CADENCE_ALLOWED_OWNERS="cameron git.sjo.lol/cameron"
 
 Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is hidden from `--help` and refuses to run interactively. `configure --list` remains available. Run `configure` from a real terminal to change hook state.
 
+### Auditing installed plugins
+
+`doctor` scans every plugin's `hooks.json` for shell-expansion bugs — primarily the single-quoted `${CLAUDE_PLUGIN_ROOT}` class, which the harness reports as a non-blocking failure with no surface to the user. Suitable for CI or one-shot audits.
+
+```bash
+# Scan the default location: ~/.claude/plugins/cache
+cadence-hooks doctor
+
+# Audit a specific tree (handy in CI before publishing a plugin)
+cadence-hooks doctor --root ./plugins
+```
+
+Exits 0 when clean, 1 when violations are found. Each violation prints the plugin, file, offending snippet, and the recommended fix.
+
 ### Snoozing warn-main-branch
 
 `warn-main-branch` fires once per session — but during quick wrap-up edits on a repo that's intentionally on `main`, even one nudge per session is noise. Silence it for a time-bound window per-repo:
