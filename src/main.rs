@@ -17,6 +17,7 @@ fn under_claude_code() -> bool {
 }
 
 mod configure;
+mod doctor;
 
 #[derive(Parser)]
 #[command(name = "cadence-hooks", version, about = "Compiled Claude Code hooks")]
@@ -51,6 +52,13 @@ enum Commands {
         /// Print current configuration without interactive mode
         #[arg(long)]
         list: bool,
+    },
+
+    /// Scan installed plugin hooks.json files for shell-expansion bugs
+    Doctor {
+        /// Scan a specific directory instead of ~/.claude/plugins/cache
+        #[arg(long, value_name = "DIR")]
+        root: Option<std::path::PathBuf>,
     },
 }
 
@@ -293,7 +301,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         Commands::Obsidian(o) => Some(match o {
             ObsidianCommands::TrashGuard => "trash-guard",
         }),
-        Commands::List | Commands::Configure { .. } => None,
+        Commands::List | Commands::Configure { .. } | Commands::Doctor { .. } => None,
     }
 }
 
@@ -453,6 +461,9 @@ fn main() {
                 process::exit(1);
             }
             configure::run(list, HOOKS);
+        }
+        Commands::Doctor { root } => {
+            process::exit(doctor::run(root.as_deref()).into());
         }
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => {
