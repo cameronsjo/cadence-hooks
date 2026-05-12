@@ -23,6 +23,7 @@ Hooks are organized by the plugin they serve:
 | `line-endings` | PreToolUse (Write) | Validate shell script line endings (LF, not CRLF) |
 | `env-vars` | PreToolUse (Write, Edit) | Warn on generic env var names (DEBUG, PORT) |
 | `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
+| `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
 
 ### guardrails (git-guardrails)
