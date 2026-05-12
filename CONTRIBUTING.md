@@ -34,6 +34,29 @@ Requires Rust 2024 edition (1.85+).
 4. Add a subcommand variant in `src/main.rs`
 5. Write tests covering: allow, warn, block, edge cases, and bypass scenarios
 
+### Optional: effort-gating
+
+The `Check` trait exposes a `skip_at_effort()` method that defaults to an
+empty slice. Override it to short-circuit the check at specific effort
+levels (`$CLAUDE_EFFORT` from Claude Code; defaults to `"medium"` when
+unset):
+
+```rust
+impl Check for ExpensivePostScan {
+    fn name(&self) -> &str { "expensive-post-scan" }
+    fn run(&self, input: &HookInput) -> CheckResult { /* ... */ }
+
+    fn skip_at_effort(&self) -> &[&str] {
+        &["low"]  // skip when CLAUDE_EFFORT=low
+    }
+}
+```
+
+Most cadence-hooks checks are security/correctness invariants and should
+keep the default (always run). Use this only when the check is genuinely
+optional at the listed levels — typically heavy PostToolUse scans or
+diagnostics that have no value on trivial sessions.
+
 ## Testing Conventions
 
 - Test names describe the scenario: `bash_cat_example_redirect_to_env_blocked`
