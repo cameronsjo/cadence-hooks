@@ -190,10 +190,7 @@ fn extract_dispatch(command: &str) -> Option<String> {
         return None;
     }
     let after = command.split("run-cadence-hooks.sh").last()?;
-    let trimmed = after
-        .trim()
-        .trim_start_matches(|c: char| c == '\'' || c == '"')
-        .trim();
+    let trimmed = after.trim().trim_start_matches(['\'', '"']).trim();
     if trimmed.is_empty() {
         return None;
     }
