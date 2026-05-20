@@ -53,6 +53,22 @@ Hooks are organized by the plugin they serve:
 |------|-------|--------------|
 | `trash-guard` | PreToolUse (Bash) | Block `rm` in Obsidian vault (use .trash/ instead) |
 
+### metrics (cadence-metrics)
+
+These are **loggers**, not guards: they append JSONL event records and always
+exit 0. They never block a tool call (see [Hook Protocol](#hook-protocol)).
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `snapshot` | PreToolUse (Bash, `git commit`) | Snapshot HEAD before a commit, so `log-commit` can tell whether it landed |
+| `log-commit` | PostToolUse (Bash, `git commit`) | Scan the transcript for tokens since the last commit, compute cost, append to `commits.jsonl` |
+| `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` |
+
+`log-commit` reads its price table from the embedded default, overridable with
+`--prices <path>` (or `CADENCE_METRICS_PRICES`). Set `CADENCE_METRICS_DEBUG=1`
+to add a `_keys` array of raw payload keys to subagent records — useful for
+spotting schema additions across Claude Code releases.
+
 ## Hook Protocol
 
 Claude Code hooks communicate via a simple protocol:

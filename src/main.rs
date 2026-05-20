@@ -4,7 +4,7 @@
 //! Each subcommand reads JSON from stdin (the hook protocol) and exits with
 //! 0 (allow), 1 (warn), or 2 (block).
 
-use cadence_hooks_core::{HookEvent, run_check_from_stdin};
+use cadence_hooks_core::{HookEvent, run_check_from_stdin, run_logger_from_stdin};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::process;
 
@@ -43,6 +43,10 @@ enum Commands {
     /// Cadence Obsidian plugin hooks
     #[command(subcommand)]
     Obsidian(ObsidianCommands),
+
+    /// Cadence metrics logging hooks
+    #[command(subcommand)]
+    Metrics(MetricsCommands),
 
     /// List all hooks with descriptions and disable status
     List,
@@ -128,6 +132,21 @@ enum RulesCommands {
 enum ObsidianCommands {
     /// Block rm in Obsidian vault (use .trash/ instead)
     TrashGuard,
+}
+
+#[derive(Subcommand)]
+enum MetricsCommands {
+    /// Snapshot HEAD before a git commit (PreToolUse)
+    Snapshot,
+    /// Log cost-per-commit after a git commit (PostToolUse)
+    LogCommit {
+        /// Override path to the model price table (JSON). Falls back to the
+        /// embedded default; `CADENCE_METRICS_PRICES` env takes precedence.
+        #[arg(long, value_name = "PATH")]
+        prices: Option<String>,
+    },
+    /// Log subagent lifecycle (SubagentStart / SubagentStop)
+    LogSubagent,
 }
 
 /// A hook entry with its name, description, and plugin group.
@@ -259,6 +278,22 @@ const HOOKS: &[HookEntry] = &[
         description: "Block rm in Obsidian vault (use .trash/ instead)",
         plugin: "obsidian",
     },
+    // metrics
+    HookEntry {
+        name: "snapshot",
+        description: "Snapshot HEAD before a git commit (PreToolUse)",
+        plugin: "metrics",
+    },
+    HookEntry {
+        name: "log-commit",
+        description: "Log cost-per-commit after a git commit (PostToolUse)",
+        plugin: "metrics",
+    },
+    HookEntry {
+        name: "log-subagent",
+        description: "Log subagent lifecycle (SubagentStart / SubagentStop)",
+        plugin: "metrics",
+    },
 ];
 
 /// Returns the kebab-case hook name for the resolved subcommand.
@@ -300,6 +335,11 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         }),
         Commands::Obsidian(o) => Some(match o {
             ObsidianCommands::TrashGuard => "trash-guard",
+        }),
+        Commands::Metrics(m) => Some(match m {
+            MetricsCommands::Snapshot => "snapshot",
+            MetricsCommands::LogCommit { .. } => "log-commit",
+            MetricsCommands::LogSubagent => "log-subagent",
         }),
         Commands::List | Commands::Configure { .. } | Commands::Doctor { .. } => None,
     }
@@ -561,6 +601,17 @@ fn main() {
                 &cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard,
                 pre,
             ),
+        },
+        Commands::Metrics(cmd) => match cmd {
+            MetricsCommands::Snapshot => run_logger_from_stdin(&cadence_hooks_metrics::Snapshot),
+            MetricsCommands::LogCommit { prices } => {
+                run_logger_from_stdin(&cadence_hooks_metrics::LogCommit {
+                    prices_path: prices,
+                })
+            }
+            MetricsCommands::LogSubagent => {
+                run_logger_from_stdin(&cadence_hooks_metrics::LogSubagent)
+            }
         },
     }
 }
