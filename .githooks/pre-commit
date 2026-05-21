@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
-# Pre-commit hook: auto-format with cargo fmt
-# If formatting changes are needed, applies them and amends the staged files.
+# Pre-commit hook: auto-format staged Rust with cargo fmt.
+#
+# Re-stages only the Rust files that were already staged for this commit, so
+# fmt churn in unstaged files — mid-feature WIP, or a deliberate partial
+# `git add -p` — never sneaks into the commit.
 set -euo pipefail
 
-# Only run if Rust files are staged
-if ! git diff --cached --name-only | grep -qE '\.rs$'; then
+# Capture the Rust files already staged for this commit, *before* fmt runs.
+# Once cargo fmt rewrites the tree we can no longer tell "was staged" apart
+# from "fmt just touched it", so the snapshot has to happen up front.
+# --diff-filter=ACMR keeps only files that still exist (Added/Copied/Modified/
+# Renamed) and drops staged deletions — fmt can't reformat a deleted file, and
+# `git add` on a removed path would error under `set -e`.
+staged_rs="$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')"
+
+# No staged Rust → nothing to format or re-stage.
+if [[ -z "${staged_rs}" ]]; then
   exit 0
 fi
 
-# Run cargo fmt and stage any changes.
-# `grep` returns 1 when there are no fmt-induced changes; with `pipefail` that
-# would abort the hook even though nothing went wrong. Tolerate the empty
-# pipeline so a clean commit isn't blocked.
 cargo fmt --all --quiet
-git diff --name-only | { grep -E '\.rs$' || true; } | xargs -r git add
+
+# Re-stage only the originally-staged Rust files, picking up any fmt edits.
+while IFS= read -r file; do
+  [[ -n "${file}" ]] && git add -- "${file}"
+done <<< "${staged_rs}"
