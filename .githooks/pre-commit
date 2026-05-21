@@ -9,7 +9,10 @@ set -euo pipefail
 # Capture the Rust files already staged for this commit, *before* fmt runs.
 # Once cargo fmt rewrites the tree we can no longer tell "was staged" apart
 # from "fmt just touched it", so the snapshot has to happen up front.
-staged_rs="$(git diff --cached --name-only -- '*.rs')"
+# --diff-filter=ACMR keeps only files that still exist (Added/Copied/Modified/
+# Renamed) and drops staged deletions — fmt can't reformat a deleted file, and
+# `git add` on a removed path would error under `set -e`.
+staged_rs="$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')"
 
 # No staged Rust → nothing to format or re-stage.
 if [[ -z "${staged_rs}" ]]; then
