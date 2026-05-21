@@ -10,6 +10,11 @@
 //!   `<repo>/.claude/settings.json`'s `env` block. For repos where main IS
 //!   the working branch by design (personal scratchpads, dotfiles, vaults).
 //! - **User-global, permanent**: same env var in `~/.claude/settings.json`.
+//!
+//! Edits inside any `.claude/` directory are exempt automatically — worktrees
+//! under `.claude/worktrees/` (always on an intentional feature branch) and the
+//! user's `~/.claude/` config and memory tree. That work is never the
+//! branch-worthy product change the warning targets.
 
 use crate::dismiss_main_branch_warn;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
@@ -52,6 +57,25 @@ fn git_dir_for_input(input: &HookInput) -> PathBuf {
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or(cwd)
+}
+
+/// Returns true if `dir` lives inside a `.claude/` directory.
+///
+/// These paths hold Claude Code tooling and state, never the branch-worthy
+/// product work the warning targets, so the check stays out of them:
+///
+/// - `<repo>/.claude/worktrees/<name>/...` — worktrees created by
+///   `EnterWorktree` / `cadence-forge:using-worktrees` are always on an
+///   intentional feature branch. A worktree that happens to sit on `main` is
+///   still ad-hoc work, never the load-bearing primary checkout (issue #33).
+/// - `~/.claude/...` — user config and the auto-written memory directory.
+///   `~/.claude` may itself be a git repo on `main`, but edits there aren't
+///   repo feature work (issue #35).
+///
+/// Matches on an exact `.claude` path component, so look-alikes like
+/// `.claude-old` or `myclaude` are not exempt.
+fn is_claude_managed_dir(dir: &Path) -> bool {
+    dir.components().any(|c| c.as_os_str() == ".claude")
 }
 
 /// Returns true if the branch name is a default branch (`main` or `master`).
@@ -129,6 +153,14 @@ impl Check for WarnMainBranch {
 
     fn run(&self, input: &HookInput) -> CheckResult {
         let dir = git_dir_for_input(input);
+
+        // Edits inside a `.claude/` directory are tooling, config, or worktree
+        // work — never branch-worthy product changes. Skip the warning (and the
+        // git spawns below) entirely. (issues #33, #35)
+        if is_claude_managed_dir(&dir) {
+            return CheckResult::allow();
+        }
+
         let dir_arg = dir.to_string_lossy();
 
         // Branch detection scoped to the edited file's repo, not CWD's repo.
@@ -508,5 +540,56 @@ mod tests {
     fn allowed_value_trims_whitespace() {
         assert!(is_main_allowed_value(Some("  true  ")));
         assert!(is_main_allowed_value(Some("\t1\n")));
+    }
+
+    // --- .claude/ directory carve-out (issues #33, #35) ---
+
+    #[test]
+    fn claude_worktree_dir_is_managed() {
+        // #33 scenarios 1 & 2: a worktree path is exempt regardless of the
+        // branch it sits on (feat-foo or main).
+        assert!(is_claude_managed_dir(Path::new(
+            "/Users/x/repo/.claude/worktrees/feat-foo"
+        )));
+    }
+
+    #[test]
+    fn claude_worktree_nested_repo_is_managed() {
+        // #33 scenario 4: a nested-repo worktree layout still matches because
+        // the `.claude` component appears anywhere in the path.
+        assert!(is_claude_managed_dir(Path::new(
+            "/Users/x/repo/inner/.claude/worktrees/x/crates/guardrails/src"
+        )));
+    }
+
+    #[test]
+    fn home_claude_memory_dir_is_managed() {
+        // #35: the auto-written memory tree under ~/.claude is exempt even
+        // though ~/.claude is itself a git repo that can sit on main.
+        assert!(is_claude_managed_dir(Path::new(
+            "/Users/x/.claude/projects/some-proj/memory"
+        )));
+    }
+
+    #[test]
+    fn plain_repo_dir_is_not_managed() {
+        // #33 scenario 3: a normal checkout still gets the warning on main.
+        assert!(!is_claude_managed_dir(Path::new("/Users/x/repo/src")));
+    }
+
+    #[test]
+    fn claude_lookalike_dirs_are_not_managed() {
+        // Exact-component match: names that merely contain "claude" are not a
+        // `.claude` segment and must still warn.
+        assert!(!is_claude_managed_dir(Path::new("/Users/x/repo/myclaude")));
+        assert!(!is_claude_managed_dir(Path::new(
+            "/Users/x/.claude-old/foo"
+        )));
+    }
+
+    #[test]
+    fn relative_dot_dir_is_not_managed() {
+        // The Bash fallback resolves to ".", which has no `.claude` component.
+        assert!(!is_claude_managed_dir(Path::new(".")));
     }
 }
