@@ -23,7 +23,11 @@ impl Logger for Snapshot {
             return;
         }
 
-        let Some(session_id) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
+        let Some(session_id) = input
+            .session_id
+            .as_deref()
+            .filter(|s| common::is_safe_session_id(s))
+        else {
             return;
         };
 
@@ -72,6 +76,13 @@ mod tests {
     fn missing_session_is_noop() {
         Snapshot.run(&input_with("git commit -m x", None));
         Snapshot.run(&input_with("git commit -m x", Some("")));
+    }
+
+    #[test]
+    fn unsafe_session_id_is_noop() {
+        // A traversal-laden session_id must be rejected before any path is built.
+        Snapshot.run(&input_with("git commit -m x", Some("../../etc/passwd")));
+        Snapshot.run(&input_with("git commit -m x", Some("a/b")));
     }
 
     #[test]

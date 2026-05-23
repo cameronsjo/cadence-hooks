@@ -31,7 +31,11 @@ impl Logger for LogCommit {
             return;
         }
 
-        let Some(session_id) = input.session_id.as_deref().filter(|s| !s.is_empty()) else {
+        let Some(session_id) = input
+            .session_id
+            .as_deref()
+            .filter(|s| common::is_safe_session_id(s))
+        else {
             return;
         };
         let Some(transcript_path) = input.transcript_path.as_deref() else {
@@ -101,7 +105,13 @@ impl Logger for LogCommit {
             .append(true)
             .open(&commits_path)
         {
-            let _ = writeln!(file, "{record}");
+            // Build the whole line (record + newline) and write it in a single
+            // `write_all`, so concurrent appends from other sessions can't
+            // interleave a record with its trailing newline. `record` is compact
+            // JSON, so this is one line with no embedded newlines.
+            let mut line = record.to_string();
+            line.push('\n');
+            let _ = file.write_all(line.as_bytes());
         }
     }
 }

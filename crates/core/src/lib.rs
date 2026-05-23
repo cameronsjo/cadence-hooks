@@ -14,6 +14,7 @@ pub mod test_builders;
 
 use serde::Deserialize;
 use std::io::Read;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
 
 /// The hook event type determines output format for nudges.
@@ -334,7 +335,11 @@ pub trait Logger {
 /// the bash `|| true` discipline — loggers never emit exit 2, never block.
 pub fn run_logger_from_stdin(logger: &dyn Logger) -> ! {
     if let Ok(input) = MetricsInput::from_stdin() {
-        logger.run(&input);
+        // A panicking logger must not skip the exit-0 below. Catch the unwind so
+        // the contract holds even on a buggy implementation. `AssertUnwindSafe`
+        // is required because `&dyn Logger` is not `UnwindSafe`; we exit
+        // immediately afterward, so there is no post-panic state to corrupt.
+        let _ = catch_unwind(AssertUnwindSafe(|| logger.run(&input)));
     }
     process::exit(0);
 }

@@ -33,6 +33,17 @@ pub fn state_dir() -> PathBuf {
     metrics_dir().join("state")
 }
 
+/// True when `session_id` is safe to embed in a state filename — non-empty and
+/// composed only of ASCII alphanumerics, `-`, or `_`. Session IDs are UUID-like;
+/// anything containing path separators or `..` is rejected so a malformed or
+/// hostile payload can never steer a write outside [`state_dir`].
+pub fn is_safe_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Build a `git` command rooted at `cwd` when it's an existing directory,
 /// otherwise inheriting the process working directory (mirrors the bash
 /// `cd "$cwd" && git ...` / bare-`git` fallback).
@@ -63,15 +74,24 @@ pub fn head_sha(cwd: Option<&str>) -> Option<String> {
 }
 
 /// Current branch name in `cwd` (empty string on detached HEAD or failure).
+///
+/// Uses `symbolic-ref --quiet --short HEAD`, which exits non-zero on a detached
+/// HEAD — so [`git_output`] yields `None` and we return empty, as documented.
+/// (`rev-parse --abbrev-ref HEAD` would return the literal string `"HEAD"`.)
 pub fn branch(cwd: Option<&str>) -> String {
-    git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default()
+    git_output(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap_or_default()
 }
 
-/// Repo basename: the final path component of `cwd`, or the process cwd's.
+/// Repo name: the basename of the git worktree root (`rev-parse --show-toplevel`)
+/// so a subdirectory name is never logged as the repo. Falls back to the
+/// `cwd`/process-directory basename when not inside a git repo.
 pub fn repo_basename(cwd: Option<&str>) -> String {
-    let dir = match cwd {
-        Some(d) if Path::new(d).is_dir() => PathBuf::from(d),
-        _ => std::env::current_dir().unwrap_or_default(),
+    let dir = match git_output(cwd, &["rev-parse", "--show-toplevel"]) {
+        Some(toplevel) => PathBuf::from(toplevel),
+        None => match cwd {
+            Some(d) if Path::new(d).is_dir() => PathBuf::from(d),
+            _ => std::env::current_dir().unwrap_or_default(),
+        },
     };
     dir.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -129,6 +149,24 @@ mod tests {
     fn ignores_unrelated_commands() {
         assert!(!is_git_commit("echo committing changes"));
         assert!(!is_git_commit("ls -la"));
+    }
+
+    #[test]
+    fn safe_session_id_accepts_uuid_like() {
+        assert!(is_safe_session_id("a1b2c3d4-5e6f-7890-abcd-ef0123456789"));
+        assert!(is_safe_session_id("session_42"));
+        assert!(is_safe_session_id("ABC-123_xyz"));
+    }
+
+    #[test]
+    fn safe_session_id_rejects_traversal_and_separators() {
+        assert!(!is_safe_session_id(""));
+        assert!(!is_safe_session_id(".."));
+        assert!(!is_safe_session_id("../../etc/passwd"));
+        assert!(!is_safe_session_id("a/b"));
+        assert!(!is_safe_session_id("a.before")); // '.' is not allowed
+        assert!(!is_safe_session_id("with space"));
+        assert!(!is_safe_session_id("/abs"));
     }
 
     #[test]
