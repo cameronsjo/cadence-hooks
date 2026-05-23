@@ -210,7 +210,7 @@ The snooze marker lives at `<repo>/.git/cadence-hooks/main-branch-snoozed-until`
 ```
 cadence-hooks (binary)
 ├── crates/core        — Hook protocol: JSON parsing, Check trait, exit codes
-├── crates/cadence     — Cadence plugin hooks (10 checks)
+├── crates/cadence     — Cadence plugin hooks (11 checks)
 ├── crates/guardrails  — Git guardrails hooks (10 checks)
 ├── crates/rules       — Rules plugin hooks (2 checks)
 ├── crates/obsidian    — Obsidian plugin hooks (1 check)
