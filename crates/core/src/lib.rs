@@ -14,6 +14,7 @@ pub mod test_builders;
 
 use serde::Deserialize;
 use std::io::Read;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
 
 /// The hook event type determines output format for nudges.
@@ -139,6 +140,64 @@ impl HookInput {
     }
 }
 
+/// The JSON Claude Code sends to fire-and-forget metrics loggers.
+///
+/// A superset of [`HookInput`]: it carries the session, transcript, and
+/// subagent context that *logging* needs but *enforcement* does not. Every
+/// field is optional — absent keys deserialize to `None`, mirroring the
+/// `// null` defaults the bash hooks used. Reacts to `PreToolUse`,
+/// `PostToolUse`, `SubagentStart`, and `SubagentStop`; the originating event
+/// is read from `hook_event_name` rather than the static [`HookEvent`] enum.
+#[derive(Debug, Default, Deserialize)]
+pub struct MetricsInput {
+    pub session_id: Option<String>,
+    pub transcript_path: Option<String>,
+    pub hook_event_name: Option<String>,
+    pub cwd: Option<String>,
+    pub tool_input: Option<ToolInput>,
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub parent_agent_id: Option<String>,
+    pub source_agent_id: Option<String>,
+    pub duration_ms: Option<u64>,
+    /// Top-level keys present in the raw payload. Populated by [`Self::from_json`],
+    /// not deserialized — powers the `CADENCE_METRICS_DEBUG` `_keys` field that
+    /// surfaces schema additions across Claude Code releases.
+    #[serde(skip)]
+    pub raw_keys: Vec<String>,
+}
+
+impl MetricsInput {
+    /// Read and parse metrics input from stdin.
+    pub fn from_stdin() -> Result<Self, String> {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("Failed to read stdin: {e}"))?;
+        Self::from_json(&buf)
+    }
+
+    /// Parse metrics input from a JSON string, capturing the raw top-level keys.
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(s).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        let mut input: MetricsInput = serde_json::from_value(value.clone())
+            .map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        if let Some(obj) = value.as_object() {
+            input.raw_keys = obj.keys().cloned().collect();
+        }
+        Ok(input)
+    }
+
+    /// The bash command, if this event carries a Bash tool invocation.
+    pub fn command(&self) -> Option<&str> {
+        self.tool_input
+            .as_ref()
+            .and_then(|ti| ti.command.as_deref())
+    }
+}
+
 /// Result of running a single check.
 pub struct CheckResult {
     pub outcome: Outcome,
@@ -252,6 +311,37 @@ pub fn run_check_from_stdin(check: &dyn Check, event: HookEvent) -> ! {
             process::exit(0); // Fail open on parse errors
         }
     }
+}
+
+/// A fire-and-forget metrics logger.
+///
+/// Unlike [`Check`], a `Logger` makes no allow/block decision — it performs a
+/// side effect (append a JSONL line, write a state file) and never influences
+/// the tool call that triggered it. There is no `CheckResult`: the contract is
+/// "log if you can, otherwise do nothing."
+pub trait Logger {
+    /// Human-readable name for diagnostics.
+    fn name(&self) -> &str;
+
+    /// Perform the logging side effect. Must not panic on bad input — degrade
+    /// to a no-op instead, so a malformed payload never disrupts the session.
+    fn run(&self, input: &MetricsInput);
+}
+
+/// Run a logger from stdin, then **always exit 0**.
+///
+/// Logging is fire-and-forget: a parse error, a missing field, or a failed
+/// write must never block the operation that triggered the hook. This mirrors
+/// the bash `|| true` discipline — loggers never emit exit 2, never block.
+pub fn run_logger_from_stdin(logger: &dyn Logger) -> ! {
+    if let Ok(input) = MetricsInput::from_stdin() {
+        // A panicking logger must not skip the exit-0 below. Catch the unwind so
+        // the contract holds even on a buggy implementation. `AssertUnwindSafe`
+        // is required because `&dyn Logger` is not `UnwindSafe`; we exit
+        // immediately afterward, so there is no post-panic state to corrupt.
+        let _ = catch_unwind(AssertUnwindSafe(|| logger.run(&input)));
+    }
+    process::exit(0);
 }
 
 #[cfg(test)]
@@ -555,5 +645,52 @@ mod tests {
             }
         }
         assert_eq!(LowSkip.skip_at_effort(), &["low"]);
+    }
+
+    // --- MetricsInput ---
+
+    #[test]
+    fn metrics_input_parses_full_payload() {
+        let json = r#"{
+            "session_id": "s1",
+            "transcript_path": "/tmp/t.jsonl",
+            "hook_event_name": "PostToolUse",
+            "cwd": "/repo",
+            "tool_input": {"command": "git commit -m x"},
+            "agent_id": "a1",
+            "agent_type": "Explore",
+            "parent_session_id": "ps1",
+            "parent_agent_id": "pa1",
+            "source_agent_id": "src1",
+            "duration_ms": 1234
+        }"#;
+        let input = MetricsInput::from_json(json).unwrap();
+        assert_eq!(input.session_id.as_deref(), Some("s1"));
+        assert_eq!(input.hook_event_name.as_deref(), Some("PostToolUse"));
+        assert_eq!(input.command(), Some("git commit -m x"));
+        assert_eq!(input.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(input.duration_ms, Some(1234));
+    }
+
+    #[test]
+    fn metrics_input_absent_fields_are_none() {
+        let input = MetricsInput::from_json(r#"{"session_id": "s1"}"#).unwrap();
+        assert_eq!(input.session_id.as_deref(), Some("s1"));
+        assert_eq!(input.transcript_path, None);
+        assert_eq!(input.agent_id, None);
+        assert_eq!(input.duration_ms, None);
+        assert_eq!(input.command(), None);
+    }
+
+    #[test]
+    fn metrics_input_captures_raw_keys() {
+        let input = MetricsInput::from_json(r#"{"session_id": "s1", "novel_field": 7}"#).unwrap();
+        assert!(input.raw_keys.contains(&"session_id".to_string()));
+        assert!(input.raw_keys.contains(&"novel_field".to_string()));
+    }
+
+    #[test]
+    fn metrics_input_rejects_malformed_json() {
+        assert!(MetricsInput::from_json("not json").is_err());
     }
 }

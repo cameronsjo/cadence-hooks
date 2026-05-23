@@ -1,0 +1,39 @@
+{
+  "_meta": {
+    "lastVerified": "2026-05-16",
+    "source": "https://www.anthropic.com/pricing",
+    "notes": "All prices in USD per million tokens. Update lastVerified when bumping rates."
+  },
+  "models": {
+    "claude-opus-4-7": {
+      "inputPerMTok": 15.00,
+      "outputPerMTok": 75.00,
+      "cacheWritePerMTok": 18.75,
+      "cacheReadPerMTok": 1.50
+    },
+    "claude-opus-4-6": {
+      "inputPerMTok": 15.00,
+      "outputPerMTok": 75.00,
+      "cacheWritePerMTok": 18.75,
+      "cacheReadPerMTok": 1.50
+    },
+    "claude-sonnet-4-6": {
+      "inputPerMTok": 3.00,
+      "outputPerMTok": 15.00,
+      "cacheWritePerMTok": 3.75,
+      "cacheReadPerMTok": 0.30
+    },
+    "claude-sonnet-4-5": {
+      "inputPerMTok": 3.00,
+      "outputPerMTok": 15.00,
+      "cacheWritePerMTok": 3.75,
+      "cacheReadPerMTok": 0.30
+    },
+    "claude-haiku-4-5": {
+      "inputPerMTok": 1.00,
+      "outputPerMTok": 5.00,
+      "cacheWritePerMTok": 1.25,
+      "cacheReadPerMTok": 0.10
+    }
+  }
+}

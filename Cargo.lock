@@ -183,6 +183,7 @@ dependencies = [
  "cadence-hooks-cadence",
  "cadence-hooks-core",
  "cadence-hooks-guardrails",
+ "cadence-hooks-metrics",
  "cadence-hooks-obsidian",
  "cadence-hooks-rules",
  "clap",
@@ -216,6 +217,16 @@ version = "0.9.0"
 dependencies = [
  "cadence-hooks-core",
  "regex",
+]
+
+[[package]]
+name = "cadence-hooks-metrics"
+version = "0.9.0"
+dependencies = [
+ "cadence-hooks-core",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

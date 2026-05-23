@@ -15,7 +15,7 @@ use std::process::Command;
 /// Discovered by running `cadence-hooks <plugin> --help` for each plugin group.
 fn binary_subcommands() -> BTreeSet<String> {
     let bin = env!("CARGO_BIN_EXE_cadence-hooks");
-    let plugins = ["cadence", "guardrails", "rules", "obsidian"];
+    let plugins = ["cadence", "guardrails", "rules", "obsidian", "metrics"];
     let mut commands = BTreeSet::new();
 
     for plugin in plugins {
@@ -80,7 +80,16 @@ const BINARY_PLUGIN_DIRS: &[(&str, &str)] =
 
 /// Plugin directories that still use shell script wrappers (not yet migrated to binary).
 /// These are tracked so the "all subcommands registered" test knows they exist.
-const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("rules", "rules"), ("cadence-obsidian", "obsidian")];
+///
+/// `cadence-metrics` ships its own bash hooks until PR 2 of the Rust port wires
+/// its hooks.json to the binary; until then its subcommands exist in the binary
+/// but aren't dispatched via run-cadence-hooks.sh. Move it to BINARY_PLUGIN_DIRS
+/// once that lands.
+const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[
+    ("rules", "rules"),
+    ("cadence-obsidian", "obsidian"),
+    ("cadence-metrics", "metrics"),
+];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
