@@ -86,6 +86,8 @@ enum CadenceCommands {
     EnvVars,
     /// Nudge to review docs when creating a PR
     WarnDocsUpdate,
+    /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR
+    NudgePolishBeforePr,
     /// Run markdownlint on markdown files
     MarkdownLint,
 }
@@ -206,6 +208,11 @@ const HOOKS: &[HookEntry] = &[
         plugin: "cadence",
     },
     HookEntry {
+        name: "nudge-polish-before-pr",
+        description: "Nudge to run `/polish` before creating a PR",
+        plugin: "cadence",
+    },
+    HookEntry {
         name: "markdown-lint",
         description: "Run markdownlint on markdown files",
         plugin: "cadence",
@@ -310,6 +317,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::LineEndings => "line-endings",
             CadenceCommands::EnvVars => "env-vars",
             CadenceCommands::WarnDocsUpdate => "warn-docs-update",
+            CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
         }),
         Commands::Guardrails(g) => Some(match g {
@@ -536,6 +544,10 @@ fn main() {
             }
             CadenceCommands::WarnDocsUpdate => run_check_from_stdin(
                 &cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate,
+                pre,
+            ),
+            CadenceCommands::NudgePolishBeforePr => run_check_from_stdin(
+                &cadence_hooks_cadence::nudge_polish_before_pr::NudgePolishBeforePr,
                 pre,
             ),
             CadenceCommands::MarkdownLint => {

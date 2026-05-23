@@ -11,6 +11,8 @@ pub mod git_safety;
 pub mod markdown_lint;
 /// Enforce line limits on MEMORY.md and topic files.
 pub mod memory_guard;
+/// Nudge to run `/polish` (cadence-forge:polish) before creating a PR.
+pub mod nudge_polish_before_pr;
 /// Block reading secrets (.env, credentials, private keys) into context.
 pub mod prevent_secret_leaks;
 /// Block writing or deleting secrets (.env, credentials, private keys).
