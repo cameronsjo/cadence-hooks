@@ -48,6 +48,10 @@ Hooks are organized by the plugin they serve:
 | `validate-frontmatter` | PreToolUse (Write, Edit) | Validate SKILL.md and command frontmatter |
 | `security-patterns` | PreToolUse (Write, Edit) | Scan for security anti-patterns |
 
+`security-patterns` is a **zero-config, no-API baseline** — a per-edit pattern scan with no
+setup. For configurable patterns plus model-backed diff and commit review, install the
+official `security-guidance` plugin (`/plugin install security-guidance@claude-plugins-official`).
+
 ### obsidian (cadence-obsidian)
 
 | Hook | Event | What it does |
