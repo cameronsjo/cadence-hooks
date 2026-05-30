@@ -15,7 +15,14 @@ use std::process::Command;
 /// Discovered by running `cadence-hooks <plugin> --help` for each plugin group.
 fn binary_subcommands() -> BTreeSet<String> {
     let bin = env!("CARGO_BIN_EXE_cadence-hooks");
-    let plugins = ["cadence", "guardrails", "rules", "obsidian", "metrics"];
+    let plugins = [
+        "cadence",
+        "guardrails",
+        "rules",
+        "obsidian",
+        "metrics",
+        "lab",
+    ];
     let mut commands = BTreeSet::new();
 
     for plugin in plugins {
@@ -75,8 +82,11 @@ struct HookRef {
 
 /// Plugin directories that dispatch to the cadence-hooks binary via run-cadence-hooks.sh.
 /// (dir_name, expected_plugin_group)
-const BINARY_PLUGIN_DIRS: &[(&str, &str)] =
-    &[("cadence", "cadence"), ("cadence-guardrails", "guardrails")];
+const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
+    ("cadence", "cadence"),
+    ("cadence-guardrails", "guardrails"),
+    ("cadence-lab", "lab"),
+];
 
 /// Plugin directories that still use shell script wrappers (not yet migrated to binary).
 /// These are tracked so the "all subcommands registered" test knows they exist.

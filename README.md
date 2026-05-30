@@ -74,6 +74,24 @@ exit 0. They never block a tool call (see [Hook Protocol](#hook-protocol)).
 to add a `_keys` array of raw payload keys to subagent records — useful for
 spotting schema additions across Claude Code releases.
 
+### lab (cadence-lab)
+
+Experimental hooks for the [cadence-lab](https://github.com/cameronsjo/cadence-lab)
+plugin. The first is the **self-representation persona ledger** — a two-hook system
+that captures a constrained, per-session self-representation and appends it to an
+append-only `~/.claude/persona/personas.jsonl`.
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `persona-nudge` | SessionStart (startup, clear) | Inject a contract asking the model to record a constrained self-representation to a per-session staging file |
+| `persona-gate` | PostToolUse (Write) | Validate the staging candidate; feed itemized corrections back for a rewrite, or promote the validated record into the ledger |
+
+The gate uses the `LoopBlock` outcome — exit 0 with `{"decision":"block","reason":...}`
+— rather than a hard `exit 2`, because `PostToolUse` fires *after* the write, so the
+re-prompt convention (not the block convention) is what drives the rewrite. Cheek mode
+ships `warn` (annotate a system-written `flags` field, still promote). Configure via
+`~/.claude/persona/config.json`; record shape in the plugin's `schema/persona.schema.json`.
+
 ## Hook Protocol
 
 Claude Code hooks communicate via a simple protocol:

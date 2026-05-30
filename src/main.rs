@@ -48,6 +48,10 @@ enum Commands {
     #[command(subcommand)]
     Metrics(MetricsCommands),
 
+    /// Cadence lab (experimental) hooks
+    #[command(subcommand)]
+    Lab(LabCommands),
+
     /// List all hooks with descriptions and disable status
     List,
 
@@ -149,6 +153,14 @@ enum MetricsCommands {
     },
     /// Log subagent lifecycle (SubagentStart / SubagentStop)
     LogSubagent,
+}
+
+#[derive(Subcommand)]
+enum LabCommands {
+    /// Inject the self-representation contract on session start (SessionStart)
+    PersonaNudge,
+    /// Validate and promote a self-representation candidate (PostToolUse)
+    PersonaGate,
 }
 
 /// A hook entry with its name, description, and plugin group.
@@ -301,6 +313,17 @@ const HOOKS: &[HookEntry] = &[
         description: "Log subagent lifecycle (SubagentStart / SubagentStop)",
         plugin: "metrics",
     },
+    // lab
+    HookEntry {
+        name: "persona-nudge",
+        description: "Inject the self-representation contract on session start",
+        plugin: "lab",
+    },
+    HookEntry {
+        name: "persona-gate",
+        description: "Validate and promote a self-representation candidate",
+        plugin: "lab",
+    },
 ];
 
 /// Returns the kebab-case hook name for the resolved subcommand.
@@ -348,6 +371,10 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::Snapshot => "snapshot",
             MetricsCommands::LogCommit { .. } => "log-commit",
             MetricsCommands::LogSubagent => "log-subagent",
+        }),
+        Commands::Lab(l) => Some(match l {
+            LabCommands::PersonaNudge => "persona-nudge",
+            LabCommands::PersonaGate => "persona-gate",
         }),
         Commands::List | Commands::Configure { .. } | Commands::Doctor { .. } => None,
     }
@@ -488,6 +515,7 @@ fn main() {
     // Event type aliases for readability at callsites.
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
+    let session = HookEvent::SessionStart;
 
     match cli.command {
         Commands::List => {
@@ -623,6 +651,14 @@ fn main() {
             }
             MetricsCommands::LogSubagent => {
                 run_logger_from_stdin(&cadence_hooks_metrics::LogSubagent)
+            }
+        },
+        Commands::Lab(cmd) => match cmd {
+            LabCommands::PersonaNudge => {
+                run_check_from_stdin(&cadence_hooks_lab::nudge::PersonaNudge, session)
+            }
+            LabCommands::PersonaGate => {
+                run_check_from_stdin(&cadence_hooks_lab::gate::PersonaGate, post)
             }
         },
     }

@@ -340,6 +340,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         }
     }
 
@@ -366,6 +367,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         };
         assert_eq!(
             git_dir_for_input(&input),
@@ -388,6 +390,7 @@ mod tests {
             tool_name: Some("Edit".into()),
             tool_input: None,
             cwd: None,
+            ..Default::default()
         };
         assert_eq!(git_dir_for_input(&input), PathBuf::from("."));
     }

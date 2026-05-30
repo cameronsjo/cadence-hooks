@@ -28,6 +28,9 @@ pub enum HookEvent {
     PreToolUse,
     /// PostToolUse — fires after a tool executes.
     PostToolUse,
+    /// SessionStart — fires when a session begins (startup/resume/clear/compact).
+    /// Nudges inject context via `hookSpecificOutput.additionalContext`.
+    SessionStart,
 }
 
 /// Exit codes matching Claude Code's hook contract.
@@ -47,6 +50,12 @@ pub enum Outcome {
     Nudge,
     /// Operation blocked, error message shown (exit 2, stderr).
     Block,
+    /// Re-prompt loop (exit 0). The tool already ran, so the write stands, but
+    /// Claude Code's `{"decision":"block","reason":...}` convention feeds the
+    /// reason back so the model self-corrects with a fresh write. Used by
+    /// PostToolUse feedback loops (e.g. validate-then-rewrite gates) where a
+    /// hard `Block` (exit 2) cannot un-run the tool.
+    LoopBlock,
 }
 
 impl Outcome {
@@ -54,6 +63,7 @@ impl Outcome {
         match self {
             Outcome::Allow => 0,
             Outcome::Nudge => 0,
+            Outcome::LoopBlock => 0,
             Outcome::Block => 2,
         }
     }
@@ -62,6 +72,7 @@ impl Outcome {
     pub fn merge(self, other: Outcome) -> Outcome {
         match (self, other) {
             (Outcome::Block, _) | (_, Outcome::Block) => Outcome::Block,
+            (Outcome::LoopBlock, _) | (_, Outcome::LoopBlock) => Outcome::LoopBlock,
             (Outcome::Nudge, _) | (_, Outcome::Nudge) => Outcome::Nudge,
             _ => Outcome::Allow,
         }
@@ -83,11 +94,23 @@ fn normalize_path(path: &str) -> String {
 }
 
 /// The JSON structure Claude Code sends to PreToolUse/PostToolUse hooks on stdin.
-#[derive(Debug, Deserialize)]
+///
+/// `session_id`, `source`, and `model` are top-level fields the `SessionStart`
+/// payload carries (and which some PostToolUse payloads also include). They
+/// deserialize to `None` when absent, so existing Pre/Post hooks are unaffected.
+/// `Default` is derived so call sites can construct partial inputs via
+/// `..Default::default()`.
+#[derive(Debug, Default, Deserialize)]
 pub struct HookInput {
     pub tool_name: Option<String>,
     pub tool_input: Option<ToolInput>,
     pub cwd: Option<String>,
+    /// Claude Code session id — present on `SessionStart`.
+    pub session_id: Option<String>,
+    /// `SessionStart` trigger: `startup` | `resume` | `clear` | `compact`.
+    pub source: Option<String>,
+    /// Model id for the session (e.g. `claude-opus-4-8`), when supplied.
+    pub model: Option<String>,
 }
 
 /// Tool-specific fields from the hook input.
@@ -137,6 +160,21 @@ impl HookInput {
     /// The tool name (Write, Edit, Bash, etc.)
     pub fn tool_name(&self) -> Option<&str> {
         self.tool_name.as_deref()
+    }
+
+    /// The Claude Code session id, if present (SessionStart and some payloads).
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// The SessionStart trigger source (startup/resume/clear/compact), if present.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// The session model id, if present.
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 }
 
@@ -225,6 +263,15 @@ impl CheckResult {
             message: Some(message.into()),
         }
     }
+
+    /// Re-prompt loop result (exit 0). The message is fed back via Claude Code's
+    /// `{"decision":"block","reason":...}` convention so the model rewrites.
+    pub fn loop_block(message: impl Into<String>) -> Self {
+        Self {
+            outcome: Outcome::LoopBlock,
+            message: Some(message.into()),
+        }
+    }
 }
 
 /// A hook check that can be run against input.
@@ -276,13 +323,28 @@ pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
 
     let result = check.run(input);
     if let Some(msg) = &result.message {
+        let event_name = match event {
+            HookEvent::PreToolUse => "PreToolUse",
+            HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::SessionStart => "SessionStart",
+        };
         match result.outcome {
             Outcome::Nudge => {
-                let event_name = match event {
-                    HookEvent::PreToolUse => "PreToolUse",
-                    HookEvent::PostToolUse => "PostToolUse",
-                };
                 let json = serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": msg
+                    }
+                });
+                println!("{json}");
+            }
+            Outcome::LoopBlock => {
+                // PostToolUse re-prompt: the tool already ran, so exit 0 and use
+                // the `decision: block` convention to feed the reason back. Also
+                // mirror it into additionalContext for clients that read that.
+                let json = serde_json::json!({
+                    "decision": "block",
+                    "reason": msg,
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
                         "additionalContext": msg
@@ -354,7 +416,41 @@ mod tests {
     fn outcome_codes() {
         assert_eq!(Outcome::Allow.code(), 0);
         assert_eq!(Outcome::Nudge.code(), 0);
+        assert_eq!(Outcome::LoopBlock.code(), 0);
         assert_eq!(Outcome::Block.code(), 2);
+    }
+
+    #[test]
+    fn outcome_merge_loop_block_below_block_above_nudge() {
+        assert_eq!(Outcome::LoopBlock.merge(Outcome::Nudge), Outcome::LoopBlock);
+        assert_eq!(Outcome::Nudge.merge(Outcome::LoopBlock), Outcome::LoopBlock);
+        assert_eq!(Outcome::Block.merge(Outcome::LoopBlock), Outcome::Block);
+        assert_eq!(Outcome::LoopBlock.merge(Outcome::Block), Outcome::Block);
+        assert_eq!(Outcome::LoopBlock.merge(Outcome::Allow), Outcome::LoopBlock);
+    }
+
+    #[test]
+    fn check_result_loop_block() {
+        let r = CheckResult::loop_block("rewrite");
+        assert_eq!(r.outcome, Outcome::LoopBlock);
+        assert_eq!(r.message.as_deref(), Some("rewrite"));
+    }
+
+    #[test]
+    fn session_start_fields_deserialize() {
+        let json = r#"{"session_id":"s1","source":"startup","model":"claude-opus-4-8"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.session_id(), Some("s1"));
+        assert_eq!(input.source(), Some("startup"));
+        assert_eq!(input.model(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn session_fields_absent_are_none() {
+        let input: HookInput = serde_json::from_str(r#"{"tool_name":"Write"}"#).unwrap();
+        assert_eq!(input.session_id(), None);
+        assert_eq!(input.source(), None);
+        assert_eq!(input.model(), None);
     }
 
     #[test]
@@ -399,6 +495,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         }
     }
 
@@ -426,6 +523,7 @@ mod tests {
             tool_name: None,
             tool_input: None,
             cwd: None,
+            ..Default::default()
         };
         assert!(input.file_path().is_none());
     }
@@ -472,6 +570,7 @@ mod tests {
             tool_name: None,
             tool_input: None,
             cwd: None,
+            ..Default::default()
         };
         assert_eq!(input.tool_name(), None);
     }

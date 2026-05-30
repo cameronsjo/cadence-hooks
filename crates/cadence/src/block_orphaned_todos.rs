@@ -222,6 +222,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         }
     }
 
@@ -252,6 +253,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         };
         let result = OrphanedTodoGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -390,6 +392,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         };
         let result = OrphanedTodoGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);

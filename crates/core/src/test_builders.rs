@@ -21,6 +21,7 @@ pub fn make_bash(cmd: &str) -> HookInput {
             old_string: None,
         }),
         cwd: None,
+        ..Default::default()
     }
 }
 
@@ -37,6 +38,7 @@ pub fn make_bash_with_cwd(cmd: &str, cwd: &str) -> HookInput {
             old_string: None,
         }),
         cwd: Some(cwd.into()),
+        ..Default::default()
     }
 }
 
@@ -53,6 +55,7 @@ pub fn make_write(path: &str, content: &str) -> HookInput {
             old_string: None,
         }),
         cwd: None,
+        ..Default::default()
     }
 }
 
@@ -69,5 +72,16 @@ pub fn make_edit(path: &str) -> HookInput {
             old_string: Some("old".into()),
         }),
         cwd: None,
+        ..Default::default()
+    }
+}
+
+/// Build a `HookInput` for a `SessionStart` event with the given session id and
+/// source (`startup` | `resume` | `clear` | `compact`).
+pub fn make_session(session_id: &str, source: &str) -> HookInput {
+    HookInput {
+        session_id: Some(session_id.into()),
+        source: Some(source.into()),
+        ..Default::default()
     }
 }
