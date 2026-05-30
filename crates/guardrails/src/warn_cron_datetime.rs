@@ -53,6 +53,7 @@ mod tests {
             tool_name: Some(tool_name.into()),
             tool_input: None,
             cwd: None,
+            ..Default::default()
         }
     }
 
@@ -90,6 +91,7 @@ mod tests {
             tool_name: None,
             tool_input: None,
             cwd: None,
+            ..Default::default()
         };
         let result = WarnCronDatetime.run(&input);
         assert_eq!(result.outcome, Outcome::Allow);

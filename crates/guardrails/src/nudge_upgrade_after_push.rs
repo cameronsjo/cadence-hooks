@@ -105,6 +105,7 @@ mod tests {
             tool_name: Some("Bash".into()),
             tool_input: None,
             cwd: None,
+            ..Default::default()
         };
         let result = NudgeUpgradeAfterPush.run(&input);
         assert_eq!(result.outcome, Outcome::Allow);

@@ -269,6 +269,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         }
     }
 
@@ -322,6 +323,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         }
     }
 
@@ -433,6 +435,7 @@ mod tests {
             tool_name: Some("Read".into()),
             tool_input: None,
             cwd: None,
+            ..Default::default()
         };
         let result = SecretLeaksGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -444,6 +447,7 @@ mod tests {
             tool_name: Some("Agent".into()),
             tool_input: None,
             cwd: None,
+            ..Default::default()
         };
         let result = SecretLeaksGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -694,6 +698,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         };
         let result = SecretLeaksGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -712,6 +717,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         };
         let result = SecretLeaksGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
@@ -730,6 +736,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         };
         let result = SecretLeaksGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);

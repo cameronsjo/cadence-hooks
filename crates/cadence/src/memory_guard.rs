@@ -92,6 +92,7 @@ mod tests {
                 old_string: None,
             }),
             cwd: None,
+            ..Default::default()
         }
     }
 
@@ -186,6 +187,7 @@ mod tests {
             tool_name: Some("Write".into()),
             tool_input: None,
             cwd: None,
+            ..Default::default()
         };
         let result = MemoryGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);

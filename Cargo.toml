@@ -23,6 +23,7 @@ cadence-hooks-guardrails = { path = "crates/guardrails" }
 cadence-hooks-rules = { path = "crates/rules" }
 cadence-hooks-obsidian = { path = "crates/obsidian" }
 cadence-hooks-metrics = { path = "crates/metrics" }
+cadence-hooks-lab = { path = "crates/lab" }
 
 [package]
 name = "cadence-hooks"
@@ -51,3 +52,4 @@ cadence-hooks-guardrails.workspace = true
 cadence-hooks-rules.workspace = true
 cadence-hooks-obsidian.workspace = true
 cadence-hooks-metrics.workspace = true
+cadence-hooks-lab.workspace = true
