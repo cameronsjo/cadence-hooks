@@ -86,20 +86,12 @@ const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
     ("cadence", "cadence"),
     ("cadence-guardrails", "guardrails"),
     ("cadence-lab", "lab"),
+    ("cadence-metrics", "metrics"),
 ];
 
 /// Plugin directories that still use shell script wrappers (not yet migrated to binary).
 /// These are tracked so the "all subcommands registered" test knows they exist.
-///
-/// `cadence-metrics` ships its own bash hooks until PR 2 of the Rust port wires
-/// its hooks.json to the binary; until then its subcommands exist in the binary
-/// but aren't dispatched via run-cadence-hooks.sh. Move it to BINARY_PLUGIN_DIRS
-/// once that lands.
-const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[
-    ("rules", "rules"),
-    ("cadence-obsidian", "obsidian"),
-    ("cadence-metrics", "metrics"),
-];
+const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("rules", "rules"), ("cadence-obsidian", "obsidian")];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
@@ -213,7 +205,16 @@ fn extract_dispatch(command: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(trimmed.to_string())
+    // Keep only the `<plugin> <subcommand>` identity, dropping any trailing
+    // flags/args — e.g. `metrics log-commit --prices "${CLAUDE_PLUGIN_ROOT}/...`
+    // normalizes to `metrics log-commit`. The binary's subcommand identity (what
+    // `<plugin> --help` enumerates) never includes runtime flags, so a flagged
+    // dispatch must compare against the bare pair.
+    let identity: Vec<&str> = trimmed.split_whitespace().take(2).collect();
+    if identity.len() < 2 {
+        return None;
+    }
+    Some(identity.join(" "))
 }
 
 /// Parse user-level settings.json and extract all hook shell script paths and
