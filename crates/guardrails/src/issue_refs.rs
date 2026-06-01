@@ -13,7 +13,9 @@ use std::sync::LazyLock;
 /// Matches: closes, closed, close, fixes, fixed, fix, resolves, resolved, resolve.
 /// Case-insensitive; captures the digit string after `#`.
 static CLOSING_KW_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([0-9]+)")
+    // Word boundaries keep substring hits ("discloses", "prefixes") from
+    // counting as closing keywords.
+    Regex::new(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s+#([0-9]+)\b")
         .expect("pattern should compile")
 });
 
@@ -61,6 +63,15 @@ mod tests {
     fn has_closing_keyword_rejects_bare_refs() {
         assert!(!has_closing_keyword("see #9 for context"));
         assert!(!has_closing_keyword("no reference at all"));
+    }
+
+    #[test]
+    fn does_not_match_keyword_inside_larger_word() {
+        // "discloses", "prefixes", "unresolves" contain closing keywords as
+        // substrings — they are not closing references.
+        assert!(!has_closing_keyword("this discloses #2 publicly"));
+        assert!(!has_closing_keyword("prefixes #3 with a dash"));
+        assert!(extract_refs("discloses #2 and prefixes #3").is_empty());
     }
 
     #[test]

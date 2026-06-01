@@ -103,8 +103,9 @@ impl GhRunner for RealGhRunner {
         if !output.status.success() {
             return None;
         }
-        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (!s.is_empty()).then_some(s)
+        // Success with empty stdout is still success — `gh issue close` writes
+        // its confirmation to stderr, so an empty stdout must not read as failure.
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 }
 

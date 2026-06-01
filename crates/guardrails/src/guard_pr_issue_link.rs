@@ -12,23 +12,23 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
 
-// Matches `--body-file <path>` or `-F <path>` in the command.
+// Matches `--body-file <path>` or `-F <path>` in the command. Quote-aware:
+// double-quoted and single-quoted paths (which may contain spaces) are
+// captured whole; bare paths capture up to the next whitespace.
 static BODY_FILE_FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:--body-file|-F)\s+(\S+)").expect("body-file flag pattern should compile")
+    Regex::new(r#"(?:--body-file|-F)\s+(?:"([^"]+)"|'([^']+)'|(\S+))"#)
+        .expect("body-file flag pattern should compile")
 });
 
 /// Extract the path argument from `--body-file <path>` or `-F <path>`.
 ///
 /// Pure: no I/O. Returns `None` when neither flag is present.
 pub(crate) fn extract_body_file_path(command: &str) -> Option<String> {
-    BODY_FILE_FLAG
-        .captures(command)
-        .and_then(|caps| caps.get(1))
-        .map(|m| {
-            m.as_str()
-                .trim_matches(|c| c == '"' || c == '\'')
-                .to_string()
-        })
+    let caps = BODY_FILE_FLAG.captures(command)?;
+    caps.get(1)
+        .or_else(|| caps.get(2))
+        .or_else(|| caps.get(3))
+        .map(|m| m.as_str().to_string())
 }
 
 /// Resolution of the `--body-file`/`-F` flag on a `gh pr create` command.
@@ -292,6 +292,27 @@ mod tests {
     fn returns_none_when_no_body_file_flag() {
         let cmd = r#"gh pr create --title x --body "Closes #1""#;
         assert!(extract_body_file_path(cmd).is_none());
+    }
+
+    // Quoted paths containing spaces must be captured whole — truncating at the
+    // first space makes the file unreadable, and the fail-open path would then
+    // let an unverified PR through.
+    #[test]
+    fn extracts_double_quoted_path_with_spaces() {
+        let cmd = r#"gh pr create -F "docs/pr bodies/body.md""#;
+        assert_eq!(
+            extract_body_file_path(cmd),
+            Some("docs/pr bodies/body.md".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_single_quoted_path_with_spaces() {
+        let cmd = "gh pr create --body-file 'my body files/pr.md'";
+        assert_eq!(
+            extract_body_file_path(cmd),
+            Some("my body files/pr.md".to_string())
+        );
     }
 
     // ---- Check::run integration tests ----
