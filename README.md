@@ -40,6 +40,9 @@ Hooks are organized by the plugin they serve:
 | `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
 | `check-idle-return` | PreToolUse | Nudge after idle periods between edits |
 | `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main |
+| `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) |
+| `guard-pr-issue-link` | PreToolUse (Bash) | Block `gh pr create` without a closing issue keyword (`Closes #N`) in the body |
+| `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge |
 
 ### rules
 
@@ -186,6 +189,8 @@ All cadence-hooks config lives under the `CADENCE_*` prefix. `OBSIDIAN_VAULT` is
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space or comma-separated `owner/repo` pairs |
 | `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host |
 | `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
+| `CADENCE_GUARD_DOTFILES` | `guard-dotfiles` | Set to `1` to block direct edits to production dotfiles (clean no-op otherwise) |
+| `GH_AUTOCLOSE_WAIT_SECONDS` | `verify-pr-autoclose` | Seconds to wait after `gh pr merge` before checking for straggler issues (default 10) |
 | `OBSIDIAN_VAULT` | `trash-guard` | Absolute path to Obsidian vault |
 
 #### Allowlist host scoping

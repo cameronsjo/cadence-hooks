@@ -118,6 +118,12 @@ enum GuardrailsCommands {
     NudgeUpgradeAfterPush,
     /// Warn about untracked files during git commit operations
     WarnUntracked,
+    /// Block direct edits to production dotfiles (opt-in via CADENCE_GUARD_DOTFILES=1)
+    GuardDotfiles,
+    /// Block `gh pr create` without a closing issue keyword in the body
+    GuardPrIssueLink,
+    /// Verify issue auto-close after PR create/merge; close stragglers
+    VerifyPrAutoclose,
     /// Snooze warn-main-branch for this repo for the given duration
     DismissMainBranchWarn {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
@@ -280,6 +286,21 @@ const HOOKS: &[HookEntry] = &[
         description: "Warn about untracked files during git commit operations",
         plugin: "guardrails",
     },
+    HookEntry {
+        name: "guard-dotfiles",
+        description: "Block direct edits to production dotfiles (opt-in)",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "guard-pr-issue-link",
+        description: "Block gh pr create without a closing issue keyword",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "verify-pr-autoclose",
+        description: "Verify and repair issue auto-close after PR create/merge",
+        plugin: "guardrails",
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",
@@ -354,6 +375,9 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
             GuardrailsCommands::WarnUntracked => "warn-untracked",
+            GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
+            GuardrailsCommands::GuardPrIssueLink => "guard-pr-issue-link",
+            GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             // dismiss-main-branch-warn is a CLI action, not a hook —
             // it has no PreToolUse/PostToolUse wiring and isn't subject
             // to CADENCE_DISABLE. Falling out of the Some(...) here is
@@ -621,6 +645,18 @@ fn main() {
             GuardrailsCommands::WarnUntracked => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles,
                 pre,
+            ),
+            GuardrailsCommands::GuardDotfiles => run_check_from_stdin(
+                &cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles,
+                pre,
+            ),
+            GuardrailsCommands::GuardPrIssueLink => run_check_from_stdin(
+                &cadence_hooks_guardrails::guard_pr_issue_link::PrIssueLinkGuard,
+                pre,
+            ),
+            GuardrailsCommands::VerifyPrAutoclose => run_check_from_stdin(
+                &cadence_hooks_guardrails::verify_pr_autoclose::VerifyPrAutoclose,
+                post,
             ),
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {
                 cadence_hooks_guardrails::dismiss_main_branch_warn::run_dismiss(&for_);
