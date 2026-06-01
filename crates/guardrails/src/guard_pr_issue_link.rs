@@ -6,16 +6,10 @@
 //! when `--body-file`/`-F` is present, the file's contents are also scanned so
 //! the keyword inside the file is not false-blocked.
 
+use crate::issue_refs::has_closing_keyword;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
-
-// Closing keyword regex — case-insensitive, matches the closing keyword immediately
-// followed by optional whitespace and a #N issue reference.
-static CLOSING_KEYWORD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#[0-9]+")
-        .expect("closing keyword pattern should compile")
-});
 
 // Matches `--body-file <path>` or `-F <path>` in the command.
 static BODY_FILE_FLAG: LazyLock<Regex> = LazyLock::new(|| {
@@ -49,13 +43,13 @@ pub(crate) fn judge_pr_create(command: &str, body_file_contents: Option<&str>) -
     }
 
     // Check the inline command text for a closing keyword
-    if CLOSING_KEYWORD.is_match(command) {
+    if has_closing_keyword(command) {
         return None;
     }
 
     // Check the body file contents when provided
     if let Some(contents) = body_file_contents {
-        if CLOSING_KEYWORD.is_match(contents) {
+        if has_closing_keyword(contents) {
             return None;
         }
         // Body file was provided but contains no keyword — deny

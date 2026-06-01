@@ -69,7 +69,7 @@ impl Check for GuardDotfiles {
             return CheckResult::allow();
         }
 
-        let enabled = std::env::var("CADENCE_GUARD_DOTFILES").is_ok_and(|v| v == "1");
+        let enabled = std::env::var("CADENCE_GUARD_DOTFILES").as_deref() == Ok("1");
         let home = std::env::var("HOME").unwrap_or_default();
 
         // Resolve target: file_path first, then command (per spec fallback)

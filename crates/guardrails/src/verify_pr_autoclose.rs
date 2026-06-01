@@ -15,28 +15,8 @@ use std::sync::LazyLock;
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/// Regex for issue-closing keywords followed by a `#<number>` ref.
-///
-/// Matches: closes, closed, close, fixes, fixed, fix, resolves, resolved, resolve
-/// Case-insensitive; captures the digit string after `#`.
-static CLOSING_KW_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([0-9]+)")
-        .expect("pattern should compile")
-});
-
-/// Extract sorted, deduplicated issue numbers from closing-keyword references.
-///
-/// Finds all `closes #N`, `fixes #N`, `resolves #N` (and inflected variants),
-/// case-insensitively. Returns issue numbers sorted ascending with duplicates removed.
-pub fn extract_refs(text: &str) -> Vec<u64> {
-    let mut nums: Vec<u64> = CLOSING_KW_RE
-        .captures_iter(text)
-        .filter_map(|cap| cap.get(1)?.as_str().parse::<u64>().ok())
-        .collect();
-    nums.sort_unstable();
-    nums.dedup();
-    nums
-}
+// Closing-keyword detection is shared with guard_pr_issue_link via issue_refs.
+pub use crate::issue_refs::extract_refs;
 
 /// Parse a git remote URL into `(host, "owner/repo")`.
 ///
@@ -120,12 +100,11 @@ impl GhRunner for RealGhRunner {
             cmd.env("GH_HOST", h);
         }
         let output = cmd.args(args).output().ok()?;
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if s.is_empty() { None } else { Some(s) }
-        } else {
-            None
+        if !output.status.success() {
+            return None;
         }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
     }
 }
 

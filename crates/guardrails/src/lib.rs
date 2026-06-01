@@ -19,6 +19,8 @@ pub mod guard_git_init;
 pub mod guard_pr_issue_link;
 /// Block `git push` to remotes owned by others.
 pub mod guard_push_remote;
+/// Shared closing-keyword detection for GitHub issue references.
+pub mod issue_refs;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
 pub mod nudge_upgrade_after_push;
 /// Warn about broken issue refs on PR create; close straggler issues on PR merge.
