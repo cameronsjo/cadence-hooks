@@ -220,8 +220,9 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) -> Option<Stri
 
 /// Close straggler issues that GitHub's auto-close missed after a PR merge.
 ///
-/// Waits `wait_secs` (injected via `clock`) to give GitHub time to auto-close,
-/// then checks each referenced issue. If still OPEN, closes it via `gh issue close`
+/// Reads the merged PR's body and, only when it references issues, waits
+/// `wait_secs` (injected via `clock`) to give GitHub time to auto-close, then
+/// checks each referenced issue. If still OPEN, closes it via `gh issue close`
 /// with a commit-citing comment. Returns a summary message naming the closed
 /// issues, or `None` when there was nothing to do. The caller routes the
 /// message through `CheckResult::nudge` so Claude sees it.
@@ -243,9 +244,8 @@ pub fn handle_merge(
         }
     };
 
-    clock.sleep_secs(wait_secs);
-
-    // Fetch body + mergeCommit
+    // Fetch body + mergeCommit first — the merged PR's body doesn't change,
+    // so there's no need to wait before reading it.
     let pr_json = gh.run(&[
         "pr",
         "view",
@@ -275,6 +275,10 @@ pub fn handle_merge(
         return None;
     }
 
+    // Only now pay the auto-close wait: there are refs to verify, and GitHub
+    // needs time to fire its own auto-close before we check issue states.
+    clock.sleep_secs(wait_secs);
+
     let short_sha = if merge_sha.len() >= 7 {
         &merge_sha[..7]
     } else {
@@ -283,6 +287,9 @@ pub fn handle_merge(
 
     let mut closed: Vec<String> = Vec::new();
 
+    // One `gh issue view` per ref. Refs per PR are typically 1-2 and this path
+    // already waited `wait_secs` — batching via GraphQL isn't worth the extra
+    // I/O-seam complexity.
     for issue in &refs {
         if fetch_issue_state(gh, *issue, slug) != IssueState::Open {
             continue;
@@ -756,6 +763,25 @@ mod tests {
         assert!(
             clock.sleep_calls.borrow().is_empty(),
             "should not sleep when PR number unresolvable"
+        );
+        assert!(gh.close_calls.borrow().is_empty());
+    }
+
+    // A merge whose PR body has no closing-keyword refs has nothing to verify —
+    // the auto-close wait must not be paid (it stalls the session for wait_secs).
+    #[test]
+    fn merge_body_without_refs_skips_sleep() {
+        let gh = FakeGh::new()
+            .with_pr_body("routine maintenance, no issue references")
+            .with_merge_commit("abc1234def456");
+
+        let clock = FakeClock::new();
+        let msg = handle_merge("owner/repo", "gh pr merge 9 --squash", &gh, &clock, 10);
+
+        assert_eq!(msg, None);
+        assert!(
+            clock.sleep_calls.borrow().is_empty(),
+            "no refs to verify — the auto-close wait should be skipped"
         );
         assert!(gh.close_calls.borrow().is_empty());
     }

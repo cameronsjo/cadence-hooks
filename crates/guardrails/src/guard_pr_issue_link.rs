@@ -7,6 +7,7 @@
 //! the keyword inside the file is not false-blocked.
 
 use crate::issue_refs::has_closing_keyword;
+use cadence_hooks_core::shell::strip_quotes;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -30,38 +31,48 @@ pub(crate) fn extract_body_file_path(command: &str) -> Option<String> {
         })
 }
 
+/// Resolution of the `--body-file`/`-F` flag on a `gh pr create` command.
+#[derive(Debug)]
+pub(crate) enum BodyFile {
+    /// No body-file flag present.
+    Absent,
+    /// Flag present; the file was read successfully.
+    Contents(String),
+    /// Flag present but the file could not be read (race, permissions, path).
+    Unreadable,
+}
+
 /// Pure decision function. Returns `Some(deny_message)` when the PR should be
 /// blocked, `None` when it should be allowed.
-///
-/// `body_file_contents` carries the body file's text when `--body-file`/`-F` is
-/// present and the file was successfully read; `None` when the flag is absent OR
-/// when the file could not be read (fail-closed in the latter case).
-pub(crate) fn judge_pr_create(command: &str, body_file_contents: Option<&str>) -> Option<String> {
-    // Only guard `gh pr create`
-    if !command.contains("gh pr create") {
+pub(crate) fn judge_pr_create(command: &str, body_file: &BodyFile) -> Option<String> {
+    // Only guard `gh pr create`. Strip quoted regions first so text like
+    // `echo "gh pr create ..."` is treated as data, not a command.
+    if !strip_quotes(command).contains("gh pr create") {
         return None;
     }
 
-    // Check the inline command text for a closing keyword
+    // Check the inline command text for a closing keyword. The keyword lives
+    // inside the quoted `--body "..."` string, so this checks the raw command.
     if has_closing_keyword(command) {
         return None;
     }
 
-    // Check the body file contents when provided
-    if let Some(contents) = body_file_contents {
-        if has_closing_keyword(contents) {
-            return None;
-        }
-        // Body file was provided but contains no keyword — deny
-        return Some(deny_message());
+    match body_file {
+        // File read and contains a keyword — allow.
+        BodyFile::Contents(contents) if has_closing_keyword(contents) => None,
+        // File read but no keyword anywhere — deny.
+        BodyFile::Contents(_) => Some(deny_message()),
+        // Flag present but the file could not be read — fail OPEN (ADR-0001).
+        // This is the guard's own verification failure (write/hook race,
+        // permissions, path resolution), not the user's violation.
+        BodyFile::Unreadable => None,
+        // No body file and no keyword in the command — deny.
+        BodyFile::Absent => Some(deny_message()),
     }
-
-    // No body-file provided (or it couldn't be read — fail closed): deny
-    Some(deny_message())
 }
 
 fn deny_message() -> String {
-    "🚫 git-guardrails: PR body must include a closing keyword linking to a GitHub Issue\n   \
+    "🚫 guard-pr-issue-link: PR body must include a closing keyword linking to a GitHub Issue\n   \
      (e.g., 'Closes #123').\n   \
      Fix: add 'Closes #N', 'Fixes #N', or 'Resolves #N' to the PR body before creating."
         .to_string()
@@ -80,16 +91,21 @@ impl Check for PrIssueLinkGuard {
             return CheckResult::allow();
         };
 
-        // Fast-path: not a gh pr create
-        if !command.contains("gh pr create") {
+        // Fast-path: not a gh pr create (quoted occurrences are data, not commands)
+        if !strip_quotes(command).contains("gh pr create") {
             return CheckResult::allow();
         }
 
-        // Extract --body-file/-F path and try to read the file
-        let body_file_contents: Option<String> =
-            extract_body_file_path(command).and_then(|path| std::fs::read_to_string(&path).ok());
+        // Resolve the body file (if any) into the three-state BodyFile.
+        let body_file = match extract_body_file_path(command) {
+            None => BodyFile::Absent,
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(contents) => BodyFile::Contents(contents),
+                Err(_) => BodyFile::Unreadable,
+            },
+        };
 
-        match judge_pr_create(command, body_file_contents.as_deref()) {
+        match judge_pr_create(command, &body_file) {
             Some(msg) => CheckResult::block(msg),
             None => CheckResult::allow(),
         }
@@ -106,72 +122,111 @@ mod tests {
     // Test case 1: non-gh-pr-create command — allow
     #[test]
     fn non_pr_create_command_allowed() {
-        assert!(judge_pr_create("git status", None).is_none());
+        assert!(judge_pr_create("git status", &BodyFile::Absent).is_none());
     }
 
     // Test case 2: inline body with "Closes #N" — allow
     #[test]
     fn inline_body_closes_allowed() {
-        assert!(judge_pr_create(r#"gh pr create --title x --body "Closes #12""#, None).is_none());
+        assert!(
+            judge_pr_create(
+                r#"gh pr create --title x --body "Closes #12""#,
+                &BodyFile::Absent
+            )
+            .is_none()
+        );
     }
 
     // Test case 3: case-insensitive — "fixes #7" — allow
     #[test]
     fn inline_body_fixes_lowercase_allowed() {
-        assert!(judge_pr_create(r#"gh pr create --title x --body "fixes #7""#, None).is_none());
+        assert!(
+            judge_pr_create(
+                r#"gh pr create --title x --body "fixes #7""#,
+                &BodyFile::Absent
+            )
+            .is_none()
+        );
     }
 
     // Test case 4: "Resolved #9" — allow (resolve[sd]? matches Resolved)
     #[test]
     fn inline_body_resolved_allowed() {
-        assert!(judge_pr_create(r#"gh pr create --title x --body "Resolved #9""#, None).is_none());
+        assert!(
+            judge_pr_create(
+                r#"gh pr create --title x --body "Resolved #9""#,
+                &BodyFile::Absent
+            )
+            .is_none()
+        );
     }
 
     // Test case 5: no closing keyword in inline body — deny
     #[test]
     fn inline_body_no_keyword_denied() {
-        assert!(judge_pr_create(r#"gh pr create --title x --body "no link here""#, None).is_some());
+        assert!(
+            judge_pr_create(
+                r#"gh pr create --title x --body "no link here""#,
+                &BodyFile::Absent
+            )
+            .is_some()
+        );
     }
 
     // Test case 6: --body-file with keyword in file — allow (port improvement)
     #[test]
     fn body_file_with_keyword_allowed() {
-        let file_contents = "This PR closes #42 by implementing the feature.";
-        assert!(judge_pr_create("gh pr create -t x -F body.md", Some(file_contents)).is_none());
+        let contents = BodyFile::Contents("This PR closes #42 by implementing the feature.".into());
+        assert!(judge_pr_create("gh pr create -t x -F body.md", &contents).is_none());
     }
 
-    // Test case 6b: --body-file flag present but file unreadable — deny (fail closed)
+    // Test case 6b: --body-file flag present but file unreadable — fail OPEN (ADR-0001).
+    // An unreadable file is the guard's own verification failure (write/hook race,
+    // permissions, path resolution) — never block the user on it.
     #[test]
-    fn body_file_unreadable_denied() {
-        // body_file_contents = None means the file could not be read
-        // When there's a -F flag but we pass None, judge_pr_create should deny
-        // (this is the fail-closed behavior for unreadable body files)
-        // The command has -F so extract_body_file_path would return Some(path),
-        // but the file read fails, so body_file_contents is None.
-        // judge_pr_create receives None and denies because no keyword in command either.
-        assert!(judge_pr_create("gh pr create -t x -F /nonexistent/body.md", None).is_some());
+    fn body_file_unreadable_fails_open() {
+        assert!(
+            judge_pr_create(
+                "gh pr create -t x -F /nonexistent/body.md",
+                &BodyFile::Unreadable
+            )
+            .is_none()
+        );
     }
 
     // Test case 7: "#5" without closing keyword — deny
     #[test]
     fn bare_issue_reference_without_keyword_denied() {
-        assert!(judge_pr_create(r#"gh pr create --body "see #5""#, None).is_some());
+        assert!(judge_pr_create(r#"gh pr create --body "see #5""#, &BodyFile::Absent).is_some());
     }
 
     // Test case 8: gh pr list — allow
     #[test]
     fn gh_pr_list_allowed() {
-        assert!(judge_pr_create("gh pr list", None).is_none());
+        assert!(judge_pr_create("gh pr list", &BodyFile::Absent).is_none());
+    }
+
+    // Quoted occurrence: 'gh pr create' inside a quoted string is data, not a
+    // command — must not trigger the guard.
+    #[test]
+    fn quoted_pr_create_text_not_guarded() {
+        assert!(
+            judge_pr_create(
+                r#"echo "gh pr create needs a closing keyword in its body""#,
+                &BodyFile::Absent
+            )
+            .is_none()
+        );
     }
 
     // Extra: long-form --body-file flag with keyword in file — allow
     #[test]
     fn long_form_body_file_with_keyword_allowed() {
-        let file_contents = "Fixes #99\n\nDetailed description here.";
+        let contents = BodyFile::Contents("Fixes #99\n\nDetailed description here.".into());
         assert!(
             judge_pr_create(
                 "gh pr create --title 'fix thing' --body-file body.md",
-                Some(file_contents)
+                &contents
             )
             .is_none()
         );
@@ -180,26 +235,31 @@ mod tests {
     // Extra: body file with no keyword — deny
     #[test]
     fn body_file_without_keyword_denied() {
-        let file_contents = "This is a detailed description with no issue link.";
-        assert!(judge_pr_create("gh pr create -t x -F body.md", Some(file_contents)).is_some());
+        let contents =
+            BodyFile::Contents("This is a detailed description with no issue link.".into());
+        assert!(judge_pr_create("gh pr create -t x -F body.md", &contents).is_some());
     }
 
     // Extra: "Closes" uppercase — allow (case insensitive)
     #[test]
     fn closes_uppercase_allowed() {
-        assert!(judge_pr_create(r#"gh pr create --body "CLOSES #10""#, None).is_none());
+        assert!(
+            judge_pr_create(r#"gh pr create --body "CLOSES #10""#, &BodyFile::Absent).is_none()
+        );
     }
 
     // Extra: "Resolves #N" — allow
     #[test]
     fn resolves_allowed() {
-        assert!(judge_pr_create(r#"gh pr create --body "Resolves #88""#, None).is_none());
+        assert!(
+            judge_pr_create(r#"gh pr create --body "Resolves #88""#, &BodyFile::Absent).is_none()
+        );
     }
 
     // Extra: "Fixed #N" — allow
     #[test]
     fn fixed_allowed() {
-        assert!(judge_pr_create(r#"gh pr create --body "Fixed #3""#, None).is_none());
+        assert!(judge_pr_create(r#"gh pr create --body "Fixed #3""#, &BodyFile::Absent).is_none());
     }
 
     // ---- extract_body_file_path tests (pure parser) ----
@@ -258,6 +318,15 @@ mod tests {
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
+    // Check::run with an unreadable body file — fail open end-to-end.
+    #[test]
+    fn check_allows_unreadable_body_file() {
+        let result = PrIssueLinkGuard.run(&make_bash(
+            "gh pr create -t x --body-file /nonexistent/dir/body-that-cannot-exist.md",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
     #[test]
     fn check_allows_no_command() {
         let input = HookInput {
@@ -276,5 +345,16 @@ mod tests {
         assert!(msg.contains("Closes #N"));
         assert!(msg.contains("Fixes #N"));
         assert!(msg.contains("Resolves #N"));
+    }
+
+    // The deny message names this check (not the legacy plugin name) so a
+    // blocked user can find the responsible guard.
+    #[test]
+    fn deny_message_names_the_check() {
+        let msg = deny_message();
+        assert!(
+            msg.contains("guard-pr-issue-link:"),
+            "deny message should name the check, got: {msg}"
+        );
     }
 }
