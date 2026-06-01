@@ -44,6 +44,12 @@ static REPO_SUBCOMMAND: LazyLock<Regex> = LazyLock::new(|| {
 static API_REPOS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
 
+static GIST_COMMAND: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"gh\s+gist\s").expect("pattern should compile"));
+
+static REPO_FORK_COMMAND: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"gh\s+repo\s+fork\b").expect("pattern should compile"));
+
 fn is_write_command(command: &str) -> bool {
     WRITE_ACTIONS.is_match(command)
         || API_WRITE_METHOD.is_match(command)
@@ -481,12 +487,12 @@ impl Check for GhWriteGuard {
         }
 
         // Gists are user-scoped
-        if Regex::new(r"gh\s+gist\s").unwrap().is_match(command) {
+        if GIST_COMMAND.is_match(command) {
             return CheckResult::allow();
         }
 
         // Fork creates under your account
-        if Regex::new(r"gh\s+repo\s+fork\b").unwrap().is_match(command) {
+        if REPO_FORK_COMMAND.is_match(command) {
             return CheckResult::allow();
         }
 
