@@ -309,6 +309,55 @@ fn loop_block_message(writes: &[String], suggestion: Option<&str>) -> String {
     )
 }
 
+/// Build the block message for an unresolvable target, naming the directory
+/// that failed to resolve and a concrete `-R` example.
+fn unresolvable_message(work_dir: &str, example_owner: Option<&str>) -> String {
+    let owner = example_owner.unwrap_or("owner");
+    format!(
+        "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
+         Directory: {work_dir}\n   \
+         Fix: add `-R {owner}/<repo>` to target a repo explicitly"
+    )
+}
+
+/// Build the block message for a disallowed target, including a host-scoping
+/// hint when the target host is neither the default nor in `CADENCE_EXTRA_HOSTS`.
+fn disallowed_message(
+    host: &str,
+    repo: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> String {
+    let all_entries: Vec<String> = allowed_owners
+        .iter()
+        .chain(allowed_repos.iter())
+        .map(|e| e.to_string())
+        .collect();
+
+    // Self-hosted-forge users trip over host scoping: bare allowlist entries
+    // match the default host only. Tell them how to widen, mirroring
+    // guard_push_remote's hint.
+    let default = default_host();
+    let host_hint = if host != default && !extra_hosts.iter().any(|e| e == host) {
+        format!(
+            "\n   Host scope: bare entries match `{default}` only — for `{host}`, qualify them (`{host}/<owner>`) or set `CADENCE_EXTRA_HOSTS={host}`"
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "🚫 git-guardrails: gh write targets repo you don't own\n   \
+         Target:  {host}/{repo}\n   \
+         Allowed: {}{host_hint}\n\n   \
+         DO NOT override with env vars. Instead:\n   \
+         1. Confirm the user intends to write to this repo\n   \
+         2. Write a shell script the user can execute manually",
+        all_entries.join(" ")
+    )
+}
+
 /// Guards against unintended `gh` CLI write operations on unauthorized repositories.
 pub struct GhWriteGuard;
 
@@ -473,10 +522,12 @@ impl Check for GhWriteGuard {
                     ))
                 }
             }
-            RepoResolution::Unresolvable => CheckResult::block(
-                "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
-                 Use -R owner/repo to specify target explicitly.",
-            ),
+            RepoResolution::Unresolvable => {
+                // Suggest the first allowed owner so the fix is concrete even
+                // when no repo can be inferred from the directory.
+                let example_owner = allowed_owners.first().map(|e| e.owner.as_str());
+                CheckResult::block(unresolvable_message(&work_dir, example_owner))
+            }
             RepoResolution::Resolved { host, repo } => {
                 if is_allowed_with_extras(
                     &host,
@@ -487,19 +538,12 @@ impl Check for GhWriteGuard {
                 ) {
                     CheckResult::allow()
                 } else {
-                    let all_entries: Vec<String> = allowed_owners
-                        .iter()
-                        .chain(allowed_repos.iter())
-                        .map(|e| e.to_string())
-                        .collect();
-                    CheckResult::block(format!(
-                        "🚫 git-guardrails: gh write targets repo you don't own\n   \
-                         Target:  {repo}\n   \
-                         Allowed: {}\n\n   \
-                         DO NOT override with env vars. Instead:\n   \
-                         1. Confirm the user intends to write to this repo\n   \
-                         2. Write a shell script the user can execute manually",
-                        all_entries.join(" ")
+                    CheckResult::block(disallowed_message(
+                        &host,
+                        &repo,
+                        &allowed_owners,
+                        &allowed_repos,
+                        &extra_hosts,
                     ))
                 }
             }
@@ -1284,6 +1328,47 @@ mod tests {
         let writes = vec!["`gh pr create`".to_string()];
         let msg = loop_block_message(&writes, None);
         assert!(msg.contains("-R owner/repo"));
+    }
+
+    // --- #44: actionable deny messages ---
+
+    #[test]
+    fn unresolvable_message_names_directory() {
+        let msg = unresolvable_message("/Users/cameron/scratch", Some("cameronsjo"));
+        assert!(msg.contains("Directory: /Users/cameron/scratch"));
+        assert!(msg.contains("-R cameronsjo/<repo>"));
+    }
+
+    #[test]
+    fn unresolvable_message_generic_without_owner() {
+        let msg = unresolvable_message("/tmp", None);
+        assert!(msg.contains("Directory: /tmp"));
+        assert!(msg.contains("-R owner/<repo>"));
+    }
+
+    #[test]
+    fn disallowed_message_includes_host_hint_for_self_hosted() {
+        let o = owners(&["cameron"]);
+        let msg = disallowed_message("git.sjo.lol", "stranger/repo", &o, &[], &[]);
+        assert!(msg.contains("CADENCE_EXTRA_HOSTS=git.sjo.lol"));
+        assert!(msg.contains("git.sjo.lol/stranger/repo"));
+    }
+
+    #[test]
+    fn disallowed_message_no_hint_for_default_host() {
+        let o = owners(&["cameronsjo"]);
+        let msg = disallowed_message("github.com", "stranger/repo", &o, &[], &[]);
+        assert!(!msg.contains("Host scope"));
+        assert!(msg.contains("stranger/repo"));
+        assert!(msg.contains("cameronsjo"));
+    }
+
+    #[test]
+    fn disallowed_message_no_hint_when_host_in_extras() {
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        let msg = disallowed_message("git.sjo.lol", "stranger/repo", &o, &[], &extras);
+        assert!(!msg.contains("Host scope"));
     }
 
     // --- CodeRabbit #6: read-only gh loops should not block ---
