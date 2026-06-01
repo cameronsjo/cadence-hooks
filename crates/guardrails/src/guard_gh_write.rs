@@ -4,7 +4,9 @@
 //! comment, edit, delete, etc.) and verifies the target repository belongs to
 //! an allowed owner list. Also blocks looped writes and cross-repo mutations.
 
-use cadence_hooks_core::config::{self, AllowEntry, default_host, env_allow_entries};
+use cadence_hooks_core::config::{
+    self, AllowEntry, default_host, env_allow_entries, env_extra_hosts,
+};
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
@@ -83,8 +85,14 @@ fn extract_repo_flag_str(command: &str) -> Option<String> {
 enum RepoResolution {
     /// Fully resolved: host + "owner/repo"
     Resolved { host: String, repo: String },
-    /// Fork detected: both remotes present, need -R to disambiguate
-    Fork { origin: String, upstream: String },
+    /// Fork detected: both origin and upstream remotes present, each with its
+    /// own host so ownership can be judged per-remote.
+    Fork {
+        origin_host: String,
+        origin: String,
+        upstream_host: String,
+        upstream: String,
+    },
     /// Cannot determine target
     Unresolvable,
 }
@@ -143,13 +151,14 @@ fn resolve_target_repo(
     if let Some(upstream_url) = git_command(work_dir, &["remote", "get-url", "upstream"]) {
         let origin_url =
             git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
-        let origin = host_and_repo_from_url(&origin_url)
-            .map(|(_, r)| r)
-            .unwrap_or_default();
-        let upstream = host_and_repo_from_url(&upstream_url)
-            .map(|(_, r)| r)
-            .unwrap_or_default();
-        return RepoResolution::Fork { origin, upstream };
+        let (origin_host, origin) = host_and_repo_from_url(&origin_url).unwrap_or_default();
+        let (upstream_host, upstream) = host_and_repo_from_url(&upstream_url).unwrap_or_default();
+        return RepoResolution::Fork {
+            origin_host,
+            origin,
+            upstream_host,
+            upstream,
+        };
     }
 
     if let Some(origin_url) = git_command(work_dir, &["remote", "get-url", "origin"]) {
@@ -168,10 +177,62 @@ fn is_allowed(
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> bool {
+    is_allowed_with_extras(host, repo, allowed_owners, allowed_repos, &[])
+}
+
+/// Like [`is_allowed`], but bare allowlist entries also match hosts listed in
+/// `CADENCE_EXTRA_HOSTS`. Used on paths where the target host comes from git
+/// remotes (single-command resolution, fork checks, deterministic loops) —
+/// explicit `-R` targets always go to the default host, so they don't need it.
+fn is_allowed_with_extras(
+    host: &str,
+    repo: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> bool {
     let mut parts = repo.splitn(2, '/');
     let owner = parts.next().unwrap_or("");
     let repo_name = parts.next().unwrap_or("");
-    config::is_allowed(host, owner, repo_name, allowed_owners, allowed_repos)
+    config::is_allowed_with_extra_hosts(
+        host,
+        owner,
+        repo_name,
+        allowed_owners,
+        allowed_repos,
+        extra_hosts,
+    )
+}
+
+/// Judge a fork (origin + upstream remotes) for write access: allowed iff
+/// **both** remotes belong to allowed owners, each checked against its own host.
+fn fork_allowed(
+    origin_host: &str,
+    origin: &str,
+    upstream_host: &str,
+    upstream: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> bool {
+    // Fail closed on unparseable remotes: an empty repo string means we could
+    // not extract owner/repo from the remote URL.
+    !origin.is_empty()
+        && !upstream.is_empty()
+        && is_allowed_with_extras(
+            origin_host,
+            origin,
+            allowed_owners,
+            allowed_repos,
+            extra_hosts,
+        )
+        && is_allowed_with_extras(
+            upstream_host,
+            upstream,
+            allowed_owners,
+            allowed_repos,
+            extra_hosts,
+        )
 }
 
 /// Guards against unintended `gh` CLI write operations on unauthorized repositories.
@@ -193,6 +254,7 @@ impl Check for GhWriteGuard {
 
         let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
+        let extra_hosts = env_extra_hosts();
 
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_gh_loops(command) {
@@ -295,19 +357,46 @@ impl Check for GhWriteGuard {
         let work_dir = parse_work_dir(command, cwd);
 
         match resolve_target_repo(command, &work_dir, &allowed_owners) {
-            RepoResolution::Fork { origin, upstream } => CheckResult::block(format!(
-                "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
-                 Fork:     {origin}\n   \
-                 Upstream: {upstream}\n\n   \
-                 Use -R {origin} to target your fork\n   \
-                 Use -R {upstream} to target upstream (if intended)"
-            )),
+            RepoResolution::Fork {
+                origin_host,
+                origin,
+                upstream_host,
+                upstream,
+            } => {
+                // Both remotes owned (each judged against its own host) — the
+                // write lands somewhere you control either way.
+                if fork_allowed(
+                    &origin_host,
+                    &origin,
+                    &upstream_host,
+                    &upstream,
+                    &allowed_owners,
+                    &allowed_repos,
+                    &extra_hosts,
+                ) {
+                    CheckResult::allow()
+                } else {
+                    CheckResult::block(format!(
+                        "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
+                         Fork:     {origin_host}/{origin}\n   \
+                         Upstream: {upstream_host}/{upstream}\n\n   \
+                         Use -R {origin} to target your fork\n   \
+                         Use -R {upstream} to target upstream (if intended)"
+                    ))
+                }
+            }
             RepoResolution::Unresolvable => CheckResult::block(
                 "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
                  Use -R owner/repo to specify target explicitly.",
             ),
             RepoResolution::Resolved { host, repo } => {
-                if is_allowed(&host, &repo, &allowed_owners, &allowed_repos) {
+                if is_allowed_with_extras(
+                    &host,
+                    &repo,
+                    &allowed_owners,
+                    &allowed_repos,
+                    &extra_hosts,
+                ) {
                     CheckResult::allow()
                 } else {
                     let all_entries: Vec<String> = allowed_owners
@@ -485,6 +574,138 @@ mod tests {
             "cameron/repo",
             &owners(&["gitea.internal/cameron"]),
             &[],
+        ));
+    }
+
+    // --- #44: fork ownership matrix ---
+
+    #[test]
+    fn fork_both_owned_allowed() {
+        let o = owners(&["cameronsjo", "partner"]);
+        assert!(fork_allowed(
+            "github.com",
+            "cameronsjo/tool",
+            "github.com",
+            "partner/tool",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_unowned_upstream_blocked() {
+        let o = owners(&["cameronsjo"]);
+        assert!(!fork_allowed(
+            "github.com",
+            "cameronsjo/fork",
+            "github.com",
+            "stranger/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_unowned_origin_blocked() {
+        let o = owners(&["cameronsjo"]);
+        assert!(!fork_allowed(
+            "github.com",
+            "stranger/fork",
+            "github.com",
+            "cameronsjo/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_upstream_other_host_bare_entry_blocked() {
+        // Bare owner entries match the default host only — an upstream on a
+        // self-hosted forge must not pass through a bare entry.
+        let o = owners(&["cameron"]);
+        assert!(!fork_allowed(
+            "github.com",
+            "cameron/fork",
+            "gitea.internal",
+            "cameron/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_upstream_host_qualified_allowed() {
+        let o = owners(&["cameron", "gitea.internal/cameron"]);
+        assert!(fork_allowed(
+            "github.com",
+            "cameron/fork",
+            "gitea.internal",
+            "cameron/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_extra_hosts_allowed() {
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(fork_allowed(
+            "github.com",
+            "cameron/fork",
+            "git.sjo.lol",
+            "cameron/orig",
+            &o,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn fork_empty_remote_blocked() {
+        // An unparseable remote URL yields an empty repo string — fail closed.
+        let o = owners(&["cameronsjo"]);
+        assert!(!fork_allowed(
+            "github.com",
+            "",
+            "github.com",
+            "cameronsjo/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    // --- #44: extras-aware single-target check ---
+
+    #[test]
+    fn is_allowed_with_extras_gitea() {
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(is_allowed_with_extras(
+            "git.sjo.lol",
+            "cameron/repo",
+            &o,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn is_allowed_with_extras_unlisted_host_blocked() {
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(!is_allowed_with_extras(
+            "evil.example",
+            "cameron/repo",
+            &o,
+            &[],
+            &extras,
         ));
     }
 
