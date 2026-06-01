@@ -148,6 +148,15 @@ fn resolve_target_repo(
     }
 
     // 4. Git remotes (with fork detection)
+    resolve_from_git_remotes(work_dir)
+}
+
+/// Resolve a repo purely from a directory's git remotes (fork-aware).
+///
+/// Shared by single-command resolution (when no explicit target appears in
+/// the command) and the deterministic-loop policy (where command-string
+/// flags are absent by definition).
+fn resolve_from_git_remotes(work_dir: &str) -> RepoResolution {
     if let Some(upstream_url) = git_command(work_dir, &["remote", "get-url", "upstream"]) {
         let origin_url =
             git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
@@ -235,6 +244,71 @@ fn fork_allowed(
         )
 }
 
+/// Policy decision for a gh write inside a loop without an explicit `-R` flag.
+#[derive(Debug, PartialEq)]
+enum LoopWriteDecision {
+    /// Deterministic loop in an owned repo — allow.
+    Allow,
+    /// Block, optionally suggesting the resolved `-R owner/repo` fix.
+    Block { suggestion: Option<String> },
+}
+
+/// Judge a looped gh write that lacks an explicit `-R` target.
+///
+/// Relaxed policy (default): allow iff the loop body provably never changes
+/// directory AND the cwd resolves to a single owned, non-fork repo. Under
+/// those conditions every iteration's gh resolves to the same repo the hook
+/// sees — identical trust to a single command.
+///
+/// Strict policy (`CADENCE_GH_STRICT_LOOPS=1`): always block, but include the
+/// resolved repo as a copy-paste `-R` suggestion when available.
+fn judge_loop_write(
+    strict: bool,
+    body_mutates_cwd: Option<bool>,
+    cwd_resolution: &RepoResolution,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> LoopWriteDecision {
+    // A concrete -R suggestion exists exactly when the cwd resolves to a
+    // single owned, non-fork repo. (Empty allowlists can never produce one —
+    // the unconfigured fail-safe holds for loops too.)
+    let suggestion = match cwd_resolution {
+        RepoResolution::Resolved { host, repo }
+            if is_allowed_with_extras(host, repo, allowed_owners, allowed_repos, extra_hosts) =>
+        {
+            Some(repo.clone())
+        }
+        _ => None,
+    };
+
+    // Relaxed: the loop body provably never changes directory, so every
+    // iteration's gh resolves to the suggested repo — same trust as a
+    // single command. Anything else (strict mode, cd in body, parse
+    // failure, fork, unowned/unresolvable cwd) blocks.
+    if !strict && body_mutates_cwd == Some(false) && suggestion.is_some() {
+        return LoopWriteDecision::Allow;
+    }
+
+    LoopWriteDecision::Block { suggestion }
+}
+
+/// Build the block message for a looped gh write, with a concrete `-R` fix
+/// when the cwd resolved to an owned repo.
+fn loop_block_message(writes: &[String], suggestion: Option<&str>) -> String {
+    let found = if writes.is_empty() {
+        "gh write command(s) without -R".to_string()
+    } else {
+        writes.join(", ")
+    };
+    let fix_target = suggestion.unwrap_or("owner/repo");
+    format!(
+        "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
+         Found: {found}\n   \
+         Fix: add `-R {fix_target}` to each command",
+    )
+}
+
 /// Guards against unintended `gh` CLI write operations on unauthorized repositories.
 pub struct GhWriteGuard;
 
@@ -296,24 +370,38 @@ impl Check for GhWriteGuard {
                     is_write_command(&reconstructed)
                 });
                 if has_write {
-                    let writes: Vec<String> = cmds
-                        .iter()
-                        .filter(|c| {
-                            let reconstructed = format!("gh {}", c.args.join(" "));
-                            c.explicit_repo.is_none() && is_write_command(&reconstructed)
-                        })
-                        .map(|c| format!("`gh {}`", c.args.join(" ")))
-                        .collect();
-                    let found = if writes.is_empty() {
-                        "gh write command(s) without -R".to_string()
-                    } else {
-                        writes.join(", ")
-                    };
-                    return CheckResult::block(format!(
-                        "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
-                         Found: {found}\n   \
-                         Fix: add `-R owner/repo` to each command",
-                    ));
+                    // Relaxed-when-deterministic policy (#44): a loop whose
+                    // body never changes directory, running in an owned
+                    // non-fork repo, targets that repo on every iteration —
+                    // the same trust extended to single commands. Set
+                    // CADENCE_GH_STRICT_LOOPS=1 to restore unconditional
+                    // blocking.
+                    let strict = std::env::var("CADENCE_GH_STRICT_LOOPS").is_ok_and(|v| v == "1");
+                    let cwd = input.cwd.as_deref().unwrap_or(".");
+                    let work_dir = parse_work_dir(command, cwd);
+                    let decision = judge_loop_write(
+                        strict,
+                        loop_analysis::loop_bodies_mutate_cwd(command),
+                        &resolve_from_git_remotes(&work_dir),
+                        &allowed_owners,
+                        &allowed_repos,
+                        &extra_hosts,
+                    );
+                    if let LoopWriteDecision::Block { suggestion } = decision {
+                        let writes: Vec<String> = cmds
+                            .iter()
+                            .filter(|c| {
+                                let reconstructed = format!("gh {}", c.args.join(" "));
+                                c.explicit_repo.is_none() && is_write_command(&reconstructed)
+                            })
+                            .map(|c| format!("`gh {}`", c.args.join(" ")))
+                            .collect();
+                        return CheckResult::block(loop_block_message(
+                            &writes,
+                            suggestion.as_deref(),
+                        ));
+                    }
+                    // Deterministic loop in owned repo — allow
                 }
                 // All looped gh commands are read-only — allow
             }
@@ -1047,6 +1135,155 @@ mod tests {
             is_write_command("gh api repos/foo/bar --method Delete"),
             "mixed-case HTTP method should be detected as write"
         );
+    }
+
+    // --- #44: loop write policy (relaxed-when-deterministic + strict toggle) ---
+
+    fn resolved(repo: &str) -> RepoResolution {
+        RepoResolution::Resolved {
+            host: "github.com".to_string(),
+            repo: repo.to_string(),
+        }
+    }
+
+    #[test]
+    fn relaxed_deterministic_owned_loop_allows() {
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(
+            false,
+            Some(false),
+            &resolved("cameronsjo/repo"),
+            &o,
+            &[],
+            &[],
+        );
+        assert_eq!(decision, LoopWriteDecision::Allow);
+    }
+
+    #[test]
+    fn strict_toggle_blocks_with_suggestion() {
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(
+            true,
+            Some(false),
+            &resolved("cameronsjo/repo"),
+            &o,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            decision,
+            LoopWriteDecision::Block {
+                suggestion: Some("cameronsjo/repo".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn relaxed_cd_in_body_blocks_with_suggestion() {
+        // Loop body changes cwd — non-deterministic, block even though cwd is owned.
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(
+            false,
+            Some(true),
+            &resolved("cameronsjo/repo"),
+            &o,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            decision,
+            LoopWriteDecision::Block {
+                suggestion: Some("cameronsjo/repo".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn relaxed_parse_failure_blocks() {
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(false, None, &resolved("cameronsjo/repo"), &o, &[], &[]);
+        assert!(matches!(decision, LoopWriteDecision::Block { .. }));
+    }
+
+    #[test]
+    fn relaxed_unowned_cwd_blocks_without_suggestion() {
+        let o = owners(&["cameronsjo"]);
+        let decision =
+            judge_loop_write(false, Some(false), &resolved("stranger/repo"), &o, &[], &[]);
+        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
+    }
+
+    #[test]
+    fn relaxed_fork_cwd_blocks() {
+        let o = owners(&["cameronsjo"]);
+        let fork = RepoResolution::Fork {
+            origin_host: "github.com".to_string(),
+            origin: "cameronsjo/fork".to_string(),
+            upstream_host: "github.com".to_string(),
+            upstream: "stranger/orig".to_string(),
+        };
+        let decision = judge_loop_write(false, Some(false), &fork, &o, &[], &[]);
+        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
+    }
+
+    #[test]
+    fn relaxed_unresolvable_cwd_blocks() {
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(
+            false,
+            Some(false),
+            &RepoResolution::Unresolvable,
+            &o,
+            &[],
+            &[],
+        );
+        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
+    }
+
+    #[test]
+    fn relaxed_unconfigured_owners_blocks() {
+        // Fail-safe invariant: unset CADENCE_ALLOWED_OWNERS (empty list) blocks
+        // even a deterministic loop in a resolvable repo.
+        let decision = judge_loop_write(
+            false,
+            Some(false),
+            &resolved("cameronsjo/repo"),
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
+    }
+
+    #[test]
+    fn relaxed_extra_hosts_owned_loop_allows() {
+        // Self-hosted forge cwd, owner allowed via CADENCE_EXTRA_HOSTS.
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        let resolution = RepoResolution::Resolved {
+            host: "git.sjo.lol".to_string(),
+            repo: "cameron/tools".to_string(),
+        };
+        let decision = judge_loop_write(false, Some(false), &resolution, &o, &[], &extras);
+        assert_eq!(decision, LoopWriteDecision::Allow);
+    }
+
+    // --- #44: loop block message ---
+
+    #[test]
+    fn loop_block_message_includes_suggestion() {
+        let writes = vec!["`gh issue close $i`".to_string()];
+        let msg = loop_block_message(&writes, Some("cameronsjo/cadence-hooks"));
+        assert!(msg.contains("-R cameronsjo/cadence-hooks"));
+        assert!(msg.contains("`gh issue close $i`"));
+    }
+
+    #[test]
+    fn loop_block_message_generic_without_suggestion() {
+        let writes = vec!["`gh pr create`".to_string()];
+        let msg = loop_block_message(&writes, None);
+        assert!(msg.contains("-R owner/repo"));
     }
 
     // --- CodeRabbit #6: read-only gh loops should not block ---
