@@ -74,6 +74,12 @@ exit 0. They never block a tool call (see [Hook Protocol](#hook-protocol)).
 to add a `_keys` array of raw payload keys to subagent records — useful for
 spotting schema additions across Claude Code releases.
 
+Cost is computed **per model**: when a commit range spans multiple models
+(opus → sonnet handoffs, fast-mode toggles), each model's tokens are priced at
+its own rates and summed. Records carry the breakdown in a `byModel` array
+(`[{model, tokens, costUsd}]`); rows written before this field existed are
+single-model by definition.
+
 ### lab (cadence-lab)
 
 Experimental hooks for the [cadence-lab](https://github.com/cameronsjo/cadence-lab)

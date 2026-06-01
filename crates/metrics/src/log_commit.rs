@@ -5,7 +5,7 @@
 //! Port of `log-commit.sh`. Silent no-op on any failure — never blocks.
 
 use crate::common;
-use crate::compute_cost::compute_cost;
+use crate::compute_cost::{compute_cost, compute_cost_by_model};
 use crate::prices::Prices;
 use crate::scan_tokens::{ScanResult, scan_tokens};
 use cadence_hooks_core::{Logger, MetricsInput};
@@ -82,7 +82,7 @@ impl Logger for LogCommit {
         };
 
         let prices = Prices::load(self.prices_path.as_deref());
-        let cost = compute_cost(&scan.tokens, &scan.model, &prices);
+        let cost = compute_cost_by_model(&scan.by_model, &prices);
 
         let since_marker = last_message_id.as_deref().unwrap_or("session-start");
         let branch = common::branch(input.cwd.as_deref());
@@ -98,6 +98,7 @@ impl Logger for LogCommit {
             &scan,
             cost,
             since_marker,
+            &prices,
         );
 
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -143,7 +144,27 @@ fn build_commit_record(
     scan: &ScanResult,
     cost: f64,
     since_marker: &str,
+    prices: &Prices,
 ) -> Value {
+    // Per-model breakdown for the byModel field.
+    let by_model: Vec<Value> = scan
+        .by_model
+        .iter()
+        .map(|(model, tokens)| {
+            let bucket_cost = compute_cost(tokens, model, prices);
+            json!({
+                "model": model,
+                "tokens": {
+                    "input": tokens.input,
+                    "cacheCreate": tokens.cache_create,
+                    "cacheRead": tokens.cache_read,
+                    "output": tokens.output,
+                },
+                "costUsd": bucket_cost,
+            })
+        })
+        .collect();
+
     json!({
         "ts": ts,
         "sessionId": input.session_id,
@@ -160,6 +181,7 @@ fn build_commit_record(
             "output": scan.tokens.output,
         },
         "costUsd": cost,
+        "byModel": by_model,
         "messagesScanned": scan.messages_scanned,
         "lastMessageId": scan.last_message_id,
         "sinceMarker": since_marker,
@@ -173,6 +195,7 @@ fn build_commit_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prices::Prices;
     use crate::scan_tokens::Tokens;
 
     #[test]
@@ -214,6 +237,15 @@ mod tests {
             last_message_id: "m9".into(),
             messages_scanned: 3,
             model: "claude-opus-4-7".into(),
+            by_model: vec![(
+                "claude-opus-4-7".into(),
+                Tokens {
+                    input: 100,
+                    cache_create: 50,
+                    cache_read: 200,
+                    output: 30,
+                },
+            )],
         }
     }
 
@@ -229,6 +261,7 @@ mod tests {
 
     #[test]
     fn commit_record_has_full_schema() {
+        let prices = Prices::embedded();
         let record = build_commit_record(
             "2026-05-19T00:00:00Z",
             &sample_input(),
@@ -239,6 +272,7 @@ mod tests {
             &sample_scan(),
             0.001234,
             "m1",
+            &prices,
         );
         assert_eq!(record["sessionId"], "s1");
         assert_eq!(record["commitHashBefore"], "aaaa");
@@ -257,10 +291,15 @@ mod tests {
         assert_eq!(record["agentType"], "Explore");
         // Main-thread fields absent → null, not omitted.
         assert!(record["parentSessionId"].is_null());
+        // byModel is always present.
+        assert!(record["byModel"].is_array());
+        assert_eq!(record["byModel"].as_array().unwrap().len(), 1);
+        assert_eq!(record["byModel"][0]["model"], "claude-opus-4-7");
     }
 
     #[test]
     fn commit_record_session_start_marker() {
+        let prices = Prices::embedded();
         let record = build_commit_record(
             "2026-05-19T00:00:00Z",
             &sample_input(),
@@ -271,9 +310,75 @@ mod tests {
             &sample_scan(),
             0.0,
             "session-start",
+            &prices,
         );
         assert_eq!(record["sinceMarker"], "session-start");
         assert_eq!(record["branch"], "");
         assert_eq!(record["costUsd"], 0.0);
+    }
+
+    #[test]
+    fn commit_record_by_model_multi_bucket() {
+        use crate::scan_tokens::Tokens;
+        let prices = Prices::embedded();
+        let scan = ScanResult {
+            tokens: Tokens {
+                input: 300,
+                cache_create: 0,
+                cache_read: 0,
+                output: 30,
+            },
+            last_message_id: "m2".into(),
+            messages_scanned: 2,
+            model: "claude-opus-4-7".into(),
+            by_model: vec![
+                (
+                    "claude-opus-4-7".into(),
+                    Tokens {
+                        input: 200,
+                        cache_create: 0,
+                        cache_read: 0,
+                        output: 20,
+                    },
+                ),
+                (
+                    "claude-sonnet-4-5".into(),
+                    Tokens {
+                        input: 100,
+                        cache_create: 0,
+                        cache_read: 0,
+                        output: 10,
+                    },
+                ),
+            ],
+        };
+        let cost = compute_cost_by_model(&scan.by_model, &prices);
+        let record = build_commit_record(
+            "2026-06-01T00:00:00Z",
+            &sample_input(),
+            "aaaa",
+            "bbbb",
+            "main",
+            "myrepo",
+            &scan,
+            cost,
+            "m0",
+            &prices,
+        );
+        let by_model_arr = record["byModel"].as_array().unwrap();
+        assert_eq!(by_model_arr.len(), 2);
+        // Both buckets have model + tokens + costUsd
+        for bucket in by_model_arr {
+            assert!(bucket["model"].is_string());
+            assert!(bucket["tokens"]["input"].is_number());
+            assert!(bucket["costUsd"].is_number());
+        }
+        // Grand total costUsd matches sum of per-bucket costUsd
+        let bucket_sum: f64 = by_model_arr
+            .iter()
+            .map(|b| b["costUsd"].as_f64().unwrap())
+            .sum();
+        let total = record["costUsd"].as_f64().unwrap();
+        assert!((total - bucket_sum).abs() < 1e-9);
     }
 }
