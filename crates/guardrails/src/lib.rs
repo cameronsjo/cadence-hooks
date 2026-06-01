@@ -15,6 +15,8 @@ pub mod guard_gh_dangerous;
 pub mod guard_gh_write;
 /// Nudge to scaffold project standards after `git init`.
 pub mod guard_git_init;
+/// Block `gh pr create` when the PR body has no closing keyword linking to an issue.
+pub mod guard_pr_issue_link;
 /// Block `git push` to remotes owned by others.
 pub mod guard_push_remote;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
