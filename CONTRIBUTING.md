@@ -19,6 +19,23 @@ Requires Rust 2024 edition (1.85+).
 3. Run `make ci` before pushing
 4. Open a PR against `main`
 
+## Prerelease Builds
+
+The Homebrew beta channel (`cadence-hooks-beta`) is retired — it lagged stable
+and created version-skew problems instead of catching them (#39). To run
+prerelease code ahead of a stable release, install straight from a branch:
+
+```bash
+cargo install --git https://github.com/cameronsjo/cadence-hooks.git --branch <branch>
+# or pin a specific commit:
+cargo install --git https://github.com/cameronsjo/cadence-hooks.git --rev <sha>
+```
+
+This installs to `~/.cargo/bin/cadence-hooks`, which shadows the Homebrew
+binary while `~/.cargo/bin` precedes `/opt/homebrew/bin` on `PATH`. Return to
+stable with `cargo uninstall cadence-hooks` followed by
+`brew install cameronsjo/tap/cadence-hooks` (or `brew upgrade`).
+
 ## Code Style
 
 - **Conventional Commits**: `type(scope): description` (e.g., `fix(cadence): scope safe-template check to target`)
