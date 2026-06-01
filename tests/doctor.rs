@@ -73,8 +73,8 @@ fn doctor_detects_single_quoted_plugin_root() {
 
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "should exit 1 when violations found. stdout: {}",
+        Some(2),
+        "should exit 2 when shell-expansion errors found. stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -162,7 +162,8 @@ fn doctor_finds_violation_across_multiple_plugins() {
         .output()
         .expect("failed to execute");
 
-    assert_eq!(output.status.code(), Some(1));
+    // Shell-expansion bugs are Severity::Error → exit 2.
+    assert_eq!(output.status.code(), Some(2));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("buggy-plugin-a"));
     assert!(stdout.contains("buggy-plugin-b"));

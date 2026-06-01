@@ -204,18 +204,18 @@ fn scan_hooks_json(plugin: &str, path: &Path, raw: &str, json: &serde_json::Valu
                 }
 
                 // Check 2: subcommand cross-reference (Warning).
-                if let Some((ns, sub)) = extract_invocation(cmd) {
-                    if let Some(diag) = judge_invocation(&ns, &sub) {
-                        findings.push(Finding {
-                            severity: Severity::Warning,
-                            plugin: plugin.to_string(),
-                            file: path.to_path_buf(),
-                            line: find_line_number(raw, cmd),
-                            snippet: cmd.to_string(),
-                            diagnosis: diag.diagnosis,
-                            remediation: diag.remediation,
-                        });
-                    }
+                if let Some((ns, sub)) = extract_invocation(cmd)
+                    && let Some(diag) = judge_invocation(&ns, &sub)
+                {
+                    findings.push(Finding {
+                        severity: Severity::Warning,
+                        plugin: plugin.to_string(),
+                        file: path.to_path_buf(),
+                        line: find_line_number(raw, cmd),
+                        snippet: cmd.to_string(),
+                        diagnosis: diag.diagnosis,
+                        remediation: diag.remediation,
+                    });
                 }
             }
         }
