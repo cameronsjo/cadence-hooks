@@ -178,7 +178,8 @@ All cadence-hooks config lives under the `CADENCE_*` prefix. `OBSIDIAN_VAULT` is
 | `CADENCE_BYPASS` | all hooks | Set to `1` to skip all enforcement (maintenance bypass) |
 | `CADENCE_ALLOWED_OWNERS` | `guard-push-remote`, `guard-gh-write` | Space or comma-separated usernames |
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space or comma-separated `owner/repo` pairs |
-| `CADENCE_EXTRA_HOSTS` | `guard-push-remote` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host |
+| `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host |
+| `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
 | `OBSIDIAN_VAULT` | `trash-guard` | Absolute path to Obsidian vault |
 
 #### Allowlist host scoping
@@ -196,6 +197,16 @@ export CADENCE_EXTRA_HOSTS="git.sjo.lol"
 # Or scope the entry explicitly without widening
 export CADENCE_ALLOWED_OWNERS="cameron git.sjo.lol/cameron"
 ```
+
+#### How guard-gh-write resolves targets
+
+For a single `gh` write, the target resolves in order: explicit `-R`/`--repo` flag (all four forms: `-R x`, `-Rx`, `--repo x`, `--repo=x`) → positional `owner/repo` argument → `gh api repos/...` path → the working directory's git remotes. A resolved target is checked against the allowlists; an owned target proceeds without any flag.
+
+**Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`.
+
+**Loops** containing gh writes without `-R` follow a *relaxed-when-deterministic* policy: the write is allowed when the loop body provably never changes directory (no `cd`/`pushd`/`popd`/`eval`/`source`) **and** the working directory resolves to a single owned, non-fork repo. Under those conditions every iteration targets the same repo the guard verified — the same trust extended to single commands. Anything the analyzer cannot prove (directory changes inside the body, parse failures, forks, unowned directories) still blocks.
+
+Set `CADENCE_GH_STRICT_LOOPS=1` to disable the relaxation and block every looped gh write that lacks `-R` (the pre-0.12 behavior). Block messages include the resolved `-R owner/repo` fix when the working directory is owned.
 
 Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is hidden from `--help` and refuses to run interactively. `configure --list` remains available. Run `configure` from a real terminal to change hook state.
 

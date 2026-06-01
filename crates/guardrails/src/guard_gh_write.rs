@@ -4,7 +4,9 @@
 //! comment, edit, delete, etc.) and verifies the target repository belongs to
 //! an allowed owner list. Also blocks looped writes and cross-repo mutations.
 
-use cadence_hooks_core::config::{self, AllowEntry, default_host, env_allow_entries};
+use cadence_hooks_core::config::{
+    self, AllowEntry, default_host, env_allow_entries, env_extra_hosts,
+};
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
@@ -34,9 +36,6 @@ static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
 static API_INPUT_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+api.*\s--input\s").expect("pattern should compile"));
 
-static REPO_FLAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(-R|--repo)\s+([^ ]+)").expect("pattern should compile"));
-
 static REPO_SUBCOMMAND: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"gh\s+repo\s+(archive|delete|rename|unarchive|fork|clone|create)\b")
         .expect("pattern should compile")
@@ -52,13 +51,48 @@ fn is_write_command(command: &str) -> bool {
         || API_INPUT_FLAG.is_match(command)
 }
 
+/// Extract a `-R`/`--repo` flag value from a raw command string.
+///
+/// Handles all four gh CLI forms: `-R x`, `-Rx`, `--repo x`, `--repo=x` —
+/// mirroring `loop_analysis::extract_repo_flag`, which does the same over
+/// parsed AST words. Values keep their quotes trimmed so `--repo "o/r"`
+/// resolves to `o/r`.
+fn extract_repo_flag_str(command: &str) -> Option<String> {
+    let trim_value = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let mut iter = words.iter();
+    while let Some(word) = iter.next() {
+        if *word == "-R" || *word == "--repo" {
+            return iter.next().map(|s| trim_value(s));
+        }
+        if let Some(repo) = word.strip_prefix("--repo=") {
+            return Some(trim_value(repo));
+        }
+        // Compact form: -Rowner/repo (no space). Exclude other dash-prefixed
+        // flags by requiring the remainder not start with another dash.
+        if let Some(repo) = word.strip_prefix("-R")
+            && !repo.is_empty()
+            && !repo.starts_with('-')
+        {
+            return Some(trim_value(repo));
+        }
+    }
+    None
+}
+
 /// Resolve target repo from command context.
 #[derive(Debug)]
 enum RepoResolution {
     /// Fully resolved: host + "owner/repo"
     Resolved { host: String, repo: String },
-    /// Fork detected: both remotes present, need -R to disambiguate
-    Fork { origin: String, upstream: String },
+    /// Fork detected: both origin and upstream remotes present, each with its
+    /// own host so ownership can be judged per-remote.
+    Fork {
+        origin_host: String,
+        origin: String,
+        upstream_host: String,
+        upstream: String,
+    },
     /// Cannot determine target
     Unresolvable,
 }
@@ -71,13 +105,8 @@ fn resolve_target_repo(
     let dh = default_host();
 
     // 1. Explicit -R / --repo flag (gh CLI always targets GH_HOST or github.com)
-    if let Some(caps) = REPO_FLAG.captures(command)
-        && let Some(repo) = caps.get(2)
-    {
-        return RepoResolution::Resolved {
-            host: dh,
-            repo: repo.as_str().to_string(),
-        };
+    if let Some(repo) = extract_repo_flag_str(command) {
+        return RepoResolution::Resolved { host: dh, repo };
     }
 
     // 2. gh repo <subcommand> <owner/repo> (positional arg)
@@ -119,16 +148,26 @@ fn resolve_target_repo(
     }
 
     // 4. Git remotes (with fork detection)
+    resolve_from_git_remotes(work_dir)
+}
+
+/// Resolve a repo purely from a directory's git remotes (fork-aware).
+///
+/// Shared by single-command resolution (when no explicit target appears in
+/// the command) and the deterministic-loop policy (where command-string
+/// flags are absent by definition).
+fn resolve_from_git_remotes(work_dir: &str) -> RepoResolution {
     if let Some(upstream_url) = git_command(work_dir, &["remote", "get-url", "upstream"]) {
         let origin_url =
             git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
-        let origin = host_and_repo_from_url(&origin_url)
-            .map(|(_, r)| r)
-            .unwrap_or_default();
-        let upstream = host_and_repo_from_url(&upstream_url)
-            .map(|(_, r)| r)
-            .unwrap_or_default();
-        return RepoResolution::Fork { origin, upstream };
+        let (origin_host, origin) = host_and_repo_from_url(&origin_url).unwrap_or_default();
+        let (upstream_host, upstream) = host_and_repo_from_url(&upstream_url).unwrap_or_default();
+        return RepoResolution::Fork {
+            origin_host,
+            origin,
+            upstream_host,
+            upstream,
+        };
     }
 
     if let Some(origin_url) = git_command(work_dir, &["remote", "get-url", "origin"]) {
@@ -147,10 +186,176 @@ fn is_allowed(
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> bool {
+    is_allowed_with_extras(host, repo, allowed_owners, allowed_repos, &[])
+}
+
+/// Like [`is_allowed`], but bare allowlist entries also match hosts listed in
+/// `CADENCE_EXTRA_HOSTS`. Used on paths where the target host comes from git
+/// remotes (single-command resolution, fork checks, deterministic loops) —
+/// explicit `-R` targets always go to the default host, so they don't need it.
+fn is_allowed_with_extras(
+    host: &str,
+    repo: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> bool {
     let mut parts = repo.splitn(2, '/');
     let owner = parts.next().unwrap_or("");
     let repo_name = parts.next().unwrap_or("");
-    config::is_allowed(host, owner, repo_name, allowed_owners, allowed_repos)
+    config::is_allowed_with_extra_hosts(
+        host,
+        owner,
+        repo_name,
+        allowed_owners,
+        allowed_repos,
+        extra_hosts,
+    )
+}
+
+/// Judge a fork (origin + upstream remotes) for write access: allowed iff
+/// **both** remotes belong to allowed owners, each checked against its own host.
+fn fork_allowed(
+    origin_host: &str,
+    origin: &str,
+    upstream_host: &str,
+    upstream: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> bool {
+    // Fail closed on unparseable remotes: an empty repo string means we could
+    // not extract owner/repo from the remote URL.
+    !origin.is_empty()
+        && !upstream.is_empty()
+        && is_allowed_with_extras(
+            origin_host,
+            origin,
+            allowed_owners,
+            allowed_repos,
+            extra_hosts,
+        )
+        && is_allowed_with_extras(
+            upstream_host,
+            upstream,
+            allowed_owners,
+            allowed_repos,
+            extra_hosts,
+        )
+}
+
+/// Policy decision for a gh write inside a loop without an explicit `-R` flag.
+#[derive(Debug, PartialEq)]
+enum LoopWriteDecision {
+    /// Deterministic loop in an owned repo — allow.
+    Allow,
+    /// Block, optionally suggesting the resolved `-R owner/repo` fix.
+    Block { suggestion: Option<String> },
+}
+
+/// Judge a looped gh write that lacks an explicit `-R` target.
+///
+/// Relaxed policy (default): allow iff the loop body provably never changes
+/// directory AND the cwd resolves to a single owned, non-fork repo. Under
+/// those conditions every iteration's gh resolves to the same repo the hook
+/// sees — identical trust to a single command.
+///
+/// Strict policy (`CADENCE_GH_STRICT_LOOPS=1`): always block, but include the
+/// resolved repo as a copy-paste `-R` suggestion when available.
+fn judge_loop_write(
+    strict: bool,
+    body_mutates_cwd: Option<bool>,
+    cwd_resolution: &RepoResolution,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> LoopWriteDecision {
+    // A concrete -R suggestion exists exactly when the cwd resolves to a
+    // single owned, non-fork repo. (Empty allowlists can never produce one —
+    // the unconfigured fail-safe holds for loops too.)
+    let suggestion = match cwd_resolution {
+        RepoResolution::Resolved { host, repo }
+            if is_allowed_with_extras(host, repo, allowed_owners, allowed_repos, extra_hosts) =>
+        {
+            Some(repo.clone())
+        }
+        _ => None,
+    };
+
+    // Relaxed: the loop body provably never changes directory, so every
+    // iteration's gh resolves to the suggested repo — same trust as a
+    // single command. Anything else (strict mode, cd in body, parse
+    // failure, fork, unowned/unresolvable cwd) blocks.
+    if !strict && body_mutates_cwd == Some(false) && suggestion.is_some() {
+        return LoopWriteDecision::Allow;
+    }
+
+    LoopWriteDecision::Block { suggestion }
+}
+
+/// Build the block message for a looped gh write, with a concrete `-R` fix
+/// when the cwd resolved to an owned repo.
+fn loop_block_message(writes: &[String], suggestion: Option<&str>) -> String {
+    let found = if writes.is_empty() {
+        "gh write command(s) without -R".to_string()
+    } else {
+        writes.join(", ")
+    };
+    let fix_target = suggestion.unwrap_or("owner/repo");
+    format!(
+        "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
+         Found: {found}\n   \
+         Fix: add `-R {fix_target}` to each command",
+    )
+}
+
+/// Build the block message for an unresolvable target, naming the directory
+/// that failed to resolve and a concrete `-R` example.
+fn unresolvable_message(work_dir: &str, example_owner: Option<&str>) -> String {
+    let owner = example_owner.unwrap_or("owner");
+    format!(
+        "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
+         Directory: {work_dir}\n   \
+         Fix: add `-R {owner}/<repo>` to target a repo explicitly"
+    )
+}
+
+/// Build the block message for a disallowed target, including a host-scoping
+/// hint when the target host is neither the default nor in `CADENCE_EXTRA_HOSTS`.
+fn disallowed_message(
+    host: &str,
+    repo: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> String {
+    let all_entries: Vec<String> = allowed_owners
+        .iter()
+        .chain(allowed_repos.iter())
+        .map(|e| e.to_string())
+        .collect();
+
+    // Self-hosted-forge users trip over host scoping: bare allowlist entries
+    // match the default host only. Tell them how to widen, mirroring
+    // guard_push_remote's hint.
+    let default = default_host();
+    let host_hint = if host != default && !extra_hosts.iter().any(|e| e == host) {
+        format!(
+            "\n   Host scope: bare entries match `{default}` only — for `{host}`, qualify them (`{host}/<owner>`) or set `CADENCE_EXTRA_HOSTS={host}`"
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "🚫 git-guardrails: gh write targets repo you don't own\n   \
+         Target:  {host}/{repo}\n   \
+         Allowed: {}{host_hint}\n\n   \
+         DO NOT override with env vars. Instead:\n   \
+         1. Confirm the user intends to write to this repo\n   \
+         2. Write a shell script the user can execute manually",
+        all_entries.join(" ")
+    )
 }
 
 /// Guards against unintended `gh` CLI write operations on unauthorized repositories.
@@ -172,6 +377,7 @@ impl Check for GhWriteGuard {
 
         let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
         let allowed_repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
+        let extra_hosts = env_extra_hosts();
 
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_gh_loops(command) {
@@ -213,24 +419,38 @@ impl Check for GhWriteGuard {
                     is_write_command(&reconstructed)
                 });
                 if has_write {
-                    let writes: Vec<String> = cmds
-                        .iter()
-                        .filter(|c| {
-                            let reconstructed = format!("gh {}", c.args.join(" "));
-                            c.explicit_repo.is_none() && is_write_command(&reconstructed)
-                        })
-                        .map(|c| format!("`gh {}`", c.args.join(" ")))
-                        .collect();
-                    let found = if writes.is_empty() {
-                        "gh write command(s) without -R".to_string()
-                    } else {
-                        writes.join(", ")
-                    };
-                    return CheckResult::block(format!(
-                        "🚫 git-guardrails: gh write command in loop without explicit -R flag\n   \
-                         Found: {found}\n   \
-                         Fix: add `-R owner/repo` to each command",
-                    ));
+                    // Relaxed-when-deterministic policy (#44): a loop whose
+                    // body never changes directory, running in an owned
+                    // non-fork repo, targets that repo on every iteration —
+                    // the same trust extended to single commands. Set
+                    // CADENCE_GH_STRICT_LOOPS=1 to restore unconditional
+                    // blocking.
+                    let strict = std::env::var("CADENCE_GH_STRICT_LOOPS").is_ok_and(|v| v == "1");
+                    let cwd = input.cwd.as_deref().unwrap_or(".");
+                    let work_dir = parse_work_dir(command, cwd);
+                    let decision = judge_loop_write(
+                        strict,
+                        loop_analysis::loop_bodies_mutate_cwd(command),
+                        &resolve_from_git_remotes(&work_dir),
+                        &allowed_owners,
+                        &allowed_repos,
+                        &extra_hosts,
+                    );
+                    if let LoopWriteDecision::Block { suggestion } = decision {
+                        let writes: Vec<String> = cmds
+                            .iter()
+                            .filter(|c| {
+                                let reconstructed = format!("gh {}", c.args.join(" "));
+                                c.explicit_repo.is_none() && is_write_command(&reconstructed)
+                            })
+                            .map(|c| format!("`gh {}`", c.args.join(" ")))
+                            .collect();
+                        return CheckResult::block(loop_block_message(
+                            &writes,
+                            suggestion.as_deref(),
+                        ));
+                    }
+                    // Deterministic loop in owned repo — allow
                 }
                 // All looped gh commands are read-only — allow
             }
@@ -274,34 +494,56 @@ impl Check for GhWriteGuard {
         let work_dir = parse_work_dir(command, cwd);
 
         match resolve_target_repo(command, &work_dir, &allowed_owners) {
-            RepoResolution::Fork { origin, upstream } => CheckResult::block(format!(
-                "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
-                 Fork:     {origin}\n   \
-                 Upstream: {upstream}\n\n   \
-                 Use -R {origin} to target your fork\n   \
-                 Use -R {upstream} to target upstream (if intended)"
-            )),
-            RepoResolution::Unresolvable => CheckResult::block(
-                "⚠️  git-guardrails: Cannot determine target repo for gh write operation\n   \
-                 Use -R owner/repo to specify target explicitly.",
-            ),
-            RepoResolution::Resolved { host, repo } => {
-                if is_allowed(&host, &repo, &allowed_owners, &allowed_repos) {
+            RepoResolution::Fork {
+                origin_host,
+                origin,
+                upstream_host,
+                upstream,
+            } => {
+                // Both remotes owned (each judged against its own host) — the
+                // write lands somewhere you control either way.
+                if fork_allowed(
+                    &origin_host,
+                    &origin,
+                    &upstream_host,
+                    &upstream,
+                    &allowed_owners,
+                    &allowed_repos,
+                    &extra_hosts,
+                ) {
                     CheckResult::allow()
                 } else {
-                    let all_entries: Vec<String> = allowed_owners
-                        .iter()
-                        .chain(allowed_repos.iter())
-                        .map(|e| e.to_string())
-                        .collect();
                     CheckResult::block(format!(
-                        "🚫 git-guardrails: gh write targets repo you don't own\n   \
-                         Target:  {repo}\n   \
-                         Allowed: {}\n\n   \
-                         DO NOT override with env vars. Instead:\n   \
-                         1. Confirm the user intends to write to this repo\n   \
-                         2. Write a shell script the user can execute manually",
-                        all_entries.join(" ")
+                        "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
+                         Fork:     {origin_host}/{origin}\n   \
+                         Upstream: {upstream_host}/{upstream}\n\n   \
+                         Use -R {origin} to target your fork\n   \
+                         Use -R {upstream} to target upstream (if intended)"
+                    ))
+                }
+            }
+            RepoResolution::Unresolvable => {
+                // Suggest the first allowed owner so the fix is concrete even
+                // when no repo can be inferred from the directory.
+                let example_owner = allowed_owners.first().map(|e| e.owner.as_str());
+                CheckResult::block(unresolvable_message(&work_dir, example_owner))
+            }
+            RepoResolution::Resolved { host, repo } => {
+                if is_allowed_with_extras(
+                    &host,
+                    &repo,
+                    &allowed_owners,
+                    &allowed_repos,
+                    &extra_hosts,
+                ) {
+                    CheckResult::allow()
+                } else {
+                    CheckResult::block(disallowed_message(
+                        &host,
+                        &repo,
+                        &allowed_owners,
+                        &allowed_repos,
+                        &extra_hosts,
                     ))
                 }
             }
@@ -336,16 +578,18 @@ mod tests {
 
     #[test]
     fn repo_flag_extraction() {
-        let caps = REPO_FLAG.captures("gh pr create -R cameronsjo/test --title hi");
-        assert!(caps.is_some());
-        assert_eq!(caps.unwrap().get(2).unwrap().as_str(), "cameronsjo/test");
+        assert_eq!(
+            extract_repo_flag_str("gh pr create -R cameronsjo/test --title hi"),
+            Some("cameronsjo/test".to_string())
+        );
     }
 
     #[test]
     fn repo_flag_long_form() {
-        let caps = REPO_FLAG.captures("gh issue create --repo cameronsjo/test --title hi");
-        assert!(caps.is_some());
-        assert_eq!(caps.unwrap().get(2).unwrap().as_str(), "cameronsjo/test");
+        assert_eq!(
+            extract_repo_flag_str("gh issue create --repo cameronsjo/test --title hi"),
+            Some("cameronsjo/test".to_string())
+        );
     }
 
     // Write detection patterns
@@ -462,6 +706,138 @@ mod tests {
             "cameron/repo",
             &owners(&["gitea.internal/cameron"]),
             &[],
+        ));
+    }
+
+    // --- #44: fork ownership matrix ---
+
+    #[test]
+    fn fork_both_owned_allowed() {
+        let o = owners(&["cameronsjo", "partner"]);
+        assert!(fork_allowed(
+            "github.com",
+            "cameronsjo/tool",
+            "github.com",
+            "partner/tool",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_unowned_upstream_blocked() {
+        let o = owners(&["cameronsjo"]);
+        assert!(!fork_allowed(
+            "github.com",
+            "cameronsjo/fork",
+            "github.com",
+            "stranger/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_unowned_origin_blocked() {
+        let o = owners(&["cameronsjo"]);
+        assert!(!fork_allowed(
+            "github.com",
+            "stranger/fork",
+            "github.com",
+            "cameronsjo/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_upstream_other_host_bare_entry_blocked() {
+        // Bare owner entries match the default host only — an upstream on a
+        // self-hosted forge must not pass through a bare entry.
+        let o = owners(&["cameron"]);
+        assert!(!fork_allowed(
+            "github.com",
+            "cameron/fork",
+            "gitea.internal",
+            "cameron/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_upstream_host_qualified_allowed() {
+        let o = owners(&["cameron", "gitea.internal/cameron"]);
+        assert!(fork_allowed(
+            "github.com",
+            "cameron/fork",
+            "gitea.internal",
+            "cameron/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn fork_extra_hosts_allowed() {
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(fork_allowed(
+            "github.com",
+            "cameron/fork",
+            "git.sjo.lol",
+            "cameron/orig",
+            &o,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn fork_empty_remote_blocked() {
+        // An unparseable remote URL yields an empty repo string — fail closed.
+        let o = owners(&["cameronsjo"]);
+        assert!(!fork_allowed(
+            "github.com",
+            "",
+            "github.com",
+            "cameronsjo/orig",
+            &o,
+            &[],
+            &[],
+        ));
+    }
+
+    // --- #44: extras-aware single-target check ---
+
+    #[test]
+    fn is_allowed_with_extras_gitea() {
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(is_allowed_with_extras(
+            "git.sjo.lol",
+            "cameron/repo",
+            &o,
+            &[],
+            &extras,
+        ));
+    }
+
+    #[test]
+    fn is_allowed_with_extras_unlisted_host_blocked() {
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        assert!(!is_allowed_with_extras(
+            "evil.example",
+            "cameron/repo",
+            &o,
+            &[],
+            &extras,
         ));
     }
 
@@ -741,6 +1117,39 @@ mod tests {
         }
     }
 
+    // --- #44: repo flag forms (equals and compact) ---
+
+    #[test]
+    fn repo_flag_equals_form_resolves() {
+        // `--repo=owner/repo` must resolve like `--repo owner/repo` does.
+        // work_dir is /nonexistent so a regex miss can only produce Unresolvable.
+        let allowed = owners(&["cameronsjo"]);
+        let resolved = resolve_target_repo(
+            "gh issue create --repo=cameronsjo/test --title hi",
+            "/nonexistent",
+            &allowed,
+        );
+        match resolved {
+            RepoResolution::Resolved { repo, .. } => assert_eq!(repo, "cameronsjo/test"),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_flag_compact_form_resolves() {
+        // `-Rowner/repo` (no space) must resolve like `-R owner/repo` does.
+        let allowed = owners(&["cameronsjo"]);
+        let resolved = resolve_target_repo(
+            "gh pr create -Rcameronsjo/test --title hi",
+            "/nonexistent",
+            &allowed,
+        );
+        match resolved {
+            RepoResolution::Resolved { repo, .. } => assert_eq!(repo, "cameronsjo/test"),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
     #[test]
     fn api_compact_field_flag_detected() {
         // Bug: -fkey=value (no space after -f) evades write detection
@@ -770,6 +1179,196 @@ mod tests {
             is_write_command("gh api repos/foo/bar --method Delete"),
             "mixed-case HTTP method should be detected as write"
         );
+    }
+
+    // --- #44: loop write policy (relaxed-when-deterministic + strict toggle) ---
+
+    fn resolved(repo: &str) -> RepoResolution {
+        RepoResolution::Resolved {
+            host: "github.com".to_string(),
+            repo: repo.to_string(),
+        }
+    }
+
+    #[test]
+    fn relaxed_deterministic_owned_loop_allows() {
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(
+            false,
+            Some(false),
+            &resolved("cameronsjo/repo"),
+            &o,
+            &[],
+            &[],
+        );
+        assert_eq!(decision, LoopWriteDecision::Allow);
+    }
+
+    #[test]
+    fn strict_toggle_blocks_with_suggestion() {
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(
+            true,
+            Some(false),
+            &resolved("cameronsjo/repo"),
+            &o,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            decision,
+            LoopWriteDecision::Block {
+                suggestion: Some("cameronsjo/repo".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn relaxed_cd_in_body_blocks_with_suggestion() {
+        // Loop body changes cwd — non-deterministic, block even though cwd is owned.
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(
+            false,
+            Some(true),
+            &resolved("cameronsjo/repo"),
+            &o,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            decision,
+            LoopWriteDecision::Block {
+                suggestion: Some("cameronsjo/repo".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn relaxed_parse_failure_blocks() {
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(false, None, &resolved("cameronsjo/repo"), &o, &[], &[]);
+        assert!(matches!(decision, LoopWriteDecision::Block { .. }));
+    }
+
+    #[test]
+    fn relaxed_unowned_cwd_blocks_without_suggestion() {
+        let o = owners(&["cameronsjo"]);
+        let decision =
+            judge_loop_write(false, Some(false), &resolved("stranger/repo"), &o, &[], &[]);
+        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
+    }
+
+    #[test]
+    fn relaxed_fork_cwd_blocks() {
+        let o = owners(&["cameronsjo"]);
+        let fork = RepoResolution::Fork {
+            origin_host: "github.com".to_string(),
+            origin: "cameronsjo/fork".to_string(),
+            upstream_host: "github.com".to_string(),
+            upstream: "stranger/orig".to_string(),
+        };
+        let decision = judge_loop_write(false, Some(false), &fork, &o, &[], &[]);
+        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
+    }
+
+    #[test]
+    fn relaxed_unresolvable_cwd_blocks() {
+        let o = owners(&["cameronsjo"]);
+        let decision = judge_loop_write(
+            false,
+            Some(false),
+            &RepoResolution::Unresolvable,
+            &o,
+            &[],
+            &[],
+        );
+        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
+    }
+
+    #[test]
+    fn relaxed_unconfigured_owners_blocks() {
+        // Fail-safe invariant: unset CADENCE_ALLOWED_OWNERS (empty list) blocks
+        // even a deterministic loop in a resolvable repo.
+        let decision = judge_loop_write(
+            false,
+            Some(false),
+            &resolved("cameronsjo/repo"),
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(decision, LoopWriteDecision::Block { suggestion: None });
+    }
+
+    #[test]
+    fn relaxed_extra_hosts_owned_loop_allows() {
+        // Self-hosted forge cwd, owner allowed via CADENCE_EXTRA_HOSTS.
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        let resolution = RepoResolution::Resolved {
+            host: "git.sjo.lol".to_string(),
+            repo: "cameron/tools".to_string(),
+        };
+        let decision = judge_loop_write(false, Some(false), &resolution, &o, &[], &extras);
+        assert_eq!(decision, LoopWriteDecision::Allow);
+    }
+
+    // --- #44: loop block message ---
+
+    #[test]
+    fn loop_block_message_includes_suggestion() {
+        let writes = vec!["`gh issue close $i`".to_string()];
+        let msg = loop_block_message(&writes, Some("cameronsjo/cadence-hooks"));
+        assert!(msg.contains("-R cameronsjo/cadence-hooks"));
+        assert!(msg.contains("`gh issue close $i`"));
+    }
+
+    #[test]
+    fn loop_block_message_generic_without_suggestion() {
+        let writes = vec!["`gh pr create`".to_string()];
+        let msg = loop_block_message(&writes, None);
+        assert!(msg.contains("-R owner/repo"));
+    }
+
+    // --- #44: actionable deny messages ---
+
+    #[test]
+    fn unresolvable_message_names_directory() {
+        let msg = unresolvable_message("/Users/cameron/scratch", Some("cameronsjo"));
+        assert!(msg.contains("Directory: /Users/cameron/scratch"));
+        assert!(msg.contains("-R cameronsjo/<repo>"));
+    }
+
+    #[test]
+    fn unresolvable_message_generic_without_owner() {
+        let msg = unresolvable_message("/tmp", None);
+        assert!(msg.contains("Directory: /tmp"));
+        assert!(msg.contains("-R owner/<repo>"));
+    }
+
+    #[test]
+    fn disallowed_message_includes_host_hint_for_self_hosted() {
+        let o = owners(&["cameron"]);
+        let msg = disallowed_message("git.sjo.lol", "stranger/repo", &o, &[], &[]);
+        assert!(msg.contains("CADENCE_EXTRA_HOSTS=git.sjo.lol"));
+        assert!(msg.contains("git.sjo.lol/stranger/repo"));
+    }
+
+    #[test]
+    fn disallowed_message_no_hint_for_default_host() {
+        let o = owners(&["cameronsjo"]);
+        let msg = disallowed_message("github.com", "stranger/repo", &o, &[], &[]);
+        assert!(!msg.contains("Host scope"));
+        assert!(msg.contains("stranger/repo"));
+        assert!(msg.contains("cameronsjo"));
+    }
+
+    #[test]
+    fn disallowed_message_no_hint_when_host_in_extras() {
+        let o = owners(&["cameron"]);
+        let extras = vec!["git.sjo.lol".to_string()];
+        let msg = disallowed_message("git.sjo.lol", "stranger/repo", &o, &[], &extras);
+        assert!(!msg.contains("Host scope"));
     }
 
     // --- CodeRabbit #6: read-only gh loops should not block ---

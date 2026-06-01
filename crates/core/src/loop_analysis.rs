@@ -189,6 +189,138 @@ pub fn analyze_push_loops(command: &str) -> LoopAnalysis {
     }
 }
 
+/// Check whether any loop body in the command contains a command that could
+/// change the shell's working directory.
+///
+/// Returns `None` when the command cannot be parsed, `Some(true)` when any
+/// loop body contains a cwd mutator (`cd`, `pushd`, `popd`) or a construct
+/// that could hide one (`eval`, `source`, `.`, `command`, `builtin`,
+/// unrecognized compound commands), and `Some(false)` otherwise.
+///
+/// Guards use this to decide whether commands inside a loop provably execute
+/// in the directory the hook resolved — the precondition for trusting
+/// cwd-based git resolution for looped writes.
+pub fn loop_bodies_mutate_cwd(command: &str) -> Option<bool> {
+    let program = parse_command(command)?;
+    let mut found = false;
+    for complete_cmd in &program.complete_commands {
+        find_loops_in_list(complete_cmd, &mut found);
+    }
+    Some(found)
+}
+
+/// Walk a compound list looking for loops; check each loop body for cwd mutators.
+fn find_loops_in_list(list: &CompoundList, found: &mut bool) {
+    for item in &list.0 {
+        let and_or = &item.0;
+        find_loops_in_pipeline(&and_or.first, found);
+        for additional in &and_or.additional {
+            let pipeline = match additional {
+                brush_parser::ast::AndOr::And(p) | brush_parser::ast::AndOr::Or(p) => p,
+            };
+            find_loops_in_pipeline(pipeline, found);
+        }
+    }
+}
+
+fn find_loops_in_pipeline(pipeline: &Pipeline, found: &mut bool) {
+    for cmd in &pipeline.seq {
+        if let Command::Compound(compound, _) = cmd {
+            match compound {
+                CompoundCommand::ForClause(for_cmd) => {
+                    body_walk(&for_cmd.body.list, found);
+                }
+                CompoundCommand::WhileClause(while_cmd) => {
+                    body_walk(&while_cmd.1.list, found);
+                }
+                CompoundCommand::UntilClause(until_cmd) => {
+                    body_walk(&until_cmd.1.list, found);
+                }
+                // Not loop bodies — keep looking for loops inside them
+                CompoundCommand::BraceGroup(bg) => find_loops_in_list(&bg.list, found),
+                CompoundCommand::Subshell(sub) => find_loops_in_list(&sub.list, found),
+                CompoundCommand::IfClause(if_cmd) => {
+                    find_loops_in_list(&if_cmd.condition, found);
+                    find_loops_in_list(&if_cmd.then, found);
+                    if let Some(elses) = &if_cmd.elses {
+                        for else_clause in elses {
+                            if let Some(cond) = &else_clause.condition {
+                                find_loops_in_list(cond, found);
+                            }
+                            find_loops_in_list(&else_clause.body, found);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Names of commands that change — or can hide a change of — the shell's cwd.
+fn is_cwd_mutator(cmd: &SimpleCommand) -> bool {
+    const MUTATORS: &[&str] = &[
+        "cd", "pushd", "popd", "eval", "source", ".", "command", "builtin",
+    ];
+    cmd.word_or_name
+        .as_ref()
+        .is_some_and(|w| MUTATORS.contains(&w.value.as_str()))
+}
+
+/// Recursively check every command inside a loop body for cwd mutators.
+///
+/// Unlike the gh/push collectors, this walk is **conservative**: constructs it
+/// cannot see inside (case clauses, function definitions, arithmetic
+/// commands) flag as mutating, because a missed `cd` would wrongly extend
+/// cwd-based trust to a loop whose iterations run elsewhere.
+fn body_walk(list: &CompoundList, found: &mut bool) {
+    for item in &list.0 {
+        let and_or = &item.0;
+        body_walk_pipeline(&and_or.first, found);
+        for additional in &and_or.additional {
+            let pipeline = match additional {
+                brush_parser::ast::AndOr::And(p) | brush_parser::ast::AndOr::Or(p) => p,
+            };
+            body_walk_pipeline(pipeline, found);
+        }
+    }
+}
+
+fn body_walk_pipeline(pipeline: &Pipeline, found: &mut bool) {
+    for cmd in &pipeline.seq {
+        match cmd {
+            Command::Simple(simple) => {
+                if is_cwd_mutator(simple) {
+                    *found = true;
+                }
+            }
+            Command::Compound(compound, _) => match compound {
+                CompoundCommand::ForClause(fc) => body_walk(&fc.body.list, found),
+                CompoundCommand::WhileClause(wc) => body_walk(&wc.1.list, found),
+                CompoundCommand::UntilClause(uc) => body_walk(&uc.1.list, found),
+                CompoundCommand::BraceGroup(bg) => body_walk(&bg.list, found),
+                CompoundCommand::Subshell(sub) => body_walk(&sub.list, found),
+                CompoundCommand::IfClause(if_cmd) => {
+                    body_walk(&if_cmd.condition, found);
+                    body_walk(&if_cmd.then, found);
+                    if let Some(elses) = &if_cmd.elses {
+                        for else_clause in elses {
+                            if let Some(cond) = &else_clause.condition {
+                                body_walk(cond, found);
+                            }
+                            body_walk(&else_clause.body, found);
+                        }
+                    }
+                }
+                // Constructs we can't see inside — conservative
+                _ => *found = true,
+            },
+            // Function definitions and other command forms — conservative
+            _ => *found = true,
+        }
+    }
+}
+
 fn parse_command(command: &str) -> Option<brush_parser::ast::Program> {
     let reader = std::io::Cursor::new(command);
     let options = ParserOptions::default();
@@ -577,6 +709,89 @@ mod tests {
             "for repo in a b; do for label in bug feat; do gh label create $label; done; done",
         );
         assert!(matches!(result, LoopAnalysis::MissingTargets(_)));
+    }
+
+    // --- loop_bodies_mutate_cwd ---
+
+    #[test]
+    fn plain_loop_body_does_not_mutate_cwd() {
+        assert_eq!(
+            loop_bodies_mutate_cwd("for i in 1 2 3; do gh issue close $i; done"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cd_before_loop_does_not_count() {
+        // cd outside the loop body is handled by parse_work_dir — only
+        // per-iteration mutation matters here.
+        assert_eq!(
+            loop_bodies_mutate_cwd("cd /repo && for i in 1 2; do gh issue close $i; done"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cd_in_loop_body_mutates() {
+        assert_eq!(
+            loop_bodies_mutate_cwd("for d in a b; do cd $d && gh pr create; done"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn subshell_cd_in_loop_body_mutates() {
+        assert_eq!(
+            loop_bodies_mutate_cwd("for d in a b; do (cd $d && gh pr create); done"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn pushd_in_loop_body_mutates() {
+        assert_eq!(
+            loop_bodies_mutate_cwd("for d in a b; do pushd $d; gh pr create; popd; done"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn eval_in_loop_body_mutates_conservatively() {
+        assert_eq!(
+            loop_bodies_mutate_cwd("for i in 1 2; do eval \"$CMD\" && gh pr create; done"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn while_loop_with_cd_mutates() {
+        assert_eq!(
+            loop_bodies_mutate_cwd("while read -r d; do cd $d && gh pr create; done < dirs.txt"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn nested_loop_inner_cd_mutates() {
+        assert_eq!(
+            loop_bodies_mutate_cwd(
+                "for a in 1; do for b in 2; do cd /tmp && gh pr create; done; done"
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn no_loops_returns_false() {
+        assert_eq!(loop_bodies_mutate_cwd("gh pr create"), Some(false));
+    }
+
+    #[test]
+    fn echo_and_gh_in_loop_body_does_not_mutate() {
+        assert_eq!(
+            loop_bodies_mutate_cwd("for i in 1 2; do echo start && gh issue close $i; done"),
+            Some(false)
+        );
     }
 
     // --- analyze_push_loops ---
