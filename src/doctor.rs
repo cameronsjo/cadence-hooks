@@ -302,14 +302,8 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
 
     let findings = scan_root(&root);
 
-    let errors: Vec<&Finding> = findings
-        .iter()
-        .filter(|f| f.severity == Severity::Error)
-        .collect();
-    let warnings: Vec<&Finding> = findings
-        .iter()
-        .filter(|f| f.severity == Severity::Warning)
-        .collect();
+    let (errors, warnings): (Vec<&Finding>, Vec<&Finding>) =
+        findings.iter().partition(|f| f.severity == Severity::Error);
 
     if quiet {
         if errors.is_empty() && warnings.is_empty() {
@@ -509,7 +503,7 @@ mod tests {
 
     /// Build a minimal hooks.json under a temp plugin dir structure.
     /// Returns the root dir (caller must keep it alive).
-    fn write_fixture(commands: &[(&str, &str)]) -> std::path::PathBuf {
+    fn write_fixture(commands: &[&str]) -> std::path::PathBuf {
         // Use PID + a counter for a unique-enough subdir.
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
@@ -524,7 +518,7 @@ mod tests {
 
         let hooks_entries: String = commands
             .iter()
-            .map(|(_event, cmd)| {
+            .map(|cmd| {
                 format!(
                     r#"{{
           "type": "command",
@@ -558,47 +552,42 @@ mod tests {
 
     #[test]
     fn integration_clean_hooks_json_exits_0() {
-        let root = write_fixture(&[(
-            "PreToolUse",
+        let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
-        )]);
+        ]);
         assert_eq!(run(Some(&root), false), 0);
     }
 
     #[test]
     fn integration_unknown_subcommand_exits_1() {
-        let root = write_fixture(&[(
-            "PreToolUse",
+        let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence no-such-hook"#,
-        )]);
+        ]);
         assert_eq!(run(Some(&root), false), 1);
     }
 
     #[test]
     fn integration_shell_expansion_bug_exits_2() {
-        let root = write_fixture(&[(
-            "PreToolUse",
+        let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
-        )]);
+        ]);
         assert_eq!(run(Some(&root), false), 2);
     }
 
     #[test]
     fn integration_both_skew_and_expansion_exits_2() {
-        let root = write_fixture(&[(
-            "PreToolUse",
+        let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' cadence no-such-hook"#,
-        )]);
+        ]);
         // Single-quoted (Error) + unknown sub (Warning) → exit 2
         assert_eq!(run(Some(&root), false), 2);
     }
 
     #[test]
     fn integration_quiet_warnings_only_exits_0_stdout_nonempty() {
-        let root = write_fixture(&[(
-            "PreToolUse",
+        let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence no-such-hook"#,
-        )]);
+        ]);
         // Capture stdout is not trivial in unit tests; we verify exit code here.
         // The output assertion is covered by manually running the binary.
         assert_eq!(run(Some(&root), true), 0);
@@ -606,19 +595,17 @@ mod tests {
 
     #[test]
     fn integration_quiet_errors_exits_2() {
-        let root = write_fixture(&[(
-            "PreToolUse",
+        let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
-        )]);
+        ]);
         assert_eq!(run(Some(&root), true), 2);
     }
 
     #[test]
     fn integration_quiet_clean_exits_0() {
-        let root = write_fixture(&[(
-            "PreToolUse",
+        let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
-        )]);
+        ]);
         assert_eq!(run(Some(&root), true), 0);
     }
 }
