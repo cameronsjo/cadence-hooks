@@ -7,28 +7,30 @@
 //! the keyword inside the file is not false-blocked.
 
 use crate::issue_refs::has_closing_keyword;
-use cadence_hooks_core::shell::strip_quotes;
+use cadence_hooks_core::shell::{strip_quotes, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use regex::Regex;
-use std::sync::LazyLock;
 
-// Matches `--body-file <path>` or `-F <path>` in the command. Quote-aware:
-// double-quoted and single-quoted paths (which may contain spaces) are
-// captured whole; bare paths capture up to the next whitespace.
-static BODY_FILE_FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:--body-file|-F)\s+(?:"([^"]+)"|'([^']+)'|(\S+))"#)
-        .expect("body-file flag pattern should compile")
-});
-
-/// Extract the path argument from `--body-file <path>` or `-F <path>`.
+/// Extract the path argument from `--body-file <path>`, `--body-file=<path>`,
+/// or `-F <path>`.
 ///
-/// Pure: no I/O. Returns `None` when neither flag is present.
+/// Pure: no I/O. Returns `None` when no body-file flag is present.
+///
+/// Operates on shell tokens, not the raw string, so flag-looking text inside
+/// quoted arguments (`--body "see --body-file foo"`) is data, never a flag —
+/// a raw regex scan there would conjure a phantom unreadable file and fail
+/// the guard open.
 pub(crate) fn extract_body_file_path(command: &str) -> Option<String> {
-    let caps = BODY_FILE_FLAG.captures(command)?;
-    caps.get(1)
-        .or_else(|| caps.get(2))
-        .or_else(|| caps.get(3))
-        .map(|m| m.as_str().to_string())
+    let tokens = tokenize(command);
+    let mut iter = tokens.into_iter();
+    while let Some(token) = iter.next() {
+        if token == "--body-file" || token == "-F" {
+            return iter.next();
+        }
+        if let Some(path) = token.strip_prefix("--body-file=") {
+            return Some(path.to_string());
+        }
+    }
+    None
 }
 
 /// Resolution of the `--body-file`/`-F` flag on a `gh pr create` command.
@@ -294,6 +296,30 @@ mod tests {
         assert!(extract_body_file_path(cmd).is_none());
     }
 
+    // `--body-file` appearing inside quoted body text is data, not a flag.
+    // Treating it as a flag turns the phantom (unreadable) path into a
+    // fail-open bypass: no keyword anywhere, yet the PR is allowed.
+    #[test]
+    fn quoted_body_text_mentioning_body_file_is_not_a_flag() {
+        let cmd = r#"gh pr create --title x --body "see --body-file foo""#;
+        assert!(extract_body_file_path(cmd).is_none());
+    }
+
+    #[test]
+    fn quoted_body_text_mentioning_short_flag_is_not_a_flag() {
+        let cmd = r#"gh pr create --title x --body "pass -F notes.md to gh""#;
+        assert!(extract_body_file_path(cmd).is_none());
+    }
+
+    // gh accepts `--body-file=path` — must resolve the same as the spaced form,
+    // otherwise the flag goes undetected and a keyword-bearing file is ignored
+    // (false block).
+    #[test]
+    fn extracts_equals_form_body_file_path() {
+        let cmd = "gh pr create --title x --body-file=./body.md";
+        assert_eq!(extract_body_file_path(cmd), Some("./body.md".to_string()));
+    }
+
     // Quoted paths containing spaces must be captured whole — truncating at the
     // first space makes the file unreadable, and the fail-open path would then
     // let an unverified PR through.
@@ -337,6 +363,16 @@ mod tests {
     fn check_allows_non_pr_create() {
         let result = PrIssueLinkGuard.run(&make_bash("git status"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // End-to-end: quoted body text mentioning --body-file must NOT become a
+    // phantom unreadable file (which would fail open). No keyword → block.
+    #[test]
+    fn check_blocks_quoted_body_file_mention_without_keyword() {
+        let result = PrIssueLinkGuard.run(&make_bash(
+            r#"gh pr create --title x --body "see --body-file foo""#,
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     // Check::run with an unreadable body file — fail open end-to-end.

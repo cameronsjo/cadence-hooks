@@ -38,6 +38,52 @@ pub fn strip_quotes(s: &str) -> String {
     result
 }
 
+/// Split a shell command into whitespace-separated tokens, honoring quotes.
+///
+/// Content inside matching `'` or `"` pairs stays in one token with the quotes
+/// stripped, so `--body "see --flag x"` yields `["--body", "see --flag x"]` —
+/// quoted text can never masquerade as a flag. Unmatched quotes consume the
+/// rest of the string. This is flag/argument extraction, not shell execution:
+/// no escape sequences, expansions, or operator splitting.
+pub fn tokenize(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut quote: Option<char> = None;
+
+    for c in command.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_token = true;
+                }
+                c if c.is_whitespace() => {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut current));
+                        in_token = false;
+                    }
+                }
+                _ => {
+                    current.push(c);
+                    in_token = true;
+                }
+            },
+        }
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Extract `(host, "owner/repo")` from any git remote URL format.
 ///
 /// Handles:
@@ -197,6 +243,54 @@ mod tests {
         assert_eq!(
             strip_quotes("gh pr create --title 'test' --body \"desc\""),
             "gh pr create --title  --body "
+        );
+    }
+
+    // --- tokenize ---
+
+    #[test]
+    fn tokenize_splits_on_whitespace() {
+        assert_eq!(tokenize("gh pr create"), vec!["gh", "pr", "create"]);
+    }
+
+    #[test]
+    fn tokenize_keeps_double_quoted_content_in_one_token() {
+        assert_eq!(
+            tokenize(r#"gh pr create --body "see --body-file foo""#),
+            vec!["gh", "pr", "create", "--body", "see --body-file foo"]
+        );
+    }
+
+    #[test]
+    fn tokenize_keeps_single_quoted_content_in_one_token() {
+        assert_eq!(
+            tokenize("gh pr create -F 'my body files/pr.md'"),
+            vec!["gh", "pr", "create", "-F", "my body files/pr.md"]
+        );
+    }
+
+    #[test]
+    fn tokenize_joins_adjacent_quoted_and_bare_text() {
+        // Shell semantics: abc"def" is one word.
+        assert_eq!(tokenize(r#"echo abc"def ghi""#), vec!["echo", "abcdef ghi"]);
+    }
+
+    #[test]
+    fn tokenize_preserves_empty_quoted_token() {
+        assert_eq!(tokenize(r#"echo "" world"#), vec!["echo", "", "world"]);
+    }
+
+    #[test]
+    fn tokenize_handles_empty_and_whitespace_input() {
+        assert_eq!(tokenize(""), Vec::<String>::new());
+        assert_eq!(tokenize("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tokenize_unmatched_quote_consumes_rest() {
+        assert_eq!(
+            tokenize(r#"echo "unclosed rest of line"#),
+            vec!["echo", "unclosed rest of line"]
         );
     }
 
