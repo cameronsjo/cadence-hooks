@@ -7,6 +7,8 @@
 pub mod check_idle_return;
 /// Per-repo snooze command + helper consumed by `warn_main_branch`.
 pub mod dismiss_main_branch_warn;
+/// Block direct edits to production dotfiles; redirect to chezmoi source.
+pub mod guard_dotfiles;
 /// Block irreversible `gh` operations (repo delete).
 pub mod guard_gh_dangerous;
 /// Block `gh` write operations targeting repos you don't own.
