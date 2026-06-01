@@ -64,11 +64,14 @@ enum Commands {
         list: bool,
     },
 
-    /// Scan installed plugin hooks.json files for shell-expansion bugs
+    /// Scan installed plugin hooks.json files for shell-expansion bugs and subcommand skew
     Doctor {
         /// Scan a specific directory instead of ~/.claude/plugins/cache
         #[arg(long, value_name = "DIR")]
         root: Option<std::path::PathBuf>,
+        /// One-line summary output; exit non-zero only on errors. For SessionStart preflight.
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -386,8 +389,8 @@ fn main() {
             }
             configure::run(list, HOOKS);
         }
-        Commands::Doctor { root } => {
-            process::exit(doctor::run(root.as_deref()).into());
+        Commands::Doctor { root, quiet } => {
+            process::exit(doctor::run(root.as_deref(), quiet).into());
         }
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => {
