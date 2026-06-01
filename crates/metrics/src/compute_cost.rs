@@ -24,21 +24,15 @@ pub fn compute_cost(tokens: &Tokens, model: &str, prices: &Prices) -> f64 {
 
 /// Total cost in USD summed across per-model token buckets.
 ///
-/// Each bucket is billed at its own model's rates. Buckets whose model is
-/// absent from the price table contribute `$0.0` (same behavior as the scalar
-/// `compute_cost`). The result is rounded to 6 decimal places.
+/// Each bucket is billed at its own model's rates via [`compute_cost`], so the
+/// total is the sum of the *rounded* per-bucket costs — exactly reconcilable
+/// with the `byModel` array, which emits those same per-bucket values. Buckets
+/// whose model is absent from the price table contribute `$0.0`. The final
+/// rounding only cleans up float-addition noise.
 pub fn compute_cost_by_model(buckets: &[(String, Tokens)], prices: &Prices) -> f64 {
     let raw: f64 = buckets
         .iter()
-        .map(|(model, tokens)| {
-            let Some(p) = prices.get(model) else {
-                return 0.0;
-            };
-            tokens.input as f64 * p.input_per_mtok / 1_000_000.0
-                + tokens.cache_create as f64 * p.cache_write_per_mtok / 1_000_000.0
-                + tokens.cache_read as f64 * p.cache_read_per_mtok / 1_000_000.0
-                + tokens.output as f64 * p.output_per_mtok / 1_000_000.0
-        })
+        .map(|(model, tokens)| compute_cost(tokens, model, prices))
         .sum();
     (raw * 1_000_000.0).round() / 1_000_000.0
 }
@@ -160,6 +154,53 @@ mod tests {
         let total = compute_cost_by_model(&buckets, &prices);
         let opus_only = compute_cost(&buckets[1].1, "claude-opus-4-7", &prices);
         assert!((total - opus_only).abs() < 1e-9);
+    }
+
+    /// Total must reconcile exactly with the sum of per-bucket rounded costs.
+    ///
+    /// The byModel array emits compute_cost per bucket (each rounded to 6
+    /// decimals), so the total must be the sum of those rounded values — not a
+    /// single rounding of the raw sum, which can differ when bucket costs land
+    /// on a half-micro-dollar boundary.
+    #[test]
+    fn compute_cost_by_model_reconciles_with_rounded_buckets() {
+        use crate::prices::ModelPrice;
+        use std::collections::HashMap;
+
+        // Priced so 1 input token costs 1.5 micro-dollars: each bucket rounds
+        // up to 0.000002, but the raw sum (3.0 micro-dollars) rounds to
+        // 0.000003 — exposing round(sum) vs sum(round) divergence.
+        let price = || ModelPrice {
+            input_per_mtok: 1.5,
+            output_per_mtok: 0.0,
+            cache_write_per_mtok: 0.0,
+            cache_read_per_mtok: 0.0,
+        };
+        let prices = Prices {
+            models: HashMap::from([
+                ("model-a".to_string(), price()),
+                ("model-b".to_string(), price()),
+            ]),
+        };
+        let one_input = Tokens {
+            input: 1,
+            ..Default::default()
+        };
+        let buckets: Vec<(String, Tokens)> = vec![
+            ("model-a".into(), one_input.clone()),
+            ("model-b".into(), one_input),
+        ];
+
+        let total = compute_cost_by_model(&buckets, &prices);
+        let bucket_sum: f64 = buckets
+            .iter()
+            .map(|(m, t)| compute_cost(t, m, &prices))
+            .sum();
+
+        assert_eq!(
+            total, bucket_sum,
+            "costUsd total must equal the sum of emitted byModel costs"
+        );
     }
 
     /// Single-model bucket total matches the scalar compute_cost result.
