@@ -130,7 +130,9 @@ pub fn scan_content(content: &str, ext: &str) -> Vec<(usize, &'static str)> {
 
         if let Ok(re) = Regex::new(sp.pattern) {
             for m in re.find_iter(content) {
-                let line_num = content[..m.start()].lines().count() + 1;
+                // Count newlines, not lines: a partial line before the match
+                // ("data = " before "pickle.loads") must not add a line.
+                let line_num = content[..m.start()].matches('\n').count() + 1;
                 warnings.push((line_num, sp.message));
             }
         }
@@ -387,6 +389,20 @@ mod tests {
         let results = scan_content(content, "py");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 5);
+    }
+
+    #[test]
+    fn line_number_accuracy_for_mid_line_match() {
+        // Match that does NOT start at column 0: the partial line before the
+        // pattern must not inflate the line count.
+        let content = "import pickle\ndata = pickle.loads(blob)";
+        let results = scan_content(content, "py");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].0, 2,
+            "pickle.loads is on line 2, got line {}",
+            results[0].0
+        );
     }
 
     #[test]
