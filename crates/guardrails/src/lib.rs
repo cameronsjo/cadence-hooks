@@ -21,6 +21,8 @@ pub mod guard_pr_issue_link;
 pub mod guard_push_remote;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
 pub mod nudge_upgrade_after_push;
+/// Warn about broken issue refs on PR create; close straggler issues on PR merge.
+pub mod verify_pr_autoclose;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
 /// Remind to check datetime before scheduling cron jobs.
