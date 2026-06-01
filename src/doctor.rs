@@ -112,8 +112,13 @@ fn extract_invocation(command: &str) -> Option<(String, String)> {
     })?;
 
     // The two tokens immediately after the dispatcher (skip flags starting with '-').
+    // Strip outer quotes from each so a quoted namespace/subcommand doesn't
+    // produce a spurious registry mismatch.
     let after = &tokens[dispatcher_idx + 1..];
-    let mut non_flags = after.iter().filter(|t| !t.starts_with('-'));
+    let mut non_flags = after
+        .iter()
+        .map(|t| t.trim_matches(|c| c == '\'' || c == '"'))
+        .filter(|t| !t.starts_with('-'));
 
     let namespace = non_flags.next()?.to_string();
     let subcommand = non_flags.next()?.to_string();
@@ -271,7 +276,8 @@ fn scan_root(root: &Path) -> Vec<Finding> {
 /// Exit codes:
 ///   0  clean
 ///   1  warnings only (version skew)
-///   2  errors present (shell-expansion bugs), regardless of warnings
+///   2  errors — shell-expansion bugs (regardless of warnings), or internal
+///      errors like an unset `$HOME`
 ///
 /// `root_override` lets tests redirect the scan; in normal use it's `None`
 /// and we fall back to `$HOME/.claude/plugins/cache`.
@@ -280,14 +286,20 @@ fn scan_root(root: &Path) -> Vec<Finding> {
 ///   - Clean: no output, exit 0
 ///   - Warnings only: ONE summary line to stdout, exit 0
 ///   - Errors: one line to stderr, exit 2
+///
+/// Stream split in quiet mode is deliberate: warnings go to stdout (a caller
+/// capturing stdout gets the skew nudge to inject), errors go to stderr (a
+/// caller redirecting stderr to /dev/null still fails on the exit code).
 pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
     let root = match root_override {
         Some(p) => p.to_path_buf(),
         None => match default_root() {
             Some(p) => p,
             None => {
+                // Internal error, not version skew — exit 2 so callers never
+                // misread it as "warnings present".
                 eprintln!("cadence-hooks doctor: $HOME not set; cannot locate plugin cache");
-                return 1;
+                return 2;
             }
         },
     };
@@ -391,6 +403,17 @@ mod tests {
     }
 
     // ── extract_invocation table tests ──────────────────────────────────────
+
+    #[test]
+    fn extract_invocation_quoted_namespace_and_subcommand() {
+        // Quoted namespace/subcommand tokens must be unquoted before the
+        // registry lookup, or doctor emits a spurious mismatch warning.
+        let cmd = r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" "cadence" 'terminology'"#;
+        assert_eq!(
+            extract_invocation(cmd),
+            Some(("cadence".into(), "terminology".into()))
+        );
+    }
 
     #[test]
     fn extract_invocation_double_quoted_wrapper() {

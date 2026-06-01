@@ -245,7 +245,7 @@ cadence-hooks doctor --quiet
 |------|---------|
 | 0 | Clean — no findings |
 | 1 | Warnings only — subcommand skew (version mismatch between plugin and binary) |
-| 2 | Errors present — shell-expansion bugs that will silently break hooks at runtime |
+| 2 | Errors — shell-expansion bugs that will silently break hooks at runtime, or internal errors (e.g. `$HOME` unset) |
 
 **Sample output (skew warning):**
 
@@ -258,6 +258,8 @@ cadence-hooks doctor: 0 error(s), 1 warning(s)
 ```
 
 **`--quiet` mode** is suitable for SessionStart preflight wiring. When clean it produces no output and exits 0; on warnings it prints one summary line to stdout and exits 0 (so a `set -euo pipefail` script won't abort); on errors it writes one line to stderr and exits 2.
+
+The stream split is deliberate: warnings go to **stdout** (a caller capturing stdout gets the skew nudge to inject), errors go to **stderr** (a caller redirecting stderr to `/dev/null` still fails on the exit code). Redirect accordingly — `>/dev/null` silences the skew nudge, `2>/dev/null` silences error detail but not the failure.
 
 ```bash
 # In a SessionStart hook — detect skew without blocking on warnings
