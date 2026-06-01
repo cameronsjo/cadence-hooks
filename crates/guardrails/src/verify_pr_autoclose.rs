@@ -105,11 +105,21 @@ pub trait Clock {
 // ---------------------------------------------------------------------------
 
 /// Production `gh` runner: shells out to the system `gh` binary.
-pub struct RealGhRunner;
+///
+/// Carries the enterprise host (if any) and scopes `GH_HOST` to each spawned
+/// command — no process-global env mutation.
+pub struct RealGhRunner {
+    /// `GH_HOST` value for enterprise GitHub remotes; `None` targets github.com.
+    pub gh_host: Option<String>,
+}
 
 impl GhRunner for RealGhRunner {
     fn run(&self, args: &[&str]) -> Option<String> {
-        let output = std::process::Command::new("gh").args(args).output().ok()?;
+        let mut cmd = std::process::Command::new("gh");
+        if let Some(h) = &self.gh_host {
+            cmd.env("GH_HOST", h);
+        }
+        let output = cmd.args(args).output().ok()?;
         if output.status.success() {
             let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if s.is_empty() { None } else { Some(s) }
@@ -167,16 +177,15 @@ fn fetch_issue_state(gh: &dyn GhRunner, issue: u64, slug: &str) -> IssueState {
 
 /// Warn about broken issue references in a newly-created PR.
 ///
-/// Fetches the PR body, extracts closing-keyword refs, and warns to stderr
-/// for any ref that is CLOSED (auto-close can't re-fire) or MISSING (not found).
-/// Silent on the happy path (all refs OPEN, or no refs at all).
-pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) {
-    let Some(pr_num) = pr_number_from_create_stdout(stdout) else {
-        return;
-    };
+/// Fetches the PR body, extracts closing-keyword refs, and returns a warning
+/// message for any ref that is CLOSED (auto-close can't re-fire) or MISSING
+/// (not found). Returns `None` on the happy path (all refs OPEN, or no refs).
+/// The caller routes the message through `CheckResult::nudge` so Claude sees it.
+pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) -> Option<String> {
+    let pr_num = pr_number_from_create_stdout(stdout)?;
 
     // Fetch the PR body as JSON then extract the body field
-    let body_json = match gh.run(&[
+    let body_json = gh.run(&[
         "pr",
         "view",
         &pr_num.to_string(),
@@ -184,10 +193,7 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) {
         "body",
         "-R",
         slug,
-    ]) {
-        Some(j) => j,
-        None => return,
-    };
+    ])?;
 
     // Parse body from JSON: {"body":"..."} — use serde_json for correctness
     let body: String = match serde_json::from_str::<serde_json::Value>(&body_json) {
@@ -201,7 +207,7 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) {
 
     let refs = extract_refs(&body);
     if refs.is_empty() {
-        return;
+        return None;
     }
 
     let mut warnings: Vec<String> = Vec::new();
@@ -219,11 +225,13 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) {
         }
     }
 
-    if !warnings.is_empty() {
-        eprintln!(
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(format!(
             "verify-pr-autoclose: PR #{pr_num} has broken references:\n{}",
             warnings.join("\n")
-        );
+        ))
     }
 }
 
@@ -235,8 +243,16 @@ pub fn handle_create(slug: &str, stdout: &str, gh: &dyn GhRunner) {
 ///
 /// Waits `wait_secs` (injected via `clock`) to give GitHub time to auto-close,
 /// then checks each referenced issue. If still OPEN, closes it via `gh issue close`
-/// with a commit-citing comment. Reports closed issues to stderr.
-pub fn handle_merge(slug: &str, cmd: &str, gh: &dyn GhRunner, clock: &dyn Clock, wait_secs: u64) {
+/// with a commit-citing comment. Returns a summary message naming the closed
+/// issues, or `None` when there was nothing to do. The caller routes the
+/// message through `CheckResult::nudge` so Claude sees it.
+pub fn handle_merge(
+    slug: &str,
+    cmd: &str,
+    gh: &dyn GhRunner,
+    clock: &dyn Clock,
+    wait_secs: u64,
+) -> Option<String> {
     // Resolve PR number: from command or from `gh pr view`
     let pr_num = match pr_number_from_merge_cmd(cmd) {
         Some(n) => n,
@@ -244,17 +260,14 @@ pub fn handle_merge(slug: &str, cmd: &str, gh: &dyn GhRunner, clock: &dyn Clock,
             let raw = gh.run(&[
                 "pr", "view", "--json", "number", "-q", ".number", "-R", slug,
             ]);
-            match raw.and_then(|s| s.parse::<u64>().ok()) {
-                Some(n) => n,
-                None => return,
-            }
+            raw.and_then(|s| s.parse::<u64>().ok())?
         }
     };
 
     clock.sleep_secs(wait_secs);
 
     // Fetch body + mergeCommit
-    let pr_json = match gh.run(&[
+    let pr_json = gh.run(&[
         "pr",
         "view",
         &pr_num.to_string(),
@@ -262,15 +275,9 @@ pub fn handle_merge(slug: &str, cmd: &str, gh: &dyn GhRunner, clock: &dyn Clock,
         "body,mergeCommit",
         "-R",
         slug,
-    ]) {
-        Some(j) => j,
-        None => return,
-    };
+    ])?;
 
-    let value: serde_json::Value = match serde_json::from_str(&pr_json) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+    let value: serde_json::Value = serde_json::from_str(&pr_json).ok()?;
 
     let body = value
         .get("body")
@@ -286,7 +293,7 @@ pub fn handle_merge(slug: &str, cmd: &str, gh: &dyn GhRunner, clock: &dyn Clock,
 
     let refs = extract_refs(&body);
     if refs.is_empty() {
-        return;
+        return None;
     }
 
     let short_sha = if merge_sha.len() >= 7 {
@@ -322,12 +329,14 @@ pub fn handle_merge(slug: &str, cmd: &str, gh: &dyn GhRunner, clock: &dyn Clock,
         }
     }
 
-    if !closed.is_empty() {
-        eprintln!(
+    if closed.is_empty() {
+        None
+    } else {
+        Some(format!(
             "verify-pr-autoclose: closed {} straggler issue(s) for PR #{pr_num}: {}",
             closed.len(),
             closed.join(", ")
-        );
+        ))
     }
 }
 
@@ -370,31 +379,29 @@ impl Check for VerifyPrAutoclose {
             return CheckResult::allow();
         };
 
-        // Set GH_HOST for enterprise GitHub
-        if let Some(ref h) = host {
-            // SAFETY: This hook process is single-threaded (one hook fires one check).
-            // No other threads read or write env vars concurrently here.
-            unsafe {
-                std::env::set_var("GH_HOST", h);
-            }
-        }
-
-        let gh = RealGhRunner;
+        // Enterprise GitHub: scope GH_HOST to the runner's spawned commands
+        // rather than mutating this process's environment.
+        let gh = RealGhRunner { gh_host: host };
         let clock = RealClock;
         let wait_secs: u64 = std::env::var("GH_AUTOCLOSE_WAIT_SECONDS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10);
 
-        if cmd.contains("gh pr create") {
+        let message = if cmd.contains("gh pr create") {
             let stdout = input.tool_response_stdout().unwrap_or("");
-            handle_create(&slug, stdout, &gh);
+            handle_create(&slug, stdout, &gh)
         } else if cmd.contains("gh pr merge") {
-            handle_merge(&slug, cmd, &gh, &clock, wait_secs);
-        }
-        // else: not a create or merge command — exit 0, no handler invoked
+            handle_merge(&slug, cmd, &gh, &clock, wait_secs)
+        } else {
+            // Not a create or merge command — no handler invoked
+            None
+        };
 
-        CheckResult::allow()
+        match message {
+            Some(msg) => CheckResult::nudge(msg),
+            None => CheckResult::allow(),
+        }
     }
 }
 
@@ -635,40 +642,40 @@ mod tests {
     // Shell-flow tests (cases 11–18)
     // -----------------------------------------------------------------------
 
-    // Case 11: create, body refs #5 (OPEN) → no stderr (test indirectly via no close calls)
+    // Case 11: create, body refs #5 (OPEN) → no warning message
     #[test]
     fn create_body_refs_open_issue_no_warnings() {
         let gh = FakeGh::new()
             .with_issue(5, "OPEN")
             .with_pr_body("Closes #5");
 
-        // handle_create should silently succeed with no close calls and no panic
-        handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh);
+        let msg = handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh);
 
-        // No warnings means no close calls; body was fetched once
+        assert_eq!(msg, None, "happy path should produce no warning");
         assert!(gh.close_calls.borrow().is_empty());
         assert_eq!(*gh.body_calls.borrow(), vec![1u64]);
     }
 
-    // Case 12: create, body refs #5 (CLOSED) → warnings logged
-    // (We test via stderr capture indirectly — we verify the function doesn't panic
-    //  and runs the warning path; stderr capture is an integration concern)
+    // Case 12: create, body refs #5 (CLOSED) → warning names the issue and reason
     #[test]
     fn create_body_refs_closed_issue_emits_warning() {
         let gh = FakeGh::new()
             .with_issue(5, "CLOSED")
             .with_pr_body("Closes #5");
 
-        // Should not panic; state is verified by checking that parse_issue_state(CLOSED)
-        // correctly maps to IssueState::Closed
-        assert_eq!(
-            parse_issue_state(Some("CLOSED".to_string())),
-            IssueState::Closed
-        );
+        let msg = handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh)
+            .expect("closed ref should produce a warning");
 
-        // handle_create runs the warning path — we verify it completes without panic
-        // and that no close calls are made (warnings only, no mutation)
-        handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh);
+        assert!(msg.contains("#5"), "warning should name the issue: {msg}");
+        assert!(
+            msg.contains("already CLOSED"),
+            "warning should explain auto-close cannot re-fire: {msg}"
+        );
+        assert!(
+            msg.contains("PR #1"),
+            "warning should cite the PR number: {msg}"
+        );
+        // Warnings only, no mutation
         assert!(gh.close_calls.borrow().is_empty());
     }
 
@@ -679,20 +686,24 @@ mod tests {
             // issue 99 not in map → gh returns None → Missing state
             .with_pr_body("Closes #99");
 
-        assert_eq!(parse_issue_state(None), IssueState::Missing);
+        let msg = handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh)
+            .expect("missing ref should produce a warning");
 
-        handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh);
+        assert!(
+            msg.contains("#99") && msg.contains("not found"),
+            "warning should name the missing issue: {msg}"
+        );
         assert!(gh.close_calls.borrow().is_empty());
     }
 
-    // Case 14: create, body has no refs → no body fetch calls after the initial one
+    // Case 14: create, body has no refs → no warning, no issue-state calls
     #[test]
     fn create_body_no_refs_returns_early() {
         let gh = FakeGh::new().with_pr_body("This PR is purely cosmetic.");
 
-        handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh);
+        let msg = handle_create("owner/repo", "https://github.com/owner/repo/pull/1", &gh);
 
-        // Body was fetched but no issue state calls and no close calls
+        assert_eq!(msg, None);
         assert!(gh.close_calls.borrow().is_empty());
         // No issue state calls because refs list is empty
         assert_eq!(*gh.body_calls.borrow(), vec![1u64]);
@@ -707,7 +718,13 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 0);
+        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 0)
+            .expect("closing a straggler should produce a summary");
+
+        assert!(
+            msg.contains("closed 1 straggler") && msg.contains("#5"),
+            "summary should count and name closed issues: {msg}"
+        );
 
         let calls = gh.close_calls.borrow();
         assert_eq!(calls.len(), 1, "should close issue #5");
@@ -732,8 +749,9 @@ mod tests {
             .with_merge_commit("abc1234def456");
 
         let clock = FakeClock::new();
-        handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 0);
+        let msg = handle_merge("owner/repo", "gh pr merge 8 --squash", &gh, &clock, 0);
 
+        assert_eq!(msg, None, "nothing closed → no summary message");
         assert!(
             gh.close_calls.borrow().is_empty(),
             "should not close already-closed issue"
@@ -746,7 +764,7 @@ mod tests {
         let gh = FakeGh::new(); // pr_number is None by default
 
         let clock = FakeClock::new();
-        handle_merge(
+        let msg = handle_merge(
             "owner/repo",
             "gh pr merge --squash", // no number in cmd
             &gh,
@@ -754,6 +772,7 @@ mod tests {
             10,
         );
 
+        assert_eq!(msg, None);
         // No sleep should have been called because we return before sleeping
         assert!(
             clock.sleep_calls.borrow().is_empty(),
