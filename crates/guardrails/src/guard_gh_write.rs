@@ -34,9 +34,6 @@ static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
 static API_INPUT_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+api.*\s--input\s").expect("pattern should compile"));
 
-static REPO_FLAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(-R|--repo)\s+([^ ]+)").expect("pattern should compile"));
-
 static REPO_SUBCOMMAND: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"gh\s+repo\s+(archive|delete|rename|unarchive|fork|clone|create)\b")
         .expect("pattern should compile")
@@ -50,6 +47,35 @@ fn is_write_command(command: &str) -> bool {
         || API_WRITE_METHOD.is_match(command)
         || API_FIELD_FLAGS.is_match(command)
         || API_INPUT_FLAG.is_match(command)
+}
+
+/// Extract a `-R`/`--repo` flag value from a raw command string.
+///
+/// Handles all four gh CLI forms: `-R x`, `-Rx`, `--repo x`, `--repo=x` —
+/// mirroring `loop_analysis::extract_repo_flag`, which does the same over
+/// parsed AST words. Values keep their quotes trimmed so `--repo "o/r"`
+/// resolves to `o/r`.
+fn extract_repo_flag_str(command: &str) -> Option<String> {
+    let trim_value = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let mut iter = words.iter();
+    while let Some(word) = iter.next() {
+        if *word == "-R" || *word == "--repo" {
+            return iter.next().map(|s| trim_value(s));
+        }
+        if let Some(repo) = word.strip_prefix("--repo=") {
+            return Some(trim_value(repo));
+        }
+        // Compact form: -Rowner/repo (no space). Exclude other dash-prefixed
+        // flags by requiring the remainder not start with another dash.
+        if let Some(repo) = word.strip_prefix("-R")
+            && !repo.is_empty()
+            && !repo.starts_with('-')
+        {
+            return Some(trim_value(repo));
+        }
+    }
+    None
 }
 
 /// Resolve target repo from command context.
@@ -71,13 +97,8 @@ fn resolve_target_repo(
     let dh = default_host();
 
     // 1. Explicit -R / --repo flag (gh CLI always targets GH_HOST or github.com)
-    if let Some(caps) = REPO_FLAG.captures(command)
-        && let Some(repo) = caps.get(2)
-    {
-        return RepoResolution::Resolved {
-            host: dh,
-            repo: repo.as_str().to_string(),
-        };
+    if let Some(repo) = extract_repo_flag_str(command) {
+        return RepoResolution::Resolved { host: dh, repo };
     }
 
     // 2. gh repo <subcommand> <owner/repo> (positional arg)
@@ -336,16 +357,18 @@ mod tests {
 
     #[test]
     fn repo_flag_extraction() {
-        let caps = REPO_FLAG.captures("gh pr create -R cameronsjo/test --title hi");
-        assert!(caps.is_some());
-        assert_eq!(caps.unwrap().get(2).unwrap().as_str(), "cameronsjo/test");
+        assert_eq!(
+            extract_repo_flag_str("gh pr create -R cameronsjo/test --title hi"),
+            Some("cameronsjo/test".to_string())
+        );
     }
 
     #[test]
     fn repo_flag_long_form() {
-        let caps = REPO_FLAG.captures("gh issue create --repo cameronsjo/test --title hi");
-        assert!(caps.is_some());
-        assert_eq!(caps.unwrap().get(2).unwrap().as_str(), "cameronsjo/test");
+        assert_eq!(
+            extract_repo_flag_str("gh issue create --repo cameronsjo/test --title hi"),
+            Some("cameronsjo/test".to_string())
+        );
     }
 
     // Write detection patterns
@@ -737,6 +760,39 @@ mod tests {
             RepoResolution::Resolved { repo, .. } => {
                 assert_eq!(repo, "cameronsjo/my-repo");
             }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    // --- #44: repo flag forms (equals and compact) ---
+
+    #[test]
+    fn repo_flag_equals_form_resolves() {
+        // `--repo=owner/repo` must resolve like `--repo owner/repo` does.
+        // work_dir is /nonexistent so a regex miss can only produce Unresolvable.
+        let allowed = owners(&["cameronsjo"]);
+        let resolved = resolve_target_repo(
+            "gh issue create --repo=cameronsjo/test --title hi",
+            "/nonexistent",
+            &allowed,
+        );
+        match resolved {
+            RepoResolution::Resolved { repo, .. } => assert_eq!(repo, "cameronsjo/test"),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_flag_compact_form_resolves() {
+        // `-Rowner/repo` (no space) must resolve like `-R owner/repo` does.
+        let allowed = owners(&["cameronsjo"]);
+        let resolved = resolve_target_repo(
+            "gh pr create -Rcameronsjo/test --title hi",
+            "/nonexistent",
+            &allowed,
+        );
+        match resolved {
+            RepoResolution::Resolved { repo, .. } => assert_eq!(repo, "cameronsjo/test"),
             other => panic!("expected Resolved, got {other:?}"),
         }
     }
