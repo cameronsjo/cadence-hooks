@@ -135,6 +135,11 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Verify and repair issue auto-close after PR create/merge",
         plugin: "guardrails",
     },
+    HookEntry {
+        name: "guard-op-vault-scan",
+        description: "Block uninvited 1Password vault enumeration (op item list)",
+        plugin: "guardrails",
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",

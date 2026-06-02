@@ -110,6 +110,16 @@ const NON_HOOK_BINARY_SUBCOMMANDS: &[&str] = &[
     "guardrails dismiss-main-branch-warn",
 ];
 
+/// settings.json shell scripts that trip the keyword-overlap heuristic but are
+/// NOT duplicates of plugin hooks. Each entry documents the distinction.
+const KNOWN_DISTINCT_SETTINGS_SCRIPTS: &[&str] = &[
+    // Blocks git writes inside the *Obsidian* vault working copy. Shares the
+    // filename tokens "vault" (with `guardrails guard-op-vault-scan` — a
+    // *1Password* vault check) and "writes" (with `cadence
+    // prevent-secret-writes`), but duplicates neither.
+    "block-vault-git-writes.sh",
+];
+
 /// Plugin name -> list of `<plugin> <subcommand>` strings referenced in its hooks.json.
 fn hooks_json_references() -> BTreeMap<String, Vec<HookRef>> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -450,6 +460,9 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
 
     for script in &shell_scripts {
         let filename = script.rsplit('/').next().unwrap_or(script).to_lowercase();
+        if KNOWN_DISTINCT_SETTINGS_SCRIPTS.contains(&filename.as_str()) {
+            continue;
+        }
         let filename_tokens: BTreeSet<String> = filename
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| !t.is_empty())
