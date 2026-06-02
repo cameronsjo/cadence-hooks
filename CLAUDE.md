@@ -1,12 +1,13 @@
 # cadence-hooks
 
-Rust workspace (7 crates) compiling to a single `cadence-hooks` binary. Dispatches Claude Code hook checks via clap subcommands, organized by namespace (cadence, guardrails, rules, obsidian, metrics, lab).
+Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatches Claude Code hook checks via clap subcommands, organized by namespace (cadence, guardrails, rules, obsidian, metrics, lab, session).
 
 ## Build & Test
 
 - `make ci` = fmt-check + clippy `-D warnings` + all tests. Run before every commit — the pre-commit hook also needs cargo on PATH.
 - cargo lives at `~/.cargo/bin` — `export PATH="$HOME/.cargo/bin:$PATH"` in every shell invocation, including git commits (the pre-commit hook runs cargo and aborts silently without it).
 - `cargo fmt --all` before `make ci` after writing long assert lines — fmt-check fails CI otherwise.
+- **Local `make ci` green does NOT guarantee CI green when the local Rust toolchain trails CI's.** CI runs the latest stable clippy, which flags lints the older local clippy doesn't (e.g. `collapsible_match` on 1.96). Treat the first CI run as the real clippy verdict, or `rustup update` before a PR.
 
 ## Release (fully automated — do NOT create tags or edit the tap formula manually)
 
