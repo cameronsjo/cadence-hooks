@@ -54,10 +54,16 @@ fn extract_frontmatter(content: &str) -> Option<Vec<(String, String)>> {
 
     let mut fields = Vec::new();
     for line in fm_lines {
+        // Indented lines are nested keys (e.g. `author:` under `metadata:`) —
+        // only top-level keys are validated against VALID_FIELDS. The check
+        // must run on the raw line: after `.trim()` every key looks top-level.
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
         if let Some(colon_pos) = line.find(':') {
             let key = line[..colon_pos].trim().to_string();
             let value = line[colon_pos + 1..].trim().to_string();
-            if !key.is_empty() && !key.starts_with(' ') {
+            if !key.is_empty() {
                 fields.push((key, value));
             }
         }
@@ -90,11 +96,15 @@ impl Check for ValidateSkillFrontmatter {
             return CheckResult::allow();
         }
 
-        let Some(content) = input.content() else {
+        // Validate the document the tool call will *produce*, not the raw tool
+        // payload. For Edit/MultiEdit this simulates the edit against the
+        // on-disk file — an Edit's new_string is a fragment, not the document.
+        // Unreadable/missing file → None → allow (fail open, ADR-0001).
+        let Some(content) = input.effective_content() else {
             return CheckResult::allow();
         };
 
-        let Some(fields) = extract_frontmatter(content) else {
+        let Some(fields) = extract_frontmatter(&content) else {
             return CheckResult::block("Frontmatter validation failed: file missing YAML frontmatter (must start with ---)".to_string());
         };
 
@@ -372,6 +382,7 @@ mod tests {
                 content: None,
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -411,12 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_with_nested_yaml_parsed() {
-        // The parser trims keys before checking, so "  nested" becomes "nested"
-        // and passes the `!key.starts_with(' ')` check — nested keys ARE included
+    fn frontmatter_nested_keys_excluded() {
+        // Indented (nested) keys belong to a parent mapping — they are not
+        // top-level fields and must not be validated against VALID_FIELDS.
         let content = "---\nname: my-skill\n  nested: value\ndescription: test\n---\n";
         let fields = extract_frontmatter(content).unwrap();
-        assert_eq!(fields.len(), 3); // nested is included after trim
+        assert_eq!(fields.len(), 2);
+        assert!(fields.iter().all(|(k, _)| k != "nested"));
     }
 
     #[test]
@@ -434,25 +446,79 @@ mod tests {
         assert!(msg.contains("Missing required 'description'"));
     }
 
+    // --- Edit/MultiEdit simulation against on-disk files (#60, #63) ---
+
+    use cadence_hooks_core::test_builders::{make_edit, make_multi_edit};
+
+    const VALID_SKILL: &str =
+        "---\nname: my-skill\ndescription: A test skill\n---\n# My Skill\n\nBody text here.\n";
+
+    /// Write a valid SKILL.md into a temp dir shaped like a plugin skill tree.
+    /// Returns (tempdir guard, absolute SKILL.md path).
+    fn on_disk_skill(content: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills/my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(&path, content).unwrap();
+        (dir, path.to_str().unwrap().to_string())
+    }
+
     #[test]
-    fn run_edit_tool_also_validated() {
-        // Edit tool is also validated — the guard checks file_path and content
-        // regardless of tool_name
-        let input = HookInput {
-            tool_name: Some("Edit".into()),
-            tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: Some("/plugins/skills/my-skill/SKILL.md".into()),
-                path: None,
-                command: None,
-                content: Some("# No frontmatter".into()),
-                new_string: None,
-                old_string: None,
-            }),
-            cwd: None,
-            ..Default::default()
-        };
+    fn run_body_only_edit_on_valid_skill_allowed() {
+        // Regression for #60: a mid-file Edit to a valid SKILL.md must not be
+        // blocked just because the edit fragment lacks frontmatter.
+        let (_dir, path) = on_disk_skill(VALID_SKILL);
+        let input = make_edit(&path, "Body text here.", "Updated body text.");
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_edit_corrupting_frontmatter_blocks() {
+        // The false-negative direction: an Edit that breaks the frontmatter of
+        // a valid file must still be caught.
+        let (_dir, path) = on_disk_skill(VALID_SKILL);
+        let input = make_edit(&path, "name: my-skill", "not a valid key line");
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("Missing required 'name'"));
+    }
+
+    #[test]
+    fn run_multi_edit_body_edit_on_valid_skill_allowed() {
+        let (_dir, path) = on_disk_skill(VALID_SKILL);
+        let input = make_multi_edit(
+            &path,
+            &[("# My Skill", "# My Skill v2"), ("Body text", "New body")],
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_edit_on_missing_file_allowed() {
+        // Fail open (ADR-0001): if the file can't be read, the edit can't be
+        // simulated — allow rather than block on incomplete information.
+        let input = make_edit(
+            "/nonexistent/plugins/skills/my-skill/SKILL.md",
+            "old",
+            "new",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_write_with_nested_metadata_allowed() {
+        // Regression for #63 (bug 2): nested keys under `metadata:` are not
+        // unknown top-level fields.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\nmetadata:\n  author: cameron\n  version: 1.0.0\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]

@@ -148,7 +148,7 @@ pub struct HookInput {
 }
 
 /// Tool-specific fields from the hook input.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ToolInput {
     pub file_path: Option<String>,
     pub path: Option<String>,
@@ -156,6 +156,27 @@ pub struct ToolInput {
     pub content: Option<String>,
     pub new_string: Option<String>,
     pub old_string: Option<String>,
+    /// Edit tool: replace every occurrence of `old_string` (default: first only).
+    pub replace_all: Option<bool>,
+    /// MultiEdit tool: sequence of edit operations applied in order.
+    pub edits: Option<Vec<EditOperation>>,
+}
+
+/// A single edit operation within a MultiEdit tool call.
+#[derive(Debug, Default, Deserialize)]
+pub struct EditOperation {
+    pub old_string: Option<String>,
+    pub new_string: Option<String>,
+    pub replace_all: Option<bool>,
+}
+
+/// Apply a single old→new replacement to a document.
+fn apply_edit(doc: &str, old: &str, new: &str, replace_all: bool) -> String {
+    if replace_all {
+        doc.replace(old, new)
+    } else {
+        doc.replacen(old, new, 1)
+    }
 }
 
 /// The tool response, available in PostToolUse hooks.
@@ -196,10 +217,58 @@ impl HookInput {
     }
 
     /// The content being written (Write tool) or the replacement text (Edit tool).
+    ///
+    /// For Edit, this is the replacement *fragment*, not the resulting document.
+    /// Checks that validate whole-document structure (frontmatter, etc.) must
+    /// use [`Self::effective_content`] instead.
     pub fn content(&self) -> Option<&str> {
         self.tool_input
             .as_ref()
             .and_then(|ti| ti.content.as_deref().or(ti.new_string.as_deref()))
+    }
+
+    /// The full document the tool call will produce.
+    ///
+    /// - Write (`content` present) → the content as-is.
+    /// - Edit (`old_string`/`new_string` present) → reads `file_path` from disk,
+    ///   applies the replacement (honoring `replace_all`), returns the result.
+    /// - MultiEdit (`edits[]` present) → reads the file, applies each edit in order.
+    /// - File unreadable or missing for Edit/MultiEdit → `None` (fail open, ADR-0001).
+    pub fn effective_content(&self) -> Option<String> {
+        let ti = self.tool_input.as_ref()?;
+
+        // Write: content is already the whole document.
+        if let Some(content) = ti.content.as_deref() {
+            return Some(content.to_string());
+        }
+
+        // Edit / MultiEdit: simulate the edit against the on-disk file.
+        let path = self.file_path()?;
+        let on_disk = std::fs::read_to_string(&path).ok()?;
+
+        if let (Some(old), Some(new)) = (ti.old_string.as_deref(), ti.new_string.as_deref()) {
+            return Some(apply_edit(
+                &on_disk,
+                old,
+                new,
+                ti.replace_all.unwrap_or(false),
+            ));
+        }
+
+        if let Some(edits) = ti.edits.as_ref() {
+            let mut doc = on_disk;
+            for edit in edits {
+                let (Some(old), Some(new)) =
+                    (edit.old_string.as_deref(), edit.new_string.as_deref())
+                else {
+                    continue;
+                };
+                doc = apply_edit(&doc, old, new, edit.replace_all.unwrap_or(false));
+            }
+            return Some(doc);
+        }
+
+        None
     }
 
     /// The tool name (Write, Edit, Bash, etc.)
@@ -628,7 +697,7 @@ mod tests {
                 command: command.map(String::from),
                 content: content.map(String::from),
                 new_string: new_string.map(String::from),
-                old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -692,6 +761,119 @@ mod tests {
     fn content_none_when_both_absent() {
         let input = make_input(None, None, None, None, None, None);
         assert_eq!(input.content(), None);
+    }
+
+    // --- effective_content ---
+
+    fn make_disk_edit(path: &str, old: &str, new: &str, replace_all: Option<bool>) -> HookInput {
+        HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(ToolInput {
+                file_path: Some(path.into()),
+                old_string: Some(old.into()),
+                new_string: Some(new.into()),
+                replace_all,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_edit_replaces_first_occurrence_only() {
+        assert_eq!(apply_edit("a b a", "a", "x", false), "x b a");
+    }
+
+    #[test]
+    fn apply_edit_replace_all_replaces_every_occurrence() {
+        assert_eq!(apply_edit("a b a", "a", "x", true), "x b x");
+    }
+
+    #[test]
+    fn effective_content_write_returns_content() {
+        let input = make_input(Some("Write"), Some("/a.md"), None, None, Some("doc"), None);
+        assert_eq!(input.effective_content().as_deref(), Some("doc"));
+    }
+
+    #[test]
+    fn effective_content_edit_simulates_against_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "line one\nline two\nline three\n").unwrap();
+
+        let input = make_disk_edit(path.to_str().unwrap(), "line two", "line 2", None);
+        assert_eq!(
+            input.effective_content().as_deref(),
+            Some("line one\nline 2\nline three\n")
+        );
+    }
+
+    #[test]
+    fn effective_content_edit_honors_replace_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "x x x").unwrap();
+
+        let input = make_disk_edit(path.to_str().unwrap(), "x", "y", Some(true));
+        assert_eq!(input.effective_content().as_deref(), Some("y y y"));
+    }
+
+    #[test]
+    fn effective_content_edit_missing_file_is_none() {
+        let input = make_disk_edit("/nonexistent/path/doc.md", "a", "b", None);
+        assert_eq!(input.effective_content(), None);
+    }
+
+    #[test]
+    fn effective_content_multi_edit_applies_sequentially() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+
+        let input = HookInput {
+            tool_name: Some("MultiEdit".into()),
+            tool_input: Some(ToolInput {
+                file_path: Some(path.to_str().unwrap().into()),
+                edits: Some(vec![
+                    EditOperation {
+                        old_string: Some("alpha".into()),
+                        new_string: Some("one".into()),
+                        replace_all: None,
+                    },
+                    EditOperation {
+                        old_string: Some("gamma".into()),
+                        new_string: Some("three".into()),
+                        replace_all: None,
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(input.effective_content().as_deref(), Some("one beta three"));
+    }
+
+    #[test]
+    fn effective_content_none_without_content_or_edit_fields() {
+        let input = make_input(Some("Read"), Some("/a.md"), None, None, None, None);
+        assert_eq!(input.effective_content(), None);
+    }
+
+    #[test]
+    fn deserialize_edit_with_replace_all() {
+        let json = r#"{"tool_name":"Edit","tool_input":{"file_path":"/a.md","old_string":"a","new_string":"b","replace_all":true}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.tool_input.as_ref().unwrap().replace_all, Some(true));
+    }
+
+    #[test]
+    fn deserialize_multi_edit_payload() {
+        let json = r#"{"tool_name":"MultiEdit","tool_input":{"file_path":"/a.md","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d","replace_all":true}]}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let edits = input.tool_input.as_ref().unwrap().edits.as_ref().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].old_string.as_deref(), Some("a"));
+        assert_eq!(edits[1].replace_all, Some(true));
     }
 
     #[test]

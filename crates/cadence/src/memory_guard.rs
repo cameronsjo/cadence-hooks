@@ -90,6 +90,7 @@ mod tests {
                 content: Some(content),
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()

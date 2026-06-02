@@ -56,6 +56,7 @@ mod tests {
                 content: None,
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             ..Default::default()
         }

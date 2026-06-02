@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn edit_env_blocked() {
-        let result = SecretWritesGuard.run(&make_edit_input("/project/.env.local"));
+        let result = SecretWritesGuard.run(&make_edit_input("/project/.env.local", "old", "new"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
@@ -324,6 +324,7 @@ mod tests {
                 content: None,
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -373,13 +374,14 @@ mod tests {
 
     #[test]
     fn edit_key_file_blocked() {
-        let result = SecretWritesGuard.run(&make_edit_input("/etc/ssl/server.key"));
+        let result = SecretWritesGuard.run(&make_edit_input("/etc/ssl/server.key", "old", "new"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
     fn edit_private_pem_blocked() {
-        let result = SecretWritesGuard.run(&make_edit_input("/etc/ssl/server-key.pem"));
+        let result =
+            SecretWritesGuard.run(&make_edit_input("/etc/ssl/server-key.pem", "old", "new"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
@@ -427,13 +429,14 @@ mod tests {
 
     #[test]
     fn edit_env_example_allowed() {
-        let result = SecretWritesGuard.run(&make_edit_input("/project/.env.example"));
+        let result = SecretWritesGuard.run(&make_edit_input("/project/.env.example", "old", "new"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
     fn edit_env_template_allowed() {
-        let result = SecretWritesGuard.run(&make_edit_input("/project/.env.template"));
+        let result =
+            SecretWritesGuard.run(&make_edit_input("/project/.env.template", "old", "new"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
@@ -471,7 +474,7 @@ mod tests {
 
     #[test]
     fn edit_env_backslash_path_blocked() {
-        let result = SecretWritesGuard.run(&make_edit_input(r"C:\Users\dev\.env"));
+        let result = SecretWritesGuard.run(&make_edit_input(r"C:\Users\dev\.env", "old", "new"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
@@ -486,6 +489,7 @@ mod tests {
                 content: None,
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -505,6 +509,7 @@ mod tests {
                 content: Some("content".into()),
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
