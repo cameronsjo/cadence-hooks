@@ -33,16 +33,25 @@ fn binary_subcommands() -> BTreeSet<String> {
             .unwrap_or_else(|e| panic!("failed to run `{bin} {plugin} --help`: {e}"));
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // clap help format: "  <subcommand>  <description>"
+        // clap help layout: about text, "Usage:", then a "Commands:" section,
+        // then "Options:". Only lines inside the Commands section name
+        // subcommands — the about text can contain hyphenated words (e.g.
+        // "Multi-session coordination hooks") that would otherwise parse as
+        // subcommand names.
+        let mut in_commands = false;
         for line in stdout.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty()
-                || trimmed.starts_with("Usage:")
-                || trimmed.starts_with("Options:")
-                || trimmed.starts_with("Commands:")
-                || trimmed == "help"
-                || trimmed.starts_with('-')
-            {
+            if trimmed.starts_with("Commands:") {
+                in_commands = true;
+                continue;
+            }
+            if !in_commands {
+                continue;
+            }
+            if trimmed.starts_with("Options:") {
+                break;
+            }
+            if trimmed.is_empty() || trimmed.starts_with('-') {
                 continue;
             }
             if let Some(subcmd) = trimmed.split_whitespace().next() {
@@ -100,10 +109,9 @@ const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("cadence-obsidian", "obsidian")];
 /// subcommands are expected to be unregistered until the plugin lands —
 /// remove the entry in the plugin's wiring PR.
 /// (group, tracking_reference)
-const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[
-    // cadence-canon — multi-session coordination satellite (issue #54).
-    ("session", "cameronsjo/cadence-hooks#54"),
-];
+///
+/// Currently empty: cadence-canon landed and wires the `session` group.
+const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
