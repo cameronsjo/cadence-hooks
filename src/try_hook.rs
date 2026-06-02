@@ -12,13 +12,24 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// Maximum bytes of payload echoed in the report. User-supplied payloads
+/// (`--payload`) can carry real command text or file content — bound the
+/// echo so `try` never leaks full payloads into scrollback or CI logs.
+/// `--show-payload` opts in to the full echo.
+const PAYLOAD_PREVIEW_LIMIT: usize = 200;
+
 /// Run `<namespace> <subcommand>` against a sample (or `--payload`) payload
 /// and print a report.
 ///
 /// Exit code: the hook's own exit code on a successful run (0 allow/nudge,
 /// 2 block), or 1 when the hook could not be run at all (unknown name,
 /// unreadable payload file, spawn failure).
-pub fn run(namespace: &str, subcommand: &str, payload_file: Option<&Path>) -> i32 {
+pub fn run(
+    namespace: &str,
+    subcommand: &str,
+    payload_file: Option<&Path>,
+    show_payload: bool,
+) -> i32 {
     let Some(entry) = registry::entry(namespace, subcommand) else {
         if let Some(actual_ns) = registry::namespace_of(subcommand) {
             eprintln!(
@@ -47,7 +58,7 @@ pub fn run(namespace: &str, subcommand: &str, payload_file: Option<&Path>) -> i3
                 return 1;
             }
         },
-        None => sample_payload_with_cwd(entry.event),
+        None => sample_payload_with_cwd(namespace, subcommand, entry.event),
     };
 
     let exe = match std::env::current_exe() {
@@ -64,7 +75,10 @@ pub fn run(namespace: &str, subcommand: &str, payload_file: Option<&Path>) -> i3
     };
     println!("Hook:     {namespace} {subcommand} — {}", entry.description);
     println!("Event:    {event_label}");
-    println!("Payload:  {}", payload.trim());
+    println!(
+        "Payload:  {}",
+        payload_preview(payload.trim(), payload_file.is_some(), show_payload)
+    );
     println!();
 
     let mut child = match Command::new(&exe)
@@ -109,12 +123,32 @@ pub fn run(namespace: &str, subcommand: &str, payload_file: Option<&Path>) -> i3
     code
 }
 
-/// The sample payload for an event, with the real working directory injected
+/// Bound the payload echo for user-supplied payloads; generated samples are
+/// synthetic (no secrets) and always short enough to show in full.
+fn payload_preview(payload: &str, user_supplied: bool, show_payload: bool) -> String {
+    if !user_supplied || show_payload || payload.len() <= PAYLOAD_PREVIEW_LIMIT {
+        return payload.to_string();
+    }
+    let truncated: String = payload.chars().take(PAYLOAD_PREVIEW_LIMIT).collect();
+    format!(
+        "{truncated}... ({} bytes total — pass --show-payload for the full payload)",
+        payload.len()
+    )
+}
+
+/// The sample payload for a hook, with the real working directory injected
 /// so hooks that resolve git state see the repo `try` was run from.
-fn sample_payload_with_cwd(event: Option<HookEvent>) -> String {
-    let base = match event {
-        Some(e) => e.sample_payload(),
-        None => LOGGER_SAMPLE_PAYLOAD,
+///
+/// Per-hook registry overrides (`registry::sample_for`) win over event-based
+/// samples — loggers gate on `hook_event_name` and command shapes, so the
+/// generic fallback can exercise the wrong branch.
+fn sample_payload_with_cwd(namespace: &str, subcommand: &str, event: Option<HookEvent>) -> String {
+    let base = match registry::sample_for(namespace, subcommand) {
+        Some(sample) => sample,
+        None => match event {
+            Some(e) => e.sample_payload(),
+            None => LOGGER_SAMPLE_PAYLOAD,
+        },
     };
     match serde_json::from_str::<serde_json::Value>(base) {
         Ok(mut v) => {
@@ -156,7 +190,8 @@ mod tests {
 
     #[test]
     fn sample_payload_with_cwd_injects_cwd() {
-        let payload = sample_payload_with_cwd(Some(HookEvent::PreToolUse));
+        let payload =
+            sample_payload_with_cwd("cadence", "terminology", Some(HookEvent::PreToolUse));
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert!(v.get("cwd").is_some(), "cwd should be injected: {payload}");
         assert_eq!(v["tool_name"], "Bash");
@@ -164,9 +199,53 @@ mod tests {
 
     #[test]
     fn sample_payload_for_logger_uses_metrics_shape() {
-        let payload = sample_payload_with_cwd(None);
+        let payload = sample_payload_with_cwd("session", "heartbeat", None);
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert!(v.get("hook_event_name").is_some());
         assert!(v.get("cwd").is_some());
+    }
+
+    #[test]
+    fn sample_payload_uses_registry_override_for_log_subagent() {
+        // log-subagent only reacts to SubagentStart/SubagentStop — the registry
+        // override must win over the generic PostToolUse fallback.
+        let payload = sample_payload_with_cwd("metrics", "log-subagent", None);
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            v["hook_event_name"], "SubagentStop",
+            "registry override should be used: {payload}"
+        );
+    }
+
+    #[test]
+    fn generated_payload_preview_is_never_truncated() {
+        let long_sample = format!(r#"{{"tool_name":"Bash","content":"{}"}}"#, "x".repeat(500));
+        let preview = payload_preview(&long_sample, false, false);
+        assert_eq!(preview, long_sample, "generated samples show in full");
+    }
+
+    #[test]
+    fn user_payload_preview_is_bounded() {
+        let long_payload = format!(r#"{{"tool_name":"Bash","content":"{}"}}"#, "x".repeat(500));
+        let preview = payload_preview(&long_payload, true, false);
+        assert!(preview.len() < long_payload.len(), "should truncate");
+        assert!(
+            preview.contains("--show-payload"),
+            "should name the opt-in flag: {preview}"
+        );
+    }
+
+    #[test]
+    fn user_payload_shown_in_full_with_opt_in() {
+        let long_payload = format!(r#"{{"tool_name":"Bash","content":"{}"}}"#, "x".repeat(500));
+        let preview = payload_preview(&long_payload, true, true);
+        assert_eq!(preview, long_payload, "--show-payload shows everything");
+    }
+
+    #[test]
+    fn short_user_payload_shown_in_full() {
+        let short = r#"{"tool_name":"Bash"}"#;
+        let preview = payload_preview(short, true, false);
+        assert_eq!(preview, short, "short payloads need no truncation");
     }
 }

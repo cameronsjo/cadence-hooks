@@ -73,6 +73,9 @@ enum Commands {
         /// Read the payload from a file instead of generating a sample
         #[arg(long, value_name = "FILE")]
         payload: Option<std::path::PathBuf>,
+        /// Echo user-supplied payloads in full (default: bounded preview)
+        #[arg(long)]
+        show_payload: bool,
     },
 
     /// List all hooks with events, descriptions, and disable status
@@ -359,8 +362,16 @@ fn main() {
     // false-clean in CI; a bypassed `session status` would hide live peers
     // exactly when someone is debugging coordination.
     let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
-    let cli_action_args = ["list", "configure", "doctor", "try", "declare", "status"];
-    if bypassed && !std::env::args().any(|a| cli_action_args.contains(&a.as_str())) {
+    // Match on subcommand *position* (argv[1], or argv[1]+argv[2] for session
+    // CLI actions) — not any argv token, which would let a hook argument that
+    // happens to equal "list"/"try"/etc. skip the bypass short-circuit.
+    let mut positional = std::env::args().skip(1);
+    let bypass_exempt = matches!(
+        (positional.next().as_deref(), positional.next().as_deref()),
+        (Some("list" | "configure" | "doctor" | "try"), _)
+            | (Some("session"), Some("declare" | "status"))
+    );
+    if bypassed && !bypass_exempt {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
     }
@@ -458,8 +469,14 @@ fn main() {
             namespace,
             subcommand,
             payload,
+            show_payload,
         } => {
-            process::exit(try_hook::run(&namespace, &subcommand, payload.as_deref()));
+            process::exit(try_hook::run(
+                &namespace,
+                &subcommand,
+                payload.as_deref(),
+                show_payload,
+            ));
         }
         Commands::List => {
             print_hook_list();
@@ -618,15 +635,20 @@ fn main() {
             ),
         },
         Commands::Metrics(cmd) => match cmd {
-            MetricsCommands::Snapshot => run_logger_from_stdin(&cadence_hooks_metrics::Snapshot),
-            MetricsCommands::LogCommit { prices } => {
-                run_logger_from_stdin(&cadence_hooks_metrics::LogCommit {
+            MetricsCommands::Snapshot => run_logger_from_stdin(
+                &cadence_hooks_metrics::Snapshot,
+                registry::sample_for("metrics", "snapshot"),
+            ),
+            MetricsCommands::LogCommit { prices } => run_logger_from_stdin(
+                &cadence_hooks_metrics::LogCommit {
                     prices_path: prices,
-                })
-            }
-            MetricsCommands::LogSubagent => {
-                run_logger_from_stdin(&cadence_hooks_metrics::LogSubagent)
-            }
+                },
+                registry::sample_for("metrics", "log-commit"),
+            ),
+            MetricsCommands::LogSubagent => run_logger_from_stdin(
+                &cadence_hooks_metrics::LogSubagent,
+                registry::sample_for("metrics", "log-subagent"),
+            ),
         },
         Commands::Lab(cmd) => match cmd {
             LabCommands::PersonaNudge => {
@@ -640,9 +662,10 @@ fn main() {
             SessionCommands::Start => {
                 run_check_from_stdin(&cadence_hooks_session::start::Start, session)
             }
-            SessionCommands::Heartbeat => {
-                run_logger_from_stdin(&cadence_hooks_session::heartbeat::Heartbeat)
-            }
+            SessionCommands::Heartbeat => run_logger_from_stdin(
+                &cadence_hooks_session::heartbeat::Heartbeat,
+                registry::sample_for("session", "heartbeat"),
+            ),
             SessionCommands::Guard => {
                 run_check_from_stdin(&cadence_hooks_session::guard::Guard, pre)
             }

@@ -197,6 +197,62 @@ fn try_works_during_bypass() {
     assert!(stdout.contains("Outcome:"), "report still prints: {stdout}");
 }
 
+#[test]
+fn bypass_exemption_is_positional_not_any_token() {
+    // A hook invocation whose *argument* equals a CLI-action word must still
+    // be bypassed — only the subcommand position grants the exemption.
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_BYPASS", "1");
+    cmd.args(["metrics", "log-commit", "--prices", "try"]);
+
+    let output = run_with_stdin(cmd, "{}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stderr.contains("bypassed"),
+        "hook with 'try' as an argument value must still be bypassed: {stderr}"
+    );
+}
+
+#[test]
+fn session_cli_actions_remain_bypass_exempt() {
+    // `session status` is argv[1]="session", argv[2]="status" — the positional
+    // match must still exempt it.
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_BYPASS", "1");
+    cmd.args(["session", "status"]);
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("all enforcement bypassed"),
+        "session status must not be short-circuited by bypass: {stderr}"
+    );
+}
+
+// ── try: per-hook sample correctness ─────────────────────────────────
+
+#[test]
+fn try_log_subagent_uses_subagent_event_sample() {
+    let mut cmd = cadence_hooks();
+    let tmp = std::env::temp_dir().join("cadence-hooks-try-test");
+    cmd.env("CADENCE_METRICS_DIR", &tmp);
+    cmd.args(["try", "metrics", "log-subagent"]);
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The registry override must put a SubagentStop payload on stdin — the
+    // generic PostToolUse fallback would make this logger no-op silently.
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+    assert!(
+        stdout.contains("SubagentStop"),
+        "log-subagent sample must use a Subagent event: {stdout}"
+    );
+}
+
 // ── interactive guard: piped stdin must never trip it ────────────────
 
 #[test]

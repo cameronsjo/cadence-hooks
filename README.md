@@ -132,8 +132,9 @@ Claude Code hooks communicate via a simple protocol:
 
 ```
 stdin  → JSON { tool_name, tool_input: { file_path, command, content, ... }, cwd }
-stderr ← Diagnostic message (shown to user)
-exit   → 0 (allow) | 1 (warn, show message) | 2 (block, prevent operation)
+stdout ← Nudge messages (JSON additionalContext, injected into Claude's context)
+stderr ← Block diagnostics (fed back to Claude)
+exit   → 0 (allow / nudge) | 2 (block, prevent operation) | other (non-blocking error)
 ```
 
 Each subcommand reads this JSON, runs its check, and exits. No network calls, no config files, no dependencies beyond the binary.

@@ -277,6 +277,35 @@ pub fn entry(namespace: &str, subcommand: &str) -> Option<&'static HookEntry> {
         .find(|h| h.plugin == namespace && h.name == subcommand)
 }
 
+/// Per-hook sample payload overrides for `try` and the interactive-terminal
+/// guidance.
+///
+/// Hooks not listed here fall back to event-based samples
+/// ([`HookEvent::sample_payload`] for checks, `LOGGER_SAMPLE_PAYLOAD` for
+/// loggers). Overrides exist where the generic sample would exercise the
+/// wrong branch — loggers gate on `hook_event_name` and specific command
+/// shapes, so a generic payload can no-op while appearing healthy.
+///
+/// Every sample here must deserialize as `MetricsInput` (loggers) or
+/// `HookInput` (checks) — enforced by unit test.
+pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
+    match (namespace, subcommand) {
+        // snapshot gates on a `git commit` command (PreToolUse partner of log-commit)
+        ("metrics", "snapshot") => Some(
+            r#"{"session_id":"test","hook_event_name":"PreToolUse","tool_input":{"command":"git commit -m test"}}"#,
+        ),
+        // log-commit gates on a `git commit` command after it ran
+        ("metrics", "log-commit") => Some(
+            r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"git commit -m test"},"transcript_path":"/tmp/transcript.jsonl"}"#,
+        ),
+        // log-subagent only reacts to SubagentStart / SubagentStop
+        ("metrics", "log-subagent") => Some(
+            r#"{"session_id":"test","hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"Explore","duration_ms":1234}"#,
+        ),
+        _ => None,
+    }
+}
+
 /// True when `<namespace> <subcommand>` names a registered hook.
 pub fn is_known(namespace: &str, subcommand: &str) -> bool {
     entry(namespace, subcommand).is_some()
@@ -330,6 +359,44 @@ mod tests {
     #[test]
     fn entry_returns_none_for_unknown_pair() {
         assert!(entry("cadence", "guard-push-remote").is_none());
+    }
+
+    #[test]
+    fn sample_overrides_exist_for_event_gated_loggers() {
+        // These three loggers gate on specific hook_event_name values or
+        // command shapes — the generic fallback would no-op them.
+        for name in ["snapshot", "log-commit", "log-subagent"] {
+            assert!(
+                sample_for("metrics", name).is_some(),
+                "{name} needs a sample override"
+            );
+        }
+        // heartbeat reacts to any tool event — generic fallback is correct.
+        assert!(sample_for("session", "heartbeat").is_none());
+        assert!(sample_for("cadence", "terminology").is_none());
+    }
+
+    #[test]
+    fn sample_overrides_parse_as_metrics_input() {
+        for hook in HOOKS {
+            if let Some(sample) = sample_for(hook.plugin, hook.name) {
+                let parsed = cadence_hooks_core::MetricsInput::from_json(sample);
+                assert!(
+                    parsed.is_ok(),
+                    "sample for {} {} must parse: {:?}",
+                    hook.plugin,
+                    hook.name,
+                    parsed.err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_subagent_sample_uses_subagent_event() {
+        let sample = sample_for("metrics", "log-subagent").unwrap();
+        let parsed = cadence_hooks_core::MetricsInput::from_json(sample).unwrap();
+        assert_eq!(parsed.hook_event_name.as_deref(), Some("SubagentStop"));
     }
 
     #[test]
