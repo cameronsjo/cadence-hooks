@@ -90,6 +90,71 @@ diagnostics that have no value on trivial sessions.
 - Use helper functions (`make_input`, `make_bash_input`) for test setup
 - Group tests: happy path first, then unhappy path / edge cases
 
+## Reproducing a Check by Hand
+
+A check is stdin JSON → exit code, so any reported bug (or new check) can be
+driven from the CLI without launching Claude Code. The README's
+[Testing Hooks Manually](README.md#testing-hooks-manually) section covers the
+operator-level workflow (`try`, bare-invocation guidance, event payload
+shapes); this section is the check-author's debugging loop.
+
+### Workflow
+
+1. Start with `cadence-hooks try <namespace> <hook>` to confirm the hook's
+   event and see a working sample payload
+2. Copy that payload into a fixture file and switch to raw piping:
+   `cadence-hooks <namespace> <hook> < fixture.json; echo "rc=$?"`
+3. Change one `tool_input` field at a time to isolate what trips the check
+4. If version drift is suspected, run both binaries against the same fixture:
+   `cadence-hooks --version` (installed) vs
+   `./target/release/cadence-hooks --version` (your checkout)
+5. Once the failure is understood, add the payload as a unit test in the
+   check's `#[cfg(test)]` block
+
+Use `try` when you want to see what a hook does; use raw `printf | cadence-hooks ...`
+when you need to control the exact payload — `try` always generates its own.
+
+### Tool shapes
+
+Each tool carries its content in a different field. A check that only reads
+one shape silently misbehaves on the others — this is the most common check
+bug class (#60, #63).
+
+| Tool | Field to inspect | Notes |
+|---|---|---|
+| Write | `tool_input.content` | The whole document |
+| Edit | `tool_input.old_string` / `new_string` | A *fragment* — `HookInput::effective_content()` reads `file_path` from disk and applies the replacement to get the document |
+| MultiEdit | `tool_input.edits[]` | Array of `{old_string, new_string, replace_all}` applied in order |
+| Bash | `tool_input.command` | The command string |
+
+Checks that validate whole-document structure must use
+`HookInput::effective_content()`, which simulates Edit/MultiEdit against the
+on-disk file. This means an Edit/MultiEdit fixture only behaves realistically
+when `file_path` points at a file that actually exists — create it first.
+
+**Edit payload** (body-only edit to an on-disk SKILL.md — must allow):
+
+```bash
+mkdir -p /tmp/fixture/skills/demo
+printf -- '---\nname: demo\ndescription: test\n---\n# Demo\n\nBody.\n' > /tmp/fixture/skills/demo/SKILL.md
+
+printf '%s' '{"tool_name":"Edit","tool_input":{"file_path":"/tmp/fixture/skills/demo/SKILL.md","old_string":"Body.","new_string":"New body."}}' \
+  | cadence-hooks rules validate-frontmatter; echo "rc=$?"   # expect rc=0
+```
+
+**MultiEdit payload** (same file, two sequential edits):
+
+```bash
+printf '%s' '{"tool_name":"MultiEdit","tool_input":{"file_path":"/tmp/fixture/skills/demo/SKILL.md","edits":[{"old_string":"# Demo","new_string":"# Demo v2"},{"old_string":"Body.","new_string":"New body."}]}}' \
+  | cadence-hooks rules validate-frontmatter; echo "rc=$?"   # expect rc=0
+```
+
+### Reporting what you find
+
+When filing a bug, note which binary you reproduced against
+(`cadence-hooks --version` for the installed one, the branch/SHA for a
+checkout build) — line numbers and behavior can differ between them.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [BSL-1.1](LICENSE).

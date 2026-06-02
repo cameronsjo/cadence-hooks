@@ -192,6 +192,11 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' \
   | cadence-hooks guardrails guard-push-remote
 ```
 
+Writing or debugging a check? See
+[CONTRIBUTING.md → Reproducing a Check by Hand](CONTRIBUTING.md#reproducing-a-check-by-hand)
+for the check-author's debugging loop and the per-tool payload shapes
+(Write/Edit/MultiEdit carry their content in different fields).
+
 ## Installation
 
 ### From release (recommended)
