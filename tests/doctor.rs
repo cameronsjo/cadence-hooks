@@ -16,6 +16,193 @@ fn write_plugin(root: &std::path::Path, plugin: &str, hooks_json: &str) {
     std::fs::write(dir.join("hooks.json"), hooks_json).unwrap();
 }
 
+/// Create a hooks.json at the REAL Claude Code cache depth:
+/// `<root>/<marketplace>/<plugin>/<sha>/hooks/hooks.json`.
+fn write_cached_plugin(
+    root: &std::path::Path,
+    marketplace: &str,
+    plugin: &str,
+    sha: &str,
+    hooks_json: &str,
+) {
+    let dir = root.join(marketplace).join(plugin).join(sha).join("hooks");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hooks.json"), hooks_json).unwrap();
+}
+
+const BUGGY_HOOKS_JSON: &str = r#"{
+    "hooks": {
+        "PreToolUse": [{
+            "hooks": [{ "command": "'${CLAUDE_PLUGIN_ROOT}/hooks/run.sh' arg" }]
+        }]
+    }
+}"#;
+
+// Version-skew fixture: references a subcommand this binary doesn't have.
+const SKEW_HOOKS_JSON: &str = r#"{
+    "hooks": {
+        "PreToolUse": [{
+            "hooks": [{ "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails hook-from-the-future" }]
+        }]
+    }
+}"#;
+
+// ── Real cache layout (marketplace/plugin/sha/hooks/hooks.json) ────────────
+//
+// The live Claude Code cache nests three levels deep. A doctor that only
+// scans <root>/<entry>/hooks/hooks.json reports "clean" against the real
+// cache no matter what's in it — the tool's primary invocation is a no-op.
+
+#[test]
+fn doctor_scans_real_cache_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "buggy-plugin",
+        "ea2f0e05b78d",
+        BUGGY_HOOKS_JSON,
+    );
+
+    let output = cadence_hooks()
+        .args(["doctor", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "doctor must find the shell-expansion bug at real cache depth.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn doctor_labels_finding_with_plugin_name_not_sha() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "buggy-plugin",
+        "ea2f0e05b78d",
+        BUGGY_HOOKS_JSON,
+    );
+
+    let output = cadence_hooks()
+        .args(["doctor", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("buggy-plugin"),
+        "finding label must include the plugin name, not just the SHA dir: {stdout}"
+    );
+}
+
+// ── Exit-code contract ──────────────────────────────────────────────────────
+
+#[test]
+fn doctor_nonexistent_root_exits_two() {
+    // A wrong --root is a configuration error. Exit 0 here would let a
+    // misconfigured CI gate pass everything forever.
+    let output = cadence_hooks()
+        .args(["doctor", "--root", "/nonexistent/path/that/cannot/exist"])
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing scan root must exit 2 (config error), not 0.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── CADENCE_BYPASS must not silence the doctor ─────────────────────────────
+
+#[test]
+fn doctor_runs_under_cadence_bypass() {
+    // CADENCE_BYPASS=1 bypasses *enforcement* hooks. Doctor is a diagnostic,
+    // not an enforcement path — bypassing it produces false-clean CI runs.
+    let tmp = tempfile::tempdir().unwrap();
+    write_plugin(tmp.path(), "buggy-plugin", BUGGY_HOOKS_JSON);
+
+    let output = cadence_hooks()
+        .args(["doctor", "--root"])
+        .arg(tmp.path())
+        .env("CADENCE_BYPASS", "1")
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "doctor must scan even under CADENCE_BYPASS=1.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── --quiet stdout contract (SessionStart preflight depends on it) ─────────
+
+#[test]
+fn doctor_quiet_warnings_print_summary_to_stdout() {
+    // The README's SessionStart preflight wiring captures stdout as the skew
+    // nudge. Warnings-only in quiet mode MUST emit a non-empty stdout line
+    // and exit 0.
+    let tmp = tempfile::tempdir().unwrap();
+    write_plugin(tmp.path(), "skewed-plugin", SKEW_HOOKS_JSON);
+
+    let output = cadence_hooks()
+        .args(["doctor", "--quiet", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "warnings-only in quiet mode exits 0.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "quiet mode with warnings must print a one-line summary to stdout"
+    );
+    assert!(
+        stdout.contains("missing"),
+        "summary should describe the skew: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_quiet_clean_prints_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_plugin(
+        tmp.path(),
+        "clean-plugin",
+        r#"{ "hooks": { "PreToolUse": [{ "hooks": [{ "command": "\"${X}\" arg" }]}] }}"#,
+    );
+
+    let output = cadence_hooks()
+        .args(["doctor", "--quiet", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output.stdout.is_empty(),
+        "quiet + clean must print nothing: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[test]
 fn doctor_clean_cache_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -168,4 +355,79 @@ fn doctor_finds_violation_across_multiple_plugins() {
     assert!(stdout.contains("buggy-plugin-a"));
     assert!(stdout.contains("buggy-plugin-b"));
     assert!(stdout.contains("2 finding"));
+}
+
+// ── Manifest-driven default scan (no --root) ───────────────────────────────
+
+#[test]
+fn doctor_default_scan_reads_installed_plugins_manifest() {
+    // The default invocation (no --root) must scan active installs listed in
+    // ~/.claude/plugins/installed_plugins.json — at the real cache depth.
+    let tmp = tempfile::tempdir().unwrap();
+    let install_path = tmp
+        .path()
+        .join(".claude/plugins/cache/workbench/buggy-plugin/ea2f0e05b78d");
+    std::fs::create_dir_all(install_path.join("hooks")).unwrap();
+    std::fs::write(install_path.join("hooks/hooks.json"), BUGGY_HOOKS_JSON).unwrap();
+
+    let manifest = format!(
+        r#"{{
+  "version": 2,
+  "plugins": {{
+    "buggy-plugin@workbench": [
+      {{ "scope": "user", "installPath": {p}, "version": "ea2f0e05b78d" }}
+    ]
+  }}
+}}"#,
+        p = serde_json::to_string(install_path.to_str().unwrap()).unwrap()
+    );
+    std::fs::write(
+        tmp.path().join(".claude/plugins/installed_plugins.json"),
+        manifest,
+    )
+    .unwrap();
+
+    let output = cadence_hooks()
+        .arg("doctor")
+        .env("HOME", tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "default scan must read the manifest and find the bug.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("buggy-plugin@workbench"),
+        "finding must be labeled with the manifest key: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_default_scan_falls_back_to_cache_walk_without_manifest() {
+    // No installed_plugins.json — recursively walk the cache dir instead.
+    let tmp = tempfile::tempdir().unwrap();
+    let plugin_dir = tmp
+        .path()
+        .join(".claude/plugins/cache/workbench/buggy-plugin/ea2f0e05b78d/hooks");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(plugin_dir.join("hooks.json"), BUGGY_HOOKS_JSON).unwrap();
+
+    let output = cadence_hooks()
+        .arg("doctor")
+        .env("HOME", tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "manifest-less fallback must still scan the cache recursively.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

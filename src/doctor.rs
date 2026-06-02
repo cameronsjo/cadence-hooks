@@ -6,10 +6,12 @@
 //! the harness logs "non-blocking", and nothing surfaces to the user.
 //! Only `cadence-hooks doctor` exposes it, and most users never run it.
 //!
-//! This subcommand walks `~/.claude/plugins/cache/*/hooks/hooks.json`,
-//! flags known shell-expansion patterns and unknown subcommand references,
-//! and exits non-zero when violations are found so it's usable as a CI
-//! check or a one-shot diagnostic.
+//! This subcommand reads `~/.claude/plugins/installed_plugins.json` and scans
+//! each active install's `hooks/hooks.json` (falling back to a recursive walk
+//! of `~/.claude/plugins/cache/` when the manifest is absent). It flags known
+//! shell-expansion patterns and unknown subcommand references, and exits
+//! non-zero when violations are found so it's usable as a CI check or a
+//! one-shot diagnostic.
 
 use std::path::{Path, PathBuf};
 
@@ -164,11 +166,20 @@ fn judge_invocation(namespace: &str, subcommand: &str) -> Option<SkewDiagnosis> 
 
 /// Find the 1-based line number of `needle` in `haystack`.
 /// Best-effort: returns `None` when not found.
+///
+/// The needle is a serde-decoded command string; the haystack is raw JSON
+/// text where inner quotes and backslashes are escaped. Search for the
+/// JSON-encoded form so commands containing quotes (the dominant real form)
+/// still resolve to a line. Needles without special characters encode to
+/// themselves, so plain-text haystacks keep working.
 fn find_line_number(haystack: &str, needle: &str) -> Option<usize> {
+    let encoded = serde_json::to_string(needle).ok()?;
+    // Strip the surrounding quotes the encoder adds.
+    let encoded_inner = &encoded[1..encoded.len() - 1];
     haystack
         .lines()
         .enumerate()
-        .find(|(_, line)| line.contains(needle))
+        .find(|(_, line)| line.contains(encoded_inner))
         .map(|(i, _)| i + 1)
 }
 
@@ -229,43 +240,99 @@ fn scan_hooks_json(plugin: &str, path: &Path, raw: &str, json: &serde_json::Valu
     findings
 }
 
-/// Default scan root: Claude Code's installed-plugin cache.
-fn default_root() -> Option<PathBuf> {
+/// Claude Code's plugins directory (`~/.claude/plugins`).
+fn plugins_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".claude/plugins/cache"))
+    Some(PathBuf::from(home).join(".claude/plugins"))
 }
 
-/// Discover plugin dirs under `root` and scan each one's `hooks/hooks.json`.
+/// Read active plugin install paths from `installed_plugins.json` (v2 schema).
+///
+/// Returns `(label, install_path)` pairs, where the label is the manifest key
+/// (`<plugin>@<marketplace>`). Returns `None` when the manifest is missing or
+/// unparseable — callers fall back to a recursive cache scan.
+///
+/// Reading the manifest (rather than walking the cache) matters: the cache
+/// never garbage-collects, so stale plugin versions sit beside active ones.
+/// Scanning them would report skew in code that no longer runs.
+fn manifest_install_paths(manifest: &Path) -> Option<Vec<(String, PathBuf)>> {
+    let content = std::fs::read_to_string(manifest).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let plugins = json.get("plugins")?.as_object()?;
+
+    let mut out = Vec::new();
+    for (key, installs) in plugins {
+        let Some(installs) = installs.as_array() else {
+            continue;
+        };
+        for install in installs {
+            let Some(path) = install.get("installPath").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            out.push((key.clone(), PathBuf::from(path)));
+        }
+    }
+    Some(out)
+}
+
+/// Scan a single plugin install dir's `hooks/hooks.json`, if present.
+fn scan_plugin_dir(label: &str, plugin_dir: &Path) -> Vec<Finding> {
+    let hooks_path = plugin_dir.join("hooks/hooks.json");
+    let Ok(content) = std::fs::read_to_string(&hooks_path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        // Invalid JSON is its own bug, but not the one this check exists
+        // to catch. The plugin loader will surface it.
+        return Vec::new();
+    };
+    scan_hooks_json(label, &hooks_path, &content, &json)
+}
+
+/// Recursively discover `hooks/hooks.json` files under `root` and scan each.
+///
+/// Handles any nesting depth: a flat layout (`<root>/<plugin>/hooks/`) and the
+/// real Claude Code cache layout (`<root>/<marketplace>/<plugin>/<sha>/hooks/`)
+/// both work. Plugin labels are the directory path from `root` to the dir
+/// containing `hooks/`, so findings stay attributable at any depth.
 fn scan_root(root: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    // Real cache layouts are 3 levels deep (marketplace/plugin/sha); allow
+    // headroom while bounding the walk against pathological trees.
+    const MAX_DEPTH: usize = 6;
 
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return findings;
-    };
-
-    for entry in entries.flatten() {
-        let plugin_dir = entry.path();
-        if !plugin_dir.is_dir() {
+    while let Some(dir) = stack.pop() {
+        let depth = dir
+            .strip_prefix(root)
+            .map(|p| p.components().count())
+            .unwrap_or(0);
+        if depth > MAX_DEPTH {
             continue;
         }
-        let plugin_name = plugin_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("<unknown>")
-            .to_string();
-        let hooks_path = plugin_dir.join("hooks/hooks.json");
-        if !hooks_path.exists() {
+
+        if dir.join("hooks/hooks.json").is_file() {
+            let label = dir
+                .strip_prefix(root)
+                .ok()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| dir.display().to_string());
+            findings.extend(scan_plugin_dir(&label, &dir));
+            // A plugin dir doesn't nest further plugins beneath it.
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&hooks_path) else {
+
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-            // Invalid JSON is its own bug, but not the one this check exists
-            // to catch. The plugin loader will surface it.
-            continue;
-        };
-        findings.extend(scan_hooks_json(&plugin_name, &hooks_path, &content, &json));
+        for entry in entries.flatten() {
+            // Recurse into real directories only — symlinks could cycle.
+            let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if !is_symlink && entry.path().is_dir() {
+                stack.push(entry.path());
+            }
+        }
     }
 
     findings
@@ -276,43 +343,69 @@ fn scan_root(root: &Path) -> Vec<Finding> {
 /// Exit codes:
 ///   0  clean
 ///   1  warnings only (version skew)
-///   2  errors — shell-expansion bugs (regardless of warnings), or internal
-///      errors like an unset `$HOME`
+///   2  errors — shell-expansion bugs (regardless of warnings), or internal /
+///      configuration errors (unset `$HOME`, nonexistent scan root)
 ///
 /// `root_override` lets tests redirect the scan; in normal use it's `None`
-/// and we fall back to `$HOME/.claude/plugins/cache`.
+/// and the scan is driven by `~/.claude/plugins/installed_plugins.json`
+/// (active installs only), falling back to a recursive walk of
+/// `~/.claude/plugins/cache` when the manifest is absent.
 ///
 /// `quiet=true` is suitable for SessionStart preflight wiring:
 ///   - Clean: no output, exit 0
 ///   - Warnings only: ONE summary line to stdout, exit 0
-///   - Errors: one line to stderr, exit 2
+///   - Errors (with or without warnings): one line to stderr, exit 2 — the
+///     warning summary is suppressed; errors take precedence
 ///
 /// Stream split in quiet mode is deliberate: warnings go to stdout (a caller
 /// capturing stdout gets the skew nudge to inject), errors go to stderr (a
 /// caller redirecting stderr to /dev/null still fails on the exit code).
 pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
-    let root = match root_override {
-        Some(p) => p.to_path_buf(),
-        None => match default_root() {
-            Some(p) => p,
-            None => {
+    let (findings, scanned) = match root_override {
+        Some(root) => {
+            if !root.exists() {
+                // Configuration error, not "clean" — exit 2 so a misconfigured
+                // CI gate can never silently pass everything.
+                eprintln!(
+                    "cadence-hooks doctor: scan root does not exist: {}",
+                    root.display()
+                );
+                return 2;
+            }
+            (scan_root(root), root.display().to_string())
+        }
+        None => {
+            let Some(plugins) = plugins_dir() else {
                 // Internal error, not version skew — exit 2 so callers never
                 // misread it as "warnings present".
                 eprintln!("cadence-hooks doctor: $HOME not set; cannot locate plugin cache");
                 return 2;
+            };
+
+            match manifest_install_paths(&plugins.join("installed_plugins.json")) {
+                Some(installs) => {
+                    let scanned = format!("{} installed plugin(s)", installs.len());
+                    let findings = installs
+                        .iter()
+                        .flat_map(|(label, dir)| scan_plugin_dir(label, dir))
+                        .collect();
+                    (findings, scanned)
+                }
+                None => {
+                    // No readable manifest — recursively scan the cache instead.
+                    let cache = plugins.join("cache");
+                    if !cache.exists() {
+                        eprintln!(
+                            "cadence-hooks doctor: no installed-plugins manifest and no plugin cache under {}",
+                            plugins.display()
+                        );
+                        return 2;
+                    }
+                    (scan_root(&cache), cache.display().to_string())
+                }
             }
-        },
+        }
     };
-
-    if !root.exists() {
-        eprintln!(
-            "cadence-hooks doctor: scan root does not exist: {}",
-            root.display()
-        );
-        return 0;
-    }
-
-    let findings = scan_root(&root);
 
     let (errors, warnings): (Vec<&Finding>, Vec<&Finding>) =
         findings.iter().partition(|f| f.severity == Severity::Error);
@@ -339,14 +432,13 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
 
     // Default (verbose) mode.
     if findings.is_empty() {
-        println!("cadence-hooks doctor: clean ({} scanned)", root.display());
+        println!("cadence-hooks doctor: clean ({scanned} scanned)");
         return 0;
     }
 
     println!(
-        "cadence-hooks doctor: {} finding(s) under {}:\n",
-        findings.len(),
-        root.display()
+        "cadence-hooks doctor: {} finding(s) in {scanned}:\n",
+        findings.len()
     );
 
     // Errors first, then warnings.
@@ -482,6 +574,77 @@ mod tests {
         assert_eq!(extract_invocation("cadence-hooks list"), None);
     }
 
+    // ── find_line_number tests ───────────────────────────────────────────────
+
+    #[test]
+    fn find_line_number_handles_json_escaped_quotes() {
+        // The needle is the serde-decoded command; the haystack is raw JSON
+        // where inner double quotes are backslash-escaped. The dominant real
+        // command form ("${CLAUDE_PLUGIN_ROOT}/..." ns sub) contains quotes,
+        // so a literal substring search never matches it.
+        let raw = r#"{
+  "hooks": {
+    "PreToolUse": [{
+      "hooks": [{ "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-push-remote" }]
+    }]
+  }
+}"#;
+        let decoded =
+            r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#;
+        assert_eq!(find_line_number(raw, decoded), Some(4));
+    }
+
+    #[test]
+    fn find_line_number_still_matches_unquoted_needle() {
+        let raw = "line one\nline two has needle\nline three";
+        assert_eq!(find_line_number(raw, "needle"), Some(2));
+    }
+
+    // ── manifest-driven scan (installed_plugins.json) ────────────────────────
+
+    #[test]
+    fn manifest_install_paths_reads_v2_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join("cache/workbench/cadence-guardrails/abc123");
+        fs::create_dir_all(&install_dir).unwrap();
+
+        let manifest = tmp.path().join("installed_plugins.json");
+        let manifest_json = format!(
+            r#"{{
+  "version": 2,
+  "plugins": {{
+    "cadence-guardrails@workbench": [
+      {{
+        "scope": "user",
+        "installPath": {install_path},
+        "version": "abc123"
+      }}
+    ]
+  }}
+}}"#,
+            install_path = serde_json::to_string(install_dir.to_str().unwrap()).unwrap()
+        );
+        fs::write(&manifest, manifest_json).unwrap();
+
+        let paths = manifest_install_paths(&manifest).expect("should parse v2 manifest");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, "cadence-guardrails@workbench");
+        assert_eq!(paths[0].1, install_dir);
+    }
+
+    #[test]
+    fn manifest_install_paths_none_for_missing_file() {
+        assert!(manifest_install_paths(Path::new("/nonexistent/manifest.json")).is_none());
+    }
+
+    #[test]
+    fn manifest_install_paths_none_for_invalid_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("installed_plugins.json");
+        fs::write(&manifest, "{ not json").unwrap();
+        assert!(manifest_install_paths(&manifest).is_none());
+    }
+
     // ── judge_invocation tests ───────────────────────────────────────────────
 
     #[test]
@@ -525,18 +688,10 @@ mod tests {
     // ── integration tests via run(Some(tmpdir), ...) ─────────────────────────
 
     /// Build a minimal hooks.json under a temp plugin dir structure.
-    /// Returns the root dir (caller must keep it alive).
-    fn write_fixture(commands: &[&str]) -> std::path::PathBuf {
-        // Use PID + a counter for a unique-enough subdir.
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "cadence-hooks-doctor-test-{}-{}",
-            std::process::id(),
-            n
-        ));
-        let plugin_dir = root.join("test-plugin/hooks");
+    /// Returns the TempDir guard (dropped = cleaned up).
+    fn write_fixture(commands: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("test-plugin/hooks");
         fs::create_dir_all(&plugin_dir).unwrap();
 
         let hooks_entries: String = commands
@@ -578,7 +733,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(&root), false), 0);
+        assert_eq!(run(Some(root.path()), false), 0);
     }
 
     #[test]
@@ -586,7 +741,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence no-such-hook"#,
         ]);
-        assert_eq!(run(Some(&root), false), 1);
+        assert_eq!(run(Some(root.path()), false), 1);
     }
 
     #[test]
@@ -594,7 +749,7 @@ mod tests {
         let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(&root), false), 2);
+        assert_eq!(run(Some(root.path()), false), 2);
     }
 
     #[test]
@@ -603,7 +758,7 @@ mod tests {
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' cadence no-such-hook"#,
         ]);
         // Single-quoted (Error) + unknown sub (Warning) → exit 2
-        assert_eq!(run(Some(&root), false), 2);
+        assert_eq!(run(Some(root.path()), false), 2);
     }
 
     #[test]
@@ -613,7 +768,7 @@ mod tests {
         ]);
         // Capture stdout is not trivial in unit tests; we verify exit code here.
         // The output assertion is covered by manually running the binary.
-        assert_eq!(run(Some(&root), true), 0);
+        assert_eq!(run(Some(root.path()), true), 0);
     }
 
     #[test]
@@ -621,7 +776,7 @@ mod tests {
         let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(&root), true), 2);
+        assert_eq!(run(Some(root.path()), true), 2);
     }
 
     #[test]
@@ -629,6 +784,6 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(&root), true), 0);
+        assert_eq!(run(Some(root.path()), true), 0);
     }
 }

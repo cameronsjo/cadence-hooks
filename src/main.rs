@@ -273,9 +273,11 @@ fn print_hook_list() {
 fn main() {
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
-    // Note: `list` and `configure` subcommands are exempt — they need to work always.
+    // Note: `list`, `configure`, and `doctor` are exempt — they're CLI/diagnostic
+    // commands, not enforcement paths, and must work always. A bypassed doctor
+    // would report false-clean in CI.
     let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
-    if bypassed && !std::env::args().any(|a| a == "list" || a == "configure") {
+    if bypassed && !std::env::args().any(|a| a == "list" || a == "configure" || a == "doctor") {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
     }
@@ -524,5 +526,65 @@ fn main() {
                 run_check_from_stdin(&cadence_hooks_lab::gate::PersonaGate, post)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry must mirror clap's dispatch exactly — both directions.
+    ///
+    /// This is the mechanical enforcement of "single source of truth"
+    /// (issue #39 P1): it is filesystem-independent, so it runs on every
+    /// bare-checkout `cargo test`, unlike the hooks.json audit test which
+    /// skips when sibling plugin dirs are absent.
+    #[test]
+    fn registry_matches_clap_dispatch() {
+        let cli = Cli::command();
+        let namespaces = [
+            "cadence",
+            "guardrails",
+            "rules",
+            "obsidian",
+            "metrics",
+            "lab",
+        ];
+        // clap subcommands that are CLI actions, not hooks (no hooks.json wiring).
+        let non_hooks = ["dismiss-main-branch-warn"];
+
+        let mut clap_pairs: Vec<(String, String)> = Vec::new();
+        for ns in namespaces {
+            let ns_cmd = cli
+                .find_subcommand(ns)
+                .unwrap_or_else(|| panic!("namespace '{ns}' should exist in clap"));
+            for sub in ns_cmd.get_subcommands() {
+                let name = sub.get_name().to_string();
+                if !non_hooks.contains(&name.as_str()) {
+                    clap_pairs.push((ns.to_string(), name));
+                }
+            }
+        }
+
+        // Direction 1: every dispatchable clap subcommand has a registry entry.
+        for (ns, sub) in &clap_pairs {
+            assert!(
+                registry::is_known(ns, sub),
+                "clap subcommand '{ns} {sub}' is dispatchable but missing from \
+                 registry::HOOKS — list/doctor/configure won't know it exists"
+            );
+        }
+
+        // Direction 2: every registry entry is a dispatchable clap subcommand.
+        for hook in HOOKS {
+            assert!(
+                clap_pairs
+                    .iter()
+                    .any(|(ns, sub)| ns == hook.plugin && sub == hook.name),
+                "registry entry '{} {}' has no clap subcommand — it's listed but not dispatchable",
+                hook.plugin,
+                hook.name
+            );
+        }
     }
 }

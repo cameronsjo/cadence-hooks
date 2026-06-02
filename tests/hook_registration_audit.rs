@@ -507,6 +507,8 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
             .join(" ");
         let event = if window.contains(", post") || window.contains("post)") {
             "PostToolUse"
+        } else if window.contains(", session") || window.contains("session)") {
+            "SessionStart"
         } else if window.contains(", pre") || window.contains("pre)") {
             "PreToolUse"
         } else {
