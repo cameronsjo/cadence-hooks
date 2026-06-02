@@ -41,7 +41,7 @@ Hooks are organized by the plugin they serve:
 | `check-idle-return` | PreToolUse | Nudge after idle periods between edits |
 | `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main |
 | `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) |
-| `guard-pr-issue-link` | PreToolUse (Bash) | Block `gh pr create` without a closing issue keyword (`Closes #N`) in the body |
+| `warn-pr-issue-link` | PreToolUse (Bash) | Nudge when `gh pr create` has no closing issue keyword (`Closes #N`) in the body |
 | `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge |
 | `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed |
 | `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |

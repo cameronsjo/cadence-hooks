@@ -1,9 +1,9 @@
 //! Shared closing-keyword detection for GitHub issue references.
 //!
-//! Both `guard_pr_issue_link` (boolean: does the PR body link an issue?) and
+//! Both `warn_pr_issue_link` (boolean: does the PR body link an issue?) and
 //! `verify_pr_autoclose` (extraction: which issues does it close?) recognize
 //! the same GitHub closing keywords. One regex serves both so the pattern
-//! cannot drift between guards.
+//! cannot drift between checks.
 
 use regex::Regex;
 use std::sync::LazyLock;

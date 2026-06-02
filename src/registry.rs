@@ -156,8 +156,8 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
-        name: "guard-pr-issue-link",
-        description: "Block gh pr create without a closing issue keyword",
+        name: "warn-pr-issue-link",
+        description: "Nudge when gh pr create has no closing issue keyword",
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
