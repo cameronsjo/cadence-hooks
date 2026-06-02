@@ -186,7 +186,13 @@ fn valid_subcommand_with_empty_input_allows() {
         .and_then(|mut child| {
             use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(b"{}")?;
+                // BrokenPipe means the child exited before reading stdin —
+                // expected for early-exit paths, not a test failure (#59).
+                if let Err(e) = stdin.write_all(b"{}")
+                    && e.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    return Err(e);
+                }
             }
             child.wait_with_output()
         })
