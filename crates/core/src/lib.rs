@@ -4,6 +4,10 @@
 //! and exit with a status code:
 //! - 0: allow / nudge (operation proceeds, stdout included in transcript)
 //! - 2: block (operation prevented, stderr fed back to Claude)
+//!
+//! Run from an interactive terminal (stdin is a TTY) instead of a pipe, hook
+//! entry points print usage guidance and exit 1 rather than blocking on a
+//! read that would never see EOF.
 
 pub mod config;
 pub mod loop_analysis;
@@ -13,7 +17,7 @@ pub mod shell;
 pub mod test_builders;
 
 use serde::Deserialize;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
 
@@ -31,6 +35,33 @@ pub enum HookEvent {
     /// SessionStart — fires when a session begins (startup/resume/clear/compact).
     /// Nudges inject context via `hookSpecificOutput.additionalContext`.
     SessionStart,
+}
+
+impl HookEvent {
+    /// The event name as it appears in the Claude Code hook protocol
+    /// (`hookEventName`, hooks.json matchers).
+    pub fn name(&self) -> &'static str {
+        match self {
+            HookEvent::PreToolUse => "PreToolUse",
+            HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::SessionStart => "SessionStart",
+        }
+    }
+
+    /// A minimal valid payload for this event, used by the interactive-terminal
+    /// guidance and the `try` subcommand. Each sample must deserialize as
+    /// [`HookInput`] — enforced by unit test.
+    pub fn sample_payload(&self) -> &'static str {
+        match self {
+            HookEvent::PreToolUse => {
+                r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#
+            }
+            HookEvent::PostToolUse => {
+                r#"{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"},"tool_response":{"stdout":"ok"}}"#
+            }
+            HookEvent::SessionStart => r#"{"session_id":"test","source":"startup"}"#,
+        }
+    }
 }
 
 /// Exit codes matching Claude Code's hook contract.
@@ -344,11 +375,7 @@ pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
 
     let result = check.run(input);
     if let Some(msg) = &result.message {
-        let event_name = match event {
-            HookEvent::PreToolUse => "PreToolUse",
-            HookEvent::PostToolUse => "PostToolUse",
-            HookEvent::SessionStart => "SessionStart",
-        };
+        let event_name = event.name();
         match result.outcome {
             Outcome::Nudge => {
                 let json = serde_json::json!({
@@ -385,8 +412,89 @@ pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
     process::exit(result.outcome.code());
 }
 
+/// The generic fallback payload for fire-and-forget loggers ([`MetricsInput`]
+/// shape). Must deserialize as [`MetricsInput`] — enforced by unit test.
+///
+/// This is a *fallback*: loggers react to `hook_event_name` in the payload and
+/// each one cares about different events (e.g. `log-subagent` only reacts to
+/// `SubagentStart`/`SubagentStop`). Per-hook sample overrides live in the
+/// binary's registry (`registry::sample_for`) and are passed in via the
+/// `sample_override` parameters below.
+pub const LOGGER_SAMPLE_PAYLOAD: &str = r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"git status"}}"#;
+
+/// Build the guidance shown when a hook subcommand is run from an interactive
+/// terminal (stdin is a TTY) instead of receiving piped JSON.
+///
+/// Without this, the stdin read blocks forever waiting for EOF the terminal
+/// never sends — which reads as "the binary locked up."
+///
+/// `event` is `None` for loggers, which react to `hook_event_name` in the
+/// payload rather than a fixed event. `sample_override` replaces the
+/// event-derived sample when the caller knows a better payload for this
+/// specific hook (from the binary's registry). `argv` is the process
+/// invocation (`std::env::args()`), passed explicitly so the builder is
+/// unit-testable.
+pub fn interactive_terminal_help(
+    hook_name: &str,
+    event: Option<HookEvent>,
+    sample_override: Option<&str>,
+    argv: &[String],
+) -> String {
+    let subcommand_path = if argv.len() > 1 {
+        argv[1..].join(" ")
+    } else {
+        hook_name.to_string()
+    };
+    let (fires_on, default_sample) = match event {
+        Some(e) => (e.name(), e.sample_payload()),
+        None => ("tool events", LOGGER_SAMPLE_PAYLOAD),
+    };
+    let sample = sample_override.unwrap_or(default_sample);
+    format!(
+        "cadence-hooks: '{hook_name}' is a Claude Code hook, not an interactive command.\n\
+         \n\
+         It reads a JSON payload on stdin — Claude Code pipes this automatically on\n\
+         {fires_on}. Nothing was piped and stdin is a terminal, so it would wait forever.\n\
+         \n\
+         Quick test:\n\
+         \n\
+         \u{20} cadence-hooks try {subcommand_path}\n\
+         \n\
+         Or pipe a payload manually:\n\
+         \n\
+         \u{20} echo '{sample}' | cadence-hooks {subcommand_path}\n\
+         \n\
+         Explore:\n\
+         \n\
+         \u{20} cadence-hooks list      all hooks and what they do\n\
+         \u{20} cadence-hooks doctor    audit installed plugin wiring\n"
+    )
+}
+
+/// If stdin is an interactive terminal, print guidance and exit 1.
+///
+/// Exit 1 (not 0) so scripts see the hook did not run; never 2 — interactive
+/// misuse is not a hook context, and a hook's own non-hook situation must
+/// never block (ADR-0001). Invisible in production: Claude Code always pipes,
+/// so `is_terminal()` is false there.
+fn guard_interactive_terminal(
+    hook_name: &str,
+    event: Option<HookEvent>,
+    sample_override: Option<&str>,
+) {
+    if std::io::stdin().is_terminal() {
+        let argv: Vec<String> = std::env::args().collect();
+        eprint!(
+            "{}",
+            interactive_terminal_help(hook_name, event, sample_override, &argv)
+        );
+        process::exit(1);
+    }
+}
+
 /// Run a single check from stdin. Convenience wrapper for subcommands.
 pub fn run_check_from_stdin(check: &dyn Check, event: HookEvent) -> ! {
+    guard_interactive_terminal(check.name(), Some(event), None);
     match HookInput::from_stdin() {
         Ok(input) => run_check(check, &input, event),
         Err(e) => {
@@ -416,7 +524,14 @@ pub trait Logger {
 /// Logging is fire-and-forget: a parse error, a missing field, or a failed
 /// write must never block the operation that triggered the hook. This mirrors
 /// the bash `|| true` discipline — loggers never emit exit 2, never block.
-pub fn run_logger_from_stdin(logger: &dyn Logger) -> ! {
+///
+/// `sample_override` is the per-hook sample payload from the binary's registry
+/// (`registry::sample_for`), shown in the interactive-terminal guidance.
+/// Loggers react to different `hook_event_name` values, so the generic
+/// [`LOGGER_SAMPLE_PAYLOAD`] fallback may exercise the wrong branch for a
+/// specific logger.
+pub fn run_logger_from_stdin(logger: &dyn Logger, sample_override: Option<&str>) -> ! {
+    guard_interactive_terminal(logger.name(), None, sample_override);
     if let Ok(input) = MetricsInput::from_stdin() {
         // A panicking logger must not skip the exit-0 below. Catch the unwind so
         // the contract holds even on a buggy implementation. `AssertUnwindSafe`
@@ -812,5 +927,102 @@ mod tests {
     #[test]
     fn metrics_input_rejects_malformed_json() {
         assert!(MetricsInput::from_json("not json").is_err());
+    }
+
+    // --- Interactive terminal guidance ---
+
+    #[test]
+    fn event_names_match_protocol() {
+        assert_eq!(HookEvent::PreToolUse.name(), "PreToolUse");
+        assert_eq!(HookEvent::PostToolUse.name(), "PostToolUse");
+        assert_eq!(HookEvent::SessionStart.name(), "SessionStart");
+    }
+
+    #[test]
+    fn sample_payloads_parse_as_hook_input() {
+        for event in [
+            HookEvent::PreToolUse,
+            HookEvent::PostToolUse,
+            HookEvent::SessionStart,
+        ] {
+            let parsed: Result<HookInput, _> = serde_json::from_str(event.sample_payload());
+            assert!(
+                parsed.is_ok(),
+                "sample for {} must deserialize as HookInput: {:?}",
+                event.name(),
+                parsed.err()
+            );
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_sample_carries_a_command() {
+        let input: HookInput =
+            serde_json::from_str(HookEvent::PreToolUse.sample_payload()).unwrap();
+        assert!(input.command().is_some());
+    }
+
+    #[test]
+    fn logger_sample_payload_parses_as_metrics_input() {
+        let parsed = MetricsInput::from_json(LOGGER_SAMPLE_PAYLOAD);
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
+        assert_eq!(
+            parsed.unwrap().hook_event_name.as_deref(),
+            Some("PostToolUse")
+        );
+    }
+
+    #[test]
+    fn interactive_help_names_hook_event_and_commands() {
+        let argv: Vec<String> = ["cadence-hooks", "lab", "persona-nudge"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let msg =
+            interactive_terminal_help("persona-nudge", Some(HookEvent::SessionStart), None, &argv);
+        assert!(msg.contains("'persona-nudge'"));
+        assert!(msg.contains("SessionStart"));
+        assert!(msg.contains("cadence-hooks try lab persona-nudge"));
+        assert!(msg.contains("| cadence-hooks lab persona-nudge"));
+        assert!(msg.contains(HookEvent::SessionStart.sample_payload()));
+        assert!(msg.contains("cadence-hooks list"));
+        assert!(msg.contains("cadence-hooks doctor"));
+    }
+
+    #[test]
+    fn interactive_help_for_logger_uses_metrics_sample() {
+        let argv: Vec<String> = ["cadence-hooks", "metrics", "snapshot"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let msg = interactive_terminal_help("snapshot", None, None, &argv);
+        assert!(msg.contains("tool events"));
+        assert!(msg.contains(LOGGER_SAMPLE_PAYLOAD));
+        assert!(msg.contains("cadence-hooks try metrics snapshot"));
+    }
+
+    #[test]
+    fn interactive_help_sample_override_replaces_default() {
+        let argv: Vec<String> = ["cadence-hooks", "metrics", "log-subagent"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let override_sample = r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#;
+        let msg = interactive_terminal_help("log-subagent", None, Some(override_sample), &argv);
+        assert!(
+            msg.contains(override_sample),
+            "override sample should appear: {msg}"
+        );
+        assert!(
+            !msg.contains(LOGGER_SAMPLE_PAYLOAD),
+            "generic fallback should be replaced: {msg}"
+        );
+    }
+
+    #[test]
+    fn interactive_help_falls_back_to_hook_name_without_argv() {
+        let msg = interactive_terminal_help("terminology", Some(HookEvent::PreToolUse), None, &[]);
+        assert!(msg.contains("cadence-hooks try terminology"));
+        assert!(msg.contains("| cadence-hooks terminology"));
     }
 }
