@@ -43,6 +43,11 @@ Hooks are organized by the plugin they serve:
 | `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) |
 | `guard-pr-issue-link` | PreToolUse (Bash) | Block `gh pr create` without a closing issue keyword (`Closes #N`) in the body |
 | `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge |
+| `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed |
+| `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
+| `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) |
+| `warn-coderabbit-retrigger` | PreToolUse (Bash) | Warn that `@coderabbitai review` comments are no-ops on already-reviewed content |
+| `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
 
 ### rules
 
