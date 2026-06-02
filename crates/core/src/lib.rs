@@ -104,6 +104,9 @@ fn normalize_path(path: &str) -> String {
 pub struct HookInput {
     pub tool_name: Option<String>,
     pub tool_input: Option<ToolInput>,
+    /// The tool response (stdout, stderr) from the tool execution.
+    /// Available in PostToolUse hooks — absent in PreToolUse and SessionStart.
+    pub tool_response: Option<ToolResponse>,
     pub cwd: Option<String>,
     /// Claude Code session id — present on `SessionStart`.
     pub session_id: Option<String>,
@@ -122,6 +125,17 @@ pub struct ToolInput {
     pub content: Option<String>,
     pub new_string: Option<String>,
     pub old_string: Option<String>,
+}
+
+/// The tool response, available in PostToolUse hooks.
+///
+/// Claude Code sends the tool's stdout (and optionally stderr) back in the
+/// hook payload so post-processing hooks can inspect the result without
+/// re-running the command.
+#[derive(Debug, Default, Deserialize)]
+pub struct ToolResponse {
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
 }
 
 impl HookInput {
@@ -175,6 +189,13 @@ impl HookInput {
     /// The session model id, if present.
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    /// The stdout from the tool response (PostToolUse only).
+    pub fn tool_response_stdout(&self) -> Option<&str> {
+        self.tool_response
+            .as_ref()
+            .and_then(|tr| tr.stdout.as_deref())
     }
 }
 

@@ -6,7 +6,7 @@
 //! cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 //! ```
 
-use crate::{HookInput, ToolInput};
+use crate::{HookInput, ToolInput, ToolResponse};
 
 /// Build a `HookInput` for a `Bash` tool invocation.
 pub fn make_bash(cmd: &str) -> HookInput {
@@ -70,6 +70,30 @@ pub fn make_edit(path: &str) -> HookInput {
             content: None,
             new_string: Some("new".into()),
             old_string: Some("old".into()),
+        }),
+        cwd: None,
+        ..Default::default()
+    }
+}
+
+/// Build a `HookInput` for a PostToolUse `Bash` invocation with a tool response stdout.
+///
+/// Used to test PostToolUse checks that inspect the command's output (e.g.
+/// `verify-pr-autoclose` which reads the PR URL from `gh pr create` stdout).
+pub fn make_bash_post_tool_use(cmd: &str, stdout: &str) -> HookInput {
+    HookInput {
+        tool_name: Some("Bash".into()),
+        tool_input: Some(ToolInput {
+            file_path: None,
+            path: None,
+            command: Some(cmd.into()),
+            content: None,
+            new_string: None,
+            old_string: None,
+        }),
+        tool_response: Some(ToolResponse {
+            stdout: Some(stdout.into()),
+            stderr: None,
         }),
         cwd: None,
         ..Default::default()
