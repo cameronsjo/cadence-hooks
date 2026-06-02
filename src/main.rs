@@ -325,11 +325,14 @@ fn print_hook_list() {
 fn main() {
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
-    // Note: `list`, `configure`, and `doctor` are exempt — they're CLI/diagnostic
-    // commands, not enforcement paths, and must work always. A bypassed doctor
-    // would report false-clean in CI.
+    // Note: `list`, `configure`, `doctor`, and the session CLI actions
+    // (`declare`, `status`) are exempt — they're CLI/diagnostic commands, not
+    // enforcement paths, and must work always. A bypassed doctor would report
+    // false-clean in CI; a bypassed `session status` would hide live peers
+    // exactly when someone is debugging coordination.
     let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
-    if bypassed && !std::env::args().any(|a| a == "list" || a == "configure" || a == "doctor") {
+    let cli_action_args = ["list", "configure", "doctor", "declare", "status"];
+    if bypassed && !std::env::args().any(|a| cli_action_args.contains(&a.as_str())) {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
     }

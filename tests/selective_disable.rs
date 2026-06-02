@@ -297,3 +297,56 @@ fn list_works_during_bypass() {
         "all hooks should show as disabled during bypass"
     );
 }
+
+#[test]
+fn session_status_works_during_bypass() {
+    // `session status` is a CLI action, not an enforcement hook — it must be
+    // exempt from CADENCE_BYPASS (a bypassed status would hide live peers
+    // exactly when someone is debugging coordination). Run from a non-git
+    // temp dir so the command exercises its "not a repo" path with no side
+    // effects on the real registry.
+    let tmp = std::env::temp_dir().join(format!("session-bypass-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["session", "status"]);
+    cmd.env("CADENCE_BYPASS", "1");
+    cmd.current_dir(&tmp);
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        !stderr.contains("all enforcement bypassed"),
+        "status must not be swallowed by the bypass: {stderr}"
+    );
+    assert!(
+        stdout.contains("not inside a git repository"),
+        "status ran and reported the non-repo cwd: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn session_enforcement_hooks_still_bypassed() {
+    // The exemption is for CLI actions only — `session guard` (an enforcement
+    // hook) must still be swallowed by CADENCE_BYPASS.
+    let mut cmd = cadence_hooks();
+    cmd.args(["session", "guard"]);
+    cmd.env("CADENCE_BYPASS", "1");
+
+    let output = run_with_stdin(
+        cmd,
+        r#"{"tool_name":"Bash","tool_input":{"command":"git checkout main"}}"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stderr.contains("all enforcement bypassed"),
+        "guard is an enforcement hook and must be bypassed: {stderr}"
+    );
+}

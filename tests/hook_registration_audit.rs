@@ -355,15 +355,21 @@ fn all_binary_subcommands_are_registered() {
         SHELL_PLUGIN_DIRS.iter().map(|(_, group)| *group).collect();
 
     // Subcommands for plugins that don't exist yet are also expected to be
-    // unregistered — but only while the plugin dir is actually absent. Once
-    // the dir appears locally, the exemption stops applying and the entry
-    // must be removed from PENDING_PLUGIN_GROUPS.
+    // unregistered — but only while the plugin *directory* is actually absent
+    // from the workspace parent. The exemption keys off directory existence
+    // (not hooks.json existence) so a checked-out plugin with missing wiring
+    // fails the audit instead of hiding behind the exemption. Remove the
+    // PENDING_PLUGIN_GROUPS entry in the plugin's wiring PR.
+    let workspace_parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cadence-hooks should be inside claude-configurations")
+        .to_path_buf();
     let pending_groups: BTreeSet<&str> = PENDING_PLUGIN_GROUPS
         .iter()
         .filter(|(group, _)| {
             !BINARY_PLUGIN_DIRS
                 .iter()
-                .any(|(dir, g)| g == group && all_refs.contains_key(*dir))
+                .any(|(dir, g)| g == group && workspace_parent.join(dir).is_dir())
         })
         .map(|(group, _)| *group)
         .collect();

@@ -167,20 +167,26 @@ pub fn is_blanket_add(command: &str) -> bool {
         let rest = &tokens[idx + 1..];
         match *subcommand {
             "add" => {
-                if rest.iter().any(|t| {
-                    *t == "-A" || *t == "--all" || *t == "." || *t == "-u" || *t == "--update"
-                }) {
+                // `git add -u <pathspec>` is path-scoped, not blanket — only a
+                // bare `-u`/`--update` (no pathspec) stages everything tracked.
+                let has_explicit_pathspec = rest.iter().any(|t| !t.starts_with('-') && *t != ".");
+                if rest
+                    .iter()
+                    .any(|t| *t == "-A" || *t == "--all" || *t == ".")
+                    || (!has_explicit_pathspec
+                        && rest.iter().any(|t| *t == "-u" || *t == "--update"))
+                {
                     return true;
                 }
             }
-            "commit" => {
+            "commit"
                 if rest.iter().any(|t| {
                     *t == "-a"
                         || *t == "--all"
                         || (t.starts_with("-a") && !t.starts_with("--") && t.len() > 2)
-                }) {
-                    return true;
-                }
+                }) =>
+            {
+                return true;
             }
             _ => {}
         }
@@ -435,6 +441,16 @@ mod tests {
         assert!(!is_blanket_add("git add CLAUDE.md docs/plan.md"));
         assert!(!is_blanket_add("git commit -m 'msg'"));
         assert!(!is_blanket_add("git commit --amend"));
+    }
+
+    #[test]
+    fn add_update_flag_scoping() {
+        // Bare `-u`/`--update` stages every tracked file — blanket.
+        assert!(is_blanket_add("git add -u"));
+        assert!(is_blanket_add("git add --update"));
+        // Path-scoped `-u <pathspec>` only touches matching tracked files.
+        assert!(!is_blanket_add("git add -u src/"));
+        assert!(!is_blanket_add("git add --update crates/session/"));
     }
 
     #[test]
