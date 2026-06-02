@@ -150,6 +150,11 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)",
         plugin: "guardrails",
     },
+    HookEntry {
+        name: "warn-coderabbit-retrigger",
+        description: "Warn that CodeRabbit re-trigger comments are no-ops on reviewed content",
+        plugin: "guardrails",
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",

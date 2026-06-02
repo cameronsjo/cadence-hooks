@@ -29,6 +29,8 @@ pub mod nudge_upgrade_after_push;
 pub mod verify_pr_autoclose;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
+/// Warn that CodeRabbit re-trigger comments are no-ops on already-reviewed content.
+pub mod warn_coderabbit_retrigger;
 /// Remind to check datetime before scheduling cron jobs.
 pub mod warn_cron_datetime;
 /// Warn when bare `curl` (aliased to curlie) is used with custom headers.
