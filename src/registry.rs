@@ -204,6 +204,22 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Validate and promote a self-representation candidate",
         plugin: "lab",
     },
+    // session (cadence-canon)
+    HookEntry {
+        name: "start",
+        description: "Register this session in the repo registry and disclose live peers",
+        plugin: "session",
+    },
+    HookEntry {
+        name: "heartbeat",
+        description: "Touch this session's registry file (mtime is the liveness signal)",
+        plugin: "session",
+    },
+    HookEntry {
+        name: "guard",
+        description: "Warn when an action intersects a live peer session's lane",
+        plugin: "session",
+    },
 ];
 
 /// True when `<namespace> <subcommand>` names a registered hook.

@@ -106,6 +106,26 @@ re-prompt convention (not the block convention) is what drives the rewrite. Chee
 ships `warn` (annotate a system-written `flags` field, still promote). Configure via
 `~/.claude/persona/config.json`; record shape in the plugin's `schema/persona.schema.json`.
 
+### session (cadence-canon)
+
+Multi-session coordination for the **cadence-canon** plugin (issue #54). Concurrent
+Claude Code sessions sharing one repo checkout cannot see each other — these hooks
+give sessions *identity* within a repo via a registry at `<repo>/.claude/sessions/`
+(one file per session, mtime is the liveness heartbeat, auto-excluded from git via
+`.git/info/exclude`).
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `start` | SessionStart | Register this session (deterministic adjective-noun name), sweep stale entries, and disclose live peers with a lane assessment + the multi-session protocol |
+| `heartbeat` | PostToolUse | Touch this session's registry file; refresh the recorded branch so peers see branch drift |
+| `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths |
+| `declare` | CLI action | Declare what this session is working on (`--intent`, `--touching`) so peers can assess collision risk |
+| `status` | CLI action | List live and stale sessions registered in this repo |
+
+Liveness is mtime-based: a session that crashes or closes simply stops heartbeating
+and is presumed dead after 10 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
+deregistration ceremony. Stale entries are swept on the next `session start`.
+
 ## Hook Protocol
 
 Claude Code hooks communicate via a simple protocol:
@@ -195,6 +215,7 @@ All cadence-hooks config lives under the `CADENCE_*` prefix. `OBSIDIAN_VAULT` is
 | `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host |
 | `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
 | `CADENCE_GUARD_DOTFILES` | `guard-dotfiles` | Set to `1` to block direct edits to production dotfiles (clean no-op otherwise) |
+| `CADENCE_SESSION_STALE_MINUTES` | `session` hooks | Minutes of heartbeat silence before a session is presumed dead (default 10) |
 | `GH_AUTOCLOSE_WAIT_SECONDS` | `verify-pr-autoclose` | Seconds to wait after `gh pr merge` before checking for straggler issues (default 10) |
 | `OBSIDIAN_VAULT` | `trash-guard` | Absolute path to Obsidian vault |
 
@@ -294,10 +315,13 @@ The snooze marker lives at `<repo>/.git/cadence-hooks/main-branch-snoozed-until`
 ```
 cadence-hooks (binary)
 ├── crates/core        — Hook protocol: JSON parsing, Check trait, exit codes
-├── crates/cadence     — Cadence plugin hooks (11 checks)
-├── crates/guardrails  — Git guardrails hooks (10 checks)
-├── crates/rules       — Rules plugin hooks (2 checks)
-├── crates/obsidian    — Obsidian plugin hooks (1 check)
+├── crates/cadence     — Cadence plugin hooks
+├── crates/guardrails  — Git guardrails hooks
+├── crates/rules       — Rules plugin hooks
+├── crates/obsidian    — Obsidian plugin hooks
+├── crates/metrics     — Fire-and-forget cost/usage loggers
+├── crates/lab         — Experimental hooks (persona ledger)
+├── crates/session     — Multi-session coordination (cadence-canon)
 └── src/main.rs        — CLI: routes subcommands to checks
 ```
 

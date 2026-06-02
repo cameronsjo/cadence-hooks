@@ -187,6 +187,7 @@ dependencies = [
  "cadence-hooks-metrics",
  "cadence-hooks-obsidian",
  "cadence-hooks-rules",
+ "cadence-hooks-session",
  "clap",
  "dialoguer",
  "serde_json",
@@ -256,6 +257,16 @@ version = "0.13.0"
 dependencies = [
  "cadence-hooks-core",
  "regex",
+]
+
+[[package]]
+name = "cadence-hooks-session"
+version = "0.13.0"
+dependencies = [
+ "cadence-hooks-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
