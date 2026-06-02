@@ -54,6 +54,10 @@ enum Commands {
     #[command(subcommand)]
     Lab(LabCommands),
 
+    /// Multi-session coordination hooks (cadence-canon)
+    #[command(subcommand)]
+    Session(SessionCommands),
+
     /// List all hooks with descriptions and disable status
     List,
 
@@ -184,6 +188,30 @@ enum LabCommands {
     PersonaGate,
 }
 
+#[derive(Subcommand)]
+enum SessionCommands {
+    /// Register this session in the repo registry and disclose live peers (SessionStart)
+    Start,
+    /// Touch this session's registry file — mtime is the liveness signal (PostToolUse)
+    Heartbeat,
+    /// Warn when an action intersects a live peer's lane (PreToolUse)
+    Guard,
+    /// Declare what this session is working on, so peers can assess collision risk
+    Declare {
+        /// What this session is working on (e.g. "cadence-hooks#54")
+        #[arg(long, value_name = "TEXT")]
+        intent: Option<String>,
+        /// Repo-relative paths this session expects to touch (repeatable)
+        #[arg(long, value_name = "PATH")]
+        touching: Vec<String>,
+        /// Session id override (defaults to $CLAUDE_SESSION_ID)
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+    },
+    /// List live and stale sessions registered in this repo
+    Status,
+}
+
 /// Returns the kebab-case hook name for the resolved subcommand.
 /// These match the CLI names that clap derives from the enum variants.
 fn hook_name(cmd: &Commands) -> Option<&'static str> {
@@ -241,6 +269,15 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         Commands::Lab(l) => Some(match l {
             LabCommands::PersonaNudge => "persona-nudge",
             LabCommands::PersonaGate => "persona-gate",
+        }),
+        Commands::Session(s) => Some(match s {
+            SessionCommands::Start => "start",
+            SessionCommands::Heartbeat => "heartbeat",
+            SessionCommands::Guard => "guard",
+            // declare and status are CLI actions, not hooks — no hooks.json
+            // wiring and not subject to CADENCE_DISABLE (same treatment as
+            // dismiss-main-branch-warn).
+            SessionCommands::Declare { .. } | SessionCommands::Status => return None,
         }),
         Commands::List | Commands::Configure { .. } | Commands::Doctor { .. } => None,
     }
@@ -561,6 +598,27 @@ fn main() {
                 run_check_from_stdin(&cadence_hooks_lab::gate::PersonaGate, post)
             }
         },
+        Commands::Session(cmd) => match cmd {
+            SessionCommands::Start => {
+                run_check_from_stdin(&cadence_hooks_session::start::Start, session)
+            }
+            SessionCommands::Heartbeat => {
+                run_logger_from_stdin(&cadence_hooks_session::heartbeat::Heartbeat)
+            }
+            SessionCommands::Guard => {
+                run_check_from_stdin(&cadence_hooks_session::guard::Guard, pre)
+            }
+            SessionCommands::Declare {
+                intent,
+                touching,
+                session_id,
+            } => {
+                cadence_hooks_session::cli::run_declare(intent, touching, session_id);
+            }
+            SessionCommands::Status => {
+                cadence_hooks_session::cli::run_status();
+            }
+        },
     }
 }
 
@@ -584,9 +642,10 @@ mod tests {
             "obsidian",
             "metrics",
             "lab",
+            "session",
         ];
         // clap subcommands that are CLI actions, not hooks (no hooks.json wiring).
-        let non_hooks = ["dismiss-main-branch-warn"];
+        let non_hooks = ["dismiss-main-branch-warn", "declare", "status"];
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();
         for ns in namespaces {

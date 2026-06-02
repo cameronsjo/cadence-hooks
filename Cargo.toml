@@ -24,6 +24,7 @@ cadence-hooks-rules = { path = "crates/rules" }
 cadence-hooks-obsidian = { path = "crates/obsidian" }
 cadence-hooks-metrics = { path = "crates/metrics" }
 cadence-hooks-lab = { path = "crates/lab" }
+cadence-hooks-session = { path = "crates/session" }
 
 [package]
 name = "cadence-hooks"
@@ -53,3 +54,4 @@ cadence-hooks-rules.workspace = true
 cadence-hooks-obsidian.workspace = true
 cadence-hooks-metrics.workspace = true
 cadence-hooks-lab.workspace = true
+cadence-hooks-session.workspace = true

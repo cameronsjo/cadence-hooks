@@ -1,0 +1,15 @@
+[package]
+name = "cadence-hooks-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Multi-session coordination hooks: identity registry, disclosure, and lane warnings"
+
+[dependencies]
+cadence-hooks-core.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+cadence-hooks-core = { workspace = true, features = ["test-builders"] }
+tempfile = "3"

@@ -22,6 +22,7 @@ fn binary_subcommands() -> BTreeSet<String> {
         "obsidian",
         "metrics",
         "lab",
+        "session",
     ];
     let mut commands = BTreeSet::new();
 
@@ -84,6 +85,7 @@ struct HookRef {
 /// (dir_name, expected_plugin_group)
 const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
     ("cadence", "cadence"),
+    ("cadence-canon", "session"),
     ("cadence-guardrails", "guardrails"),
     ("cadence-lab", "lab"),
     ("cadence-metrics", "metrics"),
@@ -93,6 +95,15 @@ const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
 /// Plugin directories that still use shell script wrappers (not yet migrated to binary).
 /// These are tracked so the "all subcommands registered" test knows they exist.
 const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("cadence-obsidian", "obsidian")];
+
+/// Plugin groups whose consuming plugin repo does not exist yet. Their hook
+/// subcommands are expected to be unregistered until the plugin lands —
+/// remove the entry in the plugin's wiring PR.
+/// (group, tracking_reference)
+const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[
+    // cadence-canon — multi-session coordination satellite (issue #54).
+    ("session", "cameronsjo/cadence-hooks#54"),
+];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
@@ -108,6 +119,9 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
 const NON_HOOK_BINARY_SUBCOMMANDS: &[&str] = &[
     // Per-repo snooze writer for warn-main-branch — invoked by hand, not by Claude Code.
     "guardrails dismiss-main-branch-warn",
+    // Lane declaration + registry listing — invoked by the coordination skill / user.
+    "session declare",
+    "session status",
 ];
 
 /// settings.json shell scripts that trip the keyword-overlap heuristic but are
@@ -340,12 +354,26 @@ fn all_binary_subcommands_are_registered() {
     let shell_plugin_groups: BTreeSet<&str> =
         SHELL_PLUGIN_DIRS.iter().map(|(_, group)| *group).collect();
 
+    // Subcommands for plugins that don't exist yet are also expected to be
+    // unregistered — but only while the plugin dir is actually absent. Once
+    // the dir appears locally, the exemption stops applying and the entry
+    // must be removed from PENDING_PLUGIN_GROUPS.
+    let pending_groups: BTreeSet<&str> = PENDING_PLUGIN_GROUPS
+        .iter()
+        .filter(|(group, _)| {
+            !BINARY_PLUGIN_DIRS
+                .iter()
+                .any(|(dir, g)| g == group && all_refs.contains_key(*dir))
+        })
+        .map(|(group, _)| *group)
+        .collect();
+
     let unregistered: Vec<&String> = binary_cmds
         .iter()
         .filter(|cmd| !registered.contains(*cmd))
         .filter(|cmd| {
             let group = cmd.split_whitespace().next().unwrap_or("");
-            !shell_plugin_groups.contains(group)
+            !shell_plugin_groups.contains(group) && !pending_groups.contains(group)
         })
         .filter(|cmd| !NON_HOOK_BINARY_SUBCOMMANDS.contains(&cmd.as_str()))
         .collect();
