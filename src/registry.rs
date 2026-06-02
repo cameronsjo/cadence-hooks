@@ -145,6 +145,11 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Warn when bare curl (aliased to curlie) is used with custom headers",
         plugin: "guardrails",
     },
+    HookEntry {
+        name: "warn-gh-merge-preflight",
+        description: "Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)",
+        plugin: "guardrails",
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",

@@ -33,6 +33,8 @@ pub mod warn_branch_base;
 pub mod warn_cron_datetime;
 /// Warn when bare `curl` (aliased to curlie) is used with custom headers.
 pub mod warn_curl_alias;
+/// Pre-flight checklist nudge before `gh pr merge` (draft, worktree, verify).
+pub mod warn_gh_merge_preflight;
 /// Warn when editing files directly on main/master branch.
 pub mod warn_main_branch;
 /// Warn about untracked files during git commit operations.

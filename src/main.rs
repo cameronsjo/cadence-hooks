@@ -133,6 +133,8 @@ enum GuardrailsCommands {
     GuardOpVaultScan,
     /// Warn when bare curl (aliased to curlie) is used with custom headers
     WarnCurlAlias,
+    /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
+    WarnGhMergePreflight,
     /// Snooze warn-main-branch for this repo for the given duration
     DismissMainBranchWarn {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
@@ -211,6 +213,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
+            GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
             // dismiss-main-branch-warn is a CLI action, not a hook —
             // it has no PreToolUse/PostToolUse wiring and isn't subject
             // to CADENCE_DISABLE. Falling out of the Some(...) here is
@@ -499,6 +502,10 @@ fn main() {
             ),
             GuardrailsCommands::WarnCurlAlias => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias,
+                pre,
+            ),
+            GuardrailsCommands::WarnGhMergePreflight => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_gh_merge_preflight::WarnGhMergePreflight,
                 pre,
             ),
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {
