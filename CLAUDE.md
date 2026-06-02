@@ -17,6 +17,8 @@ Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatch
 
 Manual tagging or formula edits race the automation. Post-release: `brew update && brew upgrade cadence-hooks`, verify `cadence-hooks --version`.
 
+**Check `git log --oneline -5` on main for bump commits before choosing the next version number.** Parallel Claude sessions release from this repo too — a 0.15.1 shipped mid-session while another session was building what became 0.15.2. The race only surfaced because the bump commit failed loudly; don't rely on that.
+
 ## Gotchas
 
 - **Ignore `make bump`'s "next steps" output** — it suggests `git tag` + `git push --tags`, which predates and races the auto-tag automation. Just commit and push; `auto-tag.yml` owns tagging.
@@ -24,5 +26,6 @@ Manual tagging or formula edits race the automation. Post-release: `brew update 
 - **The git-safety hook (this repo's own product) blocks `git rebase` in Claude sessions.** To rebase a stacked PR branch onto main: cherry-pick its own commits onto a fresh branch from main, then `git push origin <tmp-branch>:<pr-branch> --force-with-lease`.
 - **Registry/dispatch invariant**: every hook subcommand needs both a clap variant (src/main.rs) and a `HOOKS` entry (src/registry.rs) — including an `event` field that matches the `HookEvent` passed in the dispatch (`None` for loggers). The `registry_matches_clap_dispatch` unit test enforces this on every `cargo test`; the hooks.json audit test (`tests/hook_registration_audit.rs`) additionally cross-checks sibling plugin repos when they're present locally.
 - **Hook subcommands are stdin-driven** — run bare in a terminal they print guidance and exit 1 (never hang, never block). `cadence-hooks try <ns> <sub>` is the manual-test path: it runs any hook against a generated sample payload and reports the outcome.
+- **TTY-dependent behavior (the interactive-terminal guard) cannot be tested via Claude's Bash tool** — it pipes stdin, so `is_terminal()` is always false there. Verify with `script -q /dev/null cadence-hooks <ns> <sub>` (allocates a pty) or a real terminal.
 - **Guards fail open (ADR-0001)**: parse failures, unreadable files, and unknown subcommands exit 0/1, never 2. A guard's own failure must never block the user.
 - **CADENCE_BYPASS=1 exempts `list`, `configure`, `doctor`, and the session CLI actions (`declare`, `status`)** — diagnostic/CLI commands must work during maintenance; enforcement hooks are bypassed.
