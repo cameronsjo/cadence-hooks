@@ -155,6 +155,11 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Warn that CodeRabbit re-trigger comments are no-ops on reviewed content",
         plugin: "guardrails",
     },
+    HookEntry {
+        name: "warn-alias-parsing",
+        description: "Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers",
+        plugin: "guardrails",
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",

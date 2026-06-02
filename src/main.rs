@@ -137,6 +137,8 @@ enum GuardrailsCommands {
     WarnGhMergePreflight,
     /// Warn that CodeRabbit re-trigger comments are no-ops on reviewed content
     WarnCoderabbitRetrigger,
+    /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers
+    WarnAliasParsing,
     /// Snooze warn-main-branch for this repo for the given duration
     DismissMainBranchWarn {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
@@ -217,6 +219,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
             GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
             GuardrailsCommands::WarnCoderabbitRetrigger => "warn-coderabbit-retrigger",
+            GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             // dismiss-main-branch-warn is a CLI action, not a hook —
             // it has no PreToolUse/PostToolUse wiring and isn't subject
             // to CADENCE_DISABLE. Falling out of the Some(...) here is
@@ -513,6 +516,10 @@ fn main() {
             ),
             GuardrailsCommands::WarnCoderabbitRetrigger => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_coderabbit_retrigger::WarnCoderabbitRetrigger,
+                pre,
+            ),
+            GuardrailsCommands::WarnAliasParsing => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_alias_parsing::WarnAliasParsing,
                 pre,
             ),
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {

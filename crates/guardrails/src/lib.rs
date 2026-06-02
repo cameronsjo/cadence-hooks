@@ -27,6 +27,8 @@ pub mod issue_refs;
 pub mod nudge_upgrade_after_push;
 /// Warn about broken issue refs on PR create; close straggler issues on PR merge.
 pub mod verify_pr_autoclose;
+/// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers.
+pub mod warn_alias_parsing;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
 /// Warn that CodeRabbit re-trigger comments are no-ops on already-reviewed content.
