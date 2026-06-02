@@ -129,6 +129,16 @@ enum GuardrailsCommands {
     GuardPrIssueLink,
     /// Verify issue auto-close after PR create/merge; close stragglers
     VerifyPrAutoclose,
+    /// Block uninvited 1Password vault enumeration (op item list)
+    GuardOpVaultScan,
+    /// Warn when bare curl (aliased to curlie) is used with custom headers
+    WarnCurlAlias,
+    /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
+    WarnGhMergePreflight,
+    /// Warn that CodeRabbit re-trigger comments are no-ops on reviewed content
+    WarnCoderabbitRetrigger,
+    /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers
+    WarnAliasParsing,
     /// Snooze warn-main-branch for this repo for the given duration
     DismissMainBranchWarn {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
@@ -205,6 +215,11 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
             GuardrailsCommands::GuardPrIssueLink => "guard-pr-issue-link",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
+            GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
+            GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
+            GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
+            GuardrailsCommands::WarnCoderabbitRetrigger => "warn-coderabbit-retrigger",
+            GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             // dismiss-main-branch-warn is a CLI action, not a hook —
             // it has no PreToolUse/PostToolUse wiring and isn't subject
             // to CADENCE_DISABLE. Falling out of the Some(...) here is
@@ -486,6 +501,26 @@ fn main() {
             GuardrailsCommands::VerifyPrAutoclose => run_check_from_stdin(
                 &cadence_hooks_guardrails::verify_pr_autoclose::VerifyPrAutoclose,
                 post,
+            ),
+            GuardrailsCommands::GuardOpVaultScan => run_check_from_stdin(
+                &cadence_hooks_guardrails::guard_op_vault_scan::OpVaultScanGuard,
+                pre,
+            ),
+            GuardrailsCommands::WarnCurlAlias => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias,
+                pre,
+            ),
+            GuardrailsCommands::WarnGhMergePreflight => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_gh_merge_preflight::WarnGhMergePreflight,
+                pre,
+            ),
+            GuardrailsCommands::WarnCoderabbitRetrigger => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_coderabbit_retrigger::WarnCoderabbitRetrigger,
+                pre,
+            ),
+            GuardrailsCommands::WarnAliasParsing => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_alias_parsing::WarnAliasParsing,
+                pre,
             ),
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {
                 cadence_hooks_guardrails::dismiss_main_branch_warn::run_dismiss(&for_);

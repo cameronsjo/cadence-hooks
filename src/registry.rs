@@ -135,6 +135,31 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Verify and repair issue auto-close after PR create/merge",
         plugin: "guardrails",
     },
+    HookEntry {
+        name: "guard-op-vault-scan",
+        description: "Block uninvited 1Password vault enumeration (op item list)",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "warn-curl-alias",
+        description: "Warn when bare curl (aliased to curlie) is used with custom headers",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "warn-gh-merge-preflight",
+        description: "Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "warn-coderabbit-retrigger",
+        description: "Warn that CodeRabbit re-trigger comments are no-ops on reviewed content",
+        plugin: "guardrails",
+    },
+    HookEntry {
+        name: "warn-alias-parsing",
+        description: "Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers",
+        plugin: "guardrails",
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",
