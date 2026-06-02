@@ -41,7 +41,9 @@ fn try_runs_a_check_and_reports_outcome() {
     let output = cmd.output().expect("failed to execute binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // The sample Bash payload ("git status") trips no terminology rule → allow.
+    // The sample Bash payload ("git status") trips no terminology rule —
+    // a silent allow, which the decoded outcome reports as ALLOW (not the
+    // old ambiguous "ALLOW / NUDGE").
     assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
     assert!(stdout.contains("Hook:"), "report shows hook line: {stdout}");
     assert!(
@@ -53,9 +55,54 @@ fn try_runs_a_check_and_reports_outcome() {
         "report echoes payload: {stdout}"
     );
     assert!(
-        stdout.contains("ALLOW / NUDGE"),
-        "report shows outcome: {stdout}"
+        stdout.contains("Outcome:  ALLOW (exit 0)"),
+        "report shows decoded outcome: {stdout}"
     );
+}
+
+#[test]
+fn try_nudge_renders_context_as_readable_text() {
+    // warn-curl-alias is pure string logic: bare curl + custom header → nudge.
+    let dir = std::env::temp_dir().join(format!("cadence-try-nudge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let payload_path = dir.join("payload.json");
+    std::fs::write(
+        &payload_path,
+        r#"{"tool_name":"Bash","tool_input":{"command":"curl -H 'Accept: application/json' https://example.com"}}"#,
+    )
+    .unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.args([
+        "try",
+        "guardrails",
+        "warn-curl-alias",
+        "--payload",
+        payload_path.to_str().unwrap(),
+    ]);
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Outcome:  NUDGE (exit 0)"),
+        "nudge outcome is decoded, not ambiguous: {stdout}"
+    );
+    assert!(
+        stdout.contains("Context injected (what Claude sees):"),
+        "nudge heading present: {stdout}"
+    );
+    assert!(
+        !stdout.contains("hookSpecificOutput"),
+        "protocol envelope is decoded away, not echoed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\\n"),
+        "context renders real newlines, not escapes: {stdout}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

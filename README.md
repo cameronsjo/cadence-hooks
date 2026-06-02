@@ -162,10 +162,18 @@ Hook:     lab persona-nudge — Inject the self-representation contract on sessi
 Event:    SessionStart
 Payload:  {"cwd":"...","session_id":"test","source":"startup"}
 
-Outcome:  ALLOW / NUDGE (exit 0)
-Stdout:   {"hookSpecificOutput":{...}}
+Outcome:  NUDGE (exit 0)
+Context injected (what Claude sees):
+
+  Before other work, record a self-representation as ONE JSON object.
+  This is not creative writing. Report what is actually true for you...
+
 Stderr:   (none)
 ```
+
+`try` decodes the hook protocol: nudge envelopes render their
+`additionalContext` as readable text, re-prompt envelopes show the reason,
+and the outcome line distinguishes `ALLOW` / `NUDGE` / `LOOP-BLOCK` / `BLOCK`.
 
 Use `--payload <file>` to test with a real payload instead of the generated sample.
 
