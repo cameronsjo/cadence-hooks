@@ -87,11 +87,12 @@ const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
     ("cadence-guardrails", "guardrails"),
     ("cadence-lab", "lab"),
     ("cadence-metrics", "metrics"),
+    ("cadence-rules", "rules"),
 ];
 
 /// Plugin directories that still use shell script wrappers (not yet migrated to binary).
 /// These are tracked so the "all subcommands registered" test knows they exist.
-const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("rules", "rules"), ("cadence-obsidian", "obsidian")];
+const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("cadence-obsidian", "obsidian")];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
