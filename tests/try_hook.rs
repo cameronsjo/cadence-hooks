@@ -19,6 +19,10 @@ fn cadence_hooks() -> Command {
 }
 
 /// Spawns the binary with JSON on stdin and returns the completed output.
+///
+/// A child that decides its outcome without reading stdin (a bypassed or
+/// disabled hook exits immediately) may close the pipe before the write
+/// completes — that BrokenPipe is expected, not a test failure (#59).
 fn run_with_stdin(mut cmd: Command, input: &str) -> std::process::Output {
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -26,7 +30,11 @@ fn run_with_stdin(mut cmd: Command, input: &str) -> std::process::Output {
 
     let mut child = cmd.spawn().expect("failed to execute binary");
     if let Some(ref mut stdin) = child.stdin {
-        stdin.write_all(input.as_bytes()).unwrap();
+        match stdin.write_all(input.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("failed to write to child stdin: {e}"),
+        }
     }
     child.wait_with_output().expect("failed to wait on binary")
 }
