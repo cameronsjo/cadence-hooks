@@ -49,7 +49,16 @@ stable with `cargo uninstall cadence-hooks` followed by
 2. Implement the `Check` trait
 3. Export the module from the crate's `lib.rs`
 4. Add a subcommand variant in `src/main.rs`
-5. Write tests covering: allow, warn, block, edge cases, and bypass scenarios
+5. Add a `HookEntry` in `src/registry.rs` — name, description, plugin, and
+   `event` (matching the `HookEvent` passed in the main.rs dispatch; `None`
+   for loggers). The `registry_matches_clap_dispatch` test fails until the
+   registry and dispatch agree
+6. Write tests covering: allow, warn, block, edge cases, and bypass scenarios
+
+New hooks inherit the interactive-terminal guard and `cadence-hooks try`
+support automatically — both come from `run_check_from_stdin` /
+`run_logger_from_stdin` plus the registry entry. There is nothing extra to
+wire; verify with `cadence-hooks try <namespace> <name>`.
 
 ### Optional: effort-gating
 

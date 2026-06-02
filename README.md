@@ -138,6 +138,51 @@ exit   → 0 (allow) | 1 (warn, show message) | 2 (block, prevent operation)
 
 Each subcommand reads this JSON, runs its check, and exits. No network calls, no config files, no dependencies beyond the binary.
 
+## Testing Hooks Manually
+
+Hook subcommands expect piped stdin. Run one bare in a terminal and it prints
+guidance instead of hanging:
+
+```text
+$ cadence-hooks lab persona-nudge
+cadence-hooks: 'persona-nudge' is a Claude Code hook, not an interactive command.
+
+It reads a JSON payload on stdin — Claude Code pipes this automatically on
+SessionStart. Nothing was piped and stdin is a terminal, so it would wait forever.
+...
+```
+
+The fastest way to see what a hook does is `try` — it generates a sample
+payload for the hook's event, runs the hook against it, and reports the outcome:
+
+```bash
+$ cadence-hooks try lab persona-nudge
+Hook:     lab persona-nudge — Inject the self-representation contract on session start
+Event:    SessionStart
+Payload:  {"cwd":"...","session_id":"test","source":"startup"}
+
+Outcome:  ALLOW / NUDGE (exit 0)
+Stdout:   {"hookSpecificOutput":{...}}
+Stderr:   (none)
+```
+
+Use `--payload <file>` to test with a real payload instead of the generated sample.
+
+To pipe a payload by hand, match the shape to the hook's event
+(`cadence-hooks list` shows each hook's event):
+
+| Event | Minimal payload |
+|---|---|
+| PreToolUse | `{"tool_name":"Bash","tool_input":{"command":"git status"}}` |
+| PostToolUse | `{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"},"tool_response":{"stdout":"ok"}}` |
+| SessionStart | `{"session_id":"test","source":"startup"}` |
+| Loggers (metrics, heartbeat) | `{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"git status"}}` |
+
+```bash
+echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' \
+  | cadence-hooks guardrails guard-push-remote
+```
+
 ## Installation
 
 ### From release (recommended)

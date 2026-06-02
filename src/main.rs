@@ -1,8 +1,9 @@
 //! CLI entry point for compiled Claude Code hooks.
 //!
 //! Dispatches to per-crate check implementations via `clap` subcommands.
-//! Each subcommand reads JSON from stdin (the hook protocol) and exits with
-//! 0 (allow), 1 (warn), or 2 (block).
+//! Each hook subcommand reads JSON from stdin (the hook protocol) and exits
+//! with 0 (allow), 1 (warn), or 2 (block). The CLI commands (`list`, `doctor`,
+//! `configure`, `try`, `session declare`/`status`) take no stdin.
 
 use cadence_hooks_core::{HookEvent, run_check_from_stdin, run_logger_from_stdin};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -19,10 +20,15 @@ fn under_claude_code() -> bool {
 mod configure;
 mod doctor;
 mod registry;
+mod try_hook;
 use registry::{HOOKS, HookEntry};
 
 #[derive(Parser)]
-#[command(name = "cadence-hooks", version, about = "Compiled Claude Code hooks")]
+#[command(
+    name = "cadence-hooks",
+    version,
+    about = "Compiled Claude Code hooks — hook subcommands read a JSON payload on stdin"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,35 +36,46 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Cadence plugin hooks
+    /// Cadence plugin hooks (read hook JSON on stdin)
     #[command(subcommand)]
     Cadence(CadenceCommands),
 
-    /// Git guardrails hooks
+    /// Git guardrails hooks (read hook JSON on stdin)
     #[command(subcommand)]
     Guardrails(GuardrailsCommands),
 
-    /// Rules plugin hooks
+    /// Rules plugin hooks (read hook JSON on stdin)
     #[command(subcommand)]
     Rules(RulesCommands),
 
-    /// Cadence Obsidian plugin hooks
+    /// Cadence Obsidian plugin hooks (read hook JSON on stdin)
     #[command(subcommand)]
     Obsidian(ObsidianCommands),
 
-    /// Cadence metrics logging hooks
+    /// Cadence metrics logging hooks (read hook JSON on stdin)
     #[command(subcommand)]
     Metrics(MetricsCommands),
 
-    /// Cadence lab (experimental) hooks
+    /// Cadence lab (experimental) hooks (read hook JSON on stdin)
     #[command(subcommand)]
     Lab(LabCommands),
 
-    /// Multi-session coordination hooks (cadence-canon)
+    /// Multi-session coordination hooks (cadence-canon; hooks read JSON on stdin)
     #[command(subcommand)]
     Session(SessionCommands),
 
-    /// List all hooks with descriptions and disable status
+    /// Run a hook against a generated sample payload (manual testing)
+    Try {
+        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, lab, session)
+        namespace: String,
+        /// Hook name (see `cadence-hooks list`)
+        subcommand: String,
+        /// Read the payload from a file instead of generating a sample
+        #[arg(long, value_name = "FILE")]
+        payload: Option<std::path::PathBuf>,
+    },
+
+    /// List all hooks with events, descriptions, and disable status
     List,
 
     /// Interactively configure which hooks to disable for this project
@@ -279,7 +296,10 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             // dismiss-main-branch-warn).
             SessionCommands::Declare { .. } | SessionCommands::Status => return None,
         }),
-        Commands::List | Commands::Configure { .. } | Commands::Doctor { .. } => None,
+        Commands::Try { .. }
+        | Commands::List
+        | Commands::Configure { .. }
+        | Commands::Doctor { .. } => None,
     }
 }
 
@@ -314,7 +334,15 @@ fn print_hook_list() {
             ""
         };
 
-        println!("  {:<28} {}{}", hook.name, hook.description, status);
+        let event = match hook.event {
+            Some(e) => e.name(),
+            None => "logger",
+        };
+
+        println!(
+            "  {:<28} {:<13} {}{}",
+            hook.name, event, hook.description, status
+        );
     }
 
     if !disabled.is_empty() {
@@ -325,13 +353,13 @@ fn print_hook_list() {
 fn main() {
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
-    // Note: `list`, `configure`, `doctor`, and the session CLI actions
+    // Note: `list`, `configure`, `doctor`, `try`, and the session CLI actions
     // (`declare`, `status`) are exempt — they're CLI/diagnostic commands, not
     // enforcement paths, and must work always. A bypassed doctor would report
     // false-clean in CI; a bypassed `session status` would hide live peers
     // exactly when someone is debugging coordination.
     let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
-    let cli_action_args = ["list", "configure", "doctor", "declare", "status"];
+    let cli_action_args = ["list", "configure", "doctor", "try", "declare", "status"];
     if bypassed && !std::env::args().any(|a| cli_action_args.contains(&a.as_str())) {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
@@ -426,6 +454,13 @@ fn main() {
     let session = HookEvent::SessionStart;
 
     match cli.command {
+        Commands::Try {
+            namespace,
+            subcommand,
+            payload,
+        } => {
+            process::exit(try_hook::run(&namespace, &subcommand, payload.as_deref()));
+        }
         Commands::List => {
             print_hook_list();
             process::exit(0);
