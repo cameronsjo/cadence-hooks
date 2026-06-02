@@ -31,6 +31,8 @@ pub mod verify_pr_autoclose;
 pub mod warn_branch_base;
 /// Remind to check datetime before scheduling cron jobs.
 pub mod warn_cron_datetime;
+/// Warn when bare `curl` (aliased to curlie) is used with custom headers.
+pub mod warn_curl_alias;
 /// Warn when editing files directly on main/master branch.
 pub mod warn_main_branch;
 /// Warn about untracked files during git commit operations.

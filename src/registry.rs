@@ -140,6 +140,11 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Block uninvited 1Password vault enumeration (op item list)",
         plugin: "guardrails",
     },
+    HookEntry {
+        name: "warn-curl-alias",
+        description: "Warn when bare curl (aliased to curlie) is used with custom headers",
+        plugin: "guardrails",
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",

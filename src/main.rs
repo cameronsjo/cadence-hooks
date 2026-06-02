@@ -131,6 +131,8 @@ enum GuardrailsCommands {
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
     GuardOpVaultScan,
+    /// Warn when bare curl (aliased to curlie) is used with custom headers
+    WarnCurlAlias,
     /// Snooze warn-main-branch for this repo for the given duration
     DismissMainBranchWarn {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
@@ -208,6 +210,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardPrIssueLink => "guard-pr-issue-link",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
+            GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
             // dismiss-main-branch-warn is a CLI action, not a hook —
             // it has no PreToolUse/PostToolUse wiring and isn't subject
             // to CADENCE_DISABLE. Falling out of the Some(...) here is
@@ -492,6 +495,10 @@ fn main() {
             ),
             GuardrailsCommands::GuardOpVaultScan => run_check_from_stdin(
                 &cadence_hooks_guardrails::guard_op_vault_scan::OpVaultScanGuard,
+                pre,
+            ),
+            GuardrailsCommands::WarnCurlAlias => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias,
                 pre,
             ),
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {
