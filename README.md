@@ -223,17 +223,52 @@ Under Claude Code (detected via `CLAUDECODE=1`), the `configure` subcommand is h
 
 ### Auditing installed plugins
 
-`doctor` scans every plugin's `hooks.json` for shell-expansion bugs — primarily the single-quoted `${CLAUDE_PLUGIN_ROOT}` class, which the harness reports as a non-blocking failure with no surface to the user. Suitable for CI or one-shot audits.
+`doctor` scans every installed plugin's `hooks.json` for two classes of problems:
+
+- **Shell-expansion bugs** (exit 2): single-quoted `'${CLAUDE_PLUGIN_ROOT}'` won't expand in `/bin/sh` — the harness reports a silent non-blocking failure and nothing surfaces to the user.
+- **Subcommand skew** (exit 1): a hook references a subcommand this binary doesn't have — typically a plugin built for a newer version of cadence-hooks.
+
+By default the scan is driven by `~/.claude/plugins/installed_plugins.json`, so only **active** installs are checked (the cache keeps stale plugin versions around — scanning those would report skew in code that no longer runs). With `--root`, the given tree is walked recursively, so both flat layouts (`<root>/<plugin>/hooks/hooks.json`) and the real cache layout (`<root>/<marketplace>/<plugin>/<sha>/hooks/hooks.json`) work.
 
 ```bash
-# Scan the default location: ~/.claude/plugins/cache
+# Scan active installs from ~/.claude/plugins/installed_plugins.json
 cadence-hooks doctor
 
 # Audit a specific tree (handy in CI before publishing a plugin)
 cadence-hooks doctor --root ./plugins
+
+# Preflight mode for SessionStart hooks — one summary line, non-zero only on errors
+cadence-hooks doctor --quiet
 ```
 
-Exits 0 when clean, 1 when violations are found. Each violation prints the plugin, file, offending snippet, and the recommended fix.
+**Exit codes:**
+
+| Code | Meaning |
+|------|---------|
+| 0 | Clean — no findings |
+| 1 | Warnings only — subcommand skew (version mismatch between plugin and binary) |
+| 2 | Errors — shell-expansion bugs that will silently break hooks at runtime, or configuration/internal errors (`$HOME` unset, nonexistent `--root`) |
+
+**Sample output (skew warning):**
+
+```
+warning [cadence@workbench] ~/.claude/plugins/cache/workbench/cadence/174e3eb0def9/hooks/hooks.json:12: subcommand 'cadence future-hook' is not present in this binary (v0.11.0)
+  command: "${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence future-hook
+  fix: brew upgrade cadence-hooks (or downgrade the plugin)
+
+cadence-hooks doctor: 0 error(s), 1 warning(s)
+```
+
+**`--quiet` mode** is suitable for SessionStart preflight wiring. When clean it produces no output and exits 0; on warnings it prints one summary line to stdout and exits 0 (so a `set -euo pipefail` script won't abort); on errors it writes one line to stderr and exits 2.
+
+The stream split is deliberate: warnings go to **stdout** (a caller capturing stdout gets the skew nudge to inject), errors go to **stderr** (a caller redirecting stderr to `/dev/null` still fails on the exit code). Redirect accordingly — `>/dev/null` silences the skew nudge, `2>/dev/null` silences error detail but not the failure.
+
+```bash
+# In a SessionStart hook — detect skew without blocking on warnings
+if msg=$(cadence-hooks doctor --quiet 2>/dev/null); [ -n "$msg" ]; then
+  echo "$msg" >&2
+fi
+```
 
 ### Snoozing warn-main-branch
 

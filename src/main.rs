@@ -18,6 +18,8 @@ fn under_claude_code() -> bool {
 
 mod configure;
 mod doctor;
+mod registry;
+use registry::{HOOKS, HookEntry};
 
 #[derive(Parser)]
 #[command(name = "cadence-hooks", version, about = "Compiled Claude Code hooks")]
@@ -62,11 +64,14 @@ enum Commands {
         list: bool,
     },
 
-    /// Scan installed plugin hooks.json files for shell-expansion bugs
+    /// Scan installed plugin hooks.json files for shell-expansion bugs and subcommand skew
     Doctor {
         /// Scan a specific directory instead of ~/.claude/plugins/cache
         #[arg(long, value_name = "DIR")]
         root: Option<std::path::PathBuf>,
+        /// One-line summary output; exit non-zero only on errors. For SessionStart preflight.
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -169,184 +174,6 @@ enum LabCommands {
     PersonaGate,
 }
 
-/// A hook entry with its name, description, and plugin group.
-struct HookEntry {
-    name: &'static str,
-    description: &'static str,
-    plugin: &'static str,
-}
-
-/// Complete catalog of all hooks. Single source of truth for `list` output
-/// and `hook_name()` resolution. Keep in sync with the enum variants above.
-const HOOKS: &[HookEntry] = &[
-    // cadence
-    HookEntry {
-        name: "terminology",
-        description: "Block inclusive terminology violations",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "orphaned-todos",
-        description: "Block orphaned code markers without issue references",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "prevent-secret-leaks",
-        description: "Guard against reading/ingesting secrets",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "prevent-secret-writes",
-        description: "Guard against writing/editing/deleting secrets",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "memory-guard",
-        description: "Enforce MEMORY.md line limits",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "git-safety",
-        description: "Block dangerous git operations",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "line-endings",
-        description: "Validate shell script line endings",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "env-vars",
-        description: "Warn about generic environment variable names",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "warn-docs-update",
-        description: "Nudge to review docs when creating a PR",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "nudge-polish-before-pr",
-        description: "Nudge to run `/polish` before creating a PR",
-        plugin: "cadence",
-    },
-    HookEntry {
-        name: "markdown-lint",
-        description: "Run markdownlint on markdown files",
-        plugin: "cadence",
-    },
-    // guardrails
-    HookEntry {
-        name: "guard-push-remote",
-        description: "Block git push to non-owned remotes",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "guard-gh-dangerous",
-        description: "Block irreversible gh operations (repo delete)",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "guard-gh-write",
-        description: "Block gh write operations to non-owned repos",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "guard-git-init",
-        description: "Nudge to scaffold after git init",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "warn-main-branch",
-        description: "Warn when editing on main/master branch",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "check-idle-return",
-        description: "Nudge after idle periods between edits",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "warn-branch-base",
-        description: "Warn when creating a branch from a non-main base",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "warn-cron-datetime",
-        description: "Remind to check datetime before scheduling cron jobs",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "nudge-upgrade-after-push",
-        description: "Nudge to schedule a brew upgrade after pushing cadence-hooks to main",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "warn-untracked",
-        description: "Warn about untracked files during git commit operations",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "guard-dotfiles",
-        description: "Block direct edits to production dotfiles (opt-in)",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "guard-pr-issue-link",
-        description: "Block gh pr create without a closing issue keyword",
-        plugin: "guardrails",
-    },
-    HookEntry {
-        name: "verify-pr-autoclose",
-        description: "Verify and repair issue auto-close after PR create/merge",
-        plugin: "guardrails",
-    },
-    // rules
-    HookEntry {
-        name: "validate-frontmatter",
-        description: "Validate SKILL.md and command frontmatter",
-        plugin: "rules",
-    },
-    HookEntry {
-        name: "security-patterns",
-        description: "Scan for security anti-patterns",
-        plugin: "rules",
-    },
-    // obsidian
-    HookEntry {
-        name: "trash-guard",
-        description: "Block rm in Obsidian vault (use .trash/ instead)",
-        plugin: "obsidian",
-    },
-    // metrics
-    HookEntry {
-        name: "snapshot",
-        description: "Snapshot HEAD before a git commit (PreToolUse)",
-        plugin: "metrics",
-    },
-    HookEntry {
-        name: "log-commit",
-        description: "Log cost-per-commit after a git commit (PostToolUse)",
-        plugin: "metrics",
-    },
-    HookEntry {
-        name: "log-subagent",
-        description: "Log subagent lifecycle (SubagentStart / SubagentStop)",
-        plugin: "metrics",
-    },
-    // lab
-    HookEntry {
-        name: "persona-nudge",
-        description: "Inject the self-representation contract on session start",
-        plugin: "lab",
-    },
-    HookEntry {
-        name: "persona-gate",
-        description: "Validate and promote a self-representation candidate",
-        plugin: "lab",
-    },
-];
-
 /// Returns the kebab-case hook name for the resolved subcommand.
 /// These match the CLI names that clap derives from the enum variants.
 fn hook_name(cmd: &Commands) -> Option<&'static str> {
@@ -446,9 +273,11 @@ fn print_hook_list() {
 fn main() {
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
-    // Note: `list` and `configure` subcommands are exempt — they need to work always.
+    // Note: `list`, `configure`, and `doctor` are exempt — they're CLI/diagnostic
+    // commands, not enforcement paths, and must work always. A bypassed doctor
+    // would report false-clean in CI.
     let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
-    if bypassed && !std::env::args().any(|a| a == "list" || a == "configure") {
+    if bypassed && !std::env::args().any(|a| a == "list" || a == "configure" || a == "doctor") {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
     }
@@ -562,8 +391,8 @@ fn main() {
             }
             configure::run(list, HOOKS);
         }
-        Commands::Doctor { root } => {
-            process::exit(doctor::run(root.as_deref()).into());
+        Commands::Doctor { root, quiet } => {
+            process::exit(doctor::run(root.as_deref(), quiet).into());
         }
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => {
@@ -697,5 +526,65 @@ fn main() {
                 run_check_from_stdin(&cadence_hooks_lab::gate::PersonaGate, post)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry must mirror clap's dispatch exactly — both directions.
+    ///
+    /// This is the mechanical enforcement of "single source of truth"
+    /// (issue #39 P1): it is filesystem-independent, so it runs on every
+    /// bare-checkout `cargo test`, unlike the hooks.json audit test which
+    /// skips when sibling plugin dirs are absent.
+    #[test]
+    fn registry_matches_clap_dispatch() {
+        let cli = Cli::command();
+        let namespaces = [
+            "cadence",
+            "guardrails",
+            "rules",
+            "obsidian",
+            "metrics",
+            "lab",
+        ];
+        // clap subcommands that are CLI actions, not hooks (no hooks.json wiring).
+        let non_hooks = ["dismiss-main-branch-warn"];
+
+        let mut clap_pairs: Vec<(String, String)> = Vec::new();
+        for ns in namespaces {
+            let ns_cmd = cli
+                .find_subcommand(ns)
+                .unwrap_or_else(|| panic!("namespace '{ns}' should exist in clap"));
+            for sub in ns_cmd.get_subcommands() {
+                let name = sub.get_name().to_string();
+                if !non_hooks.contains(&name.as_str()) {
+                    clap_pairs.push((ns.to_string(), name));
+                }
+            }
+        }
+
+        // Direction 1: every dispatchable clap subcommand has a registry entry.
+        for (ns, sub) in &clap_pairs {
+            assert!(
+                registry::is_known(ns, sub),
+                "clap subcommand '{ns} {sub}' is dispatchable but missing from \
+                 registry::HOOKS — list/doctor/configure won't know it exists"
+            );
+        }
+
+        // Direction 2: every registry entry is a dispatchable clap subcommand.
+        for hook in HOOKS {
+            assert!(
+                clap_pairs
+                    .iter()
+                    .any(|(ns, sub)| ns == hook.plugin && sub == hook.name),
+                "registry entry '{} {}' has no clap subcommand — it's listed but not dispatchable",
+                hook.plugin,
+                hook.name
+            );
+        }
     }
 }
