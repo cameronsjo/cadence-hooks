@@ -123,6 +123,21 @@ fn is_excluded_path(path: &str) -> bool {
         || path.contains(".claude/rules/")
 }
 
+/// Remove violations that were already present in pre-existing content.
+///
+/// For Edit tool calls, a flagged term that appears in both `old_string` and
+/// `new_string` is surrounding context being carried through the edit, not
+/// new content — only *introduced* violations should fire.
+fn subtract_existing(
+    found: Vec<(String, String)>,
+    existing: &[(String, String)],
+) -> Vec<(String, String)> {
+    found
+        .into_iter()
+        .filter(|item| !existing.contains(item))
+        .collect()
+}
+
 /// Blocks content containing prohibited terminology and suggests alternatives.
 pub struct TerminologyGuard;
 
@@ -142,7 +157,20 @@ impl Check for TerminologyGuard {
             return CheckResult::allow();
         }
 
-        let result = check_terminology(content);
+        let mut result = check_terminology(content);
+
+        // Edit tool: only violations *introduced* by this edit count. A term
+        // already present in old_string is pre-existing file content — blocking
+        // on it would prevent edits that don't add anything prohibited (#63).
+        if let Some(old) = input
+            .tool_input
+            .as_ref()
+            .and_then(|ti| ti.old_string.as_deref())
+        {
+            let existing = check_terminology(old);
+            result.blocks = subtract_existing(result.blocks, &existing.blocks);
+            result.nudges = subtract_existing(result.nudges, &existing.nudges);
+        }
 
         // Tier 1: hard block
         if !result.blocks.is_empty() {
@@ -312,6 +340,7 @@ mod tests {
                 content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -369,6 +398,7 @@ mod tests {
                 content: None,
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -388,6 +418,7 @@ mod tests {
                 content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -407,6 +438,7 @@ mod tests {
                 content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -475,6 +507,7 @@ mod tests {
                 content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -495,6 +528,7 @@ mod tests {
                 content: Some(content),
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -518,6 +552,85 @@ mod tests {
                 content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
                 new_string: None,
                 old_string: None,
+                ..Default::default()
+            }),
+            cwd: None,
+            ..Default::default()
+        };
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // --- Edit tool: only introduced violations fire (#63) ---
+
+    use cadence_hooks_core::test_builders::make_edit;
+
+    #[test]
+    fn edit_with_preexisting_term_in_context_allowed() {
+        // The flagged term appears in both old_string and new_string — it is
+        // pre-existing file content carried through the edit, not new content.
+        let term = BLOCK_VIOLATIONS[0].0;
+        let input = make_edit(
+            "/project/src/config.rs",
+            &format!("{term} setting\nvalue = 1"),
+            &format!("{term} setting\nvalue = 2"),
+        );
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn edit_introducing_term_blocks() {
+        // The flagged term appears only in new_string — this edit introduces it.
+        let term = BLOCK_VIOLATIONS[0].0;
+        let input = make_edit(
+            "/project/src/config.rs",
+            "value = 1",
+            &format!("value = 2 // uses the {term}"),
+        );
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_with_preexisting_nudge_term_allowed() {
+        let term = NUDGE_VIOLATIONS[0].0;
+        let input = make_edit(
+            "/project/docs/policy.md",
+            &format!("{term} clause, v1"),
+            &format!("{term} clause, v2"),
+        );
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn edit_introducing_one_term_reports_only_that_term() {
+        // old context has term A; new content keeps term A and adds term B —
+        // only B should be reported.
+        let term_a = BLOCK_VIOLATIONS[0].0;
+        let term_b = BLOCK_VIOLATIONS[1].0;
+        let input = make_edit(
+            "/project/src/config.rs",
+            &format!("{term_a} config"),
+            &format!("{term_a} config and {term_b}"),
+        );
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        let msg = result.message.unwrap();
+        assert!(msg.contains(term_b));
+        assert!(!msg.contains(&format!("\"{term_a}\"")));
+    }
+
+    #[test]
+    fn write_with_term_still_blocks() {
+        // Write behavior is unchanged: no old_string, so every violation fires.
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some("/project/src/main.rs".into()),
+                content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()

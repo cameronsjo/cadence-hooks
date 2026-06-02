@@ -382,6 +382,8 @@ mod tests {
         let peers = vec![peer("quiet-loom", &["crates/guardrails/"])];
         let input = with_session(make_edit(
             "/Users/dev/cadence-hooks/crates/guardrails/src/lib.rs",
+            "old",
+            "new",
         ));
         let r = run_guard(&input, &peers);
         assert_eq!(r.outcome, Outcome::Nudge);
@@ -393,7 +395,11 @@ mod tests {
     #[test]
     fn edit_outside_peer_lane_allows() {
         let peers = vec![peer("quiet-loom", &["crates/guardrails/"])];
-        let input = with_session(make_edit("/Users/dev/cadence-hooks/crates/core/src/lib.rs"));
+        let input = with_session(make_edit(
+            "/Users/dev/cadence-hooks/crates/core/src/lib.rs",
+            "old",
+            "new",
+        ));
         assert_eq!(run_guard(&input, &peers).outcome, Outcome::Allow);
     }
 
@@ -401,7 +407,7 @@ mod tests {
     fn edit_with_undeclared_peer_allows() {
         // A peer with no declared lane can't produce path collisions.
         let peers = vec![peer("quiet-loom", &[])];
-        let input = with_session(make_edit("/Users/dev/repo/src/anything.rs"));
+        let input = with_session(make_edit("/Users/dev/repo/src/anything.rs", "old", "new"));
         assert_eq!(run_guard(&input, &peers).outcome, Outcome::Allow);
     }
 
@@ -409,7 +415,11 @@ mod tests {
     fn substring_lane_does_not_false_positive() {
         // "crates/guard" must not match "crates/guardrails-other/".
         let peers = vec![peer("quiet-loom", &["crates/guard"])];
-        let input = with_session(make_edit("/repo/crates/guardrails/src/lib.rs"));
+        let input = with_session(make_edit(
+            "/repo/crates/guardrails/src/lib.rs",
+            "old",
+            "new",
+        ));
         assert_eq!(
             run_guard(&input, &peers).outcome,
             Outcome::Allow,

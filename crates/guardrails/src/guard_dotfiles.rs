@@ -232,7 +232,7 @@ mod tests {
     fn edit_tool_delegated_to_pure_fn() {
         // The pure function is tested above; this just verifies the
         // Check::run plumbing calls it (outcome is Allow because no env var set)
-        let input = make_edit(&zshrc());
+        let input = make_edit(&zshrc(), "old", "new");
         let result = GuardDotfiles.run(&input);
         // CADENCE_GUARD_DOTFILES is not set in test env, so should allow
         assert_eq!(result.outcome, Outcome::Allow);

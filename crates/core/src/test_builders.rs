@@ -6,21 +6,16 @@
 //! cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 //! ```
 
-use crate::{HookInput, ToolInput, ToolResponse};
+use crate::{EditOperation, HookInput, ToolInput, ToolResponse};
 
 /// Build a `HookInput` for a `Bash` tool invocation.
 pub fn make_bash(cmd: &str) -> HookInput {
     HookInput {
         tool_name: Some("Bash".into()),
         tool_input: Some(ToolInput {
-            file_path: None,
-            path: None,
             command: Some(cmd.into()),
-            content: None,
-            new_string: None,
-            old_string: None,
+            ..Default::default()
         }),
-        cwd: None,
         ..Default::default()
     }
 }
@@ -30,12 +25,8 @@ pub fn make_bash_with_cwd(cmd: &str, cwd: &str) -> HookInput {
     HookInput {
         tool_name: Some("Bash".into()),
         tool_input: Some(ToolInput {
-            file_path: None,
-            path: None,
             command: Some(cmd.into()),
-            content: None,
-            new_string: None,
-            old_string: None,
+            ..Default::default()
         }),
         cwd: Some(cwd.into()),
         ..Default::default()
@@ -48,30 +39,48 @@ pub fn make_write(path: &str, content: &str) -> HookInput {
         tool_name: Some("Write".into()),
         tool_input: Some(ToolInput {
             file_path: Some(path.into()),
-            path: None,
-            command: None,
             content: Some(content.into()),
-            new_string: None,
-            old_string: None,
+            ..Default::default()
         }),
-        cwd: None,
         ..Default::default()
     }
 }
 
 /// Build a `HookInput` for an `Edit` tool invocation.
-pub fn make_edit(path: &str) -> HookInput {
+pub fn make_edit(path: &str, old_string: &str, new_string: &str) -> HookInput {
     HookInput {
         tool_name: Some("Edit".into()),
         tool_input: Some(ToolInput {
             file_path: Some(path.into()),
-            path: None,
-            command: None,
-            content: None,
-            new_string: Some("new".into()),
-            old_string: Some("old".into()),
+            old_string: Some(old_string.into()),
+            new_string: Some(new_string.into()),
+            ..Default::default()
         }),
-        cwd: None,
+        ..Default::default()
+    }
+}
+
+/// Build a `HookInput` for a `MultiEdit` tool invocation.
+///
+/// Each `(old_string, new_string)` pair becomes one edit operation,
+/// applied in order.
+pub fn make_multi_edit(path: &str, edits: &[(&str, &str)]) -> HookInput {
+    HookInput {
+        tool_name: Some("MultiEdit".into()),
+        tool_input: Some(ToolInput {
+            file_path: Some(path.into()),
+            edits: Some(
+                edits
+                    .iter()
+                    .map(|(old, new)| EditOperation {
+                        old_string: Some((*old).into()),
+                        new_string: Some((*new).into()),
+                        replace_all: None,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -84,18 +93,13 @@ pub fn make_bash_post_tool_use(cmd: &str, stdout: &str) -> HookInput {
     HookInput {
         tool_name: Some("Bash".into()),
         tool_input: Some(ToolInput {
-            file_path: None,
-            path: None,
             command: Some(cmd.into()),
-            content: None,
-            new_string: None,
-            old_string: None,
+            ..Default::default()
         }),
         tool_response: Some(ToolResponse {
             stdout: Some(stdout.into()),
             stderr: None,
         }),
-        cwd: None,
         ..Default::default()
     }
 }

@@ -523,6 +523,7 @@ mod tests {
                 content: None,
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -542,6 +543,7 @@ mod tests {
                 content: None,
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()
@@ -561,6 +563,7 @@ mod tests {
                 content: None,
                 new_string: None,
                 old_string: None,
+                ..Default::default()
             }),
             cwd: None,
             ..Default::default()

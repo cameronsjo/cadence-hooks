@@ -211,6 +211,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -257,6 +258,7 @@ version = "0.15.2"
 dependencies = [
  "cadence-hooks-core",
  "regex",
+ "tempfile",
 ]
 
 [[package]]
