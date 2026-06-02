@@ -568,7 +568,12 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
                     let variant = variant.split("=>").next().unwrap_or("").trim();
                     let subcmd = to_kebab_case(variant);
 
-                    // Determine plugin group from the Commands enum
+                    // Determine plugin group from the Commands enum.
+                    //
+                    // Logger-dispatched hooks (metrics, session heartbeat) use
+                    // run_logger_from_stdin and carry no HookEvent, so they
+                    // never reach this scan — only Check-dispatched hooks are
+                    // mapped here.
                     let plugin = if prev.contains("CadenceCommands") {
                         "cadence"
                     } else if prev.contains("GuardrailsCommands") {
@@ -577,6 +582,10 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
                         "rules"
                     } else if prev.contains("ObsidianCommands") {
                         "obsidian"
+                    } else if prev.contains("LabCommands") {
+                        "lab"
+                    } else if prev.contains("SessionCommands") {
+                        "session"
                     } else {
                         continue;
                     };
