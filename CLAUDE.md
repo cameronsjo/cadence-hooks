@@ -18,6 +18,8 @@ Manual tagging or formula edits race the automation. Post-release: `brew update 
 
 ## Gotchas
 
+- **Ignore `make bump`'s "next steps" output** — it suggests `git tag` + `git push --tags`, which predates and races the auto-tag automation. Just commit and push; `auto-tag.yml` owns tagging.
+- **hooks.json `if:` globs cannot match a pipe character** — `|` is the alternation separator. For checks that fire on pipelines (e.g. `warn-alias-parsing`), enumerate tool names in the filter and let the binary's pipe check do the precision work.
 - **The git-safety hook (this repo's own product) blocks `git rebase` in Claude sessions.** To rebase a stacked PR branch onto main: cherry-pick its own commits onto a fresh branch from main, then `git push origin <tmp-branch>:<pr-branch> --force-with-lease`.
 - **Registry/dispatch invariant**: every hook subcommand needs both a clap variant (src/main.rs) and a `HOOKS` entry (src/registry.rs). The `registry_matches_clap_dispatch` unit test enforces this on every `cargo test`; the hooks.json audit test (`tests/hook_registration_audit.rs`) additionally cross-checks sibling plugin repos when they're present locally.
 - **Guards fail open (ADR-0001)**: parse failures, unreadable files, and unknown subcommands exit 0/1, never 2. A guard's own failure must never block the user.
