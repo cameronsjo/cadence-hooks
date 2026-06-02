@@ -17,8 +17,6 @@ pub mod guard_gh_write;
 pub mod guard_git_init;
 /// Block uninvited 1Password vault enumeration (`op item list`).
 pub mod guard_op_vault_scan;
-/// Block `gh pr create` when the PR body has no closing keyword linking to an issue.
-pub mod guard_pr_issue_link;
 /// Block `git push` to remotes owned by others.
 pub mod guard_push_remote;
 /// Shared closing-keyword detection for GitHub issue references.
@@ -41,5 +39,7 @@ pub mod warn_curl_alias;
 pub mod warn_gh_merge_preflight;
 /// Warn when editing files directly on main/master branch.
 pub mod warn_main_branch;
+/// Remind on `gh pr create` when the PR body has no closing keyword linking to an issue.
+pub mod warn_pr_issue_link;
 /// Warn about untracked files during git commit operations.
 pub mod warn_untracked;

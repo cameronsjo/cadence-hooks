@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-// Closing-keyword detection is shared with guard_pr_issue_link via issue_refs.
+// Closing-keyword detection is shared with warn_pr_issue_link via issue_refs.
 pub use crate::issue_refs::extract_refs;
 
 /// Parse a git remote URL into `(host, "owner/repo")`.

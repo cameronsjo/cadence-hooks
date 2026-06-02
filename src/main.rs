@@ -149,8 +149,8 @@ enum GuardrailsCommands {
     WarnUntracked,
     /// Block direct edits to production dotfiles (opt-in via CADENCE_GUARD_DOTFILES=1)
     GuardDotfiles,
-    /// Block `gh pr create` without a closing issue keyword in the body
-    GuardPrIssueLink,
+    /// Nudge when `gh pr create` has no closing issue keyword in the body
+    WarnPrIssueLink,
     /// Verify issue auto-close after PR create/merge; close stragglers
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
@@ -261,7 +261,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
             GuardrailsCommands::WarnUntracked => "warn-untracked",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
-            GuardrailsCommands::GuardPrIssueLink => "guard-pr-issue-link",
+            GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
@@ -586,8 +586,8 @@ fn main() {
                 &cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles,
                 pre,
             ),
-            GuardrailsCommands::GuardPrIssueLink => run_check_from_stdin(
-                &cadence_hooks_guardrails::guard_pr_issue_link::PrIssueLinkGuard,
+            GuardrailsCommands::WarnPrIssueLink => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_pr_issue_link::WarnPrIssueLink,
                 pre,
             ),
             GuardrailsCommands::VerifyPrAutoclose => run_check_from_stdin(
