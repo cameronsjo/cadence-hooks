@@ -110,17 +110,102 @@ pub fn run(
     };
 
     let code = output.status.code().unwrap_or(-1);
-    let outcome = match code {
-        0 => "ALLOW / NUDGE",
-        2 => "BLOCK",
-        _ => "ERROR (non-blocking)",
-    };
+    let kind = classify_stdout(&output.stdout);
 
-    println!("Outcome:  {outcome} (exit {code})");
-    print_stream("Stdout", &output.stdout);
+    println!("Outcome:  {} (exit {code})", outcome_label(code, &kind));
+    match &kind {
+        StdoutKind::Empty => println!("Stdout:   (none)"),
+        StdoutKind::Nudge(ctx) => {
+            println!("Context injected (what Claude sees):");
+            println!();
+            print_text_block(ctx);
+        }
+        StdoutKind::LoopBlock(reason) => {
+            println!("Re-prompt reason (fed back to Claude):");
+            println!();
+            print_text_block(reason);
+        }
+        StdoutKind::OtherJson(pretty) => {
+            println!("Stdout:");
+            print_text_block(pretty);
+        }
+        StdoutKind::Raw(_) => print_stream("Stdout", &output.stdout),
+    }
     print_stream("Stderr", &output.stderr);
 
     code
+}
+
+/// The hook's stdout decoded per the hook protocol.
+///
+/// `try` is a teaching tool — the point is showing what the hook *says to
+/// Claude*, not echoing the protocol envelope it says it in.
+#[derive(Debug, PartialEq)]
+enum StdoutKind {
+    /// No output — a silent allow.
+    Empty,
+    /// Nudge envelope: `hookSpecificOutput.additionalContext` injected into
+    /// Claude's context.
+    Nudge(String),
+    /// Re-prompt envelope: `decision: "block"` + `reason` fed back so the
+    /// model rewrites (PostToolUse LoopBlock).
+    LoopBlock(String),
+    /// Valid JSON without a recognized protocol shape (pretty-printed).
+    OtherJson(String),
+    /// Anything that isn't JSON.
+    Raw(String),
+}
+
+/// Decode stdout into its protocol meaning.
+fn classify_stdout(bytes: &[u8]) -> StdoutKind {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return StdoutKind::Empty;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return StdoutKind::Raw(trimmed.to_string());
+    };
+    // LoopBlock first: its envelope also mirrors the message into
+    // hookSpecificOutput.additionalContext, so the decision/reason pair is
+    // the distinguishing shape.
+    if v.get("decision").and_then(|d| d.as_str()) == Some("block")
+        && let Some(reason) = v.get("reason").and_then(|r| r.as_str())
+    {
+        return StdoutKind::LoopBlock(reason.to_string());
+    }
+    if let Some(ctx) = v
+        .pointer("/hookSpecificOutput/additionalContext")
+        .and_then(|c| c.as_str())
+    {
+        return StdoutKind::Nudge(ctx.to_string());
+    }
+    StdoutKind::OtherJson(serde_json::to_string_pretty(&v).unwrap_or_else(|_| trimmed.to_string()))
+}
+
+/// The outcome label, sharpened by what stdout actually carried.
+///
+/// Exit 0 alone is ambiguous (allow and nudge share it); the decoded stdout
+/// disambiguates.
+fn outcome_label(code: i32, kind: &StdoutKind) -> &'static str {
+    match (code, kind) {
+        (0, StdoutKind::Nudge(_)) => "NUDGE",
+        (0, StdoutKind::LoopBlock(_)) => "LOOP-BLOCK (re-prompt)",
+        (0, _) => "ALLOW",
+        (2, _) => "BLOCK",
+        _ => "ERROR (non-blocking)",
+    }
+}
+
+/// Print multi-line text indented two spaces.
+fn print_text_block(text: &str) {
+    for line in text.lines() {
+        if line.is_empty() {
+            println!();
+        } else {
+            println!("  {line}");
+        }
+    }
 }
 
 /// Bound the payload echo for user-supplied payloads; generated samples are
@@ -247,5 +332,67 @@ mod tests {
         let short = r#"{"tool_name":"Bash"}"#;
         let preview = payload_preview(short, true, false);
         assert_eq!(preview, short, "short payloads need no truncation");
+    }
+
+    // --- stdout protocol decoding ---
+
+    #[test]
+    fn classify_empty_stdout() {
+        assert_eq!(classify_stdout(b""), StdoutKind::Empty);
+        assert_eq!(classify_stdout(b"  \n"), StdoutKind::Empty);
+    }
+
+    #[test]
+    fn classify_nudge_envelope_extracts_context() {
+        let stdout = br#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Line one.\nLine two."}}"#;
+        match classify_stdout(stdout) {
+            StdoutKind::Nudge(ctx) => {
+                assert_eq!(ctx, "Line one.\nLine two.");
+            }
+            other => panic!("expected Nudge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_loop_block_wins_over_nudge_mirror() {
+        // LoopBlock envelopes mirror the reason into additionalContext —
+        // the decision/reason pair must take precedence.
+        let stdout = br#"{"decision":"block","reason":"rewrite it","hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"rewrite it"}}"#;
+        match classify_stdout(stdout) {
+            StdoutKind::LoopBlock(reason) => assert_eq!(reason, "rewrite it"),
+            other => panic!("expected LoopBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_unrecognized_json_pretty_prints() {
+        let stdout = br#"{"custom":{"nested":true}}"#;
+        match classify_stdout(stdout) {
+            StdoutKind::OtherJson(pretty) => {
+                assert!(pretty.contains('\n'), "should be pretty-printed: {pretty}");
+                assert!(pretty.contains("\"nested\": true"));
+            }
+            other => panic!("expected OtherJson, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_non_json_is_raw() {
+        assert_eq!(
+            classify_stdout(b"plain text output"),
+            StdoutKind::Raw("plain text output".to_string())
+        );
+    }
+
+    #[test]
+    fn outcome_labels_disambiguate_exit_zero() {
+        assert_eq!(outcome_label(0, &StdoutKind::Empty), "ALLOW");
+        assert_eq!(outcome_label(0, &StdoutKind::Nudge("ctx".into())), "NUDGE");
+        assert_eq!(
+            outcome_label(0, &StdoutKind::LoopBlock("r".into())),
+            "LOOP-BLOCK (re-prompt)"
+        );
+        assert_eq!(outcome_label(2, &StdoutKind::Empty), "BLOCK");
+        assert_eq!(outcome_label(1, &StdoutKind::Empty), "ERROR (non-blocking)");
     }
 }
