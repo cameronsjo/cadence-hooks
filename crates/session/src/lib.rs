@@ -17,14 +17,17 @@
 //! Consumed by the `cadence-canon` plugin (same voice entering at offset
 //! times, harmonious by construction). Hook surface: issue #54.
 //!
-//! | Subcommand  | Event        | Module        |
-//! |-------------|--------------|---------------|
-//! | `start`     | SessionStart | [`start`]     |
-//! | `heartbeat` | PostToolUse  | [`heartbeat`] |
-//! | `guard`     | PreToolUse   | [`guard`]     |
-//! | `declare`   | CLI action   | [`cli`]       |
-//! | `status`    | CLI action   | [`cli`]       |
+//! | Subcommand          | Event        | Module          |
+//! |---------------------|--------------|-----------------|
+//! | `start`             | SessionStart | [`start`]       |
+//! | `heartbeat`         | PostToolUse  | [`heartbeat`]   |
+//! | `guard`             | PreToolUse   | [`guard`]       |
+//! | `warn-branch-drift` | PreToolUse   | [`branch_drift`]|
+//! | `declare`           | CLI action   | [`cli`]         |
+//! | `status`            | CLI action   | [`cli`]         |
 
+/// PreToolUse commit-time branch-drift warning — never blocks.
+pub mod branch_drift;
 /// CLI actions: `declare` (lane declaration) and `status` (registry listing).
 pub mod cli;
 /// PreToolUse lane warnings — never blocks.

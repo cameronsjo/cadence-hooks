@@ -268,6 +268,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "warn-branch-drift",
+        description: "Warn when HEAD drifted from the session's recorded branch at git commit",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
@@ -301,6 +307,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // log-subagent only reacts to SubagentStart / SubagentStop
         ("metrics", "log-subagent") => Some(
             r#"{"session_id":"test","hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"Explore","duration_ms":1234}"#,
+        ),
+        // warn-branch-drift early-exits unless the command is a git commit —
+        // the generic PreToolUse sample (`git status`) would never reach the
+        // drift comparison.
+        ("session", "warn-branch-drift") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}"#,
         ),
         _ => None,
     }

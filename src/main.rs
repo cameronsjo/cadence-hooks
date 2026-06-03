@@ -216,6 +216,8 @@ enum SessionCommands {
     Heartbeat,
     /// Warn when an action intersects a live peer's lane (PreToolUse)
     Guard,
+    /// Warn when HEAD drifted from the session's recorded branch at git commit (PreToolUse)
+    WarnBranchDrift,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -294,6 +296,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::Start => "start",
             SessionCommands::Heartbeat => "heartbeat",
             SessionCommands::Guard => "guard",
+            SessionCommands::WarnBranchDrift => "warn-branch-drift",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -668,6 +671,9 @@ fn main() {
             ),
             SessionCommands::Guard => {
                 run_check_from_stdin(&cadence_hooks_session::guard::Guard, pre)
+            }
+            SessionCommands::WarnBranchDrift => {
+                run_check_from_stdin(&cadence_hooks_session::branch_drift::WarnBranchDrift, pre)
             }
             SessionCommands::Declare {
                 intent,
