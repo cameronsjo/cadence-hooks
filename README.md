@@ -33,7 +33,7 @@ Hooks are organized by the plugin they serve:
 | `guard-push-remote` | PreToolUse (Bash) | Block git push to repos you don't own |
 | `guard-gh-write` | PreToolUse (Bash) | Block gh write operations to non-owned repos |
 | `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) |
-| `guard-git-init` | PreToolUse (Bash) | Nudge to scaffold after git init |
+| `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` |
 | `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch |
 | `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base |
 | `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs |
