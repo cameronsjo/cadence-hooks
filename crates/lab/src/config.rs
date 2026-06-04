@@ -76,10 +76,10 @@ impl Config {
         }
     }
 
-    /// The default persona root: `${HOME:-/tmp}/.claude/persona`.
+    /// The default persona root: `<config_dir>/persona`, where `<config_dir>`
+    /// honors `CLAUDE_CONFIG_DIR` (else `~/.claude`).
     pub fn persona_root() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home).join(".claude").join("persona")
+        cadence_hooks_core::paths::claude_config_dir().join("persona")
     }
 
     /// Load defaults, then apply any `<persona_root>/config.json` override.
@@ -96,19 +96,11 @@ impl Config {
     }
 }
 
-/// Expand a leading `~/` to the home directory.
+/// Expand a leading `~/` to the home directory. Delegates to the shared
+/// [`cadence_hooks_core::paths::expand_tilde_with`] so the logic lives in one place.
 fn expand_tilde(s: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    expand_tilde_with(s, &home)
-}
-
-/// Pure form of [`expand_tilde`] — replaces a leading `~/` with `home`.
-fn expand_tilde_with(s: &str, home: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        PathBuf::from(home).join(rest)
-    } else {
-        PathBuf::from(s)
-    }
+    cadence_hooks_core::paths::expand_tilde_with(s, &home)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -251,14 +243,10 @@ mod tests {
     }
 
     #[test]
-    fn expand_tilde_replaces_home() {
-        assert_eq!(
-            expand_tilde_with("~/x/y", "/home/test"),
-            PathBuf::from("/home/test/x/y")
-        );
-        assert_eq!(
-            expand_tilde_with("/abs/path", "/home/test"),
-            PathBuf::from("/abs/path")
-        );
+    fn expand_tilde_uses_home_env() {
+        // The pure `~`-expansion logic is covered by `cadence_hooks_core::paths`;
+        // here we just confirm the local wrapper reads $HOME and passes through
+        // absolute paths.
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
     }
 }

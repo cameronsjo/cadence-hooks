@@ -240,8 +240,18 @@ fn scan_hooks_json(plugin: &str, path: &Path, raw: &str, json: &serde_json::Valu
     findings
 }
 
-/// Claude Code's plugins directory (`~/.claude/plugins`).
+/// Claude Code's plugins directory.
+///
+/// Prefers `<config_dir>/plugins` (honoring `CLAUDE_CONFIG_DIR`), but it is
+/// unverified whether Claude Code's plugin loader relocates `plugins/` along
+/// with the rest of the config tree — it may keep it at `~/.claude` regardless.
+/// So when the config-dir variant does not exist, fall back to
+/// `$HOME/.claude/plugins`. This stays correct under either loader behavior.
 fn plugins_dir() -> Option<PathBuf> {
+    let config_variant = cadence_hooks_core::paths::claude_config_dir().join("plugins");
+    if config_variant.exists() {
+        return Some(config_variant);
+    }
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".claude/plugins"))
 }

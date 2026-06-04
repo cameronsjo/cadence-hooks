@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod loop_analysis;
+pub mod paths;
 pub mod shell;
 
 #[cfg(feature = "test-builders")]

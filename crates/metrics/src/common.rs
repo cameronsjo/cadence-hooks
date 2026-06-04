@@ -22,10 +22,10 @@ pub fn is_git_commit(command: &str) -> bool {
     commit_regex().is_match(command)
 }
 
-/// The metrics root: `${HOME:-/tmp}/.claude/metrics`.
+/// The metrics root: `<config_dir>/metrics`, where `<config_dir>` honors
+/// `CLAUDE_CONFIG_DIR` (else `~/.claude`).
 pub fn metrics_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".claude").join("metrics")
+    cadence_hooks_core::paths::claude_config_dir().join("metrics")
 }
 
 /// The per-session state directory: `<metrics_dir>/state`.
