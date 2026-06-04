@@ -109,7 +109,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "guard-git-init",
-        description: "Nudge to scaffold after git init",
+        description: "Nudge to scaffold and confirm license after git init or gh repo create",
         plugin: "guardrails",
         event: Some(HookEvent::PostToolUse),
     },

@@ -133,7 +133,7 @@ enum GuardrailsCommands {
     GuardGhDangerous,
     /// Block gh write operations to non-owned repos
     GuardGhWrite,
-    /// Nudge to scaffold after git init
+    /// Nudge to scaffold and confirm license after git init or gh repo create
     GuardGitInit,
     /// Warn when editing on main/master branch
     WarnMainBranch,
