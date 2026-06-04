@@ -23,8 +23,15 @@ const VALID_FIELDS: &[&str] = &[
     "hooks",
 ];
 
-static NAME_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*$").expect("pattern should compile"));
+// Kebab-case name, optionally prefixed by a kebab `namespace:` (the
+// `plugin:directory` invocation id, e.g. `cadence:attune`). Both sides are
+// independently multi-segment kebab; the optional trailing group rejects a
+// dangling colon (`cadence:`), a leading colon (`:attune`), and a double
+// colon (`a::b`) for free.
+static NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*(:[a-z0-9]+(-[a-z0-9]+)*)?$")
+        .expect("pattern should compile")
+});
 
 #[derive(Debug, PartialEq)]
 enum FileType {
@@ -133,13 +140,21 @@ impl Check for ValidateSkillFrontmatter {
                     // Check name format
                     if !NAME_PATTERN.is_match(name_value) {
                         errors.push(format!(
-                            "name must use only lowercase letters, numbers, and hyphens (got: '{name_value}')"
+                            "name must use only lowercase letters, numbers, and hyphens, with an optional 'namespace:' prefix (got: '{name_value}')"
                         ));
                     }
 
-                    // Check name matches directory
+                    // Check the skill part matches the directory. The optional
+                    // `namespace:` prefix is permitted but not required, and the
+                    // namespace itself is not verified against the plugin name —
+                    // deriving the plugin from the path is fragile (source vs
+                    // cache) and cadence-hooks must not force the prefix on
+                    // non-cadence users. Only the post-colon suffix must match.
+                    let skill_part = name_value
+                        .rsplit_once(':')
+                        .map_or(name_value.as_str(), |(_, s)| s);
                     if let Some(dir_name) = skill_dir_name(&path)
-                        && name_value != dir_name
+                        && skill_part != dir_name
                     {
                         errors.push(format!(
                             "name '{name_value}' must match directory '{dir_name}'"
@@ -191,10 +206,20 @@ mod tests {
     fn valid_name_format() {
         assert!(NAME_PATTERN.is_match("my-skill"));
         assert!(NAME_PATTERN.is_match("skill123"));
+        // Optional `namespace:` prefix (the plugin:directory invocation id).
+        assert!(NAME_PATTERN.is_match("cadence:attune"));
+        assert!(NAME_PATTERN.is_match("cadence-forge:add-narrative-logging"));
+        assert!(NAME_PATTERN.is_match("cadence-rules:init-all"));
         assert!(!NAME_PATTERN.is_match("My-Skill"));
         assert!(!NAME_PATTERN.is_match("-leading"));
         assert!(!NAME_PATTERN.is_match("trailing-"));
         assert!(!NAME_PATTERN.is_match("double--hyphen"));
+        // Colon edge cases the optional trailing group must reject.
+        assert!(!NAME_PATTERN.is_match("cadence:")); // dangling colon
+        assert!(!NAME_PATTERN.is_match(":attune")); // leading colon
+        assert!(!NAME_PATTERN.is_match("a::b")); // double colon
+        assert!(!NAME_PATTERN.is_match("Cadence:attune")); // uppercase namespace
+        assert!(!NAME_PATTERN.is_match("cadence:At")); // uppercase suffix
     }
 
     #[test]
@@ -306,6 +331,31 @@ mod tests {
         let input = make_write_input(
             "/plugins/skills/my-skill/SKILL.md",
             "---\nname: other-name\ndescription: test\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("must match directory"));
+    }
+
+    #[test]
+    fn run_skill_namespaced_name_matching_dir_passes() {
+        // The plugin:directory form is allowed: the post-colon suffix matches
+        // the directory, so the prefix is accepted.
+        let input = make_write_input(
+            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "---\nname: cadence:my-skill\ndescription: test\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_namespaced_name_suffix_mismatch_blocks() {
+        // A prefix does not excuse a mismatched skill part: suffix `wrong`
+        // still has to equal the directory `my-skill`.
+        let input = make_write_input(
+            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "---\nname: cadence:wrong\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
