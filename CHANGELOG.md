@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-05
+
 ### Added
 
 - Native Windows support for the binary. CI now runs check/clippy/test on `windows-latest`, and the release pipeline builds an `x86_64-pc-windows-msvc` leg, shipping `cadence-hooks.exe` in a `.zip` (with checksum + provenance) alongside the existing unix `.tar.gz` artifacts. The Homebrew tap dispatch is unchanged.
