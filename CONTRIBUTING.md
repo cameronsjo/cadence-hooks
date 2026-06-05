@@ -12,6 +12,16 @@ make ci    # Run fmt check, clippy, and tests
 
 Requires Rust 2024 edition (1.85+).
 
+### Windows
+
+The binary builds and tests natively on Windows (`x86_64-pc-windows-msvc`); CI
+runs the full `make ci` on `windows-latest`. `make` itself may not be present —
+run the steps directly (`cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --workspace`), or use Git Bash, which
+provides `make`. The pre-commit hook needs a `bash` shell (Git Bash satisfies
+it). Build a release binary with
+`cargo build --release --target x86_64-pc-windows-msvc`.
+
 ## Development Workflow
 
 1. Create a feature branch from `main`

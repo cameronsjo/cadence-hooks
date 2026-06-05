@@ -213,6 +213,32 @@ curl -sL https://github.com/cameronsjo/cadence-hooks/releases/latest/download/ca
 mv cadence-hooks ~/.local/bin/
 ```
 
+### Windows
+
+Releases ship a Windows build (`cadence-hooks-vX.Y.Z-windows-x86_64.zip`
+containing `cadence-hooks.exe`). Install via Scoop (preferred), WinGet, or the
+direct `.zip`:
+
+```powershell
+# Scoop
+scoop bucket add cameronsjo https://github.com/cameronsjo/scoop-bucket
+scoop install cameronsjo/cadence-hooks
+
+# WinGet
+winget install cameronsjo.cadence-hooks
+```
+
+For the direct `.zip`, download from [Releases](https://github.com/cameronsjo/cadence-hooks/releases),
+unpack `cadence-hooks.exe` to a directory on your `PATH` (e.g.
+`%LOCALAPPDATA%\cadence-hooks`).
+
+> **Git Bash is required for the hooks to fire.** Cadence's plugins dispatch
+> through `.sh` wrappers, and Claude Code runs shell-form hook commands via Git
+> Bash on Windows (falling back to PowerShell, which can't run `.sh`, when Git
+> Bash is absent). Install [Git for Windows](https://git-scm.com/download/win)
+> and keep `bash` on `PATH`. The binary runs fine without it — the guards just
+> won't fire.
+
 ### From source
 
 ```bash
