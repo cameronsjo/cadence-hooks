@@ -13,6 +13,7 @@ pub mod config;
 pub mod loop_analysis;
 pub mod paths;
 pub mod shell;
+pub mod time;
 
 #[cfg(feature = "test-builders")]
 pub mod test_builders;
@@ -115,7 +116,12 @@ impl Outcome {
 /// - Replace backslashes with forward slashes (Windows compatibility)
 /// - Strip null bytes (C string truncation attack prevention)
 /// - Trim trailing slashes and whitespace
-fn normalize_path(path: &str) -> String {
+///
+/// Exposed so guards that compare an env-sourced path (e.g. an Obsidian vault
+/// root) against hook-supplied paths can normalize **both sides** before a
+/// string prefix test — otherwise a `C:\vault` env value never matches a
+/// `C:/vault` hook path on Windows.
+pub fn normalize_path(path: &str) -> String {
     let cleaned: String = path
         .replace('\\', "/")
         .replace('\0', "")

@@ -5,7 +5,6 @@
 use crate::config::Limits;
 use regex::Regex;
 use serde_json::{Map, Value, json};
-use std::process::Command;
 use std::sync::OnceLock;
 
 /// The model-authored fields the gate validates. System metadata
@@ -222,16 +221,11 @@ pub fn detect_cheek(candidate: &Value) -> Vec<String> {
 
 // ---------- Record construction ----------
 
-/// Current UTC timestamp, ISO 8601 second precision. Shells out to `date -u`
-/// to avoid a date crate (mirrors the metrics hooks). Empty on failure.
+/// Current UTC timestamp, ISO 8601 second precision. Delegates to the canonical
+/// [`cadence_hooks_core::time::utc_timestamp`] (jiff-backed, portable to
+/// Windows) so the workspace shares one timestamp source.
 pub fn utc_timestamp() -> String {
-    Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    cadence_hooks_core::time::utc_timestamp()
 }
 
 /// Build the canonical one-line ledger record. The model-authored fields are

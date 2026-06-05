@@ -5,23 +5,10 @@
 //! when the date rolls over at midnight. This nudge injects the current
 //! date and time into the transcript so the agent can schedule accurately.
 
-use std::process::Command;
-
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Nudges on CronCreate with current datetime context.
 pub struct WarnCronDatetime;
-
-/// Run `date` with the given format string, trimming the trailing newline.
-fn date_fmt(args: &[&str]) -> String {
-    Command::new("date")
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".into())
-}
 
 impl Check for WarnCronDatetime {
     fn name(&self) -> &str {
@@ -31,12 +18,14 @@ impl Check for WarnCronDatetime {
     fn run(&self, input: &HookInput) -> CheckResult {
         let tool = input.tool_name().unwrap_or("");
         if tool == "CronCreate" {
-            let local = date_fmt(&["+%Y-%m-%d %H:%M:%S %Z"]);
-            let utc = date_fmt(&["-u", "+%Y-%m-%d %H:%M:%S UTC"]);
-            let day = date_fmt(&["+%A"]);
+            // Local wall clock (with tz + weekday) is the load-bearing field —
+            // CronCreate fires in the user's local zone. jiff supplies it
+            // portably; the std library exposes UTC instants only.
+            let dt = cadence_hooks_core::time::cron_datetime();
             return CheckResult::nudge(format!(
-                "Current date/time: {local} ({utc})\n\
-                 Day of week: {day}"
+                "Current date/time: {} ({})\n\
+                 Day of week: {}",
+                dt.local, dt.utc, dt.weekday
             ));
         }
         CheckResult::allow()

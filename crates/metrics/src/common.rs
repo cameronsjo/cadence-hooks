@@ -100,17 +100,10 @@ pub fn repo_basename(cwd: Option<&str>) -> String {
 
 /// Current UTC timestamp, ISO 8601 second precision (`%Y-%m-%dT%H:%M:%SZ`).
 ///
-/// Shells out to `date -u` to match the bash hooks exactly and avoid pulling a
-/// date/time crate into the workspace. Falls back to an empty string if `date`
-/// is somehow unavailable — the line is still written, just without a `ts`.
+/// Re-exports the canonical [`cadence_hooks_core::time::utc_timestamp`] so every
+/// logger shares one timestamp source (jiff-backed, portable to Windows).
 pub fn utc_timestamp() -> String {
-    Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    cadence_hooks_core::time::utc_timestamp()
 }
 
 #[cfg(test)]

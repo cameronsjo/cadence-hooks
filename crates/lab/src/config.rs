@@ -99,8 +99,9 @@ impl Config {
 /// Expand a leading `~/` to the home directory. Delegates to the shared
 /// [`cadence_hooks_core::paths::expand_tilde_with`] so the logic lives in one place.
 fn expand_tilde(s: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    cadence_hooks_core::paths::expand_tilde_with(s, &home)
+    let home = cadence_hooks_core::paths::user_home()
+        .unwrap_or_else(cadence_hooks_core::paths::marker_temp_dir);
+    cadence_hooks_core::paths::expand_tilde_with(s, &home.to_string_lossy())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -175,12 +176,20 @@ pub fn is_safe_session_id(session_id: &str) -> bool {
 }
 
 /// True when `path` resolves inside `dir` (string-prefix on normalized paths).
+///
+/// `path` arrives forward-slash-normalized (from `HookInput::file_path`), but
+/// `dir` is a native `PathBuf` whose `to_string_lossy` is backslash-joined on
+/// Windows. Normalize both sides so the prefix test is separator-agnostic —
+/// otherwise the gate never recognizes its own staging dir on Windows.
 pub fn is_within(path: &str, dir: &Path) -> bool {
+    let path = cadence_hooks_core::normalize_path(path);
     if path.contains("..") {
         return false;
     }
-    let dir_str = dir.to_string_lossy();
-    let needle = format!("{}/", dir_str.trim_end_matches('/'));
+    let needle = format!(
+        "{}/",
+        cadence_hooks_core::normalize_path(&dir.to_string_lossy())
+    );
     path.starts_with(&needle)
 }
 
@@ -240,6 +249,15 @@ mod tests {
             "/home/u/.claude/persona/staging/../personas.jsonl",
             dir
         ));
+    }
+
+    #[test]
+    fn is_within_normalizes_backslash_dir() {
+        // On Windows the staging dir is backslash-joined while the hook path is
+        // forward-slash-normalized; both sides must normalize to match.
+        let dir = Path::new(r"C:\Users\u\.claude\persona\staging");
+        assert!(is_within("C:/Users/u/.claude/persona/staging/s1.json", dir));
+        assert!(!is_within("C:/Users/u/.claude/persona/personas.jsonl", dir));
     }
 
     #[test]

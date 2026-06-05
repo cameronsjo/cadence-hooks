@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Native Windows support for the binary. CI now runs check/clippy/test on `windows-latest`, and the release pipeline builds an `x86_64-pc-windows-msvc` leg, shipping `cadence-hooks.exe` in a `.zip` (with checksum + provenance) alongside the existing unix `.tar.gz` artifacts. The Homebrew tap dispatch is unchanged.
+
+### Changed
+
+- Replaced ten POSIX-only assumptions with portable code so the binary is correct outside WSL/unix: a `cadence_hooks_core::paths::user_home()` helper (`HOME` → `USERPROFILE` → `HOMEDRIVE`+`HOMEPATH`) and `marker_temp_dir()` (`std::env::temp_dir`) replace `HOME`-or-`/tmp` reads and hardcoded `/tmp` markers; a single jiff-backed `cadence_hooks_core::time` module replaces four `date -u` shell-outs (and gives `warn-cron-datetime` portable local time + timezone + weekday); and `obsidian-trash-guard` normalizes both the vault root and hook paths before comparison. Adds `jiff` as the one new dependency.
+
 ## [0.20.0] - 2026-06-04
 
 ### Changed

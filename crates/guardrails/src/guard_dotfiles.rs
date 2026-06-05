@@ -70,7 +70,7 @@ impl Check for GuardDotfiles {
         }
 
         let enabled = std::env::var("CADENCE_GUARD_DOTFILES").as_deref() == Ok("1");
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = cadence_hooks_core::paths::user_home_lossy_or_default();
 
         // Resolve target: file_path first, then command (per spec fallback)
         let target = input

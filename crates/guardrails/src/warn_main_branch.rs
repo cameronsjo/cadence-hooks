@@ -142,7 +142,8 @@ impl WarnMainBranch {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or_else(std::process::id);
 
-        PathBuf::from(format!("/tmp/.claude-main-branch-warned-{hash:x}-{ppid}"))
+        cadence_hooks_core::paths::marker_temp_dir()
+            .join(format!(".claude-main-branch-warned-{hash:x}-{ppid}"))
     }
 }
 

@@ -99,6 +99,19 @@ mod tests {
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
     use cadence_hooks_core::{HookInput, Outcome};
 
+    /// The cadence-hooks repo root, derived portably from this crate's manifest
+    /// dir (`<root>/crates/guardrails` → `<root>`). Uses `Path::ancestors` rather
+    /// than `rsplit_once("/crates")`, which misses the backslash-joined
+    /// `CARGO_MANIFEST_DIR` on Windows and falls back to the wrong directory.
+    fn repo_root() -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn no_command_allows() {
         let input = HookInput {
@@ -172,11 +185,7 @@ mod tests {
     #[test]
     fn push_from_cadence_hooks_repo_nudges() {
         // Use the actual cadence-hooks repo directory
-        let cwd = env!("CARGO_MANIFEST_DIR")
-            .rsplit_once("/crates")
-            .map(|(root, _)| root)
-            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
-        let input = make_bash_with_cwd("git push origin main", cwd);
+        let input = make_bash_with_cwd("git push origin main", &repo_root());
         let result = NudgeUpgradeAfterPush.run(&input);
         assert_eq!(
             result.outcome,
@@ -191,11 +200,7 @@ mod tests {
 
     #[test]
     fn push_from_cadence_hooks_feature_branch_allows() {
-        let cwd = env!("CARGO_MANIFEST_DIR")
-            .rsplit_once("/crates")
-            .map(|(root, _)| root)
-            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
-        let input = make_bash_with_cwd("git push origin feature/test", cwd);
+        let input = make_bash_with_cwd("git push origin feature/test", &repo_root());
         let result = NudgeUpgradeAfterPush.run(&input);
         assert_eq!(
             result.outcome,
@@ -217,13 +222,16 @@ mod tests {
         );
     }
 
+    // Unix-only: exercises POSIX bash `cd <absolute-path>` resolution through
+    // parse_work_dir. A native Windows repo path (`D:\...`) is not a `/`-rooted
+    // bash absolute path, so it cannot drive this code path — and in production
+    // Claude's Bash tool on Windows is Git Bash, where cd targets are `/d/...`
+    // mounts, not native paths. parse_work_dir's parsing itself is covered
+    // portably by the unit tests in core::shell.
+    #[cfg(not(windows))]
     #[test]
     fn push_with_cd_to_cadence_hooks_nudges() {
-        let repo_root = env!("CARGO_MANIFEST_DIR")
-            .rsplit_once("/crates")
-            .map(|(root, _)| root)
-            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
-        let cmd = format!("cd {repo_root} && git push origin main");
+        let cmd = format!("cd {} && git push origin main", repo_root());
         let input = make_bash_with_cwd(&cmd, "/tmp");
         let result = NudgeUpgradeAfterPush.run(&input);
         assert_eq!(

@@ -200,7 +200,11 @@ fn resolve_cd_target(target: &str, effective: &str) -> String {
     if target.starts_with('/') {
         target.to_string()
     } else if target.starts_with('~') {
-        let home = std::env::var("HOME").unwrap_or_default();
+        // Shell `~` expansion. `effective`/`target` are shell paths (forward
+        // slash, even under Git Bash on Windows), so the concat below stays a
+        // string join — NOT a `PathBuf::join`, which would emit a backslash on
+        // Windows and corrupt the shell path the git layer consumes.
+        let home = crate::paths::user_home_lossy_or_default();
         target.replacen('~', &home, 1)
     } else {
         format!("{effective}/{target}")
