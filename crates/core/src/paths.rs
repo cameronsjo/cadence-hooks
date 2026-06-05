@@ -51,6 +51,18 @@ pub fn resolve_home(
     }
 }
 
+/// [`user_home`] as a `String`, empty when no home directory resolves.
+///
+/// For the string-prefix path comparisons (dotfile matching, `~` expansion in
+/// shell-path parsing) where a `PathBuf` is unwieldy and an empty string is the
+/// right "matches nothing" sentinel. Sites that need a writable fallback should
+/// use `user_home().unwrap_or_else(marker_temp_dir)` instead.
+pub fn user_home_lossy_or_default() -> String {
+    user_home()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// The system temp directory, portably (`%TEMP%` on Windows, `/tmp` on unix).
 ///
 /// Wraps [`std::env::temp_dir`] so marker/state files land in a writable

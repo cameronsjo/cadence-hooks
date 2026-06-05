@@ -204,9 +204,7 @@ fn resolve_cd_target(target: &str, effective: &str) -> String {
         // slash, even under Git Bash on Windows), so the concat below stays a
         // string join — NOT a `PathBuf::join`, which would emit a backslash on
         // Windows and corrupt the shell path the git layer consumes.
-        let home = crate::paths::user_home()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let home = crate::paths::user_home_lossy_or_default();
         target.replacen('~', &home, 1)
     } else {
         format!("{effective}/{target}")
