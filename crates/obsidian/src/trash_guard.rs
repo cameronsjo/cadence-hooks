@@ -6,6 +6,18 @@
 
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
+/// True when a normalized path is absolute — POSIX (`/foo`) or a Windows
+/// drive-absolute path (`C:/foo`, after `normalize_path` turns `\` into `/`).
+/// Used to distinguish an explicit path argument from a flag (`-rf`) or a
+/// bare relative name.
+fn looks_absolute(p: &str) -> bool {
+    if p.starts_with('/') {
+        return true;
+    }
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
+}
+
 /// Check if an rm command targets the Obsidian vault.
 fn check_rm_in_vault(command: &str, cwd: &str, vault: &str) -> CheckResult {
     if !command.contains("rm") {
@@ -25,7 +37,7 @@ fn check_rm_in_vault(command: &str, cwd: &str, vault: &str) -> CheckResult {
     if !in_vault {
         for part in command.split_whitespace() {
             let part = normalize_path(part);
-            if part.starts_with('/') && (part == vault || part.starts_with(&vault_prefix)) {
+            if looks_absolute(&part) && (part == vault || part.starts_with(&vault_prefix)) {
                 in_vault = true;
                 break;
             }
@@ -184,10 +196,17 @@ mod tests {
 
     #[test]
     fn windows_backslash_command_path_matches_vault() {
+        // A Windows drive-absolute command arg (`C:\vault\...`) normalizes to
+        // `C:/vault/...` and is recognized as an explicit path, so an `rm`
+        // targeting the vault from an outside cwd is blocked.
         let result = check_rm_in_vault(r"rm C:\vault\notes\todo.md", "C:/home", r"C:\vault");
-        // Command path arg is normalized; it starts with `C:/...`, not `/`, so
-        // the explicit-path branch (which gates on a leading `/`) does not fire
-        // — Windows drive-absolute detection is out of scope for this fix.
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn windows_drive_path_outside_vault_allowed() {
+        // A drive-absolute path that isn't the vault must not false-match.
+        let result = check_rm_in_vault(r"rm C:\other\file.md", "C:/home", r"C:\vault");
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
