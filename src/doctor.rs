@@ -252,8 +252,8 @@ fn plugins_dir() -> Option<PathBuf> {
     if config_variant.exists() {
         return Some(config_variant);
     }
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".claude/plugins"))
+    let home = cadence_hooks_core::paths::user_home()?;
+    Some(home.join(".claude/plugins"))
 }
 
 /// Read active plugin install paths from `installed_plugins.json` (v2 schema).

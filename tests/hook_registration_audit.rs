@@ -253,8 +253,12 @@ fn extract_dispatch(command: &str) -> Option<String> {
 /// Parse user-level settings.json and extract all hook shell script paths and
 /// any cadence-hooks binary dispatches registered there.
 fn settings_json_hooks() -> (Vec<String>, Vec<String>) {
-    let home = std::env::var("HOME").expect("HOME not set");
-    let settings_path = PathBuf::from(&home).join(".claude/settings.json");
+    // No resolvable home (e.g. a Windows CI runner with no `~/.claude`) means
+    // there is nothing registered to audit — no-op rather than panic.
+    let Some(home) = cadence_hooks_core::paths::user_home() else {
+        return (Vec::new(), Vec::new());
+    };
+    let settings_path = home.join(".claude/settings.json");
 
     if !settings_path.exists() {
         return (Vec::new(), Vec::new());
@@ -668,7 +672,15 @@ fn hook_event_types_match_hooks_json() {
 #[test]
 fn settings_json_shell_scripts_exist() {
     let (shell_scripts, _) = settings_json_hooks();
-    let home = std::env::var("HOME").expect("HOME not set");
+    // Empty means no registered hooks to verify (no `~/.claude/settings.json`,
+    // or no resolvable home on this platform) — nothing to assert.
+    if shell_scripts.is_empty() {
+        return;
+    }
+    let home = cadence_hooks_core::paths::user_home()
+        .expect("settings_json_hooks returned scripts, so a home dir resolved")
+        .to_string_lossy()
+        .into_owned();
 
     let mut missing = Vec::new();
     for script in &shell_scripts {
