@@ -62,7 +62,10 @@ impl CheckIdleReturn {
         repo_root.hash(&mut hasher);
         let hash = hasher.finish();
 
-        Some(PathBuf::from(format!("/tmp/.claude-last-edit-{hash:x}")))
+        Some(
+            cadence_hooks_core::paths::marker_temp_dir()
+                .join(format!(".claude-last-edit-{hash:x}")),
+        )
     }
 
     fn now_secs() -> u64 {

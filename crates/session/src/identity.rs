@@ -172,18 +172,11 @@ pub fn now_epoch() -> u64 {
 
 /// Current UTC timestamp, ISO 8601 second precision (`%Y-%m-%dT%H:%M:%SZ`).
 ///
-/// Shells out to `date -u` to avoid pulling a date/time crate into the
-/// workspace (mirrors `metrics::common::utc_timestamp`). Falls back to an
-/// empty string if `date` is somehow unavailable — the record is still
-/// written, just without a human-readable timestamp.
+/// Delegates to the canonical [`cadence_hooks_core::time::utc_timestamp`]
+/// (jiff-backed, portable to Windows) so the workspace has a single timestamp
+/// source rather than four `date` shell-outs.
 pub fn utc_timestamp() -> String {
-    std::process::Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    cadence_hooks_core::time::utc_timestamp()
 }
 
 #[cfg(test)]

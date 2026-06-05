@@ -99,8 +99,9 @@ impl Config {
 /// Expand a leading `~/` to the home directory. Delegates to the shared
 /// [`cadence_hooks_core::paths::expand_tilde_with`] so the logic lives in one place.
 fn expand_tilde(s: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    cadence_hooks_core::paths::expand_tilde_with(s, &home)
+    let home = cadence_hooks_core::paths::user_home()
+        .unwrap_or_else(cadence_hooks_core::paths::marker_temp_dir);
+    cadence_hooks_core::paths::expand_tilde_with(s, &home.to_string_lossy())
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -4,7 +4,7 @@
 //! `rm` bypasses it and loses recoverability. This guard blocks `rm` inside
 //! the vault directory and suggests `mv` to `.trash/` instead.
 
-use cadence_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
 /// Check if an rm command targets the Obsidian vault.
 fn check_rm_in_vault(command: &str, cwd: &str, vault: &str) -> CheckResult {
@@ -12,13 +12,19 @@ fn check_rm_in_vault(command: &str, cwd: &str, vault: &str) -> CheckResult {
         return CheckResult::allow();
     }
 
-    let vault = vault.trim_end_matches('/');
+    // Normalize both sides before the prefix test: the vault root comes from
+    // `OBSIDIAN_VAULT` (which on Windows may carry backslashes) while `cwd` and
+    // the command's path args come from the hook payload. Without normalizing
+    // both, a `C:\vault` env value never matches a `C:/vault` hook path.
+    let vault = normalize_path(vault);
+    let cwd = normalize_path(cwd);
     let vault_prefix = format!("{vault}/");
 
     let mut in_vault = cwd == vault || cwd.starts_with(&vault_prefix);
 
     if !in_vault {
         for part in command.split_whitespace() {
+            let part = normalize_path(part);
             if part.starts_with('/') && (part == vault || part.starts_with(&vault_prefix)) {
                 in_vault = true;
                 break;
@@ -166,6 +172,23 @@ mod tests {
         // Trailing slash on vault is stripped before comparison
         let result = check_rm_in_vault("rm note.md", "/vault", "/vault/");
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn windows_backslash_vault_matches_forward_slash_cwd() {
+        // OBSIDIAN_VAULT with Windows backslashes must match a forward-slash
+        // cwd from the hook payload once both sides are normalized.
+        let result = check_rm_in_vault("rm note.md", "C:/vault/notes", r"C:\vault");
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn windows_backslash_command_path_matches_vault() {
+        let result = check_rm_in_vault(r"rm C:\vault\notes\todo.md", "C:/home", r"C:\vault");
+        // Command path arg is normalized; it starts with `C:/...`, not `/`, so
+        // the explicit-path branch (which gates on a leading `/`) does not fire
+        // — Windows drive-absolute detection is out of scope for this fix.
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
