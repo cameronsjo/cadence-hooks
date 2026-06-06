@@ -15,6 +15,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `gh-write-loop-missing-repo` — `fix` is the resolved repo when a deterministic loop's cwd resolves to an owned repo, or `-R <owner>/<repo>` otherwise.
 
   The unconfigured fail-safe and fork-not-allowed paths intentionally stay on the legacy `block` for now and will follow in a separate PR.
+- `guard-browser-device` (guardrails, PreToolUse) blocks the **first**
+  Claude-in-Chrome MCP tool call of a session (`mcp__claude-in-chrome__*`),
+  exiting 2 with a re-clarify message that routes through
+  `list_connected_browsers` → `AskUserQuestion` → `select_browser`. It writes a
+  per-session marker and allows every subsequent call — a one-shot handshake so
+  an unconfirmed action can't land on the wrong physical Chrome when several are
+  paired to one account. **Deliberate policy exception** to `developing-guards`'
+  block-vs-nudge heuristic: a single connected browser would route to a nudge,
+  but a nudge is exit 0 and the tool still runs, so its context would arrive
+  *after* the action already hit a device. Stopping *before* the irreversible
+  side effect requires exit 2. The guard fires at most once per session, fails
+  open on any error (ADR-0001), and does not verify a device was actually chosen
+  — it trusts the model to act on the message, then opens the gate. (Companion
+  `mcp__claude-in-chrome__.*` matcher ships in `cadence-guardrails`'s `hooks.json`.)
 
 ## [0.23.0] - 2026-06-06
 

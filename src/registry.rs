@@ -197,6 +197,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "guard-browser-device",
+        description: "Block the first Claude-in-Chrome action per session until the device is confirmed",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",

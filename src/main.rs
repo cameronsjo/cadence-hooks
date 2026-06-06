@@ -163,6 +163,8 @@ enum GuardrailsCommands {
     WarnCoderabbitRetrigger,
     /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers
     WarnAliasParsing,
+    /// Block the first Claude-in-Chrome action per session until the device is confirmed
+    GuardBrowserDevice,
     /// Snooze warn-main-branch for this repo for the given duration
     DismissMainBranchWarn {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
@@ -270,6 +272,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
             GuardrailsCommands::WarnCoderabbitRetrigger => "warn-coderabbit-retrigger",
             GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
+            GuardrailsCommands::GuardBrowserDevice => "guard-browser-device",
             // dismiss-main-branch-warn is a CLI action, not a hook —
             // it has no PreToolUse/PostToolUse wiring and isn't subject
             // to CADENCE_DISABLE. Falling out of the Some(...) here is
@@ -615,6 +618,10 @@ fn main() {
             ),
             GuardrailsCommands::WarnAliasParsing => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_alias_parsing::WarnAliasParsing,
+                pre,
+            ),
+            GuardrailsCommands::GuardBrowserDevice => run_check_from_stdin(
+                &cadence_hooks_guardrails::guard_browser_device::GuardBrowserDevice,
                 pre,
             ),
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {
