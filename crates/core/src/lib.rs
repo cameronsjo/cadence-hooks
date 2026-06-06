@@ -432,6 +432,39 @@ fn should_skip_for_effort(skip_levels: &[&str], current: Option<&str>) -> bool {
     skip_levels.contains(&effective)
 }
 
+/// The feedback-channel footer appended to hard blocks. Points the user at the
+/// `cadence:feedback` skill so a false-positive block becomes one structured
+/// issue on the meta-repo instead of silent friction.
+const FEEDBACK_FOOTER: &str = "\n\nIf this fired in error: /cadence:feedback";
+
+/// Resolve the feedback footer from the environment.
+///
+/// Returns `None` when `CADENCE_NO_FEEDBACK_FOOTER` is set to any non-empty
+/// value (the suppression toggle), otherwise the [`FEEDBACK_FOOTER`] text.
+fn feedback_footer() -> Option<String> {
+    let suppressed = std::env::var("CADENCE_NO_FEEDBACK_FOOTER")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if suppressed {
+        None
+    } else {
+        Some(FEEDBACK_FOOTER.to_string())
+    }
+}
+
+/// Compose the message body emitted for an outcome, appending the feedback
+/// footer to **hard blocks only** (never Nudge/LoopBlock/Allow — they aren't
+/// errors the user needs a feedback channel for).
+///
+/// `footer` is the resolved footer ([`feedback_footer`]); passing it in keeps
+/// this pure and unit-testable without mutating process-global env.
+fn apply_feedback_footer(outcome: Outcome, msg: &str, footer: Option<&str>) -> String {
+    match (outcome, footer) {
+        (Outcome::Block, Some(f)) => format!("{msg}{f}"),
+        _ => msg.to_string(),
+    }
+}
+
 /// Run a single check, emit output, and exit.
 ///
 /// Routing:
@@ -477,8 +510,9 @@ pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
                 println!("{json}");
             }
             Outcome::Block => {
-                eprint!("{msg}");
-                if !msg.ends_with('\n') {
+                let full = apply_feedback_footer(Outcome::Block, msg, feedback_footer().as_deref());
+                eprint!("{full}");
+                if !full.ends_with('\n') {
                     eprintln!();
                 }
             }
@@ -630,6 +664,67 @@ mod tests {
         assert_eq!(Outcome::Nudge.code(), 0);
         assert_eq!(Outcome::LoopBlock.code(), 0);
         assert_eq!(Outcome::Block.code(), 2);
+    }
+
+    // --- feedback footer ---
+
+    #[test]
+    fn feedback_footer_appends_to_blocks() {
+        let out = apply_feedback_footer(Outcome::Block, "blocked: nope", Some(FEEDBACK_FOOTER));
+        assert!(out.starts_with("blocked: nope"));
+        assert!(out.contains("/cadence:feedback"));
+        assert!(out.ends_with(FEEDBACK_FOOTER));
+    }
+
+    #[test]
+    fn feedback_footer_skips_nudge_loop_block_and_allow() {
+        // The footer is a block-only affordance — nudges and loop-blocks are not
+        // errors the user needs a feedback channel for, so they pass through.
+        assert_eq!(
+            apply_feedback_footer(Outcome::Nudge, "heads up", Some(FEEDBACK_FOOTER)),
+            "heads up"
+        );
+        assert_eq!(
+            apply_feedback_footer(Outcome::LoopBlock, "rewrite", Some(FEEDBACK_FOOTER)),
+            "rewrite"
+        );
+        assert_eq!(
+            apply_feedback_footer(Outcome::Allow, "", Some(FEEDBACK_FOOTER)),
+            ""
+        );
+    }
+
+    #[test]
+    fn feedback_footer_omitted_from_block_when_suppressed() {
+        // `None` models the CADENCE_NO_FEEDBACK_FOOTER suppression path.
+        assert_eq!(
+            apply_feedback_footer(Outcome::Block, "blocked", None),
+            "blocked"
+        );
+    }
+
+    // `feedback_footer()` reads process-global env; serialize the two
+    // env-mutating tests so they don't race each other. No other test touches
+    // this variable, so the lock only guards this pair.
+    static FOOTER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn feedback_footer_present_by_default() {
+        let _guard = FOOTER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized against the other env-mutating footer test.
+        unsafe { std::env::remove_var("CADENCE_NO_FEEDBACK_FOOTER") };
+        let footer = feedback_footer().expect("footer present by default");
+        assert!(footer.contains("/cadence:feedback"));
+    }
+
+    #[test]
+    fn feedback_footer_suppressed_by_env() {
+        let _guard = FOOTER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized against the other env-mutating footer test.
+        unsafe { std::env::set_var("CADENCE_NO_FEEDBACK_FOOTER", "1") };
+        let result = feedback_footer();
+        unsafe { std::env::remove_var("CADENCE_NO_FEEDBACK_FOOTER") };
+        assert!(result.is_none(), "footer suppressed when env set");
     }
 
     #[test]

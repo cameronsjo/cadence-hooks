@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-06-06
+
+### Added
+
+- Hard blocks now carry a feedback-channel footer — `If this fired in error: /cadence:feedback` — appended to the stderr message of any `Outcome::Block`. It turns a false-positive block into one structured issue on the meta-repo (`cameronsjo/claude-configurations`) via the new `cadence:feedback` skill, instead of silent friction. Nudges and loop-blocks are untouched (they aren't errors). Suppress with `CADENCE_NO_FEEDBACK_FOOTER` set to any non-empty value.
+
 ## [0.21.0] - 2026-06-05
 
 ### Added
