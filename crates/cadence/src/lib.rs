@@ -27,3 +27,5 @@ pub mod validate_env_vars;
 pub mod validate_line_endings;
 /// Nudge to review documentation when creating a pull request.
 pub mod warn_docs_update;
+/// Nudge to audit about-to-ship content for personal-context overshare.
+pub mod warn_overshare;

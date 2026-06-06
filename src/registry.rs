@@ -77,6 +77,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-overshare",
+        description: "Nudge to audit about-to-ship content for personal-context overshare",
+        plugin: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "nudge-polish-before-pr",
         description: "Nudge to run `/polish` before creating a PR",
         plugin: "cadence",

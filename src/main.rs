@@ -119,6 +119,8 @@ enum CadenceCommands {
     EnvVars,
     /// Nudge to review docs when creating a PR
     WarnDocsUpdate,
+    /// Nudge to audit about-to-ship content for personal-context overshare
+    WarnOvershare,
     /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR
     NudgePolishBeforePr,
     /// Run markdownlint on markdown files
@@ -250,6 +252,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::LineEndings => "line-endings",
             CadenceCommands::EnvVars => "env-vars",
             CadenceCommands::WarnDocsUpdate => "warn-docs-update",
+            CadenceCommands::WarnOvershare => "warn-overshare",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
         }),
@@ -540,6 +543,9 @@ fn main() {
                 &cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate,
                 pre,
             ),
+            CadenceCommands::WarnOvershare => {
+                run_check_from_stdin(&cadence_hooks_cadence::warn_overshare::WarnOvershare, pre)
+            }
             CadenceCommands::NudgePolishBeforePr => run_check_from_stdin(
                 &cadence_hooks_cadence::nudge_polish_before_pr::NudgePolishBeforePr,
                 pre,
