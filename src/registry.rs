@@ -209,6 +209,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "inject-gh-context",
+        description: "Inject the gh-write allowlist + `-R` rule on SessionStart",
+        plugin: "guardrails",
+        event: Some(HookEvent::SessionStart),
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",
