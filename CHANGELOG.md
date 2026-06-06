@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- New `CheckResult::block_structured(message, BlockMetadata)` builder + `BlockMetadata` struct (`rule_id`, `fix`, `allowed_owners`, `severity`) in `cadence_hooks_core`. When a check returns a structured block on a PreToolUse event, `run_check` now emits a `permissionDecision: "deny"` JSON envelope on stdout (carrying both `permissionDecisionReason` for the prose and `additionalContext` for the structured payload) alongside the legacy stderr+exit-2 message — Claude self-corrects from the machine-parseable shape instead of re-parsing prose. The legacy `CheckResult::block(...)` path is unchanged; checks opt in by calling `block_structured`.
+- `guardrails guard-gh-write` upgraded three of its hard-block sites to the new primitive:
+  - `gh-write-unauthorized-target` — `fix` substitutes the first allowed owner under the same project name (e.g. `evil-corp/cool` → `-R cameronsjo/cool`).
+  - `gh-write-target-unresolvable` — `fix` is `-R <first-allowed-owner>/<repo>` when no repo can be inferred.
+  - `gh-write-loop-missing-repo` — `fix` is the resolved repo when a deterministic loop's cwd resolves to an owned repo, or `-R <owner>/<repo>` otherwise.
+
+  The unconfigured fail-safe and fork-not-allowed paths intentionally stay on the legacy `block` for now and will follow in a separate PR.
+
 ## [0.23.0] - 2026-06-06
 
 ### Added

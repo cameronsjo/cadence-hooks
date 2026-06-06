@@ -11,7 +11,7 @@ use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
 };
-use cadence_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -299,6 +299,18 @@ fn judge_loop_write(
     LoopWriteDecision::Block { suggestion }
 }
 
+/// Render the configured allowlist as a flat Vec of display strings.
+/// Owners and repo-scoped entries are interleaved; both prose messages
+/// (`disallowed_message`) and structured payloads
+/// ([`BlockMetadata::allowed_owners`]) treat them as one displayable set.
+fn allowed_display_list(owners: &[AllowEntry], repos: &[AllowEntry]) -> Vec<String> {
+    owners
+        .iter()
+        .chain(repos.iter())
+        .map(|e| e.to_string())
+        .collect()
+}
+
 /// Build the block message for a looped gh write, with a concrete `-R` fix
 /// when the cwd resolved to an owned repo.
 fn loop_block_message(writes: &[String], suggestion: Option<&str>) -> String {
@@ -335,11 +347,7 @@ fn disallowed_message(
     allowed_repos: &[AllowEntry],
     extra_hosts: &[String],
 ) -> String {
-    let all_entries: Vec<String> = allowed_owners
-        .iter()
-        .chain(allowed_repos.iter())
-        .map(|e| e.to_string())
-        .collect();
+    let all_entries = allowed_display_list(allowed_owners, allowed_repos);
 
     // Self-hosted-forge users trip over host scoping: bare allowlist entries
     // match the default host only. Tell them how to widen, mirroring
@@ -451,10 +459,22 @@ impl Check for GhWriteGuard {
                             })
                             .map(|c| format!("`gh {}`", c.args.join(" ")))
                             .collect();
-                        return CheckResult::block(loop_block_message(
-                            &writes,
-                            suggestion.as_deref(),
-                        ));
+                        let fix = match suggestion.as_deref() {
+                            Some(s) => format!("-R {s}"),
+                            None => "-R <owner>/<repo>".to_string(),
+                        };
+                        return CheckResult::block_structured(
+                            loop_block_message(&writes, suggestion.as_deref()),
+                            BlockMetadata {
+                                rule_id: "gh-write-loop-missing-repo".to_string(),
+                                fix,
+                                allowed_owners: allowed_display_list(
+                                    &allowed_owners,
+                                    &allowed_repos,
+                                ),
+                                severity: "error",
+                            },
+                        );
                     }
                     // Deterministic loop in owned repo — allow
                 }
@@ -532,7 +552,16 @@ impl Check for GhWriteGuard {
                 // Suggest the first allowed owner so the fix is concrete even
                 // when no repo can be inferred from the directory.
                 let example_owner = allowed_owners.first().map(|e| e.owner.as_str());
-                CheckResult::block(unresolvable_message(&work_dir, example_owner))
+                let owner_for_fix = example_owner.unwrap_or("owner");
+                CheckResult::block_structured(
+                    unresolvable_message(&work_dir, example_owner),
+                    BlockMetadata {
+                        rule_id: "gh-write-target-unresolvable".to_string(),
+                        fix: format!("-R {owner_for_fix}/<repo>"),
+                        allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
+                        severity: "error",
+                    },
+                )
             }
             RepoResolution::Resolved { host, repo } => {
                 if is_allowed_with_extras(
@@ -544,13 +573,29 @@ impl Check for GhWriteGuard {
                 ) {
                     CheckResult::allow()
                 } else {
-                    CheckResult::block(disallowed_message(
-                        &host,
-                        &repo,
-                        &allowed_owners,
-                        &allowed_repos,
-                        &extra_hosts,
-                    ))
+                    let example_owner = allowed_owners
+                        .first()
+                        .map(|e| e.owner.as_str())
+                        .unwrap_or("owner");
+                    // Reuse the repo *name* under an allowed owner so the
+                    // fix lands on the same project — `evil/cool-tool`
+                    // becomes `cameronsjo/cool-tool`, not a placeholder.
+                    let repo_name = repo.split('/').next_back().unwrap_or(repo.as_str());
+                    CheckResult::block_structured(
+                        disallowed_message(
+                            &host,
+                            &repo,
+                            &allowed_owners,
+                            &allowed_repos,
+                            &extra_hosts,
+                        ),
+                        BlockMetadata {
+                            rule_id: "gh-write-unauthorized-target".to_string(),
+                            fix: format!("-R {example_owner}/{repo_name}"),
+                            allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
+                            severity: "error",
+                        },
+                    )
                 }
             }
         }
@@ -1446,5 +1491,143 @@ mod tests {
             }
             other => panic!("expected MissingTargets, got {other:?}"),
         }
+    }
+
+    // --- BlockMetadata payloads on hard blocks ---
+
+    use cadence_hooks_core::HookInput;
+
+    // GhWriteGuard.run() reads CADENCE_ALLOWED_OWNERS / CADENCE_ALLOWED_REPOS
+    // / CADENCE_EXTRA_HOSTS via process-global env vars. Serialize all
+    // metadata-shape tests so they don't race each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn input_with(command: &str, cwd: &str) -> HookInput {
+        // Build via JSON to avoid private-field gymnastics; the real hook
+        // payload arrives through the same deserialization path.
+        let json = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+            "cwd": cwd,
+        });
+        serde_json::from_value(json).expect("HookInput deserializes")
+    }
+
+    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
+            .collect();
+        for (k, v) in vars {
+            // SAFETY: serialized via ENV_LOCK; restored below.
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (k, v) in prior {
+            // SAFETY: same lock still held; we're restoring the prior state.
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn disallowed_target_emits_structured_payload() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+            ],
+            || {
+                // -R short-circuits resolution to Resolved (no git config required).
+                let input = input_with("gh pr create -R evil-corp/cool-tool --title hi", "/tmp");
+                let result = GhWriteGuard.run(&input);
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+                // Fix preserves the project name and substitutes the allowed owner.
+                assert_eq!(meta.fix, "-R cameronsjo/cool-tool");
+                assert!(meta.allowed_owners.contains(&"cameronsjo".to_string()));
+                assert_eq!(meta.severity, "error");
+            },
+        );
+    }
+
+    #[test]
+    fn unresolvable_target_emits_structured_payload() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+            ],
+            || {
+                // No -R + cwd is /tmp (no git remote) → Unresolvable.
+                let input = input_with("gh pr create --title hi", "/tmp");
+                let result = GhWriteGuard.run(&input);
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+                // Fix names the first allowed owner with a <repo> placeholder.
+                assert_eq!(meta.fix, "-R cameronsjo/<repo>");
+                assert!(meta.allowed_owners.contains(&"cameronsjo".to_string()));
+                assert_eq!(meta.severity, "error");
+            },
+        );
+    }
+
+    #[test]
+    fn loop_missing_repo_emits_structured_payload() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+                ("CADENCE_GH_STRICT_LOOPS", Some("1")),
+            ],
+            || {
+                // Strict-loops mode forces a block regardless of cwd resolution,
+                // keeping this test hermetic. The relaxed-when-deterministic
+                // policy is covered separately.
+                let input = input_with("for i in 1 2; do gh pr comment $i --body x; done", "/tmp");
+                let result = GhWriteGuard.run(&input);
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-loop-missing-repo");
+                // No cwd suggestion in /tmp → placeholder.
+                assert_eq!(meta.fix, "-R <owner>/<repo>");
+                assert_eq!(meta.severity, "error");
+            },
+        );
+    }
+
+    #[test]
+    fn legacy_block_paths_leave_metadata_none() {
+        // The unconfigured fail-safe (no CADENCE_ALLOWED_OWNERS) blocks via
+        // the legacy CheckResult::block path — no structured metadata yet.
+        // A follow-up may upgrade it; this guards the current contract.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", None),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+            ],
+            || {
+                let input = input_with("gh pr create -R x/y --title hi", "/tmp");
+                let result = GhWriteGuard.run(&input);
+                assert!(result.block_metadata.is_none());
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            },
+        );
     }
 }
