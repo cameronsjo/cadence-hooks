@@ -21,6 +21,8 @@ pub mod guard_git_init;
 pub mod guard_op_vault_scan;
 /// Block `git push` to remotes owned by others.
 pub mod guard_push_remote;
+/// Inject the gh-write allowlist + `-R` rule on SessionStart.
+pub mod inject_gh_context;
 /// Shared closing-keyword detection for GitHub issue references.
 pub mod issue_refs;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.

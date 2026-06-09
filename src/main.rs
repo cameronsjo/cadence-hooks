@@ -167,6 +167,8 @@ enum GuardrailsCommands {
     WarnAliasParsing,
     /// Block the first Claude-in-Chrome action per session until the device is confirmed
     GuardBrowserDevice,
+    /// Inject the gh-write allowlist + `-R` rule on SessionStart
+    InjectGhContext,
     /// Snooze warn-main-branch for this repo for the given duration
     DismissMainBranchWarn {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
@@ -276,6 +278,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnCoderabbitRetrigger => "warn-coderabbit-retrigger",
             GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             GuardrailsCommands::GuardBrowserDevice => "guard-browser-device",
+            GuardrailsCommands::InjectGhContext => "inject-gh-context",
             // dismiss-main-branch-warn is a CLI action, not a hook —
             // it has no PreToolUse/PostToolUse wiring and isn't subject
             // to CADENCE_DISABLE. Falling out of the Some(...) here is
@@ -629,6 +632,10 @@ fn main() {
             GuardrailsCommands::GuardBrowserDevice => run_check_from_stdin(
                 &cadence_hooks_guardrails::guard_browser_device::GuardBrowserDevice,
                 pre,
+            ),
+            GuardrailsCommands::InjectGhContext => run_check_from_stdin(
+                &cadence_hooks_guardrails::inject_gh_context::InjectGhContext,
+                session,
             ),
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {
                 cadence_hooks_guardrails::dismiss_main_branch_warn::run_dismiss(&for_);

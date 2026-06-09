@@ -30,6 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   — it trusts the model to act on the message, then opens the gate. (Companion
   `mcp__claude-in-chrome__.*` matcher ships in `cadence-guardrails`'s `hooks.json`.)
 - `warn-overshare` (cadence): nudges Claude to audit about-to-ship content (commit messages, PR/issue bodies, changed files) for personal-context overshare — disabilities, neurodivergence, health, relationships, family, non-technical biographical detail. Fires on `git push`, `git commit`, `gh pr create`, `gh pr edit`, `gh issue create`, `gh issue comment`, and Write/Edit to `docs/field-reports/` paths. Skips writes under `$OBSIDIAN_VAULT` (the safe destination for personal context) and to `docs/blog/*retro*` paths (retros feed blog articles and are intentionally personal). Session-scoped bypass: `CADENCE_SKIP_OVERSHARE_AUDIT=1`. (Companion `hooks.json` wiring ships in `cadence-guardrails`.)
+- New `guardrails inject-gh-context` check (SessionStart): renders the configured gh-write allowlist (`CADENCE_ALLOWED_OWNERS`, `CADENCE_ALLOWED_REPOS`, `CADENCE_EXTRA_HOSTS`) and the `gh ... -R owner/repo` rule into Claude's context at session start, resume, and post-compaction. Companion wiring ships in `cadence-canon`'s `hooks.json`. Primes the model with the same context `guard-gh-write` enforces, recovering "silent damage" cases where `cwd`'s remote happens to be allowlisted but is not the intended write target.
 
 ## [0.23.0] - 2026-06-06
 
