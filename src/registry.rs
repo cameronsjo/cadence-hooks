@@ -168,6 +168,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-issue-tracker",
+        description: "Nudge when gh issue create targets a repo other than the canonical tracker",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "verify-pr-autoclose",
         description: "Verify and repair issue auto-close after PR create/merge",
         plugin: "guardrails",
