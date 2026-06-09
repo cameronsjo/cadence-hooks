@@ -437,9 +437,15 @@ Requires Rust 2024 edition (1.85+).
 
 ## Reporting issues
 
-Bug reports and feature requests for the binary belong here: [Issues](https://github.com/cameronsjo/cadence-hooks/issues/new/choose).
-
-Two templates are available — Bug report (capture version, OS, plugin namespace, hook name, env, and repro) and Feature request. Issues about plugin distribution, marketplace metadata, or `hooks.json` wiring belong in [claude-configurations](https://github.com/cameronsjo/claude-configurations/issues) instead.
+All cadence ecosystem issues — including everything about this binary (a wrong
+block/allow decision, a guard bug, a feature request, plus plugin distribution,
+marketplace metadata, and `hooks.json` wiring) — go to one tracker:
+[**claude-configurations**](https://github.com/cameronsjo/claude-configurations/issues).
+There is no separate per-repo tracker; the meta-repo `CLAUDE.md` issue-filing
+rule is the single source of truth. When reporting a binary bug, capture
+`cadence-hooks --version`, OS, plugin namespace, hook name, relevant `CADENCE_*`
+env, and a repro (a payload via `cadence-hooks try …`). The fastest path from a
+hook firing in error is `/cadence:feedback`.
 
 ## License
 
