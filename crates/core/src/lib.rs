@@ -18,7 +18,7 @@ pub mod time;
 #[cfg(feature = "test-builders")]
 pub mod test_builders;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
@@ -364,10 +364,44 @@ impl MetricsInput {
     }
 }
 
+/// Structured metadata attached to a hard block, so Claude self-corrects from
+/// a machine-parseable payload instead of re-parsing prose. Renders into the
+/// PreToolUse JSON envelope as `additionalContext` (and as a parallel JSON
+/// fragment inside `permissionDecisionReason`, so it survives whichever field
+/// Claude Code surfaces on `deny`).
+///
+/// `severity` is a `&'static str` because every call site picks a constant
+/// (`"error"`, `"warn"`) — making it an enum would force serde glue without
+/// adding value.
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockMetadata {
+    /// Stable identifier for the rule that fired — e.g. `gh-write-unauthorized-target`.
+    /// Names a rule, not a hook subcommand, so a hook with multiple branches can
+    /// expose them distinctly to downstream tooling.
+    pub rule_id: String,
+
+    /// Concrete fragment the user (or Claude) can apply verbatim on retry.
+    /// Typically a flag + value (e.g. `-R cameronsjo/cadence`), not a full
+    /// reconstructed command — full reconstruction is fragile and rarely needed.
+    pub fix: String,
+
+    /// Currently-configured allowlist, serialized as display strings. Empty
+    /// when no allowlist is configured (the unconfigured fail-safe block).
+    pub allowed_owners: Vec<String>,
+
+    /// `"error"` for blocking violations, `"warn"` for advisory blocks.
+    pub severity: &'static str,
+}
+
 /// Result of running a single check.
 pub struct CheckResult {
     pub outcome: Outcome,
     pub message: Option<String>,
+    /// Structured payload attached to hard blocks. Always `None` for
+    /// `Allow`, `Nudge`, and `LoopBlock` (their delivery shapes don't carry
+    /// it). When `Some`, `run_check` emits a `permissionDecision: "deny"`
+    /// JSON envelope alongside the legacy stderr message.
+    pub block_metadata: Option<BlockMetadata>,
 }
 
 impl CheckResult {
@@ -375,6 +409,7 @@ impl CheckResult {
         Self {
             outcome: Outcome::Allow,
             message: None,
+            block_metadata: None,
         }
     }
 
@@ -382,6 +417,7 @@ impl CheckResult {
         Self {
             outcome: Outcome::Nudge,
             message: Some(message.into()),
+            block_metadata: None,
         }
     }
 
@@ -389,6 +425,18 @@ impl CheckResult {
         Self {
             outcome: Outcome::Block,
             message: Some(message.into()),
+            block_metadata: None,
+        }
+    }
+
+    /// Hard block carrying a [`BlockMetadata`] payload. Use this when the rule
+    /// can name a concrete fix — `block(...)` stays the right call when the
+    /// block is purely advisory (e.g. an unconfigured fail-safe).
+    pub fn block_structured(message: impl Into<String>, meta: BlockMetadata) -> Self {
+        Self {
+            outcome: Outcome::Block,
+            message: Some(message.into()),
+            block_metadata: Some(meta),
         }
     }
 
@@ -398,6 +446,7 @@ impl CheckResult {
         Self {
             outcome: Outcome::LoopBlock,
             message: Some(message.into()),
+            block_metadata: None,
         }
     }
 }
@@ -473,8 +522,11 @@ fn apply_feedback_footer(outcome: Outcome, msg: &str, footer: Option<&str>) -> S
 /// - Nudge → JSON to stdout with `additionalContext` (exit 0).
 ///   Claude Code parses this and injects the message into Claude's context.
 ///   The JSON format differs by event type (PreToolUse vs PostToolUse).
-/// - Block → plain text to stderr (exit 2).
-///   Claude Code feeds stderr back to Claude as an error.
+/// - Block → plain text to stderr (exit 2). When the check supplied a
+///   [`BlockMetadata`] (via [`CheckResult::block_structured`]) and the event
+///   is `PreToolUse`, also emit a `permissionDecision: "deny"` JSON envelope
+///   on stdout so Claude reads a machine-parseable payload. Stderr is still
+///   written for clients that don't parse the envelope.
 /// - Allow → silent exit 0.
 pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
     let current_effort = std::env::var("CLAUDE_EFFORT").ok();
@@ -511,6 +563,24 @@ pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
             }
             Outcome::Block => {
                 let full = apply_feedback_footer(Outcome::Block, msg, feedback_footer().as_deref());
+                // Structured payload (when supplied) is delivered via the
+                // PreToolUse `deny` JSON envelope on stdout. The envelope
+                // names this only well-defined under PreToolUse — other
+                // events fall back to the legacy stderr-only path.
+                if let (Some(meta), HookEvent::PreToolUse) = (&result.block_metadata, event) {
+                    let json = serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": event_name,
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": &full,
+                            "additionalContext": meta,
+                        }
+                    });
+                    println!("{json}");
+                }
+                // Legacy stderr surface — preserved unconditionally for
+                // backward compatibility and as the fallback when a client
+                // doesn't parse the JSON envelope.
                 eprint!("{full}");
                 if !full.ends_with('\n') {
                     eprintln!();
@@ -725,6 +795,74 @@ mod tests {
         let result = feedback_footer();
         unsafe { std::env::remove_var("CADENCE_NO_FEEDBACK_FOOTER") };
         assert!(result.is_none(), "footer suppressed when env set");
+    }
+
+    // --- BlockMetadata / block_structured ---
+
+    fn sample_metadata() -> BlockMetadata {
+        BlockMetadata {
+            rule_id: "test-rule".to_string(),
+            fix: "-R owner/repo".to_string(),
+            allowed_owners: vec!["alice".to_string(), "bob".to_string()],
+            severity: "error",
+        }
+    }
+
+    #[test]
+    fn block_constructor_leaves_metadata_none() {
+        // Existing call sites that haven't migrated to block_structured stay
+        // on the legacy stderr path — no JSON envelope emitted.
+        let r = CheckResult::block("bad");
+        assert!(r.block_metadata.is_none());
+        assert!(matches!(r.outcome, Outcome::Block));
+    }
+
+    #[test]
+    fn block_structured_carries_metadata() {
+        let r = CheckResult::block_structured("bad", sample_metadata());
+        let meta = r.block_metadata.expect("metadata attached");
+        assert_eq!(meta.rule_id, "test-rule");
+        assert_eq!(meta.fix, "-R owner/repo");
+        assert_eq!(meta.allowed_owners, vec!["alice", "bob"]);
+        assert_eq!(meta.severity, "error");
+        assert!(matches!(r.outcome, Outcome::Block));
+    }
+
+    #[test]
+    fn allow_nudge_loop_block_have_no_metadata() {
+        // Only hard blocks carry structured metadata. The other outcomes
+        // serialize through different envelopes (additionalContext for
+        // Nudge; decision:block for LoopBlock) where it has no place.
+        assert!(CheckResult::allow().block_metadata.is_none());
+        assert!(CheckResult::nudge("x").block_metadata.is_none());
+        assert!(CheckResult::loop_block("y").block_metadata.is_none());
+    }
+
+    #[test]
+    fn block_metadata_serializes_with_expected_fields() {
+        // Pin the wire shape — downstream consumers (and the future PR that
+        // upgrades guard-push-remote to the same primitive) depend on these
+        // field names. A casual rename would silently break them.
+        let v = serde_json::to_value(sample_metadata()).expect("serializes");
+        assert_eq!(v["rule_id"], "test-rule");
+        assert_eq!(v["fix"], "-R owner/repo");
+        assert_eq!(v["allowed_owners"], serde_json::json!(["alice", "bob"]));
+        assert_eq!(v["severity"], "error");
+    }
+
+    #[test]
+    fn block_metadata_serializes_empty_allowlist_as_empty_array() {
+        // When the unconfigured fail-safe fires there is no allowlist — the
+        // field must still serialize to a JSON array, not be omitted, so
+        // consumers don't have to special-case "missing vs empty".
+        let meta = BlockMetadata {
+            rule_id: "x".to_string(),
+            fix: String::new(),
+            allowed_owners: vec![],
+            severity: "error",
+        };
+        let v = serde_json::to_value(meta).expect("serializes");
+        assert_eq!(v["allowed_owners"], serde_json::json!([]));
     }
 
     #[test]
