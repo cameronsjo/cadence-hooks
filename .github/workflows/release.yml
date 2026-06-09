@@ -108,6 +108,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # Checkout + toolchain are needed for the CycloneDX SBOM step below — the
+      # release job otherwise only consumes the build job's artifacts.
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -116,12 +122,48 @@ jobs:
       - name: Generate checksums
         run: sha256sum cadence-hooks-*.tar.gz cadence-hooks-*.zip > checksums.txt
 
+      # CycloneDX SBOM for the shipped binary. The root package `cadence-hooks`
+      # carries the full transitive graph (all 8 workspace crates + their deps),
+      # so a single root-package SBOM is the complete bill of materials — no
+      # per-crate aggregation needed. One platform-independent file ships.
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json
+          SBOM="cadence-hooks-${GITHUB_REF_NAME}.cdx.json"
+          # cargo-cyclonedx writes <package>.cdx.json next to the manifest;
+          # promote the root package's SBOM to the release asset name.
+          GENERATED=$(find . -maxdepth 1 -name '*.cdx.json' | head -1)
+          mv "${GENERATED}" "${SBOM}"
+          echo "SBOM=${SBOM}" >> "${GITHUB_ENV}"
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
             cadence-hooks-*.tar.gz
             cadence-hooks-*.zip
+
+      # Attest the SBOM against the binaries it describes. Complements (does not
+      # replace) the build-provenance attestation above.
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: |
+            cadence-hooks-*.tar.gz
+            cadence-hooks-*.zip
+          sbom-path: ${{ env.SBOM }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Detached keyless signature over checksums.txt — one signature covers
+      # every artifact by hash (goreleaser convention). Gives an offline,
+      # GitHub-independent verification path via `cosign verify-blob`, distinct
+      # from `gh attestation verify`. The bundle embeds the signature + Fulcio
+      # cert + Rekor inclusion proof in one file.
+      - name: Sign checksums with Cosign (keyless)
+        run: cosign sign-blob --yes --bundle checksums.txt.cosign.bundle checksums.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -131,6 +173,8 @@ jobs:
             cadence-hooks-*.tar.gz
             cadence-hooks-*.zip
             checksums.txt
+            checksums.txt.cosign.bundle
+            ${{ env.SBOM }}
 
       - name: Clean up beta prereleases
         env:
