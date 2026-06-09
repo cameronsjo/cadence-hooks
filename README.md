@@ -245,6 +245,23 @@ unpack `cadence-hooks.exe` to a directory on your `PATH` (e.g.
 cargo install --git https://github.com/cameronsjo/cadence-hooks.git
 ```
 
+### Verifying release integrity
+
+`cadence-hooks` is the binary that decides whether the harness lets a `git push`, a `gh`
+write, or an edit-on-`main` through — so every release is signed and attested, and you can
+prove a download came from this repo's release workflow before you trust it:
+
+```bash
+# GitHub-native (needs the gh CLI):
+gh attestation verify cadence-hooks-vX.Y.Z-macos-aarch64.tar.gz -R cameronsjo/cadence-hooks
+
+# Offline / GitHub-independent (needs cosign): verify the Cosign bundle over
+# checksums.txt, then chain to your archive with sha256sum -c.
+```
+
+Full instructions for both paths — the OIDC identity, the SBOM, and `cosign verify-blob` —
+are in [SECURITY.md](SECURITY.md).
+
 ### Verify
 
 ```bash
