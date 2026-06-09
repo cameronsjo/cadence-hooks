@@ -153,6 +153,8 @@ enum GuardrailsCommands {
     GuardDotfiles,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
     WarnPrIssueLink,
+    /// Nudge when `gh issue create` targets a repo other than the canonical issue tracker
+    WarnIssueTracker,
     /// Verify issue auto-close after PR create/merge; close stragglers
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
@@ -271,6 +273,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnUntracked => "warn-untracked",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
+            GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
@@ -603,6 +606,10 @@ fn main() {
             ),
             GuardrailsCommands::WarnPrIssueLink => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_pr_issue_link::WarnPrIssueLink,
+                pre,
+            ),
+            GuardrailsCommands::WarnIssueTracker => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_issue_tracker::WarnIssueTracker,
                 pre,
             ),
             GuardrailsCommands::VerifyPrAutoclose => run_check_from_stdin(

@@ -1,0 +1,624 @@
+//! Nudge when `gh issue create` (or a `gh api .../issues` POST) targets an
+//! owned repo other than the canonical issue tracker.
+//!
+//! Fires as a PreToolUse hook on Bash. Detects `gh issue create` commands and
+//! `gh api` POST calls to `.../repos/OWNER/REPO/issues` endpoints. Nudges
+//! (never blocks) when the resolved target is an owned repo that is not the
+//! canonical issue tracker (`cameronsjo/claude-configurations` by default,
+//! overridable via `CADENCE_ISSUE_TRACKER`). Unowned repos and third-party
+//! projects are silently allowed — the nudge only fires for repos you control.
+
+use cadence_hooks_core::config::{self, default_host, env_allow_entries, env_extra_hosts};
+use cadence_hooks_core::shell::{
+    git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
+};
+use cadence_hooks_core::{Check, CheckResult, HookInput};
+use regex::Regex;
+use std::path::Path;
+use std::sync::LazyLock;
+
+/// Default canonical issue tracker. Overridable via `CADENCE_ISSUE_TRACKER`.
+const CANONICAL: &str = "cameronsjo/claude-configurations";
+
+/// Return the effective canonical issue tracker.
+///
+/// Returns the `CADENCE_ISSUE_TRACKER` env value when set and non-empty;
+/// falls back to `CANONICAL`.
+fn canonical() -> String {
+    std::env::var("CADENCE_ISSUE_TRACKER")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| CANONICAL.to_string())
+}
+
+/// Matches `gh api /?repos/OWNER/REPO/issues` where `/issues` is the final
+/// path segment (no issue number, comments, or other sub-resource after it).
+static API_ISSUES_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"gh\s+api\s[^\n]*/?repos/([^/\s]+/[^/\s]+)/issues(?:\s|$|[?#])")
+        .expect("pattern should compile")
+});
+
+/// Detects a `gh api` call with an explicit write method flag.
+static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"gh\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
+        .expect("pattern should compile")
+});
+
+/// Detects a `gh api` call with field flags (implies a write).
+static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"gh\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
+        .expect("pattern should compile")
+});
+
+/// Detects a `gh api` call with `--input` (implies a write).
+static API_INPUT_FLAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"gh\s+api.*\s--input\s").expect("pattern should compile"));
+
+/// Extract a `-R`/`--repo` flag value from a raw command string.
+///
+/// Handles `-R x`, `-Rx`, `--repo x`, `--repo=x`. Quote-trims values so
+/// `--repo "o/r"` resolves to `o/r`.
+fn extract_repo_flag(command: &str) -> Option<String> {
+    let trim_value = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let mut iter = words.iter();
+    while let Some(word) = iter.next() {
+        if *word == "-R" || *word == "--repo" {
+            return iter.next().map(|s| trim_value(s));
+        }
+        if let Some(repo) = word.strip_prefix("--repo=") {
+            return Some(trim_value(repo));
+        }
+        if let Some(repo) = word.strip_prefix("-R")
+            && !repo.is_empty()
+            && !repo.starts_with('-')
+        {
+            return Some(trim_value(repo));
+        }
+    }
+    None
+}
+
+/// True when `stripped` (a quote-stripped command) is an issue-create write.
+///
+/// Matches:
+/// - `gh issue create` (after quote-stripping, so quoted occurrences are data)
+/// - `gh api .../repos/OWNER/REPO/issues` path with a write method or field flags
+fn is_issue_create(stripped: &str) -> bool {
+    if stripped.contains("gh issue create") {
+        return true;
+    }
+    API_ISSUES_PATH.is_match(stripped)
+        && (API_WRITE_METHOD.is_match(stripped)
+            || API_FIELD_FLAGS.is_match(stripped)
+            || API_INPUT_FLAG.is_match(stripped))
+}
+
+/// Pure judge: returns `Some(owner/repo)` when the command should fire a nudge.
+///
+/// Nudge gate — returns `Some(target)` only when ALL hold:
+/// - The command is an issue-create write (after quote-stripping)
+/// - A target `owner/repo` resolves via `-R` flag, API path, or git remote
+/// - The target host is the default host (`github.com` unless `GH_HOST` is set)
+/// - The target owner is in `CADENCE_ALLOWED_OWNERS`
+/// - The target is not the canonical issue tracker
+pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
+    let stripped = strip_quotes(command);
+
+    if !is_issue_create(&stripped) {
+        return None;
+    }
+
+    let dh = default_host();
+    let allowed_owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
+    let extra_hosts = env_extra_hosts();
+
+    // Resolve host + target repo.
+    // Precedence: (a) -R/--repo flag, (b) gh api path, (c) git remote.
+    let (host, target) = if let Some(repo) = extract_repo_flag(command) {
+        (dh.clone(), repo.to_lowercase())
+    } else if let Some(caps) = API_ISSUES_PATH.captures(command) {
+        let repo = caps
+            .get(1)
+            .map(|m| m.as_str().to_lowercase())
+            .unwrap_or_default();
+        (dh.clone(), repo)
+    } else {
+        let wd = work_dir.to_str().unwrap_or(".");
+        match git_command(wd, &["remote", "get-url", "origin"]) {
+            Some(origin_url) => match host_and_repo_from_url(&origin_url) {
+                Some((h, r)) => (h, r.to_lowercase()),
+                None => return None,
+            },
+            None => return None,
+        }
+    };
+
+    // Gate: default host only (gh CLI convention; self-hosted forges are out of scope).
+    if host != dh {
+        return None;
+    }
+
+    // Gate: target must be owned.
+    let mut parts = target.splitn(2, '/');
+    let owner = parts.next().unwrap_or("");
+    let repo_name = parts.next().unwrap_or("");
+    if !config::is_allowed_with_extra_hosts(
+        &host,
+        owner,
+        repo_name,
+        &allowed_owners,
+        &[],
+        &extra_hosts,
+    ) {
+        return None;
+    }
+
+    // Gate: not the canonical tracker.
+    if target == canonical().to_lowercase() {
+        return None;
+    }
+
+    Some(target)
+}
+
+fn nudge_message(target: &str) -> String {
+    let c = canonical();
+    format!(
+        "warn-issue-tracker: GitHub issues now consolidate to {c}.\n\
+         This filing targets {target}. If that's deliberate — a genuinely external project —\n\
+         carry on. Otherwise refile with -R {c}."
+    )
+}
+
+/// Nudges when `gh issue create` (or a `gh api .../issues` POST) targets an
+/// owned repo that is not the canonical issue tracker.
+pub struct WarnIssueTracker;
+
+impl Check for WarnIssueTracker {
+    fn name(&self) -> &str {
+        "warn-issue-tracker"
+    }
+
+    fn run(&self, input: &HookInput) -> CheckResult {
+        let Some(command) = input.command() else {
+            return CheckResult::allow();
+        };
+
+        // Fast-path: skip commands that can't possibly match.
+        let stripped = strip_quotes(command);
+        if !stripped.contains("gh issue create") && !stripped.contains("gh api") {
+            return CheckResult::allow();
+        }
+
+        let cwd_fallback = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| ".".to_string());
+        let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
+        let work_dir_str = parse_work_dir(command, cwd);
+        let work_dir = Path::new(&work_dir_str);
+
+        match judge_issue_target(command, work_dir) {
+            Some(target) => CheckResult::nudge(nudge_message(&target)),
+            None => CheckResult::allow(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadence_hooks_core::test_builders::make_bash;
+    // make_bash_with_cwd is only used by the non-windows cwd test below; gate the
+    // import to match, or clippy's -D unused-imports fails the Windows build.
+    #[cfg(not(windows))]
+    use cadence_hooks_core::test_builders::make_bash_with_cwd;
+    use std::path::PathBuf;
+
+    // Serialize tests that mutate CADENCE_ALLOWED_OWNERS / CADENCE_ISSUE_TRACKER
+    // so they don't race each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
+            .collect();
+        for (k, v) in vars {
+            // SAFETY: serialized via ENV_LOCK; restored in the block below.
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (k, v) in prior {
+            // SAFETY: same lock still held; restoring prior state.
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn workdir(path: &str) -> PathBuf {
+        PathBuf::from(path)
+    }
+
+    // ---- guard-clause tests — return before reading env vars, no lock needed ----
+
+    // `gh issue list` is a read, not a create — must not match.
+    #[test]
+    fn issue_list_not_guarded() {
+        assert!(
+            judge_issue_target("gh issue list -R cameronsjo/workbench", &workdir("/tmp")).is_none()
+        );
+    }
+
+    // `gh pr create` is a PR, not an issue — must not match.
+    #[test]
+    fn pr_create_not_guarded() {
+        assert!(
+            judge_issue_target(
+                "gh pr create -R cameronsjo/workbench --title x",
+                &workdir("/tmp")
+            )
+            .is_none()
+        );
+    }
+
+    // A plain git command has nothing to do with issues.
+    #[test]
+    fn git_status_not_guarded() {
+        assert!(judge_issue_target("git status", &workdir("/tmp")).is_none());
+    }
+
+    // "gh issue create" inside a quoted string is data, not a command.
+    #[test]
+    fn quoted_issue_create_text_not_guarded() {
+        assert!(
+            judge_issue_target(
+                r#"echo "gh issue create needs a canonical repo""#,
+                &workdir("/tmp")
+            )
+            .is_none()
+        );
+    }
+
+    // `gh api .../issues` without any write method is a GET — not a create.
+    #[test]
+    fn api_get_issues_not_guarded() {
+        assert!(
+            judge_issue_target("gh api repos/cameronsjo/workbench/issues", &workdir("/tmp"))
+                .is_none()
+        );
+    }
+
+    // `gh api .../issues` with --jq (read-only flag) and no write method.
+    #[test]
+    fn api_issues_with_jq_flag_not_guarded() {
+        assert!(
+            judge_issue_target(
+                "gh api repos/cameronsjo/workbench/issues --jq '.[]'",
+                &workdir("/tmp")
+            )
+            .is_none()
+        );
+    }
+
+    // Sub-resource `/issues/123` is a specific issue, not a create endpoint.
+    #[test]
+    fn api_issue_sub_resource_not_guarded() {
+        assert!(
+            judge_issue_target(
+                "gh api repos/cameronsjo/workbench/issues/123 -X PATCH -f title=new",
+                &workdir("/tmp")
+            )
+            .is_none()
+        );
+    }
+
+    // ---- happy-path tests (need CADENCE_ALLOWED_OWNERS) ----
+
+    // `gh issue create -R <owned>` should fire a nudge.
+    #[test]
+    fn issue_create_with_repo_flag_nudges() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R cameronsjo/workbench --title x",
+                    &workdir("/tmp"),
+                );
+                assert_eq!(result, Some("cameronsjo/workbench".to_string()));
+            },
+        );
+    }
+
+    // `gh api .../issues -X POST` should fire a nudge for an owned repo.
+    #[test]
+    fn api_post_issues_nudges() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh api repos/cameronsjo/workbench/issues -X POST -f title=x",
+                    &workdir("/tmp"),
+                );
+                assert_eq!(result, Some("cameronsjo/workbench".to_string()));
+            },
+        );
+    }
+
+    // `gh api .../issues` with field flags (no explicit -X POST) is also a create.
+    #[test]
+    fn api_issues_field_flags_nudges() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh api repos/cameronsjo/workbench/issues -f title=Bug -f body=Description",
+                    &workdir("/tmp"),
+                );
+                assert_eq!(result, Some("cameronsjo/workbench".to_string()));
+            },
+        );
+    }
+
+    // ---- edge tests ----
+
+    // Filing to the canonical tracker should be silent.
+    #[test]
+    fn canonical_tracker_not_nudged() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R cameronsjo/claude-configurations --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(result.is_none());
+            },
+        );
+    }
+
+    // Filing to an unowned third-party repo should be silent (not our business).
+    #[test]
+    fn unowned_repo_not_nudged() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R someorg/thirdparty --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(result.is_none());
+            },
+        );
+    }
+
+    // `CADENCE_ISSUE_TRACKER` override changes which target is exempt.
+    #[test]
+    fn env_override_changes_canonical() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", Some("cameronsjo/workbench")),
+            ],
+            || {
+                // workbench is now the canonical — no nudge.
+                let no_nudge = judge_issue_target(
+                    "gh issue create -R cameronsjo/workbench --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    no_nudge.is_none(),
+                    "canonical override should suppress nudge"
+                );
+
+                // claude-configurations is no longer canonical — should nudge.
+                let nudge = judge_issue_target(
+                    "gh issue create -R cameronsjo/claude-configurations --title x",
+                    &workdir("/tmp"),
+                );
+                assert_eq!(
+                    nudge,
+                    Some("cameronsjo/claude-configurations".to_string()),
+                    "non-canonical owned repo should nudge when override is active"
+                );
+            },
+        );
+    }
+
+    // ---- evasion tests ----
+
+    // "gh issue create" as a quoted data argument to echo must not be treated as a command.
+    #[test]
+    fn quoted_issue_create_in_echo_not_guarded() {
+        assert!(
+            judge_issue_target(
+                r#"echo "gh issue create -R cameronsjo/workbench --title x""#,
+                &workdir("/tmp"),
+            )
+            .is_none()
+        );
+    }
+
+    // `gh api .../issues` without a write method is a read — must not trigger.
+    #[test]
+    fn api_issues_read_without_method_not_guarded() {
+        assert!(
+            judge_issue_target(
+                "gh api repos/cameronsjo/workbench/issues --paginate",
+                &workdir("/tmp"),
+            )
+            .is_none()
+        );
+    }
+
+    // ---- nudge message format ----
+    // These tests call canonical() which reads CADENCE_ISSUE_TRACKER — serialize
+    // with ENV_LOCK and clear the var so concurrent env-mutating tests don't race.
+
+    #[test]
+    fn nudge_message_names_the_check() {
+        with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
+            let msg = nudge_message("cameronsjo/workbench");
+            assert!(
+                msg.contains("warn-issue-tracker:"),
+                "message should name the check: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn nudge_message_names_the_target() {
+        with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
+            let msg = nudge_message("cameronsjo/workbench");
+            assert!(
+                msg.contains("cameronsjo/workbench"),
+                "message should name the filing target: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn nudge_message_names_the_canonical() {
+        with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
+            let msg = nudge_message("cameronsjo/workbench");
+            assert!(
+                msg.contains("cameronsjo/claude-configurations"),
+                "message should name the canonical tracker: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn nudge_message_is_advisory_not_blocking() {
+        with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
+            let msg = nudge_message("cameronsjo/workbench");
+            assert!(!msg.contains("🚫"), "nudge should not contain block emoji");
+            assert!(msg.contains("carry on"), "nudge should give user an out");
+        });
+    }
+
+    // ---- Check::run integration tests ----
+
+    #[test]
+    fn check_nudges_owned_non_canonical_repo() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                let result = WarnIssueTracker.run(&make_bash(
+                    "gh issue create -R cameronsjo/workbench --title x",
+                ));
+                assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+                let msg = result.message.as_deref().unwrap_or("");
+                assert!(
+                    msg.contains("cameronsjo/workbench"),
+                    "nudge message should name target"
+                );
+                assert!(
+                    msg.contains("cameronsjo/claude-configurations"),
+                    "nudge message should name canonical"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn check_allows_canonical_repo() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                let result = WarnIssueTracker.run(&make_bash(
+                    "gh issue create -R cameronsjo/claude-configurations --title x",
+                ));
+                assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+                assert!(result.message.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn check_allows_unowned_repo() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                let result = WarnIssueTracker
+                    .run(&make_bash("gh issue create -R someorg/external --title x"));
+                assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+            },
+        );
+    }
+
+    #[test]
+    fn check_allows_issue_list() {
+        let result = WarnIssueTracker.run(&make_bash("gh issue list -R cameronsjo/workbench"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn check_allows_api_get_issues() {
+        let result = WarnIssueTracker.run(&make_bash(
+            "gh api repos/cameronsjo/workbench/issues --jq '.[]'",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn check_allows_no_command() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            cwd: None,
+            ..Default::default()
+        };
+        let result = WarnIssueTracker.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // CWD-based integration: issue create resolved from git remote in the
+    // cadence-hooks worktree. Uses make_bash_with_cwd to supply a real cwd.
+    // This exercises the git-remote path through judge_issue_target.
+    #[cfg(not(windows))]
+    #[test]
+    fn check_allows_when_cwd_is_not_a_git_repo() {
+        // /tmp has no git remote — unresolvable → allow silently.
+        let result = WarnIssueTracker.run(&make_bash_with_cwd("gh issue create --title x", "/tmp"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+}
