@@ -32,6 +32,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   flips to blocked (it prints every line; the Grep tool already blocks the
   same read). Env-dump nudges ride `split_segments`, so a newline-separated
   `env` now nudges too.
+- **prevent-secret-writes: writer verbs beyond redirects, quote-aware rm**
+  (#76, #86 on claude-configurations). The guard knew two writers (`>`/`rm`);
+  `tee`, `cp`/`mv`/`install` (including `-t`/`--target-directory` forms),
+  `dd of=`, and `truncate` now block when their write target is a
+  `.env`-family file — `echo SECRET | tee .env` and `cp .env.example .env`
+  were documented known gaps. Targets are judged by the shared
+  component-based classifier, so `rm settings.environment` and quoted prose
+  (`rm "notes about .env stuff.txt"`) no longer false-block. `git rm .env`
+  and wrapper-prefixed writers (`sudo rm .env`) stay covered.
 
 ## [0.27.0] - 2026-06-10
 
