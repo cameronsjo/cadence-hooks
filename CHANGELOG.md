@@ -51,6 +51,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   non-inline query (`-F query=@file.graphql`) is undeterminable and treated as a
   write. Pathed `gh api repos/<owner>/<repo>` writes keep the ownership check and
   non-api gh writes keep the remote fallback.
+- **guard-op-vault-scan: tokenized adjacent-pair detection robust to global
+  flags** (#81 on claude-configurations). Detection no longer enumerates command
+  shapes with a regex — each shell segment is tokenized, and a scan is any `op`
+  invocation (basename of the command word) with an `item`/`vault` token
+  immediately followed by `list` after the command word. 1Password global flags
+  between `op` and the subcommand (`op --format json item list`,
+  `op --account x item list`, `op --cache item list`, `op --session abc item
+  list`) no longer evade the guard, and quoted-prose protection plus shell-wrapper
+  expansion (`bash -c '…'`) are now structural via `command_segments`.
 
 ## [0.27.0] - 2026-06-10
 

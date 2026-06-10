@@ -5,21 +5,22 @@
 //! any session it reads far more secret metadata than a task needs. Single-item
 //! reads (`op read op://...`, `op item get <name>`) stay allowed — the guard
 //! targets enumeration, not access.
+//!
+//! Detection is tokenized, not regex-based. A flag-run regex cannot tell that
+//! `--format json` is a flag plus its value without enumerating every
+//! value-taking flag, so any global flag between `op` and the subcommand
+//! (`op --format json item list`, `op --account x item list`, `op --cache item
+//! list`, `op --session abc item list`) would evade it — the exact brittleness
+//! this guard fixes. Instead, each shell segment is tokenized: if the segment's
+//! command word is `op` and an `item`/`vault` token is immediately followed by
+//! `list` anywhere after the command word, it's a scan. Intervening flags are
+//! just skipped tokens, value-flag or not.
 
-use cadence_hooks_core::shell::strip_quotes;
+use cadence_hooks_core::shell::{command_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use regex::Regex;
-use std::sync::LazyLock;
 
-/// Matches `op item list` / `op vault list` enumeration commands.
-static OP_VAULT_SCAN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bop\s+(item|vault)\s+list\b").expect("pattern should compile"));
-
-/// Matches shell exec wrappers that can hide a scan inside quotes.
-static EXEC_WRAPPER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(bash|sh|zsh)\s+-c\b").expect("pattern should compile"));
-
-/// Blocks `op item list` vault enumeration; single-item reads are allowed.
+/// Blocks `op item list` / `op vault list` vault enumeration; single-item reads
+/// are allowed.
 pub struct OpVaultScanGuard;
 
 fn block_message(found: &str) -> String {
@@ -30,6 +31,39 @@ fn block_message(found: &str) -> String {
          vault scans read every item's metadata and trip the auto-mode classifier.\n   \
          Allowed: single-item reads like `op read op://vault/item/field` or `op item get <name>`"
     )
+}
+
+/// If `segment` is an `op` invocation that enumerates the vault, return the
+/// matched keyword (`item` or `vault`) for the block message.
+///
+/// A scan is: the command word's basename is `op`, and some adjacent pair after
+/// the command word is `item`/`vault` immediately followed by `list`. Tokenizing
+/// (not regex) is what makes this robust to global flags — every token between
+/// `op` and the subcommand is simply skipped, no value-flag enumeration needed.
+/// Quoted prose can't fire: an `echo "... op item list"` segment's command word
+/// is `echo`, and the quoted run is a single token.
+///
+/// Documented edges:
+/// - `$OP_CMD item list` stays unseen — token 0 is `$OP_CMD`, not `op` (the
+///   existing gap test; the auto-mode classifier is the backstop).
+/// - `op run -- ./tool item list` would match (no real-world shape — accepted).
+fn vault_scan_keyword(segment: &str) -> Option<&'static str> {
+    let tokens = tokenize(segment);
+    let first = tokens.first()?;
+    let cmd = first.rsplit('/').next().unwrap_or(first);
+    if cmd != "op" {
+        return None;
+    }
+    // Adjacent pairs strictly after the command word (token 0).
+    tokens
+        .windows(2)
+        .skip(1)
+        .find_map(|pair| match pair[0].as_str() {
+            "item" | "vault" if pair[1] == "list" => {
+                Some(if pair[0] == "item" { "item" } else { "vault" })
+            }
+            _ => None,
+        })
 }
 
 impl Check for OpVaultScanGuard {
@@ -46,19 +80,12 @@ impl Check for OpVaultScanGuard {
             return CheckResult::allow();
         }
 
-        // Strip quoted strings so prose mentioning the command doesn't fire.
-        let stripped = strip_quotes(command);
-
-        // Pass 1: direct invocation (after stripping quotes)
-        if let Some(m) = OP_VAULT_SCAN.find(&stripped) {
-            return CheckResult::block(block_message(m.as_str().trim()));
-        }
-
-        // Pass 2: inside exec wrappers (bash -c 'op item list')
-        if EXEC_WRAPPER.is_match(&stripped)
-            && let Some(m) = OP_VAULT_SCAN.find(command)
-        {
-            return CheckResult::block(block_message(m.as_str().trim()));
+        // `command_segments` splits chains/pipes AND expands shell wrappers
+        // (`bash -c '…'`), so the wrapper case is structural — no separate pass.
+        for segment in command_segments(command) {
+            if let Some(kw) = vault_scan_keyword(&segment) {
+                return CheckResult::block(block_message(&format!("op {kw} list")));
+            }
         }
 
         CheckResult::allow()
@@ -151,6 +178,46 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Block);
     }
 
+    // --- #81: global flags between `op` and the subcommand ---
+
+    #[test]
+    fn op_global_flag_format_json_blocked() {
+        let result = OpVaultScanGuard.run(&make_bash("op --format json item list | grep token"));
+        assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    #[test]
+    fn op_global_flag_format_equals_blocked() {
+        let result = OpVaultScanGuard.run(&make_bash("op --format=json item list | grep api"));
+        assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    #[test]
+    fn op_global_flag_account_blocked() {
+        let result = OpVaultScanGuard.run(&make_bash("op --account my.1password.com item list"));
+        assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    #[test]
+    fn op_global_flag_cache_blocked() {
+        let result = OpVaultScanGuard.run(&make_bash("op --cache item list"));
+        assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    #[test]
+    fn op_global_flag_session_blocked() {
+        let result =
+            OpVaultScanGuard.run(&make_bash("op --session abc item list | awk '{print $1}'"));
+        assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    #[test]
+    fn op_absolute_path_blocked() {
+        // The command word may be a path; its basename is what's matched.
+        let result = OpVaultScanGuard.run(&make_bash("/usr/local/bin/op item list"));
+        assert_eq!(result.outcome, Outcome::Block);
+    }
+
     // --- block message quality ---
 
     #[test]
@@ -187,6 +254,15 @@ mod tests {
     fn hyphenated_lookalike_allowed() {
         // "op-item-list" is a different word, not the op CLI
         let result = OpVaultScanGuard.run(&make_bash("op-item-list --help"));
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn op_item_get_named_list_allowed() {
+        // An item literally named "list": tokens are [op, item, get, list].
+        // The adjacent pairs (item, get) and (get, list) never match
+        // item|vault + list, so this single-item read stays allowed.
+        let result = OpVaultScanGuard.run(&make_bash("op item get list"));
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
