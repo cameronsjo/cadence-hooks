@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.28.0]
+
+### Fixed
+
+- **git-safety: precision pass on force flags, protected targets, global flags,
+  and discard handlers** (#71, #72, #73 on claude-configurations).
+  `--force-with-lease=<ref>` now counts as a force flag; `refs/heads/main`
+  matches the protected branch as a push or delete target; a force-push of bare
+  `HEAD` resolves the current branch and blocks on main/master (or when
+  unresolvable — fail safe), while staying a routine nudge on a feature branch.
+  The subcommand is now the first non-flag token after `git`, so unlisted global
+  flags (`git -p reset --hard`, `git --literal-pathspecs push --force …`) no
+  longer hide it. `git checkout .` and worktree-touching `git restore .` (any
+  discard-all pathspec: `.`, `./`, `:/`) block; staged-only restore stays
+  allowed; restore of named paths nudges.
+
 ## [0.27.0] - 2026-06-10
 
 ### Added
