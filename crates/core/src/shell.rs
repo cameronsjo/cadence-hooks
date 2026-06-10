@@ -266,11 +266,17 @@ pub fn split_segments(command: &str) -> Vec<String> {
                 flush_segment(&mut segments, &mut current);
             }
             '|' => {
-                // `||` and `|` are both separators; consume the second `|`.
-                if chars.peek() == Some(&'|') {
-                    chars.next();
+                // `>|` is the force-clobber redirect operator, not a pipe —
+                // keep it joined to its segment so the target stays attached.
+                if current.trim_end().ends_with('>') {
+                    current.push('|');
+                } else {
+                    // `||` and `|` are both separators; consume the second `|`.
+                    if chars.peek() == Some(&'|') {
+                        chars.next();
+                    }
+                    flush_segment(&mut segments, &mut current);
                 }
-                flush_segment(&mut segments, &mut current);
             }
             ';' | '\n' => flush_segment(&mut segments, &mut current),
             _ => current.push(c),
@@ -480,6 +486,21 @@ mod tests {
             split_segments("  git status  &&  ls  "),
             vec!["git status", "ls"]
         );
+    }
+
+    #[test]
+    fn split_segments_clobber_redirect_not_split_as_pipe() {
+        // `>|` is the force-clobber redirect, not a pipe — must stay one segment.
+        assert_eq!(
+            split_segments("echo secret >| .env"),
+            vec!["echo secret >| .env"]
+        );
+        assert_eq!(
+            split_segments("echo secret >|.env"),
+            vec!["echo secret >|.env"]
+        );
+        // A real pipe still splits.
+        assert_eq!(split_segments("echo x | grep y"), vec!["echo x", "grep y"]);
     }
 
     // --- command_segments (wrapper expansion) ---

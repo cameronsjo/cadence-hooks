@@ -5,20 +5,74 @@
 //! Safe templates (.env.example, .env.test) are always allowed.
 
 use crate::secret_patterns::{SAFE_SUFFIXES, is_ambiguous, is_blocked, is_safe_template};
+use cadence_hooks_core::shell::command_segments;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
-/// Extract the redirect target from a command (the token after > or >>).
-fn redirect_target(command: &str) -> Option<&str> {
-    // Find > or >> and grab the next whitespace-delimited token
-    let lower = command;
-    let rest = if let Some(pos) = lower.find(">>") {
-        &lower[pos + 2..]
-    } else if let Some(pos) = lower.find('>') {
-        &lower[pos + 1..]
-    } else {
-        return None;
-    };
-    rest.split_whitespace().next()
+/// Extract every redirect target in a command segment — the filename after each
+/// `>`, `>>`, `>|`, `2>`, `&>`, etc. Quote-aware: a `>` inside `'…'`/`"…"` is
+/// literal text, not a redirect (so `echo "a > b" > c` targets only `c`). This
+/// catches stderr, clobber, glued (`>file`), and multiple redirects in one
+/// segment — the old single-`>` scan saw only the first.
+fn redirect_targets(segment: &str) -> Vec<String> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                i += 1;
+            }
+            '>' => {
+                i += 1;
+                // Consume a doubled `>>` (append) or `>|` (clobber).
+                if i < chars.len() && (chars[i] == '>' || chars[i] == '|') {
+                    i += 1;
+                }
+                // Skip whitespace between the operator and the filename.
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                // Collect the target token, honoring a quoted filename.
+                let mut target = String::new();
+                while i < chars.len() {
+                    let tc = chars[i];
+                    if tc == '\'' || tc == '"' {
+                        i += 1;
+                        while i < chars.len() && chars[i] != tc {
+                            target.push(chars[i]);
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            i += 1; // closing quote
+                        }
+                        continue;
+                    }
+                    if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
+                        break;
+                    }
+                    target.push(tc);
+                    i += 1;
+                }
+                if !target.is_empty() {
+                    targets.push(target);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    targets
 }
 
 /// Extract rm targets from a command (tokens after rm that aren't flags).
@@ -51,23 +105,24 @@ fn is_dangerous_env_target(target: &str) -> bool {
 
 /// Check if a bash command targets .env files destructively.
 fn bash_targets_env_file(command: &str) -> bool {
-    let lower = command.to_lowercase();
-
-    if !lower.contains(".env") {
+    // Quick reject: nothing to guard if no `.env` token appears anywhere.
+    if !command.to_lowercase().contains(".env") {
         return false;
     }
 
-    // Check redirect target specifically
-    if let Some(target) = redirect_target(&lower)
-        && is_dangerous_env_target(target)
-    {
-        return true;
-    }
-
-    // Check rm targets specifically
-    for target in rm_targets(&lower) {
-        if is_dangerous_env_target(target) {
-            return true;
+    // Judge each command segment independently so a benign first redirect can't
+    // shield a dangerous one later in the chain, and a write hidden in
+    // `sh -c '…'` is still seen. `is_dangerous_env_target` lowercases per token.
+    for segment in command_segments(command) {
+        for target in redirect_targets(&segment) {
+            if is_dangerous_env_target(&target) {
+                return true;
+            }
+        }
+        for target in rm_targets(&segment) {
+            if is_dangerous_env_target(target) {
+                return true;
+            }
         }
     }
 
@@ -560,5 +615,57 @@ mod tests {
     fn bash_rm_env_example_allowed() {
         // rm target is a safe template
         assert!(!bash_targets_env_file("rm .env.example"));
+    }
+
+    // --- #75: per-segment, all-operator redirect scanning ---
+
+    #[test]
+    fn chained_benign_then_secret_redirect_blocked() {
+        // The bypass: only the first redirect (safe.txt) was inspected.
+        assert!(bash_targets_env_file(
+            "echo ok > safe.txt && echo SECRET > .env"
+        ));
+    }
+
+    #[test]
+    fn stderr_redirect_to_env_blocked() {
+        assert!(bash_targets_env_file("echo SECRET 2> .env"));
+    }
+
+    #[test]
+    fn clobber_redirect_to_env_blocked() {
+        assert!(bash_targets_env_file("echo SECRET >| .env"));
+    }
+
+    #[test]
+    fn semicolon_chained_secret_redirect_blocked() {
+        assert!(bash_targets_env_file("cmd > a.txt; echo S > .env"));
+    }
+
+    #[test]
+    fn sh_c_wrapped_secret_redirect_blocked() {
+        assert!(bash_targets_env_file("sh -c 'echo SECRET > .env'"));
+    }
+
+    #[test]
+    fn quoted_redirect_text_not_flagged() {
+        // The `> .env` inside the quoted string is literal text; only the real
+        // `> note.txt` redirect counts — must not block.
+        assert!(!bash_targets_env_file(
+            r#"echo "redirect > .env in a string" > note.txt"#
+        ));
+    }
+
+    #[test]
+    fn dup_fd_redirect_not_flagged() {
+        // `2>&1` duplicates a descriptor — no `.env` file target.
+        assert!(!bash_targets_env_file("echo SECRET > out.txt 2>&1"));
+    }
+
+    #[test]
+    fn chained_secret_redirect_blocks_via_run() {
+        let result =
+            SecretWritesGuard.run(&make_bash_input("echo ok > safe.txt && echo SECRET > .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 }
