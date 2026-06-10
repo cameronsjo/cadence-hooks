@@ -21,6 +21,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer hide it. `git checkout .` and worktree-touching `git restore .` (any
   discard-all pathspec: `.`, `./`, `:/`) block; staged-only restore stays
   allowed; restore of named paths nudges.
+- **guard-gh-write: block unverifiable `gh api` writes; exempt graphql reads**
+  (#78 on claude-configurations). A `gh api` write whose endpoint isn't
+  `repos/<owner>/<repo>` (graphql mutations, `orgs/…`, `user/…`,
+  `notifications/…`) no longer falls back to the cwd git remote — which let any
+  mutation pass from an owned checkout. Such writes now hard-block with the new
+  `gh-write-api-unverifiable` rule_id and a path-shaped fix. `gh api graphql`
+  read queries (`query { … }` and the `{ … }` shorthand) are exempted; a
+  non-inline query (`-F query=@file.graphql`) is undeterminable and treated as a
+  write. Pathed `gh api repos/<owner>/<repo>` writes keep the ownership check and
+  non-api gh writes keep the remote fallback.
 
 ## [0.27.0] - 2026-06-10
 
