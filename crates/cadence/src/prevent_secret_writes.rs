@@ -853,4 +853,22 @@ mod tests {
             SecretWritesGuard.run(&make_bash_input("echo ok > safe.txt && echo SECRET > .env"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
+
+    // --- #116: expansion modeling ---
+
+    #[test]
+    fn bash_substitution_rm_env_blocked() {
+        // The substitution body executes — the rm inside it is real.
+        let result = SecretWritesGuard.run(&make_bash_input("echo $(rm .env)"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_heredoc_prose_redirect_mention_allowed() {
+        // Heredoc prose mentioning a redirect to .env is text, not a write.
+        let result = SecretWritesGuard.run(&make_bash_input(
+            "cat > guide.md <<'EOF'\nnever run: echo x > .env\nEOF",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
 }
