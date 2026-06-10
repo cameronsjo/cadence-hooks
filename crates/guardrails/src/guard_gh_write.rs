@@ -10,7 +10,7 @@ use cadence_hooks_core::config::{
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
     LOOP_PATTERN, command_segments, git_command, host_and_repo_from_url, parse_work_dir,
-    strip_quotes,
+    strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -44,6 +44,11 @@ static REPO_SUBCOMMAND: LazyLock<Regex> = LazyLock::new(|| {
 
 static API_REPOS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
+
+/// Word-boundary, case-insensitive match for the GraphQL `mutation` keyword —
+/// the signal that a `gh api graphql` query writes rather than reads.
+static MUTATION_WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bmutation\b").expect("pattern should compile"));
 
 static GIST_COMMAND: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+gist\s").expect("pattern should compile"));
@@ -373,6 +378,147 @@ fn disallowed_message(
     )
 }
 
+/// gh api flags whose value is carried in the *following* token (`-X POST`,
+/// `-f key=val`, …). Used to skip a flag's value when scanning for the
+/// positional api endpoint.
+fn api_flag_takes_separate_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-X" | "--method"
+            | "-f"
+            | "--field"
+            | "-F"
+            | "--raw-field"
+            | "-H"
+            | "--header"
+            | "-q"
+            | "--jq"
+            | "-t"
+            | "--template"
+            | "--input"
+            | "--hostname"
+            | "-p"
+            | "--preview"
+            | "--cache"
+    )
+}
+
+/// If `segment` invokes `gh api` (command word `gh` or a `*/gh` basename, first
+/// non-flag subcommand `api`), return its endpoint — the first positional token
+/// after `api`, skipping flags and their values. `Some("")` for a bare `gh api`
+/// with no endpoint; `None` when the segment isn't a `gh api` call.
+fn gh_api_endpoint(segment: &str) -> Option<String> {
+    let tokens = tokenize(segment);
+    let first = tokens.first()?;
+    let cmd = first.rsplit('/').next().unwrap_or(first);
+    if cmd != "gh" {
+        return None;
+    }
+    // First non-flag token after `gh` must be the `api` subcommand.
+    let mut i = 1;
+    while i < tokens.len() && tokens[i].starts_with('-') {
+        i += 1;
+    }
+    if tokens.get(i).map(String::as_str) != Some("api") {
+        return None;
+    }
+    i += 1;
+    // The endpoint is the first positional after `api`, skipping flag values.
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        if tok.starts_with('-') {
+            if api_flag_takes_separate_value(tok) && !tok.contains('=') {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        return Some(tok.clone());
+    }
+    Some(String::new())
+}
+
+/// Extract the value of a `gh api graphql` `query=` field across the
+/// `-f`/`--field`/`-F`/`--raw-field` forms (separate-token, compact `-fquery=…`,
+/// and `=`-joined `--field=query=…`). Returns the substring after `query=`.
+fn graphql_query_value(tokens: &[String]) -> Option<String> {
+    let is_field_flag = |t: &str| matches!(t, "-f" | "--field" | "-F" | "--raw-field");
+    for (i, tok) in tokens.iter().enumerate() {
+        // Separate-token form: `-f query=…`.
+        if is_field_flag(tok)
+            && let Some(next) = tokens.get(i + 1)
+            && let Some(v) = next.strip_prefix("query=")
+        {
+            return Some(v.to_string());
+        }
+        // Compact / `=`-joined forms: `-fquery=…`, `-Fquery=…`,
+        // `--field=query=…`, `--raw-field=query=…`.
+        for prefix in ["-f", "-F", "--field=", "--raw-field="] {
+            if let Some(rest) = tok.strip_prefix(prefix)
+                && let Some(v) = rest.strip_prefix("query=")
+            {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Classify a `gh api graphql` segment by its `query=` field value:
+/// - `Some(true)`  — an inline query containing the word `mutation` (a write)
+/// - `Some(false)` — an inline query with no `mutation` keyword (a read)
+/// - `None`        — the query is non-inline (`-F query=@file`) or absent, so
+///   its kind can't be verified (treat as a write, and name it out)
+fn graphql_mutation_status(segment: &str) -> Option<bool> {
+    let tokens = tokenize(segment);
+    let query = graphql_query_value(&tokens)?;
+    // `@file` / `@-` (stdin) references aren't inline — undeterminable.
+    if query.starts_with('@') {
+        return None;
+    }
+    Some(MUTATION_WORD.is_match(&query))
+}
+
+/// Build the block message for a `gh api` write whose target owner can't be
+/// verified (graphql, `orgs/…`, `user/…`, anything that isn't
+/// `repos/<owner>/<repo>`). When `undeterminable_query` is set, the GraphQL
+/// query was loaded from a file, so its mutation status couldn't be confirmed.
+fn api_unverifiable_message(segment: &str, undeterminable_query: bool) -> String {
+    let note = if undeterminable_query {
+        "\n   Note: the GraphQL query is loaded from a file (`-F query=@…`), so its \
+         mutation status can't be verified — treated as a write."
+    } else {
+        ""
+    };
+    format!(
+        "🚫 git-guardrails: gh api write to an unverifiable target — ownership can't be checked\n   \
+         Command: {segment}\n   \
+         Fix: use `gh api repos/<owner>/<repo>/…` so ownership is checkable, or ask the user{note}"
+    )
+}
+
+/// Structured block for an unverifiable `gh api` write (#78). Carries the new
+/// `gh-write-api-unverifiable` rule_id and a path-shaped fix (graphql has no
+/// `-R`, so the fix steers toward `repos/<owner>/<repo>`).
+fn api_unverifiable_block(
+    segment: &str,
+    undeterminable_query: bool,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+) -> CheckResult {
+    CheckResult::block_structured(
+        api_unverifiable_message(segment, undeterminable_query),
+        BlockMetadata {
+            rule_id: "gh-write-api-unverifiable".to_string(),
+            fix: "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user"
+                .to_string(),
+            allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+            severity: "error",
+        },
+    )
+}
+
 /// Resolve and judge a single gh write segment's target. Returns `Some(block)`
 /// when the segment targets a repo outside the allowlist (or one that can't be
 /// resolved), `None` when it's allowed. Per-segment resolution is what stops a
@@ -598,6 +744,40 @@ impl Check for GhWriteGuard {
             // Gists are user-scoped; a fork creates under your account.
             if GIST_COMMAND.is_match(&segment) || REPO_FORK_COMMAND.is_match(&segment) {
                 continue;
+            }
+
+            // #78: `gh api` writes can't all be resolved from the cwd remote.
+            // graphql reads are exempt; any non-`repos/<owner>/<repo>` api write
+            // is unverifiable — block it rather than trusting the owned checkout.
+            if let Some(endpoint) = gh_api_endpoint(&segment) {
+                if endpoint == "graphql" {
+                    match graphql_mutation_status(&segment) {
+                        // Inline read query — no ownership to check, allow.
+                        Some(false) => continue,
+                        // Mutation (`Some(true)`) or non-inline/undeterminable
+                        // (`None`) — both block; the message names the latter.
+                        status => {
+                            return api_unverifiable_block(
+                                &segment,
+                                status.is_none(),
+                                &allowed_owners,
+                                &allowed_repos,
+                            );
+                        }
+                    }
+                }
+                // Non-graphql api write that isn't `repos/<owner>/<repo>`
+                // (graphql is handled above) can't be owner-checked.
+                if !API_REPOS.is_match(&segment) {
+                    return api_unverifiable_block(
+                        &segment,
+                        false,
+                        &allowed_owners,
+                        &allowed_repos,
+                    );
+                }
+                // `repos/<owner>/<repo>` api write — fall through to the
+                // existing per-segment ownership check below.
             }
 
             if let Some(block) = judge_write_segment(
@@ -1730,5 +1910,169 @@ mod tests {
                 assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
             },
         );
+    }
+
+    // --- #78: unverifiable gh api writes block; graphql reads exempt ---
+
+    // The crate's own dir is an owned checkout (origin = cameronsjo/cadence-hooks),
+    // so it exercises the cwd-remote fallback the bypass relied on.
+    const OWNED_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+    fn owners_env() -> [(&'static str, Option<&'static str>); 3] {
+        [
+            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+            ("CADENCE_ALLOWED_REPOS", None),
+            ("CADENCE_EXTRA_HOSTS", None),
+        ]
+    }
+
+    #[test]
+    fn graphql_mutation_from_owned_dir_blocks() {
+        // #78 repro: from an owned checkout the cwd-remote fallback used to
+        // resolve graphql to the owned repo and allow ANY mutation. Now blocked.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "gh api graphql -f query='mutation { createRepository(input: {}) { id } }'",
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn graphql_mutation_emits_api_unverifiable_rule() {
+        // Hermetic (/tmp): the new machinery engages regardless of cwd.
+        with_env(&owners_env(), || {
+            let input = input_with("gh api graphql -f query='mutation { foo }'", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+            assert_eq!(
+                meta.fix,
+                "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user"
+            );
+            assert_eq!(meta.severity, "error");
+        });
+    }
+
+    #[test]
+    fn api_post_orgs_from_owned_dir_blocks() {
+        with_env(&owners_env(), || {
+            let input = input_with("gh api -X POST orgs/evil-org/repos -f name=x", OWNED_DIR);
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn api_user_repos_from_owned_dir_blocks() {
+        with_env(&owners_env(), || {
+            let input = input_with("gh api user/repos -f name=x", OWNED_DIR);
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn api_delete_notifications_from_owned_dir_blocks() {
+        with_env(&owners_env(), || {
+            let input = input_with("gh api -X DELETE notifications/threads/123", OWNED_DIR);
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn graphql_file_query_is_undeterminable_and_blocks() {
+        // `-F query=@file.graphql` — value is not inline, so the kind can't be
+        // verified; treated as a write and the message names that out.
+        with_env(&owners_env(), || {
+            let input = input_with("gh api graphql -F query=@big.graphql", OWNED_DIR);
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+            let msg = result.message.expect("block message");
+            assert!(
+                msg.contains("@") && msg.to_lowercase().contains("file"),
+                "message must name the non-inline (@file) query: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn chained_read_then_graphql_mutation_blocks() {
+        // Per-segment: a benign first read can't shield a graphql mutation later.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "gh pr list && gh api graphql -f query='mutation { x }'",
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn graphql_read_query_inline_allows() {
+        // False-block guard: a `query { … }` read must pass even with no -R / cwd.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "gh api graphql -f query='query { viewer { login } }'",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_read_shorthand_allows() {
+        // Anonymous-operation shorthand `{ … }` is also a read.
+        with_env(&owners_env(), || {
+            let input = input_with("gh api graphql -f query='{ viewer { login } }'", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn api_repos_owned_pathed_write_allows() {
+        // `gh api repos/<owner>/<repo>` keeps the existing ownership check.
+        with_env(&owners_env(), || {
+            let input = input_with("gh api repos/cameronsjo/x -X POST -f title=t", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn api_get_no_write_flags_allows() {
+        with_env(&owners_env(), || {
+            for cmd in ["gh api octocat", "gh api repos/o/r"] {
+                let input = input_with(cmd, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "GET should allow: {cmd}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn pr_create_owned_fallback_allows() {
+        // Non-api gh writes keep the cwd-remote fallback — routine work stays green.
+        with_env(&owners_env(), || {
+            let input = input_with("gh pr create --title hi", OWNED_DIR);
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
     }
 }
