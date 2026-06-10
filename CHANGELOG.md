@@ -21,6 +21,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer hide it. `git checkout .` and worktree-touching `git restore .` (any
   discard-all pathspec: `.`, `./`, `:/`) block; staged-only restore stays
   allowed; restore of named paths nudges.
+- **guard-op-vault-scan: tokenized adjacent-pair detection robust to global
+  flags** (#81 on claude-configurations). Detection no longer enumerates command
+  shapes with a regex — each shell segment is tokenized, and a scan is any `op`
+  invocation (basename of the command word) with an `item`/`vault` token
+  immediately followed by `list` after the command word. 1Password global flags
+  between `op` and the subcommand (`op --format json item list`,
+  `op --account x item list`, `op --cache item list`, `op --session abc item
+  list`) no longer evade the guard, and quoted-prose protection plus shell-wrapper
+  expansion (`bash -c '…'`) are now structural via `command_segments`.
 
 ## [0.27.0] - 2026-06-10
 
