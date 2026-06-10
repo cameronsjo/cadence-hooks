@@ -270,9 +270,26 @@ mod tests {
 
     #[test]
     fn variable_expansion_not_caught() {
-        // Variable indirection can't be resolved statically — documented gap.
-        // The auto-mode classifier remains the backstop for this.
+        // An ENVIRONMENT-sourced variable can't be resolved statically —
+        // documented gap. The auto-mode classifier remains the backstop.
+        // (A visible same-command assignment IS resolved — next test.)
         let result = OpVaultScanGuard.run(&make_bash("$OP_CMD item list"));
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    // --- #116: expansion modeling ---
+
+    #[test]
+    fn visible_assignment_resolved_blocked() {
+        // The assignment is right there in the command string — resolvable.
+        let result = OpVaultScanGuard.run(&make_bash("OP_CMD=op; $OP_CMD item list"));
+        assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    #[test]
+    fn scan_inside_substitution_blocked() {
+        // `$(…)` executes; hiding the scan inside one changes nothing.
+        let result = OpVaultScanGuard.run(&make_bash(r#"echo "$(op item list)""#));
+        assert_eq!(result.outcome, Outcome::Block);
     }
 }

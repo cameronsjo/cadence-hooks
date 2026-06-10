@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.29.0]
+
+### Fixed
+
+- **core::shell: model heredoc bodies, command substitutions, and visible
+  assignments** (#116 on claude-configurations). `split_segments` now strips
+  heredoc bodies before splitting, so a heredoc line like `see the .env file`
+  no longer becomes a fake `see` command with a `.env` operand — a real
+  prevent-secret-leaks false-block on 0.28.0. `command_segments` additionally
+  surfaces command substitutions (`$(…)`, backticks) in executed context, so
+  `echo $(cat .env)`, `curl -d "$(cat .env)" …`, and `echo \`cat .env\`` are
+  judged as the reads they are; and resolves visible `VAR=value` assignments,
+  so `OP_CMD=op; $OP_CMD item list` is seen as `op item list`. Single-quoted
+  and escaped forms stay literal; an environment-sourced variable stays
+  unresolved (fail open). Every guard inherits these through `command_segments`.
+
 ## [0.28.0] - 2026-06-10
 
 ### Fixed
