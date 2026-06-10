@@ -21,7 +21,18 @@ const PROTECTED_BRANCHES: &[&str] = &["main", "master"];
 /// following argument which must also be stripped. Tokens are lowercased
 /// before matching, so `-C <path>` and `-c <key>=<value>` collapse into one
 /// entry — both consume exactly one argument, so the collision is harmless.
-const GIT_GLOBAL_FLAGS_WITH_ARG: &[&str] = &["-c", "--git-dir", "--work-tree"];
+/// `--namespace`, `--super-prefix`, `--config-env`, and `--attr-source` are
+/// git's remaining enumerable separate-arg globals (#117); only a truly
+/// unknown future separate-arg flag remains a documented gap.
+const GIT_GLOBAL_FLAGS_WITH_ARG: &[&str] = &[
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--config-env",
+    "--attr-source",
+];
 
 /// Pathspecs that discard every change in the working tree when handed to
 /// `git checkout` / `git restore` (#73).
@@ -72,8 +83,10 @@ fn normalize_git_command(command: &str) -> Vec<String> {
         // After `git` but before the subcommand, strip global flags. Known
         // value-carrying flags consume their separate argument; every other
         // `-`-prefixed token (including `--flag=value` forms) is skipped, so
-        // the subcommand is the first non-flag token (#72). Known gap: an
-        // UNLISTED flag with a separate argument (`git --namespace ns push`)
+        // the subcommand is the first non-flag token (#72). The named
+        // separate-arg globals (`--namespace`, `--super-prefix`, `--config-env`,
+        // `--attr-source`) are now enumerated and consumed too (#117). Known
+        // gap: a truly UNLISTED future flag with a separate argument still
         // mis-takes the argument as the subcommand and allows — the same
         // outcome as before this rewrite, never worse.
         if !seen_subcommand {
@@ -303,9 +316,10 @@ impl GitSafetyGuard {
 
     fn check_checkout_blocked(&self, args: &[&str]) -> Option<String> {
         // `git checkout .` / `./` / `:/` discards every uncommitted change,
-        // with or without `--` (#73). Named-pathspec discards
-        // (`git checkout -- src/file.rs`) stay allowed; extending to them is a
-        // non-goal — checkout's positional grammar makes a named pathspec
+        // with or without `--` (#73). Named-pathspec discards after `--`
+        // (`git checkout -- src/file.rs`) nudge in check_warned instead of
+        // blocking (#117); bare `git checkout <name>` without `--` stays out of
+        // scope — checkout's positional grammar makes a named pathspec
         // ambiguous with a branch name.
         if args.iter().any(|a| DISCARD_ALL_PATHSPECS.contains(a)) {
             return Some("git checkout of all pathspecs (discards all changes)".into());
@@ -402,6 +416,22 @@ impl GitSafetyGuard {
                         .any(|a| !a.starts_with('-') && !DISCARD_ALL_PATHSPECS.contains(a))
                 {
                     return Some("git restore (overwrites local changes to named paths)".into());
+                }
+                None
+            }
+            "checkout" => {
+                // `git checkout [-<ref>] -- <named paths>` overwrites local
+                // edits to those files — the same operation as `git restore`,
+                // so it nudges too (#117). Everything after `--` is a pathspec,
+                // so this form is unambiguous (unlike bare `git checkout <name>`,
+                // which stays out of scope). Discard-all pathspecs (`. ./ :/`)
+                // block in check_checkout_blocked before this runs.
+                if let Some(dd) = args.iter().position(|a| *a == "--")
+                    && args[dd + 1..]
+                        .iter()
+                        .any(|a| !DISCARD_ALL_PATHSPECS.contains(a))
+                {
+                    return Some("git checkout (overwrites local changes to named paths)".into());
                 }
                 None
             }
@@ -870,9 +900,11 @@ mod tests {
     }
 
     #[test]
-    fn checkout_specific_file_allowed() {
+    fn checkout_named_pathspec_warned() {
+        // `git checkout -- <named path>` overwrites local edits to that file —
+        // the same operation as `git restore`, so it nudges too (#117).
         let result = GitSafetyGuard.run(&make_bash_input("git checkout -- src/main.rs"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
     #[test]
@@ -1423,14 +1455,33 @@ mod tests {
     }
 
     #[test]
-    fn unknown_separate_arg_flag_documented_gap_allowed() {
-        // `--namespace ns` is an unlisted flag with a separate argument; `ns`
-        // is mis-taken as the subcommand and the push escapes. Documented gap
-        // — same outcome as before this fix, never worse.
+    fn namespace_flag_force_push_blocked() {
+        // `--namespace ns` is a global flag taking a separate argument;
+        // consuming it exposes the real subcommand (`push --force`) (#117).
         let result = GitSafetyGuard.run(&make_bash_input(
             "git --namespace ns push --force origin main",
         ));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn config_env_flag_force_push_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git --config-env name=GIT_AUTHOR push --force origin main",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn attr_source_flag_reset_hard_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git --attr-source HEAD reset --hard"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn super_prefix_flag_clean_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git --super-prefix x clean -fd"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     // ---------------------------------------------------------------
@@ -1529,6 +1580,36 @@ mod tests {
     fn checkout_main_allowed() {
         // Branch switching is not a discard — out of scope for this guard.
         let result = GitSafetyGuard.run(&make_bash_input("git checkout main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // ---------------------------------------------------------------
+    // #117: checkout `--` named-pathspec discards nudge
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn checkout_ref_named_pathspec_warned() {
+        // Everything after `--` is a pathspec, so a leading ref is unambiguous.
+        let result = GitSafetyGuard.run(&make_bash_input("git checkout main -- path/file.rs"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn checkout_head_named_dir_warned() {
+        let result = GitSafetyGuard.run(&make_bash_input("git checkout HEAD -- src/"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn checkout_multiple_named_pathspecs_warned() {
+        let result = GitSafetyGuard.run(&make_bash_input("git checkout feature -- a.txt b.txt"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn checkout_dashdash_nothing_after_allowed() {
+        // `--` with no pathspec following is not a discard — out of scope.
+        let result = GitSafetyGuard.run(&make_bash_input("git checkout --"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }
