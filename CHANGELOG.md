@@ -21,6 +21,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sees through `sh -c '…'` wrappers, matches path-form git (`/usr/bin/git`),
   reads quoted flags (`"--force"`), and exempts an alias definition only for its
   own segment instead of the whole command line.
+- **guard-gh-write: chained writes resolved per-segment** (#67). A gh write chain
+  is now judged one command at a time — `gh pr comment -R me/owned … && gh repo
+  delete evil/unowned --yes` no longer slips because the benign first `-R`
+  resolved the whole chain. Each write segment resolves its own target (and a
+  write hidden in `sh -c '…'` is seen); the first unowned/unresolvable write
+  blocks. Loop handling and structured block payloads are unchanged.
 
 ## [0.25.0] - 2026-06-08
 
