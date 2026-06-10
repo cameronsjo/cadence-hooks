@@ -239,8 +239,16 @@ fn flush_segment(segments: &mut Vec<String>, current: &mut String) {
 /// substitutions, so body lines that contain `$(` or a backtick are
 /// re-appended to the introducing line (their substitutions still execute)
 /// while pure-prose lines are dropped. `<<<` (here-string) is not a heredoc.
-/// Detection suppresses inside single quotes only; over-stripping a literal
-/// multi-line `"<<WORD"` only ever makes guards see *less* (fail open).
+///
+/// **Safety invariant (security review #93):** a body is dropped ONLY when its
+/// terminator is actually found before end-of-input. If the terminator is
+/// never matched — because the parser's heredoc model is narrower than bash's
+/// (an exotic delimiter char class) or because the `<<` was inside a string
+/// bash treats as literal — the lines are kept verbatim. Dropping lines past
+/// an unmatched terminator would discard commands bash *executes*, which is a
+/// guard MISS, not a safe fail-open. Detection also suppresses inside double
+/// quotes (a `<<WORD` inside `"…"` is literal text), with the
+/// terminator-not-found rule as the backstop for cross-line quote state.
 fn strip_heredoc_bodies(command: &str) -> String {
     if !command.contains("<<") {
         return command.to_string();
@@ -253,20 +261,35 @@ fn strip_heredoc_bodies(command: &str) -> String {
         let delims = heredoc_delimiters(lines[i]);
         i += 1;
         for (word, expands) in delims {
+            // Scan ahead for the terminator without committing the drop. Only
+            // if it is found do we replace the body with the carried-forward
+            // substitution lines; otherwise the lines are restored untouched.
+            let body_start = i;
             let mut carried: Vec<String> = Vec::new();
+            let mut found = false;
             while i < lines.len() {
                 let body = lines[i];
-                i += 1;
                 if body.trim() == word {
-                    break; // terminator (handles <<- leading tabs via trim)
+                    i += 1; // consume the terminator line
+                    found = true;
+                    break;
                 }
                 if expands && (body.contains("$(") || body.contains('`')) {
                     carried.push(body.to_string());
                 }
+                i += 1;
             }
-            for c in carried {
-                line.push(' ');
-                line.push_str(&c);
+            if found {
+                for c in carried {
+                    line.push(' ');
+                    line.push_str(&c);
+                }
+            } else {
+                // Terminator never matched — keep every consumed line as-is so
+                // a command bash would execute is never silently dropped.
+                out.push(line);
+                out.extend(lines[body_start..].iter().map(|l| l.to_string()));
+                return out.join("\n");
             }
         }
         out.push(line);
@@ -274,22 +297,31 @@ fn strip_heredoc_bodies(command: &str) -> String {
     out.join("\n")
 }
 
-/// Find heredoc delimiters introduced on a single line, outside single
-/// quotes. Returns `(delimiter_word, body_expands)` per heredoc: `body_expands`
-/// is false when the delimiter is quoted. `<<<` (here-string) is skipped.
+/// Find heredoc delimiters introduced on a single line, outside quotes.
+/// Returns `(delimiter_word, body_expands)` per heredoc: `body_expands` is
+/// false when the delimiter is quoted. `<<<` (here-string) is skipped. A `<<`
+/// inside a `'…'` or `"…"` string on this line is literal text and ignored;
+/// cross-line quote state is backstopped by the terminator-not-found rule in
+/// [`strip_heredoc_bodies`].
 fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
     let chars: Vec<char> = line.chars().collect();
     let mut delims = Vec::new();
     let mut i = 0;
     let mut in_single = false;
+    let mut in_double = false;
     while i < chars.len() {
         let c = chars[i];
-        if c == '\'' {
+        if c == '\'' && !in_double {
             in_single = !in_single;
             i += 1;
             continue;
         }
-        if in_single {
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if in_single || in_double {
             i += 1;
             continue;
         }
@@ -307,15 +339,18 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
                 j += 1;
             }
             // Optional quote around the delimiter word suppresses expansion.
-            let quote = matches!(chars.get(j), Some('\'') | Some('"'));
-            if quote {
+            // A quoted word reads until its MATCHING quote, so an inner other
+            // quote is part of the word (`<<'EOF"'` → terminator `EOF"`); an
+            // unquoted word stops at the first non-word char.
+            let quote_char = chars.get(j).copied().filter(|c| *c == '\'' || *c == '"');
+            if quote_char.is_some() {
                 j += 1;
             }
             let mut word = String::new();
             while j < chars.len() {
                 let wc = chars[j];
-                if quote {
-                    if wc == '\'' || wc == '"' {
+                if let Some(q) = quote_char {
+                    if wc == q {
                         j += 1;
                         break;
                     }
@@ -326,7 +361,7 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
                 j += 1;
             }
             if !word.is_empty() {
-                delims.push((word, !quote));
+                delims.push((word, quote_char.is_none()));
             }
             i = j;
             continue;
@@ -438,6 +473,11 @@ fn expand_segments(
                 expand_segments(&inner, assignments, depth + 1, out);
             }
             _ => {
+                // Substitution recursion shares the wrapper-nesting budget, so
+                // three levels of `sh -c` nesting can exhaust it before a
+                // substitution is surfaced as its own segment. Accepted: the
+                // substitution text still appears as a substring of the pushed
+                // wrapper segment, and three levels is already generous.
                 if depth < MAX_WRAPPER_DEPTH {
                     for body in substitution_bodies(&segment) {
                         expand_segments(&body, assignments, depth + 1, out);
@@ -883,6 +923,67 @@ mod tests {
         // `<<-` lets the terminator be indented; trim handles it.
         let segs = split_segments("cat <<-EOF\n\tbody\n\tEOF");
         assert_eq!(segs, vec!["cat <<-EOF"]);
+    }
+
+    // --- heredoc evasion guards (security review #93) ---
+    //
+    // A heredoc whose terminator the stripper cannot confidently locate must
+    // NOT drop trailing lines: bash may execute them, so dropping a real
+    // command is a guard MISS, not a safe fail-open. The safe rule is "only
+    // strip when the terminator is actually found".
+
+    #[test]
+    fn heredoc_exotic_delimiter_does_not_drop_trailing_command() {
+        // Delimiter `E.F` has a non-word char; a narrower parse must not eat
+        // the real `op item list` that follows the true terminator.
+        let out = command_segments("cat <<E.F\nbody\nE.F\nop item list");
+        assert!(
+            out.contains(&"op item list".to_string()),
+            "trailing command dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_unmatched_terminator_keeps_trailing_command() {
+        // Terminator never appears at all → keep everything (fail toward
+        // over-inspection, never toward dropping an executed command).
+        let out = command_segments("cat <<NOPE\nbody line\ncat .env");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "trailing read dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_inside_double_quotes_not_detected() {
+        // `<<EOF` inside an open double-quoted string is literal text, not a
+        // heredoc operator — must not strip the trailing `cat secret.txt`.
+        let out = command_segments("echo \"intro <<EOF\nfiller\n\" ; cat secret.txt");
+        assert!(
+            out.iter().any(|s| s.contains("cat secret.txt")),
+            "trailing command dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_quoted_delim_with_inner_quote_keeps_trailing() {
+        // `<<'EOF"'` — the quoted word reads to its matching `'`, so the true
+        // terminator `EOF"` is parsed correctly, the body strips, and the
+        // trailing `rm .env` survives as a clean segment (not swallowed by the
+        // unbalanced quote a mis-parsed terminator line would reintroduce).
+        let out = command_segments("cat <<'EOF\"'\nbody\nEOF\"\nrm .env");
+        assert!(
+            out.iter().any(|s| s.contains("rm .env")),
+            "trailing command dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn heredoc_clean_delimiter_still_strips_body() {
+        // The common case (clean word, matched terminator) still strips — the
+        // original false-block fix is preserved.
+        let segs = split_segments("cat > notes.md <<EOF\nsee the .env file\nEOF");
+        assert_eq!(segs, vec!["cat > notes.md <<EOF"]);
     }
 
     // --- command substitution ---
