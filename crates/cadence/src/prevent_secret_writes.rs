@@ -1,12 +1,17 @@
 //! Prevent writing or deleting secret files.
 //!
 //! Blocks Write/Edit on .env files, credentials, private keys, and keystores.
-//! Blocks Bash commands that redirect to or `rm` secret files.
+//! Blocks Bash commands that redirect to a `.env`-family file or hand one to
+//! a writer verb (`tee`, `cp`/`mv`/`install`, `dd`, `truncate`, `rm`) (#76).
 //! Safe templates (.env.example, .env.test) are always allowed.
 
-use crate::secret_patterns::{SAFE_SUFFIXES, is_ambiguous, is_blocked, is_safe_template};
-use cadence_hooks_core::shell::command_segments;
+use crate::secret_patterns::{is_ambiguous, is_blocked, is_dangerous_env_token, is_safe_template};
+use cadence_hooks_core::shell::{command_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+
+/// Wrapper words that pass their argv through to the real command —
+/// `sudo rm .env` must classify as `rm`, not `sudo`.
+const COMMAND_WRAPPERS: &[&str] = &["sudo", "command", "nohup", "time", "xargs"];
 
 /// Extract every redirect target in a command segment — the filename after each
 /// `>`, `>>`, `>|`, `2>`, `&>`, etc. Quote-aware: a `>` inside `'…'`/`"…"` is
@@ -75,32 +80,98 @@ fn redirect_targets(segment: &str) -> Vec<String> {
     targets
 }
 
-/// Extract rm targets from a command (tokens after rm that aren't flags).
-fn rm_targets(command: &str) -> Vec<&str> {
-    let mut targets = Vec::new();
-    let mut in_rm = false;
-    for token in command.split_whitespace() {
-        if token == "rm" {
-            in_rm = true;
+/// Extract write targets created by writer verbs in a segment (#76):
+/// `tee` and `rm` — every non-flag token; `cp`/`mv`/`install` — the last
+/// non-flag operand, or with `-t <dir>` / `--target-directory=<dir>` the dir
+/// value AND every operand (each source materializes under the target dir);
+/// `dd` — `of=` values; `truncate` — operands after consuming `-s <size>` /
+/// `--size=<n>`. `git rm` is judged as `rm`, and common pass-through
+/// wrappers (`sudo rm .env`) are unwrapped.
+///
+/// Quote-aware via [`tokenize`] (#86): a quoted filename is one clean token,
+/// so prose inside quotes (`rm "notes about .env stuff.txt"`, commit
+/// messages) never matches — this replaces the old whitespace-split `rm`
+/// scanner that saw a bare `.env` token in quoted text.
+fn writer_targets(segment: &str) -> Vec<String> {
+    let tokens = tokenize(segment);
+    let mut start = 0;
+    while let Some(first) = tokens.get(start) {
+        let word = first.rsplit('/').next().unwrap_or(first);
+        if COMMAND_WRAPPERS.contains(&word) {
+            start += 1;
             continue;
         }
-        if in_rm {
-            if token.starts_with('-') {
-                continue;
-            }
-            targets.push(token);
-        }
+        break;
     }
-    targets
-}
+    let Some(first) = tokens.get(start) else {
+        return Vec::new();
+    };
+    let mut cmd = first.rsplit('/').next().unwrap_or(first);
+    let mut args: &[String] = &tokens[start + 1..];
+    if cmd == "git" && args.first().map(String::as_str) == Some("rm") {
+        cmd = "rm";
+        args = &args[1..];
+    }
 
-/// Check if a specific file token is a dangerous .env target.
-fn is_dangerous_env_target(target: &str) -> bool {
-    let lower = target.to_lowercase();
-    if !lower.contains(".env") {
-        return false;
+    match cmd {
+        "tee" | "rm" => args
+            .iter()
+            .filter(|t| !t.starts_with('-'))
+            .cloned()
+            .collect(),
+        "cp" | "mv" | "install" => {
+            let mut targets = Vec::new();
+            let mut operands: Vec<String> = Vec::new();
+            let mut has_target_dir = false;
+            let mut i = 0;
+            while i < args.len() {
+                let t = &args[i];
+                if t == "-t" || t == "--target-directory" {
+                    has_target_dir = true;
+                    if let Some(v) = args.get(i + 1) {
+                        targets.push(v.clone());
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(v) = t.strip_prefix("--target-directory=") {
+                    has_target_dir = true;
+                    targets.push(v.to_string());
+                } else if !t.starts_with('-') {
+                    operands.push(t.clone());
+                }
+                i += 1;
+            }
+            if has_target_dir {
+                targets.append(&mut operands);
+            } else if let Some(last) = operands.pop() {
+                targets.push(last);
+            }
+            targets
+        }
+        "dd" => args
+            .iter()
+            .filter_map(|t| t.strip_prefix("of="))
+            .map(String::from)
+            .collect(),
+        "truncate" => {
+            let mut targets = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let t = &args[i];
+                if t == "-s" || t == "--size" {
+                    i += 2;
+                    continue;
+                }
+                if !t.starts_with('-') {
+                    targets.push(t.clone());
+                }
+                i += 1;
+            }
+            targets
+        }
+        _ => Vec::new(),
     }
-    !SAFE_SUFFIXES.iter().any(|s| lower.ends_with(s))
 }
 
 /// Check if a bash command targets .env files destructively.
@@ -112,17 +183,15 @@ fn bash_targets_env_file(command: &str) -> bool {
 
     // Judge each command segment independently so a benign first redirect can't
     // shield a dangerous one later in the chain, and a write hidden in
-    // `sh -c '…'` is still seen. `is_dangerous_env_target` lowercases per token.
+    // `sh -c '…'` is still seen. Targets are judged by the shared
+    // component-based classifier, so `settings.environment` stays clean (#86).
     for segment in command_segments(command) {
-        for target in redirect_targets(&segment) {
-            if is_dangerous_env_target(&target) {
-                return true;
-            }
-        }
-        for target in rm_targets(&segment) {
-            if is_dangerous_env_target(target) {
-                return true;
-            }
+        if redirect_targets(&segment)
+            .iter()
+            .chain(writer_targets(&segment).iter())
+            .any(|t| is_dangerous_env_token(t))
+        {
+            return true;
         }
     }
 
@@ -174,8 +243,10 @@ impl Check for SecretWritesGuard {
 
                 if bash_targets_env_file(command) {
                     return CheckResult::block(
-                        "🚫 BLOCKED: Bash command would modify/delete a .env file. \
-                         Modify manually outside Claude Code.",
+                        "🚫 BLOCKED: prevent-secret-writes: command would write or delete a .env file\n\
+                         Found: a redirect or writer verb (tee, cp/mv/install, dd, truncate, rm) targeting a .env-family file\n\
+                         Fix: modify .env files manually outside Claude Code.\n\
+                         Allowed: safe templates (.env.example, .env.test, …) and non-.env targets.",
                     );
                 }
 
@@ -400,21 +471,135 @@ mod tests {
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
-    // --- Unhappy path: bypass scenarios ---
+    // --- #76: writer verbs beyond redirects and rm ---
 
     #[test]
-    fn bash_tee_env_not_detected() {
-        // Known gap: tee/cp/dd bypass not detected by current implementation
+    fn bash_tee_env_blocked() {
+        // Was a documented known gap (`bash_tee_env_not_detected`).
         let result = SecretWritesGuard.run(&make_bash_input("echo SECRET | tee .env"));
-        // tee doesn't use > or rm, so it won't be caught
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
-    fn bash_cp_env_not_detected() {
-        // Known gap: cp bypass
+    fn bash_cp_env_blocked() {
+        // Was a documented known gap (`bash_cp_env_not_detected`).
         let result = SecretWritesGuard.run(&make_bash_input("cp source.txt .env"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_tee_append_env_blocked() {
+        assert!(bash_targets_env_file("echo SECRET | tee -a .env"));
+    }
+
+    #[test]
+    fn bash_mv_to_env_blocked() {
+        assert!(bash_targets_env_file("mv tmp.txt .env"));
+    }
+
+    #[test]
+    fn bash_dd_of_env_blocked() {
+        assert!(bash_targets_env_file("dd if=/dev/zero of=.env"));
+    }
+
+    #[test]
+    fn bash_truncate_env_blocked() {
+        assert!(bash_targets_env_file("truncate -s 0 .env"));
+    }
+
+    #[test]
+    fn bash_install_to_env_blocked() {
+        assert!(bash_targets_env_file("install tmp .env"));
+    }
+
+    #[test]
+    fn bash_cp_target_directory_env_source_blocked() {
+        // `-t <dir>` makes every operand a source; copying .env anywhere
+        // materializes a new .env. Both spellings.
+        assert!(bash_targets_env_file("cp -t /etc .env"));
+        assert!(bash_targets_env_file("cp --target-directory=/etc .env"));
+    }
+
+    #[test]
+    fn bash_chained_tee_env_blocked() {
+        assert!(bash_targets_env_file(
+            "echo ok > safe.txt && echo S | tee .env"
+        ));
+    }
+
+    #[test]
+    fn bash_sh_c_cp_env_blocked() {
+        assert!(bash_targets_env_file("sh -c 'cp x .env'"));
+    }
+
+    #[test]
+    fn bash_cp_env_backup_blocked() {
+        // `.env.backup` is not a safe template.
+        assert!(bash_targets_env_file("cp x .env.backup"));
+    }
+
+    #[test]
+    fn bash_git_rm_env_blocked() {
+        // `git rm .env` deletes through git — preserved from the old scanner.
+        assert!(bash_targets_env_file("git rm .env"));
+    }
+
+    #[test]
+    fn bash_sudo_rm_env_blocked() {
+        // The old scanner caught `rm` anywhere in the segment; the wrapper
+        // strip keeps `sudo rm` (and friends) covered under the new
+        // command-word model.
+        assert!(bash_targets_env_file("sudo rm .env"));
+        assert!(bash_targets_env_file("sudo tee .env"));
+    }
+
+    // --- #86: component-matched targets, quote-aware rm ---
+
+    #[test]
+    fn bash_rm_settings_environment_allowed() {
+        // Substring `.env` gate false-blocked `settings.environment`.
+        assert!(!bash_targets_env_file("rm settings.environment"));
+    }
+
+    #[test]
+    fn bash_redirect_settings_environment_allowed() {
+        assert!(!bash_targets_env_file("echo done > settings.environment"));
+    }
+
+    #[test]
+    fn bash_rm_quoted_filename_with_env_words_allowed() {
+        // The quoted filename is ONE token; `.env` inside it is prose, and the
+        // component classifier sees `stuff.txt`, not `.env`.
+        assert!(!bash_targets_env_file(r#"rm "notes about .env stuff.txt""#));
+    }
+
+    #[test]
+    fn bash_cp_example_to_env_test_allowed() {
+        // Destination is a safe template.
+        assert!(!bash_targets_env_file("cp .env.example .env.test"));
+    }
+
+    #[test]
+    fn bash_cp_env_to_clean_dest_allowed() {
+        // Destination is clean — this guard judges writes. The *read* of the
+        // .env source is prevent-secret-leaks' block (cross-guard split).
+        assert!(!bash_targets_env_file("cp .env /tmp/notes.txt"));
+    }
+
+    #[test]
+    fn bash_rm_then_env_prose_allowed() {
+        // Wave-1 regression armor: the prose mention is not an rm target.
+        assert!(!bash_targets_env_file(
+            r#"rm tmp.log && echo "see the .env file in docs""#
+        ));
+    }
+
+    #[test]
+    fn bash_commit_message_quoting_redirect_allowed() {
+        // Wave-1 regression armor: quoted `> .env` is literal text.
+        assert!(!bash_targets_env_file(
+            r#"git commit -m "redirect output with > .env carefully""#
+        ));
     }
 
     #[test]
@@ -600,9 +785,9 @@ mod tests {
     }
 
     #[test]
-    fn bash_cp_example_to_env_not_detected() {
-        // cp bypass — known gap (no redirect/rm)
-        assert!(!bash_targets_env_file("cp .env.example .env"));
+    fn bash_cp_example_to_env_blocked() {
+        // Was a documented known gap: safe-template source, dangerous dest.
+        assert!(bash_targets_env_file("cp .env.example .env"));
     }
 
     #[test]
