@@ -89,6 +89,30 @@ pub fn is_ambiguous(filename: &str) -> bool {
     false
 }
 
+/// True if a shell token resolves to a dangerous `.env`-family file.
+///
+/// Component-matched, not substring: the token's final path component must
+/// be `.env`, `.envrc`, or `.env.<something>` — minus [`SAFE_SUFFIXES`] — so
+/// `settings.environment`, `.environment`, and `my.envelope.txt` stay clean
+/// (closes the #86 substring false-block class for both secret guards).
+/// Strips one leading `@` (the curl/httpie upload-operand idiom `@.env`) and
+/// trailing `)` (subshell close) before classifying.
+pub fn is_dangerous_env_token(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    let trimmed = lower.strip_prefix('@').unwrap_or(&lower);
+    let trimmed = trimmed.trim_end_matches(')');
+    let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
+
+    if component == ".env" || component == ".envrc" {
+        return true;
+    }
+
+    match component.strip_prefix(".env.") {
+        Some(rest) if !rest.is_empty() => !SAFE_SUFFIXES.iter().any(|s| component.ends_with(s)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +185,30 @@ mod tests {
     fn case_insensitive() {
         assert!(is_blocked(".ENV", "/project/.ENV"));
         assert!(is_safe_template(".ENV.EXAMPLE"));
+    }
+
+    #[test]
+    fn dangerous_env_tokens_detected() {
+        assert!(is_dangerous_env_token(".env"));
+        assert!(is_dangerous_env_token(".envrc"));
+        assert!(is_dangerous_env_token(".env.local"));
+        assert!(is_dangerous_env_token(".env.production"));
+        assert!(is_dangerous_env_token("@.env"));
+        assert!(is_dangerous_env_token("/app/.env"));
+        assert!(is_dangerous_env_token(".env)"));
+        assert!(is_dangerous_env_token(".ENV"));
+    }
+
+    #[test]
+    fn clean_env_lookalike_tokens_pass() {
+        assert!(!is_dangerous_env_token("settings.environment"));
+        assert!(!is_dangerous_env_token(".environment"));
+        assert!(!is_dangerous_env_token("my.envelope.txt"));
+        assert!(!is_dangerous_env_token(".env.example"));
+        assert!(!is_dangerous_env_token(".env.test"));
+        assert!(!is_dangerous_env_token(".env.template"));
+        assert!(!is_dangerous_env_token("env"));
+        assert!(!is_dangerous_env_token("-env"));
+        assert!(!is_dangerous_env_token("feat/allow-main-branch-env"));
     }
 }

