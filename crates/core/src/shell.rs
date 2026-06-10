@@ -211,6 +211,130 @@ fn resolve_cd_target(target: &str, effective: &str) -> String {
     }
 }
 
+/// Maximum recursion depth for shell-wrapper expansion in [`command_segments`].
+const MAX_WRAPPER_DEPTH: usize = 3;
+
+/// Push `current` (trimmed) onto `segments` as a new segment, dropping it if
+/// empty, then clear `current`. Helper for [`split_segments`].
+fn flush_segment(segments: &mut Vec<String>, current: &mut String) {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+    current.clear();
+}
+
+/// Split a shell command into top-level command segments.
+///
+/// Splits on the control operators `&&`, `||`, `;`, `|`, `&`, and newlines —
+/// but never inside `'…'` or `"…"` quotes, so `echo "a && b"` is one segment
+/// and `git commit -m "fix; bug"` is one segment. Multi-character operators
+/// (`&&`, `||`) are consumed before their single-character prefixes (`&`, `|`).
+/// Quote characters are preserved within each segment; segments are trimmed and
+/// empty segments dropped.
+///
+/// This is syntactic splitting, not shell execution: it does not expand
+/// subshells (`$(…)`, backticks) or honor backslash escapes (consistent with
+/// [`tokenize`]). Heredoc bodies split on their newlines — accepted here, since
+/// the guards consuming this favor catching a hidden dangerous command over
+/// preserving heredoc text. To also see inside `sh -c '…'` wrappers, use
+/// [`command_segments`].
+pub fn split_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            current.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            '&' => {
+                // `&&` and `&` are both separators; consume the second `&`.
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                }
+                flush_segment(&mut segments, &mut current);
+            }
+            '|' => {
+                // `||` and `|` are both separators; consume the second `|`.
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                }
+                flush_segment(&mut segments, &mut current);
+            }
+            ';' | '\n' => flush_segment(&mut segments, &mut current),
+            _ => current.push(c),
+        }
+    }
+    flush_segment(&mut segments, &mut current);
+    segments
+}
+
+/// Like [`split_segments`], but also expands shell wrappers: any segment whose
+/// command word is `sh`/`bash`/`zsh`/`dash` invoked with `-c <script>` also
+/// contributes `<script>`'s own segments, recursively (bounded depth). The
+/// wrapper segment itself is still included, so a guard sees both the literal
+/// `sh -c '…'` invocation and the command(s) it will run.
+///
+/// This is the "every command that will actually execute" view: it surfaces a
+/// dangerous command hidden inside `sh -c 'git push --force origin main'` that
+/// plain segment splitting would leave buried in a quoted argument.
+pub fn command_segments(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    expand_segments(command, 0, &mut out);
+    out
+}
+
+/// Recursive worker for [`command_segments`].
+fn expand_segments(command: &str, depth: usize, out: &mut Vec<String>) {
+    for segment in split_segments(command) {
+        match shell_c_argument(&segment) {
+            Some(inner) if depth < MAX_WRAPPER_DEPTH => {
+                out.push(segment);
+                expand_segments(&inner, depth + 1, out);
+            }
+            _ => out.push(segment),
+        }
+    }
+}
+
+/// If `segment` is a `sh`/`bash`/`zsh`/`dash` invocation carrying a `-c
+/// <script>` argument, return the script. The command word may be a bare name
+/// or a path (`/bin/sh`). The `-c` may stand alone or appear in a short cluster
+/// such as `-lc` (login shell + command); the script is the token following the
+/// flag that carries `c`.
+fn shell_c_argument(segment: &str) -> Option<String> {
+    let tokens = tokenize(segment);
+    let first = tokens.first()?;
+    let cmd = first.rsplit('/').next().unwrap_or(first);
+    if !matches!(cmd, "sh" | "bash" | "zsh" | "dash") {
+        return None;
+    }
+    for (i, tok) in tokens.iter().enumerate().skip(1) {
+        let carries_c =
+            tok == "-c" || (tok.starts_with('-') && !tok.starts_with("--") && tok.contains('c'));
+        if carries_c {
+            return tokens.get(i + 1).cloned();
+        }
+        // First non-flag token without a `-c` means this isn't the `-c` form
+        // (e.g. `sh script.sh`) — no inline script to expand.
+        if !tok.starts_with('-') {
+            return None;
+        }
+    }
+    None
+}
+
 /// Regex pattern for detecting shell loops (`for ... in` / `while ... do`).
 pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bfor\s+\w+\s+in\b|\bwhile\b.*;\s*do\b").expect("pattern should compile")
@@ -296,6 +420,125 @@ mod tests {
             tokenize(r#"echo "unclosed rest of line"#),
             vec!["echo", "unclosed rest of line"]
         );
+    }
+
+    // --- split_segments ---
+
+    #[test]
+    fn split_segments_single_command() {
+        assert_eq!(split_segments("git status"), vec!["git status"]);
+    }
+
+    #[test]
+    fn split_segments_and_operator() {
+        assert_eq!(
+            split_segments("git status && git push --force origin main"),
+            vec!["git status", "git push --force origin main"]
+        );
+    }
+
+    #[test]
+    fn split_segments_each_operator() {
+        assert_eq!(split_segments("a && b"), vec!["a", "b"]);
+        assert_eq!(split_segments("a || b"), vec!["a", "b"]);
+        assert_eq!(split_segments("a ; b"), vec!["a", "b"]);
+        assert_eq!(split_segments("a | b"), vec!["a", "b"]);
+        assert_eq!(split_segments("a & b"), vec!["a", "b"]);
+        assert_eq!(split_segments("a\nb"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn split_segments_double_operators_not_split_into_singles() {
+        // `&&`/`||` must not leave an empty segment between the two chars.
+        assert_eq!(split_segments("x&&y"), vec!["x", "y"]);
+        assert_eq!(split_segments("x||y"), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn split_segments_operators_inside_double_quotes_preserved() {
+        assert_eq!(split_segments(r#"echo "a && b""#), vec![r#"echo "a && b""#]);
+    }
+
+    #[test]
+    fn split_segments_operators_inside_single_quotes_preserved() {
+        assert_eq!(
+            split_segments("git commit -m 'fix: a; b | c'"),
+            vec!["git commit -m 'fix: a; b | c'"]
+        );
+    }
+
+    #[test]
+    fn split_segments_empty_segments_dropped() {
+        assert_eq!(split_segments(";; a ;;"), vec!["a"]);
+        assert_eq!(split_segments(""), Vec::<String>::new());
+        assert_eq!(split_segments("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_segments_trims_whitespace() {
+        assert_eq!(
+            split_segments("  git status  &&  ls  "),
+            vec!["git status", "ls"]
+        );
+    }
+
+    // --- command_segments (wrapper expansion) ---
+
+    #[test]
+    fn command_segments_plain_chain_matches_split() {
+        assert_eq!(
+            command_segments("git status && git push --force origin main"),
+            vec!["git status", "git push --force origin main"]
+        );
+    }
+
+    #[test]
+    fn command_segments_expands_sh_c() {
+        assert_eq!(
+            command_segments("sh -c 'git push --force origin main'"),
+            vec![
+                "sh -c 'git push --force origin main'",
+                "git push --force origin main"
+            ]
+        );
+    }
+
+    #[test]
+    fn command_segments_expands_bash_c_double_quoted_with_operators() {
+        assert_eq!(
+            command_segments(r#"bash -c "a && b""#),
+            vec![r#"bash -c "a && b""#, "a", "b"]
+        );
+    }
+
+    #[test]
+    fn command_segments_expands_path_shell_and_login_cluster() {
+        assert_eq!(
+            command_segments("/bin/bash -lc 'rm -rf .env'"),
+            vec!["/bin/bash -lc 'rm -rf .env'", "rm -rf .env"]
+        );
+    }
+
+    #[test]
+    fn command_segments_nested_wrappers_bounded() {
+        // Two levels of sh -c nest cleanly; depth bound prevents runaway.
+        let out = command_segments(r#"sh -c "sh -c 'echo deep'""#);
+        assert!(out.contains(&"echo deep".to_string()));
+    }
+
+    #[test]
+    fn command_segments_non_wrapper_not_expanded() {
+        // `echo` is not a shell wrapper — its quoted argument stays glued.
+        assert_eq!(
+            command_segments(r#"echo "git push --force origin main""#),
+            vec![r#"echo "git push --force origin main""#]
+        );
+    }
+
+    #[test]
+    fn command_segments_sh_with_script_file_not_expanded() {
+        // `sh script.sh` has no inline `-c` script to surface.
+        assert_eq!(command_segments("sh deploy.sh"), vec!["sh deploy.sh"]);
     }
 
     #[test]

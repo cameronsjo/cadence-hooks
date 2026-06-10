@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `core::shell::split_segments` / `command_segments` — quote-aware splitting of a
+  shell command into its top-level segments (`&&`, `||`, `;`, `|`, `&`, newline),
+  with recursive `sh -c '…'` wrapper expansion. The shared primitive guards use
+  to judge every command a shell will run, not just the first.
+
+### Fixed
+
+- **git-safety: compound-command and quote-aware bypasses** (#61, #62, #63).
+  git-safety now judges every command in a chain — `git status && git push
+  --force origin main` no longer slips because the first command is benign — and
+  sees through `sh -c '…'` wrappers, matches path-form git (`/usr/bin/git`),
+  reads quoted flags (`"--force"`), and exempts an alias definition only for its
+  own segment instead of the whole command line.
+
 ## [0.25.0] - 2026-06-08
 
 ### Added
