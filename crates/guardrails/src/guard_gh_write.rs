@@ -9,7 +9,8 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
+    LOOP_PATTERN, command_segments, git_command, host_and_repo_from_url, parse_work_dir,
+    strip_quotes,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -372,6 +373,87 @@ fn disallowed_message(
     )
 }
 
+/// Resolve and judge a single gh write segment's target. Returns `Some(block)`
+/// when the segment targets a repo outside the allowlist (or one that can't be
+/// resolved), `None` when it's allowed. Per-segment resolution is what stops a
+/// benign first `-R` from covering an unowned write later in the same chain.
+fn judge_write_segment(
+    segment: &str,
+    work_dir: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> Option<CheckResult> {
+    match resolve_target_repo(segment, work_dir, allowed_owners) {
+        RepoResolution::Fork {
+            origin_host,
+            origin,
+            upstream_host,
+            upstream,
+        } => {
+            // Both remotes owned (each judged against its own host) — the write
+            // lands somewhere you control either way.
+            if fork_allowed(
+                &origin_host,
+                &origin,
+                &upstream_host,
+                &upstream,
+                allowed_owners,
+                allowed_repos,
+                extra_hosts,
+            ) {
+                None
+            } else {
+                Some(CheckResult::block(format!(
+                    "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
+                     Fork:     {origin_host}/{origin}\n   \
+                     Upstream: {upstream_host}/{upstream}\n\n   \
+                     Use -R {origin} to target your fork\n   \
+                     Use -R {upstream} to target upstream (if intended)"
+                )))
+            }
+        }
+        RepoResolution::Unresolvable => {
+            // Suggest the first allowed owner so the fix is concrete even when no
+            // repo can be inferred from the directory.
+            let example_owner = allowed_owners.first().map(|e| e.owner.as_str());
+            let owner_for_fix = example_owner.unwrap_or("owner");
+            Some(CheckResult::block_structured(
+                unresolvable_message(work_dir, example_owner),
+                BlockMetadata {
+                    rule_id: "gh-write-target-unresolvable".to_string(),
+                    fix: format!("-R {owner_for_fix}/<repo>"),
+                    allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+                    severity: "error",
+                },
+            ))
+        }
+        RepoResolution::Resolved { host, repo } => {
+            if is_allowed_with_extras(&host, &repo, allowed_owners, allowed_repos, extra_hosts) {
+                None
+            } else {
+                let example_owner = allowed_owners
+                    .first()
+                    .map(|e| e.owner.as_str())
+                    .unwrap_or("owner");
+                // Reuse the repo *name* under an allowed owner so the fix lands
+                // on the same project — `evil/cool-tool` becomes
+                // `cameronsjo/cool-tool`, not a placeholder.
+                let repo_name = repo.split('/').next_back().unwrap_or(repo.as_str());
+                Some(CheckResult::block_structured(
+                    disallowed_message(&host, &repo, allowed_owners, allowed_repos, extra_hosts),
+                    BlockMetadata {
+                        rule_id: "gh-write-unauthorized-target".to_string(),
+                        fix: format!("-R {example_owner}/{repo_name}"),
+                        allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+                        severity: "error",
+                    },
+                ))
+            }
+        }
+    }
+}
+
 /// Guards against unintended `gh` CLI write operations on unauthorized repositories.
 pub struct GhWriteGuard;
 
@@ -493,112 +575,44 @@ impl Check for GhWriteGuard {
             LoopAnalysis::NoLoops => {} // Continue to write detection
         }
 
-        // Only guard write operations
-        if !is_write_command(command) {
-            return CheckResult::allow();
-        }
-
-        // Fail-safe: block when unconfigured
-        if allowed_owners.is_empty() {
-            return CheckResult::block(
-                "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
-                 CADENCE_ALLOWED_OWNERS is not set.",
-            );
-        }
-
-        // Gists are user-scoped
-        if GIST_COMMAND.is_match(command) {
-            return CheckResult::allow();
-        }
-
-        // Fork creates under your account
-        if REPO_FORK_COMMAND.is_match(command) {
-            return CheckResult::allow();
-        }
-
+        // No loops: judge each command segment independently so a benign first
+        // gh write (with its own -R) can't shield an unowned write later in the
+        // chain, and a write hidden in `sh -c '…'` is still seen. The first
+        // disallowed / unresolvable write segment blocks.
         let cwd = input.cwd.as_deref().unwrap_or(".");
         let work_dir = parse_work_dir(command, cwd);
 
-        match resolve_target_repo(command, &work_dir, &allowed_owners) {
-            RepoResolution::Fork {
-                origin_host,
-                origin,
-                upstream_host,
-                upstream,
-            } => {
-                // Both remotes owned (each judged against its own host) — the
-                // write lands somewhere you control either way.
-                if fork_allowed(
-                    &origin_host,
-                    &origin,
-                    &upstream_host,
-                    &upstream,
-                    &allowed_owners,
-                    &allowed_repos,
-                    &extra_hosts,
-                ) {
-                    CheckResult::allow()
-                } else {
-                    CheckResult::block(format!(
-                        "🚫 git-guardrails: Write operation in a fork — specify target with -R\n   \
-                         Fork:     {origin_host}/{origin}\n   \
-                         Upstream: {upstream_host}/{upstream}\n\n   \
-                         Use -R {origin} to target your fork\n   \
-                         Use -R {upstream} to target upstream (if intended)"
-                    ))
-                }
+        for segment in command_segments(command) {
+            if !is_write_command(&segment) {
+                continue;
             }
-            RepoResolution::Unresolvable => {
-                // Suggest the first allowed owner so the fix is concrete even
-                // when no repo can be inferred from the directory.
-                let example_owner = allowed_owners.first().map(|e| e.owner.as_str());
-                let owner_for_fix = example_owner.unwrap_or("owner");
-                CheckResult::block_structured(
-                    unresolvable_message(&work_dir, example_owner),
-                    BlockMetadata {
-                        rule_id: "gh-write-target-unresolvable".to_string(),
-                        fix: format!("-R {owner_for_fix}/<repo>"),
-                        allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
-                        severity: "error",
-                    },
-                )
+
+            // Fail-safe: block when unconfigured.
+            if allowed_owners.is_empty() {
+                return CheckResult::block(
+                    "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
+                     CADENCE_ALLOWED_OWNERS is not set.",
+                );
             }
-            RepoResolution::Resolved { host, repo } => {
-                if is_allowed_with_extras(
-                    &host,
-                    &repo,
-                    &allowed_owners,
-                    &allowed_repos,
-                    &extra_hosts,
-                ) {
-                    CheckResult::allow()
-                } else {
-                    let example_owner = allowed_owners
-                        .first()
-                        .map(|e| e.owner.as_str())
-                        .unwrap_or("owner");
-                    // Reuse the repo *name* under an allowed owner so the
-                    // fix lands on the same project — `evil/cool-tool`
-                    // becomes `cameronsjo/cool-tool`, not a placeholder.
-                    let repo_name = repo.split('/').next_back().unwrap_or(repo.as_str());
-                    CheckResult::block_structured(
-                        disallowed_message(
-                            &host,
-                            &repo,
-                            &allowed_owners,
-                            &allowed_repos,
-                            &extra_hosts,
-                        ),
-                        BlockMetadata {
-                            rule_id: "gh-write-unauthorized-target".to_string(),
-                            fix: format!("-R {example_owner}/{repo_name}"),
-                            allowed_owners: allowed_display_list(&allowed_owners, &allowed_repos),
-                            severity: "error",
-                        },
-                    )
-                }
+
+            // Gists are user-scoped; a fork creates under your account.
+            if GIST_COMMAND.is_match(&segment) || REPO_FORK_COMMAND.is_match(&segment) {
+                continue;
+            }
+
+            if let Some(block) = judge_write_segment(
+                &segment,
+                &work_dir,
+                &allowed_owners,
+                &allowed_repos,
+                &extra_hosts,
+            ) {
+                return block;
             }
         }
+
+        // No write segments, or every write segment targets an owned repo.
+        CheckResult::allow()
     }
 }
 
@@ -1626,6 +1640,93 @@ mod tests {
                 let input = input_with("gh pr create -R x/y --title hi", "/tmp");
                 let result = GhWriteGuard.run(&input);
                 assert!(result.block_metadata.is_none());
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            },
+        );
+    }
+
+    // --- #67: per-segment target resolution in chained gh commands ---
+
+    #[test]
+    fn plain_chain_returns_no_loops() {
+        // The per-segment write-detection path lives in the NoLoops branch, so a
+        // plain `&&` chain must resolve to NoLoops for it to engage.
+        let result = analyze_gh_loops("gh pr comment -R me/a 1 && gh repo delete evil/b");
+        assert!(matches!(result, LoopAnalysis::NoLoops));
+    }
+
+    #[test]
+    fn chained_benign_first_then_unowned_write_blocks() {
+        // The bypass: a benign first -R covered the unowned second write.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+            ],
+            || {
+                let input = input_with(
+                    "gh pr comment -R cameronsjo/owned 1 --body hi && gh repo delete evil/unowned --yes",
+                    "/tmp",
+                );
+                let result = GhWriteGuard.run(&input);
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+            },
+        );
+    }
+
+    #[test]
+    fn chained_two_owned_writes_allows() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+            ],
+            || {
+                let input = input_with(
+                    "gh issue comment -R cameronsjo/a 1 --body x && gh issue comment -R cameronsjo/b 2 --body y",
+                    "/tmp",
+                );
+                let result = GhWriteGuard.run(&input);
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+            },
+        );
+    }
+
+    #[test]
+    fn chained_read_then_owned_write_allows() {
+        // False-block guard: a read followed by an owned write must pass.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+            ],
+            || {
+                let input = input_with(
+                    "gh pr list && gh issue comment -R cameronsjo/owned 1 --body hi",
+                    "/tmp",
+                );
+                let result = GhWriteGuard.run(&input);
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+            },
+        );
+    }
+
+    #[test]
+    fn sh_c_wrapped_unowned_write_blocks() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", None),
+            ],
+            || {
+                let input = input_with("sh -c 'gh repo delete evil/unowned --yes'", "/tmp");
+                let result = GhWriteGuard.run(&input);
                 assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
             },
         );
