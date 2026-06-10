@@ -566,6 +566,25 @@ mod tests {
     }
 
     #[test]
+    fn read_envrc_blocked() {
+        // #119: tool-side parity with the Bash-side .envrc block.
+        let result = SecretLeaksGuard.run(&make_read_input("/project/.envrc"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn grep_envrc_blocked() {
+        let result = SecretLeaksGuard.run(&make_grep_input("/project/.envrc"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_envrc_example_allowed() {
+        let result = SecretLeaksGuard.run(&make_read_input("/project/.envrc.example"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
     fn read_p12_blocked() {
         let result = SecretLeaksGuard.run(&make_read_input("/etc/ssl/cert.p12"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);

@@ -396,6 +396,25 @@ mod tests {
     }
 
     #[test]
+    fn write_envrc_blocked() {
+        // #119: tool-side parity — Write/Edit on .envrc were wide open.
+        let result = SecretWritesGuard.run(&make_write_input("/project/.envrc"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_envrc_blocked() {
+        let result = SecretWritesGuard.run(&make_edit_input("/project/.envrc", "old", "new"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_envrc_example_allowed() {
+        let result = SecretWritesGuard.run(&make_write_input("/project/.envrc.example"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
     fn private_pem_suffix_blocked() {
         assert!(is_blocked(
             "server.private.pem",
