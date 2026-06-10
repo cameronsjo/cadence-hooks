@@ -41,6 +41,12 @@ fn segment_env_read(segment: &str) -> Option<(String, String)> {
     let tokens = tokenize(segment);
     let first = tokens.first()?;
     let cmd_word = first.rsplit('/').next().unwrap_or(first);
+    // `find` is metadata-safe on its own (`find . -name .env`), but an
+    // exec-family action runs a real command on each hit — judge that
+    // command instead of exempting the whole `find` (#118).
+    if cmd_word == "find" {
+        return find_exec_leak(&tokens);
+    }
     if METADATA_SAFE_COMMANDS.contains(&cmd_word) {
         return None;
     }
@@ -48,6 +54,28 @@ fn segment_env_read(segment: &str) -> Option<(String, String)> {
         .iter()
         .find(|t| !t.chars().any(char::is_whitespace) && is_dangerous_env_token(t))
         .map(|t| (cmd_word.to_string(), t.clone()))
+}
+
+/// `find`'s exec-family flags (`-exec`, `-execdir`, `-ok`, `-okdir`) run their
+/// following token as a command on each matched file. Return the leak when
+/// that command is NOT metadata-safe and a dangerous `.env`-family token
+/// appears among find's arguments (the `-name`/`-path` pattern or a literal
+/// path). A plain `find` with no exec-family action, or one whose action is
+/// metadata-safe (`-exec ls …`), leaks nothing.
+fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
+    const EXEC_FLAGS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
+    let sub = tokens
+        .iter()
+        .position(|t| EXEC_FLAGS.contains(&t.as_str()))
+        .and_then(|i| tokens.get(i + 1))?;
+    let sub_word = sub.rsplit('/').next().unwrap_or(sub);
+    if METADATA_SAFE_COMMANDS.contains(&sub_word) {
+        return None;
+    }
+    tokens
+        .iter()
+        .find(|t| !t.chars().any(char::is_whitespace) && is_dangerous_env_token(t))
+        .map(|t| (sub_word.to_string(), t.clone()))
 }
 
 /// Check if a command token sequence appears as the first executed command
@@ -1227,6 +1255,54 @@ mod tests {
     fn bash_substitution_clean_operand_allowed() {
         let result =
             SecretLeaksGuard.run(&make_bash_input("VERSION=$(cat VERSION.txt) make build"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // ---------------------------------------------------------------
+    // #118: find -exec escapes the metadata-safe exemption
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bash_find_exec_cat_env_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("find . -name .env -exec cat {} \\;"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_find_execdir_base64_env_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input(
+            "find /app -name .env -execdir base64 {} \\;",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_find_ok_cat_env_blocked() {
+        let result =
+            SecretLeaksGuard.run(&make_bash_input("find . -name .env.local -ok cat {} \\;"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_find_exec_ls_env_allowed() {
+        // A metadata-safe exec subcommand does not leak contents.
+        let result =
+            SecretLeaksGuard.run(&make_bash_input("find . -name .env -exec ls -la {} \\;"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_find_name_env_no_exec_allowed() {
+        // Plain find of .env files is metadata only — still allowed.
+        let result = SecretLeaksGuard.run(&make_bash_input("find . -name .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_find_exec_cat_non_env_allowed() {
+        // No dangerous env token among find's args.
+        let result =
+            SecretLeaksGuard.run(&make_bash_input("find . -name '*.log' -exec cat {} \\;"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }

@@ -35,6 +35,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `git restore <named path>` — since everything after `--` is unambiguously a
   pathspec; discard-all forms (`.`, `./`, `:/`) keep blocking, and bare
   `git checkout <name>` without `--` stays out of scope.
+- **secret guards: `find -exec`/`-delete` no longer escapes the metadata-safe
+  exemption** (#118 on claude-configurations). `find` is metadata-safe on its
+  own, but `find . -name .env -exec cat {} \;` printed contents and `find .
+  -name .env -delete` / `-exec rm {} \;` destroyed the file — both allowed on
+  0.28.0. prevent-secret-leaks now judges the exec-family subcommand (`-exec`,
+  `-execdir`, `-ok`, `-okdir`): a non-metadata-safe action with a dangerous
+  `.env`-family token among find's args blocks, while `-exec ls …` and a plain
+  `find -name .env` stay allowed. prevent-secret-writes blocks `find` carrying
+  `-delete` or an exec-family writer verb (`rm`, `tee`, `cp`, `truncate`, …)
+  against a dangerous env file; safe templates and non-`.env` targets stay
+  allowed.
 
 ## [0.28.0] - 2026-06-10
 
