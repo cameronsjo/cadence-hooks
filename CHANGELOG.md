@@ -60,6 +60,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `op --account x item list`, `op --cache item list`, `op --session abc item
   list`) no longer evade the guard, and quoted-prose protection plus shell-wrapper
   expansion (`bash -c '…'`) are now structural via `command_segments`.
+- **guard-gh-dangerous: catch the API-form repo delete** (#88 on
+  claude-configurations). `gh api -X DELETE repos/<owner>/<repo>` is an
+  irreversible repo deletion that the subcommand-form regex (`gh repo delete`)
+  never saw. A tokenized pass now blocks it across every Cobra method spelling
+  (`-X delete`, `--method delete`, `-X=DELETE`, `--method=DELETE`, `-XDELETE`),
+  in chains and `sh -c` wrappers, but only at exact owner/repo depth — sub-resource
+  deletes (`repos/o/r/issues/1`, `repos/o/r/git/refs/heads/x`) stay allowed.
 
 ## [0.27.0] - 2026-06-10
 
