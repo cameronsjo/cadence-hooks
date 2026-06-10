@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.29.0]
+
+### Fixed
+
+- **git-safety: consume remaining separate-arg global flags; nudge
+  `checkout --` named-pathspec discards** (#117 on claude-configurations).
+  Git's remaining enumerable global flags that take a separate argument —
+  `--namespace`, `--super-prefix`, `--config-env`, `--attr-source` — now
+  consume their argument, so `git --namespace ns push --force origin main` no
+  longer hides the subcommand and escapes (only a truly unknown future
+  separate-arg flag remains a documented gap). `git checkout [-<ref>] --
+  <named paths>` now nudges — the same overwrite-local-edits operation as
+  `git restore <named path>` — since everything after `--` is unambiguously a
+  pathspec; discard-all forms (`.`, `./`, `:/`) keep blocking, and bare
+  `git checkout <name>` without `--` stays out of scope.
+
 ## [0.28.0] - 2026-06-10
 
 ### Fixed
