@@ -27,6 +27,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   resolved the whole chain. Each write segment resolves its own target (and a
   write hidden in `sh -c '…'` is seen); the first unowned/unresolvable write
   blocks. Loop handling and structured block payloads are unchanged.
+- **prevent-secret-writes: every redirect in a chain is inspected** (#75). The
+  guard scanned only the first `>`/`>>`, so `echo ok > safe.txt && echo SECRET >
+  .env` slipped. It now scans each command segment for all redirect operators —
+  `>`, `>>`, `>|`, and stderr/fd forms (`2>`) — quote-aware (a `>` inside a
+  string is literal), plus `rm` targets, and sees writes hidden in `sh -c '…'`.
+  `split_segments` also no longer mis-splits the `>|` clobber operator as a pipe.
 
 ## [0.25.0] - 2026-06-08
 
