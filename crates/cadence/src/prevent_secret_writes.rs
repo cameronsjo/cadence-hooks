@@ -170,8 +170,43 @@ fn writer_targets(segment: &str) -> Vec<String> {
             }
             targets
         }
+        // `find … -delete` and `find … -exec <writer> …` destroy or overwrite
+        // each matched file (#118). When such an action is present, every
+        // non-flag arg (the `-name`/`-path` pattern, literal paths) is a
+        // candidate target; the shared classifier filters to the dangerous
+        // `.env`-family ones. A plain `find` or a read action (`-exec cat …`)
+        // yields no target — that read is prevent-secret-leaks' concern.
+        "find" => {
+            if find_writes(args) {
+                args.iter()
+                    .filter(|t| !t.starts_with('-'))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
         _ => Vec::new(),
     }
+}
+
+/// True if a `find` invocation deletes or writes its matched files: a
+/// `-delete` action, or an exec-family flag whose command is a writer verb.
+fn find_writes(args: &[String]) -> bool {
+    const EXEC_FLAGS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
+    const WRITER_VERBS: &[&str] = &[
+        "rm", "tee", "cp", "mv", "install", "dd", "truncate", "shred", "unlink", "ln",
+    ];
+    if args.iter().any(|a| a == "-delete") {
+        return true;
+    }
+    args.iter().enumerate().any(|(i, a)| {
+        EXEC_FLAGS.contains(&a.as_str())
+            && args
+                .get(i + 1)
+                .map(|s| s.rsplit('/').next().unwrap_or(s))
+                .is_some_and(|w| WRITER_VERBS.contains(&w))
+    })
 }
 
 /// Check if a bash command targets .env files destructively.
@@ -870,5 +905,46 @@ mod tests {
             "cat > guide.md <<'EOF'\nnever run: echo x > .env\nEOF",
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- #118: find -delete / -exec writer escapes ---
+
+    #[test]
+    fn bash_find_delete_env_blocked() {
+        assert!(bash_targets_env_file("find . -name .env -delete"));
+    }
+
+    #[test]
+    fn bash_find_exec_rm_env_blocked() {
+        assert!(bash_targets_env_file("find . -name .env -exec rm {} \\;"));
+    }
+
+    #[test]
+    fn bash_find_execdir_tee_env_blocked() {
+        assert!(bash_targets_env_file(
+            "find /app -name .env -execdir tee {} \\;"
+        ));
+    }
+
+    #[test]
+    fn bash_find_exec_cat_env_allowed_for_writes() {
+        // A read via find-exec is prevent-secret-leaks' concern, not writes.
+        assert!(!bash_targets_env_file("find . -name .env -exec cat {} \\;"));
+    }
+
+    #[test]
+    fn bash_find_name_env_no_action_allowed() {
+        assert!(!bash_targets_env_file("find . -name .env"));
+    }
+
+    #[test]
+    fn bash_find_delete_non_env_allowed() {
+        assert!(!bash_targets_env_file("find . -name '*.tmp' -delete"));
+    }
+
+    #[test]
+    fn bash_find_delete_env_example_allowed() {
+        // Safe template — deleting it is not a secret write.
+        assert!(!bash_targets_env_file("find . -name .env.example -delete"));
     }
 }
