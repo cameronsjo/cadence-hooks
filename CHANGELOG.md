@@ -35,6 +35,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `git restore <named path>` — since everything after `--` is unambiguously a
   pathspec; discard-all forms (`.`, `./`, `:/`) keep blocking, and bare
   `git checkout <name>` without `--` stays out of scope.
+- **secret guards: `.envrc` blocked on the tool side, not just Bash** (#119 on
+  claude-configurations). `.envrc` was treated as dangerous in Bash (`cat
+  .envrc` blocked) but `BLOCKED_FILENAMES` omitted it, so Read, Grep, Write,
+  and Edit operated on it freely — a tool-side escape hatch. Adding `.envrc` to
+  the shared list closes it across both guards; `.envrc.example` stays allowed
+  (the safe-template check runs first), and `direnv allow .envrc` is untouched.
 
 ## [0.28.0] - 2026-06-10
 

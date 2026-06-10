@@ -17,6 +17,7 @@ pub const SAFE_SUFFIXES: &[&str] = &[
 /// Files that must never be read or written by Claude Code.
 pub const BLOCKED_FILENAMES: &[&str] = &[
     ".env",
+    ".envrc",
     ".env.local",
     ".env.production",
     ".env.staging",
@@ -185,6 +186,16 @@ mod tests {
     fn case_insensitive() {
         assert!(is_blocked(".ENV", "/project/.ENV"));
         assert!(is_safe_template(".ENV.EXAMPLE"));
+    }
+
+    #[test]
+    fn envrc_blocked_on_tool_side() {
+        // #119: .envrc is dangerous on the Bash side but was wide open to
+        // Read/Grep/Write/Edit — the tool-side block needs the filename listed.
+        assert!(is_blocked(".envrc", "/project/.envrc"));
+        // Safe-template check runs first in the guards, so .envrc.example is
+        // still allowed.
+        assert!(is_safe_template(".envrc.example"));
     }
 
     #[test]
