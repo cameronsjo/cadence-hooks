@@ -9,6 +9,7 @@
 //! `--no-optional-locks`) are stripped so that flag injection and
 //! whitespace padding cannot bypass detection.
 
+use cadence_hooks_core::shell::{command_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Protected branch names that trigger blocks instead of warnings.
@@ -21,30 +22,40 @@ const GIT_GLOBAL_FLAGS_WITH_ARG: &[&str] = &["-C", "--git-dir", "--work-tree"];
 /// Git global options that are standalone (no following argument).
 const GIT_GLOBAL_FLAGS_STANDALONE: &[&str] = &["--no-pager", "--no-optional-locks", "--bare"];
 
-/// Normalize a git command string for reliable matching.
+/// True if a token is the `git` command word — either bare `git` or a path
+/// ending in `/git` (e.g. `/usr/bin/git`, `./git`). Closes the absolute/relative
+/// path-git evasion: matching only the exact token `git` let `/usr/bin/git push
+/// --force` slip the normalizer.
+fn is_git_word(token: &str) -> bool {
+    token == "git" || token.ends_with("/git")
+}
+
+/// Normalize a single command segment into matchable tokens.
 ///
-/// 1. Collapse all runs of whitespace to single spaces and trim.
+/// 1. Quote-aware tokenization ([`tokenize`]): a quoted flag like `"--force"`
+///    becomes a clean `--force` token, while a whole command quoted as an
+///    argument stays one token and can never masquerade as the git command word.
 /// 2. Strip git global options that appear between `git` and the subcommand
 ///    (`-C <path>`, `--git-dir=<path>`, `--work-tree=<path>`, `--no-pager`,
 ///    `--no-optional-locks`, `--bare`).
 ///
-/// Returns the normalized string lowercased.
-fn normalize_git_command(command: &str) -> String {
-    let lower = command.to_lowercase();
-    // Collapse whitespace
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
-    let mut result: Vec<&str> = Vec::with_capacity(tokens.len());
+/// Returns the lowercased token list. The caller must judge these tokens
+/// directly (not a re-joined string), or a quoted span with internal spaces
+/// would re-fragment and defeat the quote-awareness.
+fn normalize_git_command(command: &str) -> Vec<String> {
+    let tokens = tokenize(&command.to_lowercase());
+    let mut result: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
     let mut seen_git = false;
     let mut seen_subcommand = false;
 
     while i < tokens.len() {
-        let token = tokens[i];
+        let token = tokens[i].as_str();
 
         // Pass through everything before `git`
         if !seen_git {
-            result.push(token);
-            if token == "git" {
+            result.push(token.to_string());
+            if is_git_word(token) {
                 seen_git = true;
             }
             i += 1;
@@ -84,11 +95,11 @@ fn normalize_git_command(command: &str) -> String {
             seen_subcommand = true;
         }
 
-        result.push(token);
+        result.push(token.to_string());
         i += 1;
     }
 
-    result.join(" ")
+    result
 }
 
 /// Check whether a short flag cluster (e.g., `-fu`, `-xfd`) contains a
@@ -140,7 +151,7 @@ impl GitSafetyGuard {
     /// Returns `Some(reason)` if blocked, `None` if not.
     fn check_blocked(&self, normalized: &str, tokens: &[&str]) -> Option<String> {
         // Find the git subcommand position
-        let git_pos = tokens.iter().position(|t| *t == "git")?;
+        let git_pos = tokens.iter().position(|t| is_git_word(t))?;
         let sub_pos = git_pos + 1;
         if sub_pos >= tokens.len() {
             return None;
@@ -274,7 +285,7 @@ impl GitSafetyGuard {
     /// Check the normalized tokens for warned operations.
     /// Returns `Some(message)` if warned, `None` if not.
     fn check_warned(&self, tokens: &[&str]) -> Option<String> {
-        let git_pos = tokens.iter().position(|t| *t == "git")?;
+        let git_pos = tokens.iter().position(|t| is_git_word(t))?;
         let sub_pos = git_pos + 1;
         if sub_pos >= tokens.len() {
             return None;
@@ -339,32 +350,43 @@ impl Check for GitSafetyGuard {
             return CheckResult::allow();
         };
 
-        let lower = command.to_lowercase();
-
-        if !lower.contains("git") {
+        if !command.to_lowercase().contains("git") {
             return CheckResult::allow();
         }
 
-        // Skip alias definitions to avoid false positives
-        if is_alias_definition(command) {
-            return CheckResult::allow();
+        // Judge each command segment independently so a benign first command
+        // (`git status &&`, `cd x &&`) can't shield a destructive sibling, and
+        // a command hidden in `sh -c '…'` is still seen. Block precedence: any
+        // segment blocks → block; else any warns → nudge.
+        let mut should_warn = false;
+        for segment in command_segments(command) {
+            // Per-segment alias check: a `git config alias.x …` segment is
+            // exempt, but a destructive sibling in the same chain is not.
+            if is_alias_definition(&segment) {
+                continue;
+            }
+
+            let norm_tokens = normalize_git_command(&segment);
+            let tokens: Vec<&str> = norm_tokens.iter().map(String::as_str).collect();
+            // Joined form is only for the substring-based reflog/gc checks; the
+            // git-word match runs on the span-preserved token list above.
+            let normalized = tokens.join(" ");
+
+            if self.check_blocked(&normalized, &tokens).is_some() {
+                return CheckResult::block(format!(
+                    "BLOCKED: Dangerous git operation detected.\n\n\
+                     Command: {command}\n\n\
+                     This operation could cause data loss or rewrite shared history.\n\
+                     If you really need to do this, run it manually outside Claude Code."
+                ));
+            }
+
+            if self.check_warned(&tokens).is_some() {
+                should_warn = true;
+            }
         }
 
-        let normalized = normalize_git_command(command);
-        let tokens: Vec<&str> = normalized.split_whitespace().collect();
-
-        // Check absolute blocks first
-        if let Some(_reason) = self.check_blocked(&normalized, &tokens) {
-            return CheckResult::block(format!(
-                "BLOCKED: Dangerous git operation detected.\n\n\
-                 Command: {command}\n\n\
-                 This operation could cause data loss or rewrite shared history.\n\
-                 If you really need to do this, run it manually outside Claude Code."
-            ));
-        }
-
-        // Check warnings
-        if let Some(_reason) = self.check_warned(&tokens) {
+        if should_warn {
             return CheckResult::nudge(format!(
                 "Git operation may modify history or lose work: {command}"
             ));
@@ -386,7 +408,7 @@ mod tests {
     #[test]
     fn normalize_collapses_whitespace() {
         assert_eq!(
-            normalize_git_command("git  push  --force  origin  main"),
+            normalize_git_command("git  push  --force  origin  main").join(" "),
             "git push --force origin main"
         );
     }
@@ -394,7 +416,7 @@ mod tests {
     #[test]
     fn normalize_strips_no_pager() {
         assert_eq!(
-            normalize_git_command("git --no-pager push --force origin main"),
+            normalize_git_command("git --no-pager push --force origin main").join(" "),
             "git push --force origin main"
         );
     }
@@ -402,7 +424,7 @@ mod tests {
     #[test]
     fn normalize_strips_c_flag() {
         assert_eq!(
-            normalize_git_command("git -C /some/path push --force origin main"),
+            normalize_git_command("git -C /some/path push --force origin main").join(" "),
             "git push --force origin main"
         );
     }
@@ -410,7 +432,7 @@ mod tests {
     #[test]
     fn normalize_strips_git_dir_eq() {
         assert_eq!(
-            normalize_git_command("git --git-dir=/foo/.git push --force origin main"),
+            normalize_git_command("git --git-dir=/foo/.git push --force origin main").join(" "),
             "git push --force origin main"
         );
     }
@@ -418,7 +440,7 @@ mod tests {
     #[test]
     fn normalize_strips_work_tree() {
         assert_eq!(
-            normalize_git_command("git --work-tree /foo push --force origin main"),
+            normalize_git_command("git --work-tree /foo push --force origin main").join(" "),
             "git push --force origin main"
         );
     }
@@ -426,7 +448,7 @@ mod tests {
     #[test]
     fn normalize_strips_no_optional_locks() {
         assert_eq!(
-            normalize_git_command("git --no-optional-locks status"),
+            normalize_git_command("git --no-optional-locks status").join(" "),
             "git status"
         );
     }
@@ -436,7 +458,8 @@ mod tests {
         assert_eq!(
             normalize_git_command(
                 "git --no-pager -C /repo --git-dir=/repo/.git push -f origin main"
-            ),
+            )
+            .join(" "),
             "git push -f origin main"
         );
     }
@@ -1062,5 +1085,106 @@ mod tests {
             "git  --no-pager  -C /repo  push  origin  main  --force",
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---------------------------------------------------------------
+    // #61: chained command — only the first git was inspected
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn benign_first_then_force_push_main_blocked() {
+        // The bypass: `git status` is benign, so the force-push slipped through.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git status && git push --force origin main",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn benign_first_then_reset_hard_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("ls && git reset --hard"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn force_push_main_after_semicolon_blocked() {
+        let result =
+            GitSafetyGuard.run(&make_bash_input("echo done; git push --force origin main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn force_push_main_after_pipe_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("true | git push --force origin main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---------------------------------------------------------------
+    // #63: quote-aware tokenization — path/escaped git and quoted flags
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn absolute_path_git_force_push_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("/usr/bin/git push --force origin main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn relative_path_git_force_push_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("./git push --force origin main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn quoted_force_flag_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input(r#"git push "--force" origin main"#));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn sh_c_wrapped_force_push_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("sh -c 'git push --force origin main'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---------------------------------------------------------------
+    // #62: alias check exempted the whole command line
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn alias_config_then_force_push_blocked() {
+        // The config-alias segment is exempt, but the chained force-push is not.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git config alias.fp 'push --force' && git push --force origin main",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---------------------------------------------------------------
+    // False-block guards: quoted-as-argument commands must stay allowed
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn echo_of_force_push_string_allowed() {
+        // `git` lives inside a quoted argument to echo — not a git command.
+        let result = GitSafetyGuard.run(&make_bash_input(r#"echo "git push --force origin main""#));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn echo_single_quoted_git_then_ls_allowed() {
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "echo 'use git push --force carefully' && ls",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn commit_message_with_reset_hard_text_allowed() {
+        // `reset --hard` and `;` are inside the commit message — not commands.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            r#"git commit -m "wip; reset --hard test""#,
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }
