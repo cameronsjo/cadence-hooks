@@ -1,9 +1,14 @@
 //! Block irreversible `gh` operations.
 //!
 //! `gh repo delete` is permanently destructive with no undo. This guard
-//! blocks it in direct invocations and inside shell exec wrappers (`bash -c`).
+//! blocks it in direct invocations and inside shell exec wrappers (`bash -c`),
+//! plus the equivalent REST API form (`gh api -X DELETE repos/<owner>/<repo>`).
+//!
+//! Note: guard-gh-write judges by *ownership* (is the target repo yours?); this
+//! guard enforces *irreversibility* — a repo delete is blocked even for a repo
+//! you own, because there is no undo.
 
-use cadence_hooks_core::shell::strip_quotes;
+use cadence_hooks_core::shell::{command_segments, strip_quotes, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -13,6 +18,35 @@ static GH_REPO_DELETE: LazyLock<Regex> =
 
 static EXEC_WRAPPER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(bash|sh|zsh)\s+-c\b").expect("pattern should compile"));
+
+/// Matches an API path at EXACTLY owner/repo depth: `repos/<owner>/<repo>`,
+/// with an optional leading or trailing slash. Sub-resource paths
+/// (`repos/o/r/issues/1`, `repos/o/r/git/refs/heads/x`) deliberately do not
+/// match — those DELETEs remove a sub-resource, not the repository itself.
+static API_REPO_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^/?repos/[^/]+/[^/]+/?$").expect("pattern should compile"));
+
+/// True when `tokens` carry an HTTP DELETE method flag in any Cobra spelling:
+/// the adjacent pair `-X delete` / `--method delete`, or a single token
+/// `-x=delete` / `--method=delete` / `-xdelete`. Value comparison is
+/// case-insensitive (tokens are lowercased before matching).
+fn has_delete_method(tokens: &[String]) -> bool {
+    for (i, tok) in tokens.iter().enumerate() {
+        let lower = tok.to_ascii_lowercase();
+        // Single-token forms: `-X=DELETE`, `--method=DELETE`, `-XDELETE`.
+        if lower == "-x=delete" || lower == "--method=delete" || lower == "-xdelete" {
+            return true;
+        }
+        // Adjacent-pair forms: flag token followed by a `delete` value token.
+        if (lower == "-x" || lower == "--method")
+            && let Some(next) = tokens.get(i + 1)
+            && next.eq_ignore_ascii_case("delete")
+        {
+            return true;
+        }
+    }
+    false
+}
 
 /// Blocks `gh repo delete` and other irreversible GitHub CLI operations.
 pub struct GhDangerousGuard;
@@ -54,6 +88,30 @@ impl Check for GhDangerousGuard {
                      Fix: delete manually via github.com — this is irreversible",
                 m.as_str().trim(),
             ));
+        }
+
+        // Pass 3: the REST API form `gh api -X DELETE repos/<owner>/<repo>`.
+        // The subcommand-form regex above never sees this shape, so tokenize
+        // every executable segment (chains and `sh -c` wrappers expanded) and
+        // block iff it is a `gh api` DELETE targeting an exact owner/repo path.
+        for segment in command_segments(command) {
+            let tokens = tokenize(&segment);
+            let Some(first) = tokens.first() else {
+                continue;
+            };
+            // Command word: basename so `/opt/homebrew/bin/gh` still counts.
+            let cmd_word = first.rsplit('/').next().unwrap_or(first);
+            if cmd_word != "gh" || tokens.get(1).map(String::as_str) != Some("api") {
+                continue;
+            }
+            if has_delete_method(&tokens) && tokens.iter().any(|t| API_REPO_PATH.is_match(t)) {
+                return CheckResult::block(format!(
+                    "🚫 git-guardrails: gh repo delete is blocked\n   \
+                     Found: `{}`\n   \
+                     Fix: delete manually via github.com — this is irreversible",
+                    segment.trim(),
+                ));
+            }
         }
 
         CheckResult::allow()
@@ -217,5 +275,146 @@ mod tests {
         let result = GhDangerousGuard.run(&make_bash("gh  repo  delete  my-repo"));
         // Extra spaces between words — regex uses \s+ so this still matches
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // --- #88: API-form repo delete (gh api -X DELETE repos/owner/repo) ---
+
+    fn outcome(cmd: &str) -> cadence_hooks_core::Outcome {
+        GhDangerousGuard.run(&make_bash(cmd)).outcome
+    }
+
+    #[test]
+    fn api_delete_owned_repo_blocked() {
+        // The #88 repro: an API-form delete of a repo you own is still
+        // irreversible, so it blocks regardless of ownership.
+        assert_eq!(
+            outcome("gh api -X DELETE repos/cameronsjo/some-owned-repo"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_method_delete_blocked() {
+        assert_eq!(
+            outcome("gh api --method DELETE repos/o/r"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_delete_lowercase_value_blocked() {
+        assert_eq!(
+            outcome("gh api -X delete repos/o/r"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_delete_equals_form_blocked() {
+        assert_eq!(
+            outcome("gh api -X=DELETE repos/o/r"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_delete_attached_form_blocked() {
+        assert_eq!(
+            outcome("gh api -XDELETE repos/o/r"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_delete_path_before_method_blocked() {
+        assert_eq!(
+            outcome("gh api repos/o/r -X DELETE"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_delete_leading_slash_blocked() {
+        assert_eq!(
+            outcome("gh api -X DELETE /repos/o/r"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_delete_chained_blocked() {
+        assert_eq!(
+            outcome("echo ok && gh api -X DELETE repos/o/r"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_delete_sh_wrapper_blocked() {
+        assert_eq!(
+            outcome("sh -c 'gh api -X DELETE repos/o/r'"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn api_delete_full_path_gh_blocked() {
+        assert_eq!(
+            outcome("/opt/homebrew/bin/gh api -X DELETE repos/o/r"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    // --- #88: overmatch traps (these MUST stay allowed) ---
+
+    #[test]
+    fn api_delete_subresource_allowed() {
+        // Deleting an issue comment is a sub-resource delete, not a repo delete.
+        assert_eq!(
+            outcome("gh api -X DELETE repos/o/r/issues/comments/1"),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn api_delete_deep_ref_allowed() {
+        assert_eq!(
+            outcome("gh api -X DELETE repos/o/r/git/refs/heads/x"),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn api_get_repo_allowed() {
+        assert_eq!(
+            outcome("gh api repos/o/r"),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn api_post_issues_allowed() {
+        assert_eq!(
+            outcome("gh api -X POST repos/o/r/issues"),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn api_delete_quoted_prose_allowed() {
+        // The echo segment's command word isn't gh — quoted prose must not block.
+        assert_eq!(
+            outcome("echo \"gh api -X DELETE repos/o/r\""),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn api_delete_user_starred_allowed() {
+        // Not owner/repo depth under repos/ — `user/starred/o/r` is a different path.
+        assert_eq!(
+            outcome("gh api -X DELETE user/starred/o/r"),
+            cadence_hooks_core::Outcome::Allow
+        );
     }
 }

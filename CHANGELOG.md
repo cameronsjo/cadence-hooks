@@ -21,6 +21,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer hide it. `git checkout .` and worktree-touching `git restore .` (any
   discard-all pathspec: `.`, `./`, `:/`) block; staged-only restore stays
   allowed; restore of named paths nudges.
+- **guard-gh-dangerous: catch the API-form repo delete** (#88 on
+  claude-configurations). `gh api -X DELETE repos/<owner>/<repo>` is an
+  irreversible repo deletion that the subcommand-form regex (`gh repo delete`)
+  never saw. A tokenized pass now blocks it across every Cobra method spelling
+  (`-X delete`, `--method delete`, `-X=DELETE`, `--method=DELETE`, `-XDELETE`),
+  in chains and `sh -c` wrappers, but only at exact owner/repo depth — sub-resource
+  deletes (`repos/o/r/issues/1`, `repos/o/r/git/refs/heads/x`) stay allowed.
 
 ## [0.27.0] - 2026-06-10
 
