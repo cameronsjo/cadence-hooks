@@ -1,0 +1,157 @@
+# Hook Catalog
+
+The full catalog of hooks shipped by the `cadence-hooks` binary, organized by
+the plugin they serve. The binary is the single source of truth — run
+`cadence-hooks list` for the live list with disable status, or `cadence-hooks
+try <namespace> <hook>` to see any hook run against a sample payload (see
+[docs/testing.md](testing.md)).
+
+For how hooks communicate with Claude Code (stdin/stdout/exit codes), see
+[Hook Protocol](../README.md#hook-protocol) in the README.
+
+## cadence
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `terminology` | PreToolUse (Write, Edit) | Block inclusive terminology violations |
+| `orphaned-todos` | PreToolUse (Write, Edit) | Require `MARKER(#issue):` format for TODO/FIXME/HACK |
+| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading .env, credentials, private keys |
+| `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting .env and credential files |
+| `memory-guard` | PreToolUse (Write, Edit) | Enforce MEMORY.md line limits |
+| `git-safety` | PreToolUse (Bash) | Block force-push to main, reset --hard, etc. |
+| `line-endings` | PreToolUse (Write) | Validate shell script line endings (LF, not CRLF) |
+| `env-vars` | PreToolUse (Write, Edit) | Warn on generic env var names (DEBUG, PORT) |
+| `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
+| `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
+| `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
+| `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
+
+`warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
+commands and on Write/Edit to `docs/field-reports/`, then leaves the content
+judgment to the model. It exempts retro paths and writes under `$OBSIDIAN_VAULT`
+(the safe home for personal context), and is silenced session-wide with
+`CADENCE_SKIP_OVERSHARE_AUDIT=1`.
+
+## guardrails (git-guardrails)
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `guard-push-remote` | PreToolUse (Bash) | Block git push to repos you don't own |
+| `guard-gh-write` | PreToolUse (Bash) | Block gh write operations to non-owned repos |
+| `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) |
+| `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` |
+| `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch |
+| `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base |
+| `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs |
+| `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
+| `check-idle-return` | PreToolUse | Nudge after idle periods between edits |
+| `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main |
+| `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) |
+| `warn-pr-issue-link` | PreToolUse (Bash) | Nudge when `gh pr create` has no closing issue keyword (`Closes #N`) in the body |
+| `warn-issue-tracker` | PreToolUse (Bash) | Nudge when `gh issue create` targets an owned repo other than the canonical tracker |
+| `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge |
+| `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed |
+| `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
+| `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) |
+| `warn-coderabbit-retrigger` | PreToolUse (Bash) | Warn that `@coderabbitai review` comments are no-ops on already-reviewed content |
+| `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
+| `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed |
+| `inject-gh-context` | SessionStart (startup, resume, compact) | Inject the gh-write allowlist + `-R owner/repo` rule into context |
+
+`guard-browser-device` is a deliberate block (not a nudge): a nudge is exit 0,
+so the browser action would already have hit a device before the context
+arrived. It blocks the first claude-in-chrome tool call of a session, writes a
+per-session marker, and allows every subsequent call — forcing the
+`list_connected_browsers` → `select_browser` handshake the MCP server only
+advises.
+
+## rules
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `validate-frontmatter` | PreToolUse (Write, Edit) | Validate SKILL.md and command frontmatter |
+| `security-patterns` | PostToolUse (Write, Edit) | Scan for security anti-patterns |
+
+`security-patterns` is a **zero-config, no-API baseline** — a per-edit pattern
+scan with no setup. For configurable patterns plus model-backed diff and commit
+review, install the official `security-guidance` plugin
+(`/plugin install security-guidance@claude-plugins-official`).
+
+## obsidian (cadence-obsidian)
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `trash-guard` | PreToolUse (Bash) | Block `rm` in Obsidian vault (use .trash/ instead) |
+
+## metrics (cadence-metrics)
+
+These are **loggers**, not guards: they append JSONL event records and always
+exit 0. They never block a tool call (see
+[Hook Protocol](../README.md#hook-protocol)).
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `snapshot` | PreToolUse (Bash, `git commit`) | Snapshot HEAD before a commit, so `log-commit` can tell whether it landed |
+| `log-commit` | PostToolUse (Bash, `git commit`) | Scan the transcript for tokens since the last commit, compute cost, append to `commits.jsonl` |
+| `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` |
+
+`log-commit` reads its price table from the embedded default, overridable with
+`--prices <path>` (or `CADENCE_METRICS_PRICES`). Set `CADENCE_METRICS_DEBUG=1`
+to add a `_keys` array of raw payload keys to subagent records — useful for
+spotting schema additions across Claude Code releases.
+
+Cost is computed **per model**: when a commit range spans multiple models
+(opus → sonnet handoffs, fast-mode toggles), each model's tokens are priced at
+its own rates and summed. Records carry the breakdown in a `byModel` array
+(`[{model, tokens, costUsd}]`); rows written before this field existed are
+single-model by definition.
+
+## lab (cadence-lab)
+
+Experimental hooks for the [cadence-lab](https://github.com/cameronsjo/cadence-lab)
+plugin. The first is the **self-representation persona ledger** — a two-hook system
+that captures a constrained, per-session self-representation and appends it to an
+append-only `~/.claude/persona/personas.jsonl`.
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `persona-nudge` | SessionStart (startup, clear) | Inject a contract asking the model to record a constrained self-representation to a per-session staging file |
+| `persona-gate` | PostToolUse (Write) | Validate the staging candidate; feed itemized corrections back for a rewrite, or promote the validated record into the ledger |
+
+The gate uses the `LoopBlock` outcome — exit 0 with `{"decision":"block","reason":...}`
+— rather than a hard `exit 2`, because `PostToolUse` fires *after* the write, so the
+re-prompt convention (not the block convention) is what drives the rewrite. Cheek mode
+ships `warn` (annotate a system-written `flags` field, still promote). Configure via
+`~/.claude/persona/config.json`; record shape in the plugin's `schema/persona.schema.json`.
+
+## session (cadence-canon)
+
+Multi-session coordination for the **cadence-canon** plugin (issue #54). Concurrent
+Claude Code sessions sharing one repo checkout cannot see each other — these hooks
+give sessions *identity* within a repo via a registry at `<repo>/.claude/sessions/`
+(one file per session, mtime is the liveness heartbeat, auto-excluded from git via
+`.git/info/exclude`).
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `start` | SessionStart | Register this session (deterministic adjective-noun name), sweep stale entries, and disclose live peers with a lane assessment + the multi-session protocol |
+| `heartbeat` | PostToolUse | Touch this session's registry file; refresh the recorded branch so peers see branch drift |
+| `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths |
+| `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time |
+
+Liveness is mtime-based: a session that crashes or closes simply stops heartbeating
+and is presumed dead after 10 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
+deregistration ceremony. Stale entries are swept on the next `session start`.
+
+### CLI actions (not hooks)
+
+A few `cadence-hooks` subcommands are operator commands, not hooks — they take
+no stdin payload, have no `hooks.json` wiring, and are not subject to
+`CADENCE_DISABLE`. They are exempt from `CADENCE_BYPASS` so they keep working
+during maintenance.
+
+| Command | What it does |
+|---------|--------------|
+| `session declare` | Declare what this session is working on (`--intent`, `--touching`) so peers can assess collision risk |
+| `session status` | List live and stale sessions registered in this repo |
+| `guardrails dismiss-main-branch-warn` | Snooze `warn-main-branch` for this repo for a bounded window (`--for 2h`, capped at 24h) — see [Snoozing warn-main-branch](configuration.md#snoozing-warn-main-branch) |

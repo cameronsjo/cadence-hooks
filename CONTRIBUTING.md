@@ -103,10 +103,10 @@ diagnostics that have no value on trivial sessions.
 ## Reproducing a Check by Hand
 
 A check is stdin JSON → exit code, so any reported bug (or new check) can be
-driven from the CLI without launching Claude Code. The README's
-[Testing Hooks Manually](README.md#testing-hooks-manually) section covers the
-operator-level workflow (`try`, bare-invocation guidance, event payload
-shapes); this section is the check-author's debugging loop.
+driven from the CLI without launching Claude Code.
+[docs/testing.md](docs/testing.md) covers the operator-level workflow (`try`,
+bare-invocation guidance, event payload shapes); this section is the
+check-author's debugging loop.
 
 ### Workflow
 
