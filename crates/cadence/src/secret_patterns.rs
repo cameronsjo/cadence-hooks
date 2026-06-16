@@ -57,6 +57,12 @@ pub fn is_safe_template(filename: &str) -> bool {
 pub fn is_blocked(filename: &str, path: &str) -> bool {
     let lower = filename.to_lowercase();
 
+    // The whole `.env` family — not just the handful in BLOCKED_FILENAMES — so
+    // the tool path agrees with the Bash path's predicate (#64).
+    if is_env_family_secret(&lower) {
+        return true;
+    }
+
     if BLOCKED_FILENAMES.iter().any(|&p| lower == p) {
         return true;
     }
@@ -90,20 +96,17 @@ pub fn is_ambiguous(filename: &str) -> bool {
     false
 }
 
-/// True if a shell token resolves to a dangerous `.env`-family file.
+/// True if a lowercased path component is a dangerous `.env`-family secret:
+/// `.env`, `.envrc`, or `.env.<x>` where `<x>` is non-empty and the component
+/// does not end in a [`SAFE_SUFFIXES`] template suffix (`.env.example`, etc.).
 ///
-/// Component-matched, not substring: the token's final path component must
-/// be `.env`, `.envrc`, or `.env.<something>` — minus [`SAFE_SUFFIXES`] — so
-/// `settings.environment`, `.environment`, and `my.envelope.txt` stay clean
-/// (closes the #86 substring false-block class for both secret guards).
-/// Strips one leading `@` (the curl/httpie upload-operand idiom `@.env`) and
-/// trailing `)` (subshell close) before classifying.
-pub fn is_dangerous_env_token(token: &str) -> bool {
-    let lower = token.to_lowercase();
-    let trimmed = lower.strip_prefix('@').unwrap_or(&lower);
-    let trimmed = trimmed.trim_end_matches(')');
-    let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
-
+/// Shared by [`is_blocked`] (the Read/Grep/Write/Edit tool paths) and
+/// [`is_dangerous_env_token`] (the Bash path) so the tool and shell guards
+/// classify the whole family by one predicate instead of `is_blocked`'s exact
+/// `BLOCKED_FILENAMES` membership — which missed `.env.prod`, `.env.dev`,
+/// `.env.development.local`, … and let the tools read what the shell blocked
+/// (#64). Callers pass an already-lowercased basename/component.
+pub(crate) fn is_env_family_secret(component: &str) -> bool {
     if component == ".env" || component == ".envrc" {
         return true;
     }
@@ -112,6 +115,23 @@ pub fn is_dangerous_env_token(token: &str) -> bool {
         Some(rest) if !rest.is_empty() => !SAFE_SUFFIXES.iter().any(|s| component.ends_with(s)),
         _ => false,
     }
+}
+
+/// True if a shell token resolves to a dangerous `.env`-family file.
+///
+/// Component-matched, not substring: the token's final path component must
+/// be `.env`, `.envrc`, or `.env.<something>` — minus [`SAFE_SUFFIXES`] — so
+/// `settings.environment`, `.environment`, and `my.envelope.txt` stay clean
+/// (closes the #86 substring false-block class for both secret guards).
+/// Strips one leading `@` (the curl/httpie upload-operand idiom `@.env`) and
+/// trailing `)` (subshell close) before classifying via [`is_env_family_secret`].
+pub fn is_dangerous_env_token(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    let trimmed = lower.strip_prefix('@').unwrap_or(&lower);
+    let trimmed = trimmed.trim_end_matches(')');
+    let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
+
+    is_env_family_secret(component)
 }
 
 #[cfg(test)]
@@ -132,6 +152,39 @@ mod tests {
         assert!(is_blocked(".env.local", "/project/.env.local"));
         assert!(is_blocked("credentials.json", "/project/credentials.json"));
         assert!(is_blocked("id_rsa", "/home/user/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn env_family_secret_detected() {
+        // Bare members.
+        assert!(is_env_family_secret(".env"));
+        assert!(is_env_family_secret(".envrc"));
+        // #64: family members absent from BLOCKED_FILENAMES.
+        assert!(is_env_family_secret(".env.prod"));
+        assert!(is_env_family_secret(".env.dev"));
+        assert!(is_env_family_secret(".env.development.local"));
+        assert!(is_env_family_secret(".env.docker"));
+        // Safe template suffixes stay allowed.
+        assert!(!is_env_family_secret(".env.example"));
+        assert!(!is_env_family_secret(".env.test"));
+        // Lookalikes that aren't the family.
+        assert!(!is_env_family_secret(".environment"));
+        assert!(!is_env_family_secret("settings.environment"));
+    }
+
+    #[test]
+    fn blocked_env_family_gap_closed() {
+        // #64: these are NOT in BLOCKED_FILENAMES but the Bash path already
+        // blocked them via is_dangerous_env_token — is_blocked now agrees.
+        assert!(is_blocked(".env.prod", "/project/.env.prod"));
+        assert!(is_blocked(".env.dev", "/project/.env.dev"));
+        assert!(is_blocked(
+            ".env.development.local",
+            "/project/.env.development.local"
+        ));
+        // Safe templates still allowed through is_blocked.
+        assert!(!is_blocked(".env.example", "/project/.env.example"));
+        assert!(!is_blocked(".env.test", "/project/.env.test"));
     }
 
     #[test]

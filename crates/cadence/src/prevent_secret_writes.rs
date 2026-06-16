@@ -464,6 +464,24 @@ mod tests {
     }
 
     #[test]
+    fn write_env_prod_blocked() {
+        // #64: .env.prod is not in BLOCKED_FILENAMES — Write let it through
+        // while the Bash path blocked the same family. Now both block.
+        let result = SecretWritesGuard.run(&make_write_input("/project/.env.prod"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_env_development_local_blocked() {
+        let result = SecretWritesGuard.run(&make_edit_input(
+            "/project/.env.development.local",
+            "old",
+            "new",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
     fn write_env_example_allowed() {
         let result = SecretWritesGuard.run(&make_write_input("/project/.env.example"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);

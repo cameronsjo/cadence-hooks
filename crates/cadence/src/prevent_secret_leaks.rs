@@ -530,6 +530,21 @@ mod tests {
     }
 
     #[test]
+    fn read_env_prod_blocked() {
+        // #64: .env.prod is not in BLOCKED_FILENAMES — the Bash path blocked
+        // `cat .env.prod` while Read let it through. Now both block.
+        let result = SecretLeaksGuard.run(&make_read_input("/project/.env.prod"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn grep_env_dev_blocked() {
+        // #64: tool-path parity for another family member missing from the list.
+        let result = SecretLeaksGuard.run(&make_grep_input("/project/.env.dev"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
     fn read_secrets_json_blocked() {
         let result = SecretLeaksGuard.run(&make_read_input("/project/secrets.json"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
@@ -769,10 +784,14 @@ mod tests {
 
     #[test]
     fn null_byte_injection_blocked() {
+        // After null-byte removal the path is "/project/.env.txt". Under the
+        // unified #64 predicate that is `.env.<x>` (x = "txt", not a safe
+        // suffix), so it blocks on the tool path exactly as `cat .env.txt`
+        // already blocked on the Bash path — the null byte cannot smuggle an
+        // .env-family file past. (Pre-#64 this returned Allow, encoding the
+        // tool-vs-Bash divergence this fix removes.)
         let result = SecretLeaksGuard.run(&make_read_input("/project/.env\0.txt"));
-        // After null byte removal: "/project/.env.txt" - not a blocked name
-        // But the key is that \0 doesn't help bypass — ".env" files still blocked
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
