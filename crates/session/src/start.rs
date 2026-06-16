@@ -51,22 +51,31 @@ pub fn run_start(
         return CheckResult::allow();
     };
 
-    // Housekeeping: presumed-dead sessions leave the room before roll call.
-    registry::sweep_stale(dir, stale_secs);
-
     // Register (or re-register on resume/clear/compact — preserves any
-    // declared intent/touching from earlier in the session).
+    // declared intent/touching from earlier in the session). This runs
+    // *before* the sweep: writing the record refreshes our own mtime to ~now,
+    // so a session that went quiet (a read/think phase) and re-enters via
+    // /clear or compaction can never sweep its own aged file and then rebuild
+    // a minimal record stripped of its intent/touching lanes (#69).
     let record = match registry::read_own(dir, sid) {
         Some(mut existing) => {
             if branch.is_some() {
-                existing.branch = branch;
+                existing.branch = branch.clone();
+            }
+            // Back-fill the drift baseline for a pre-upgrade record that never
+            // had one. Re-registering at start is the session (re)establishing
+            // where it intends to commit, so live HEAD is the correct baseline;
+            // an existing baseline is preserved (its own self-switch set it).
+            if existing.declared_branch.is_none() {
+                existing.declared_branch = branch.clone();
             }
             existing
         }
         None => SessionRecord {
             name: identity::generate_name(sid),
             session_id: sid.to_string(),
-            branch,
+            branch: branch.clone(),
+            declared_branch: branch,
             started: identity::utc_timestamp(),
             started_epoch: identity::now_epoch(),
             ..Default::default()
@@ -76,6 +85,10 @@ pub fn run_start(
         // Fail open: a read-only filesystem must not break session start.
         return CheckResult::allow();
     }
+
+    // Housekeeping: presumed-dead peers leave the room before roll call. Our
+    // own (just-refreshed) file is excluded by sid as defense-in-depth.
+    registry::sweep_stale(dir, stale_secs, sid);
 
     // Disclose live peers, if any.
     let peers = registry::live_peers(dir, sid, stale_secs);
@@ -212,6 +225,37 @@ mod tests {
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
         assert_eq!(back.intent.as_deref(), Some("cadence-hooks#54"));
         assert_eq!(back.branch.as_deref(), Some("feat/x"));
+    }
+
+    #[test]
+    fn self_sweep_on_restart_preserves_intent_and_touching() {
+        // Bug #69: a session that went quiet long enough for its own file to
+        // age past the threshold, then re-enters (/clear, compaction), must not
+        // sweep its own file and rebuild a minimal record stripped of its
+        // declared lanes. Register-before-sweep + own-sid exclusion guarantee it.
+        let tmp = TempDir::new().unwrap();
+
+        // First registration + declaration.
+        let input = make_session_with_cwd("self-session", "startup", "/tmp");
+        run_start(&input, tmp.path(), Some("main".into()), 600);
+        let mut rec = registry::read_own(tmp.path(), "self-session").unwrap();
+        rec.intent = Some("cadence-hooks#69".into());
+        rec.touching = vec!["crates/session/".into()];
+        registry::write_record(tmp.path(), &rec).unwrap();
+
+        // Let the own file age, then re-register with a zero-second threshold so
+        // the OLD sweep-first ordering would have deleted it before read_own.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let input = make_session_with_cwd("self-session", "clear", "/tmp");
+        run_start(&input, tmp.path(), Some("main".into()), 0);
+
+        let back = registry::read_own(tmp.path(), "self-session").unwrap();
+        assert_eq!(
+            back.intent.as_deref(),
+            Some("cadence-hooks#69"),
+            "intent preserved across self-restart, not minimal-rebuilt"
+        );
+        assert_eq!(back.touching, vec!["crates/session/"]);
     }
 
     // --- disclosure ---

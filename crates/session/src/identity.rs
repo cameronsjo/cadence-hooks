@@ -18,6 +18,12 @@ pub struct SessionRecord {
     /// Git branch at registration / last heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The branch this session intends to commit on — its drift baseline.
+    /// Distinct from `branch` (last-observed HEAD): moves only when THIS session
+    /// performs an explicit checkout/switch, so a peer moving shared HEAD stays
+    /// detectable at commit time. Back-filled from live HEAD on first `session start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_branch: Option<String>,
     /// What the session is working on (e.g. `cadence-hooks#54`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
@@ -326,6 +332,7 @@ mod tests {
             name: "quiet-loom".into(),
             session_id: "e4739a12".into(),
             branch: Some("feat/issue-52".into()),
+            declared_branch: Some("feat/issue-52".into()),
             intent: Some("cadence-hooks#52".into()),
             touching: vec!["crates/guardrails/".into()],
             started: "2026-06-02T01:26:05Z".into(),
@@ -357,6 +364,9 @@ mod tests {
             serde_json::from_str(r#"{"name":"a-b","session_id":"s1"}"#).unwrap();
         assert_eq!(record.name, "a-b");
         assert!(record.branch.is_none());
+        // A pre-upgrade record (no declared_branch key) parses to None — no
+        // migration needed; it self-heals on the next `session start` back-fill.
+        assert!(record.declared_branch.is_none());
         assert!(record.touching.is_empty());
     }
 
