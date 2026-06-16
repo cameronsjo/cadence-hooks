@@ -62,10 +62,16 @@ pub fn run_start(
             if branch.is_some() {
                 existing.branch = branch.clone();
             }
-            // Back-fill the drift baseline for a pre-upgrade record that never
-            // had one. Re-registering at start is the session (re)establishing
-            // where it intends to commit, so live HEAD is the correct baseline;
-            // an existing baseline is preserved (its own self-switch set it).
+            // Back-fill the drift baseline ONLY for a pre-upgrade record that
+            // never had one. An existing baseline is deliberately preserved
+            // even when live HEAD differs from it at re-registration: at start
+            // we cannot tell whether HEAD moved because THIS session switched
+            // (should re-anchor) or because a PEER moved shared HEAD (must NOT
+            // re-anchor). Re-anchoring on any observed-branch change would
+            // re-absorb a peer's checkout and silently reopen the #70 bypass.
+            // Leaving a stale baseline is the safe failure: it yields an
+            // over-eager drift nudge, never a missed one, and a real self-switch
+            // re-baselines it via the heartbeat anyway.
             if existing.declared_branch.is_none() {
                 existing.declared_branch = branch.clone();
             }
@@ -225,6 +231,12 @@ mod tests {
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
         assert_eq!(back.intent.as_deref(), Some("cadence-hooks#54"));
         assert_eq!(back.branch.as_deref(), Some("feat/x"));
+        // The drift baseline is PRESERVED across re-registration, not re-anchored
+        // to the new observed HEAD: at start we can't distinguish a self-switch
+        // from a peer's HEAD move, so re-anchoring would reopen #70. A stale
+        // baseline (here: still `main`) is the safe direction — an over-eager
+        // nudge, never a missed one (code-review C2).
+        assert_eq!(back.declared_branch.as_deref(), Some("main"));
     }
 
     #[test]

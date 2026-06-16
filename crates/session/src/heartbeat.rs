@@ -11,7 +11,7 @@
 use crate::guard;
 use crate::identity;
 use crate::registry;
-use cadence_hooks_core::shell::{git_command, strip_quotes};
+use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::{Logger, MetricsInput};
 
 /// Touch this session's registry file (mtime = heartbeat).
@@ -43,19 +43,22 @@ impl Logger for Heartbeat {
 
 /// Testable core: upsert the session's record, refreshing mtime and the
 /// last-observed branch. `command` is the triggering tool's Bash command, if
-/// any; the drift baseline moves only when it is THIS session's own
-/// `git checkout`/`switch`. Quotes are stripped first so a quoted command (e.g.
-/// `echo 'git checkout x'`) is not mistaken for a real switch — the same
-/// discipline `guard`/`branch_drift` apply before calling these parsers.
+/// any; the drift baseline (`declared_branch`) moves only when it is THIS
+/// session's own `git checkout`/`switch`.
+///
+/// The RAW command is handed to [`guard::is_branch_switch`] — NOT pre-stripped
+/// of quotes. That parser strips heredoc bodies and requires `git` to lead a
+/// segment, so prose like `echo git checkout x` (and heredoc bodies) cannot
+/// re-anchor the baseline, while a quoted branch argument (`git checkout
+/// 'feat/x'`) is still recognized. Pre-`strip_quotes` would erase the argument
+/// and miss a real switch, then falsely flag the next commit as drift (#70).
 pub fn run_heartbeat(
     dir: &std::path::Path,
     session_id: &str,
     branch: Option<String>,
     command: Option<&str>,
 ) {
-    let is_self_switch = command
-        .map(|c| guard::is_branch_switch(&strip_quotes(c)))
-        .unwrap_or(false);
+    let is_self_switch = command.map(guard::is_branch_switch).unwrap_or(false);
     let _ = registry::touch_own(dir, session_id, branch, is_self_switch);
 }
 
@@ -136,13 +139,84 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_quoted_checkout_updates_declared_baseline() {
+        // A self-switch whose branch argument is QUOTED is still a real switch.
+        // The raw command reaches is_branch_switch (no pre-strip_quotes), so the
+        // baseline re-anchors and a later commit on that branch is not falsely
+        // flagged as drift (code-review C1).
+        let tmp = TempDir::new().unwrap();
+        let rec = SessionRecord {
+            name: "quiet-loom".into(),
+            session_id: "self-session".into(),
+            branch: Some("main".into()),
+            declared_branch: Some("main".into()),
+            ..Default::default()
+        };
+        registry::write_record(tmp.path(), &rec).unwrap();
+
+        run_heartbeat(
+            tmp.path(),
+            "self-session",
+            Some("feat/mine".into()),
+            Some("git checkout 'feat/mine'"),
+        );
+
+        let back = registry::read_own(tmp.path(), "self-session").unwrap();
+        assert_eq!(
+            back.declared_branch.as_deref(),
+            Some("feat/mine"),
+            "quoted-branch switch re-baselines (raw command parsed, arg not stripped)"
+        );
+    }
+
+    #[test]
+    fn heartbeat_prose_git_checkout_does_not_rebaseline() {
+        // Security #70/I1: a non-switch command that merely MENTIONS a checkout
+        // (a peer moved HEAD, then this session echoed/wrote git-workflow prose)
+        // must NOT re-anchor the baseline — otherwise the peer's branch is
+        // absorbed and drift vanishes at commit. `git` is not leading here.
+        let tmp = TempDir::new().unwrap();
+        let rec = SessionRecord {
+            name: "quiet-loom".into(),
+            session_id: "self-session".into(),
+            branch: Some("main".into()),
+            declared_branch: Some("main".into()),
+            ..Default::default()
+        };
+        registry::write_record(tmp.path(), &rec).unwrap();
+
+        // Peer moved HEAD to feat/peer; this session only echoes prose about it.
+        run_heartbeat(
+            tmp.path(),
+            "self-session",
+            Some("feat/peer".into()),
+            Some("echo run git checkout feat/peer to reproduce"),
+        );
+
+        let back = registry::read_own(tmp.path(), "self-session").unwrap();
+        assert_eq!(
+            back.branch.as_deref(),
+            Some("feat/peer"),
+            "observed branch still refreshes for display"
+        );
+        assert_eq!(
+            back.declared_branch.as_deref(),
+            Some("main"),
+            "baseline unchanged — prose `git checkout` is not a self-switch (#70/I1)"
+        );
+    }
+
+    #[test]
     fn heartbeat_creates_record_when_missing() {
         // A heartbeat firing before `session start` (partial plugin wiring)
         // must still register the session.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("sessions");
         run_heartbeat(&dir, "unregistered-session", Some("main".into()), None);
-        assert!(registry::read_own(&dir, "unregistered-session").is_some());
+        let back = registry::read_own(&dir, "unregistered-session").unwrap();
+        // A pre-start heartbeat seeds the drift baseline from live HEAD — this
+        // is the invariant run_drift relies on (code-review N4).
+        assert_eq!(back.declared_branch.as_deref(), Some("main"));
     }
 
     #[test]

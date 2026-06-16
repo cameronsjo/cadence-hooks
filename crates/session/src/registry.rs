@@ -250,6 +250,10 @@ mod tests {
             name: name.into(),
             session_id: session_id.into(),
             branch: Some("main".into()),
+            // Mirror the production path (run_start / touch_own set branch and
+            // declared_branch together), so a test that feeds this record to
+            // run_drift gets a real baseline instead of a silent None→allow.
+            declared_branch: Some("main".into()),
             started: "2026-06-02T00:00:00Z".into(),
             started_epoch: identity::now_epoch(),
             ..Default::default()

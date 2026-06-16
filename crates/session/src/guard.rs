@@ -14,7 +14,7 @@
 //! unparsable command must never stop work.
 
 use crate::registry::{self, Peer};
-use cadence_hooks_core::shell::strip_quotes;
+use cadence_hooks_core::shell::{split_segments, strip_quotes};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Warn when an action intersects a live peer's lane.
@@ -104,18 +104,33 @@ pub fn run_guard(input: &HookInput, peers: &[Peer]) -> CheckResult {
 /// True when the command switches branches: `git checkout <branch>`,
 /// `git checkout -b <new>`, `git switch <branch>`.
 ///
+/// `git` must be the **leading** word of a `&&`/`;`/`|`-separated segment, and
+/// heredoc bodies are stripped first ([`split_segments`]). So a `git` token
+/// buried in prose (`echo git checkout x`) or in a heredoc body is not mistaken
+/// for this session executing a switch. Operating on the raw command (no
+/// pre-`strip_quotes`) also keeps a quoted branch argument intact, so
+/// `git checkout 'feat/x'` is still recognized.
+///
 /// `git checkout -- <path>` and `git checkout <ref> -- <path>` are file
 /// restores, not switches. `git checkout <path>` without `--` is ambiguous
-/// without repo knowledge — treated as a switch (this is a nudge, not a
-/// block; a false positive costs one line of context).
+/// without repo knowledge — treated as a switch.
+///
+/// Two callers depend on this: the `session guard` nudge (a false positive
+/// costs one line of context) and the `heartbeat` drift baseline (a false
+/// positive silently re-anchors `declared_branch` and suppresses #70 drift
+/// detection). The leading-word + heredoc discipline keeps both honest; when in
+/// doubt it returns `false`, the safe direction for the baseline (an unmoved
+/// baseline yields an over-eager nudge, never a missed one).
 pub fn is_branch_switch(command: &str) -> bool {
-    for segment in command.split(&['&', ';', '|'][..]) {
+    for segment in split_segments(command) {
         let tokens: Vec<&str> = segment.split_whitespace().collect();
-        let Some(git_pos) = tokens.iter().position(|t| *t == "git") else {
+        // `git` must LEAD the segment — a mid-command or prose `git` is not a
+        // switch this session executed.
+        if tokens.first() != Some(&"git") {
             continue;
-        };
+        }
         // Skip git's own flags/options (e.g. `git -C /path checkout x`).
-        let mut idx = git_pos + 1;
+        let mut idx = 1;
         while idx < tokens.len() && (tokens[idx].starts_with('-') || tokens[idx - 1] == "-C") {
             idx += 1;
         }
@@ -436,10 +451,33 @@ mod tests {
         assert!(is_branch_switch("git checkout -b new-branch"));
         assert!(is_branch_switch("git switch -c new-branch"));
         assert!(is_branch_switch("cd /x && git checkout other"));
+        // A quoted branch ARGUMENT is still a real switch — the raw command is
+        // parsed (no pre-strip_quotes erasing the argument).
+        assert!(is_branch_switch("git checkout 'feat/mine'"));
+        assert!(is_branch_switch("git switch -c \"new-branch\""));
         assert!(!is_branch_switch("git checkout -- file.rs"));
         assert!(!is_branch_switch("git status"));
         assert!(!is_branch_switch("git checkout"));
         assert!(!is_branch_switch("echo checkout main"));
+    }
+
+    #[test]
+    fn branch_switch_rejects_non_leading_git_and_heredoc_prose() {
+        // #70/I1: `git` must LEAD a segment. A `git checkout` in prose or a
+        // heredoc body is not this session switching — treating it as one would
+        // re-anchor the drift baseline and silently suppress detection.
+        assert!(!is_branch_switch("echo git checkout feat/x"));
+        assert!(!is_branch_switch(
+            "printf 'run git checkout feat/x to repro'"
+        ));
+        // Heredoc body mentioning a switch — body is stripped by split_segments,
+        // even when it contains an operator before the `git` token.
+        assert!(!is_branch_switch(
+            "cat > pr.md <<'EOF'\nrepro: foo; git checkout feat/peer\nEOF"
+        ));
+        // A real switch chained after another command still counts (git leads
+        // its own segment).
+        assert!(is_branch_switch("git commit -m wip; git checkout feat/x"));
     }
 
     #[test]
