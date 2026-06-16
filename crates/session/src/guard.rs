@@ -170,10 +170,11 @@ pub fn is_branch_switch(command: &str) -> bool {
 }
 
 /// True when a leading `git` invocation redirects to another working tree via
-/// `-C <path>`. Such a checkout/switch does not move the current directory's
-/// HEAD, so the heartbeat must not treat it as a self-switch and re-anchor the
-/// drift baseline (#70/R2). The guard's lane nudge stays permissive — a `-C`
-/// path may resolve to cwd — so only the heartbeat consults this.
+/// `-C <path>`, `--work-tree`, or `--git-dir`. Such a checkout/switch does not
+/// move the current directory's HEAD, so the heartbeat must not treat it as a
+/// self-switch and re-anchor the drift baseline (#70/R2). The guard's lane nudge
+/// stays permissive — a `-C` path may resolve to cwd — so only the heartbeat
+/// consults this.
 pub fn redirects_to_other_tree(command: &str) -> bool {
     for segment in split_segments(command) {
         let tokens: Vec<&str> = segment.split_whitespace().collect();
@@ -181,10 +182,18 @@ pub fn redirects_to_other_tree(command: &str) -> bool {
             continue;
         }
         // git's own options run from token 1 until the first non-flag (the
-        // subcommand); a `-C` anywhere in that span redirects the working tree.
+        // subcommand); a redirect flag anywhere in that span points git at
+        // another working tree. Cover both the `-C <path>` / `--work-tree <p>`
+        // (separate) and `--work-tree=<p>` / `--git-dir=<p>` (joined) forms.
         let mut i = 1;
         while i < tokens.len() && (tokens[i].starts_with('-') || tokens[i - 1] == "-C") {
-            if tokens[i] == "-C" {
+            let t = tokens[i];
+            if t == "-C"
+                || t == "--work-tree"
+                || t == "--git-dir"
+                || t.starts_with("--work-tree=")
+                || t.starts_with("--git-dir=")
+            {
                 return true;
             }
             i += 1;
@@ -504,8 +513,19 @@ mod tests {
         assert!(redirects_to_other_tree("git -C ../other checkout main"));
         assert!(redirects_to_other_tree("git -C /abs/repo switch feat/x"));
         assert!(redirects_to_other_tree("cd /x && git -C sub checkout y"));
+        // The whole tree-redirect flag class, joined and separate forms.
+        assert!(redirects_to_other_tree(
+            "git --work-tree=/other checkout main"
+        ));
+        assert!(redirects_to_other_tree(
+            "git --git-dir=/o/.git switch feat/x"
+        ));
+        assert!(redirects_to_other_tree(
+            "git --work-tree /other checkout main"
+        ));
         // No redirect → plain switches and non-switches alike are not "other".
         assert!(!redirects_to_other_tree("git checkout main"));
+        // `-c` (lowercase, a config override) is NOT `-C` (a directory redirect).
         assert!(!redirects_to_other_tree(
             "git -c color.ui=always checkout x"
         ));
