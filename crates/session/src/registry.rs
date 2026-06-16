@@ -12,9 +12,13 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Default staleness threshold in minutes.
-pub const DEFAULT_STALE_MINUTES: u64 = 10;
+///
+/// Liveness is mtime-only and the heartbeat fires only on Bash/Edit/Write, so a
+/// session in a long read/think phase emits no signal. 30 min keeps such a
+/// session out of the sweep's reach far more reliably than the original 10.
+pub const DEFAULT_STALE_MINUTES: u64 = 30;
 
-/// Staleness threshold from `CADENCE_SESSION_STALE_MINUTES`, default 10.
+/// Staleness threshold from `CADENCE_SESSION_STALE_MINUTES`, default 30.
 /// Zero or unparsable values fall back to the default.
 pub fn stale_minutes() -> u64 {
     std::env::var("CADENCE_SESSION_STALE_MINUTES")
@@ -131,20 +135,37 @@ pub fn read_own(dir: &Path, session_id: &str) -> Option<SessionRecord> {
 }
 
 /// Upsert a session's record: refresh mtime (the heartbeat), update the
-/// branch when it changed, and create a minimal record if missing (so a
-/// heartbeat firing before `session start` still registers the session).
-pub fn touch_own(dir: &Path, session_id: &str, branch: Option<String>) -> std::io::Result<()> {
+/// observed `branch` when it changed, and create a minimal record if missing
+/// (so a heartbeat firing before `session start` still registers the session).
+///
+/// `is_self_switch` is true only when the triggering command is THIS session's
+/// own `git checkout`/`switch`. The drift baseline (`declared_branch`) moves
+/// solely on a self-switch — a non-switch heartbeat refreshes the last-observed
+/// `branch` (which may be a peer's HEAD move) but leaves the baseline alone, so
+/// the divergence stays detectable at `git commit`.
+pub fn touch_own(
+    dir: &Path,
+    session_id: &str,
+    branch: Option<String>,
+    is_self_switch: bool,
+) -> std::io::Result<()> {
     let record = match read_own(dir, session_id) {
         Some(mut existing) => {
             if branch.is_some() && existing.branch != branch {
-                existing.branch = branch;
+                existing.branch = branch.clone();
+            }
+            if is_self_switch && branch.is_some() {
+                // This session deliberately switched — re-baseline the drift
+                // reference to where it now intends to commit.
+                existing.declared_branch = branch;
             }
             existing
         }
         None => SessionRecord {
             name: identity::generate_name(session_id),
             session_id: session_id.to_string(),
-            branch,
+            branch: branch.clone(),
+            declared_branch: branch,
             started: identity::utc_timestamp(),
             started_epoch: identity::now_epoch(),
             ..Default::default()
@@ -153,14 +174,31 @@ pub fn touch_own(dir: &Path, session_id: &str, branch: Option<String>) -> std::i
     write_record(dir, &record)
 }
 
-/// Delete registry files whose mtime is older than `stale_secs`.
-pub fn sweep_stale(dir: &Path, stale_secs: u64) {
+/// Delete registry files whose mtime is older than `stale_secs`, never the
+/// caller's own file.
+///
+/// `own_session_id` is matched the same way [`find_own`] matches — by the
+/// `.<short-id>.json` filename suffix — and excluded from the sweep even when
+/// aged. A quiet session (read/think phase, or paused) still owns its lane;
+/// only `session start` itself, having just refreshed its own mtime, should
+/// reach this, and the exclusion is defense-in-depth against a self-sweep.
+/// Pass `""` to sweep everything (CLI/tests with no own session).
+pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
+    let own_suffix = (!own_session_id.is_empty())
+        .then(|| format!(".{}.json", identity::short_id(own_session_id)));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(suffix) = &own_suffix
+            && path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(suffix.as_str()))
+        {
             continue;
         }
         if let Some(age) = mtime_age_secs(&path)
@@ -212,6 +250,10 @@ mod tests {
             name: name.into(),
             session_id: session_id.into(),
             branch: Some("main".into()),
+            // Mirror the production path (run_start / touch_own set branch and
+            // declared_branch together), so a test that feeds this record to
+            // run_drift gets a real baseline instead of a silent None→allow.
+            declared_branch: Some("main".into()),
             started: "2026-06-02T00:00:00Z".into(),
             started_epoch: identity::now_epoch(),
             ..Default::default()
@@ -330,7 +372,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         write_record(&dir, &record("quiet-loom", "self-session")).unwrap();
-        touch_own(&dir, "self-session", Some("feat/new-branch".into())).unwrap();
+        touch_own(&dir, "self-session", Some("feat/new-branch".into()), false).unwrap();
         let back = read_own(&dir, "self-session").unwrap();
         assert_eq!(back.branch.as_deref(), Some("feat/new-branch"));
     }
@@ -340,7 +382,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         write_record(&dir, &record("quiet-loom", "self-session")).unwrap();
-        touch_own(&dir, "self-session", None).unwrap();
+        touch_own(&dir, "self-session", None, false).unwrap();
         let back = read_own(&dir, "self-session").unwrap();
         assert_eq!(back.branch.as_deref(), Some("main"));
     }
@@ -349,10 +391,12 @@ mod tests {
     fn touch_own_creates_record_when_missing() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("sessions");
-        touch_own(&dir, "brand-new-session", Some("main".into())).unwrap();
+        touch_own(&dir, "brand-new-session", Some("main".into()), false).unwrap();
         let back = read_own(&dir, "brand-new-session").unwrap();
         assert_eq!(back.session_id, "brand-new-session");
         assert!(!back.name.is_empty());
+        // A brand-new record establishes its drift baseline from live HEAD.
+        assert_eq!(back.declared_branch.as_deref(), Some("main"));
     }
 
     #[test]
@@ -363,7 +407,7 @@ mod tests {
         rec.intent = Some("cadence-hooks#54".into());
         rec.touching = vec!["crates/session/".into()];
         write_record(&dir, &rec).unwrap();
-        touch_own(&dir, "self-session", Some("other-branch".into())).unwrap();
+        touch_own(&dir, "self-session", Some("other-branch".into()), false).unwrap();
         let back = read_own(&dir, "self-session").unwrap();
         assert_eq!(back.intent.as_deref(), Some("cadence-hooks#54"));
         assert_eq!(back.touching, vec!["crates/session/"]);
@@ -379,14 +423,35 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         write_record(&dir, &record("fresh-face", "new-session")).unwrap();
         // stale_secs = 0: the old file (age ≥ 1s) is stale, the fresh one (age 0) is not.
-        sweep_stale(&dir, 0);
+        sweep_stale(&dir, 0, "");
         assert!(find_own(&dir, "old-session").is_none(), "stale swept");
         assert!(find_own(&dir, "new-session").is_some(), "fresh kept");
     }
 
     #[test]
+    fn sweep_never_removes_own_file_even_when_aged() {
+        // Bug #69: a quiet (read/think-phase) session whose own file aged past
+        // the threshold must not sweep itself; a peer that aged is still swept.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("my-self", "own-session")).unwrap();
+        write_record(&dir, &record("the-peer", "peer-session")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // stale_secs = 0: both files have aged ≥ 1s, but own is excluded by sid.
+        sweep_stale(&dir, 0, "own-session");
+        assert!(
+            find_own(&dir, "own-session").is_some(),
+            "own aged file is NOT swept"
+        );
+        assert!(
+            find_own(&dir, "peer-session").is_none(),
+            "peer aged file IS swept"
+        );
+    }
+
+    #[test]
     fn sweep_missing_directory_is_noop() {
-        sweep_stale(Path::new("/nonexistent/sessions"), 0);
+        sweep_stale(Path::new("/nonexistent/sessions"), 0, "");
     }
 
     // --- git exclude ---
@@ -445,6 +510,6 @@ mod tests {
         // Note: tests run in parallel; avoid mutating the env var here. The
         // default path is what matters — env parsing is exercised by the
         // filter/parse chain which is simple enough to verify by reading.
-        assert_eq!(DEFAULT_STALE_MINUTES, 10);
+        assert_eq!(DEFAULT_STALE_MINUTES, 30);
     }
 }

@@ -2,15 +2,20 @@
 //!
 //! Concurrent sessions share one working tree, so HEAD can move out from under
 //! a session when a peer (or the user in another terminal) runs `git checkout`.
-//! The registry already holds the baseline: each session's own `branch` field
-//! is written at `session start` and refreshed by the PostToolUse heartbeat on
-//! every git op. Because the heartbeat keeps `recorded == current` for *this*
-//! session's own checkouts, a mismatch at `git commit` time means HEAD moved
-//! due to something other than this session — "changed out from under you."
+//! The registry holds each session's drift baseline in its `declared_branch`
+//! field: set at `session start` and re-baselined by the PostToolUse heartbeat
+//! *only* when THIS session itself runs `git checkout`/`switch`. A peer moving
+//! shared HEAD refreshes the session's last-observed `branch` but leaves
+//! `declared_branch` untouched — so at `git commit` time a mismatch between
+//! live HEAD and the baseline means HEAD moved due to something other than this
+//! session: "changed out from under you."
 //!
 //! Detection is therefore a pure comparison: live `git branch --show-current`
-//! versus this session's recorded branch. No new state, and no false positives
-//! from one's own branch switches (the heartbeat already caught those).
+//! versus this session's `declared_branch` baseline. No new state on the commit
+//! path, and no false positives from one's own branch switches (the heartbeat
+//! re-baselined those). A record with no baseline yet — a pre-upgrade file that
+//! predates this field — fails open to `allow()` until the next `session start`
+//! back-fills it.
 //!
 //! Always `allow()` or `nudge()` — drift can be intentional, and a registry or
 //! git problem must never stop a commit (ADR-0001).
@@ -59,14 +64,15 @@ impl Check for WarnBranchDrift {
     }
 }
 
-/// Testable core: compare the live branch against the session's recorded
+/// Testable core: compare the live branch against the session's `declared_branch`
 /// baseline. `current` is the live `git branch --show-current` result, injected
 /// so tests can target a tempdir registry without a real git repository.
 ///
-/// `None` recorded (unregistered, or registered before a branch was known) or
-/// `None`/empty `current` (detached HEAD, not a repo) → `allow()`.
+/// `None` baseline (unregistered, or a pre-upgrade record with no
+/// `declared_branch` yet) or `None`/empty `current` (detached HEAD, not a repo)
+/// → `allow()`.
 pub fn run_drift(dir: &Path, session_id: &str, current: Option<&str>) -> CheckResult {
-    let Some(recorded) = registry::read_own(dir, session_id).and_then(|r| r.branch) else {
+    let Some(recorded) = registry::read_own(dir, session_id).and_then(|r| r.declared_branch) else {
         return CheckResult::allow();
     };
     let Some(current) = current.filter(|c| !c.is_empty()) else {
@@ -128,11 +134,15 @@ mod tests {
     use cadence_hooks_core::test_builders::make_bash;
     use tempfile::TempDir;
 
+    /// Seed a record whose drift baseline (`declared_branch`) — what `run_drift`
+    /// now compares against — is `branch`. The observed `branch` is set to the
+    /// same value, the steady state of a session that has not drifted.
     fn seed_record(dir: &Path, session_id: &str, branch: Option<&str>) {
         let rec = SessionRecord {
             name: "quiet-loom".into(),
             session_id: session_id.into(),
             branch: branch.map(String::from),
+            declared_branch: branch.map(String::from),
             ..Default::default()
         };
         registry::write_record(dir, &rec).unwrap();
@@ -272,6 +282,43 @@ mod tests {
             run_drift(tmp.path(), "self-session", Some("")).outcome,
             Outcome::Allow,
             "empty current → allow"
+        );
+    }
+
+    // --- #70: baseline survives a peer's HEAD move, self-switch re-baselines ---
+
+    #[test]
+    fn peer_checkout_drift_is_detected() {
+        // Session starts on main (baseline = main). A peer runs `git checkout
+        // feat/peer`, then this session does non-git work — a non-switch
+        // heartbeat observes feat/peer but the baseline stays main. At commit,
+        // live HEAD feat/peer vs baseline main → drift detected.
+        let tmp = TempDir::new().unwrap();
+        seed_record(tmp.path(), "self-session", Some("main"));
+        // Non-switch heartbeat absorbing the peer-moved HEAD.
+        registry::touch_own(tmp.path(), "self-session", Some("feat/peer".into()), false).unwrap();
+
+        let r = run_drift(tmp.path(), "self-session", Some("feat/peer"));
+        assert_eq!(r.outcome, Outcome::Nudge, "peer-moved HEAD is flagged");
+        let msg = r.message.unwrap();
+        assert!(msg.contains("feat/peer"), "live branch named: {msg}");
+        assert!(msg.contains("main"), "baseline named: {msg}");
+    }
+
+    #[test]
+    fn self_checkout_is_not_falsely_flagged() {
+        // Session starts on main, then deliberately switches to feat/mine — a
+        // self-switch heartbeat re-baselines declared_branch to feat/mine. At
+        // commit, live HEAD feat/mine == baseline feat/mine → no false positive.
+        let tmp = TempDir::new().unwrap();
+        seed_record(tmp.path(), "self-session", Some("main"));
+        // Self-switch heartbeat re-baselines to the new branch.
+        registry::touch_own(tmp.path(), "self-session", Some("feat/mine".into()), true).unwrap();
+
+        assert_eq!(
+            run_drift(tmp.path(), "self-session", Some("feat/mine")).outcome,
+            Outcome::Allow,
+            "own branch switch must not be flagged as drift",
         );
     }
 }
