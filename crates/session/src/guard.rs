@@ -129,7 +129,12 @@ pub fn is_branch_switch(command: &str) -> bool {
         if tokens.first() != Some(&"git") {
             continue;
         }
-        // Skip git's own flags/options (e.g. `git -C /path checkout x`).
+        // Skip git's own flags/options (e.g. `git -C /path checkout x`). Note
+        // the GUARD intentionally keeps `-C` here: a `-C <path>` may resolve to
+        // cwd, so the lane nudge stays conservative. The HEARTBEAT applies the
+        // stricter `-C` exclusion separately (see `redirects_to_other_tree`),
+        // because re-anchoring the drift baseline off another repo's switch
+        // would suppress #70 (R2).
         let mut idx = 1;
         while idx < tokens.len() && (tokens[idx].starts_with('-') || tokens[idx - 1] == "-C") {
             idx += 1;
@@ -144,21 +149,45 @@ pub fn is_branch_switch(command: &str) -> bool {
         if rest.is_empty() {
             continue;
         }
-        // `--` before any non-flag argument → file restore, not a switch.
-        let first_non_flag = rest.iter().position(|t| !t.starts_with('-'));
-        let double_dash = rest.iter().position(|t| *t == "--");
-        match (first_non_flag, double_dash) {
-            (_, Some(dd)) if first_non_flag.is_none_or(|nf| dd < nf) => continue,
-            (None, None) => {
-                // Only flags (e.g. `git switch -c` missing its arg, `git checkout -b`).
-                // `-b`/`-c` create-and-switch even when the name is on the next
-                // token that didn't parse — treat flag-only as a switch attempt.
-                if rest.iter().any(|t| *t == "-b" || *t == "-c") {
-                    return true;
-                }
-                continue;
+        // Any bare `--` token means a file restore (`git checkout [<ref>] --
+        // <path>`) — git does NOT move HEAD. `git switch` never accepts `--`,
+        // and a real branch switch never needs it, so any `--` is an
+        // unambiguous restore, not a switch (R1).
+        if rest.contains(&"--") {
+            continue;
+        }
+        // `-b`/`-c` create-and-switch even when the branch name parsed as a
+        // later operand; otherwise a non-flag token is the target branch.
+        if rest
+            .iter()
+            .any(|t| *t == "-b" || *t == "-c" || !t.starts_with('-'))
+        {
+            return true;
+        }
+        continue;
+    }
+    false
+}
+
+/// True when a leading `git` invocation redirects to another working tree via
+/// `-C <path>`. Such a checkout/switch does not move the current directory's
+/// HEAD, so the heartbeat must not treat it as a self-switch and re-anchor the
+/// drift baseline (#70/R2). The guard's lane nudge stays permissive — a `-C`
+/// path may resolve to cwd — so only the heartbeat consults this.
+pub fn redirects_to_other_tree(command: &str) -> bool {
+    for segment in split_segments(command) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        if tokens.first() != Some(&"git") {
+            continue;
+        }
+        // git's own options run from token 1 until the first non-flag (the
+        // subcommand); a `-C` anywhere in that span redirects the working tree.
+        let mut i = 1;
+        while i < tokens.len() && (tokens[i].starts_with('-') || tokens[i - 1] == "-C") {
+            if tokens[i] == "-C" {
+                return true;
             }
-            _ => return true,
+            i += 1;
         }
     }
     false
@@ -459,6 +488,28 @@ mod tests {
         assert!(!is_branch_switch("git status"));
         assert!(!is_branch_switch("git checkout"));
         assert!(!is_branch_switch("echo checkout main"));
+        // R1: a file restore from a ref does NOT move HEAD — any `--` is a
+        // restore, even with a ref before it.
+        assert!(!is_branch_switch("git checkout HEAD -- src/foo.rs"));
+        assert!(!is_branch_switch("git checkout main -- file"));
+        assert!(!is_branch_switch("git checkout origin/main -- path/to/f"));
+        // `-C` stays a switch HERE (the guard nudge is intentionally
+        // conservative); the heartbeat excludes it via redirects_to_other_tree.
+        assert!(is_branch_switch("git -C /some/repo checkout feat/x"));
+    }
+
+    #[test]
+    fn redirects_to_other_tree_detects_dash_c() {
+        // R2: a `-C <path>` checkout/switch targets another working tree.
+        assert!(redirects_to_other_tree("git -C ../other checkout main"));
+        assert!(redirects_to_other_tree("git -C /abs/repo switch feat/x"));
+        assert!(redirects_to_other_tree("cd /x && git -C sub checkout y"));
+        // No redirect → plain switches and non-switches alike are not "other".
+        assert!(!redirects_to_other_tree("git checkout main"));
+        assert!(!redirects_to_other_tree(
+            "git -c color.ui=always checkout x"
+        ));
+        assert!(!redirects_to_other_tree("echo git -C x checkout y"));
     }
 
     #[test]

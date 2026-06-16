@@ -52,13 +52,20 @@ impl Logger for Heartbeat {
 /// re-anchor the baseline, while a quoted branch argument (`git checkout
 /// 'feat/x'`) is still recognized. Pre-`strip_quotes` would erase the argument
 /// and miss a real switch, then falsely flag the next commit as drift (#70).
+///
+/// A `git -C <other> checkout` switches a DIFFERENT working tree, so it is
+/// excluded via [`guard::redirects_to_other_tree`] — re-anchoring cwd's
+/// baseline off another repo's switch would suppress drift (#70/R2). This
+/// stricter `-C` rule is heartbeat-only; the guard nudge stays permissive.
 pub fn run_heartbeat(
     dir: &std::path::Path,
     session_id: &str,
     branch: Option<String>,
     command: Option<&str>,
 ) {
-    let is_self_switch = command.map(guard::is_branch_switch).unwrap_or(false);
+    let is_self_switch = command
+        .map(|c| guard::is_branch_switch(c) && !guard::redirects_to_other_tree(c))
+        .unwrap_or(false);
     let _ = registry::touch_own(dir, session_id, branch, is_self_switch);
 }
 
@@ -203,6 +210,37 @@ mod tests {
             back.declared_branch.as_deref(),
             Some("main"),
             "baseline unchanged — prose `git checkout` is not a self-switch (#70/I1)"
+        );
+    }
+
+    #[test]
+    fn heartbeat_dash_c_checkout_does_not_rebaseline() {
+        // Security #70/R2: `git -C <other> checkout` switches a DIFFERENT working
+        // tree. The heartbeat reads cwd's HEAD (here a peer moved it to
+        // feat/peer); re-anchoring the baseline off another repo's switch would
+        // suppress drift. The baseline must stay put.
+        let tmp = TempDir::new().unwrap();
+        let rec = SessionRecord {
+            name: "quiet-loom".into(),
+            session_id: "self-session".into(),
+            branch: Some("main".into()),
+            declared_branch: Some("main".into()),
+            ..Default::default()
+        };
+        registry::write_record(tmp.path(), &rec).unwrap();
+
+        run_heartbeat(
+            tmp.path(),
+            "self-session",
+            Some("feat/peer".into()),
+            Some("git -C ../other-plugin checkout main"),
+        );
+
+        let back = registry::read_own(tmp.path(), "self-session").unwrap();
+        assert_eq!(
+            back.declared_branch.as_deref(),
+            Some("main"),
+            "baseline unchanged — a -C switch targets another tree (#70/R2)"
         );
     }
 
