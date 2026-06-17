@@ -25,11 +25,14 @@
 //! | `warn-branch-drift` | PreToolUse   | [`branch_drift`]|
 //! | `declare`           | CLI action   | [`cli`]         |
 //! | `status`            | CLI action   | [`cli`]         |
+//! | `end`               | SessionEnd   | [`end`]         |
 
 /// PreToolUse commit-time branch-drift warning — never blocks.
 pub mod branch_drift;
 /// CLI actions: `declare` (lane declaration) and `status` (registry listing).
 pub mod cli;
+/// SessionEnd logger: deregister this session's registry file (#97).
+pub mod end;
 /// PreToolUse lane warnings — never blocks.
 pub mod guard;
 /// PostToolUse heartbeat — touches the session's own registry file.

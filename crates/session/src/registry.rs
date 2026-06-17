@@ -144,6 +144,26 @@ pub fn find_own(dir: &Path, session_id: &str) -> Option<PathBuf> {
     Some(first)
 }
 
+/// Deregister a session: remove its own registry file so it stops appearing as
+/// a live peer the moment it ends, instead of lingering until the next `session
+/// start` sweeps it by age (#97). Resolves the file the same content-verified
+/// way [`find_own`] does, so only the record whose stored `session_id` matches
+/// exactly is removed — never a peer's lane (#90). A clean no-op (`Ok`) when the
+/// session has no registered file: a SessionEnd that fires before `session
+/// start` ever ran has nothing to remove.
+///
+/// Assumes `session_id` was validated by the caller (`End::run` filters through
+/// [`identity::is_safe_session_id`]). Even an unvalidated id cannot traverse:
+/// `find_own` uses it only for content equality and as a filename-suffix string
+/// match against `read_dir` entries, never as a path component — so the deleted
+/// path is always one already inside `dir`.
+pub fn remove_own(dir: &Path, session_id: &str) -> std::io::Result<()> {
+    match find_own(dir, session_id) {
+        Some(path) => fs::remove_file(path),
+        None => Ok(()),
+    }
+}
+
 /// Write `contents` to `path` atomically: stage to a uniquely-named temp file
 /// in the SAME directory, then `rename` it over `path`. A concurrent reader
 /// sees either the old complete file or the new complete file — never a
@@ -694,6 +714,73 @@ mod tests {
     #[test]
     fn sweep_missing_directory_is_noop() {
         sweep_stale(Path::new("/nonexistent/sessions"), 0, "");
+    }
+
+    // --- deregister (remove_own, #97) ---
+
+    #[test]
+    fn remove_own_deletes_the_session_file() {
+        // SessionEnd deregister: an ended session removes its own lane so it
+        // stops appearing as a live peer immediately, instead of lingering
+        // until the next `session start` sweeps it by age (#97).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("quiet-loom", "self-session")).unwrap();
+        remove_own(&dir, "self-session").unwrap();
+        assert!(
+            find_own(&dir, "self-session").is_none(),
+            "own lane removed on deregister"
+        );
+    }
+
+    #[test]
+    fn remove_own_leaves_peers_untouched() {
+        // Deregister removes only the caller's own lane — a concurrent peer's
+        // record must survive.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("quiet-loom", "self-session")).unwrap();
+        write_record(&dir, &record("forge-anvil", "peer-session")).unwrap();
+        remove_own(&dir, "self-session").unwrap();
+        assert!(find_own(&dir, "self-session").is_none(), "own lane removed");
+        assert!(
+            find_own(&dir, "peer-session").is_some(),
+            "peer lane untouched"
+        );
+    }
+
+    #[test]
+    fn remove_own_removes_only_matching_colliding_short_id() {
+        // Content-targeted delete (#90-hardened find_own): two sessions sharing
+        // the 8-char prefix ("session-") must not cross-delete. Deregistering
+        // session-1 leaves session-2's lane intact.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("alpha-loom", "session-1")).unwrap();
+        write_record(&dir, &record("beta-anvil", "session-2")).unwrap();
+        remove_own(&dir, "session-1").unwrap();
+        assert!(
+            !dir.join("alpha-loom.session-.json").exists(),
+            "session-1 lane removed"
+        );
+        assert!(
+            dir.join("beta-anvil.session-.json").exists(),
+            "colliding session-2 lane NOT cross-deleted"
+        );
+    }
+
+    #[test]
+    fn remove_own_noop_when_unregistered() {
+        // Deregistering a session with no registered file is a clean no-op,
+        // never an error — a SessionEnd before `session start` ever ran.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("forge-anvil", "peer-session")).unwrap();
+        remove_own(&dir, "never-registered").unwrap();
+        assert!(
+            find_own(&dir, "peer-session").is_some(),
+            "unrelated lane untouched by a no-op deregister"
+        );
     }
 
     // --- git exclude ---

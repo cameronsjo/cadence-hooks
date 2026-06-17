@@ -243,6 +243,8 @@ enum SessionCommands {
     Guard,
     /// Warn when HEAD drifted from the session's recorded branch at git commit (PreToolUse)
     WarnBranchDrift,
+    /// Deregister this session's registry file when it ends (SessionEnd logger)
+    End,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -326,6 +328,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::Heartbeat => "heartbeat",
             SessionCommands::Guard => "guard",
             SessionCommands::WarnBranchDrift => "warn-branch-drift",
+            SessionCommands::End => "end",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -739,6 +742,10 @@ fn main() {
             SessionCommands::WarnBranchDrift => {
                 run_check_from_stdin(&cadence_hooks_session::branch_drift::WarnBranchDrift, pre)
             }
+            SessionCommands::End => run_logger_from_stdin(
+                &cadence_hooks_session::end::End,
+                registry::sample_for("session", "end"),
+            ),
             SessionCommands::Declare {
                 intent,
                 touching,
