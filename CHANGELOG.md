@@ -29,7 +29,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   file, fails to parse, and silently drops a live peer — worst case, a peer
   missing from the one-shot SessionStart disclosure for the whole session.
   Records now stage to a temp file in the same directory and `rename` over the
-  target, so a reader only ever sees a complete document.
+  target, so a reader only ever sees a complete document. The temp is created
+  with `O_EXCL` and the rename replaces the target path itself, so the write is
+  symlink-safe end to end.
 - **session: the lane guard now assesses MultiEdit** (#80 on
   claude-configurations). The guard matched only Edit/Write, so a MultiEdit into
   a peer's declared `touching` lane slipped through unwarned. MultiEdit carries a

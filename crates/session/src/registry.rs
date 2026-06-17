@@ -140,7 +140,31 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "record".to_string());
     let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    fs::write(&tmp, contents)?;
+    // create_new (O_EXCL) refuses to follow or overwrite an existing path, so a
+    // pre-planted symlink at the predictable temp name is rejected rather than
+    // clobbered (the registry dir is user-owned in normal use, but defense in
+    // depth is cheap here). A stale temp from a crashed same-PID process is the
+    // only benign collision — remove it and retry once. `rename` then replaces
+    // `path` itself (never follows a symlink at the target), so the whole write
+    // is symlink-safe end to end.
+    use std::io::Write;
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&tmp)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?
+        }
+        Err(e) => return Err(e),
+    };
+    file.write_all(contents)?;
+    drop(file);
     if let Err(e) = fs::rename(&tmp, path) {
         // Don't leak a staging file when the rename fails (e.g. read-only fs).
         let _ = fs::remove_file(&tmp);
@@ -386,6 +410,36 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(read_peers(&dir, "none", 600).len(), 16);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_clobber_preplanted_symlink_at_temp() {
+        // A co-tenant pre-plants a symlink at the predictable temp path; the
+        // O_EXCL create_new must reject/replace it without writing through to
+        // the victim, and the record must still land.
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, "precious\n").unwrap();
+
+        let rec = record("quiet-loom", "e4739a12-full");
+        let target_name = identity::filename(&rec.name, &rec.session_id);
+        let temp_path = dir.join(format!(".{target_name}.{}.tmp", std::process::id()));
+        symlink(&victim, &temp_path).unwrap();
+
+        write_record(&dir, &rec).unwrap();
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "precious\n",
+            "victim file must not be clobbered through the symlink"
+        );
+        assert!(
+            read_own(&dir, "e4739a12-full").is_some(),
+            "record still landed"
+        );
     }
 
     // --- peer discovery ---
