@@ -320,12 +320,30 @@ impl GitSafetyGuard {
     }
 
     fn check_update_ref_blocked(&self, args: &[&str]) -> Option<String> {
+        // `--stdin` batch mode reads the ref commands from stdin, which the guard
+        // cannot see — the block path can't judge it, so check_warned nudges.
+        if args.contains(&"--stdin") {
+            return None;
+        }
         let has_delete = args.iter().any(|a| *a == "-d" || *a == "--delete");
-        // The ref operand is the first non-flag token; `--stdin` (operates on
-        // stdin, no operand) is out of scope.
-        let targets_protected = args
-            .iter()
-            .find(|a| !a.starts_with('-'))
+        // The ref operand is the first non-flag token — but `-m`/`--message`
+        // takes a reflog-reason value that is itself a non-flag token, so a naive
+        // first-non-flag scan picks the reason and the protected-ref check never
+        // fires (review H1). Skip the value of `-m`/`--message`; every other
+        // update-ref flag is boolean.
+        let mut skip_next = false;
+        let ref_operand = args.iter().find(|a| {
+            if skip_next {
+                skip_next = false;
+                return false;
+            }
+            if **a == "-m" || **a == "--message" {
+                skip_next = true;
+                return false;
+            }
+            !a.starts_with('-')
+        });
+        let targets_protected = ref_operand
             .map(|r| is_protected_branch(push_target_branch(r)))
             .unwrap_or(false);
 
@@ -511,6 +529,14 @@ impl GitSafetyGuard {
                 // check_update_ref_blocked) has no safety net — nudge (#84).
                 if args.iter().any(|a| *a == "-d" || *a == "--delete") {
                     return Some("git update-ref -d (deletes a ref with no safety net)".into());
+                }
+                // `--stdin` batch edits carry their refs on stdin (invisible to
+                // the guard, and a protected delete/repoint could hide there) —
+                // surface it rather than silently allow (review M1).
+                if args.contains(&"--stdin") {
+                    return Some(
+                        "git update-ref --stdin (batch ref edits; refs not verifiable here)".into(),
+                    );
                 }
                 None
             }
@@ -1783,5 +1809,41 @@ mod tests {
         // Regression: a normal push without --mirror is unaffected.
         let result = GitSafetyGuard.run(&make_bash_input("git push origin feature"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn update_ref_reflog_message_then_protected_repoint_blocked() {
+        // Review H1: `-m <reason>` carries a non-flag value; the operand scan
+        // must skip it and still find the protected ref.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git update-ref -m cleanup refs/heads/main abc1234",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn update_ref_message_then_protected_delete_blocked() {
+        // Review H1: the `-m … -d` form must not downgrade Block → Nudge.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git update-ref -m cleanup -d refs/heads/main",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn update_ref_message_then_feature_allowed() {
+        // Review H1 regression: the reason string must not be mistaken for the
+        // ref — a non-protected ref stays allowed.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git update-ref -m reason refs/heads/feature abc1234",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn update_ref_stdin_warned() {
+        // Review M1: batch refs are invisible — surface, don't silently allow.
+        let result = GitSafetyGuard.run(&make_bash_input("git update-ref --stdin"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 }

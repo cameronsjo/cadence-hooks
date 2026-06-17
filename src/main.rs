@@ -36,6 +36,7 @@ const PROTECTED_GUARDS: &[&str] = &[
     "guard-gh-write",
     "guard-op-vault-scan",
     "guard-browser-device",
+    "guard-dotfiles",
     "trash-guard",
 ];
 
