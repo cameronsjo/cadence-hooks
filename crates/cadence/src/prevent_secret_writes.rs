@@ -5,7 +5,10 @@
 //! a writer verb (`tee`, `cp`/`mv`/`install`, `dd`, `truncate`, `rm`) (#76).
 //! Safe templates (.env.example, .env.test) are always allowed.
 
-use crate::secret_patterns::{is_ambiguous, is_blocked, is_dangerous_env_token, is_safe_template};
+use crate::secret_patterns::{
+    is_ambiguous, is_blocked, is_dangerous_env_token, is_safe_template, is_secret_scan_exempt,
+    scan_secret_values,
+};
 use cadence_hooks_core::shell::{command_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -249,6 +252,31 @@ impl Check for SecretWritesGuard {
                 let Some(path) = input.file_path() else {
                     return CheckResult::allow();
                 };
+
+                // Content-value scan (orthogonal to the filename checks): block a
+                // live secret VALUE introduced into ANY file. Runs first so even
+                // a safe-template name (.env.example) can't smuggle a real key.
+                // Scans only the *introduced* fragment of each edit, so removing
+                // a secret — or editing elsewhere in a file that already holds
+                // one — is never blocked. Skips this repo's own fixtures only
+                // (see is_secret_scan_exempt). The matched value is never echoed.
+                if !is_secret_scan_exempt(&path)
+                    && let Some(fragments) = input.edit_fragments()
+                {
+                    for (introduced, _removed) in &fragments {
+                        if let Some(kind) = scan_secret_values(introduced) {
+                            return CheckResult::block(format!(
+                                "🚫 BLOCKED: prevent-secret-writes: the content introduces what looks \
+                                 like a live secret ({kind}).\n\
+                                 A real credential must never be written into a tracked file.\n\
+                                 Fix: replace it with a placeholder or an env-var reference. If this is \
+                                 a genuine false positive (test fixture, documentation), write it \
+                                 manually outside Claude Code."
+                            ));
+                        }
+                    }
+                }
+
                 let filename = path.rsplit('/').next().unwrap_or(&path);
 
                 if is_safe_template(filename) {
@@ -983,5 +1011,85 @@ mod tests {
     fn bash_find_delete_env_example_allowed() {
         // Safe template — deleting it is not a secret write.
         assert!(!bash_targets_env_file("find . -name .env.example -delete"));
+    }
+
+    // --- #85: secret-value content scanner (Write/Edit) ---
+
+    #[test]
+    fn write_with_aws_key_in_content_blocked() {
+        // A live-looking AWS key pasted into an ordinary source file.
+        let body = format!("AWS_KEY = \"AKIA{}\"", "A".repeat(16));
+        let result = SecretWritesGuard.run(&cadence_hooks_core::test_builders::make_write(
+            "/project/src/config.py",
+            &body,
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_introducing_github_token_blocked() {
+        let new = format!("token: ghp_{}", "a".repeat(36));
+        let result = SecretWritesGuard.run(&make_edit_input(
+            "/project/config.yaml",
+            "token: PLACEHOLDER",
+            &new,
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_clean_content_allowed() {
+        let result = SecretWritesGuard.run(&cadence_hooks_core::test_builders::make_write(
+            "/project/src/main.rs",
+            "fn main() { println!(\"hello\"); }",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn safe_template_with_live_key_still_blocked() {
+        // The value scan runs BEFORE the safe-template allow, so a real key in
+        // `.env.example` is still caught — the ordering that makes the scan
+        // orthogonal to the filename classification.
+        let body = format!("AWS_ACCESS_KEY_ID=AKIA{}", "A".repeat(16));
+        let result = SecretWritesGuard.run(&cadence_hooks_core::test_builders::make_write(
+            "/project/.env.example",
+            &body,
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn edit_removing_secret_not_blocked() {
+        // Only the introduced fragment is scanned; pulling a secret OUT (it
+        // lives in old_string, not new_string) must not block.
+        let old = format!("KEY=AKIA{}", "A".repeat(16));
+        let result = SecretWritesGuard.run(&make_edit_input(
+            "/project/src/config.py",
+            &old,
+            "KEY=${AWS_KEY}",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn value_scan_exempt_for_cadence_hooks_source() {
+        // This repo's own fixtures carry secret-shaped strings — exempt.
+        let body = format!("const FIXTURE: &str = \"AKIA{}\";", "A".repeat(16));
+        let result = SecretWritesGuard.run(&cadence_hooks_core::test_builders::make_write(
+            "/home/dev/cadence-hooks/crates/cadence/src/secret_patterns.rs",
+            &body,
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn value_scan_clean_normal_file_allowed() {
+        // A normal file with no secret value — unaffected by the scan.
+        let result = SecretWritesGuard.run(&cadence_hooks_core::test_builders::make_write(
+            "/project/config/app.yaml",
+            "service:\n  name: web\n  replicas: 3\n",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }
