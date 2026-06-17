@@ -32,12 +32,28 @@ impl MemoryGuard {
     /// `…/memory/…`, or a `memory/` nested deeper in the slug's subtree
     /// (`projects/<slug>/docs/memory/…`), no longer matches (#93).
     fn is_memory_path_under(path: &str, config_dir: &str) -> bool {
-        let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-        let config_components: Vec<&str> = config_dir
-            .trim_end_matches('/')
-            .split('/')
-            .filter(|c| !c.is_empty())
-            .collect();
+        // Normalize before component matching: resolve `.`/`..` and `\` so a
+        // traversal-addressed path (`projects/foo/docs/../memory/MEMORY.md`,
+        // which resolves to `projects/foo/memory/MEMORY.md`) can't slip past the
+        // anchor by presenting `docs` where `memory` should be. The prior loose
+        // `contains("/memory/")` matched such paths incidentally; the anchor
+        // must not regress that coverage.
+        fn normalized_components(raw: &str) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for component in raw.replace('\\', "/").split('/') {
+                match component {
+                    "" | "." => {}
+                    ".." if out.last().is_some_and(|last| last != "..") => {
+                        out.pop();
+                    }
+                    value => out.push(value.to_owned()),
+                }
+            }
+            out
+        }
+
+        let components = normalized_components(path);
+        let config_components = normalized_components(config_dir);
 
         // Rooted at <config_dir>/projects/<slug>/memory/<file> — honors a
         // relocated CLAUDE_CONFIG_DIR whose dir isn't named ".claude".
@@ -343,6 +359,17 @@ mod tests {
         ));
         assert!(!MemoryGuard::is_memory_path_under(
             "/home/user/.claude/projects/foo/docs/memory/MEMORY.md",
+            "/home/user/.claude"
+        ));
+    }
+
+    #[test]
+    fn auto_memory_with_dot_dot_components_still_matches() {
+        // A traversal-addressed auto-memory path resolves back to
+        // projects/<slug>/memory/ and must still be guarded — the anchor must
+        // not let `..` smuggle the real MEMORY.md past the hard limit.
+        assert!(MemoryGuard::is_memory_path_under(
+            "/home/user/.claude/projects/foo/docs/../memory/MEMORY.md",
             "/home/user/.claude"
         ));
     }
