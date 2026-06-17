@@ -165,6 +165,17 @@ fn build_commit_record(
         })
         .collect();
 
+    // Models absent from the price table compute to $0 silently (#95). Record
+    // them so an unknown/unpriced model is loud in the data — a non-empty array
+    // means costUsd is understated and a reprocessing pass can recompute once
+    // the table is patched. Empty in the normal (all-priced) case.
+    let unpriced: Vec<&str> = scan
+        .by_model
+        .iter()
+        .filter(|(model, _)| prices.get(model).is_none())
+        .map(|(model, _)| model.as_str())
+        .collect();
+
     json!({
         "ts": ts,
         "sessionId": input.session_id,
@@ -182,6 +193,7 @@ fn build_commit_record(
         },
         "costUsd": cost,
         "byModel": by_model,
+        "unpricedModels": unpriced,
         "messagesScanned": scan.messages_scanned,
         "lastMessageId": scan.last_message_id,
         "sinceMarker": since_marker,
@@ -380,5 +392,61 @@ mod tests {
             .sum();
         let total = record["costUsd"].as_f64().unwrap();
         assert!((total - bucket_sum).abs() < 1e-9);
+    }
+
+    #[test]
+    fn commit_record_flags_unpriced_models() {
+        // #95: a model absent from the price table is recorded in unpricedModels
+        // so the silent $0 cost is greppable.
+        let prices = Prices::embedded();
+        let scan = ScanResult {
+            tokens: Tokens {
+                input: 100,
+                ..Default::default()
+            },
+            last_message_id: "m9".into(),
+            messages_scanned: 1,
+            model: "gpt-9".into(),
+            by_model: vec![(
+                "gpt-9".into(),
+                Tokens {
+                    input: 100,
+                    ..Default::default()
+                },
+            )],
+        };
+        let rec = build_commit_record(
+            "ts",
+            &sample_input(),
+            "a",
+            "b",
+            "main",
+            "r",
+            &scan,
+            0.0,
+            "m0",
+            &prices,
+        );
+        let unpriced = rec["unpricedModels"].as_array().unwrap();
+        assert_eq!(unpriced.len(), 1);
+        assert_eq!(unpriced[0], "gpt-9");
+    }
+
+    #[test]
+    fn commit_record_no_unpriced_for_known_model() {
+        // sample_scan() uses claude-opus-4-7, which is priced → empty array.
+        let rec = build_commit_record(
+            "ts",
+            &sample_input(),
+            "a",
+            "b",
+            "main",
+            "r",
+            &sample_scan(),
+            0.001,
+            "m1",
+            &Prices::embedded(),
+        );
+        assert!(rec["unpricedModels"].as_array().unwrap().is_empty());
     }
 }

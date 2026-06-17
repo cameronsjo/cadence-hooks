@@ -77,14 +77,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **memory-guard: measure the resulting file and anchor to the auto-memory
   root** (#92, #93 on claude-configurations). The 200-line cap counted the Edit
   *fragment* (`content()`), so an Edit appending to a near-limit MEMORY.md was
-  allowed while the file grew past the cap — now uses `effective_content()`. And
-  the `/memory/` path test over-matched any project file with a `memory/` dir —
-  now scoped to `<config>/projects/…/memory/`.
-- **prevent-secret-leaks: lowercase the echo-secret nudge keywords** (#85 on
+  allowed while the file grew past the cap — now uses `effective_content()`. The
+  `/memory/` path test over-matched any project file with a `memory/` dir — now
+  anchored to `<config>/projects/<slug>/memory/` with `.`/`..`/`\` normalized
+  before matching, so a nested `docs/memory/` or a `..`-traversal path neither
+  over-matches an ordinary file nor smuggles MEMORY.md past the cap.
+- **prevent-secret-leaks: sharpen the echo-secret nudge** (#85 on
   claude-configurations, partial). The exfil nudge matched uppercase `KEY`/
   `SECRET`/… against the original-case command, so `echo $database_password`
-  (lowercase) was missed. (The secret-value content scanner — the rest of #85 —
-  ships separately.)
+  (lowercase) was missed; keywords are now lowercased on both sides, and
+  `echo`/`printf` match at command position (not substring) so a benign arg or
+  path containing those words no longer over-fires. (The secret-value content
+  scanner — the rest of #85 — ships separately.)
+- **metrics: atomic subagent log writes, current model prices, tail-bounded
+  transcript scan** (#94, #95, #96 on claude-configurations). `log-subagent`
+  built its JSONL line with `writeln!` (many small writes that tear under
+  concurrent appends) — now one `write_all`, matching the sibling loggers.
+  `prices.json` gained `claude-opus-4-8` and `claude-fable-5` (commit cost was
+  silently `$0` for the current default models), plus an `unpricedModels` record
+  field so an unknown model is loud rather than a silent zero. `scan-tokens`
+  parsed the entire transcript on every commit; it now byte-scans past the
+  marker and only JSON-parses the tail, bounding the per-commit hot-path cost.
 
 ## [0.29.0] - 2026-06-10
 

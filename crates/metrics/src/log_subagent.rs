@@ -40,7 +40,13 @@ impl Logger for LogSubagent {
             .append(true)
             .open(dir.join("subagents.jsonl"))
         {
-            let _ = writeln!(file, "{record}");
+            // Build the whole line (record + newline) and write it in one
+            // write_all, matching log_commit.rs — a single O_APPEND write is
+            // atomic, so concurrent appends from parallel subagents can't
+            // interleave a record with its trailing newline (#94).
+            let mut line = record.to_string();
+            line.push('\n');
+            let _ = file.write_all(line.as_bytes());
         }
     }
 }
@@ -116,5 +122,13 @@ mod tests {
             ..Default::default()
         };
         LogSubagent.run(&input);
+    }
+
+    #[test]
+    fn record_serializes_to_single_line() {
+        // #94: the single-write_all fix is only atomic-per-record if the record
+        // has no embedded newline. Compact JSON guarantees this; lock it down.
+        let line = build_subagent_record(&stop_event(), "2026-05-19T00:00:00Z", true).to_string();
+        assert!(!line.contains('\n'), "record must be one line: {line}");
     }
 }

@@ -57,6 +57,13 @@ mod tests {
     }
 
     #[test]
+    fn one_million_input_tokens_opus_4_8() {
+        // #95: opus-4-8 is now priced ($5/MTok input), not silently $0.
+        let cost = compute_cost(&opus_tokens(), "claude-opus-4-8", &Prices::embedded());
+        assert_eq!(cost, 5.0);
+    }
+
+    #[test]
     fn mixed_tokens_sum_correctly() {
         let tokens = Tokens {
             input: 1_000_000,

@@ -65,57 +65,76 @@ struct Usage {
 ///   predates this transcript — skip rather than overcount).
 /// - No assistant messages in range: returns `None`.
 pub fn scan_tokens(transcript: &str, from: Option<&str>) -> Option<ScanResult> {
-    let msgs: Vec<Message> = transcript
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Line>(line).ok())
-        .filter_map(|line| line.message)
-        .filter(|m| m.usage.is_some() && m.id.is_some() && m.role.as_deref() == Some("assistant"))
-        .collect();
+    let marker = from.unwrap_or("");
+    // None/"" → sum from the start; otherwise accumulate only after the marker
+    // message. `started` gates accumulation; `marker_seen` distinguishes
+    // "marker found, nothing after" (→ None) from "marker never found" (→ None).
+    let mut started = marker.is_empty();
+    let mut marker_seen = started;
 
-    let start = match from {
-        None | Some("") => 0,
-        Some(marker) => {
-            let idx = msgs.iter().position(|m| m.id.as_deref() == Some(marker))?;
-            idx + 1
-        }
-    };
-
-    if msgs.len() <= start {
-        return None;
-    }
-
-    let range = &msgs[start..];
     let mut tokens = Tokens::default();
     let mut by_model: BTreeMap<String, Tokens> = BTreeMap::new();
-    for m in range {
-        if let Some(u) = &m.usage {
-            let delta_input = u.input_tokens;
-            let delta_cache_create = u.cache_creation_input_tokens;
-            let delta_cache_read = u.cache_read_input_tokens;
-            let delta_output = u.output_tokens;
+    let mut messages_scanned = 0usize;
+    let mut last_id: Option<String> = None;
+    let mut last_model: Option<String> = None;
 
-            tokens.input += delta_input;
-            tokens.cache_create += delta_cache_create;
-            tokens.cache_read += delta_cache_read;
-            tokens.output += delta_output;
-
-            let model_key = m.model.clone().unwrap_or_else(|| "unknown".to_string());
-            let bucket = by_model.entry(model_key).or_default();
-            bucket.input += delta_input;
-            bucket.cache_create += delta_cache_create;
-            bucket.cache_read += delta_cache_read;
-            bucket.output += delta_output;
+    for line in transcript.lines() {
+        // Cheap byte-scan pre-filter (#96): before the marker, only pay for a
+        // full JSON parse on a line that could BE the marker. This bounds the
+        // O(transcript) parse to the tail past the marker — the hot-path cost
+        // on every commit. A candidate is still fully parsed and accepted only
+        // when it is an assistant message with id == marker, so a content
+        // substring match never false-starts accumulation.
+        if !started && !line.contains(marker) {
+            continue;
         }
+        let Ok(parsed) = serde_json::from_str::<Line>(line) else {
+            continue;
+        };
+        let Some(m) = parsed.message else {
+            continue;
+        };
+        if m.usage.is_none() || m.id.is_none() || m.role.as_deref() != Some("assistant") {
+            continue;
+        }
+        if !started {
+            if m.id.as_deref() == from {
+                started = true;
+                marker_seen = true;
+            }
+            // The marker message itself is excluded from the sum.
+            continue;
+        }
+
+        let u = m.usage.as_ref().unwrap();
+        tokens.input += u.input_tokens;
+        tokens.cache_create += u.cache_creation_input_tokens;
+        tokens.cache_read += u.cache_read_input_tokens;
+        tokens.output += u.output_tokens;
+
+        let model_key = m.model.clone().unwrap_or_else(|| "unknown".to_string());
+        let bucket = by_model.entry(model_key.clone()).or_default();
+        bucket.input += u.input_tokens;
+        bucket.cache_create += u.cache_creation_input_tokens;
+        bucket.cache_read += u.cache_read_input_tokens;
+        bucket.output += u.output_tokens;
+
+        messages_scanned += 1;
+        last_id = m.id.clone();
+        last_model = Some(model_key);
     }
 
-    let last = range.last()?;
-    let by_model_vec: Vec<(String, Tokens)> = by_model.into_iter().collect();
+    if !marker_seen || messages_scanned == 0 {
+        // Marker predated this transcript, or nothing new since it — skip
+        // rather than overcount (mirrors the bash "emit nothing" behavior).
+        return None;
+    }
     Some(ScanResult {
         tokens,
-        last_message_id: last.id.clone()?,
-        messages_scanned: range.len(),
-        model: last.model.clone().unwrap_or_else(|| "unknown".to_string()),
-        by_model: by_model_vec,
+        last_message_id: last_id?,
+        messages_scanned,
+        model: last_model.unwrap_or_else(|| "unknown".to_string()),
+        by_model: by_model.into_iter().collect(),
     })
 }
 
@@ -240,5 +259,25 @@ mod tests {
         let (model, tokens) = &result.by_model[0];
         assert_eq!(model, "unknown");
         assert_eq!(tokens.output, 5);
+    }
+
+    #[test]
+    fn marker_substring_in_earlier_content_does_not_false_start() {
+        // #96: a user line mentions "m1" before the real m1 assistant message.
+        // The contains() pre-filter parses it but must reject it (not an
+        // assistant message with id==m1), so only m2 is summed — not m1+m2.
+        let transcript = [
+            r#"{"type":"user","message":{"role":"user","content":"continue from m1"}}"#,
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            r#"{"message":{"id":"m2","role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":20,"output_tokens":2}}}"#,
+        ]
+        .join("\n");
+        let r = scan_tokens(&transcript, Some("m1")).unwrap();
+        assert_eq!(
+            r.tokens.input, 20,
+            "m2 only; 30 would mean a false start on m1"
+        );
+        assert_eq!(r.messages_scanned, 1);
+        assert_eq!(r.last_message_id, "m2");
     }
 }
