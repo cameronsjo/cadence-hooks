@@ -2,6 +2,11 @@
 //!
 //! Both `prevent_secret_leaks` and `prevent_secret_writes` use these
 //! constants and functions to classify files as blocked, ambiguous, or safe.
+//! [`scan_secret_values`] adds an orthogonal axis: detecting a live secret
+//! *value* embedded in written content, regardless of the filename.
+
+use regex::Regex;
+use std::sync::LazyLock;
 
 /// Safe template suffixes that are always allowed.
 pub const SAFE_SUFFIXES: &[&str] = &[
@@ -143,6 +148,90 @@ pub fn is_dangerous_env_token(token: &str) -> bool {
     let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
 
     is_env_family_secret(component)
+}
+
+/// High-confidence secret-*value* patterns: `(human name, regex)`.
+///
+/// Each is deliberately provider-prefixed and length-bounded so a match means
+/// "this really is a credential", not "this looks random". Two whole classes
+/// are intentionally **excluded** because they fire on benign content:
+/// - **JWTs** (`eyJ…` — any base64url-encoded JSON), and
+/// - **generic high-entropy strings** (hashes, UUIDs, base64 blobs, content
+///   digests) — there is no entropy threshold that separates a secret from a
+///   git SHA or a minified asset without drowning real writes in false blocks.
+///
+/// The match is reported by *name* only — [`scan_secret_values`] never returns
+/// the value, so the secret is not echoed into hook output or logs.
+static SECRET_VALUE_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
+    [
+        // AWS long-term (AKIA) and temporary (ASIA) access key ids.
+        ("AWS access key id", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+        // GitHub tokens: classic PAT (ghp_), OAuth (gho_), user-to-server
+        // (ghu_), server-to-server (ghs_), refresh (ghr_) — all 36-char bodies.
+        ("GitHub token", r"\bgh[pousr]_[A-Za-z0-9]{36}\b"),
+        // GitHub fine-grained PAT — the `github_pat_` prefix is near-unique.
+        (
+            "GitHub fine-grained PAT",
+            r"\bgithub_pat_[A-Za-z0-9_]{30,}\b",
+        ),
+        // OpenAI keys (legacy `sk-…`, `sk-proj-…`, `sk-svcacct-…`). Anchored on
+        // the `T3BlbkFJ` infix every such key carries — a far stronger
+        // discriminator than the weak `sk-` prefix. Requiring the infix avoids
+        // the false-positive class a bare `sk-<32 alnum>` hit: `sk-`-namespaced
+        // hashes (`sk-<md5>`, `sk-<uuid>`), hyphenated slugs (`sk-proj-foo-bar`),
+        // and padded doc placeholders (`sk-xxxx…`) — none contain `T3BlbkFJ`.
+        // Trade-off: a hypothetical future key format without the infix would be
+        // missed (acceptable for a best-effort catch; precision over recall).
+        (
+            "OpenAI API key",
+            r"\bsk-[A-Za-z0-9_-]*T3BlbkFJ[A-Za-z0-9_-]{10,}",
+        ),
+        // Slack bot/user/legacy/refresh/app tokens.
+        ("Slack token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+        // PEM private-key header (RSA/EC/DSA/OPENSSH/ENCRYPTED/bare).
+        (
+            "private key (PEM)",
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, p)| {
+        (
+            name,
+            Regex::new(p).expect("secret value pattern should compile"),
+        )
+    })
+    .collect()
+});
+
+/// Scan `text` for an embedded live secret value, returning the *name* of the
+/// first matching pattern (never the value itself). `None` when clean.
+///
+/// Patterns are high-confidence by design (see [`SECRET_VALUE_PATTERNS`]); this
+/// is a best-effort accidental-paste catch, not an exhaustive exfil boundary.
+pub fn scan_secret_values(text: &str) -> Option<&'static str> {
+    SECRET_VALUE_PATTERNS
+        .iter()
+        .find(|(_, re)| re.is_match(text))
+        .map(|(name, _)| *name)
+}
+
+/// Paths exempt from the secret-value content scan: this repo's own source,
+/// whose test fixtures legitimately carry secret-shaped literals (the PEM
+/// header and AWS example id appear verbatim in the unit tests, so the scanner
+/// would otherwise block edits to its own source).
+///
+/// Component-matched, so a decorated sibling (`legacy-cadence-hooks/`) is not
+/// exempt. `.claude/` is deliberately NOT exempt: it is gitignored *wholesale*
+/// but this ecosystem force-adds tracked files under it (`.claude/rules/*.md`),
+/// so exempting it would let a real credential land in a tracked file — the
+/// very outcome the block forbids. The broad `cadence-hooks` component shares
+/// the residual tracked in claude-configurations#128 (narrow to the active
+/// checkout); acceptable for a best-effort value scanner.
+pub fn is_secret_scan_exempt(path: &str) -> bool {
+    path.replace('\\', "/")
+        .split('/')
+        .any(|c| c == "cadence-hooks")
 }
 
 #[cfg(test)]
@@ -319,5 +408,163 @@ mod tests {
         assert!(!is_dangerous_env_token("env"));
         assert!(!is_dangerous_env_token("-env"));
         assert!(!is_dangerous_env_token("feat/allow-main-branch-env"));
+    }
+
+    // --- #85: secret-value content scanner ---
+
+    #[test]
+    fn scans_aws_access_key() {
+        // AWS's own documented example id (matches AKIA + 16 [0-9A-Z]).
+        assert_eq!(
+            scan_secret_values("aws_access_key_id = AKIAIOSFODNN7EXAMPLE"),
+            Some("AWS access key id")
+        );
+        assert_eq!(
+            scan_secret_values(&format!("ASIA{}", "A".repeat(16))),
+            Some("AWS access key id")
+        );
+    }
+
+    #[test]
+    fn scans_github_tokens() {
+        assert_eq!(
+            scan_secret_values(&format!("token: ghp_{}", "a".repeat(36))),
+            Some("GitHub token")
+        );
+        assert_eq!(
+            scan_secret_values(&format!("gho_{}", "Z9".repeat(18))),
+            Some("GitHub token")
+        );
+        assert_eq!(
+            scan_secret_values(&format!("github_pat_{}", "a1B2_".repeat(8))),
+            Some("GitHub fine-grained PAT")
+        );
+    }
+
+    #[test]
+    fn scans_openai_keys() {
+        // Legacy (`sk-<20>T3BlbkFJ<20>`) and project-scoped (`sk-proj-…`) forms
+        // — both carry the `T3BlbkFJ` infix the pattern anchors on.
+        assert_eq!(
+            scan_secret_values(&format!(
+                "OPENAI_API_KEY=sk-{}T3BlbkFJ{}",
+                "a".repeat(20),
+                "b".repeat(20)
+            )),
+            Some("OpenAI API key")
+        );
+        assert_eq!(
+            scan_secret_values(&format!(
+                "sk-proj-{}T3BlbkFJ{}",
+                "aB1".repeat(7),
+                "xy".repeat(8)
+            )),
+            Some("OpenAI API key")
+        );
+    }
+
+    #[test]
+    fn scans_slack_and_pem() {
+        assert_eq!(
+            scan_secret_values(&format!("xoxb-{}", "1".repeat(20))),
+            Some("Slack token")
+        );
+        assert_eq!(
+            scan_secret_values("-----BEGIN RSA PRIVATE KEY-----\nMIIE..."),
+            Some("private key (PEM)")
+        );
+        assert_eq!(
+            scan_secret_values("-----BEGIN PRIVATE KEY-----"),
+            Some("private key (PEM)")
+        );
+        assert_eq!(
+            scan_secret_values("-----BEGIN OPENSSH PRIVATE KEY-----"),
+            Some("private key (PEM)")
+        );
+    }
+
+    #[test]
+    fn clean_content_does_not_match() {
+        assert_eq!(scan_secret_values("let x = compute(a, b);"), None);
+        assert_eq!(scan_secret_values("# just some markdown prose"), None);
+        // Empty / whitespace.
+        assert_eq!(scan_secret_values(""), None);
+    }
+
+    #[test]
+    fn high_entropy_lookalikes_do_not_false_positive() {
+        // git SHA (40 hex) — no provider prefix.
+        assert_eq!(
+            scan_secret_values("commit a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"),
+            None
+        );
+        // UUID.
+        assert_eq!(
+            scan_secret_values("id: 550e8400-e29b-41d4-a716-446655440000"),
+            None
+        );
+        // JWT — deliberately NOT matched (excluded class).
+        assert_eq!(
+            scan_secret_values("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2ln"),
+            None
+        );
+        // base64 blob without a provider prefix.
+        assert_eq!(
+            scan_secret_values("data: dGhpcyBpcyBub3QgYSBzZWNyZXQgYXQgYWxs"),
+            None
+        );
+    }
+
+    #[test]
+    fn sk_identifiers_without_openai_infix_not_a_key() {
+        // The `T3BlbkFJ` infix is required, so tokens that merely start `sk-`
+        // are not OpenAI keys — closing the false-positive class the reviewer
+        // found on the prior `sk-<32 alnum>` branch.
+        // CSS-ish identifier:
+        assert_eq!(
+            scan_secret_values("class=\"sk-spinner-fade-in-out-slow\""),
+            None
+        );
+        // `sk-`-namespaced hash (cache/session key): md5, sha1, dashless uuid.
+        assert_eq!(
+            scan_secret_values("redis.get(\"sk-d41d8cd98f00b204e9800998ecf8427e\")"),
+            None
+        );
+        // Hyphenated project-style slug.
+        assert_eq!(
+            scan_secret_values("sk-proj-management-dashboard-v2-config"),
+            None
+        );
+        // Padded documentation placeholder (no infix).
+        assert_eq!(
+            scan_secret_values(&format!("OPENAI_API_KEY=sk-{}", "x".repeat(48))),
+            None
+        );
+        // Short token.
+        assert_eq!(scan_secret_values("sk-test"), None);
+    }
+
+    #[test]
+    fn short_prefixed_tokens_below_length_floor_pass() {
+        // Right prefix, too short to be a real credential.
+        assert_eq!(scan_secret_values("ghp_abc123"), None);
+        assert_eq!(scan_secret_values("AKIA12345"), None);
+        assert_eq!(scan_secret_values("xoxb-12"), None);
+    }
+
+    #[test]
+    fn secret_scan_exemptions() {
+        // This repo's own source (fixtures legitimately carry secret shapes).
+        assert!(is_secret_scan_exempt(
+            "/Users/x/Projects/cc/cadence-hooks/crates/cadence/src/secret_patterns.rs"
+        ));
+        // .claude/ is NOT exempt — it holds tracked, force-added files
+        // (.claude/rules/*.md), so a secret there would be committable.
+        assert!(!is_secret_scan_exempt("/home/user/.claude/rules/notes.md"));
+        // Ordinary project files are scanned.
+        assert!(!is_secret_scan_exempt("/project/src/main.rs"));
+        assert!(!is_secret_scan_exempt("/project/config/app.yaml"));
+        // Decorated sibling is not exempt (component-matched).
+        assert!(!is_secret_scan_exempt("/tmp/legacy-cadence-hooks/x.rs"));
     }
 }

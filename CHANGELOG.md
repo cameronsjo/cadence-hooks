@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **prevent-secret-writes: scan written content for live secret values** (#85 on
+  claude-configurations). Beyond the filename/`.env` checks, Write/Edit now scans
+  the *introduced* content of any non-exempt file for high-confidence credential
+  shapes — AWS access keys (`AKIA`/`ASIA`), GitHub tokens (`ghp_`/`gho_`/…/
+  `github_pat_`), OpenAI keys (`sk-`/`sk-proj-`), Slack tokens (`xox[baprs]-`),
+  and PEM private-key headers — and blocks, naming the kind without ever echoing
+  the value. Runs before the safe-template allow, so a real key pasted into
+  `.env.example` is still caught. JWTs and generic high-entropy strings are
+  deliberately not matched (unbounded false positives); this repo's own fixtures
+  and `.claude/` scratch are exempt.
+
 ### Fixed
 
 - **git-safety: `git rebase --onto <protected>` is no longer falsely blocked**
