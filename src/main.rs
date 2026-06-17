@@ -23,6 +23,22 @@ mod registry;
 mod try_hook;
 use registry::{HOOKS, HookEntry};
 
+/// Guards that prevent irreversible harm — secret exposure, data loss,
+/// destructive git/gh/remote/vault operations. `CADENCE_DISABLE` (silent,
+/// persistent, settable in settings.json `env`) must not be able to neuter
+/// these; only the loud, per-session `CADENCE_BYPASS` can (#89).
+const PROTECTED_GUARDS: &[&str] = &[
+    "prevent-secret-leaks",
+    "prevent-secret-writes",
+    "git-safety",
+    "guard-push-remote",
+    "guard-gh-dangerous",
+    "guard-gh-write",
+    "guard-op-vault-scan",
+    "guard-browser-device",
+    "trash-guard",
+];
+
 #[derive(Parser)]
 #[command(
     name = "cadence-hooks",
@@ -346,8 +362,16 @@ fn print_hook_list() {
             current_plugin = hook.plugin;
         }
 
-        let status = if bypassed || disabled.contains(&hook.name) {
+        let status = if bypassed {
             " (disabled)"
+        } else if disabled.contains(&hook.name) {
+            // A protected guard named in CADENCE_DISABLE is refused, not
+            // disabled — don't let the listing claim it's off (#89).
+            if PROTECTED_GUARDS.contains(&hook.name) {
+                " (protected — disable refused)"
+            } else {
+                " (disabled)"
+            }
         } else {
             ""
         };
@@ -465,13 +489,25 @@ fn main() {
     };
 
     // Selective disable — skip specific hooks by name via CADENCE_DISABLE.
-    // Comma-separated list of hook names (e.g., "git-safety,warn-main-branch").
+    // Comma-separated list of hook names (e.g., "warn-main-branch,line-endings").
     // Set per-project in .claude/settings.json `env` block, or ad-hoc in shell.
+    // Emits a one-line stderr notice whenever it disables (or refuses to
+    // disable) a hook, so suppression always leaves a trace (#89).
     if let Ok(disabled) = std::env::var("CADENCE_DISABLE")
         && let Some(name) = hook_name(&cli.command)
         && disabled.split(',').any(|h| h.trim() == name)
     {
-        process::exit(0);
+        if PROTECTED_GUARDS.contains(&name) {
+            // Refuse: the guard still runs (fall through to dispatch).
+            eprintln!(
+                "⚠️  cadence-hooks: refusing to disable protected guard '{name}' \
+                 via CADENCE_DISABLE (it still runs). Use CADENCE_BYPASS=1 for a \
+                 one-session maintenance bypass."
+            );
+        } else {
+            eprintln!("⚠️  cadence-hooks: '{name}' disabled via CADENCE_DISABLE");
+            process::exit(0);
+        }
     }
 
     // Event type aliases for readability at callsites.

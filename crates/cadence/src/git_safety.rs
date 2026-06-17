@@ -242,11 +242,23 @@ impl GitSafetyGuard {
             "gc" => self.check_gc_blocked(normalized),
             "branch" => self.check_branch_blocked(args),
             "rebase" => self.check_rebase_blocked(args),
+            sub @ ("filter-branch" | "filter-repo") => {
+                // Mass history rewrite — no benign form; same family as the
+                // reflog-expire / gc --prune blocks (#84).
+                Some(format!("git {sub} (mass history rewrite)"))
+            }
+            "update-ref" => self.check_update_ref_blocked(args),
             _ => None,
         }
     }
 
     fn check_push_blocked(&self, args: &[&str], current_branch: Option<&str>) -> Option<String> {
+        // `--mirror` overwrites EVERY remote ref and deletes remote refs absent
+        // locally — protected branches included, no per-branch targeting (#84).
+        if args.contains(&"--mirror") {
+            return Some("Mirror push (overwrites/deletes all remote refs)".into());
+        }
+
         let has_force = args.iter().any(|a| is_force_flag(a));
         let has_delete = args.iter().any(|a| *a == "--delete" || *a == "-d");
 
@@ -304,6 +316,28 @@ impl GitSafetyGuard {
             return Some("Force push via refspec to protected branch".into());
         }
 
+        None
+    }
+
+    fn check_update_ref_blocked(&self, args: &[&str]) -> Option<String> {
+        let has_delete = args.iter().any(|a| *a == "-d" || *a == "--delete");
+        // The ref operand is the first non-flag token; `--stdin` (operates on
+        // stdin, no operand) is out of scope.
+        let targets_protected = args
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .map(|r| is_protected_branch(push_target_branch(r)))
+            .unwrap_or(false);
+
+        if targets_protected {
+            return Some(if has_delete {
+                "Delete of protected branch via update-ref".into()
+            } else {
+                // Repointing a protected ref to an arbitrary commit can silently
+                // drop commits (no merge check) — as destructive as force-push.
+                "Repoint of protected branch via update-ref".into()
+            });
+        }
         None
     }
 
@@ -469,6 +503,14 @@ impl GitSafetyGuard {
             "remote" => {
                 if args.contains(&"remove") || args.contains(&"rm") {
                     return Some("git remote remove".into());
+                }
+                None
+            }
+            "update-ref" => {
+                // A non-protected ref delete (protected deletes already block in
+                // check_update_ref_blocked) has no safety net — nudge (#84).
+                if args.iter().any(|a| *a == "-d" || *a == "--delete") {
+                    return Some("git update-ref -d (deletes a ref with no safety net)".into());
                 }
                 None
             }
@@ -1661,6 +1703,85 @@ mod tests {
     fn checkout_dashdash_nothing_after_allowed() {
         // `--` with no pathspec following is not a discard — out of scope.
         let result = GitSafetyGuard.run(&make_bash_input("git checkout --"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // ---------------------------------------------------------------
+    // #84: history-rewrite + remote-destructive subcommands/flags
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn filter_branch_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git filter-branch --tree-filter 'rm -f secrets.txt' HEAD",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn filter_repo_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git filter-repo --path secrets --invert-paths",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn filter_branch_in_chain_blocked() {
+        // Per-segment: a benign first command must not shield the rewrite.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git status && git filter-branch --force --all",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn update_ref_delete_main_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git update-ref -d refs/heads/main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn update_ref_delete_long_form_master_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git update-ref --delete refs/heads/master",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn update_ref_repoint_main_blocked() {
+        // Repointing a protected ref can silently drop commits (no merge check).
+        let result = GitSafetyGuard.run(&make_bash_input("git update-ref refs/heads/main abc1234"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn push_mirror_blocked() {
+        let result = GitSafetyGuard.run(&make_bash_input("git push --mirror origin"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn update_ref_delete_feature_warned() {
+        // Non-protected ref delete: no merge safety net → nudge.
+        let result = GitSafetyGuard.run(&make_bash_input("git update-ref -d refs/heads/feature"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn update_ref_repoint_feature_allowed() {
+        // Benign plumbing on a non-protected ref is unaffected.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git update-ref refs/heads/feature abc1234",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn push_without_mirror_allowed() {
+        // Regression: a normal push without --mirror is unaffected.
+        let result = GitSafetyGuard.run(&make_bash_input("git push origin feature"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }
