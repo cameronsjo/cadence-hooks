@@ -114,13 +114,41 @@ pub fn check_terminology(content: &str) -> TerminologyResult {
     TerminologyResult { blocks, nudges }
 }
 
-/// Paths that legitimately contain prohibited terms (hook source, test fixtures).
+/// Paths that legitimately contain prohibited terms: this repo's own source,
+/// hook scripts, rules files, and CLAUDE.md docs.
+///
+/// Anchored to `/`-split path *components*, not bare substrings. The old
+/// `path.contains("cadence-hooks/")` (and the `.claude/hooks|rules` and
+/// `ends_with("claude.md")` arms) handed a terminology free pass to any path
+/// that merely *contained* the fragment — an unrelated sibling repo
+/// (`legacy-cadence-hooks/`), a scratch dir, or a spoofed segment
+/// (`x.claude/hooks/`, `evilclaude.md`) — trivially self-grantable (#91).
+/// Component matching closes those over-matches. A directory whose component is
+/// exactly `cadence-hooks` is still exempt by design: the exemption is
+/// whole-repo (repro scripts, fixtures, docs all legitimately carry the
+/// literals), and the guard has no ground truth for the real checkout's root.
 fn is_excluded_path(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.ends_with("claude.md")
-        || path.contains("cadence-hooks/")
-        || path.contains(".claude/hooks/")
-        || path.contains(".claude/rules/")
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+
+    // CLAUDE.md (any case) — basename only, so `evilclaude.md` does not match.
+    if components
+        .last()
+        .is_some_and(|name| name.eq_ignore_ascii_case("claude.md"))
+    {
+        return true;
+    }
+
+    // A directory component named exactly `cadence-hooks` (this repo's source).
+    // `legacy-cadence-hooks` and other decorated names no longer match.
+    if components.contains(&"cadence-hooks") {
+        return true;
+    }
+
+    // Consecutive `.claude` then `hooks`/`rules` components, so `x.claude/hooks`
+    // and `foo.claude/rules` (non-boundary, decorated) do not match.
+    components
+        .windows(2)
+        .any(|w| w[0] == ".claude" && (w[1] == "hooks" || w[1] == "rules"))
 }
 
 /// Remove violations that were already present in pre-existing content.
@@ -342,6 +370,64 @@ mod tests {
             "/home/dev/.claude/hooks/enforcement/foo.sh"
         ));
         assert!(!is_excluded_path("/project/src/main.rs"));
+    }
+
+    // --- #91: component-anchored exclusion (no substring free pass) ---
+
+    #[test]
+    fn sibling_repo_substring_not_excluded() {
+        // `legacy-cadence-hooks` contains the substring but is not a component.
+        assert!(!is_excluded_path("/home/dev/legacy-cadence-hooks/notes.md"));
+    }
+
+    #[test]
+    fn spoofed_claude_hooks_segment_not_excluded() {
+        assert!(!is_excluded_path("/tmp/x.claude/hooks/y.md"));
+        assert!(!is_excluded_path("/tmp/foo.claude/rules/y.md"));
+    }
+
+    #[test]
+    fn evilclaude_basename_not_excluded() {
+        assert!(!is_excluded_path("/tmp/evilclaude.md"));
+    }
+
+    #[test]
+    fn claude_md_basename_still_excluded() {
+        assert!(is_excluded_path("/project/CLAUDE.md"));
+        assert!(is_excluded_path("/project/sub/claude.md")); // case-insensitive
+    }
+
+    #[test]
+    fn this_repo_source_still_excluded() {
+        assert!(is_excluded_path(
+            "/Users/x/Projects/cadence-hooks/crates/cadence/src/foo.rs"
+        ));
+        assert!(is_excluded_path("/home/dev/.claude/hooks/enforcement/x.sh"));
+        assert!(is_excluded_path("/home/dev/.claude/rules/terminology.md"));
+    }
+
+    #[test]
+    fn cadence_hooks_component_still_exempt_by_design() {
+        // Documented residual: a dir named exactly `cadence-hooks` is whole-repo
+        // exempt; closing this needs repo-root resolution (#91).
+        assert!(is_excluded_path("/tmp/cadence-hooks/x.md"));
+    }
+
+    #[test]
+    fn run_blocks_violation_in_sibling_repo() {
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some("/home/dev/legacy-cadence-hooks/notes.md".into()),
+                content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            TerminologyGuard.run(&input).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
     }
 
     #[test]
