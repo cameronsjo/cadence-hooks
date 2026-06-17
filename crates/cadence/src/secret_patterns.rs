@@ -33,6 +33,8 @@ pub const BLOCKED_FILENAMES: &[&str] = &[
     ".npmrc",
     ".pypirc",
     ".netrc",
+    ".git-credentials",
+    ".pgpass",
 ];
 
 /// File extensions that must never be read or written (unambiguous secrets).
@@ -42,7 +44,16 @@ pub const BLOCKED_EXTENSIONS: &[&str] = &["key", "p12", "pfx", "keystore", "jks"
 pub const BLOCKED_SUFFIXES: &[&str] = &["-key.pem", "_key.pem", ".private.pem"];
 
 /// Path fragments indicating secrets.
-pub const BLOCKED_PATH_FRAGMENTS: &[&str] = &[".docker/config.json", "gcloud-credentials.json"];
+///
+/// Parent-dir-qualified so the generic basenames `credentials` and `config`
+/// only block inside their credential directories — a bare `credentials` /
+/// `config` filename would over-block every repo (#77).
+pub const BLOCKED_PATH_FRAGMENTS: &[&str] = &[
+    ".docker/config.json",
+    "gcloud-credentials.json",
+    ".aws/credentials",
+    ".kube/config",
+];
 
 /// Ambiguous patterns (warn, not block).
 pub const WARN_EXTENSIONS: &[&str] = &["pem", "p8"];
@@ -249,6 +260,40 @@ mod tests {
         // Safe-template check runs first in the guards, so .envrc.example is
         // still allowed.
         assert!(is_safe_template(".envrc.example"));
+    }
+
+    #[test]
+    fn aws_kube_credential_stores_blocked_by_fragment() {
+        // #77: high-value plaintext credential stores reachable only by path —
+        // matched as parent-dir-qualified fragments, not bare basenames.
+        assert!(is_blocked("credentials", "/home/user/.aws/credentials"));
+        assert!(is_blocked("config", "/home/user/.kube/config"));
+        // Fragment form also covers adjacent variants in the same dir.
+        assert!(is_blocked(
+            "credentials.bak",
+            "/home/user/.aws/credentials.bak"
+        ));
+    }
+
+    #[test]
+    fn plaintext_credential_dotfiles_blocked() {
+        // #77: exact-filename plaintext credential stores (git token store,
+        // Postgres password file).
+        assert!(is_blocked(
+            ".git-credentials",
+            "/home/user/.git-credentials"
+        ));
+        assert!(is_blocked(".pgpass", "/home/user/.pgpass"));
+    }
+
+    #[test]
+    fn bare_config_and_credentials_not_overblocked() {
+        // #77 guard: the generic basenames are fragments (parent-dir-qualified),
+        // so benign `config`/`credentials` files outside the credential dirs
+        // stay readable — proves no bare filename was added.
+        assert!(!is_blocked("config", "/project/config"));
+        assert!(!is_blocked("config", "/project/src/config"));
+        assert!(!is_blocked("credentials", "/project/credentials"));
     }
 
     #[test]
