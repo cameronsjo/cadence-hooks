@@ -147,7 +147,10 @@ impl Check for TerminologyGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let Some(content) = input.content() else {
+        // edit_fragments() yields one (introduced, removed) pair for Write/Edit
+        // and one per edits[] element for MultiEdit — so MultiEdit is inspected
+        // instead of waved through `content()`'s None early-allow (#83).
+        let Some(fragments) = input.edit_fragments() else {
             return CheckResult::allow();
         };
 
@@ -157,23 +160,35 @@ impl Check for TerminologyGuard {
             return CheckResult::allow();
         }
 
-        let mut result = check_terminology(content);
-
-        // Edit tool: only violations *introduced* by this edit count. A term
-        // already present in old_string is pre-existing file content — blocking
-        // on it would prevent edits that don't add anything prohibited (#63).
-        if let Some(old) = input
-            .tool_input
-            .as_ref()
-            .and_then(|ti| ti.old_string.as_deref())
-        {
-            let existing = check_terminology(old);
-            result.blocks = subtract_existing(result.blocks, &existing.blocks);
-            result.nudges = subtract_existing(result.nudges, &existing.nudges);
+        // Per-edit introduced-vs-existing diff, accumulated and deduped. Only
+        // violations *introduced* by this call fire; a term carried through
+        // (present in an edit's old_string) is pre-existing context, not new
+        // content (#63). Folding per-edit — not over a concatenated document —
+        // keeps each edit's subtraction scoped and stops a phrase pattern
+        // matching across an edit boundary.
+        let mut blocks: Vec<(String, String)> = Vec::new();
+        let mut nudges: Vec<(String, String)> = Vec::new();
+        for (new_text, old_text) in &fragments {
+            let mut found = check_terminology(new_text);
+            if !old_text.is_empty() {
+                let existing = check_terminology(old_text);
+                found.blocks = subtract_existing(found.blocks, &existing.blocks);
+                found.nudges = subtract_existing(found.nudges, &existing.nudges);
+            }
+            for b in found.blocks {
+                if !blocks.contains(&b) {
+                    blocks.push(b);
+                }
+            }
+            for n in found.nudges {
+                if !nudges.contains(&n) {
+                    nudges.push(n);
+                }
+            }
         }
 
         // Tier 1: hard block
-        if !result.blocks.is_empty() {
+        if !blocks.is_empty() {
             let mut msg = String::new();
             msg.push_str("🚫 BLOCKED: Inclusive terminology violation detected");
             if let Some(ref path) = input.file_path() {
@@ -181,12 +196,12 @@ impl Check for TerminologyGuard {
             }
             msg.push_str("\n\nFound prohibited terms:\n");
 
-            for (term, _) in &result.blocks {
+            for (term, _) in &blocks {
                 msg.push_str(&format!("  - \"{term}\"\n"));
             }
 
             msg.push_str("\nRequired alternatives:\n");
-            for (term, replacement) in &result.blocks {
+            for (term, replacement) in &blocks {
                 msg.push_str(&format!("  {term} → {replacement}\n"));
             }
 
@@ -194,14 +209,14 @@ impl Check for TerminologyGuard {
         }
 
         // Tier 2: nudge (advisory)
-        if !result.nudges.is_empty() {
+        if !nudges.is_empty() {
             let mut msg = String::new();
             msg.push_str("⚠️  Terminology nudge");
             if let Some(ref path) = input.file_path() {
                 msg.push_str(&format!(" in {path}"));
             }
             msg.push_str(" — consider alternatives if technical context:\n");
-            for (term, replacement) in &result.nudges {
+            for (term, replacement) in &nudges {
                 msg.push_str(&format!("  {term} → {replacement}\n"));
             }
 
@@ -563,7 +578,7 @@ mod tests {
 
     // --- Edit tool: only introduced violations fire (#63) ---
 
-    use cadence_hooks_core::test_builders::make_edit;
+    use cadence_hooks_core::test_builders::{make_edit, make_multi_edit};
 
     #[test]
     fn edit_with_preexisting_term_in_context_allowed() {
@@ -637,5 +652,49 @@ mod tests {
         };
         let result = TerminologyGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // --- MultiEdit: edits[] folded per-edit, same #63 semantics (#83) ---
+
+    #[test]
+    fn multi_edit_introducing_term_blocks() {
+        // A MultiEdit whose new_string introduces a prohibited term must block —
+        // it would silently pass through content()'s None early-allow before #83.
+        let term = BLOCK_VIOLATIONS[0].0;
+        let input = make_multi_edit(
+            "/project/src/config.rs",
+            &[
+                ("fn a() {}", "fn a() { /* tidy */ }"),
+                ("value = 1", &format!("value = 2 // uses the {term}")),
+            ],
+        );
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains(term));
+    }
+
+    #[test]
+    fn multi_edit_carried_through_term_allowed() {
+        // Term present in BOTH old and new of one edit = pre-existing context
+        // carried through — #63 parity, folded per-edit.
+        let term = BLOCK_VIOLATIONS[0].0;
+        let input = make_multi_edit(
+            "/project/src/config.rs",
+            &[(&format!("{term} setting v1"), &format!("{term} setting v2"))],
+        );
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn multi_edit_removing_term_not_blamed() {
+        // Term only in old_string (the edit REMOVES it) → not falsely blamed.
+        let term = BLOCK_VIOLATIONS[0].0;
+        let input = make_multi_edit(
+            "/project/src/config.rs",
+            &[(&format!("use the {term} here"), "use the allowlist here")],
+        );
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }

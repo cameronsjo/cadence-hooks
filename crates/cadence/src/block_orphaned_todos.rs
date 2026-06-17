@@ -82,7 +82,10 @@ impl Check for OrphanedTodoGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let Some(content) = input.content() else {
+        // edit_fragments() yields the introduced text for Write/Edit and one
+        // fragment per edits[] element for MultiEdit, which `content()` returned
+        // None for — letting MultiEdit slip past unchecked (#83).
+        let Some(fragments) = input.edit_fragments() else {
             return CheckResult::allow();
         };
 
@@ -92,7 +95,10 @@ impl Check for OrphanedTodoGuard {
             return CheckResult::allow();
         }
 
-        let orphans = find_orphaned(content);
+        let orphans: Vec<(usize, String)> = fragments
+            .iter()
+            .flat_map(|(new_text, _old)| find_orphaned(new_text))
+            .collect();
         if orphans.is_empty() {
             return CheckResult::allow();
         }
@@ -264,6 +270,45 @@ mod tests {
     #[test]
     fn run_allows_clean_code() {
         let input = make_check_input(Some("src/main.rs"), "fn main() {}");
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- MultiEdit: introduced fragments scanned per edit (#83) ---
+
+    use cadence_hooks_core::test_builders::make_multi_edit;
+
+    #[test]
+    fn multi_edit_introducing_orphan_blocks() {
+        // A MultiEdit whose new_string introduces an unreferenced marker must
+        // block — before #83 it slipped through content()'s None early-allow.
+        let orphan = make_marker("TODO", false); // assembled at runtime — source-safe
+        let input = make_multi_edit(
+            "src/main.rs",
+            &[("fn main() {}", &format!("fn main() {{}} {orphan}"))],
+        );
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn multi_edit_referenced_marker_allowed() {
+        // A MultiEdit introducing a properly-referenced marker is fine.
+        let ok = make_marker("TODO", true);
+        let input = make_multi_edit(
+            "src/main.rs",
+            &[("fn main() {}", &format!("fn main() {{}} {ok}"))],
+        );
+        let result = OrphanedTodoGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn multi_edit_clean_edits_allowed() {
+        let input = make_multi_edit(
+            "src/main.rs",
+            &[("let a = 1;", "let a = 2;"), ("let b = 3;", "let b = 4;")],
+        );
         let result = OrphanedTodoGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }

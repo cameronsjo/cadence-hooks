@@ -25,11 +25,17 @@ impl Check for LineEndingsGuard {
             return CheckResult::allow();
         }
 
-        let Some(content) = input.content() else {
+        // Scan each introduced fragment (new_string). MultiEdit carries one per
+        // edits[] element; `content()` returned None for it, so a CRLF introduced
+        // by a MultiEdit slipped through before #83.
+        let Some(fragments) = input.edit_fragments() else {
             return CheckResult::allow();
         };
 
-        if content.contains('\r') {
+        if fragments
+            .iter()
+            .any(|(new_text, _old)| new_text.contains('\r'))
+        {
             return CheckResult::block(
                 "🚫 BLOCKED: Shell script contains Windows-style CRLF line endings.\n\
                  This causes \"env: bash\\r: No such file or directory\" errors.\n\
@@ -186,6 +192,26 @@ mod tests {
     fn zsh_extension_not_checked() {
         // Only .sh and .bash are checked — .zsh is not
         let input = make_input("script.zsh", "#!/bin/zsh\r\necho hello\r\n");
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- MultiEdit: introduced fragments scanned per edit (#83) ---
+
+    use cadence_hooks_core::test_builders::make_multi_edit;
+
+    #[test]
+    fn multi_edit_introducing_crlf_blocked() {
+        // A MultiEdit whose new_string introduces a CRLF into a .sh must block —
+        // before #83 it slipped through content()'s None early-allow.
+        let input = make_multi_edit("script.sh", &[("echo hi", "echo hi\r\necho bye")]);
+        let result = LineEndingsGuard.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn multi_edit_lf_only_allowed() {
+        let input = make_multi_edit("script.sh", &[("echo hi", "echo hi\necho bye")]);
         let result = LineEndingsGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
