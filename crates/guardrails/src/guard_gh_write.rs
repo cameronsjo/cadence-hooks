@@ -24,6 +24,20 @@ static WRITE_ACTIONS: LazyLock<Regex> = LazyLock::new(|| {
     ).expect("pattern should compile")
 });
 
+/// Write subcommands whose noun is absent from [`WRITE_ACTIONS`]' noun group,
+/// or whose verb is absent from its shared verb group. Kept SEPARATE (with `\b`
+/// anchors) so the new verbs don't leak across the shared alternation — notably
+/// so `clone` here never makes `gh repo clone` (a local read) look like a write
+/// (#87). `gh ruleset` is read-only in gh (rulesets are written via `gh api`,
+/// already covered); account-level `gh ssh-key`/`gpg-key` and `--owner`-scoped
+/// `gh project` are deliberately excluded (no `-R` → would mis-target cwd).
+static WRITE_ACTIONS_EXTRA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"gh\s+(secret|variable)\s+(set|delete)\b|gh\s+release\s+upload\b|gh\s+label\s+clone\b",
+    )
+    .expect("pattern should compile")
+});
+
 static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"gh\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
         .expect("pattern should compile")
@@ -58,6 +72,7 @@ static REPO_FORK_COMMAND: LazyLock<Regex> =
 
 fn is_write_command(command: &str) -> bool {
     WRITE_ACTIONS.is_match(command)
+        || WRITE_ACTIONS_EXTRA.is_match(command)
         || API_WRITE_METHOD.is_match(command)
         || API_FIELD_FLAGS.is_match(command)
         || API_INPUT_FLAG.is_match(command)
@@ -1156,6 +1171,57 @@ mod tests {
         assert!(is_write_command("gh repo rename new-name"));
     }
 
+    // --- #87: write-verb/noun coverage gap ---
+    #[test]
+    fn release_upload_is_write() {
+        assert!(is_write_command("gh release upload v1.0.0 dist.zip"));
+    }
+    #[test]
+    fn release_delete_asset_is_write() {
+        assert!(is_write_command("gh release delete-asset v1.0.0 dist.zip"));
+    }
+    #[test]
+    fn secret_set_is_write() {
+        assert!(is_write_command("gh secret set TOKEN"));
+    }
+    #[test]
+    fn secret_delete_is_write() {
+        assert!(is_write_command("gh secret delete TOKEN"));
+    }
+    #[test]
+    fn variable_set_is_write() {
+        assert!(is_write_command("gh variable set NAME --body v"));
+    }
+    #[test]
+    fn variable_delete_is_write() {
+        assert!(is_write_command("gh variable delete NAME"));
+    }
+    #[test]
+    fn label_clone_is_write() {
+        assert!(is_write_command("gh label clone source/repo"));
+    }
+    #[test]
+    fn secret_list_is_not_write() {
+        assert!(!is_write_command("gh secret list"));
+    }
+    #[test]
+    fn variable_get_is_not_write() {
+        assert!(!is_write_command("gh variable get NAME"));
+    }
+    #[test]
+    fn variable_list_is_not_write() {
+        assert!(!is_write_command("gh variable list"));
+    }
+    #[test]
+    fn release_download_is_not_write() {
+        assert!(!is_write_command("gh release download v1.0.0"));
+    }
+    #[test]
+    fn repo_clone_is_not_write() {
+        // Regression: shared-verb bleed — `clone` must not flag the local read.
+        assert!(!is_write_command("gh repo clone cameronsjo/cadence-hooks"));
+    }
+
     #[test]
     fn release_delete_is_write() {
         assert!(is_write_command("gh release delete v1.0.0"));
@@ -1975,6 +2041,31 @@ mod tests {
             let result = GhWriteGuard.run(&input);
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn release_upload_unowned_target_blocks() {
+        // #87: a newly-covered write to a non-owned repo is now ownership-checked.
+        with_env(&owners_env(), || {
+            let input = input_with("gh release upload v1 x.zip -R evil/unowned", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            assert_eq!(
+                result.block_metadata.unwrap().rule_id,
+                "gh-write-unauthorized-target"
+            );
+        });
+    }
+
+    #[test]
+    fn secret_set_owned_target_allows() {
+        with_env(&owners_env(), || {
+            let input = input_with("gh secret set TOKEN -R cameronsjo/x", "/tmp");
+            assert!(matches!(
+                GhWriteGuard.run(&input).outcome,
+                cadence_hooks_core::Outcome::Allow
+            ));
         });
     }
 

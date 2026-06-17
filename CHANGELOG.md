@@ -52,6 +52,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one per `edits[]` element — that the guards fold over; terminology preserves
   its introduced-vs-existing diff (#63) per edit. Write/single-Edit behavior is
   unchanged.
+- **git-safety: block history-rewrite and remote-mirror destruction** (#84 on
+  claude-configurations). `git filter-branch`/`filter-repo` (mass history
+  rewrite), `git update-ref` deleting or repointing a protected branch, and
+  `git push --mirror` (overwrites/deletes all remote refs) fell through to
+  Allow. Now blocked; a non-protected `update-ref -d` nudges.
+- **guard-gh-write: cover release upload, secret/variable set, label clone**
+  (#87 on claude-configurations). These write GitHub state and accept `-R`, but
+  the noun/verb table missed them, so ownership was never checked. Added via a
+  separate anchored pattern so `clone` can't make `gh repo clone` (a local read)
+  look like a write. (`gh ruleset` is read-only — written via `gh api`, already
+  covered; account-level `ssh-key`/`gpg-key` and `--owner` `project` excluded.)
+- **dispatch: protect security guards from silent `CADENCE_DISABLE`** (#89 on
+  claude-configurations). Disabling a guard by name exited 0 with no trace, and
+  nothing exempted the enforcement guards — `CADENCE_DISABLE=git-safety` silently
+  neutered it. Now every disable emits a one-line stderr notice, and a protected
+  set (secret/git/gh/vault/browser/trash guards) refuses to disable and still
+  runs. Use the loud, per-session `CADENCE_BYPASS` for maintenance.
+- **terminology: anchor the source-exemption to path components** (#91 on
+  claude-configurations). The `cadence-hooks/`/`.claude/hooks|rules`/`claude.md`
+  exemptions were unanchored substrings, so a sibling `legacy-cadence-hooks/`, a
+  spoofed `x.claude/hooks/`, or `evilclaude.md` got a free pass. Now matched on
+  `/`-split components.
+- **memory-guard: measure the resulting file and anchor to the auto-memory
+  root** (#92, #93 on claude-configurations). The 200-line cap counted the Edit
+  *fragment* (`content()`), so an Edit appending to a near-limit MEMORY.md was
+  allowed while the file grew past the cap — now uses `effective_content()`. The
+  `/memory/` path test over-matched any project file with a `memory/` dir — now
+  anchored to `<config>/projects/<slug>/memory/` with `.`/`..`/`\` normalized
+  before matching, so a nested `docs/memory/` or a `..`-traversal path neither
+  over-matches an ordinary file nor smuggles MEMORY.md past the cap.
+- **prevent-secret-leaks: sharpen the echo-secret nudge** (#85 on
+  claude-configurations, partial). The exfil nudge matched uppercase `KEY`/
+  `SECRET`/… against the original-case command, so `echo $database_password`
+  (lowercase) was missed; keywords are now lowercased on both sides, and
+  `echo`/`printf` match at command position (not substring) so a benign arg or
+  path containing those words no longer over-fires. (The secret-value content
+  scanner — the rest of #85 — ships separately.)
 - **metrics: atomic subagent log writes, current model prices, tail-bounded
   transcript scan** (#94, #95, #96 on claude-configurations). `log-subagent`
   built its JSONL line with `writeln!` (many small writes that tear under

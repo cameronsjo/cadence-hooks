@@ -144,11 +144,15 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
         }
     }
 
-    // Warn: echo/printf of secret env vars
-    if (lower.contains("echo") || lower.contains("printf"))
-        && ["KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "AUTH"]
+    // Warn: echo/printf of secret env vars. Compare lowercased on both sides so
+    // a lowercase var (`echo $database_password`) nudges too — the prior
+    // uppercase-literal match against the original-case command missed it (#85).
+    // Match echo/printf at command position (not substring) so a benign arg or
+    // path containing "echo"/"printf" (`cat ./echoes.log`) doesn't over-fire.
+    if (is_executed_command(&lower, &["echo"]) || is_executed_command(&lower, &["printf"]))
+        && ["key", "secret", "token", "password", "credential", "auth"]
             .iter()
-            .any(|s| command.contains(s))
+            .any(|s| lower.contains(s))
     {
         return Some(CheckResult::nudge(
             "⚠️  Command may print a secret environment variable. \
@@ -1341,6 +1345,19 @@ mod tests {
         // No dangerous env token among find's args.
         let result =
             SecretLeaksGuard.run(&make_bash_input("find . -name '*.log' -exec cat {} \\;"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_echo_lowercase_password_warned() {
+        // #85: a lowercase var must nudge too (the old uppercase-literal match missed it).
+        let result = SecretLeaksGuard.run(&make_bash_input("echo $database_password"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn bash_echo_plain_text_allowed() {
+        let result = SecretLeaksGuard.run(&make_bash_input("echo hello world"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }
