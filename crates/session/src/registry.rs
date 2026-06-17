@@ -163,7 +163,13 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    file.write_all(contents)?;
+    if let Err(e) = file.write_all(contents) {
+        // A failed write (e.g. disk full) must not leave an orphan .tmp —
+        // sweep_stale only reaps .json files, so it would accumulate.
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     drop(file);
     if let Err(e) = fs::rename(&tmp, path) {
         // Don't leak a staging file when the rename fails (e.g. read-only fs).
