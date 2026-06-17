@@ -234,6 +234,46 @@ impl HookInput {
             .and_then(|ti| ti.content.as_deref().or(ti.new_string.as_deref()))
     }
 
+    /// The `(introduced, removed)` text-fragment pairs a tool call carries, so a
+    /// content guard can inspect *what the edit introduces* uniformly across
+    /// Write, Edit, and MultiEdit:
+    ///
+    /// - Write (`content`) → one pair `(content, "")` — no removed fragment.
+    /// - Edit (`new_string`/`old_string`) → one pair.
+    /// - MultiEdit (`edits[]`) → one pair per element.
+    ///
+    /// `None` when the payload carries no editable text (e.g. Read, Bash).
+    ///
+    /// Fragments are kept SEPARATE (not concatenated) so a phrase pattern can't
+    /// match across an edit boundary, and so each edit's removed-context
+    /// subtraction stays scoped to that edit. Use this — not [`Self::content`],
+    /// which is `None` for MultiEdit — for fragment-scanning guards that must
+    /// also see `edits[]` (#83); use [`Self::effective_content`] only when the
+    /// whole resulting document matters.
+    pub fn edit_fragments(&self) -> Option<Vec<(String, String)>> {
+        let ti = self.tool_input.as_ref()?;
+
+        if let Some(new) = ti.content.as_deref().or(ti.new_string.as_deref()) {
+            let old = ti.old_string.as_deref().unwrap_or_default().to_string();
+            return Some(vec![(new.to_string(), old)]);
+        }
+
+        if let Some(edits) = ti.edits.as_ref() {
+            let pairs: Vec<(String, String)> = edits
+                .iter()
+                .map(|e| {
+                    (
+                        e.new_string.as_deref().unwrap_or_default().to_string(),
+                        e.old_string.as_deref().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            return (!pairs.is_empty()).then_some(pairs);
+        }
+
+        None
+    }
+
     /// The full document the tool call will produce.
     ///
     /// - Write (`content` present) → the content as-is.
@@ -1001,6 +1041,75 @@ mod tests {
     fn content_none_when_both_absent() {
         let input = make_input(None, None, None, None, None, None);
         assert_eq!(input.content(), None);
+    }
+
+    // --- edit_fragments (#83) ---
+
+    #[test]
+    fn edit_fragments_write_single_pair_no_old() {
+        let input = make_input(Some("Write"), Some("/a.rs"), None, None, Some("doc"), None);
+        assert_eq!(
+            input.edit_fragments(),
+            Some(vec![("doc".to_string(), String::new())])
+        );
+    }
+
+    #[test]
+    fn edit_fragments_edit_pairs_new_and_old() {
+        let input = HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(ToolInput {
+                file_path: Some("/a.rs".into()),
+                new_string: Some("new".into()),
+                old_string: Some("old".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            input.edit_fragments(),
+            Some(vec![("new".to_string(), "old".to_string())])
+        );
+    }
+
+    #[test]
+    fn edit_fragments_multi_edit_one_pair_per_edit() {
+        // The MultiEdit case content() returns None for — one (new, old) pair
+        // per edits[] element, in order.
+        let input = HookInput {
+            tool_name: Some("MultiEdit".into()),
+            tool_input: Some(ToolInput {
+                file_path: Some("/a.rs".into()),
+                edits: Some(vec![
+                    EditOperation {
+                        old_string: Some("o1".into()),
+                        new_string: Some("n1".into()),
+                        replace_all: None,
+                    },
+                    EditOperation {
+                        old_string: Some("o2".into()),
+                        new_string: Some("n2".into()),
+                        replace_all: None,
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(input.content(), None, "content() is blind to MultiEdit");
+        assert_eq!(
+            input.edit_fragments(),
+            Some(vec![
+                ("n1".to_string(), "o1".to_string()),
+                ("n2".to_string(), "o2".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn edit_fragments_none_for_bash() {
+        let input = make_input(Some("Bash"), None, None, Some("ls"), None, None);
+        assert_eq!(input.edit_fragments(), None);
     }
 
     // --- effective_content ---

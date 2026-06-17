@@ -118,13 +118,74 @@ pub fn find_own(dir: &Path, session_id: &str) -> Option<PathBuf> {
     })
 }
 
+/// Write `contents` to `path` atomically: stage to a uniquely-named temp file
+/// in the SAME directory, then `rename` it over `path`. A concurrent reader
+/// sees either the old complete file or the new complete file — never a
+/// truncated or half-written document.
+///
+/// Plain `fs::write` does `open(O_TRUNC)` then `write_all`, exposing a window
+/// where a peer's `read_peers` lands on a 0-byte/partial file, fails to parse,
+/// and silently skips the session (#79). The one-shot SessionStart disclosure
+/// then misses a live peer for the whole session.
+///
+/// The temp name carries the target filename AND the writer's PID: separate
+/// hook invocations are separate processes (distinct PIDs), and within one
+/// process distinct records have distinct filenames — so two concurrent writers
+/// never collide on the same temp path. `rename` is atomic only within one
+/// filesystem, so the temp MUST share `path`'s parent directory.
+fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "record".to_string());
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    // create_new (O_EXCL) refuses to follow or overwrite an existing path, so a
+    // pre-planted symlink at the predictable temp name is rejected rather than
+    // clobbered (the registry dir is user-owned in normal use, but defense in
+    // depth is cheap here). A stale temp from a crashed same-PID process is the
+    // only benign collision — remove it and retry once. `rename` then replaces
+    // `path` itself (never follows a symlink at the target), so the whole write
+    // is symlink-safe end to end.
+    use std::io::Write;
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&tmp)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?
+        }
+        Err(e) => return Err(e),
+    };
+    if let Err(e) = file.write_all(contents) {
+        // A failed write (e.g. disk full) must not leave an orphan .tmp —
+        // sweep_stale only reaps .json files, so it would accumulate.
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(file);
+    if let Err(e) = fs::rename(&tmp, path) {
+        // Don't leak a staging file when the rename fails (e.g. read-only fs).
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Write (or overwrite) a record's file in the registry. Creates the
 /// directory if needed. Writing refreshes mtime — this *is* the heartbeat.
 pub fn write_record(dir: &Path, record: &SessionRecord) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let path = dir.join(identity::filename(&record.name, &record.session_id));
     let json = serde_json::to_string_pretty(record).unwrap_or_else(|_| "{}".to_string());
-    fs::write(path, json + "\n")
+    atomic_write(&path, (json + "\n").as_bytes())
 }
 
 /// Read a session's own record, if registered.
@@ -294,6 +355,97 @@ mod tests {
     fn find_own_none_when_unregistered() {
         let tmp = TempDir::new().unwrap();
         assert!(find_own(tmp.path(), "nobody").is_none());
+    }
+
+    // --- atomic write (#79) ---
+
+    #[test]
+    fn atomic_write_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("doc.json");
+        atomic_write(&path, b"hello\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn write_record_leaves_no_temp_file() {
+        // The rename staging file must not survive a successful write — only the
+        // .json record remains, never a stray .tmp.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("quiet-loom", "e4739a12-full")).unwrap();
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["quiet-loom.e4739a12.json".to_string()]);
+    }
+
+    #[test]
+    fn read_peers_skips_empty_file() {
+        // A 0-byte .json is exactly what a torn (non-atomic) fs::write left
+        // mid-flight. The reader must fail open and still surface the valid
+        // peer — and the atomic writer guarantees new writers never create this.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::write(dir.join("torn.deadbeef.json"), "").unwrap();
+        write_record(&dir, &record("forge-anvil", "peer-session")).unwrap();
+        let peers = read_peers(&dir, "self", 600);
+        assert_eq!(peers.len(), 1, "empty file skipped, valid peer found");
+    }
+
+    #[test]
+    fn concurrent_writes_to_distinct_files_all_persist() {
+        // 16 threads share one PID, so this fails under pid-only temp naming
+        // (temp collision corrupts records) and passes once the temp name also
+        // carries the target filename. Guards the uniqueness design.
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let dir = Arc::new(tmp.path().to_path_buf());
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let dir = Arc::clone(&dir);
+                std::thread::spawn(move || {
+                    let sid = format!("session-{i:02}");
+                    write_record(&dir, &record(&format!("peer-{i:02}"), &sid)).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(read_peers(&dir, "none", 600).len(), 16);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_clobber_preplanted_symlink_at_temp() {
+        // A co-tenant pre-plants a symlink at the predictable temp path; the
+        // O_EXCL create_new must reject/replace it without writing through to
+        // the victim, and the record must still land.
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, "precious\n").unwrap();
+
+        let rec = record("quiet-loom", "e4739a12-full");
+        let target_name = identity::filename(&rec.name, &rec.session_id);
+        let temp_path = dir.join(format!(".{target_name}.{}.tmp", std::process::id()));
+        symlink(&victim, &temp_path).unwrap();
+
+        write_record(&dir, &rec).unwrap();
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "precious\n",
+            "victim file must not be clobbered through the symlink"
+        );
+        assert!(
+            read_own(&dir, "e4739a12-full").is_some(),
+            "record still landed"
+        );
     }
 
     // --- peer discovery ---

@@ -4,6 +4,7 @@
 //! `rm` bypasses it and loses recoverability. This guard blocks `rm` inside
 //! the vault directory and suggests `mv` to `.trash/` instead.
 
+use cadence_hooks_core::shell::tokenize;
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
 /// True when a normalized path is absolute — POSIX (`/foo`) or a Windows
@@ -35,8 +36,13 @@ fn check_rm_in_vault(command: &str, cwd: &str, vault: &str) -> CheckResult {
     let mut in_vault = cwd == vault || cwd.starts_with(&vault_prefix);
 
     if !in_vault {
-        for part in command.split_whitespace() {
-            let part = normalize_path(part);
+        // Quote-aware tokenize (not split_whitespace): a vault path with spaces
+        // must be quoted (`"…/Field Reports/old.md"`), and split_whitespace both
+        // shreds it across tokens and leaves a leading `"` that defeats
+        // `looks_absolute`. tokenize keeps a quoted path in one token and strips
+        // the quotes, so the absolute/in-vault test sees the real path (#82).
+        for part in tokenize(command) {
+            let part = normalize_path(&part);
             if looks_absolute(&part) && (part == vault || part.starts_with(&vault_prefix)) {
                 in_vault = true;
                 break;
@@ -105,6 +111,51 @@ mod tests {
     fn rm_with_explicit_vault_path_blocked() {
         let result = check_rm_in_vault("rm /vault/notes/todo.md", "/home/user", "/vault");
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rm_double_quoted_vault_path_blocked() {
+        // #82: a leading `"` must not defeat looks_absolute.
+        let result = check_rm_in_vault("rm \"/vault/notes/todo.md\"", "/home/user", "/vault");
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rm_single_quoted_vault_path_blocked() {
+        let result = check_rm_in_vault("rm '/vault/notes/todo.md'", "/home/user", "/vault");
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rm_double_quoted_vault_path_with_spaces_blocked() {
+        // #82 headline repro: a spaced vault path must be quoted; split_whitespace
+        // shredded it across tokens and the guard never saw the absolute path.
+        let result =
+            check_rm_in_vault("rm \"/vault/Field Reports/old.md\"", "/home/user", "/vault");
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rm_single_quoted_vault_path_with_spaces_blocked() {
+        let result = check_rm_in_vault("rm '/vault/Field Reports/old.md'", "/home/user", "/vault");
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rm_quoted_out_of_vault_path_with_spaces_allowed() {
+        // Regression: a genuinely out-of-vault quoted spaced path stays Allow.
+        let result = check_rm_in_vault(
+            "rm \"/home/user/Field Reports/old.md\"",
+            "/home/user",
+            "/vault",
+        );
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn rm_quoted_out_of_vault_path_allowed() {
+        let result = check_rm_in_vault("rm '/other/note.md'", "/home/user", "/vault");
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]

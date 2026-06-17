@@ -6,6 +6,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **git-safety: `git rebase --onto <protected>` is no longer falsely blocked**
+  (#74 on claude-configurations). `check_rebase_blocked` flagged any rebase
+  whose args contained a bare `main`/`master`, catching `git rebase --onto main
+  <upstream> <branch>` — a documented stacked-PR restack where main is the
+  replay destination and is never rewritten. The token following `--onto` is now
+  exempt; a protected branch named anywhere else (plain `git rebase main`, or as
+  the trailing `<branch>`) still blocks.
+- **secret guards: block `.git-credentials`, `.pgpass`, `.aws/credentials`,
+  `.kube/config`** (#77 on claude-configurations). These plaintext credential
+  stores were in neither deny-list, so Read/Grep/Write/Edit operated on them
+  freely. `.git-credentials`/`.pgpass` (unique basenames) join
+  `BLOCKED_FILENAMES`; `.aws/credentials`/`.kube/config` join
+  `BLOCKED_PATH_FRAGMENTS` as parent-dir-qualified fragments so a bare
+  `config`/`credentials` file elsewhere is not over-blocked. (The Bash arms stay
+  `.env`-family-only, as for `id_rsa`/`.netrc` today.)
+- **session: registry records are written atomically** (#79 on
+  claude-configurations). `write_record` used `fs::write` (truncate-then-write),
+  exposing a window where a concurrent `read_peers` lands on a 0-byte/partial
+  file, fails to parse, and silently drops a live peer — worst case, a peer
+  missing from the one-shot SessionStart disclosure for the whole session.
+  Records now stage to a temp file in the same directory and `rename` over the
+  target, so a reader only ever sees a complete document. The temp is created
+  with `O_EXCL` and the rename replaces the target path itself, so the write is
+  symlink-safe end to end.
+- **session: the lane guard now assesses MultiEdit** (#80 on
+  claude-configurations). The guard matched only Edit/Write, so a MultiEdit into
+  a peer's declared `touching` lane slipped through unwarned. MultiEdit carries a
+  top-level `file_path`, so matching the arm is sufficient (the hook matcher
+  already routes MultiEdit to the binary).
+- **obsidian trash_guard: quoted vault paths no longer evade the check** (#82 on
+  claude-configurations). When cwd was outside the vault, the in-vault scan used
+  raw `split_whitespace`, so a quoted absolute vault path evaded it — a leading
+  `"` defeated the absolute-path test, and a quoted path with spaces (e.g.
+  `Field Reports/…`) was shredded across tokens. The scan now uses the
+  quote-aware `core::shell::tokenize`, so `rm "/vault/Field Reports/old.md"` is
+  caught; out-of-vault quoted paths stay allowed.
+- **content guards: terminology, orphaned-todos, and line-endings now inspect
+  MultiEdit** (#83 on claude-configurations). All three gated on
+  `input.content()`, which is `None` for a MultiEdit payload (it carries
+  `edits[]`), so every MultiEdit hit the early allow() unchecked. A new
+  `HookInput::edit_fragments()` exposes the introduced/removed fragment pairs —
+  one per `edits[]` element — that the guards fold over; terminology preserves
+  its introduced-vs-existing diff (#63) per edit. Write/single-Edit behavior is
+  unchanged.
+
 ## [0.29.0] - 2026-06-10
 
 ### Fixed
