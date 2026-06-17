@@ -16,8 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and PEM private-key headers — and blocks, naming the kind without ever echoing
   the value. Runs before the safe-template allow, so a real key pasted into
   `.env.example` is still caught. JWTs and generic high-entropy strings are
-  deliberately not matched (unbounded false positives); this repo's own fixtures
-  and `.claude/` scratch are exempt.
+  deliberately not matched (unbounded false positives); only this repo's own
+  source is exempt (its test fixtures carry secret-shaped literals).
 
 ### Fixed
 
