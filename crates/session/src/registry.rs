@@ -108,14 +108,40 @@ pub fn live_peers(dir: &Path, own_session_id: &str, stale_secs: u64) -> Vec<Peer
         .collect()
 }
 
-/// Find a session's own registry file by its short id suffix.
+/// True when the registry file at `path` is the record for `session_id` — it
+/// parses and its stored `session_id` matches exactly. Fail-open false on a read
+/// or parse error: a file we cannot verify is not "ours".
+///
+/// The 8-char short id in the filename is ambiguous — distinct sessions whose
+/// ids share a prefix (notably manual `--session-id` values) land on the same
+/// `.<short-id>.json` suffix (#90). The filename is only a cheap pre-filter;
+/// this exact-id check is the authority on ownership.
+fn matches_own(path: &Path, session_id: &str) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<SessionRecord>(&t).ok())
+        .is_some_and(|r| r.session_id == session_id)
+}
+
+/// Find a session's own registry file. The `.<short-id>.json` suffix narrows
+/// the candidates cheaply; [`matches_own`] then verifies the full `session_id`,
+/// so a peer that merely shares this session's 8-char prefix is never mistaken
+/// for it (#90). Returns `None` when no candidate verifies — or when more than
+/// one does (ambiguous; reachable only via crafted/duplicate records, since
+/// production naming is deterministic), refusing to guess which is ours.
 pub fn find_own(dir: &Path, session_id: &str) -> Option<PathBuf> {
     let suffix = format!(".{}.json", identity::short_id(session_id));
     let entries = fs::read_dir(dir).ok()?;
-    entries.flatten().map(|e| e.path()).find(|p| {
+    let mut matches = entries.flatten().map(|e| e.path()).filter(|p| {
         p.file_name()
             .is_some_and(|n| n.to_string_lossy().ends_with(&suffix))
-    })
+            && matches_own(p, session_id)
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 /// Write `contents` to `path` atomically: stage to a uniquely-named temp file
@@ -238,12 +264,14 @@ pub fn touch_own(
 /// Delete registry files whose mtime is older than `stale_secs`, never the
 /// caller's own file.
 ///
-/// `own_session_id` is matched the same way [`find_own`] matches — by the
-/// `.<short-id>.json` filename suffix — and excluded from the sweep even when
-/// aged. A quiet session (read/think phase, or paused) still owns its lane;
-/// only `session start` itself, having just refreshed its own mtime, should
-/// reach this, and the exclusion is defense-in-depth against a self-sweep.
-/// Pass `""` to sweep everything (CLI/tests with no own session).
+/// `own_session_id` is matched the same way [`find_own`] resolves it — the
+/// `.<short-id>.json` suffix narrows candidates, then the full `session_id` is
+/// verified ([`matches_own`]) — and excluded from the sweep even when aged. A
+/// peer that merely shares the 8-char prefix is NOT spared (#90). A quiet
+/// session (read/think phase, or paused) still owns its lane; only `session
+/// start` itself, having just refreshed its own mtime, should reach this, and
+/// the exclusion is defense-in-depth against a self-sweep. Pass `""` to sweep
+/// everything (CLI/tests with no own session).
 pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -259,6 +287,7 @@ pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
             && path
                 .file_name()
                 .is_some_and(|n| n.to_string_lossy().ends_with(suffix.as_str()))
+            && matches_own(&path, own_session_id)
         {
             continue;
         }
@@ -355,6 +384,43 @@ mod tests {
     fn find_own_none_when_unregistered() {
         let tmp = TempDir::new().unwrap();
         assert!(find_own(tmp.path(), "nobody").is_none());
+    }
+
+    #[test]
+    fn find_own_disambiguates_colliding_short_ids() {
+        // #90: two manual --session-id values that share the first 8 chars
+        // ("session-") collide on the `.session-.json` filename suffix but are
+        // distinct sessions. find_own must verify the FULL session_id and return
+        // each session's own file — never whichever read_dir yields first.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("alpha-loom", "session-1")).unwrap();
+        write_record(&dir, &record("beta-anvil", "session-2")).unwrap();
+
+        let p1 = find_own(&dir, "session-1").expect("session-1 resolves");
+        assert!(
+            p1.to_string_lossy().contains("alpha-loom"),
+            "find_own(session-1) returned the wrong file: {p1:?}"
+        );
+        let p2 = find_own(&dir, "session-2").expect("session-2 resolves");
+        assert!(
+            p2.to_string_lossy().contains("beta-anvil"),
+            "find_own(session-2) returned the wrong file: {p2:?}"
+        );
+    }
+
+    #[test]
+    fn find_own_none_when_record_session_id_mismatches() {
+        // A file whose short_id matches the query but whose stored session_id
+        // does not is NOT this session's record — find_own must reject it rather
+        // than resolve by suffix alone.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("beta-anvil", "session-2")).unwrap();
+        assert!(
+            find_own(&dir, "session-1").is_none(),
+            "suffix-only match must not resolve a different session"
+        );
     }
 
     // --- atomic write (#79) ---
@@ -598,6 +664,30 @@ mod tests {
         assert!(
             find_own(&dir, "peer-session").is_none(),
             "peer aged file IS swept"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_own_but_sweeps_colliding_short_id_peer() {
+        // #90 twin: sweep_stale inlined the same suffix-only self-exclusion the
+        // old find_own used. A stale peer that shares our 8-char prefix
+        // ("session-") must still be swept — only OUR exact session_id is spared.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("alpha-loom", "session-1")).unwrap(); // own
+        write_record(&dir, &record("beta-anvil", "session-2")).unwrap(); // colliding peer
+        let own_file = dir.join("alpha-loom.session-.json");
+        let peer_file = dir.join("beta-anvil.session-.json");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // stale_secs = 0: both files have aged ≥ 1s; own is spared by session_id.
+        sweep_stale(&dir, 0, "session-1");
+        assert!(
+            own_file.exists(),
+            "own file kept (spared by exact session_id)"
+        );
+        assert!(
+            !peer_file.exists(),
+            "colliding-short-id peer is swept, not wrongly spared by suffix"
         );
     }
 

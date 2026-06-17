@@ -82,6 +82,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   neutered it. Now every disable emits a one-line stderr notice, and a protected
   set (secret/git/gh/vault/browser/trash guards) refuses to disable and still
   runs. Use the loud, per-session `CADENCE_BYPASS` for maintenance.
+- **session: `find_own` verifies the full `session_id`, not the 8-char suffix**
+  (#90 on claude-configurations). `find_own` resolved a session's own record by
+  the `.<short-id>.json` filename suffix and returned the first `read_dir` match
+  without ever parsing it, so two sessions whose ids share the first 8 chars
+  (notably manual `--session-id` values) cross-resolved — `read_own`/`touch_own`
+  and the drift baseline could read or overwrite the *other* session's record. A
+  new `matches_own` parses the candidate and checks the full `session_id`;
+  `find_own` returns only a verified match (and `None` when more than one
+  verifies — ambiguous). `sweep_stale` inlined the same suffix-only
+  self-exclusion (the twin site), so a stale peer sharing the prefix was wrongly
+  spared from the sweep; it now verifies the full id too.
 - **terminology: anchor the source-exemption to path components** (#91 on
   claude-configurations). The `cadence-hooks/`/`.claude/hooks|rules`/`claude.md`
   exemptions were unanchored substrings, so a sibling `legacy-cadence-hooks/`, a
