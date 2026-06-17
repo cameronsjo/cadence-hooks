@@ -204,13 +204,27 @@ fn guardrails_hook_can_be_disabled() {
 #[test]
 fn obsidian_trash_guard_disable_refused() {
     // trash-guard is a protected (data-loss) guard: CADENCE_DISABLE must NOT
-    // silently neuter it. It still runs, and the refusal is announced on stderr
-    // (#89). (Was `obsidian_hook_can_be_disabled`, asserting silent disable.)
+    // silently neuter it. Feed a vault-targeting `rm` and assert it STILL blocks
+    // (exit 2) despite the disable — proving the guard actually engaged, not
+    // merely that it didn't short-circuit (#89). (An exit-code-1 check on an
+    // empty-stdin invocation can't catch a silent-disable regression: the guard
+    // fails open to exit 0 on EOF per ADR-0001, same code a "disabled" path
+    // would return. A real payload + exit-2 is the unambiguous proof it ran.)
+    // (Was `obsidian_hook_can_be_disabled`, asserting silent disable.)
     let mut cmd = cadence_hooks();
     cmd.args(["obsidian", "trash-guard"]);
     cmd.env("CADENCE_DISABLE", "trash-guard");
-
-    let output = cmd.output().expect("failed to execute binary");
+    cmd.env("OBSIDIAN_VAULT", "/vault");
+    let output = run_with_stdin(
+        cmd,
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm /vault/notes/todo.md"}}"#,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "protected trash-guard must still block a vault rm despite CADENCE_DISABLE.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

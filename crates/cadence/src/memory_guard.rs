@@ -25,16 +25,35 @@ impl MemoryGuard {
 
     /// Pure form of [`Self::is_memory_path`], env-free for unit testing.
     ///
-    /// Matches a `memory/` segment rooted at an auto-memory tree — either under
-    /// the resolved `<config_dir>/projects/` (honoring a relocated
-    /// `CLAUDE_CONFIG_DIR`) or under a default `.claude/projects/` tree. A bare
-    /// `…/memory/…` no longer matches.
+    /// Auto-memory lives at `<root>/projects/<slug>/memory/<file>`, so `memory`
+    /// must sit *directly* under a single slug under `projects` — rooted at
+    /// either the resolved `<config_dir>/projects/` (honoring a relocated
+    /// `CLAUDE_CONFIG_DIR`) or a default `.claude/projects/` tree. A bare
+    /// `…/memory/…`, or a `memory/` nested deeper in the slug's subtree
+    /// (`projects/<slug>/docs/memory/…`), no longer matches (#93).
     fn is_memory_path_under(path: &str, config_dir: &str) -> bool {
-        if !path.contains("/memory/") {
-            return false;
+        let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let config_components: Vec<&str> = config_dir
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        // Rooted at <config_dir>/projects/<slug>/memory/<file> — honors a
+        // relocated CLAUDE_CONFIG_DIR whose dir isn't named ".claude".
+        if let Some(rest) = components.strip_prefix(config_components.as_slice())
+            && rest.len() >= 4
+            && rest[0] == "projects"
+            && rest[2] == "memory"
+        {
+            return true;
         }
-        let projects_root = format!("{}/projects/", config_dir.trim_end_matches('/'));
-        path.starts_with(&projects_root) || path.contains("/.claude/projects/")
+
+        // Rooted at a default `.claude/projects/<slug>/memory/` anywhere in the
+        // path: window of [.claude, projects, <slug>, memory].
+        components
+            .windows(4)
+            .any(|w| w[0] == ".claude" && w[1] == "projects" && w[3] == "memory")
     }
 
     fn is_memory_md(path: &str) -> bool {
@@ -309,6 +328,21 @@ mod tests {
     fn project_assets_memory_topic_is_not_auto_memory() {
         assert!(!MemoryGuard::is_memory_path_under(
             "/work/repo/assets/memory/notes.md",
+            "/home/user/.claude"
+        ));
+    }
+
+    #[test]
+    fn memory_nested_under_slug_subtree_is_not_auto_memory() {
+        // #93 (CodeRabbit): a `memory/` nested *inside* the projects tree but
+        // below an extra subdir (docs/, assets/) is NOT auto-memory — `memory`
+        // must sit directly under the slug. Both roots must reject it.
+        assert!(!MemoryGuard::is_memory_path_under(
+            "/custom/cfg/projects/foo/docs/memory/MEMORY.md",
+            "/custom/cfg"
+        ));
+        assert!(!MemoryGuard::is_memory_path_under(
+            "/home/user/.claude/projects/foo/docs/memory/MEMORY.md",
             "/home/user/.claude"
         ));
     }

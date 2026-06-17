@@ -525,18 +525,20 @@ impl GitSafetyGuard {
                 None
             }
             "update-ref" => {
-                // A non-protected ref delete (protected deletes already block in
-                // check_update_ref_blocked) has no safety net — nudge (#84).
-                if args.iter().any(|a| *a == "-d" || *a == "--delete") {
-                    return Some("git update-ref -d (deletes a ref with no safety net)".into());
-                }
                 // `--stdin` batch edits carry their refs on stdin (invisible to
                 // the guard, and a protected delete/repoint could hide there) —
-                // surface it rather than silently allow (review M1).
+                // surface it rather than silently allow (review M1). Checked
+                // before `-d` so the more-informative "refs not verifiable"
+                // message wins when both are present (`update-ref -d --stdin`).
                 if args.contains(&"--stdin") {
                     return Some(
                         "git update-ref --stdin (batch ref edits; refs not verifiable here)".into(),
                     );
+                }
+                // A non-protected ref delete (protected deletes already block in
+                // check_update_ref_blocked) has no safety net — nudge (#84).
+                if args.iter().any(|a| *a == "-d" || *a == "--delete") {
+                    return Some("git update-ref -d (deletes a ref with no safety net)".into());
                 }
                 None
             }

@@ -147,7 +147,9 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     // Warn: echo/printf of secret env vars. Compare lowercased on both sides so
     // a lowercase var (`echo $database_password`) nudges too — the prior
     // uppercase-literal match against the original-case command missed it (#85).
-    if (lower.contains("echo") || lower.contains("printf"))
+    // Match echo/printf at command position (not substring) so a benign arg or
+    // path containing "echo"/"printf" (`cat ./echoes.log`) doesn't over-fire.
+    if (is_executed_command(&lower, &["echo"]) || is_executed_command(&lower, &["printf"]))
         && ["key", "secret", "token", "password", "credential", "auth"]
             .iter()
             .any(|s| lower.contains(s))
