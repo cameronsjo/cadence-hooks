@@ -55,10 +55,15 @@ fn disabled_hook_exits_zero() {
 }
 
 #[test]
-fn disabled_hook_produces_no_output() {
+fn disabled_advisory_hook_exits_zero_with_notice() {
+    // An advisory (non-protected) hook disabled via CADENCE_DISABLE exits 0
+    // before reading stdin and produces no stdout — but now leaves a one-line
+    // stderr notice so the suppression is always traceable (#89). (Was
+    // `disabled_hook_produces_no_output`, which asserted silent disable of the
+    // protected git-safety guard — the bug #89 fixes.)
     let mut cmd = cadence_hooks();
-    cmd.args(["cadence", "git-safety"]);
-    cmd.env("CADENCE_DISABLE", "git-safety");
+    cmd.args(["cadence", "line-endings"]);
+    cmd.env("CADENCE_DISABLE", "line-endings");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -67,17 +72,19 @@ fn disabled_hook_produces_no_output() {
         output.stdout.is_empty(),
         "disabled hook should produce no stdout"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.stderr.is_empty(),
-        "disabled hook should produce no stderr"
+        stderr.contains("disabled via CADENCE_DISABLE"),
+        "disabling an advisory hook must leave a trace: {stderr}"
     );
 }
 
 #[test]
 fn comma_separated_list_disables_multiple() {
+    // line-endings is advisory (not protected), so it actually disables.
     let mut cmd = cadence_hooks();
-    cmd.args(["cadence", "git-safety"]);
-    cmd.env("CADENCE_DISABLE", "terminology,git-safety,line-endings");
+    cmd.args(["cadence", "line-endings"]);
+    cmd.env("CADENCE_DISABLE", "terminology,line-endings,orphaned-todos");
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -91,8 +98,11 @@ fn comma_separated_list_disables_multiple() {
 #[test]
 fn spaces_around_commas_tolerated() {
     let mut cmd = cadence_hooks();
-    cmd.args(["cadence", "git-safety"]);
-    cmd.env("CADENCE_DISABLE", "terminology , git-safety , line-endings");
+    cmd.args(["cadence", "line-endings"]);
+    cmd.env(
+        "CADENCE_DISABLE",
+        "terminology , line-endings , orphaned-todos",
+    );
 
     let output = cmd.output().expect("failed to execute binary");
 
@@ -192,18 +202,58 @@ fn guardrails_hook_can_be_disabled() {
 }
 
 #[test]
-fn obsidian_hook_can_be_disabled() {
+fn obsidian_trash_guard_disable_refused() {
+    // trash-guard is a protected (data-loss) guard: CADENCE_DISABLE must NOT
+    // silently neuter it. Feed a vault-targeting `rm` and assert it STILL blocks
+    // (exit 2) despite the disable — proving the guard actually engaged, not
+    // merely that it didn't short-circuit (#89). (An exit-code-1 check on an
+    // empty-stdin invocation can't catch a silent-disable regression: the guard
+    // fails open to exit 0 on EOF per ADR-0001, same code a "disabled" path
+    // would return. A real payload + exit-2 is the unambiguous proof it ran.)
+    // (Was `obsidian_hook_can_be_disabled`, asserting silent disable.)
     let mut cmd = cadence_hooks();
     cmd.args(["obsidian", "trash-guard"]);
     cmd.env("CADENCE_DISABLE", "trash-guard");
-
-    let output = cmd.output().expect("failed to execute binary");
-
+    cmd.env("OBSIDIAN_VAULT", "/vault");
+    let output = run_with_stdin(
+        cmd,
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm /vault/notes/todo.md"}}"#,
+    );
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "obsidian hook should be disableable too"
+        Some(2),
+        "protected trash-guard must still block a vault rm despite CADENCE_DISABLE.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to disable protected guard"),
+        "protected guard disable must be refused with a notice: {stderr}"
+    );
+    assert!(stderr.contains("trash-guard"));
+}
+
+#[test]
+fn protected_guard_cannot_be_disabled_via_cadence_disable() {
+    // git-safety is protected: naming it in CADENCE_DISABLE must NOT skip it.
+    // Feed the dangerous payload and assert it STILL blocks (exit 2) — proving
+    // the guard actually engaged, not merely that it didn't short-circuit (#89).
+    let mut cmd = cadence_hooks();
+    cmd.args(["cadence", "git-safety"]);
+    cmd.env("CADENCE_DISABLE", "git-safety");
+    let output = run_with_stdin(
+        cmd,
+        r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~3"}}"#,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "protected git-safety must still block despite CADENCE_DISABLE"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refusing to disable protected guard"));
+    assert!(stderr.contains("git-safety"));
 }
 
 #[test]
@@ -266,14 +316,25 @@ fn list_shows_disabled_status() {
     let output = cmd.output().expect("failed to execute binary");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Disabled hooks should be marked
+    // git-safety is protected: the listing must show the refusal, not claim
+    // it's disabled (#89).
     let git_safety_line = stdout.lines().find(|l| l.contains("git-safety")).unwrap();
     assert!(
-        git_safety_line.contains("(disabled)"),
-        "disabled hook should be marked: {git_safety_line}"
+        git_safety_line.contains("(protected — disable refused)"),
+        "protected hook in disable list should show refusal: {git_safety_line}"
     );
 
-    // Non-disabled hooks should not be marked
+    // An advisory hook in the disable list is marked disabled.
+    let warn_line = stdout
+        .lines()
+        .find(|l| l.contains("warn-main-branch"))
+        .unwrap();
+    assert!(
+        warn_line.contains("(disabled)"),
+        "advisory disabled hook should be marked: {warn_line}"
+    );
+
+    // Non-disabled hooks should not be marked.
     let terminology_line = stdout.lines().find(|l| l.contains("terminology")).unwrap();
     assert!(
         !terminology_line.contains("(disabled)"),
