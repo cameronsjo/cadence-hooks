@@ -52,6 +52,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one per `edits[]` element — that the guards fold over; terminology preserves
   its introduced-vs-existing diff (#63) per edit. Write/single-Edit behavior is
   unchanged.
+- **metrics: atomic subagent log writes, current model prices, tail-bounded
+  transcript scan** (#94, #95, #96 on claude-configurations). `log-subagent`
+  built its JSONL line with `writeln!` (many small writes that tear under
+  concurrent appends) — now one `write_all`, matching the sibling loggers.
+  `prices.json` gained `claude-opus-4-8` and `claude-fable-5` (commit cost was
+  silently `$0` for the current default models), plus an `unpricedModels` record
+  field so an unknown model is loud rather than a silent zero. `scan-tokens`
+  parsed the entire transcript on every commit; it now byte-scans past the
+  marker and only JSON-parses the tail, bounding the per-commit hot-path cost.
 
 ## [0.29.0] - 2026-06-10
 

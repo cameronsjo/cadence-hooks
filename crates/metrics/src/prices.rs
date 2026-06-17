@@ -84,6 +84,22 @@ mod tests {
     }
 
     #[test]
+    fn embedded_has_current_opus_and_fable() {
+        // #95: the current default models must be priced, not silently $0.
+        let prices = Prices::embedded();
+        let opus = prices
+            .get("claude-opus-4-8")
+            .expect("opus-4-8 must be priced");
+        assert_eq!(opus.input_per_mtok, 5.0);
+        assert_eq!(opus.output_per_mtok, 25.0);
+        let fable = prices
+            .get("claude-fable-5")
+            .expect("fable-5 must be priced");
+        assert_eq!(fable.input_per_mtok, 10.0);
+        assert_eq!(fable.output_per_mtok, 50.0);
+    }
+
+    #[test]
     fn unknown_model_absent() {
         let prices = Prices::embedded();
         assert!(prices.get("gpt-9").is_none());
