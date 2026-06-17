@@ -377,10 +377,18 @@ impl GitSafetyGuard {
     }
 
     fn check_rebase_blocked(&self, args: &[&str]) -> Option<String> {
-        // Check if any non-flag argument is exactly a protected branch name
+        // `--onto <newbase>` names a rebase DESTINATION, not a ref being
+        // rewritten — replaying commits onto main never modifies main, so the
+        // single token following `--onto` is exempt (#74, a documented
+        // stacked-PR restack workflow). A protected branch named anywhere else
+        // still relocates/rewrites a protected ref and stays blocked: plain
+        // `git rebase main`, or `main`/`master` as the rewritten <branch> in
+        // `git rebase --onto X Y main`.
+        let onto_newbase = args.iter().position(|a| *a == "--onto").map(|i| i + 1);
         let targets_protected = args
             .iter()
-            .any(|a| !a.starts_with('-') && is_protected_branch(a));
+            .enumerate()
+            .any(|(i, a)| Some(i) != onto_newbase && !a.starts_with('-') && is_protected_branch(a));
         if targets_protected {
             return Some("Rebase onto protected branch".into());
         }
@@ -630,6 +638,49 @@ mod tests {
     #[test]
     fn rebase_main_blocked() {
         let result = GitSafetyGuard.run(&make_bash_input("git rebase main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rebase_onto_main_destination_allowed() {
+        // #74: `--onto main` names main as the DESTINATION (never rewritten);
+        // the rewritten ref is `feature`. Must not hard-block (rebase still
+        // nudges as a history-rewriting op).
+        let result =
+            GitSafetyGuard.run(&make_bash_input("git rebase --onto main feature~3 feature"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn rebase_onto_main_newbase_only_allowed() {
+        // `--onto main` with no upstream/branch rebases the CURRENT branch onto
+        // main — main is still only the destination, so it is not blocked.
+        let result = GitSafetyGuard.run(&make_bash_input("git rebase --onto main"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn rebase_onto_with_main_as_branch_blocked() {
+        // #74 regression: main as the trailing <branch> IS rewritten — stays blocked.
+        let result = GitSafetyGuard.run(&make_bash_input(
+            "git rebase --onto refactor feature~3 main",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rebase_onto_main_with_master_branch_blocked() {
+        // #74 regression: only the token after --onto is exempt; master as
+        // <branch> is rewritten and stays blocked.
+        let result = GitSafetyGuard.run(&make_bash_input("git rebase --onto main feature master"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn rebase_onto_with_main_upstream_blocked() {
+        // #74: main as <upstream> is not rewritten, but the minimal fix keeps
+        // this blocked (a deliberate, documented over-block — not a hole).
+        let result = GitSafetyGuard.run(&make_bash_input("git rebase --onto HEAD~2 main feature"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
