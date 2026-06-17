@@ -80,7 +80,12 @@ pub fn run_guard(input: &HookInput, peers: &[Peer]) -> CheckResult {
             }
             CheckResult::allow()
         }
-        Some("Edit") | Some("Write") => {
+        Some("Edit") | Some("MultiEdit") | Some("Write") => {
+            // MultiEdit carries a top-level file_path like Edit, but was never
+            // matched here, so a MultiEdit into a peer's declared lane slipped
+            // through unwarned (#80). The hook matcher (`Edit|Write`) already
+            // routes MultiEdit to the binary — unanchored regex substring-matches
+            // it — so only this arm needed the fix.
             let Some(path) = input.file_path() else {
                 return CheckResult::allow();
             };
@@ -280,7 +285,7 @@ mod tests {
     use super::*;
     use crate::identity::SessionRecord;
     use cadence_hooks_core::Outcome;
-    use cadence_hooks_core::test_builders::{make_bash, make_edit};
+    use cadence_hooks_core::test_builders::{make_bash, make_edit, make_multi_edit};
 
     fn peer(name: &str, touching: &[&str]) -> Peer {
         Peer {
@@ -437,6 +442,22 @@ mod tests {
             "/Users/dev/cadence-hooks/crates/guardrails/src/lib.rs",
             "old",
             "new",
+        ));
+        let r = run_guard(&input, &peers);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("quiet-loom"));
+        assert!(msg.contains("crates/guardrails/"));
+    }
+
+    #[test]
+    fn multi_edit_inside_peer_lane_warns() {
+        // MultiEdit carries a top-level file_path like Edit; a MultiEdit into a
+        // peer's declared lane must nudge, not slip through (#80).
+        let peers = vec![peer("quiet-loom", &["crates/guardrails/"])];
+        let input = with_session(make_multi_edit(
+            "/Users/dev/cadence-hooks/crates/guardrails/src/lib.rs",
+            &[("old", "new"), ("foo", "bar")],
         ));
         let r = run_guard(&input, &peers);
         assert_eq!(r.outcome, Outcome::Nudge);
