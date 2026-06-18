@@ -298,6 +298,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "end",
+        description: "Deregister this session's registry file when it ends (SessionEnd)",
+        plugin: "session",
+        event: None,
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
@@ -338,6 +344,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "warn-branch-drift") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}"#,
         ),
+        // end gates on hook_event_name == "SessionEnd"; the generic logger
+        // sample carries a different event and would no-op before the gate.
+        ("session", "end") => {
+            Some(r#"{"session_id":"test","hook_event_name":"SessionEnd","cwd":"/tmp"}"#)
+        }
         _ => None,
     }
 }
@@ -439,7 +450,7 @@ mod tests {
     fn only_loggers_have_no_event() {
         // Fire-and-forget loggers react to `hook_event_name` in the payload
         // rather than a fixed event; everything else must declare one.
-        let loggers = ["snapshot", "log-commit", "log-subagent", "heartbeat"];
+        let loggers = ["snapshot", "log-commit", "log-subagent", "heartbeat", "end"];
         for hook in HOOKS {
             if loggers.contains(&hook.name) {
                 assert!(

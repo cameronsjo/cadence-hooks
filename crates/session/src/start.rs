@@ -51,12 +51,18 @@ pub fn run_start(
         return CheckResult::allow();
     };
 
-    // Register (or re-register on resume/clear/compact — preserves any
-    // declared intent/touching from earlier in the session). This runs
-    // *before* the sweep: writing the record refreshes our own mtime to ~now,
-    // so a session that went quiet (a read/think phase) and re-enters via
-    // /clear or compaction can never sweep its own aged file and then rebuild
-    // a minimal record stripped of its intent/touching lanes (#69).
+    // Register (or re-register on resume — preserves any declared
+    // intent/touching from earlier in the session). This runs *before* the
+    // sweep: writing the record refreshes our own mtime to ~now, so a session
+    // that went quiet (a read/think phase) and re-enters with the SAME
+    // session_id can never sweep its own aged file and then rebuild a minimal
+    // record stripped of its intent/touching lanes (#69).
+    //
+    // The same-session_id case is the *resume* path (`--resume`/`--continue`).
+    // `/clear` and `/compact`, by contrast, mint a NEW session_id (verified
+    // 2026-06-17) and fire SessionEnd for the old one — which `session end`
+    // (#97) deregisters — so a post-/clear session arrives here with a fresh id
+    // and no prior record to preserve. The two fixes do not collide on /clear.
     let record = match registry::read_own(dir, sid) {
         Some(mut existing) => {
             if branch.is_some() {

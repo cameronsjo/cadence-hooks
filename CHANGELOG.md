@@ -18,6 +18,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `.env.example` is still caught. JWTs and generic high-entropy strings are
   deliberately not matched (unbounded false positives); only this repo's own
   source is exempt (its test fixtures carry secret-shaped literals).
+- **session: deregister on SessionEnd so ended sessions stop lingering as
+  phantom peers** (#97 on claude-configurations). Liveness was mtime-only with
+  no deregistration ceremony, so an ended session (`/clear`, exit, logout)
+  lingered in `.claude/sessions/` until the next `session start` swept it by age
+  (up to 30 min) — and the next session's SessionStart disclosure listed the
+  dead session as a live peer. A new `session end` fire-and-forget Logger
+  (wired to the SessionEnd event in cadence-canon) removes the session's own
+  registry file via `registry::remove_own`. It gates strictly on
+  `hook_event_name == "SessionEnd"` (a delete must never fire on another event)
+  and removes only the record whose stored `session_id` matches exactly
+  (content-verified via the #90-hardened `find_own`), so it can never delete a
+  peer's lane. `HookEvent` has no `SessionEnd` variant, so it is modelled as a
+  Logger (`event: None`) like `heartbeat` — no enum change.
 
 ### Fixed
 
