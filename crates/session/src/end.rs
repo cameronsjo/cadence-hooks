@@ -56,12 +56,25 @@ impl Logger for End {
 /// phantom, and the successor session registers fresh under its own id. #69's
 /// same-session_id re-registration path is therefore the *resume* path
 /// (`--resume`/`--continue` reusing an id after an exit), not the `/clear` path.
-/// We do NOT gate on the `reason` field: the only id-reusing case is resume, and
-/// there the lost `intent`/`touching` are best-effort and self-heal on the next
-/// heartbeat (`touch_own` rebuilds the record) — a bounded, transient
-/// degradation, not the lane loss #69 fixed. (Compaction uses the separate
-/// `PreCompact` hook, not SessionEnd, so a live session never self-deregisters
-/// mid-work.) Revisiting the resume case is tracked as claude-configurations#136.
+/// We do NOT gate on the `reason` field. This was investigated and ruled out
+/// under claude-configurations#136 (resolved 2026-06-19): there is no exit-time
+/// signal that a *later* cold `--resume` is coming. A clean exit fires reason
+/// `other` / `prompt_input_exit` whether or not the id is ever resumed, and the
+/// SessionEnd `reason: "resume"` value covers only in-the-moment resumption, not
+/// a cold `claude --resume <id>` minutes or hours later — so a `reason` allowlist
+/// could not catch the very case #136 is about, while still adding staleness-prone
+/// state to maintain.
+///
+/// The residual is accepted as a bounded degradation. On resume,
+/// `--resume`/`--continue` reuses the id and fires SessionStart (`source=resume`),
+/// so [`crate::start`]'s re-registration runs — but finds no record (this fn
+/// removed it) and rebuilds a *minimal* lane: liveness, `branch`, and the
+/// `declared_branch` baseline re-seed immediately, while `intent`/`touching` are
+/// best-effort metadata the session re-declares via `session declare` (they are
+/// not auto-restored). The only fix that would carry `intent`/`touching` across a
+/// resume is a tombstone / soft-delete, deliberately deferred (P3) until the loss
+/// proves to matter in practice. (Compaction uses the separate `PreCompact` hook,
+/// not SessionEnd, so a live session never self-deregisters mid-work.)
 pub fn run_end(hook_event_name: Option<&str>, dir: &std::path::Path, session_id: &str) {
     if hook_event_name != Some("SessionEnd") {
         return;
