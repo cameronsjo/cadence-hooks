@@ -11,9 +11,11 @@
 //! `SessionStart` disclosure. The feature is therefore **deferred**:
 //!
 //! - [`BackstopRecord`] — a SessionEnd [`Logger`] (mirrors [`crate::end`]) that
-//!   probes the repo for loose ends and, when any remain, stashes a marker in
-//!   the git-excluded `.claude/sessions/` directory. Fire-and-forget, no
-//!   user-visible output (the marker IS the output).
+//!   probes the repo for loose ends and, when any remain *and no live peer is
+//!   still in the checkout* (lights-out: the last session out records, since a
+//!   live peer owns the dirty tree), stashes a marker in the git-excluded
+//!   `.claude/sessions/` directory. Fire-and-forget, no user-visible output
+//!   (the marker IS the output).
 //! - [`BackstopWarn`] — a SessionStart [`Check`] (mirrors [`crate::start`]'s
 //!   disclosure shape) that reads the marker, renders a one-shot nudge, and
 //!   deletes it. Never blocks (ADR-0001) — a nudge, exit 0.
@@ -172,29 +174,50 @@ impl Logger for BackstopRecord {
         };
         let root = root.to_string_lossy().into_owned();
 
-        let mut marker = detect_loose_ends(&root);
+        // Lights-out: only the last session out of a shared checkout records.
+        // A peer still live in this repo owns the dirty tree — that work isn't
+        // loose, it's in progress, and recording it would cry wolf about a
+        // teammate's live edits at the next start. `live_peers` excludes self,
+        // so an empty result means we're the last one leaving.
         let sid = input.session_id.as_deref().unwrap_or_default();
+        let stale_secs = registry::stale_minutes() * 60;
+        let last_out = registry::live_peers(&dir, sid, stale_secs).is_empty();
+
+        let mut marker = detect_loose_ends(&root);
         if !sid.is_empty() {
             marker.session_name = identity::generate_name(sid);
             marker.session_id = sid.to_string();
         }
         marker.ended = identity::utc_timestamp();
 
-        run_record(input.hook_event_name.as_deref(), &dir, &marker);
+        run_record(input.hook_event_name.as_deref(), &dir, &marker, last_out);
     }
 }
 
-/// Testable core: write `marker` into `dir`, but ONLY on SessionEnd AND only
-/// when loose ends are present. The marker and registry dir are injected so
-/// tests need neither a real git repo nor a git upstream.
+/// Testable core: write `marker` into `dir`, but ONLY on SessionEnd, only when
+/// this is the last session leaving the repo, and only when loose ends are
+/// present. The marker, registry dir, and `last_out` flag are injected so tests
+/// need neither a real git repo nor a populated registry.
 ///
 /// The event gate lives here, not just in the hooks.json wiring, with the same
 /// discipline as [`crate::end::run_end`]: a marker write must never fire on the
-/// wrong event. The signal gate keeps a clean session (outro ran, or nothing was
-/// left) from writing a marker at all — which is what makes the next start
-/// silent automatically.
-pub fn run_record(hook_event_name: Option<&str>, dir: &Path, marker: &LooseEndMarker) {
+/// wrong event. The `last_out` gate is the multi-session guard — a peer still
+/// live in a shared checkout owns the dirty tree, so its in-progress work must
+/// not be recorded as loose ends (it accepts a rare miss when two sessions exit
+/// in the same registry-read window, trading it for not crying wolf, the right
+/// bias for a best-effort nudge). The signal gate keeps a clean session (outro
+/// ran, or nothing was left) from writing a marker at all — which is what makes
+/// the next start silent automatically.
+pub fn run_record(
+    hook_event_name: Option<&str>,
+    dir: &Path,
+    marker: &LooseEndMarker,
+    last_out: bool,
+) {
     if hook_event_name != Some("SessionEnd") {
+        return;
+    }
+    if !last_out {
         return;
     }
     if !marker.has_signals() {
@@ -311,7 +334,7 @@ mod tests {
     #[test]
     fn run_record_on_session_end_with_signals_writes_marker() {
         let tmp = TempDir::new().unwrap();
-        run_record(Some("SessionEnd"), tmp.path(), &marker(2, 1, 0));
+        run_record(Some("SessionEnd"), tmp.path(), &marker(2, 1, 0), true);
         let back = read_marker(tmp.path()).expect("marker written");
         assert_eq!(back.uncommitted, 2);
         assert_eq!(back.unpushed, 1);
@@ -324,7 +347,7 @@ mod tests {
         // (here PostToolUse) must NOT write a marker — else a marker would land
         // mid-session on the first tool call.
         let tmp = TempDir::new().unwrap();
-        run_record(Some("PostToolUse"), tmp.path(), &marker(2, 1, 0));
+        run_record(Some("PostToolUse"), tmp.path(), &marker(2, 1, 0), true);
         assert!(
             read_marker(tmp.path()).is_none(),
             "a non-SessionEnd event must not write a marker"
@@ -334,7 +357,7 @@ mod tests {
     #[test]
     fn run_record_ignores_missing_event() {
         let tmp = TempDir::new().unwrap();
-        run_record(None, tmp.path(), &marker(2, 1, 0));
+        run_record(None, tmp.path(), &marker(2, 1, 0), true);
         assert!(read_marker(tmp.path()).is_none());
     }
 
@@ -345,10 +368,32 @@ mod tests {
         // The clean-repo path: outro ran (or nothing was left) → git clean →
         // zero counts → no marker → next start is silent.
         let tmp = TempDir::new().unwrap();
-        run_record(Some("SessionEnd"), tmp.path(), &marker(0, 0, 0));
+        run_record(Some("SessionEnd"), tmp.path(), &marker(0, 0, 0), true);
         assert!(
             read_marker(tmp.path()).is_none(),
             "no signals → no marker (the silent-by-default guarantee)"
+        );
+    }
+
+    // --- run_record: lights-out (multi-session) gate ---
+
+    #[test]
+    fn run_record_skips_when_peer_still_live() {
+        // A peer still live in a shared checkout owns the dirty tree — its
+        // in-progress work must not be recorded as loose ends, even on a clean
+        // SessionEnd with real signals. The last session out (last_out = true)
+        // is the only one that records.
+        let tmp = TempDir::new().unwrap();
+        run_record(Some("SessionEnd"), tmp.path(), &marker(2, 1, 0), false);
+        assert!(
+            read_marker(tmp.path()).is_none(),
+            "live peer present → no marker (don't cry wolf about live work)"
+        );
+        // And the last one out, same signals, does record.
+        run_record(Some("SessionEnd"), tmp.path(), &marker(2, 1, 0), true);
+        assert!(
+            read_marker(tmp.path()).is_some(),
+            "last session out records the loose ends"
         );
     }
 
@@ -406,7 +451,7 @@ mod tests {
     #[test]
     fn record_then_warn_round_trips_counts() {
         let tmp = TempDir::new().unwrap();
-        run_record(Some("SessionEnd"), tmp.path(), &marker(5, 0, 0));
+        run_record(Some("SessionEnd"), tmp.path(), &marker(5, 0, 0), true);
         let r = run_warn(tmp.path());
         assert_eq!(r.outcome, Outcome::Nudge);
         assert!(r.message.unwrap().contains("5 uncommitted"));

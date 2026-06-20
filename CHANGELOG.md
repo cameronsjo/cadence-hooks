@@ -18,8 +18,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   suspenders. `backstop-record` is a SessionEnd Logger (mirrors `session end`)
   that probes the repo for loose ends — uncommitted/untracked
   (`git status --short`), unpushed commits (`@{u}..`, only when an upstream
-  exists), and stashes — and, when any remain, stashes a counts-only marker in
-  the git-excluded `.claude/sessions/`. `backstop-warn` is a SessionStart Check
+  exists), and stashes — and, when any remain *and no live peer is still in the
+  checkout*, stashes a counts-only marker in the git-excluded `.claude/sessions/`.
+  The lights-out gate (only the last session out records) keeps a shared
+  multi-session checkout from recording a live peer's in-progress work as loose
+  ends. `backstop-warn` is a SessionStart Check
   (mirrors the `session start` disclosure) that reads the marker at the next
   open, emits a one-shot nudge summarizing what was left, and deletes it. It
   **never blocks** (ADR-0001) — a nudge, exit 0. The design is deferred
