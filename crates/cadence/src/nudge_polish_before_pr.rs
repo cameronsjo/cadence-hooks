@@ -5,11 +5,11 @@
 //! branch-scoped pass over the changes vs `origin/main` — simplify, logging,
 //! tests, docs, security, and code review. Skill, agent, command, and rule
 //! markdown (and CLAUDE.md) are behavior, not documentation, so they are in
-//! scope; a branch that is *literally* documentation (prose about the system)
-//! routes to `/polish docs`. Skippable only when the branch is a trivial
-//! one-liner or has already been taken through `/polish`; planning, TDD,
-//! attune, or a manual code-review precede polish — they are not a substitute
-//! for running it.
+//! scope; literal documentation (prose about the system) routes to
+//! `/polish docs`. Skippable only when the branch is a trivial one-liner or has
+//! already been taken through `/polish` — planning, TDD, attune, and a manual
+//! code-review precede polish, they don't replace it. A skip must be stated and
+//! justified, never silent.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -31,18 +31,15 @@ impl Check for NudgePolishBeforePr {
         }
 
         CheckResult::nudge(
-            "Before opening this PR, consider running `/polish` \
-             (cadence-forge:polish) — a branch-scoped pass over your changes \
-             vs `origin/main`: simplify, logging, tests, docs, security, code \
-             review. Skill, agent, command, and rule markdown (and CLAUDE.md) \
-             are behavior, not documentation — they are IN scope. For a branch \
-             that is *literally* documentation (prose about the system — \
-             READMEs, ADRs, field reports), run `/polish docs`. Skip ONLY if \
-             the branch is a trivial one-liner or has already been taken \
-             through `/polish`. Having planned the work, used TDD, or gone \
-             through attune, a manual code-review, or any upstream design \
-             process is NOT the same as running the polish skill — those \
-             precede polish, they don't replace it."
+            "Before opening this PR, consider `/polish` (cadence-forge:polish) \
+             — a branch-scoped pass vs `origin/main`: simplify, logging, tests, \
+             docs, security, code review. Skill / agent / command / rule \
+             markdown and CLAUDE.md are behavior, not documentation — IN scope; \
+             only *literal* docs (prose about the system) route to \
+             `/polish docs`. Skip ONLY if it's a trivial one-liner or already \
+             went through `/polish` — planning, TDD, attune, or a code-review \
+             precede polish, they don't replace it. If you skip, say so and \
+             why — don't skip silently."
                 .to_string(),
         )
     }
@@ -80,8 +77,14 @@ mod tests {
         // Loophole guard: planning / TDD / attune / review must not read as a
         // polish-equivalent — the skip is only trivial-one-liner or already-polished.
         assert!(
-            msg.contains("NOT the same as running the polish skill"),
+            msg.contains("they don't replace it"),
             "message should deny that upstream process substitutes for polish"
+        );
+        // Loophole guard: a skip must be surfaced, never silent — so the user
+        // can veto a rationalized skip.
+        assert!(
+            msg.contains("don't skip silently"),
+            "message should require the model to state why it is skipping"
         );
     }
 

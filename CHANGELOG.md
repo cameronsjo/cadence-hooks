@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **nudge-polish-before-pr: tighten the wording and require a stated skip
+  reason**. Trims the 0.32.0 message ~35% (same beats — what polish does,
+  behavioral-markdown-is-in-scope, `/polish docs` for literal docs, the two real
+  skips, process-is-not-polish) and adds a final clause: *if you skip, say so
+  and why — don't skip silently*. A silent skip is where the rationalization
+  hides; forcing the model to state the reason surfaces it for the user to veto.
+  A third unit test pins the `don't skip silently` clause.
+
 ## [0.32.0] - 2026-06-19
 
 ### Changed
