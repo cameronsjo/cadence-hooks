@@ -2,9 +2,14 @@
 //!
 //! Fires on `gh pr create` and reminds the model that
 //! [cadence-forge:polish](https://github.com/cameronsjo/cadence-forge) runs a
-//! branch-scoped polish pass against `origin/main` — simplifying code,
-//! tightening narrative logging, filling test gaps, and updating docs.
-//! Skippable when the change is trivial or polish has already been run.
+//! branch-scoped pass over the changes vs `origin/main` — simplify, logging,
+//! tests, docs, security, and code review. Skill, agent, command, and rule
+//! markdown (and CLAUDE.md) are behavior, not documentation, so they are in
+//! scope; a branch that is *literally* documentation (prose about the system)
+//! routes to `/polish docs`. Skippable only when the branch is a trivial
+//! one-liner or has already been taken through `/polish`; planning, TDD,
+//! attune, or a manual code-review precede polish — they are not a substitute
+//! for running it.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -26,11 +31,18 @@ impl Check for NudgePolishBeforePr {
         }
 
         CheckResult::nudge(
-            "Before opening this PR, consider running `/polish` — a branch-scoped \
-             polish pass (cadence-forge:polish) that simplifies code, tightens \
-             narrative logging, fills test gaps, and updates docs against \
-             `origin/main`. Skip only if this is a trivial fix or polish has \
-             already been run on this branch."
+            "Before opening this PR, consider running `/polish` \
+             (cadence-forge:polish) — a branch-scoped pass over your changes \
+             vs `origin/main`: simplify, logging, tests, docs, security, code \
+             review. Skill, agent, command, and rule markdown (and CLAUDE.md) \
+             are behavior, not documentation — they are IN scope. For a branch \
+             that is *literally* documentation (prose about the system — \
+             READMEs, ADRs, field reports), run `/polish docs`. Skip ONLY if \
+             the branch is a trivial one-liner or has already been taken \
+             through `/polish`. Having planned the work, used TDD, or gone \
+             through attune, a manual code-review, or any upstream design \
+             process is NOT the same as running the polish skill — those \
+             precede polish, they don't replace it."
                 .to_string(),
         )
     }
@@ -58,6 +70,19 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("/polish"), "message should mention /polish");
+        // Loophole guard: the nudge MUST keep telling the model that skill /
+        // agent / command / rule markdown is behavior, not documentation — that
+        // clause is what stops the "it's just markdown, skip polish" skip.
+        assert!(
+            msg.contains("behavior, not documentation"),
+            "message should name behavioral markdown as in scope"
+        );
+        // Loophole guard: planning / TDD / attune / review must not read as a
+        // polish-equivalent — the skip is only trivial-one-liner or already-polished.
+        assert!(
+            msg.contains("NOT the same as running the polish skill"),
+            "message should deny that upstream process substitutes for polish"
+        );
     }
 
     #[test]

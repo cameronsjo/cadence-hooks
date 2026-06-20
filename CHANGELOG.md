@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **nudge-polish-before-pr: behavioral markdown is in scope; close the "it's
+  just docs" skip loophole**. The pre-PR `/polish` nudge was being rationalized
+  away on skill / agent / command / rule-markdown branches as "trivial" or
+  "already reviewed." It now states plainly that skill, agent, command, and rule
+  markdown (and CLAUDE.md) are *behavior, not documentation* — so they are IN
+  scope — routes a branch that is *literally* documentation to `/polish docs`
+  instead of a skip, and narrows the skip conditions to a trivial one-liner or a
+  branch already taken through `/polish`. It also denies the second common
+  rationalization: having planned the work, used TDD, or gone through attune or
+  a manual code-review is *not* the same as running the polish skill — those
+  precede polish, they don't replace it. Two unit tests assert the "behavior,
+  not documentation" and "not the same as running the polish skill" clauses so
+  the loopholes cannot silently regress.
+
 ## [0.31.0] - 2026-06-17
 
 ### Added
