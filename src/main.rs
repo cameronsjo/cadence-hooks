@@ -249,6 +249,10 @@ enum SessionCommands {
     WarnBranchDrift,
     /// Deregister this session's registry file when it ends (SessionEnd logger)
     End,
+    /// Record loose ends when the session ends, for the next start to surface (SessionEnd logger)
+    BackstopRecord,
+    /// Warn at session start when the last session in this repo left loose ends (SessionStart)
+    BackstopWarn,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -335,6 +339,8 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::Guard => "guard",
             SessionCommands::WarnBranchDrift => "warn-branch-drift",
             SessionCommands::End => "end",
+            SessionCommands::BackstopRecord => "backstop-record",
+            SessionCommands::BackstopWarn => "backstop-warn",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -760,6 +766,13 @@ fn main() {
                 &cadence_hooks_session::end::End,
                 registry::sample_for("session", "end"),
             ),
+            SessionCommands::BackstopRecord => run_logger_from_stdin(
+                &cadence_hooks_session::backstop::BackstopRecord,
+                registry::sample_for("session", "backstop-record"),
+            ),
+            SessionCommands::BackstopWarn => {
+                run_check_from_stdin(&cadence_hooks_session::backstop::BackstopWarn, session)
+            }
             SessionCommands::Declare {
                 intent,
                 touching,
