@@ -202,6 +202,10 @@ enum RulesCommands {
     ValidateFrontmatter,
     /// Scan for security anti-patterns
     SecurityPatterns,
+    /// Nudge to label a recommended AskUserQuestion option "(Recommended)"
+    WarnRecommendedOption,
+    /// Nudge to re-ask when AskUserQuestion returns empty auto-approve answers
+    WarnEmptyAnswers,
 }
 
 #[derive(Subcommand)]
@@ -310,6 +314,8 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         Commands::Rules(r) => Some(match r {
             RulesCommands::ValidateFrontmatter => "validate-frontmatter",
             RulesCommands::SecurityPatterns => "security-patterns",
+            RulesCommands::WarnRecommendedOption => "warn-recommended-option",
+            RulesCommands::WarnEmptyAnswers => "warn-empty-answers",
         }),
         Commands::Obsidian(o) => Some(match o {
             ObsidianCommands::TrashGuard => "trash-guard",
@@ -695,6 +701,14 @@ fn main() {
             ),
             RulesCommands::SecurityPatterns => run_check_from_stdin(
                 &cadence_hooks_rules::check_security_patterns::SecurityPatternScanner,
+                post,
+            ),
+            RulesCommands::WarnRecommendedOption => run_check_from_stdin(
+                &cadence_hooks_rules::askuserquestion::WarnRecommendedOption,
+                pre,
+            ),
+            RulesCommands::WarnEmptyAnswers => run_check_from_stdin(
+                &cadence_hooks_rules::askuserquestion::WarnEmptyAnswers,
                 post,
             ),
         },

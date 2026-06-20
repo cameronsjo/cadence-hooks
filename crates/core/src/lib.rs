@@ -19,6 +19,7 @@ pub mod time;
 pub mod test_builders;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
@@ -167,6 +168,8 @@ pub struct ToolInput {
     pub replace_all: Option<bool>,
     /// MultiEdit tool: sequence of edit operations applied in order.
     pub edits: Option<Vec<EditOperation>>,
+    /// AskUserQuestion tool: the questions being asked, each with its options.
+    pub questions: Option<Vec<AskQuestion>>,
 }
 
 /// A single edit operation within a MultiEdit tool call.
@@ -175,6 +178,23 @@ pub struct EditOperation {
     pub old_string: Option<String>,
     pub new_string: Option<String>,
     pub replace_all: Option<bool>,
+}
+
+/// A single AskUserQuestion question and its answer options.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskQuestion {
+    pub question: Option<String>,
+    pub header: Option<String>,
+    pub multi_select: Option<bool>,
+    pub options: Option<Vec<AskOption>>,
+}
+
+/// A single answer option within an AskUserQuestion question.
+#[derive(Debug, Default, Deserialize)]
+pub struct AskOption {
+    pub label: Option<String>,
+    pub description: Option<String>,
 }
 
 /// Apply a single old→new replacement to a document.
@@ -195,6 +215,10 @@ fn apply_edit(doc: &str, old: &str, new: &str, replace_all: bool) -> String {
 pub struct ToolResponse {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
+    /// AskUserQuestion tool: answers keyed by question text. Values are strings
+    /// (multiSelect = comma-joined) or null when unanswered. Present only on the
+    /// PostToolUse payload for AskUserQuestion.
+    pub answers: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl HookInput {
@@ -343,6 +367,13 @@ impl HookInput {
         self.tool_response
             .as_ref()
             .and_then(|tr| tr.stdout.as_deref())
+    }
+
+    /// The AskUserQuestion questions carried by this tool call, if any.
+    pub fn ask_questions(&self) -> Option<&[AskQuestion]> {
+        self.tool_input
+            .as_ref()
+            .and_then(|ti| ti.questions.as_deref())
     }
 }
 
@@ -1555,5 +1586,30 @@ mod tests {
         let msg = interactive_terminal_help("terminology", Some(HookEvent::PreToolUse), None, &[]);
         assert!(msg.contains("cadence-hooks try terminology"));
         assert!(msg.contains("| cadence-hooks terminology"));
+    }
+
+    #[test]
+    fn deserialize_askuserquestion_tool_input() {
+        let json = r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which approach?","header":"Approach","multiSelect":false,"options":[{"label":"Option A (Recommended)","description":"first"},{"label":"Option B","description":"second"}]}]}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let qs = input.ask_questions().expect("questions present");
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].multi_select, Some(false));
+        let opts = qs[0].options.as_ref().unwrap();
+        assert_eq!(opts[0].label.as_deref(), Some("Option A (Recommended)"));
+    }
+
+    #[test]
+    fn deserialize_askuserquestion_answers() {
+        let json = r#"{"tool_name":"AskUserQuestion","tool_response":{"answers":{"Which approach?":"Option A"}}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let answers = input
+            .tool_response
+            .as_ref()
+            .unwrap()
+            .answers
+            .as_ref()
+            .unwrap();
+        assert_eq!(answers.get("Which approach?").unwrap(), "Option A");
     }
 }

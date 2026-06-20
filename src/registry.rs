@@ -234,6 +234,18 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "rules",
         event: Some(HookEvent::PostToolUse),
     },
+    HookEntry {
+        name: "warn-recommended-option",
+        description: "Nudge to label a recommended AskUserQuestion option \"(Recommended)\"",
+        plugin: "rules",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-empty-answers",
+        description: "Nudge to re-ask when AskUserQuestion returns empty auto-approve answers",
+        plugin: "rules",
+        event: Some(HookEvent::PostToolUse),
+    },
     // obsidian
     HookEntry {
         name: "trash-guard",
@@ -349,6 +361,14 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "end") => {
             Some(r#"{"session_id":"test","hook_event_name":"SessionEnd","cwd":"/tmp"}"#)
         }
+        // warn-recommended-option: a question with no "(Recommended)" option → nudge
+        ("rules", "warn-recommended-option") => Some(
+            r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which approach?","header":"Approach","multiSelect":false,"options":[{"label":"Option A","description":"first"},{"label":"Option B","description":"second"}]}]}}"#,
+        ),
+        // warn-empty-answers: a PostToolUse response with empty answers → nudge
+        ("rules", "warn-empty-answers") => Some(
+            r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which approach?","options":[{"label":"Option A"}]}]},"tool_response":{"answers":{"Which approach?":""}}}"#,
+        ),
         _ => None,
     }
 }
