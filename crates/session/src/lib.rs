@@ -26,7 +26,11 @@
 //! | `declare`           | CLI action   | [`cli`]         |
 //! | `status`            | CLI action   | [`cli`]         |
 //! | `end`               | SessionEnd   | [`end`]         |
+//! | `backstop-record`   | SessionEnd   | [`backstop`]    |
+//! | `backstop-warn`     | SessionStart | [`backstop`]    |
 
+/// Outro "no loose ends" backstop: SessionEnd records loose ends, SessionStart warns (#123).
+pub mod backstop;
 /// PreToolUse commit-time branch-drift warning — never blocks.
 pub mod branch_drift;
 /// CLI actions: `declare` (lane declaration) and `status` (registry listing).

@@ -316,6 +316,18 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: None,
     },
+    HookEntry {
+        name: "backstop-record",
+        description: "Record loose ends at session end for the next start to surface (SessionEnd)",
+        plugin: "session",
+        event: None,
+    },
+    HookEntry {
+        name: "backstop-warn",
+        description: "Warn at session start when the last session left loose ends",
+        plugin: "session",
+        event: Some(HookEvent::SessionStart),
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
@@ -369,6 +381,16 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("rules", "warn-empty-answers") => Some(
             r#"{"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which approach?","options":[{"label":"Option A"}]}]},"tool_response":{"answers":{"Which approach?":""}}}"#,
         ),
+        // backstop-record gates on hook_event_name == "SessionEnd" too — the
+        // generic logger sample would no-op before the gate.
+        ("session", "backstop-record") => {
+            Some(r#"{"session_id":"test","hook_event_name":"SessionEnd","cwd":"/tmp"}"#)
+        }
+        // backstop-warn is a SessionStart check; carry a cwd so `try` resolves a
+        // sessions dir instead of the cwd-less event sample.
+        ("session", "backstop-warn") => {
+            Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#)
+        }
         _ => None,
     }
 }
@@ -470,7 +492,14 @@ mod tests {
     fn only_loggers_have_no_event() {
         // Fire-and-forget loggers react to `hook_event_name` in the payload
         // rather than a fixed event; everything else must declare one.
-        let loggers = ["snapshot", "log-commit", "log-subagent", "heartbeat", "end"];
+        let loggers = [
+            "snapshot",
+            "log-commit",
+            "log-subagent",
+            "heartbeat",
+            "end",
+            "backstop-record",
+        ];
         for hook in HOOKS {
             if loggers.contains(&hook.name) {
                 assert!(

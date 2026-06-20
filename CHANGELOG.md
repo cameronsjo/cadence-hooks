@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-06-20
+
+### Added
+
+- **session: deterministic backstop for outro's "no loose ends" contract**
+  (#123 on claude-configurations). `cadence:outro` accounts for every thread a
+  session opens against five terminal dispositions, but that contract is skill
+  prose — a session can end without `/outro` and work slips away silently. Two
+  new `session` subcommands add the deterministic belt to that probabilistic
+  suspenders. `backstop-record` is a SessionEnd Logger (mirrors `session end`)
+  that probes the repo for loose ends — uncommitted/untracked
+  (`git status --short`), unpushed commits (`@{u}..`, only when an upstream
+  exists), and stashes — and, when any remain *and no live peer is still in the
+  checkout*, stashes a counts-only marker in the git-excluded `.claude/sessions/`.
+  The lights-out gate (only the last session out records) keeps a shared
+  multi-session checkout from recording a live peer's in-progress work as loose
+  ends. `backstop-warn` is a SessionStart Check
+  (mirrors the `session start` disclosure) that reads the marker at the next
+  open, emits a one-shot nudge summarizing what was left, and deletes it. It
+  **never blocks** (ADR-0001) — a nudge, exit 0. The design is deferred
+  (SessionEnd → next SessionStart) because `HookEvent` has no `SessionEnd`
+  variant and `Stop` fires after every turn, so the next SessionStart is the only
+  reliable user-visible end-of-session surface. If outro (or any commit/push)
+  resolved the work, git is clean → no marker → silent automatically; for
+  deliberately-left work, set `CADENCE_NO_OUTRO_BACKSTOP`. The message states
+  only what is observable ("loose ends remained at session end") and never claims
+  outro was skipped. The marker filename carries no `.json` extension so the
+  registry's `sweep_stale` never reaps it before the repo is reopened. Wiring
+  lands in cadence-canon's `SessionEnd`/`SessionStart` arrays.
+
 ## [0.34.0] - 2026-06-19
 
 ### Added
