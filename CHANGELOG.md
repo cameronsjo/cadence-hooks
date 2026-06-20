@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-06-19
+
 ### Added
 
 - **AskUserQuestion guidance moves from prose/shell to two Rust nudge hooks**
@@ -23,6 +25,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fields on the hook payload back the checks (previously dropped by serde).
   Companion `hooks.json` wiring ships in `cadence-rules`. Supersedes ADR 0012's
   shell implementation (ADR 0020).
+
+## [0.33.0] - 2026-06-19
+
+### Changed
+
+- **nudge-polish-before-pr: tighten the wording and require a stated skip
+  reason**. Trims the 0.32.0 message ~35% (same beats — what polish does,
+  behavioral-markdown-is-in-scope, `/polish docs` for literal docs, the two real
+  skips, process-is-not-polish) and adds a final clause: *if you skip, say so
+  and why — don't skip silently*. A silent skip is where the rationalization
+  hides; forcing the model to state the reason surfaces it for the user to veto.
+  A third unit test pins the `don't skip silently` clause.
+
+## [0.32.0] - 2026-06-19
+
+### Changed
+
+- **nudge-polish-before-pr: behavioral markdown is in scope; close the "it's
+  just docs" skip loophole**. The pre-PR `/polish` nudge was being rationalized
+  away on skill / agent / command / rule-markdown branches as "trivial" or
+  "already reviewed." It now states plainly that skill, agent, command, and rule
+  markdown (and CLAUDE.md) are *behavior, not documentation* — so they are IN
+  scope — routes a branch that is *literally* documentation to `/polish docs`
+  instead of a skip, and narrows the skip conditions to a trivial one-liner or a
+  branch already taken through `/polish`. It also denies the second common
+  rationalization: having planned the work, used TDD, or gone through attune or
+  a manual code-review is *not* the same as running the polish skill — those
+  precede polish, they don't replace it. Two unit tests assert the "behavior,
+  not documentation" and "not the same as running the polish skill" clauses so
+  the loopholes cannot silently regress.
 
 ## [0.31.0] - 2026-06-17
 
