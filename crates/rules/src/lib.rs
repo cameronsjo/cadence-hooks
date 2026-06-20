@@ -2,6 +2,8 @@
 //!
 //! Structural validation for plugin files and security-aware code scanning.
 
+/// AskUserQuestion advisory nudges: label a recommended option (Pre) and re-ask on empty auto-approve answers (Post).
+pub mod askuserquestion;
 /// Scan written code for language-specific security anti-patterns.
 pub mod check_security_patterns;
 /// Validate SKILL.md and command file frontmatter (required fields, name format, known fields).

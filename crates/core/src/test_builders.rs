@@ -98,7 +98,7 @@ pub fn make_bash_post_tool_use(cmd: &str, stdout: &str) -> HookInput {
         }),
         tool_response: Some(ToolResponse {
             stdout: Some(stdout.into()),
-            stderr: None,
+            ..Default::default()
         }),
         ..Default::default()
     }

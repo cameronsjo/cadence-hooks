@@ -259,6 +259,7 @@ version = "0.31.0"
 dependencies = [
  "cadence-hooks-core",
  "regex",
+ "serde_json",
  "tempfile",
 ]
 

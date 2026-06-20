@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **AskUserQuestion guidance moves from prose/shell to two Rust nudge hooks**
+  (`rules warn-recommended-option`, `rules warn-empty-answers`).
+  `warn-recommended-option` (PreToolUse) nudges Claude to label a clearly-preferred
+  option "(Recommended)" and list it first when no option across the questions
+  carries the marker — a deterministic call-time reinforcement of the conditional,
+  drift-prone always-loaded rule that the model had quietly stopped applying.
+  `warn-empty-answers` (PostToolUse) ports the retired `guard-askuserquestion.sh`:
+  it re-asks-as-plain-text when the answers dict is empty or every value is garbage
+  (`""`/`.`/`null`/`undefined`), the auto-approve artifact from
+  anthropics/claude-code#29962. Both are nudges, never blocks — the rule is
+  conditional ("when you have a clear preference"), so a block would over-apply to
+  genuinely-equivalent options. New `ToolInput.questions` / `ToolResponse.answers`
+  fields on the hook payload back the checks (previously dropped by serde).
+  Companion `hooks.json` wiring ships in `cadence-rules`. Supersedes ADR 0012's
+  shell implementation (ADR 0020).
+
 ## [0.31.0] - 2026-06-17
 
 ### Added
