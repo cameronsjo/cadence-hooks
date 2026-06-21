@@ -1,12 +1,12 @@
 //! `session heartbeat` — PostToolUse logger.
 //!
-//! Touches this session's registry file on every (wired) tool call, so file
-//! mtime is the liveness signal. Also refreshes the last-observed branch.
-//! The triggering command decides whether THIS session deliberately switched
-//! branches: only a self-switch moves the drift baseline (`declared_branch`);
-//! a peer moving shared HEAD updates the observed branch but leaves the
-//! baseline, so the divergence stays detectable at commit time (#70).
-//! Fire-and-forget: implemented as a [`Logger`], never blocks, never errors.
+//! On every (wired) tool call: refreshes this session's registry file mtime
+//! (the liveness signal), updates the last-observed branch, and sweeps stale
+//! peer lanes (#155). The triggering command decides whether THIS session
+//! deliberately switched branches: only a self-switch moves the drift baseline
+//! (`declared_branch`); a peer moving shared HEAD updates the observed branch
+//! but leaves the baseline, so the divergence stays detectable at commit time
+//! (#70). Implemented as a [`Logger`] — never blocks, never errors.
 
 use crate::guard;
 use crate::identity;
@@ -37,7 +37,8 @@ impl Logger for Heartbeat {
             return;
         };
         let branch = git_command(cwd, &["branch", "--show-current"]);
-        run_heartbeat(&dir, sid, branch, input.command());
+        let stale_secs = registry::stale_minutes() * 60;
+        run_heartbeat(&dir, sid, branch, input.command(), stale_secs);
     }
 }
 
@@ -57,16 +58,33 @@ impl Logger for Heartbeat {
 /// excluded via [`guard::redirects_to_other_tree`] — re-anchoring cwd's
 /// baseline off another repo's switch would suppress drift (#70/R2). This
 /// stricter `-C` rule is heartbeat-only; the guard nudge stays permissive.
+///
+/// After refreshing self, the heartbeat also sweeps stale peers (#155). Before
+/// this, `sweep_stale` had exactly one production trigger — SessionStart — so a
+/// long-lived session that swept once at its own start never reaped a peer that
+/// went stale afterward, and forks/subagents (no SessionStart) never swept at
+/// all. Dead lanes then accumulated (17 of 17 unreaped) while `session status`
+/// kept classifying them `[STALE]` on demand. The heartbeat is the only
+/// high-frequency signal every live session emits, so reaping here prunes dead
+/// peers within ~one heartbeat of their crossing the threshold, independent of
+/// any fresh SessionStart.
 pub fn run_heartbeat(
     dir: &std::path::Path,
     session_id: &str,
     branch: Option<String>,
     command: Option<&str>,
+    stale_secs: u64,
 ) {
     let is_self_switch = command
         .map(|c| guard::is_branch_switch(c) && !guard::redirects_to_other_tree(c))
         .unwrap_or(false);
+    // touch_own FIRST (mirrors `run_start`): writing our record refreshes our
+    // own mtime to ~now, so a session that went quiet past the threshold can
+    // never sweep its own aged file in the call below (#69). The own-sid
+    // exclusion in `sweep_stale` is then defense-in-depth — our file is fresh
+    // regardless.
     let _ = registry::touch_own(dir, session_id, branch, is_self_switch);
+    registry::sweep_stale(dir, stale_secs, session_id);
 }
 
 #[cfg(test)]
@@ -99,6 +117,7 @@ mod tests {
             "self-session",
             Some("feat/peer-moved".into()),
             Some("cargo build"),
+            600,
         );
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
@@ -134,6 +153,7 @@ mod tests {
             "self-session",
             Some("feat/mine".into()),
             Some("git checkout -b feat/mine"),
+            600,
         );
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
@@ -166,6 +186,7 @@ mod tests {
             "self-session",
             Some("feat/mine".into()),
             Some("git checkout 'feat/mine'"),
+            600,
         );
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
@@ -198,6 +219,7 @@ mod tests {
             "self-session",
             Some("feat/peer".into()),
             Some("echo run git checkout feat/peer to reproduce"),
+            600,
         );
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
@@ -234,6 +256,7 @@ mod tests {
             "self-session",
             Some("feat/peer".into()),
             Some("git -C ../other-plugin checkout main"),
+            600,
         );
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
@@ -250,11 +273,102 @@ mod tests {
         // must still register the session.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("sessions");
-        run_heartbeat(&dir, "unregistered-session", Some("main".into()), None);
+        run_heartbeat(&dir, "unregistered-session", Some("main".into()), None, 600);
         let back = registry::read_own(&dir, "unregistered-session").unwrap();
         // A pre-start heartbeat seeds the drift baseline from live HEAD — this
         // is the invariant run_drift relies on (code-review N4).
         assert_eq!(back.declared_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn heartbeat_sweeps_stale_peer_keeps_self_and_live() {
+        // #155: the staleness CLASSIFIER (read_peers) and the REAPER
+        // (sweep_stale) share one threshold and one mtime helper, so at any
+        // instant they cannot disagree on a file — yet 17 of 17 stale lanes
+        // accumulated unreaped. The failing predicate was the sweep's TRIGGER
+        // SET, not its comparison: sweep_stale fired ONLY from `session start`,
+        // never from the high-frequency heartbeat. A long-lived session that
+        // swept once at its own start never reaps a peer that goes stale
+        // afterward, and forks/subagents never fire SessionStart at all. Wiring
+        // the sweep into the heartbeat closes it: any live, active session
+        // prunes dead peers within ~one heartbeat of their crossing the
+        // threshold. This asserts the TRIGGER — a unit test of sweep_stale
+        // alone already passes (`sweep_removes_stale_keeps_fresh`).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // A peer registers, then ages past the (zero-second) threshold.
+        let dead = SessionRecord {
+            name: "dead-peer".into(),
+            session_id: "dead-sess".into(),
+            branch: Some("main".into()),
+            declared_branch: Some("main".into()),
+            ..Default::default()
+        };
+        registry::write_record(dir, &dead).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // A second peer registers fresh (age 0) right before our heartbeat.
+        let live = SessionRecord {
+            name: "live-peer".into(),
+            session_id: "live-sess".into(),
+            branch: Some("main".into()),
+            declared_branch: Some("main".into()),
+            ..Default::default()
+        };
+        registry::write_record(dir, &live).unwrap();
+
+        // Our heartbeat fires with a zero-second staleness threshold: any
+        // measurable age (whole seconds) is stale.
+        run_heartbeat(dir, "self-session", Some("main".into()), None, 0);
+
+        assert!(
+            registry::find_own(dir, "dead-sess").is_none(),
+            "stale peer reaped on heartbeat"
+        );
+        assert!(
+            registry::find_own(dir, "live-sess").is_some(),
+            "fresh peer kept"
+        );
+        assert!(
+            registry::find_own(dir, "self-session").is_some(),
+            "self registered & kept"
+        );
+    }
+
+    #[test]
+    fn heartbeat_sweeps_all_stale_peers_in_one_pass() {
+        // #155 was "17 of 17 unreaped" — many dead lanes accumulating, not one.
+        // A single heartbeat must reap EVERY stale peer in one pass, not just
+        // the first (sweep_stale loops with no early return; this pins it).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        for (name, sid) in [("dead-a", "sess-a"), ("dead-b", "sess-b")] {
+            let rec = SessionRecord {
+                name: name.into(),
+                session_id: sid.into(),
+                branch: Some("main".into()),
+                declared_branch: Some("main".into()),
+                ..Default::default()
+            };
+            registry::write_record(dir, &rec).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        run_heartbeat(dir, "self-session", Some("main".into()), None, 0);
+
+        assert!(
+            registry::find_own(dir, "sess-a").is_none(),
+            "first stale peer reaped"
+        );
+        assert!(
+            registry::find_own(dir, "sess-b").is_none(),
+            "second stale peer reaped"
+        );
+        assert!(
+            registry::find_own(dir, "self-session").is_some(),
+            "self registered & kept"
+        );
     }
 
     #[test]
@@ -272,7 +386,7 @@ mod tests {
         let peers = registry::read_peers(tmp.path(), "other", 0);
         assert!(peers[0].stale);
 
-        run_heartbeat(tmp.path(), "self-session", None, None);
+        run_heartbeat(tmp.path(), "self-session", None, None, 600);
 
         let peers = registry::read_peers(tmp.path(), "other", 0);
         assert!(!peers[0].stale, "heartbeat resets liveness");

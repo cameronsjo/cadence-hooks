@@ -3,7 +3,8 @@
 //!
 //! Liveness is the file's mtime, not its contents — a session that crashes or
 //! is closed without ceremony simply stops heartbeating and goes stale. Stale
-//! files are swept on the next `session start` in the same repo.
+//! files are swept by the PostToolUse heartbeat (every wired tool call in any
+//! live session) and, as a baseline, on `session start`.
 
 use crate::identity::{self, SessionRecord};
 use cadence_hooks_core::shell::git_command;
@@ -288,10 +289,10 @@ pub fn touch_own(
 /// `.<short-id>.json` suffix narrows candidates, then the full `session_id` is
 /// verified ([`matches_own`]) — and excluded from the sweep even when aged. A
 /// peer that merely shares the 8-char prefix is NOT spared (#90). A quiet
-/// session (read/think phase, or paused) still owns its lane; only `session
-/// start` itself, having just refreshed its own mtime, should reach this, and
-/// the exclusion is defense-in-depth against a self-sweep. Pass `""` to sweep
-/// everything (CLI/tests with no own session).
+/// session (read/think phase, or paused) still owns its lane; callers
+/// (`session start` and the PostToolUse heartbeat) refresh their own mtime
+/// first, so the exclusion is defense-in-depth against a self-sweep. Pass
+/// `""` to sweep everything (CLI/tests with no own session).
 pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
