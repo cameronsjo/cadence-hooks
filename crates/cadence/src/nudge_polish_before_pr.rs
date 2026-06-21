@@ -11,6 +11,7 @@
 //! code-review precede polish, they don't replace it. A skip must be stated and
 //! justified, never silent.
 
+use cadence_hooks_core::shell::is_gh_pr_create;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Nudges to run `/polish` (cadence-forge:polish) before opening a PR.
@@ -43,17 +44,6 @@ impl Check for NudgePolishBeforePr {
                 .to_string(),
         )
     }
-}
-
-/// Returns true if `command` contains a `gh pr create` token sequence.
-///
-/// Token-based to avoid substring false positives (e.g. branch names
-/// containing the literal string `gh-pr-create`).
-fn is_gh_pr_create(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    tokens
-        .windows(3)
-        .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == "create")
 }
 
 #[cfg(test)]

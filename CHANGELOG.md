@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **metrics: `log-polish-nudge` — deterministic telemetry for polish-nudge
+  efficacy** (#151 on claude-configurations). A new PostToolUse metrics Logger
+  fires on `gh pr create` — the same `is_gh_pr_create` predicate that drives
+  `nudge-polish-before-pr`, so the recorded set is exactly the PRs that got
+  nudged (the denominator). Each row appends to `polish_nudges.jsonl` with
+  `{ts, sessionId, transcriptPath, branch, repo, polished}`, where `polished`
+  is a best-effort transcript scan for a `cadence-forge:polish` Skill
+  invocation earlier in the session; a `polished: false` row is a deterministic
+  *skip candidate*. (A line merely mentioning `/polish` in prose does not count
+  — only an actual Skill `tool_use` does.) Distinguishing a *rationalized* skip
+  from a legitimate one stays a transcript/prose judgment, but the rate is now
+  queryable without re-mining every transcript. `is_gh_pr_create` moved to
+  `cadence_hooks_core::shell` so the nudge and the logger share one definition.
+  (Wiring this logger into the cadence-metrics plugin's `hooks.json` is the
+  companion step.)
+
 ### Fixed
 
 - **session: the heartbeat now sweeps stale peer lanes** (#155 on

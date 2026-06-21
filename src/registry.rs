@@ -272,6 +272,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "metrics",
         event: None,
     },
+    HookEntry {
+        name: "log-polish-nudge",
+        description: "Log polish-nudge skips: gh pr create + whether /polish ran (PostToolUse)",
+        plugin: "metrics",
+        event: None,
+    },
     // lab
     HookEntry {
         name: "persona-nudge",
@@ -361,6 +367,10 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // log-subagent only reacts to SubagentStart / SubagentStop
         ("metrics", "log-subagent") => Some(
             r#"{"session_id":"test","hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"Explore","duration_ms":1234}"#,
+        ),
+        // log-polish-nudge gates on a `gh pr create` command (the nudge denominator)
+        ("metrics", "log-polish-nudge") => Some(
+            r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"gh pr create --title test"},"transcript_path":"/tmp/transcript.jsonl"}"#,
         ),
         // warn-branch-drift early-exits unless the command is a git commit —
         // the generic PreToolUse sample (`git status`) would never reach the
@@ -496,6 +506,7 @@ mod tests {
             "snapshot",
             "log-commit",
             "log-subagent",
+            "log-polish-nudge",
             "heartbeat",
             "end",
             "backstop-record",
