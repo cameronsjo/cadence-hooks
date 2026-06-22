@@ -94,6 +94,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "cadence",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "redact-external-content",
+        description: "Nudge when an external post mentions internal harness vocabulary",
+        plugin: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
     // guardrails
     HookEntry {
         name: "guard-push-remote",

@@ -17,6 +17,8 @@ pub mod nudge_polish_before_pr;
 pub mod prevent_secret_leaks;
 /// Block writing or deleting secrets (.env, credentials, private keys).
 pub mod prevent_secret_writes;
+/// Nudge before internal harness vocabulary leaks into an external post.
+pub mod redact_external_content;
 /// Shared secret file patterns for both secret guards.
 pub mod secret_patterns;
 /// Block inclusive terminology violations in written content.
