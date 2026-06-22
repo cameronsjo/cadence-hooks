@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-06-22
+
 ### Added
 
 - **metrics: `log-polish-nudge` — deterministic telemetry for polish-nudge
