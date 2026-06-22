@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **session: the heartbeat now sweeps stale peer lanes** (#155 on
+  claude-configurations). `sweep_stale` had exactly one production trigger —
+  SessionStart — so a long-lived session that swept once at its own start never
+  reaped a peer that went stale afterward, and forks/subagents (which never fire
+  the cadence-canon SessionStart) never swept at all. Dead lanes accumulated (17
+  of 17 unreaped in a shared checkout) while `session status` kept *classifying*
+  them `[STALE]` on demand — the classifier and the reaper shared one threshold
+  and one mtime helper, so the gap was never a predicate mismatch, only the
+  reaper's trigger set. The reaper now also runs from the PostToolUse heartbeat —
+  the only high-frequency signal every live session emits — so dead peers are
+  pruned within ~one heartbeat of crossing the 30-min threshold, independent of
+  any fresh SessionStart. `touch_own` runs first (self's mtime refreshed to
+  ~now), so a quiet session can never sweep its own aged file (#69); the
+  staleness threshold and the own-session exclusion are unchanged.
+
 ## [0.35.0] - 2026-06-20
 
 ### Added
