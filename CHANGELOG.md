@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **guardrails: `warn-subagent-worktree` — nudge when dispatching a subagent
+  from main while a sibling worktree exists** (#201 on claude-configurations). A
+  subagent inherits the *spawning session's* working directory, so a session in
+  the main checkout spawns subagents that operate on the main checkout — never a
+  sibling worktree. This PreToolUse check fires once per session (per repo) on an
+  `Agent`/`Task` spawn when the session is in the primary checkout (`.git` is a
+  directory, not a linked-worktree file), a sibling worktree exists
+  (`git worktree list` shows more than the primary), and the spawn doesn't set
+  `isolation: "worktree"`. The nudge names both fixes — dispatch from inside the
+  worktree, or pass `isolation: "worktree"` for a fresh one — and a permanent
+  per-repo opt-out via `CADENCE_ALLOW_SUBAGENT_FROM_MAIN=true`. `ToolInput` gains
+  `subagent_type` / `isolation` (snake_case, matching the Agent payload).
+
 ## [0.36.0] - 2026-06-22
 
 ### Added

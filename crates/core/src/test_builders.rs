@@ -104,6 +104,26 @@ pub fn make_bash_post_tool_use(cmd: &str, stdout: &str) -> HookInput {
     }
 }
 
+/// Build a `HookInput` for an `Agent` (subagent dispatch) tool invocation.
+///
+/// `subagent_type` and `isolation` mirror the Agent tool's input keys — pass
+/// `None` to model an omitted field (a fork-yourself dispatch omits
+/// `subagent_type`; a no-isolation dispatch omits `isolation`). `cwd` is the
+/// spawning session's working directory, which `warn-subagent-worktree`
+/// resolves the checkout from.
+pub fn make_agent(subagent_type: Option<&str>, isolation: Option<&str>, cwd: &str) -> HookInput {
+    HookInput {
+        tool_name: Some("Agent".into()),
+        tool_input: Some(ToolInput {
+            subagent_type: subagent_type.map(Into::into),
+            isolation: isolation.map(Into::into),
+            ..Default::default()
+        }),
+        cwd: Some(cwd.into()),
+        ..Default::default()
+    }
+}
+
 /// Build a `HookInput` for a `SessionStart` event with the given session id and
 /// source (`startup` | `resume` | `clear` | `compact`).
 pub fn make_session(session_id: &str, source: &str) -> HookInput {

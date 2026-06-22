@@ -170,6 +170,14 @@ pub struct ToolInput {
     pub edits: Option<Vec<EditOperation>>,
     /// AskUserQuestion tool: the questions being asked, each with its options.
     pub questions: Option<Vec<AskQuestion>>,
+    /// Agent/Task tool: which subagent type the dispatch spawns. Absent for a
+    /// fork-yourself dispatch (`subagent_type` omitted). Carried for diagnostics
+    /// only — guards do not branch on the value.
+    pub subagent_type: Option<String>,
+    /// Agent/Task tool: isolation mode for the spawned subagent. `Some("worktree")`
+    /// means the spawn gets a fresh agent-owned worktree; absent means the
+    /// subagent inherits the spawning session's working directory.
+    pub isolation: Option<String>,
 }
 
 /// A single edit operation within a MultiEdit tool call.
@@ -245,6 +253,25 @@ impl HookInput {
         self.tool_input
             .as_ref()
             .and_then(|ti| ti.command.as_deref())
+    }
+
+    /// The subagent isolation mode for an Agent/Task spawn, if set.
+    ///
+    /// `Some("worktree")` means the spawn already gets a fresh agent-owned
+    /// worktree (so it is confined); `None` means the subagent inherits the
+    /// spawning session's working directory.
+    pub fn isolation(&self) -> Option<&str> {
+        self.tool_input
+            .as_ref()
+            .and_then(|ti| ti.isolation.as_deref())
+    }
+
+    /// The subagent type for an Agent/Task spawn, if set (`None` for a
+    /// fork-yourself dispatch). Diagnostics only.
+    pub fn subagent_type(&self) -> Option<&str> {
+        self.tool_input
+            .as_ref()
+            .and_then(|ti| ti.subagent_type.as_deref())
     }
 
     /// The content being written (Write tool) or the replacement text (Edit tool).
@@ -1325,6 +1352,26 @@ mod tests {
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.command(), Some("git status"));
+    }
+
+    #[test]
+    fn deserialize_agent_isolation_and_subagent_type() {
+        // The Agent tool's input carries snake_case `subagent_type` and
+        // `isolation` (confirmed against real session payloads).
+        let json = r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose","isolation":"worktree"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.subagent_type(), Some("general-purpose"));
+        assert_eq!(input.isolation(), Some("worktree"));
+    }
+
+    #[test]
+    fn agent_fields_absent_are_none() {
+        // A fork-yourself / no-isolation dispatch omits both keys; serde maps
+        // the absent fields to None (backward-compatible with every other tool).
+        let json = r#"{"tool_name":"Agent","tool_input":{"description":"do x"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.subagent_type(), None);
+        assert_eq!(input.isolation(), None);
     }
 
     // --- Path normalization ---
