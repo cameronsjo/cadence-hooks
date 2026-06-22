@@ -156,6 +156,8 @@ enum GuardrailsCommands {
     GuardGitInit,
     /// Warn when editing on main/master branch
     WarnMainBranch,
+    /// Warn when dispatching a subagent from main while a sibling worktree exists
+    WarnSubagentWorktree,
     /// Nudge after idle periods between edits
     CheckIdleReturn,
     /// Warn when creating a branch from a non-main base
@@ -295,6 +297,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardGhWrite => "guard-gh-write",
             GuardrailsCommands::GuardGitInit => "guard-git-init",
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
+            GuardrailsCommands::WarnSubagentWorktree => "warn-subagent-worktree",
             GuardrailsCommands::CheckIdleReturn => "check-idle-return",
             GuardrailsCommands::WarnBranchBase => "warn-branch-base",
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
@@ -633,6 +636,10 @@ fn main() {
             ),
             GuardrailsCommands::WarnMainBranch => run_check_from_stdin(
                 &cadence_hooks_guardrails::warn_main_branch::WarnMainBranch,
+                pre,
+            ),
+            GuardrailsCommands::WarnSubagentWorktree => run_check_from_stdin(
+                &cadence_hooks_guardrails::warn_subagent_worktree::WarnSubagentWorktree,
                 pre,
             ),
             GuardrailsCommands::CheckIdleReturn => run_check_from_stdin(

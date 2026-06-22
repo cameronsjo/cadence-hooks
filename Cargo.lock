@@ -222,6 +222,7 @@ dependencies = [
  "cadence-hooks-core",
  "regex",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

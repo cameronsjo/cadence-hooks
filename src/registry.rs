@@ -126,6 +126,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-subagent-worktree",
+        description: "Warn when dispatching a subagent from main while a sibling worktree exists",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "check-idle-return",
         description: "Nudge after idle periods between edits",
         plugin: "guardrails",
@@ -401,6 +407,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "backstop-warn") => {
             Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#)
         }
+        // warn-subagent-worktree only engages on an Agent/Task spawn; the generic
+        // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a
+        // directory to resolve against.
+        ("guardrails", "warn-subagent-worktree") => Some(
+            r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
+        ),
         _ => None,
     }
 }
