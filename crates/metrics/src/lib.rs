@@ -12,6 +12,8 @@ mod common;
 pub mod compute_cost;
 /// Append cost-per-commit records to `commits.jsonl`.
 pub mod log_commit;
+/// Append polish-nudge (`gh pr create`) records to `polish_nudges.jsonl`.
+pub mod log_polish_nudge;
 /// Append subagent lifecycle records to `subagents.jsonl`.
 pub mod log_subagent;
 /// Embedded + overridable model price table.
@@ -22,5 +24,6 @@ pub mod scan_tokens;
 pub mod snapshot;
 
 pub use log_commit::LogCommit;
+pub use log_polish_nudge::LogPolishNudge;
 pub use log_subagent::LogSubagent;
 pub use snapshot::Snapshot;

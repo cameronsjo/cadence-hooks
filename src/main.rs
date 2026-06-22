@@ -227,6 +227,8 @@ enum MetricsCommands {
     },
     /// Log subagent lifecycle (SubagentStart / SubagentStop)
     LogSubagent,
+    /// Log polish-nudge skips: `gh pr create` + whether /polish ran (PostToolUse)
+    LogPolishNudge,
 }
 
 #[derive(Subcommand)]
@@ -328,6 +330,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::Snapshot => "snapshot",
             MetricsCommands::LogCommit { .. } => "log-commit",
             MetricsCommands::LogSubagent => "log-subagent",
+            MetricsCommands::LogPolishNudge => "log-polish-nudge",
         }),
         Commands::Lab(l) => Some(match l {
             LabCommands::PersonaNudge => "persona-nudge",
@@ -738,6 +741,10 @@ fn main() {
             MetricsCommands::LogSubagent => run_logger_from_stdin(
                 &cadence_hooks_metrics::LogSubagent,
                 registry::sample_for("metrics", "log-subagent"),
+            ),
+            MetricsCommands::LogPolishNudge => run_logger_from_stdin(
+                &cadence_hooks_metrics::LogPolishNudge,
+                registry::sample_for("metrics", "log-polish-nudge"),
             ),
         },
         Commands::Lab(cmd) => match cmd {

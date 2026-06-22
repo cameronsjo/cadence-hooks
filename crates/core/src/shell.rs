@@ -84,6 +84,20 @@ pub fn tokenize(command: &str) -> Vec<String> {
     tokens
 }
 
+/// Returns true if `command` contains a `gh pr create` token sequence.
+///
+/// Whitespace-token based to avoid substring false positives — a branch named
+/// `gh-pr-create-experiments`, or the literal text inside a quoted arg, must not
+/// match. Shared by the `nudge-polish-before-pr` Check (the nudge) and the
+/// `log-polish-nudge` metrics Logger, so the logged denominator is exactly the
+/// set of PRs that fired the nudge.
+pub fn is_gh_pr_create(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    tokens
+        .windows(3)
+        .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == "create")
+}
+
 /// Extract `(host, "owner/repo")` from any git remote URL format.
 ///
 /// Handles:
@@ -675,6 +689,23 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_gh_pr_create_matches_the_command() {
+        assert!(is_gh_pr_create("gh pr create --title test"));
+        assert!(is_gh_pr_create("cd repo && gh pr create --fill"));
+    }
+
+    #[test]
+    fn is_gh_pr_create_rejects_other_gh_and_substrings() {
+        assert!(!is_gh_pr_create("gh pr list"));
+        assert!(!is_gh_pr_create("gh pr view 123"));
+        assert!(!is_gh_pr_create("gh issue create --title x"));
+        // A branch name containing the literal substring must not match.
+        assert!(!is_gh_pr_create("git checkout gh-pr-create-experiments"));
+        // Quoted as a single commit-message arg → tokens don't line up.
+        assert!(!is_gh_pr_create("git commit -m 'gh pr create'"));
+    }
 
     // --- strip_quotes ---
 
