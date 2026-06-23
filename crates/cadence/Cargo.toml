@@ -8,6 +8,8 @@ description = "Cadence plugin hooks: enforcement, memory guard, session manageme
 [dependencies]
 cadence-hooks-core.workspace = true
 regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tempfile = "3"
 
 [dev-dependencies]

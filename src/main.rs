@@ -142,6 +142,8 @@ enum CadenceCommands {
     NudgePolishBeforePr,
     /// Run markdownlint on markdown files
     MarkdownLint,
+    /// Nudge when an external post mentions internal harness vocabulary
+    RedactExternalContent,
 }
 
 #[derive(Subcommand)]
@@ -290,6 +292,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::WarnOvershare => "warn-overshare",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
+            CadenceCommands::RedactExternalContent => "redact-external-content",
         }),
         Commands::Guardrails(g) => Some(match g {
             GuardrailsCommands::GuardPushRemote => "guard-push-remote",
@@ -617,6 +620,10 @@ fn main() {
             CadenceCommands::MarkdownLint => {
                 run_check_from_stdin(&cadence_hooks_cadence::markdown_lint::MarkdownLint, pre)
             }
+            CadenceCommands::RedactExternalContent => run_check_from_stdin(
+                &cadence_hooks_cadence::redact_external_content::RedactExternalContent,
+                pre,
+            ),
         },
         Commands::Guardrails(cmd) => match cmd {
             GuardrailsCommands::GuardPushRemote => run_check_from_stdin(

@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **cadence: `redact-external-content` — nudge when an external post mentions
+  internal harness vocabulary** (planning issue #27 on claude-configurations).
+  A PreToolUse **nudge** (never a block) that scans the *body text* of
+  external-posting Bash commands — `gh pr/issue/release/gist/discussion`
+  create/comment/edit, `git commit`, `tea pr/issue` — and flags four categories
+  of harness-internal vocabulary before the content ships: skill/plugin IDs
+  (`cadence:attune`, derived from a maintained namespace list), local filesystem
+  paths (`/Users/…`, `~/.claude/…`, `/private/tmp/claude-*`), marketplace/cache
+  paths (`~/.claude/plugins/…`, `cache/workbench/…`, raw marketplace URLs), and
+  bare harness nouns (`harness`, `transcript`, `tool_input`, `tool_response`).
+  Bodies are pulled from `--body`/`-b`/`-m`/`--message`, `--body-file`/`-F`
+  (read from disk), and heredocs carried in a quoted command substitution.
+  A per-repo `.claude/redaction.json` extends it: `additionalPatterns` flag
+  project-specific strings (with a suggested replacement) and `allowlist`
+  suppresses hits — a full token (`cadence:writing-skills`) suppresses that
+  exact snippet, a bare namespace (`cadence-forge`) suppresses every skill-id
+  in that namespace (so a repo that legitimately discusses a whole namespace
+  can allow-list it wholesale).
+  Missing/invalid config, unreadable body files, and unrecognized commands all
+  fail open silently. Binary subcommand only — the plugin's hooks.json wiring
+  (with the `if` filter) lands in a separate PR.
+
 ## [0.37.0] - 2026-06-22
 
 ### Added
