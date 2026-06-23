@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **doctor: honest version-skew advisory + clearer bare invocation** (#223 on
+  claude-configurations). The skew advisory hardcoded `brew upgrade
+  cadence-hooks` even when the Homebrew tap was already current, so the
+  recommended command was a silent no-op and the SessionStart banner returned
+  every session with no way to clear it. `doctor` now detects the binary's
+  install channel from `current_exe()` and names the truthful upgrade path:
+  Homebrew installs still get `brew upgrade` but with a source fallback for the
+  "tap already current" case; cargo / unknown installs are pointed at `cargo
+  install` or the releases page (mirroring the binary's own runtime fallback).
+  The quiet SessionStart banner defers channel-specific detail to `cadence-hooks
+  doctor`. Separately, a bare `cadence-hooks` (no subcommand) now prints plain
+  `--help` guidance instead of the "a plugin expects a newer version" warning,
+  which is now reserved for genuinely unknown subcommands. Advisory-only — exit
+  codes and the fail-open contract are unchanged.
+
 ## [0.39.0] - 2026-06-23
 
 ### Added

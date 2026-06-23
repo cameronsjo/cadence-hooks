@@ -29,8 +29,8 @@ fn unknown_top_level_subcommand_fails_open() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unrecognized command"),
-        "should mention unrecognized command: {stderr}"
+        stderr.contains("unrecognized subcommand"),
+        "should mention unrecognized subcommand: {stderr}"
     );
     assert!(
         stderr.contains("To update:"),
@@ -54,8 +54,8 @@ fn unknown_plugin_subcommand_fails_open() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unrecognized command"),
-        "should mention unrecognized command: {stderr}"
+        stderr.contains("unrecognized subcommand"),
+        "should mention unrecognized subcommand: {stderr}"
     );
 }
 
@@ -75,8 +75,8 @@ fn unknown_guardrails_subcommand_fails_open() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unrecognized command"),
-        "should mention unrecognized command: {stderr}"
+        stderr.contains("unrecognized subcommand"),
+        "should mention unrecognized subcommand: {stderr}"
     );
 }
 
@@ -148,8 +148,8 @@ fn distant_name_subcommand_fails_open() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unrecognized command"),
-        "should mention unrecognized command: {stderr}"
+        stderr.contains("unrecognized subcommand"),
+        "should mention unrecognized subcommand: {stderr}"
     );
 }
 
@@ -168,8 +168,40 @@ fn missing_subcommand_fails_open() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unrecognized command"),
-        "should mention unrecognized command: {stderr}"
+        stderr.contains("no subcommand given"),
+        "bare invocation should say 'no subcommand given', not a version warning: {stderr}"
+    );
+    assert!(
+        !stderr.contains("newer version"),
+        "bare invocation must not claim a plugin expects a newer version: {stderr}"
+    );
+}
+
+#[test]
+fn namespace_without_hook_says_no_subcommand() {
+    // `cadence-hooks cadence` — a real namespace with no hook name. Hits the
+    // same MissingSubcommand arm as a bare run, so it gets plain guidance, not
+    // the version-skew warning (#223).
+    let output = cadence_hooks()
+        .args(["cadence"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "namespace-only invocation should exit 1 (warn), not block.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no subcommand given"),
+        "namespace-only should say 'no subcommand given': {stderr}"
+    );
+    assert!(
+        !stderr.contains("newer version"),
+        "namespace-only must not claim a plugin expects a newer version: {stderr}"
     );
 }
 

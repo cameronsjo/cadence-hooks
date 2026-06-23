@@ -477,25 +477,39 @@ fn main() {
             }
         },
         Err(e) => {
-            // Clap errors (unknown subcommand, missing args, etc.) must NOT block
-            // operations. Exit code 2 from clap would be interpreted as "block" by
-            // the hook protocol. Instead, fail open with a warning so the user
-            // knows their cadence-hooks binary may be out of date.
+            // Clap errors must NOT block operations. Exit code 2 from clap would
+            // be interpreted as "block" by the hook protocol, so every arm here
+            // fails open (exit 1) instead.
             let installed = env!("CARGO_PKG_VERSION");
             match e.kind() {
-                // InvalidSubcommand: entirely unknown subcommand name
-                //   (e.g., `cadence-hooks future-plugin some-hook`)
-                // UnknownArgument: known subcommand but with unrecognized flags/args
-                //   (e.g., `cadence-hooks cadence terminology --new-flag`)
-                // MissingSubcommand / DisplayHelpOnMissingArgumentOrSubcommand:
-                //   no subcommand provided (e.g., bare `cadence-hooks` or `cadence-hooks cadence`)
-                // All indicate misconfiguration or version mismatch. Warn (exit 1) instead of blocking.
-                clap::error::ErrorKind::InvalidSubcommand
-                | clap::error::ErrorKind::UnknownArgument
-                | clap::error::ErrorKind::MissingSubcommand
+                // No subcommand provided — bare `cadence-hooks`, or a namespace
+                // with no hook (e.g. `cadence-hooks cadence`). This is NOT a
+                // version problem: these hooks are invoked by plugins, not run
+                // by hand. Point at --help instead of crying "newer version"
+                // (claude-configurations #223).
+                clap::error::ErrorKind::MissingSubcommand
                 | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
                     eprintln!(
-                        "cadence-hooks v{installed}: unrecognized command or arguments.\n\
+                        "cadence-hooks v{installed}: no subcommand given.\n\
+                         \n\
+                         These hooks are invoked by Claude Code plugins, not run directly.\n\
+                         Run 'cadence-hooks --help' to list subcommands, or\n\
+                         'cadence-hooks doctor' to audit installed plugin wiring."
+                    );
+                    process::exit(1);
+                }
+                // Unknown subcommand name (`cadence-hooks future-plugin hook`) or
+                // an unrecognized flag on a known subcommand — a plugin likely
+                // expects a newer build. This path deliberately stays
+                // channel-agnostic (cargo / releases), unlike `doctor`'s
+                // channel-aware advisory: cargo/releases is truthful regardless
+                // of how this binary was installed, so it never degenerates into
+                // a no-op `brew upgrade` (#223) here, where we can't run doctor's
+                // fuller "already current" detection.
+                clap::error::ErrorKind::InvalidSubcommand
+                | clap::error::ErrorKind::UnknownArgument => {
+                    eprintln!(
+                        "cadence-hooks v{installed}: unrecognized subcommand or arguments.\n\
                          \n\
                          This usually means a plugin expects a newer version of cadence-hooks.\n\
                          \n\
