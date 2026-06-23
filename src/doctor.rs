@@ -135,10 +135,87 @@ struct SkewDiagnosis {
     remediation: String,
 }
 
+/// How this binary was installed — picks the truthful upgrade path.
+///
+/// `doctor` runs at SessionStart and must not make a network call, so it can't
+/// know whether the Homebrew tap is already current. Instead of recommending an
+/// unconditional `brew upgrade` (a silent no-op when the tap already ships the
+/// installed version — claude-configurations #223), it names the channel this
+/// binary came from and always offers the source path as the "already current"
+/// fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallChannel {
+    Homebrew,
+    Cargo,
+    Unknown,
+}
+
+const RELEASES_URL: &str = "https://github.com/cameronsjo/cadence-hooks/releases/latest";
+const CARGO_INSTALL: &str = "cargo install --git https://github.com/cameronsjo/cadence-hooks.git";
+
+/// Classify an executable path into an install channel. Pure, for testing.
+fn classify_channel(exe_path: &str) -> InstallChannel {
+    if exe_path.contains("/Cellar/")
+        || exe_path.contains("/homebrew/")
+        || exe_path.contains("linuxbrew")
+    {
+        InstallChannel::Homebrew
+    } else if exe_path.contains("/.cargo/") {
+        InstallChannel::Cargo
+    } else {
+        InstallChannel::Unknown
+    }
+}
+
+/// Best-effort detection of how the running binary was installed.
+/// Falls back to [`InstallChannel::Unknown`] when the path is unreadable.
+fn install_channel() -> InstallChannel {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(classify_channel))
+        .unwrap_or(InstallChannel::Unknown)
+}
+
+/// The full skew remediation for a finding, honest for this install channel.
+/// Homebrew still names `brew upgrade` (the normal path) but never as the *sole*
+/// remedy — the source fallback covers the "tap already current" no-op case.
+fn upgrade_remediation(channel: InstallChannel) -> String {
+    match channel {
+        InstallChannel::Homebrew => format!(
+            "brew upgrade cadence-hooks — if it reports up-to-date, the plugin \
+             references an unreleased build: install from source ({CARGO_INSTALL}) \
+             or downgrade the plugin"
+        ),
+        InstallChannel::Cargo => format!("{CARGO_INSTALL} (or downgrade the plugin)"),
+        InstallChannel::Unknown => format!(
+            "update to the latest release ({RELEASES_URL}) or {CARGO_INSTALL} \
+             (or downgrade the plugin)"
+        ),
+    }
+}
+
+/// One-line upgrade hint for the quiet SessionStart banner. Defers channel
+/// detail to `cadence-hooks doctor` rather than asserting a possibly-no-op
+/// command.
+fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
+    match channel {
+        InstallChannel::Homebrew => {
+            "run 'brew upgrade cadence-hooks' (or 'cadence-hooks doctor' if already up-to-date)"
+        }
+        InstallChannel::Cargo | InstallChannel::Unknown => {
+            "run 'cadence-hooks doctor' for upgrade steps"
+        }
+    }
+}
+
 /// Judge an invocation against the registry.
 /// Returns `None` when the pair is known-good.
 /// Returns `Some(SkewDiagnosis)` for a namespace mismatch or unknown subcommand.
-fn judge_invocation(namespace: &str, subcommand: &str) -> Option<SkewDiagnosis> {
+fn judge_invocation(
+    namespace: &str,
+    subcommand: &str,
+    channel: InstallChannel,
+) -> Option<SkewDiagnosis> {
     if registry::is_known(namespace, subcommand) {
         return None;
     }
@@ -154,12 +231,14 @@ fn judge_invocation(namespace: &str, subcommand: &str) -> Option<SkewDiagnosis> 
             remediation: format!("fix the hooks.json entry to: {actual_ns} {subcommand}"),
         })
     } else {
-        // Fully unknown — version skew.
+        // Fully unknown — version skew. The remediation names the upgrade path
+        // for *this* binary's install channel, not an unconditional
+        // `brew upgrade` that no-ops when the tap is already current (#223).
         Some(SkewDiagnosis {
             diagnosis: format!(
                 "subcommand '{namespace} {subcommand}' is not present in this binary (v{version})"
             ),
-            remediation: "brew upgrade cadence-hooks (or downgrade the plugin)".to_string(),
+            remediation: upgrade_remediation(channel),
         })
     }
 }
@@ -184,7 +263,13 @@ fn find_line_number(haystack: &str, needle: &str) -> Option<usize> {
 }
 
 /// Walk a `hooks.json` blob's hook commands and collect findings.
-fn scan_hooks_json(plugin: &str, path: &Path, raw: &str, json: &serde_json::Value) -> Vec<Finding> {
+fn scan_hooks_json(
+    plugin: &str,
+    path: &Path,
+    raw: &str,
+    json: &serde_json::Value,
+    channel: InstallChannel,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     let Some(hooks_obj) = json.get("hooks").and_then(|v| v.as_object()) else {
@@ -221,7 +306,7 @@ fn scan_hooks_json(plugin: &str, path: &Path, raw: &str, json: &serde_json::Valu
 
                 // Check 2: subcommand cross-reference (Warning).
                 if let Some((ns, sub)) = extract_invocation(cmd)
-                    && let Some(diag) = judge_invocation(&ns, &sub)
+                    && let Some(diag) = judge_invocation(&ns, &sub, channel)
                 {
                     findings.push(Finding {
                         severity: Severity::Warning,
@@ -286,7 +371,7 @@ fn manifest_install_paths(manifest: &Path) -> Option<Vec<(String, PathBuf)>> {
 }
 
 /// Scan a single plugin install dir's `hooks/hooks.json`, if present.
-fn scan_plugin_dir(label: &str, plugin_dir: &Path) -> Vec<Finding> {
+fn scan_plugin_dir(label: &str, plugin_dir: &Path, channel: InstallChannel) -> Vec<Finding> {
     let hooks_path = plugin_dir.join("hooks/hooks.json");
     let Ok(content) = std::fs::read_to_string(&hooks_path) else {
         return Vec::new();
@@ -296,7 +381,7 @@ fn scan_plugin_dir(label: &str, plugin_dir: &Path) -> Vec<Finding> {
         // to catch. The plugin loader will surface it.
         return Vec::new();
     };
-    scan_hooks_json(label, &hooks_path, &content, &json)
+    scan_hooks_json(label, &hooks_path, &content, &json, channel)
 }
 
 /// Recursively discover `hooks/hooks.json` files under `root` and scan each.
@@ -305,7 +390,7 @@ fn scan_plugin_dir(label: &str, plugin_dir: &Path) -> Vec<Finding> {
 /// real Claude Code cache layout (`<root>/<marketplace>/<plugin>/<sha>/hooks/`)
 /// both work. Plugin labels are the directory path from `root` to the dir
 /// containing `hooks/`, so findings stay attributable at any depth.
-fn scan_root(root: &Path) -> Vec<Finding> {
+fn scan_root(root: &Path, channel: InstallChannel) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     // Real cache layouts are 3 levels deep (marketplace/plugin/sha); allow
@@ -328,7 +413,7 @@ fn scan_root(root: &Path) -> Vec<Finding> {
                 .filter(|p| !p.as_os_str().is_empty())
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| dir.display().to_string());
-            findings.extend(scan_plugin_dir(&label, &dir));
+            findings.extend(scan_plugin_dir(&label, &dir, channel));
             // A plugin dir doesn't nest further plugins beneath it.
             continue;
         }
@@ -371,6 +456,9 @@ fn scan_root(root: &Path) -> Vec<Finding> {
 /// capturing stdout gets the skew nudge to inject), errors go to stderr (a
 /// caller redirecting stderr to /dev/null still fails on the exit code).
 pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
+    // Resolve the install channel once — it's process-invariant, so the scan
+    // below shouldn't re-probe current_exe() per hook entry.
+    let channel = install_channel();
     let (findings, scanned) = match root_override {
         Some(root) => {
             if !root.exists() {
@@ -382,7 +470,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
                 );
                 return 2;
             }
-            (scan_root(root), root.display().to_string())
+            (scan_root(root, channel), root.display().to_string())
         }
         None => {
             let Some(plugins) = plugins_dir() else {
@@ -397,7 +485,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
                     let scanned = format!("{} installed plugin(s)", installs.len());
                     let findings = installs
                         .iter()
-                        .flat_map(|(label, dir)| scan_plugin_dir(label, dir))
+                        .flat_map(|(label, dir)| scan_plugin_dir(label, dir, channel))
                         .collect();
                     (findings, scanned)
                 }
@@ -411,7 +499,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
                         );
                         return 2;
                     }
-                    (scan_root(&cache), cache.display().to_string())
+                    (scan_root(&cache, channel), cache.display().to_string())
                 }
             }
         }
@@ -434,8 +522,9 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
         // Warnings only in quiet mode: one summary line to stdout, exit 0.
         let version = env!("CARGO_PKG_VERSION");
         println!(
-            "cadence-hooks {version} is missing {} subcommand(s) referenced by installed plugins — run 'brew upgrade cadence-hooks'",
-            warnings.len()
+            "cadence-hooks {version} is missing {} subcommand(s) referenced by installed plugins — {}",
+            warnings.len(),
+            upgrade_hint_short(channel)
         );
         return 0;
     }
@@ -659,15 +748,17 @@ mod tests {
 
     #[test]
     fn judge_invocation_known_pair_is_clean() {
-        assert_eq!(judge_invocation("guardrails", "guard-push-remote"), None);
-        assert_eq!(judge_invocation("cadence", "terminology"), None);
-        assert_eq!(judge_invocation("metrics", "log-commit"), None);
+        let c = InstallChannel::Unknown;
+        assert_eq!(judge_invocation("guardrails", "guard-push-remote", c), None);
+        assert_eq!(judge_invocation("cadence", "terminology", c), None);
+        assert_eq!(judge_invocation("metrics", "log-commit", c), None);
     }
 
     #[test]
     fn judge_invocation_wrong_namespace_gives_mismatch_diagnosis() {
         // guard-push-remote is guardrails, not cadence
-        let diag = judge_invocation("cadence", "guard-push-remote").expect("should find mismatch");
+        let diag = judge_invocation("cadence", "guard-push-remote", InstallChannel::Unknown)
+            .expect("should find mismatch");
         assert!(
             diag.diagnosis.contains("guardrails"),
             "diagnosis: {}",
@@ -682,17 +773,121 @@ mod tests {
 
     #[test]
     fn judge_invocation_unknown_gives_skew_diagnosis() {
-        let diag = judge_invocation("cadence", "totally-made-up-hook").expect("should find skew");
+        let diag = judge_invocation("cadence", "totally-made-up-hook", InstallChannel::Homebrew)
+            .expect("should find skew");
         assert!(
             diag.diagnosis.contains("not present in this binary"),
             "diagnosis: {}",
             diag.diagnosis
         );
+        // Homebrew channel names brew but also the source fallback for the
+        // tap-already-current no-op case (#223).
         assert!(
             diag.remediation.contains("brew upgrade"),
             "remediation: {}",
             diag.remediation
         );
+        assert!(
+            diag.remediation.contains("cargo install"),
+            "should offer source fallback: {}",
+            diag.remediation
+        );
+    }
+
+    #[test]
+    fn judge_invocation_unknown_cargo_channel_omits_brew() {
+        let diag = judge_invocation("cadence", "totally-made-up-hook", InstallChannel::Cargo)
+            .expect("should find skew");
+        assert!(
+            diag.remediation.contains("cargo install"),
+            "remediation: {}",
+            diag.remediation
+        );
+        assert!(
+            !diag.remediation.contains("brew"),
+            "cargo-installed binary must not be told to brew upgrade: {}",
+            diag.remediation
+        );
+    }
+
+    // ── install-channel classification ───────────────────────────────────────
+
+    #[test]
+    fn classify_channel_detects_homebrew() {
+        assert_eq!(
+            classify_channel("/opt/homebrew/bin/cadence-hooks"),
+            InstallChannel::Homebrew
+        );
+        assert_eq!(
+            classify_channel("/opt/homebrew/Cellar/cadence-hooks/0.39.0/bin/cadence-hooks"),
+            InstallChannel::Homebrew
+        );
+        assert_eq!(
+            classify_channel("/home/linuxbrew/.linuxbrew/bin/cadence-hooks"),
+            InstallChannel::Homebrew
+        );
+    }
+
+    #[test]
+    fn classify_channel_detects_cargo() {
+        assert_eq!(
+            classify_channel("/Users/x/.cargo/bin/cadence-hooks"),
+            InstallChannel::Cargo
+        );
+    }
+
+    #[test]
+    fn classify_channel_unknown_for_other_paths() {
+        assert_eq!(
+            classify_channel("/usr/local/bin/cadence-hooks"),
+            InstallChannel::Unknown
+        );
+        assert_eq!(
+            classify_channel("/Users/x/proj/target/debug/cadence-hooks"),
+            InstallChannel::Unknown
+        );
+    }
+
+    #[test]
+    fn upgrade_remediation_homebrew_names_brew_and_source_fallback() {
+        let r = upgrade_remediation(InstallChannel::Homebrew);
+        assert!(r.contains("brew upgrade"), "{r}");
+        assert!(
+            r.contains("cargo install"),
+            "should offer source fallback: {r}"
+        );
+        assert!(r.contains("downgrade the plugin"), "{r}");
+    }
+
+    #[test]
+    fn upgrade_remediation_cargo_omits_brew() {
+        let r = upgrade_remediation(InstallChannel::Cargo);
+        assert!(r.contains("cargo install"), "{r}");
+        assert!(!r.contains("brew"), "{r}");
+    }
+
+    #[test]
+    fn upgrade_remediation_unknown_points_at_releases_not_brew() {
+        let r = upgrade_remediation(InstallChannel::Unknown);
+        assert!(r.contains("releases"), "{r}");
+        assert!(
+            !r.contains("brew upgrade"),
+            "unknown channel must not assert a possibly-no-op brew upgrade: {r}"
+        );
+    }
+
+    #[test]
+    fn upgrade_hint_short_homebrew_mentions_doctor_fallback() {
+        let h = upgrade_hint_short(InstallChannel::Homebrew);
+        assert!(h.contains("brew upgrade"), "{h}");
+        assert!(h.contains("doctor"), "{h}");
+    }
+
+    #[test]
+    fn upgrade_hint_short_non_brew_defers_to_doctor() {
+        let h = upgrade_hint_short(InstallChannel::Cargo);
+        assert!(h.contains("doctor"), "{h}");
+        assert!(!h.contains("brew"), "{h}");
     }
 
     // ── integration tests via run(Some(tmpdir), ...) ─────────────────────────
