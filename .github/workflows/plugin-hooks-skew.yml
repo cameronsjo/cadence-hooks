@@ -1,0 +1,44 @@
+name: plugin-hooks-skew
+
+# Reusable gate for cadence plugins: a plugin's hooks.json must only reference
+# cadence-hooks subcommands present in the LATEST RELEASED binary. Each plugin
+# calls this from a thin hooks-skew.yml. Enforces "release the binary before the
+# plugin wiring goes live", so a SessionStart `doctor` skew advisory never
+# reaches users on the tap (claude-configurations #223).
+#
+# When called, actions/checkout checks out the CALLER plugin's repo, so
+# `doctor --root .` scans that plugin's hooks.json.
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install latest released cadence-hooks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --repo cameronsjo/cadence-hooks --json tagName --jq .tagName)"
+          echo "Latest released cadence-hooks: $tag"
+          gh release download "$tag" --repo cameronsjo/cadence-hooks \
+            --pattern "*linux-x86_64.tar.gz" --dir /tmp/ch
+          tar -xzf /tmp/ch/*linux-x86_64.tar.gz -C /tmp/ch
+          bin="$(find /tmp/ch -type f -name cadence-hooks | head -n1)"
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 "$bin" "$HOME/.local/bin/cadence-hooks"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cadence-hooks" --version
+
+      # Verbose doctor exits non-zero on subcommand skew (1) or a shell-expansion
+      # bug (2). NOT --quiet: that suppresses the skew warning's exit code (it's
+      # the non-blocking SessionStart preflight mode).
+      - name: doctor — released binary must support every wired subcommand
+        run: cadence-hooks doctor --root .
