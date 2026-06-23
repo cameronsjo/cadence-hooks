@@ -29,6 +29,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Missing/invalid config, unreadable body files, and unrecognized commands all
   fail open silently. Binary subcommand only — the plugin's hooks.json wiring
   (with the `if` filter) lands in a separate PR.
+- **metrics: `log-ask-user-question` — record AskUserQuestion stance + shape on
+  every call** (#210 on claude-configurations). A fire-and-forget PreToolUse
+  logger that appends one line to `<metrics_dir>/askuserquestion.jsonl` per
+  AskUserQuestion call: the call's *stance* — `recommended` when an option label
+  carries `(Recommended)`, `declared_no_rec` when a question text carries the
+  `no clear recommendation` marker, else `silent` — plus its shape
+  (`multiSelect`, `nQuestions`, `nOptions`, `sessionId`, `model`). Stage 1 of
+  making `(Recommended)` reliable: pure observation, zero behavior change — the
+  `silent` rate is the diagnostic denominator for "is Claude omitting a
+  recommendation, or are the options genuinely equivalent?". The shared
+  `stance(...)` classifier (new `Stance` enum in `rules::askuserquestion`) is
+  reused by the `warn-recommended-option` nudge so the two never drift;
+  `MetricsInput` gains a `model` field. The `cadence-metrics` hooks.json wiring
+  ships alongside.
 
 ## [0.37.0] - 2026-06-22
 

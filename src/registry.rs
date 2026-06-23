@@ -290,6 +290,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "metrics",
         event: None,
     },
+    HookEntry {
+        name: "log-ask-user-question",
+        description: "Log AskUserQuestion stance + shape on every call (PreToolUse)",
+        plugin: "metrics",
+        event: None,
+    },
     // lab
     HookEntry {
         name: "persona-nudge",
@@ -383,6 +389,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // log-polish-nudge gates on a `gh pr create` command (the nudge denominator)
         ("metrics", "log-polish-nudge") => Some(
             r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"gh pr create --title test"},"transcript_path":"/tmp/transcript.jsonl"}"#,
+        ),
+        // log-ask-user-question records every AskUserQuestion call's stance +
+        // shape; the generic logger sample carries no `questions` and would no-op.
+        ("metrics", "log-ask-user-question") => Some(
+            r#"{"session_id":"test","hook_event_name":"PreToolUse","model":"claude-opus-4-8","tool_input":{"questions":[{"question":"Which approach?","header":"Approach","multiSelect":false,"options":[{"label":"Option A","description":"first"},{"label":"Option B","description":"second"}]}]}}"#,
         ),
         // warn-branch-drift early-exits unless the command is a git commit —
         // the generic PreToolUse sample (`git status`) would never reach the
@@ -525,6 +536,7 @@ mod tests {
             "log-commit",
             "log-subagent",
             "log-polish-nudge",
+            "log-ask-user-question",
             "heartbeat",
             "end",
             "backstop-record",
