@@ -10,6 +10,8 @@ mod common;
 
 /// USD cost from token totals and a model name.
 pub mod compute_cost;
+/// Append AskUserQuestion stance/shape records to `askuserquestion.jsonl`.
+pub mod log_askuserquestion;
 /// Append cost-per-commit records to `commits.jsonl`.
 pub mod log_commit;
 /// Append polish-nudge (`gh pr create`) records to `polish_nudges.jsonl`.
@@ -23,6 +25,7 @@ pub mod scan_tokens;
 /// Snapshot HEAD before a `git commit`.
 pub mod snapshot;
 
+pub use log_askuserquestion::LogAskUserQuestion;
 pub use log_commit::LogCommit;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_subagent::LogSubagent;

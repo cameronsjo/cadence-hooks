@@ -7,6 +7,7 @@ description = "Fire-and-forget metrics loggers: cost-per-commit and subagent lif
 
 [dependencies]
 cadence-hooks-core.workspace = true
+cadence-hooks-rules.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true

@@ -243,6 +243,7 @@ name = "cadence-hooks-metrics"
 version = "0.38.0"
 dependencies = [
  "cadence-hooks-core",
+ "cadence-hooks-rules",
  "regex",
  "serde",
  "serde_json",

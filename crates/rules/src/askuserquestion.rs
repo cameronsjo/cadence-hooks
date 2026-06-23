@@ -11,10 +11,89 @@
 //! "(Recommended)" rule is conditional ("when you have a clear preference"), so
 //! a hard block would over-apply to genuinely-equivalent options.
 
-use cadence_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{AskQuestion, Check, CheckResult, HookInput};
 use std::collections::HashMap;
 
+/// Case-sensitive by design: option labels are machine-emitted, so the exact
+/// `(Recommended)` casing is expected — unlike [`NO_REC_MARKER`], which scans
+/// free-form question prose and so matches case-insensitively.
 const RECOMMENDED_MARKER: &str = "(Recommended)";
+
+/// The phrase that marks a question as deliberately offering no recommendation.
+/// Detected case-insensitively anywhere in the question text (tolerant of the
+/// `— no clear recommendation` framing the rule suggests), so Claude can declare
+/// genuine neutrality instead of staying silent. See [`Stance`].
+const NO_REC_MARKER: &str = "no clear recommendation";
+
+/// Whether an AskUserQuestion call makes Claude's stance on its options legible.
+///
+/// The reader of an AskUserQuestion (often Cameron, later, with no conversation
+/// to anchor it) should always be able to tell *Claude's* stance — a clear pick,
+/// or a deliberate "these are genuine trade-offs" — and never be left guessing
+/// whether Claude simply forgot. The three buckets are mutually exclusive;
+/// [`stance`] resolves them in priority order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stance {
+    /// At least one option label carries the `(Recommended)` marker.
+    Recommended,
+    /// No recommended option, but a question text declares no clear
+    /// recommendation (the explicit-neutrality marker).
+    DeclaredNoRec,
+    /// Neither signal — Claude said nothing about which option it prefers.
+    Silent,
+}
+
+impl Stance {
+    /// Stable lowercase tag for logging/JSONL
+    /// (`recommended` / `declared_no_rec` / `silent`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Stance::Recommended => "recommended",
+            Stance::DeclaredNoRec => "declared_no_rec",
+            Stance::Silent => "silent",
+        }
+    }
+}
+
+/// Classify an AskUserQuestion call's stance from its questions.
+///
+/// Priority: a `(Recommended)` label wins over a no-rec marker (a call that both
+/// recommends and hedges still expresses a preference); `Silent` is the absence
+/// of both. Shared by the [`WarnRecommendedOption`] nudge and the
+/// `log-ask-user-question` metrics logger so the two never drift.
+pub fn stance(questions: &[AskQuestion]) -> Stance {
+    if has_recommended(questions) {
+        Stance::Recommended
+    } else if declares_no_rec(questions) {
+        Stance::DeclaredNoRec
+    } else {
+        Stance::Silent
+    }
+}
+
+/// True when any option label across all questions carries `(Recommended)`.
+fn has_recommended(questions: &[AskQuestion]) -> bool {
+    questions
+        .iter()
+        .flat_map(|q| q.options.iter().flatten())
+        .any(|o| {
+            o.label
+                .as_deref()
+                .is_some_and(|l| l.contains(RECOMMENDED_MARKER))
+        })
+}
+
+/// True when any question text declares no clear recommendation.
+fn declares_no_rec(questions: &[AskQuestion]) -> bool {
+    questions
+        .iter()
+        .any(|q| q.question.as_deref().is_some_and(contains_no_rec_marker))
+}
+
+/// Case-insensitive, prose-tolerant detection of the no-recommendation marker.
+fn contains_no_rec_marker(text: &str) -> bool {
+    text.to_ascii_lowercase().contains(NO_REC_MARKER)
+}
 
 /// PreToolUse nudge: remind Claude to label a recommended AskUserQuestion option.
 pub struct WarnRecommendedOption;
@@ -34,15 +113,10 @@ impl Check for WarnRecommendedOption {
         if questions.is_empty() {
             return CheckResult::allow();
         }
-        let has_recommended = questions
-            .iter()
-            .flat_map(|q| q.options.iter().flatten())
-            .any(|o| {
-                o.label
-                    .as_deref()
-                    .is_some_and(|l| l.contains(RECOMMENDED_MARKER))
-            });
-        if has_recommended {
+        // Stage 1 (diagnose): behavior unchanged — still nudge whenever no option
+        // is labeled "(Recommended)". Stage 2 will gate this on `stance(...) ==
+        // Silent` so a declared "no clear recommendation" stops tripping it.
+        if has_recommended(questions) {
             CheckResult::allow()
         } else {
             CheckResult::nudge(
@@ -225,6 +299,91 @@ mod tests {
             WarnRecommendedOption.run(&input).outcome,
             cadence_hooks_core::Outcome::Allow
         );
+    }
+
+    // --- Stance classifier ---
+
+    fn q(text: &str, labels: &[&str]) -> AskQuestion {
+        AskQuestion {
+            question: Some(text.into()),
+            header: Some("H".into()),
+            multi_select: Some(false),
+            options: Some(
+                labels
+                    .iter()
+                    .map(|l| AskOption {
+                        label: Some((*l).into()),
+                        description: None,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn stance_recommended_when_label_marked() {
+        let qs = vec![q("Which approach?", &["A (Recommended)", "B"])];
+        assert_eq!(stance(&qs), Stance::Recommended);
+    }
+
+    #[test]
+    fn stance_declared_no_rec_when_question_marks_neutral() {
+        let qs = vec![q("Which approach? — no clear recommendation", &["A", "B"])];
+        assert_eq!(stance(&qs), Stance::DeclaredNoRec);
+    }
+
+    #[test]
+    fn stance_silent_when_neither_signal() {
+        let qs = vec![q("Which approach?", &["A", "B"])];
+        assert_eq!(stance(&qs), Stance::Silent);
+    }
+
+    #[test]
+    fn stance_recommended_beats_declared_no_rec() {
+        // A call that both recommends and hedges still expresses a preference.
+        let qs = vec![q(
+            "Which approach? — no clear recommendation",
+            &["A (Recommended)", "B"],
+        )];
+        assert_eq!(stance(&qs), Stance::Recommended);
+    }
+
+    #[test]
+    fn stance_no_rec_marker_in_any_question_counts() {
+        let qs = vec![
+            q("First question?", &["A", "B"]),
+            q("Second? — no clear recommendation", &["C", "D"]),
+        ];
+        assert_eq!(stance(&qs), Stance::DeclaredNoRec);
+    }
+
+    #[test]
+    fn stance_recommended_in_one_question_beats_no_rec_in_another() {
+        // Cross-question priority: a `(Recommended)` label in *any* question
+        // outranks a no-rec marker in a *different* question.
+        let qs = vec![
+            q("First — no clear recommendation", &["A", "B"]),
+            q("Second?", &["C (Recommended)", "D"]),
+        ];
+        assert_eq!(stance(&qs), Stance::Recommended);
+    }
+
+    #[test]
+    fn no_rec_marker_is_case_insensitive_and_prose_tolerant() {
+        assert!(contains_no_rec_marker(
+            "These are genuine trade-offs — No Clear Recommendation."
+        ));
+        assert!(contains_no_rec_marker("no clear recommendation"));
+        // The bare prose "recommend" must not count, nor a near-miss phrase.
+        assert!(!contains_no_rec_marker("I recommend option A clearly"));
+        assert!(!contains_no_rec_marker("no recommendation given"));
+    }
+
+    #[test]
+    fn stance_as_str_tags() {
+        assert_eq!(Stance::Recommended.as_str(), "recommended");
+        assert_eq!(Stance::DeclaredNoRec.as_str(), "declared_no_rec");
+        assert_eq!(Stance::Silent.as_str(), "silent");
     }
 
     // --- WarnEmptyAnswers ---

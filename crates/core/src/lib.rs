@@ -425,6 +425,10 @@ pub struct MetricsInput {
     pub parent_agent_id: Option<String>,
     pub source_agent_id: Option<String>,
     pub duration_ms: Option<u64>,
+    /// Model id for the session (e.g. `claude-opus-4-8`), when the payload
+    /// carries it (SessionStart and some Pre/PostToolUse payloads). Mirrors
+    /// [`HookInput::model`]; deserializes to `None` when absent.
+    pub model: Option<String>,
     /// Top-level keys present in the raw payload. Populated by [`Self::from_json`],
     /// not deserialized — powers the `CADENCE_METRICS_DEBUG` `_keys` field that
     /// surfaces schema additions across Claude Code releases.
