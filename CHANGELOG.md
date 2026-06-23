@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-06-23
+
 ### Fixed
 
 - **doctor: honest version-skew advisory + clearer bare invocation** (#223 on
