@@ -14,6 +14,7 @@ pub mod loop_analysis;
 pub mod paths;
 pub mod shell;
 pub mod time;
+pub mod transcript;
 
 #[cfg(feature = "test-builders")]
 pub mod test_builders;
@@ -147,6 +148,12 @@ pub struct HookInput {
     /// Available in PostToolUse hooks — absent in PreToolUse and SessionStart.
     pub tool_response: Option<ToolResponse>,
     pub cwd: Option<String>,
+    /// Absolute path to the session transcript (`.jsonl`). A documented common
+    /// field present on every hook event — PreToolUse included — so a guard can
+    /// scan what already happened this session (e.g. did `/polish` run before
+    /// this `gh pr create`?). Deserializes to `None` when absent, so existing
+    /// hooks are unaffected.
+    pub transcript_path: Option<String>,
     /// Claude Code session id — present on `SessionStart`.
     pub session_id: Option<String>,
     /// `SessionStart` trigger: `startup` | `resume` | `clear` | `compact`.
@@ -377,6 +384,12 @@ impl HookInput {
     /// The Claude Code session id, if present (SessionStart and some payloads).
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// The absolute path to the session transcript (`.jsonl`), if present.
+    /// A documented common field on every hook event (PreToolUse included).
+    pub fn transcript_path(&self) -> Option<&str> {
+        self.transcript_path.as_deref()
     }
 
     /// The SessionStart trigger source (startup/resume/clear/compact), if present.
@@ -998,6 +1011,28 @@ mod tests {
         assert_eq!(input.session_id(), None);
         assert_eq!(input.source(), None);
         assert_eq!(input.model(), None);
+    }
+
+    #[test]
+    fn pre_tool_use_payload_carries_transcript_path() {
+        // The real PreToolUse payload shape (per the Claude Code hooks docs):
+        // transcript_path is a common field present on every event. A guard that
+        // scans the session transcript depends on this deserializing.
+        let json = r#"{"session_id":"abc123","transcript_path":"/home/u/.claude/projects/x/t.jsonl","cwd":"/repo","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr create"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            input.transcript_path(),
+            Some("/home/u/.claude/projects/x/t.jsonl")
+        );
+        assert_eq!(input.command(), Some("gh pr create"));
+    }
+
+    #[test]
+    fn transcript_path_absent_is_none() {
+        // Backward compatibility: payloads without the field (older clients, or
+        // synthetic test inputs) deserialize to None, never an error.
+        let input: HookInput = serde_json::from_str(r#"{"tool_name":"Bash"}"#).unwrap();
+        assert_eq!(input.transcript_path(), None);
     }
 
     #[test]

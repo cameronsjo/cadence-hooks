@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **nudge-polish-before-pr: transcript-aware conditional block** (#151 on
+  claude-configurations). The pre-PR polish reminder was a soft nudge (allow +
+  warn) on every `gh pr create`, so the model could talk past it — "day 3 of
+  polish not needed." It now scans the session transcript (via
+  `core::transcript::transcript_has_polish_run`, extracted from the metrics
+  logger into a shared module and tightened — exact-leaf match replaces the
+  prior `.contains("polish")`, so the metrics logger's `polished` field no
+  longer counts decoys like `repolish`) for a real `cadence-forge:polish` Skill
+  run and routes a 3-way,
+  fail-open outcome: a transcript **showing** a polish run → silent **allow**
+  (kills the nag-after-polish noise); a readable transcript with **no** polish
+  run → **block** (exit 2, the teeth); no / empty / unreadable / unparsable
+  transcript → the original **nudge** (ADR-0001 — never block on our own missing
+  data). Polish-skill detection is leaf-exact (rejects decoys that merely
+  contain `polish`). The
+  block message reassigns authority — run `/polish`, or surface a believed-
+  legitimate skip to Cameron, who decides; the model may not self-approve — and
+  does not advertise a self-serve bypass. Same subcommand, event, and matcher;
+  `HookInput` gains a `transcript_path` field (a documented common field on
+  every hook event).
+
 ### Fixed
 
 - **warn-main-branch: carve out `docs/plans/`** (#226 on claude-configurations).
