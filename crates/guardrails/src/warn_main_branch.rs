@@ -13,8 +13,9 @@
 //!
 //! Edits inside any `.claude/` directory are exempt automatically — worktrees
 //! under `.claude/worktrees/` (always on an intentional feature branch) and the
-//! user's `~/.claude/` config and memory tree. That work is never the
-//! branch-worthy product change the warning targets.
+//! user's `~/.claude/` config and memory tree. Plan documents under `docs/plans/`
+//! are exempt too: cadence mandates copying approved plans there on the default
+//! branch. That work is never the branch-worthy product change the warning targets.
 
 use crate::dismiss_main_branch_warn;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
@@ -76,6 +77,22 @@ fn git_dir_for_input(input: &HookInput) -> PathBuf {
 /// `.claude-old` or `myclaude` are not exempt.
 fn is_claude_managed_dir(dir: &Path) -> bool {
     dir.components().any(|c| c.as_os_str() == ".claude")
+}
+
+/// Returns true if `dir` is a cadence plan-document directory (`docs/plans`).
+///
+/// Approved plans are copied to `docs/plans/` on the default branch by design —
+/// cadence's plan-execution rule mandates it — so authoring a plan there is not
+/// the branch-worthy product change this warning targets. Without the carve-out
+/// the once-per-session warning is *consumed* by that first plan-doc write, so
+/// later real product edits on `main` then escape unwarned (issue #226).
+///
+/// Matches consecutive `docs` → `plans` path components anywhere in the path, so
+/// a bare `plans/`, a non-adjacent `docs/foo/plans`, or a look-alike like
+/// `mydocs/plans` is not exempt.
+fn is_plan_doc_dir(dir: &Path) -> bool {
+    let comps: Vec<_> = dir.components().map(|c| c.as_os_str()).collect();
+    comps.windows(2).any(|w| w[0] == "docs" && w[1] == "plans")
 }
 
 /// Returns true if the branch name is a default branch (`main` or `master`).
@@ -156,9 +173,10 @@ impl Check for WarnMainBranch {
         let dir = git_dir_for_input(input);
 
         // Edits inside a `.claude/` directory are tooling, config, or worktree
-        // work — never branch-worthy product changes. Skip the warning (and the
-        // git spawns below) entirely. (issues #33, #35)
-        if is_claude_managed_dir(&dir) {
+        // work, and plan docs under `docs/plans/` are mandated on the default
+        // branch — never the branch-worthy product change this warns about. Skip
+        // the warning (and the git spawns below) entirely. (issues #33, #35, #226)
+        if is_claude_managed_dir(&dir) || is_plan_doc_dir(&dir) {
             return CheckResult::allow();
         }
 
@@ -597,5 +615,53 @@ mod tests {
     fn relative_dot_dir_is_not_managed() {
         // The Bash fallback resolves to ".", which has no `.claude` component.
         assert!(!is_claude_managed_dir(Path::new(".")));
+    }
+
+    // --- docs/plans carve-out (#226) ---
+    // Approved plans are copied to docs/plans/ on the default branch by design
+    // (cadence's plan-execution rule mandates it), so plan-doc authoring there
+    // is not the branch-worthy product change this warning targets.
+
+    #[test]
+    fn docs_plans_dir_is_plan_doc() {
+        assert!(is_plan_doc_dir(Path::new("/Users/x/repo/docs/plans")));
+    }
+
+    #[test]
+    fn nested_under_docs_plans_is_plan_doc() {
+        // A subdirectory beneath docs/plans/ (e.g. an archive folder) still counts.
+        assert!(is_plan_doc_dir(Path::new(
+            "/Users/x/repo/docs/plans/2026/q2"
+        )));
+    }
+
+    #[test]
+    fn plan_doc_dir_requires_docs_parent() {
+        // A bare `plans/` without an immediate `docs/` parent is not exempt —
+        // a product `plans/` dir must still warn on main.
+        assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/plans")));
+        assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/src/plans")));
+    }
+
+    #[test]
+    fn docs_without_plans_is_not_plan_doc() {
+        // Other docs subdirs (adr, architecture) are process/product docs that
+        // should still warn on main.
+        assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/docs")));
+        assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/docs/adr")));
+    }
+
+    #[test]
+    fn plan_doc_lookalike_dirs_are_not_exempt() {
+        // Exact-component match: `mydocs/plans` or `docs-old/plans` are not the
+        // canonical docs/plans path.
+        assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/mydocs/plans")));
+        assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/docs-old/plans")));
+    }
+
+    #[test]
+    fn plan_doc_dir_components_must_be_consecutive() {
+        // `docs/` then a different dir then `plans/` is not the canonical path.
+        assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/docs/foo/plans")));
     }
 }

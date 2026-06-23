@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **warn-main-branch: carve out `docs/plans/`** (#226 on claude-configurations).
+  The on-main editing nudge fires once per session, and a plan-document write to
+  `docs/plans/` — which cadence mandates on the default branch — consumed that
+  one-shot warning, letting later real product edits on `main` escape unwarned.
+  Plan-doc directories are now exempt alongside the existing `.claude/` carve-out
+  (consecutive `docs`→`plans` path components; a bare `plans/` or a look-alike
+  such as `mydocs/plans` still warns). Nudge-only; the fail-open contract is
+  unchanged.
+
 ## [0.40.0] - 2026-06-23
 
 ### Fixed
