@@ -28,6 +28,45 @@ Each hook is a subcommand; `cadence-hooks list` shows every hook with its event
 and disable status, and `cadence-hooks <namespace> --help` lists a namespace's
 subcommands.
 
+## Per-repo terminology exemptions
+
+The `terminology` guard hard-**blocks** a small set of dated terms on every
+`Write`/`Edit` (`whitelist`, `blacklist`, `master branch`/`master node`,
+`slave`, `sanity check`, `dummy value`; `grandfathered` is a softer nudge). That
+block is the right default everywhere. But some files legitimately carry these
+words — a vendor ACL format named `whitelist`, an existing API field, a config
+schema whose key *is* the dated term. A per-repo `<git-root>/.claude/terminology.json`
+softens the block for named files and terms.
+
+It can only ever **remove or demote** a violation — never add one. It cannot
+introduce new blocked terms, and it cannot turn the block on for a path the
+built-in baseline already exempts (this repo's own source, `CLAUDE.md`,
+`.claude/hooks`/`rules`). Missing, unreadable, or invalid JSON is ignored and the
+block stands (fail-open, ADR-0001).
+
+```jsonc
+{
+  "exemptions": [
+    {
+      "paths": ["config/acl.yml", "**/firewall-*.yaml", "vendor-list.yml"],
+      "terms": ["whitelist", "blacklist"],
+      "mode": "allow"
+    },
+    { "paths": ["vendor/**"] }
+  ]
+}
+```
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `paths` | yes | Glob patterns. A pattern containing `/` matches the **repo-relative** path (`**` spans separators, `*` does not); a bare pattern (no `/`, e.g. `vendor-list.yml`) matches the **basename** in any directory. |
+| `terms` | no | Which flagged terms to exempt at those paths, matched case-insensitively against the guard's display term (the block labels plus `grandfathered`). **Omit to exempt every flagged term** at the matched path. An unknown string simply never matches. |
+| `mode` | no | `"allow"` (default) drops the violation silently; `"nudge"` demotes a hard block to an advisory nudge (never blocks) so a visible reminder remains. |
+
+**Matching & precedence.** For each `(file, term)` pair, the **first** exemption
+entry in document order that matches both the path and the term decides. An entry
+matches the term when `terms` is omitted/empty or contains it.
+
 ## Environment Variables
 
 All cadence-hooks config lives under the `CADENCE_*` prefix. `OBSIDIAN_VAULT` is

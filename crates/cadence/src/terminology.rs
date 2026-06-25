@@ -4,7 +4,10 @@
 //! Case-insensitive with word-boundary matching to avoid false positives.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+use glob::{MatchOptions, Pattern};
 use regex::RegexSet;
+use serde::Deserialize;
+use std::path::Path;
 use std::sync::LazyLock;
 
 // NOTE: This file contains prohibited terms as detection patterns.
@@ -166,6 +169,165 @@ fn subtract_existing(
         .collect()
 }
 
+/// Per-repo terminology exemptions, read from `<git-root>/.claude/terminology.json`.
+///
+/// Softens the hard block for named files/terms — it can only ever *remove* or
+/// *demote* a violation, never add one. Missing, unreadable, or invalid JSON all
+/// deserialize to the default (empty) config; the guard never errors on it
+/// (fail-open, ADR-0001). Mirrors the `.claude/redaction.json` precedent.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminologyConfig {
+    #[serde(default)]
+    exemptions: Vec<Exemption>,
+}
+
+/// One exemption entry: which paths it covers, which flagged terms it exempts,
+/// and how much it softens them.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Exemption {
+    /// Glob patterns. A pattern containing `/` matches the **repo-relative**
+    /// path (`**` spans separators, `*` does not); a bare pattern (no `/`)
+    /// matches the **basename** in any directory.
+    #[serde(default)]
+    paths: Vec<String>,
+    /// Flagged terms to exempt, matched case-insensitively against the guard's
+    /// display term (e.g. the seven block labels plus the nudge label). Empty or
+    /// omitted exempts *all* flagged terms at the matched path; an unknown string
+    /// simply never matches.
+    #[serde(default)]
+    terms: Vec<String>,
+    /// `allow` (default) drops the violation silently; `nudge` demotes a Tier-1
+    /// block to a Tier-2 advisory so a visible reminder remains.
+    #[serde(default)]
+    mode: ExemptionMode,
+}
+
+/// How an exemption softens a matched violation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ExemptionMode {
+    /// Drop the violation entirely (silent).
+    #[default]
+    Allow,
+    /// Demote a block to an advisory nudge (exit 0, never blocks).
+    Nudge,
+}
+
+/// Glob options for `/`-bearing patterns: `*` stops at `/`, `**` crosses it —
+/// gitignore-style. Case-sensitive; a leading dot is not treated specially.
+const MATCH_OPTIONS: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+impl Exemption {
+    /// Does this entry cover `rel_path` (repo-relative) / `basename`?
+    fn matches_path(&self, rel_path: &str, basename: &str) -> bool {
+        self.paths.iter().any(|p| glob_match(p, rel_path, basename))
+    }
+
+    /// Does this entry exempt `term`? Empty `terms` exempts every flagged term;
+    /// otherwise a case-insensitive match against the display term.
+    fn matches_term(&self, term: &str) -> bool {
+        self.terms.is_empty() || self.terms.iter().any(|t| t.eq_ignore_ascii_case(term))
+    }
+}
+
+impl TerminologyConfig {
+    /// First exemption (document order) matching both the path and the term.
+    fn first_match(&self, rel_path: &str, basename: &str, term: &str) -> Option<&Exemption> {
+        self.exemptions
+            .iter()
+            .find(|e| e.matches_path(rel_path, basename) && e.matches_term(term))
+    }
+}
+
+/// Match one glob `pattern`. A pattern containing `/` is matched against the
+/// repo-relative path (with [`MATCH_OPTIONS`] so `**` spans separators); a bare
+/// pattern is matched against the basename. An uncompilable pattern never
+/// matches (fail-open).
+fn glob_match(pattern: &str, rel_path: &str, basename: &str) -> bool {
+    let Ok(pat) = Pattern::new(pattern) else {
+        return false;
+    };
+    if pattern.contains('/') {
+        pat.matches_with(rel_path, MATCH_OPTIONS)
+    } else {
+        pat.matches(basename)
+    }
+}
+
+/// Load `<root>/.claude/terminology.json`. Missing, unreadable, or invalid JSON
+/// all yield the default (empty) config (fail-open, ADR-0001).
+fn load_terminology_config(root: &Path) -> TerminologyConfig {
+    let path = root.join(".claude/terminology.json");
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return TerminologyConfig::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Apply per-repo `.claude/terminology.json` softening to the accumulated
+/// violations, in place. `allow`-mode exemptions drop a block; `nudge`-mode
+/// exemptions demote a block to a nudge; any matching exemption drops a
+/// pre-existing nudge (already advisory). The git root is found by walking up
+/// from the file's directory; no git root or no exemptions leaves both vectors
+/// untouched. Only ever removes or demotes — never adds a violation.
+fn apply_exemptions(
+    file_path: &str,
+    blocks: &mut Vec<(String, String)>,
+    nudges: &mut Vec<(String, String)>,
+) {
+    let start_dir = Path::new(file_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let Some(root) = cadence_hooks_core::paths::find_git_root(&start_dir) else {
+        return;
+    };
+    let config = load_terminology_config(&root);
+    if config.exemptions.is_empty() {
+        return;
+    }
+
+    let rel_path = Path::new(file_path)
+        .strip_prefix(&root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| file_path.to_string());
+    let basename = Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Pre-existing nudges first: any matching exemption drops them. Run before
+    // demotion below so a freshly-demoted block is not immediately re-dropped.
+    nudges.retain(|(term, _)| config.first_match(&rel_path, &basename, term).is_none());
+
+    // Blocks: allow drops; nudge demotes (collected, then appended).
+    let mut demoted: Vec<(String, String)> = Vec::new();
+    blocks.retain(|item| {
+        match config
+            .first_match(&rel_path, &basename, &item.0)
+            .map(|e| e.mode)
+        {
+            Some(ExemptionMode::Allow) => false,
+            Some(ExemptionMode::Nudge) => {
+                demoted.push(item.clone());
+                false
+            }
+            None => true,
+        }
+    });
+    for d in demoted {
+        if !nudges.contains(&d) {
+            nudges.push(d);
+        }
+    }
+}
+
 /// Blocks content containing prohibited terminology and suggests alternatives.
 pub struct TerminologyGuard;
 
@@ -213,6 +375,16 @@ impl Check for TerminologyGuard {
                     nudges.push(n);
                 }
             }
+        }
+
+        // Per-repo `.claude/terminology.json` softening — only when there's a
+        // violation to soften and we know the file path (so a clean edit never
+        // touches disk). The hardcoded is_excluded_path() baseline above still
+        // applies; this only ever removes or demotes a violation, never adds one.
+        if (!blocks.is_empty() || !nudges.is_empty())
+            && let Some(ref path) = input.file_path()
+        {
+            apply_exemptions(path, &mut blocks, &mut nudges);
         }
 
         // Tier 1: hard block
@@ -782,5 +954,283 @@ mod tests {
         );
         let result = TerminologyGuard.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- Per-repo .claude/terminology.json exemptions ---
+    //
+    // The loader reads `<git-root>/.claude/terminology.json` from disk, so these
+    // tests build a real temp git root and address the written file by an
+    // absolute path inside it. Flagged terms are taken from BLOCK_VIOLATIONS
+    // (never spelled as literals) so the config JSON carries no hardcoded term.
+
+    use cadence_hooks_core::Outcome;
+    use std::path::PathBuf;
+
+    /// A temp git root containing `.claude/terminology.json` with `json`.
+    fn temp_repo(json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/terminology.json"), json).unwrap();
+        dir
+    }
+
+    /// A temp git root with NO terminology.json (config-absent baseline).
+    fn temp_repo_no_config() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        dir
+    }
+
+    /// A Write HookInput targeting `path` (created on disk so a nested `path`'s
+    /// directory exists for the relative-path computation) with `content`.
+    fn write_at(root: &std::path::Path, rel: &str, content: &str) -> HookInput {
+        let full = root.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(full.to_string_lossy().into_owned()),
+                content: Some(content.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn outcome(input: &HookInput) -> Outcome {
+        TerminologyGuard.run(input).outcome
+    }
+
+    // -- Pure match-logic units (no disk) --
+
+    #[test]
+    fn glob_match_basename_pattern_ignores_dir() {
+        // A bare pattern matches the basename anywhere in the tree.
+        assert!(glob_match(
+            "silly-file.yml",
+            "a/b/silly-file.yml",
+            "silly-file.yml"
+        ));
+        assert!(glob_match(
+            "silly-file.yml",
+            "silly-file.yml",
+            "silly-file.yml"
+        ));
+        assert!(!glob_match("silly-file.yml", "a/other.yml", "other.yml"));
+    }
+
+    #[test]
+    fn glob_match_slash_pattern_is_repo_relative() {
+        assert!(glob_match("config/**", "config/acl.yml", "acl.yml"));
+        assert!(glob_match("config/**", "config/sub/acl.yml", "acl.yml"));
+        assert!(!glob_match("config/**", "other/acl.yml", "acl.yml"));
+    }
+
+    #[test]
+    fn glob_match_star_does_not_cross_separator() {
+        // `*` stops at `/`; `**` is required to span directories.
+        assert!(glob_match("config/*.yml", "config/acl.yml", "acl.yml"));
+        assert!(!glob_match("config/*.yml", "config/sub/acl.yml", "acl.yml"));
+        assert!(glob_match(
+            "**/firewall-*.yaml",
+            "net/firewall-a.yaml",
+            "firewall-a.yaml"
+        ));
+    }
+
+    #[test]
+    fn glob_match_invalid_pattern_never_matches() {
+        // An uncompilable glob fails open (matches nothing).
+        assert!(!glob_match("[", "x", "x"));
+    }
+
+    #[test]
+    fn matches_term_is_case_insensitive_and_blanket() {
+        let term = BLOCK_VIOLATIONS[0].0;
+        let listed = Exemption {
+            paths: vec![],
+            terms: vec![term.to_uppercase()],
+            mode: ExemptionMode::Allow,
+        };
+        assert!(listed.matches_term(term));
+        assert!(!listed.matches_term(BLOCK_VIOLATIONS[1].0));
+
+        let blanket = Exemption {
+            paths: vec![],
+            terms: vec![],
+            mode: ExemptionMode::Allow,
+        };
+        assert!(blanket.matches_term(term));
+        assert!(blanket.matches_term(BLOCK_VIOLATIONS[1].0));
+    }
+
+    // -- run() integration (real temp git root) --
+
+    #[test]
+    fn no_config_leaves_block_unchanged() {
+        // Config absent → a violation in a normal file still blocks.
+        let repo = temp_repo_no_config();
+        let input = write_at(repo.path(), "src/main.rs", BLOCK_VIOLATIONS[0].0);
+        assert_eq!(outcome(&input), Outcome::Block);
+    }
+
+    #[test]
+    fn allow_exemption_drops_block() {
+        let term = BLOCK_VIOLATIONS[0].0;
+        let json = format!(r#"{{"exemptions":[{{"paths":["acl.yml"],"terms":["{term}"]}}]}}"#);
+        let repo = temp_repo(&json);
+        let input = write_at(repo.path(), "acl.yml", term);
+        assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
+    fn nudge_mode_demotes_block() {
+        let term = BLOCK_VIOLATIONS[0].0;
+        let json = format!(
+            r#"{{"exemptions":[{{"paths":["acl.yml"],"terms":["{term}"],"mode":"nudge"}}]}}"#
+        );
+        let repo = temp_repo(&json);
+        let input = write_at(repo.path(), "acl.yml", term);
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        // The demoted term still surfaces in the advisory message.
+        assert!(result.message.unwrap().contains(term));
+    }
+
+    #[test]
+    fn path_match_but_term_mismatch_still_blocks() {
+        // Exempting term A in acl.yml must NOT exempt term B written there.
+        let term_a = BLOCK_VIOLATIONS[0].0;
+        let term_b = BLOCK_VIOLATIONS[1].0;
+        let json = format!(r#"{{"exemptions":[{{"paths":["acl.yml"],"terms":["{term_a}"]}}]}}"#);
+        let repo = temp_repo(&json);
+        let input = write_at(repo.path(), "acl.yml", &format!("{term_a} then {term_b}"));
+        let result = TerminologyGuard.run(&input);
+        assert_eq!(result.outcome, Outcome::Block);
+        let msg = result.message.unwrap();
+        assert!(
+            msg.contains(term_b),
+            "unexempted term must still block: {msg}"
+        );
+        assert!(
+            !msg.contains(&format!("\"{term_a}\"")),
+            "exempted term must be dropped from the block list: {msg}"
+        );
+    }
+
+    #[test]
+    fn blanket_exemption_drops_all_terms() {
+        // `terms` omitted → every flagged term at that path is exempt.
+        let term_a = BLOCK_VIOLATIONS[0].0;
+        let term_b = BLOCK_VIOLATIONS[1].0;
+        let repo = temp_repo(r#"{"exemptions":[{"paths":["acl.yml"]}]}"#);
+        let input = write_at(repo.path(), "acl.yml", &format!("{term_a} and {term_b}"));
+        assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
+    fn basename_pattern_matches_in_subdir() {
+        let term = BLOCK_VIOLATIONS[0].0;
+        let json =
+            format!(r#"{{"exemptions":[{{"paths":["silly-file.yml"],"terms":["{term}"]}}]}}"#);
+        let repo = temp_repo(&json);
+        let input = write_at(repo.path(), "deep/nested/silly-file.yml", term);
+        assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
+    fn slash_pattern_matches_repo_relative_path() {
+        let term = BLOCK_VIOLATIONS[0].0;
+        let json = format!(r#"{{"exemptions":[{{"paths":["config/**"],"terms":["{term}"]}}]}}"#);
+        let repo = temp_repo(&json);
+        // Inside config/ → exempt.
+        let inside = write_at(repo.path(), "config/acl.yml", term);
+        assert_eq!(outcome(&inside), Outcome::Allow);
+        // Outside config/ → the same term still blocks.
+        let outside = write_at(repo.path(), "other/acl.yml", term);
+        assert_eq!(outcome(&outside), Outcome::Block);
+    }
+
+    #[test]
+    fn first_match_precedence_decides_mode() {
+        let term = BLOCK_VIOLATIONS[0].0;
+        // allow first, nudge second → first wins → dropped (Allow).
+        let allow_first = format!(
+            r#"{{"exemptions":[{{"paths":["acl.yml"],"terms":["{term}"]}},{{"paths":["acl.yml"],"terms":["{term}"],"mode":"nudge"}}]}}"#
+        );
+        let repo = temp_repo(&allow_first);
+        assert_eq!(
+            outcome(&write_at(repo.path(), "acl.yml", term)),
+            Outcome::Allow
+        );
+
+        // nudge first, allow second → first wins → demoted (Nudge).
+        let nudge_first = format!(
+            r#"{{"exemptions":[{{"paths":["acl.yml"],"terms":["{term}"],"mode":"nudge"}},{{"paths":["acl.yml"],"terms":["{term}"]}}]}}"#
+        );
+        let repo2 = temp_repo(&nudge_first);
+        assert_eq!(
+            outcome(&write_at(repo2.path(), "acl.yml", term)),
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn invalid_json_fails_open_and_still_blocks() {
+        let repo = temp_repo("{not valid json");
+        let input = write_at(repo.path(), "acl.yml", BLOCK_VIOLATIONS[0].0);
+        assert_eq!(outcome(&input), Outcome::Block);
+    }
+
+    #[test]
+    fn carried_through_term_in_exempt_mismatch_file_still_allowed() {
+        // #63 subtract-existing runs before the config pass: a term carried
+        // through an Edit (present in both old and new) produces no block, so
+        // the gate skips apply_exemptions entirely — Allow regardless of config.
+        let term = BLOCK_VIOLATIONS[0].0;
+        let repo = temp_repo(r#"{"exemptions":[{"paths":["unrelated.yml"]}]}"#);
+        let full = repo.path().join("src/main.rs");
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        let path = full.to_string_lossy().into_owned();
+        let input = make_edit(
+            &path,
+            &format!("{term} setting v1"),
+            &format!("{term} setting v2"),
+        );
+        assert_eq!(outcome(&input), Outcome::Allow);
+    }
+
+    #[test]
+    fn no_git_root_leaves_block_unchanged() {
+        // A file with no ancestor .git → no config possible → block stands.
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_at(dir.path(), "acl.yml", BLOCK_VIOLATIONS[0].0);
+        assert_eq!(outcome(&input), Outcome::Block);
+    }
+
+    #[test]
+    fn load_terminology_config_missing_file_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_terminology_config(dir.path());
+        assert!(config.exemptions.is_empty());
+    }
+
+    #[test]
+    fn load_terminology_config_reads_exemptions() {
+        let repo = temp_repo(r#"{"exemptions":[{"paths":["a.yml"]},{"paths":["b.yml"]}]}"#);
+        let config = load_terminology_config(repo.path());
+        assert_eq!(config.exemptions.len(), 2);
+    }
+
+    #[test]
+    fn find_git_root_walks_up() {
+        let repo = temp_repo_no_config();
+        let nested = repo.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+        let found = cadence_hooks_core::paths::find_git_root(&nested.to_string_lossy());
+        assert_eq!(found, Some(PathBuf::from(repo.path())));
     }
 }

@@ -77,6 +77,23 @@ fn non_empty_var(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// Walk up from `start` to the first directory containing a `.git` entry.
+///
+/// `.git` may be a directory (normal checkout) or a file (linked worktree);
+/// `Path::exists` catches both. Returns `None` if no ancestor has one. Used by
+/// guards that read a per-repo `<git-root>/.claude/*.json` override file.
+pub fn find_git_root(start: &str) -> Option<PathBuf> {
+    let mut dir = PathBuf::from(start);
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Claude Code's global config dir, honoring `CLAUDE_CONFIG_DIR` (else `~/.claude`).
 pub fn claude_config_dir() -> PathBuf {
     let cfg = std::env::var("CLAUDE_CONFIG_DIR").ok();

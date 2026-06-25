@@ -36,7 +36,7 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::LazyLock;
 
 /// Plugin/skill namespaces whose `<ns>:<name>` IDs are harness-internal.
@@ -310,7 +310,7 @@ fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
 /// — no git root, missing/unreadable file, invalid JSON — yields the default
 /// (empty) config.
 fn load_redaction_config(base_dir: &str) -> RedactionConfig {
-    let Some(root) = find_git_root(base_dir) else {
+    let Some(root) = cadence_hooks_core::paths::find_git_root(base_dir) else {
         return RedactionConfig::default();
     };
     let path = root.join(".claude/redaction.json");
@@ -318,21 +318,6 @@ fn load_redaction_config(base_dir: &str) -> RedactionConfig {
         return RedactionConfig::default();
     };
     serde_json::from_str(&content).unwrap_or_default()
-}
-
-/// Walk up from `start` to the first directory containing a `.git` entry.
-/// `.git` may be a directory (normal checkout) or a file (linked worktree);
-/// `Path::exists` catches both. `None` if no ancestor has one.
-fn find_git_root(start: &str) -> Option<PathBuf> {
-    let mut dir = PathBuf::from(start);
-    loop {
-        if dir.join(".git").exists() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
 }
 
 /// Scan one body for blocklist hits, deduped by start offset across categories,
