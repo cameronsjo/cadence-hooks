@@ -21,6 +21,7 @@ const VALID_FIELDS: &[&str] = &[
     "context",
     "agent",
     "hooks",
+    "paths",
 ];
 
 // Kebab-case name, optionally prefixed by a kebab `namespace:` (the
@@ -576,6 +577,19 @@ mod tests {
         let input = make_write_input(
             "/plugins/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A skill\nmodel: opus\nallowed-tools: Read,Grep\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn valid_skill_with_paths_field() {
+        // #227: `paths` is a valid Claude Code conditional-activation field
+        // (scopes a skill to activate only when matching files are touched).
+        // It must not be rejected as an unknown frontmatter field.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\npaths: src/**/*.rs\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);

@@ -33,6 +33,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   run in any child satisfies the gate. The scan is lazy (only on the
   would-block path) and fail-open at every step (missing dir / unreadable child
   → falls through, never blocks on our own missing data, ADR-0001).
+- **rules validate-frontmatter: accept the valid `paths` field** (#227 on
+  claude-configurations). `paths` — Claude Code's conditional-activation field
+  that scopes a skill to fire only when matching files are touched, documented
+  in `cadence:writing-skills` — was absent from the validator's allowed-field
+  set, so every `Write` to a path-scoped `SKILL.md` under a real skills
+  directory hard-blocked with `Unknown frontmatter field: 'paths'`. Added
+  `paths` to `VALID_FIELDS`; path-conditional skills now write cleanly.
 
 ## [0.41.0] - 2026-06-23
 
