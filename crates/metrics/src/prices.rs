@@ -76,11 +76,17 @@ mod tests {
     #[test]
     fn embedded_opus_rates_match_schema() {
         let prices = Prices::embedded();
-        let opus = prices.get("claude-opus-4-7").unwrap();
-        assert_eq!(opus.input_per_mtok, 15.0);
-        assert_eq!(opus.output_per_mtok, 75.0);
-        assert_eq!(opus.cache_write_per_mtok, 18.75);
-        assert_eq!(opus.cache_read_per_mtok, 1.5);
+        // Both corrected aliases (#127) are pinned so neither can regress to the
+        // old 3x-too-high $15/$75 values.
+        for alias in ["claude-opus-4-7", "claude-opus-4-6"] {
+            let opus = prices
+                .get(alias)
+                .unwrap_or_else(|| panic!("{alias} must be priced"));
+            assert_eq!(opus.input_per_mtok, 5.0, "{alias} input");
+            assert_eq!(opus.output_per_mtok, 25.0, "{alias} output");
+            assert_eq!(opus.cache_write_per_mtok, 6.25, "{alias} cache-write");
+            assert_eq!(opus.cache_read_per_mtok, 0.5, "{alias} cache-read");
+        }
     }
 
     #[test]

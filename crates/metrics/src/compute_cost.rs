@@ -53,7 +53,7 @@ mod tests {
     #[test]
     fn one_million_input_tokens_opus() {
         let cost = compute_cost(&opus_tokens(), "claude-opus-4-7", &Prices::embedded());
-        assert_eq!(cost, 15.0);
+        assert_eq!(cost, 5.0);
     }
 
     #[test]
@@ -71,9 +71,9 @@ mod tests {
             cache_read: 1_000_000,
             output: 1_000_000,
         };
-        // 15 + 18.75 + 1.50 + 75 = 110.25
+        // 5 + 6.25 + 0.50 + 25 = 36.75
         let cost = compute_cost(&tokens, "claude-opus-4-7", &Prices::embedded());
-        assert_eq!(cost, 110.25);
+        assert_eq!(cost, 36.75);
     }
 
     #[test]
@@ -84,13 +84,13 @@ mod tests {
 
     #[test]
     fn rounds_to_six_decimals() {
-        // 1 input token on opus = 15 / 1e6 = 0.000015 exactly.
+        // 1 input token on opus = 5 / 1e6 = 0.000005 exactly.
         let tokens = Tokens {
             input: 1,
             ..Default::default()
         };
         let cost = compute_cost(&tokens, "claude-opus-4-7", &Prices::embedded());
-        assert_eq!(cost, 0.000015);
+        assert_eq!(cost, 0.000005);
     }
 
     #[test]
@@ -126,7 +126,7 @@ mod tests {
         ];
         let prices = Prices::embedded();
         let total = compute_cost_by_model(&buckets, &prices);
-        // opus: 1M input * $15/MTok = $15; sonnet rates differ — just verify structure
+        // opus: 1M input * $5/MTok = $5; sonnet rates differ — just verify structure
         let opus_cost = compute_cost(&buckets[0].1, "claude-opus-4-7", &prices);
         let sonnet_cost = compute_cost(&buckets[1].1, "claude-sonnet-4-5", &prices);
         assert!((total - (opus_cost + sonnet_cost)).abs() < 1e-9);

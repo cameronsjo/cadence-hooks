@@ -40,6 +40,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   set, so every `Write` to a path-scoped `SKILL.md` under a real skills
   directory hard-blocked with `Unknown frontmatter field: 'paths'`. Added
   `paths` to `VALID_FIELDS`; path-conditional skills now write cleanly.
+- **metrics: correct opus-4-7/4-6 prices + honor CADENCE_METRICS_DIR**
+  (claude-configurations#127, claude-configurations#120). `claude-opus-4-7` and
+  `claude-opus-4-6` were priced at $15/$75/MTok (3× too high); corrected to
+  $5.00 input / $25.00 output / $6.25 cache-write / $0.50 cache-read, matching
+  `claude-opus-4-8`. `metrics_dir()` now checks `CADENCE_METRICS_DIR` first
+  before falling back to `CLAUDE_CONFIG_DIR`-derived path, so integration tests
+  that set that variable actually redirect output.
 
 ## [0.41.0] - 2026-06-23
 
