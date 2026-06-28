@@ -1,8 +1,8 @@
 {
   "_meta": {
-    "lastVerified": "2026-06-17",
+    "lastVerified": "2026-06-26",
     "source": "https://www.anthropic.com/pricing",
-    "notes": "All prices in USD per million tokens. input/output for opus-4-8 and fable-5 from the claude-api skill (cached 2026-06-04); cache tiers derived input*1.25 / input*0.10 per the table convention. opus-4-7/4-6 pending reconciliation (claude-configurations#127). Update lastVerified when bumping rates."
+    "notes": "All prices in USD per million tokens. input/output for opus-4-8, opus-4-7, opus-4-6, and fable-5 from the claude-api skill; cache tiers derived input*1.25 / input*0.10 per the table convention. Update lastVerified when bumping rates."
   },
   "models": {
     "claude-opus-4-8": {
@@ -18,16 +18,16 @@
       "cacheReadPerMTok": 1.00
     },
     "claude-opus-4-7": {
-      "inputPerMTok": 15.00,
-      "outputPerMTok": 75.00,
-      "cacheWritePerMTok": 18.75,
-      "cacheReadPerMTok": 1.50
+      "inputPerMTok": 5.00,
+      "outputPerMTok": 25.00,
+      "cacheWritePerMTok": 6.25,
+      "cacheReadPerMTok": 0.50
     },
     "claude-opus-4-6": {
-      "inputPerMTok": 15.00,
-      "outputPerMTok": 75.00,
-      "cacheWritePerMTok": 18.75,
-      "cacheReadPerMTok": 1.50
+      "inputPerMTok": 5.00,
+      "outputPerMTok": 25.00,
+      "cacheWritePerMTok": 6.25,
+      "cacheReadPerMTok": 0.50
     },
     "claude-sonnet-4-6": {
       "inputPerMTok": 3.00,

@@ -22,9 +22,27 @@ pub fn is_git_commit(command: &str) -> bool {
     commit_regex().is_match(command)
 }
 
-/// The metrics root: `<config_dir>/metrics`, where `<config_dir>` honors
-/// `CLAUDE_CONFIG_DIR` (else `~/.claude`).
+/// The metrics root directory.
+///
+/// Resolution order:
+/// 1. `CADENCE_METRICS_DIR` — when set and non-empty, the value **is** the
+///    metrics dir (JSONL files and the `state/` subdir live directly inside it).
+/// 2. `<config_dir>/metrics` — where `<config_dir>` honors `CLAUDE_CONFIG_DIR`
+///    (else `~/.claude`).
 pub fn metrics_dir() -> PathBuf {
+    metrics_dir_from(std::env::var("CADENCE_METRICS_DIR").ok())
+}
+
+/// Pure resolver behind [`metrics_dir`]: takes the `CADENCE_METRICS_DIR` value
+/// explicitly (rather than reading process-global env) so the resolution order
+/// is unit-testable without `set_var`/`remove_var`. `None` or an empty string
+/// falls through to the `<config_dir>/metrics` default.
+fn metrics_dir_from(override_dir: Option<String>) -> PathBuf {
+    if let Some(dir) = override_dir
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
     cadence_hooks_core::paths::claude_config_dir().join("metrics")
 }
 
@@ -109,6 +127,40 @@ pub fn utc_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `metrics_dir`'s resolution order is tested through the pure
+    // `metrics_dir_from` helper, so these tests never touch process-global env
+    // (no `set_var`/`remove_var`, no serialization lock, no cross-test leakage).
+
+    #[test]
+    fn metrics_dir_override_via_cadence_metrics_dir() {
+        // A non-empty override value becomes the metrics dir verbatim.
+        assert_eq!(
+            metrics_dir_from(Some("/tmp/cadence-test-metrics".to_string())),
+            std::path::PathBuf::from("/tmp/cadence-test-metrics")
+        );
+    }
+
+    #[test]
+    fn metrics_dir_fallback_contains_metrics() {
+        // No override → the `<config_dir>/metrics` default.
+        let dir = metrics_dir_from(None);
+        assert!(
+            dir.to_string_lossy().contains("metrics"),
+            "fallback metrics_dir should contain 'metrics': {dir:?}"
+        );
+    }
+
+    #[test]
+    fn metrics_dir_empty_override_falls_through() {
+        // An empty CADENCE_METRICS_DIR must not shadow the default (guards the
+        // `!dir.is_empty()` branch).
+        let dir = metrics_dir_from(Some(String::new()));
+        assert!(
+            dir.to_string_lossy().contains("metrics"),
+            "empty override should fall through to default: {dir:?}"
+        );
+    }
 
     #[test]
     fn detects_plain_git_commit() {
