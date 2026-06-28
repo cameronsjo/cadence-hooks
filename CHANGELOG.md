@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **nudge-polish-before-pr: see polish run in a subagent transcript** (#247 on
+  claude-configurations). The pre-PR polish gate (and the `log-polish-nudge`
+  metric) read only the *parent* session transcript, so `cadence-forge:polish`
+  invoked inside a subagent was invisible — delegated PR flows were hard-blocked
+  and logged `polished: false` despite a real polish run. Both now also scan
+  this session's child transcripts (`<stem>/subagents/agent-*.jsonl`): a polish
+  run in any child satisfies the gate. The scan is lazy (only on the
+  would-block path) and fail-open at every step (missing dir / unreadable child
+  → falls through, never blocks on our own missing data, ADR-0001).
+
 ## [0.41.0] - 2026-06-23
 
 ### Changed

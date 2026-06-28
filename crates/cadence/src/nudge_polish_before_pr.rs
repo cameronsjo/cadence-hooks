@@ -22,8 +22,11 @@
 //! `nudge-polish-before-pr` for wiring stability even though it now can block.)
 
 use cadence_hooks_core::shell::is_gh_pr_create;
-use cadence_hooks_core::transcript::transcript_has_polish_run;
+use cadence_hooks_core::transcript::{
+    subagent_transcripts_have_polish_run, transcript_has_polish_run,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+use std::path::Path;
 
 /// Gates `/polish` (cadence-forge:polish) before opening a PR — conditional on
 /// transcript evidence of a real polish run.
@@ -42,11 +45,27 @@ impl Check for NudgePolishBeforePr {
         // readable. A missing path, a non-file, or a read error all collapse to
         // `None`, and `decide` then fails open to a nudge — we never block on
         // our own missing data (ADR-0001).
-        let transcript = input
+        let tp = input
             .transcript_path()
-            .filter(|p| std::path::Path::new(p).is_file())
-            .and_then(|p| std::fs::read_to_string(p).ok());
-        decide(command, transcript.as_deref())
+            .filter(|p| Path::new(p).is_file());
+        let transcript = tp.and_then(|p| std::fs::read_to_string(p).ok());
+        // Polish run inside a *subagent* lives in a child transcript the parent
+        // scan above never sees (#247). Only scan those children on the path
+        // that would otherwise block — a gh-pr-create whose parent transcript is
+        // readable, non-empty, and shows no polish — so the common allow/nudge
+        // paths pay no directory-walk cost.
+        let subagent_polish = match transcript.as_deref() {
+            Some(t)
+                if is_gh_pr_create(command)
+                    && !t.trim().is_empty()
+                    && !transcript_has_polish_run(t) =>
+            {
+                tp.map(Path::new)
+                    .is_some_and(subagent_transcripts_have_polish_run)
+            }
+            _ => false,
+        };
+        decide(command, transcript.as_deref(), subagent_polish)
     }
 }
 
@@ -56,9 +75,14 @@ impl Check for NudgePolishBeforePr {
 ///
 /// - non-`gh pr create` → allow.
 /// - `gh pr create` + transcript showing a polish Skill run → allow (silent).
+/// - `gh pr create` + parent shows no polish but a subagent did → allow (delegated flow, #247).
 /// - `gh pr create` + readable, **non-empty** transcript without a polish run → block.
 /// - `gh pr create` + `None` / empty / whitespace-only transcript → nudge (fail-open floor).
-fn decide(command: &str, transcript: Option<&str>) -> CheckResult {
+///
+/// `subagent_polish` is the caller's pre-computed verdict on whether a child
+/// subagent transcript shows polish; it is kept out of `decide` so this stays
+/// pure (no I/O) and unit-testable.
+fn decide(command: &str, transcript: Option<&str>, subagent_polish: bool) -> CheckResult {
     if !is_gh_pr_create(command) {
         return CheckResult::allow();
     }
@@ -71,6 +95,9 @@ fn decide(command: &str, transcript: Option<&str>) -> CheckResult {
         Some(t) if t.trim().is_empty() => CheckResult::nudge(nudge_message()),
         // Polish actually ran — silent allow. Kills the nag-after-polish noise.
         Some(t) if transcript_has_polish_run(t) => CheckResult::allow(),
+        // Parent shows no polish, but a subagent of this session ran it — the
+        // delegated-flow case (#247). Silent allow, same as a parent-side run.
+        Some(_) if subagent_polish => CheckResult::allow(),
         // Readable, non-empty transcript with no polish run — an evidenced skip.
         // The teeth.
         Some(_) => CheckResult::block(block_message()),
@@ -161,7 +188,7 @@ mod tests {
     fn decide_pr_create_with_polish_run_allows_silently() {
         // Polish actually ran → silent allow. This is the noise-kill: today the
         // nudge fires even after a real polish run.
-        let result = decide("gh pr create --title test", Some(polish_transcript()));
+        let result = decide("gh pr create --title test", Some(polish_transcript()), false);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(
             result.message.is_none(),
@@ -173,7 +200,11 @@ mod tests {
     fn decide_pr_create_without_polish_run_blocks() {
         // The teeth: a readable transcript with no polish Skill run is an
         // evidenced skip → hard block.
-        let result = decide("gh pr create --title test", Some(no_polish_transcript()));
+        let result = decide(
+            "gh pr create --title test",
+            Some(no_polish_transcript()),
+            false,
+        );
         assert_eq!(result.outcome, Outcome::Block);
         let msg = result.message.unwrap_or_default();
         // The block carries the same loophole-closing clauses the nudge does.
@@ -216,11 +247,11 @@ mod tests {
         // evidence", not an evidenced skip — it must nudge, never block. Guards
         // the 0-byte / not-yet-flushed file case (security review finding 1).
         assert_eq!(
-            decide("gh pr create --title x", Some("")).outcome,
+            decide("gh pr create --title x", Some(""), false).outcome,
             Outcome::Nudge
         );
         assert_eq!(
-            decide("gh pr create --title x", Some("   \n\t  ")).outcome,
+            decide("gh pr create --title x", Some("   \n\t  "), false).outcome,
             Outcome::Nudge
         );
     }
@@ -229,7 +260,7 @@ mod tests {
     fn decide_pr_create_no_transcript_nudges() {
         // Fail-open floor (ADR-0001): no transcript evidence → today's soft
         // nudge, never a block. Preserves the pre-teeth behavior exactly.
-        let result = decide("gh pr create --title test", None);
+        let result = decide("gh pr create --title test", None, false);
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("/polish"));
@@ -243,10 +274,10 @@ mod tests {
         // The matcher only scopes the process spawn; decide() still guards
         // against a non-create gh command slipping through.
         assert_eq!(
-            decide("gh pr list", Some(no_polish_transcript())).outcome,
+            decide("gh pr list", Some(no_polish_transcript()), false).outcome,
             Outcome::Allow
         );
-        assert_eq!(decide("git commit -m x", None).outcome, Outcome::Allow);
+        assert_eq!(decide("git commit -m x", None, false).outcome, Outcome::Allow);
     }
 
     #[test]
@@ -306,5 +337,48 @@ mod tests {
         // Branch named gh-pr-create-experiments shouldn't fire.
         let result = NudgePolishBeforePr.run(&make_bash("git checkout gh-pr-create-experiments"));
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    // --- the delegated-flow case (#247) ---
+
+    #[test]
+    fn decide_pr_create_subagent_polish_allows() {
+        // Parent transcript shows no polish, but a subagent did (subagent_polish
+        // = true) → allow, not block. This is the delegated-PR-flow fix: polish
+        // run inside a child satisfies the gate.
+        let result = decide(
+            "gh pr create --title test",
+            Some(no_polish_transcript()),
+            true,
+        );
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(
+            result.message.is_none(),
+            "a subagent polish run must allow silently, same as a parent run"
+        );
+    }
+
+    #[test]
+    fn run_allows_when_only_subagent_polished() {
+        // End-to-end through `run()`: a real gh-pr-create payload whose parent
+        // transcript shows no polish, but a sibling `<stem>/subagents/agent-*.jsonl`
+        // does → Allow. Proves run() reads the child transcripts, not just decide().
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("sess.jsonl");
+        std::fs::write(&parent, no_polish_transcript()).unwrap();
+        let subagents = tmp.path().join("sess").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), polish_transcript()).unwrap();
+
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                command: Some("gh pr create --title test".into()),
+                ..Default::default()
+            }),
+            transcript_path: Some(parent.to_str().unwrap().into()),
+            ..Default::default()
+        };
+        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Allow);
     }
 }
