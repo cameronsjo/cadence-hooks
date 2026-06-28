@@ -221,7 +221,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let parent = parent_with_subagents(tmp.path());
         std::fs::write(
-            tmp.path().join("sess").join("subagents").join("agent-a1.jsonl"),
+            tmp.path()
+                .join("sess")
+                .join("subagents")
+                .join("agent-a1.jsonl"),
             POLISH_LINE,
         )
         .unwrap();
