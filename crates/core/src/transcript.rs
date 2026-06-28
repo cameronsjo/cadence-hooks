@@ -9,6 +9,7 @@
 //! set of tests.
 
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// True when the session transcript contains a `cadence-forge:polish` Skill
 /// invocation. Pure — operates on the transcript text, no I/O.
@@ -58,6 +59,59 @@ fn is_polish_skill(skill: &str) -> bool {
         .rsplit(':')
         .next()
         .is_some_and(|leaf| leaf.eq_ignore_ascii_case("polish"))
+}
+
+/// True when any child subagent transcript under
+/// `<parent-stem>/subagents/agent-*.jsonl` shows a polish Skill run.
+///
+/// Claude Code records a subagent's transcript next to the parent's: a parent
+/// `<dir>/<session>.jsonl` has its children at `<dir>/<session>/subagents/`.
+/// Polish invoked *inside* a delegated session therefore lives in a child file
+/// the parent-only [`transcript_has_polish_run`] never reads — this scans those
+/// children so a delegated polish run still satisfies the pre-PR gate (#247).
+///
+/// Fail-safe at every step: a missing `subagents/` dir, no children, or an
+/// unreadable child all yield `false`, so the caller falls through to the
+/// existing parent-transcript decision (ADR-0001 — never block on our own
+/// missing data). Never panics. `.any()` short-circuits on the first child that
+/// shows a polish run.
+pub fn subagent_transcripts_have_polish_run(parent_transcript_path: &Path) -> bool {
+    let Some(dir) = subagents_dir(parent_transcript_path) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        is_agent_transcript(&path)
+            && std::fs::read_to_string(&path)
+                .map(|c| transcript_has_polish_run(&c))
+                .unwrap_or(false)
+    })
+}
+
+/// The `subagents/` directory a parent transcript's children live in:
+/// `<parent-dir>/<parent-stem>/subagents`. `None` when the path has no parent
+/// or no file stem (so a degenerate path can't panic the scan).
+fn subagents_dir(parent_transcript_path: &Path) -> Option<PathBuf> {
+    Some(
+        parent_transcript_path
+            .parent()?
+            .join(parent_transcript_path.file_stem()?)
+            .join("subagents"),
+    )
+}
+
+/// True when a path names a subagent transcript: a `.jsonl` file whose name
+/// starts with `agent-`. Excludes the `agent-*.meta.json` companion sidecars
+/// (extension `json`, not `jsonl`), which are not transcripts.
+fn is_agent_transcript(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("agent-"))
 }
 
 #[cfg(test)]
@@ -146,5 +200,75 @@ mod tests {
     #[test]
     fn corrupt_transcript_line_is_skipped() {
         assert!(!transcript_has_polish_run("not json {{\n"));
+    }
+
+    // --- subagent_transcripts_have_polish_run (#247) ---
+
+    /// A realistic transcript line carrying a `cadence-forge:polish` Skill run.
+    const POLISH_LINE: &str = r#"{"message":{"role":"assistant","content":[{"type":"tool_use","name":"Skill","input":{"skill":"cadence-forge:polish"}}]}}"#;
+
+    /// Stand up a `<dir>/<sess>/subagents/` tree and return the *parent*
+    /// transcript path (`<dir>/<sess>.jsonl`) the helper derives children from.
+    /// The parent file itself is never read by the helper, so it need not exist.
+    fn parent_with_subagents(dir: &std::path::Path) -> PathBuf {
+        let subagents = dir.join("sess").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        dir.join("sess.jsonl")
+    }
+
+    #[test]
+    fn subagent_polish_in_child_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = parent_with_subagents(tmp.path());
+        std::fs::write(
+            tmp.path().join("sess").join("subagents").join("agent-a1.jsonl"),
+            POLISH_LINE,
+        )
+        .unwrap();
+        assert!(
+            subagent_transcripts_have_polish_run(&parent),
+            "a polish run in a child subagent transcript must be detected"
+        );
+    }
+
+    #[test]
+    fn subagent_meta_json_companion_is_ignored() {
+        // Only an `agent-a1.meta.json` sidecar exists (no `.jsonl` transcript).
+        // It is not a transcript, so it must not count even if it held polish text.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = parent_with_subagents(tmp.path());
+        std::fs::write(
+            tmp.path()
+                .join("sess")
+                .join("subagents")
+                .join("agent-a1.meta.json"),
+            POLISH_LINE,
+        )
+        .unwrap();
+        assert!(
+            !subagent_transcripts_have_polish_run(&parent),
+            "a .meta.json companion must be ignored, not scanned"
+        );
+    }
+
+    #[test]
+    fn no_subagents_dir_is_false() {
+        // Parent path with no `subagents/` directory beside it → false, never panic.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("sess.jsonl");
+        assert!(!subagent_transcripts_have_polish_run(&parent));
+    }
+
+    #[test]
+    fn child_without_polish_is_false() {
+        // A child transcript exists but holds no polish Skill run → false.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = parent_with_subagents(tmp.path());
+        std::fs::write(
+            tmp.path().join("sess").join("subagents").join("agent-a1.jsonl"),
+            r#"{"message":{"role":"assistant","content":[{"type":"text","text":"no polish here"}]}}"#,
+        )
+        .unwrap();
+        assert!(!subagent_transcripts_have_polish_run(&parent));
     }
 }

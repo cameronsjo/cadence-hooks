@@ -15,7 +15,9 @@
 
 use crate::common;
 use cadence_hooks_core::shell::is_gh_pr_create;
-use cadence_hooks_core::transcript::transcript_has_polish_run;
+use cadence_hooks_core::transcript::{
+    subagent_transcripts_have_polish_run, transcript_has_polish_run,
+};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -49,13 +51,19 @@ impl Logger for LogPolishNudge {
 
         // Did `/polish` run earlier this session? Best-effort — a missing or
         // unreadable transcript yields `false` (an honest "no evidence of
-        // polish"), never a panic.
+        // polish"), never a panic. Scans the parent transcript *and* this
+        // session's subagent transcripts, so a delegated polish run is recorded
+        // honestly rather than logged as `polished: false` (#247).
         let polished = input
             .transcript_path
             .as_deref()
             .filter(|p| std::path::Path::new(p).is_file())
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|t| transcript_has_polish_run(&t))
+            .map(|p| {
+                let parent_polished = std::fs::read_to_string(p)
+                    .map(|t| transcript_has_polish_run(&t))
+                    .unwrap_or(false);
+                parent_polished || subagent_transcripts_have_polish_run(std::path::Path::new(p))
+            })
             .unwrap_or(false);
 
         let dir = common::metrics_dir();
