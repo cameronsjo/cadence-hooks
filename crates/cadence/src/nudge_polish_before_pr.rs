@@ -45,9 +45,7 @@ impl Check for NudgePolishBeforePr {
         // readable. A missing path, a non-file, or a read error all collapse to
         // `None`, and `decide` then fails open to a nudge — we never block on
         // our own missing data (ADR-0001).
-        let tp = input
-            .transcript_path()
-            .filter(|p| Path::new(p).is_file());
+        let tp = input.transcript_path().filter(|p| Path::new(p).is_file());
         let transcript = tp.and_then(|p| std::fs::read_to_string(p).ok());
         // Polish run inside a *subagent* lives in a child transcript the parent
         // scan above never sees (#247). Only scan those children on the path
@@ -188,7 +186,11 @@ mod tests {
     fn decide_pr_create_with_polish_run_allows_silently() {
         // Polish actually ran → silent allow. This is the noise-kill: today the
         // nudge fires even after a real polish run.
-        let result = decide("gh pr create --title test", Some(polish_transcript()), false);
+        let result = decide(
+            "gh pr create --title test",
+            Some(polish_transcript()),
+            false,
+        );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(
             result.message.is_none(),
@@ -277,7 +279,10 @@ mod tests {
             decide("gh pr list", Some(no_polish_transcript()), false).outcome,
             Outcome::Allow
         );
-        assert_eq!(decide("git commit -m x", None, false).outcome, Outcome::Allow);
+        assert_eq!(
+            decide("git commit -m x", None, false).outcome,
+            Outcome::Allow
+        );
     }
 
     #[test]
