@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-repo terminology exemptions (`.claude/terminology.json`).** The
+  `terminology` guard now reads an optional `<git-root>/.claude/terminology.json`
+  that softens its hard block for named files and terms — mirroring the
+  `.claude/redaction.json` precedent. Each `exemptions[]` entry takes `paths`
+  (glob patterns: a `/`-bearing pattern matches the repo-relative path with `**`
+  spanning separators, a bare pattern matches the basename anywhere), optional
+  `terms` (case-insensitive against the display term; omit to exempt all), and an
+  optional `mode` (`allow` drops the violation, `nudge` demotes a block to an
+  advisory). It can only ever *remove* or *demote* a violation, never add one;
+  the global hard block and the built-in path baseline are untouched. Missing,
+  unreadable, or invalid JSON is ignored (fail-open, ADR-0001). The shared
+  `find_git_root` walk also moved into `core::paths`. See
+  [docs/configuration.md](docs/configuration.md#per-repo-terminology-exemptions).
+
 ### Fixed
 
 - **nudge-polish-before-pr: see polish run in a subagent transcript** (#247 on
