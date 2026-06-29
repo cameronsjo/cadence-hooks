@@ -172,4 +172,4 @@ hook firing in error is `/cadence:feedback`.
 
 ## License
 
-[BSL-1.1](LICENSE) — free for personal, non-commercial use. Converts to MIT after four years.
+[PolyForm Noncommercial 1.0.0](LICENSE) — free for any noncommercial use. Commercial use requires a separate license from the author.
