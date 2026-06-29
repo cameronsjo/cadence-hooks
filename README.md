@@ -172,4 +172,4 @@ hook firing in error is `/cadence:feedback`.
 
 ## License
 
-[BSL-1.1](LICENSE) — free for personal, non-commercial use. Converts to MIT after four years.
+[Apache-2.0 with the Commons Clause](LICENSE) — free to use, modify, and distribute (including commercially); you may not **sell** it. See [LICENSE](LICENSE) for full terms.
