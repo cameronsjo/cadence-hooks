@@ -320,21 +320,25 @@ pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
     }
 }
 
-/// Ensure `.claude/sessions/` is listed in the repo's `.git/info/exclude` so
-/// registry files never appear in `git status`.
+/// Ensure `.claude/sessions/` is listed in the repo's `info/exclude` so registry
+/// files never appear in `git status`.
 ///
-/// `.git/info/exclude` is per-checkout git plumbing — never committed, never
-/// shared — so this keeps the user's `.gitignore` untouched while preventing
-/// registry noise in every other guard that inspects untracked files.
+/// `info/exclude` is per-repo git plumbing — never committed, never shared — so
+/// this keeps the user's `.gitignore` untouched while preventing registry noise
+/// in every other guard that inspects untracked files.
+///
+/// The exclude lives in the git **common directory**, which is *shared* by the
+/// primary checkout and every linked worktree. Resolving it via
+/// [`cadence_hooks_core::paths::resolve_git_common_dir`] means a session running
+/// inside a linked worktree still writes the exclude to the primary `.git` (#130,
+/// previously an early-return no-op that left worktree registries noisy). One
+/// write covers all checkouts and is idempotent with the dedupe below.
 pub fn ensure_git_excluded(repo_root: &Path) {
     const EXCLUDE_LINE: &str = ".claude/sessions/";
-    let exclude_path = repo_root.join(".git").join("info").join("exclude");
-    // Only act inside a real checkout (a .git *directory* — skip worktrees and
-    // submodules whose .git is a file pointing elsewhere; their exclude file
-    // lives in the common dir and editing it is the user's call).
-    if !repo_root.join(".git").is_dir() {
+    let Some(common) = cadence_hooks_core::paths::resolve_git_common_dir(repo_root) else {
         return;
-    }
+    };
+    let exclude_path = common.join("info").join("exclude");
     let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == EXCLUDE_LINE) {
         return;
@@ -791,6 +795,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".git/info")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         ensure_git_excluded(root);
         ensure_git_excluded(root);
         let contents = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
@@ -806,6 +811,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".git/info")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(root.join(".git/info/exclude"), "*.swp\n").unwrap();
         ensure_git_excluded(root);
         let contents = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
@@ -821,8 +827,9 @@ mod tests {
     }
 
     #[test]
-    fn ensure_git_excluded_skips_worktree_git_file() {
-        // In a linked worktree, .git is a *file* pointing at the common dir.
+    fn ensure_git_excluded_noop_when_gitdir_unresolvable() {
+        // A linked worktree's .git file that points at a nonexistent gitdir
+        // (no HEAD reachable) must resolve to no common dir → no write, no panic.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join(".git"),
@@ -831,6 +838,40 @@ mod tests {
         .unwrap();
         ensure_git_excluded(tmp.path());
         assert!(tmp.path().join(".git").is_file(), ".git file untouched");
+    }
+
+    #[test]
+    fn ensure_git_excluded_writes_common_dir_for_linked_worktree() {
+        // A linked worktree's exclude line must land in the PRIMARY checkout's
+        // shared .git/info/exclude (resolved via the worktree's commondir), so a
+        // session running inside the worktree still silences registry noise
+        // repo-wide (#130). Pure-fs fixture — no git spawn.
+        let tmp = TempDir::new().unwrap();
+        let primary_git = tmp.path().join("primary").join(".git");
+        fs::create_dir_all(primary_git.join("info")).unwrap();
+        fs::write(primary_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let wt_admin = primary_git.join("worktrees").join("wt");
+        fs::create_dir_all(&wt_admin).unwrap();
+        // commondir is relative to the worktree admin dir: ../.. → primary/.git
+        fs::write(wt_admin.join("commondir"), "../..\n").unwrap();
+        fs::write(wt_admin.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
+
+        let linked = tmp.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", wt_admin.display()),
+        )
+        .unwrap();
+
+        ensure_git_excluded(&linked);
+
+        let exclude = fs::read_to_string(primary_git.join("info").join("exclude"))
+            .expect("exclude written under the primary common dir");
+        assert!(
+            exclude.lines().any(|l| l.trim() == ".claude/sessions/"),
+            "exclude line lands in the primary .git/info/exclude: {exclude}"
+        );
     }
 
     // --- env config ---

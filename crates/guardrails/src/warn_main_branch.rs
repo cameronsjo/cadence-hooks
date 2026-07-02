@@ -19,8 +19,6 @@
 
 use crate::dismiss_main_branch_warn;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -145,22 +143,13 @@ pub struct WarnMainBranch;
 impl WarnMainBranch {
     /// Build the per-session marker path scoped to a specific repo root.
     ///
-    /// Hashes the repo root so two repos with the same name don't share
-    /// markers. The PPID component ties the marker to the Claude Code
-    /// session — hooks run as separate child processes so `process::id()`
-    /// would change every invocation.
-    fn marker_path(repo_root: &str) -> PathBuf {
-        let mut hasher = DefaultHasher::new();
-        repo_root.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let ppid = std::env::var("PPID")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or_else(std::process::id);
-
-        cadence_hooks_core::paths::marker_temp_dir()
-            .join(format!(".claude-main-branch-warned-{hash:x}-{ppid}"))
+    /// Delegates to the shared [`cadence_hooks_core::markers::session_marker`]
+    /// primitive: keyed on the Claude Code session id (stable across a session's
+    /// many separate hook processes — the pre-CP0 `PPID`→pid scheme re-warned
+    /// every edit because `PPID` is never exported, #133) and the repo-root hash,
+    /// under the private 0700 marker dir.
+    fn marker_path(input: &HookInput, repo_root: &str) -> PathBuf {
+        cadence_hooks_core::markers::session_marker(input, "main-branch-warned", Some(repo_root))
     }
 }
 
@@ -208,15 +197,15 @@ impl Check for WarnMainBranch {
             _ => return CheckResult::allow(),
         };
 
-        let marker = Self::marker_path(&repo_root);
+        let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
-        let snoozed = dismiss_main_branch_warn::is_snoozed_now(Path::new(&repo_root));
+        let snoozed = dismiss_main_branch_warn::is_snoozed_now(input, Path::new(&repo_root));
         let allowed = is_main_allowed();
 
         let result = should_warn(&branch, already_warned, snoozed, allowed);
 
         if result.outcome == Outcome::Nudge {
-            let _ = std::fs::write(&marker, "");
+            let _ = cadence_hooks_core::markers::write_marker(&marker, "");
         }
 
         result
@@ -324,24 +313,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn marker_uses_ppid_not_pid() {
-        // Bug: code uses process::id() (current PID) but names var "ppid"
-        // Since hooks run as separate processes, each invocation gets a new PID,
-        // so the marker file from a previous invocation is never found.
-        // The intent was to use the PARENT PID (Claude Code process) for session scoping.
-        let ppid_env = std::env::var("PPID")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
-        let current_pid = std::process::id();
-        if let Some(ppid) = ppid_env {
-            assert_ne!(
-                current_pid, ppid,
-                "PID should differ from PPID — marker_path() should use PPID for session scoping"
-            );
-        }
-    }
-
     // --- Regression: nested-repo branch resolution (issue #26) ---
     // When CWD is an outer repo and the edited file is in a nested inner repo,
     // branch resolution must follow the file path, not CWD. Using `git -C
@@ -416,22 +387,40 @@ mod tests {
         assert_eq!(git_dir_for_input(&input), PathBuf::from("."));
     }
 
+    fn input_with_session(sid: &str) -> HookInput {
+        HookInput {
+            session_id: Some(sid.into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn marker_path_differs_per_repo() {
         // Two different repo roots should produce distinct marker paths
         // so a snooze in one repo doesn't suppress warnings in another.
-        let a = WarnMainBranch::marker_path("/tmp/repo-a");
-        let b = WarnMainBranch::marker_path("/tmp/repo-b");
+        let input = input_with_session("sid");
+        let a = WarnMainBranch::marker_path(&input, "/tmp/repo-a");
+        let b = WarnMainBranch::marker_path(&input, "/tmp/repo-b");
         assert_ne!(a, b, "marker path must include a repo-specific hash");
     }
 
     #[test]
     fn marker_path_stable_for_same_repo() {
-        // Same repo root, called twice in the same process, should produce
-        // the same marker path so suppression works.
-        let a = WarnMainBranch::marker_path("/tmp/repo");
-        let b = WarnMainBranch::marker_path("/tmp/repo");
+        // Same repo root and session, called twice, should produce the same
+        // marker path so suppression works.
+        let input = input_with_session("sid");
+        let a = WarnMainBranch::marker_path(&input, "/tmp/repo");
+        let b = WarnMainBranch::marker_path(&input, "/tmp/repo");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn marker_path_differs_per_session() {
+        // The #133 fix: the marker is keyed on the session id, so two sessions
+        // in the same repo each get their own once-per-session nudge.
+        let a = WarnMainBranch::marker_path(&input_with_session("sid-a"), "/tmp/repo");
+        let b = WarnMainBranch::marker_path(&input_with_session("sid-b"), "/tmp/repo");
+        assert_ne!(a, b, "marker must be session-scoped");
     }
 
     #[test]

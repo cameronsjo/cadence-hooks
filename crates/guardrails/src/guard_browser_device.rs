@@ -26,8 +26,6 @@
 //! the gate for the rest of the session.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Fully-qualified prefix shared by every claude-in-chrome MCP tool.
@@ -47,27 +45,15 @@ Fix:   1) list_connected_browsers  2) AskUserQuestion listing every connected\n\
 pub struct GuardBrowserDevice;
 
 impl GuardBrowserDevice {
-    /// Per-session marker path.
+    /// Per-session marker path (session-global — no repo component).
     ///
-    /// Hashes the session id so concurrent sessions don't share the handshake.
-    /// Falls back to `PPID` (the Claude Code process — hooks run as separate
-    /// children, so `process::id()` changes every invocation) and finally to
-    /// `process::id()`, mirroring [`crate::warn_main_branch`]'s scoping.
+    /// The device handshake is once per *session*, independent of any repo, so
+    /// the marker carries no repo scope. Delegates to the shared
+    /// [`cadence_hooks_core::markers::session_marker`] primitive, which supplies
+    /// the session-id key (with the PPID→pid fallback) under the private 0700
+    /// marker dir.
     fn marker_path(input: &HookInput) -> PathBuf {
-        let scope = input.session_id().map(str::to_string).unwrap_or_else(|| {
-            std::env::var("PPID")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or_else(std::process::id)
-                .to_string()
-        });
-
-        let mut hasher = DefaultHasher::new();
-        scope.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        cadence_hooks_core::paths::marker_temp_dir()
-            .join(format!(".claude-browser-device-{hash:x}"))
+        cadence_hooks_core::markers::session_marker(input, "browser-device", None)
     }
 }
 
@@ -94,7 +80,7 @@ impl Check for GuardBrowserDevice {
         // First call: record the handshake *before* returning so the marker
         // persists even though we exit 2, then block. A write failure is not a
         // reason to keep blocking — fail open (ADR-0001).
-        let _ = std::fs::write(&marker, "");
+        let _ = cadence_hooks_core::markers::write_marker(&marker, "");
         CheckResult::block(BLOCK_MESSAGE)
     }
 }
