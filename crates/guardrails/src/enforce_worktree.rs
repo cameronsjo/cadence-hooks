@@ -30,7 +30,11 @@
 //! boundary): file mutations via bash (`sed -i`, redirects) are not inspected —
 //! the `git commit` arm is the persistence backstop; `git --work-tree=…` /
 //! `--git-dir=…` commit forms and commits wrapped in `sh -c '…'` skip the check
-//! (the target tree cannot be cheaply resolved — ambiguity fails open). A
+//! (the target tree cannot be cheaply resolved — ambiguity fails open).
+//! Env-prefixed forms (`VAR=x git commit`) are missed too — the leading word
+//! isn't `git` — and a `GIT_DIR=`/`GIT_WORK_TREE=` prefix can even invert the
+//! target (a rare false block when committing into a worktree *from* the
+//! primary via env); both accepted as exotic. A
 //! `git -C <path> commit` IS resolved against `<path>`, so committing into the
 //! primary from elsewhere still blocks, and committing into a worktree from
 //! the primary does not.
@@ -82,7 +86,15 @@ fn is_temp_root(repo_root: &Path, tmpdir: Option<&str>) -> bool {
     let via_env = tmpdir
         .map(str::trim)
         .filter(|t| !t.is_empty() && *t != "/")
-        .is_some_and(|t| repo_root.starts_with(t));
+        .is_some_and(|t| {
+            // `repo_root` comes from `git rev-parse --show-toplevel`, which
+            // canonicalizes (`/private/var/…` on macOS) while `$TMPDIR` does
+            // not (`/var/folders/…`) — compare against the canonicalized
+            // tmpdir too, or the exemption never fires on macOS.
+            repo_root.starts_with(t)
+                || std::fs::canonicalize(t)
+                    .is_ok_and(|c| c != Path::new("/") && repo_root.starts_with(&c))
+        });
     fixed || via_env
 }
 
@@ -95,6 +107,8 @@ type CommitTarget = Option<String>;
 /// `commit`, return where that commit lands: `Some(path)` for `git -C <path>
 /// commit`, `None` for the cwd. Segments using `--work-tree`/`--git-dir` are
 /// skipped entirely — the target tree is ambiguous, and ambiguity fails open.
+/// `-c <key>=<val>` pairs are walked over (value consumed) so the subcommand
+/// is still found behind inline config.
 ///
 /// The leading-word discipline mirrors `is_branch_switch` in the session
 /// crate: a `git commit` quoted in prose or a heredoc body is not this session
@@ -111,7 +125,9 @@ fn git_commit_targets(command: &str) -> Vec<CommitTarget> {
         let mut redirect: Option<&str> = None;
         let mut ambiguous = false;
         let mut idx = 1;
-        while idx < tokens.len() && (tokens[idx].starts_with('-') || tokens[idx - 1] == "-C") {
+        while idx < tokens.len()
+            && (tokens[idx].starts_with('-') || tokens[idx - 1] == "-C" || tokens[idx - 1] == "-c")
+        {
             let t = tokens[idx];
             if tokens[idx - 1] == "-C" {
                 redirect = Some(t);
@@ -345,6 +361,23 @@ mod tests {
         assert!(!is_temp_root(Path::new("/tmpfoo/repo"), None));
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn tmpdir_env_canonicalization_mismatch_is_temp() {
+        // macOS: `git rev-parse --show-toplevel` canonicalizes
+        // (`/private/var/…`) while `$TMPDIR` stays `/var/folders/…` — the
+        // exemption must fire anyway. Simulated with a symlinked tmpdir under
+        // the non-temp scratch root (`Scratch` is defined with the
+        // end-to-end tests below).
+        let scratch = Scratch::new("tmpdir-canon");
+        let real = scratch.0.join("real");
+        let link = scratch.0.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let repo_root = std::fs::canonicalize(&real).unwrap().join("repo");
+        assert!(is_temp_root(&repo_root, Some(link.to_str().unwrap())));
+    }
+
     // --- git_commit_targets (pure parsing) ---
 
     #[test]
@@ -365,6 +398,20 @@ mod tests {
         assert_eq!(
             git_commit_targets("git -C /some/worktree commit -m 'x'"),
             vec![Some("/some/worktree".to_string())]
+        );
+    }
+
+    #[test]
+    fn inline_config_commit_targets_cwd() {
+        // `git -c key=val commit` — the -c value must be consumed, not end
+        // the flag walk (else the commit is silently missed).
+        assert_eq!(
+            git_commit_targets("git -c user.email=x@y.z commit -m 'x'"),
+            vec![None]
+        );
+        assert_eq!(
+            git_commit_targets("git -c commit.gpgsign=false -C /wt commit -m 'x'"),
+            vec![Some("/wt".to_string())]
         );
     }
 

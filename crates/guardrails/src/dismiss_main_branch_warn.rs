@@ -30,7 +30,9 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     if s.is_empty() {
         return None;
     }
-    let (num_part, unit) = s.split_at(s.len() - 1);
+    // Split before the final *character* — a byte index panics mid-char when
+    // the value ends in a multibyte char (e.g. `--for 5€`).
+    let (num_part, unit) = s.split_at(s.char_indices().last().map(|(i, _)| i)?);
     let n: u64 = num_part.parse().ok()?;
     if n == 0 {
         return None;
@@ -186,6 +188,13 @@ mod tests {
     #[test]
     fn parse_duration_rejects_unknown_unit() {
         assert_eq!(parse_duration("30y"), None);
+    }
+
+    #[test]
+    fn parse_duration_rejects_multibyte_unit() {
+        // A multibyte final char must reject, not panic — `5€`'s len-1 is not
+        // a char boundary, so a byte-index split_at would panic mid-char.
+        assert_eq!(parse_duration("5€"), None);
     }
 
     #[test]
