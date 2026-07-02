@@ -4,14 +4,12 @@
 //! returns after 5+ minutes of inactivity, warns them to review context.
 //! After 8+ hours, suggests starting a fresh session.
 
+use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 #[cfg(test)]
 use cadence_hooks_core::Outcome;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const IDLE_THRESHOLD_SECS: u64 = 300; // 5 minutes
@@ -50,22 +48,20 @@ fn idle_outcome(gap: Option<u64>) -> CheckResult {
 pub struct CheckIdleReturn;
 
 impl CheckIdleReturn {
-    fn marker_path() -> Option<PathBuf> {
-        let repo_root = Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
-
-        let mut hasher = DefaultHasher::new();
-        repo_root.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        Some(
-            cadence_hooks_core::paths::marker_temp_dir()
-                .join(format!(".claude-last-edit-{hash:x}")),
-        )
+    /// The last-edit marker, scoped to this session AND the edited file's repo.
+    ///
+    /// Repo resolution uses `git -C <cwd>` (house style) so nested-repo edits key
+    /// to the right checkout. Session-scoping is the #132 fix: "idle" now means
+    /// *this session's* last edit — a peer's activity in the same repo no longer
+    /// refreshes your marker and masks your idle return.
+    fn marker_path(input: &HookInput) -> Option<PathBuf> {
+        let cwd = input.cwd.as_deref().unwrap_or(".");
+        let repo_root = git_command(cwd, &["rev-parse", "--show-toplevel"])?;
+        Some(cadence_hooks_core::markers::session_marker(
+            input,
+            "last-edit",
+            Some(&repo_root),
+        ))
     }
 
     fn now_secs() -> u64 {
@@ -81,8 +77,8 @@ impl Check for CheckIdleReturn {
         "check-idle-return"
     }
 
-    fn run(&self, _input: &HookInput) -> CheckResult {
-        let Some(marker) = Self::marker_path() else {
+    fn run(&self, input: &HookInput) -> CheckResult {
+        let Some(marker) = Self::marker_path(input) else {
             return CheckResult::allow();
         };
 
@@ -95,8 +91,8 @@ impl Check for CheckIdleReturn {
 
         let result = idle_outcome(gap);
 
-        // Always update marker with current timestamp
-        let _ = std::fs::write(&marker, now.to_string());
+        // Always update this session's marker with the current timestamp.
+        let _ = cadence_hooks_core::markers::write_marker(&marker, &now.to_string());
 
         result
     }
@@ -242,6 +238,64 @@ mod tests {
                 .as_deref()
                 .expect("nudge should have a message")
                 .contains("fresh session")
+        );
+    }
+
+    // --- session-scoped marker keying (#132) ---
+
+    fn init_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git init");
+        assert!(ok.success(), "git init failed");
+        dir
+    }
+
+    fn input_in_repo(session_id: &str, repo: &std::path::Path) -> HookInput {
+        HookInput {
+            tool_name: Some("Edit".into()),
+            session_id: Some(session_id.into()),
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn marker_path_differs_per_session() {
+        // Same repo, two sessions → distinct markers. Before #132 the marker was
+        // keyed on the repo hash alone, so both sessions shared one path.
+        let repo = init_git_repo();
+        let a = CheckIdleReturn::marker_path(&input_in_repo("sid-a", repo.path()));
+        let b = CheckIdleReturn::marker_path(&input_in_repo("sid-b", repo.path()));
+        assert!(a.is_some() && b.is_some(), "repo resolves");
+        assert_ne!(a, b, "same repo, different session → distinct markers");
+    }
+
+    #[test]
+    fn peer_activity_does_not_mask_idle_session() {
+        // Session A last edited 10m ago; peer B just edited in the same repo. A's
+        // idle return must still fire — B's fresh marker is B's, not A's (#132).
+        let repo = init_git_repo();
+        let input_a = input_in_repo("idle-session-a", repo.path());
+        let input_b = input_in_repo("busy-session-b", repo.path());
+        let now = CheckIdleReturn::now_secs();
+        let marker_a = CheckIdleReturn::marker_path(&input_a).expect("A marker");
+        let marker_b = CheckIdleReturn::marker_path(&input_b).expect("B marker");
+        cadence_hooks_core::markers::write_marker(&marker_a, &(now - 600).to_string()).unwrap();
+        cadence_hooks_core::markers::write_marker(&marker_b, &now.to_string()).unwrap();
+
+        let result = CheckIdleReturn.run(&input_a);
+        assert_eq!(
+            result.outcome,
+            Outcome::Nudge,
+            "A's idle return still fires"
+        );
+        assert!(
+            result.message.as_deref().unwrap().contains("10m"),
+            "A sees its own 10m gap, not B's fresh activity"
         );
     }
 }
