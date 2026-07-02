@@ -83,7 +83,8 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
 | `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Override the canonical issue-tracker repo (`owner/repo`) the nudge steers `gh issue create` toward (default `cameronsjo/claude-configurations`) |
 | `CADENCE_GUARD_DOTFILES` | `guard-dotfiles` | Set to `1` to block direct edits to production dotfiles (clean no-op otherwise) |
-| `CADENCE_ALLOW_MAIN` | `warn-main-branch` | Set truthy (`1`/`true`/`yes`) in a repo's `.claude/settings.json` `env` block to permanently silence the main-branch warning where `main` is the working branch by design (dotfiles, vaults, scratchpads) |
+| `CADENCE_ALLOW_MAIN` | `warn-main-branch`, `enforce-worktree` | Set truthy (`1`/`true`/`yes`) in a repo's `.claude/settings.json` `env` block to mark a repo where `main` is the working branch by design (dotfiles, vaults, scratchpads) — silences the main-branch warning and exempts the repo from worktree enforcement |
+| `CADENCE_NO_ENFORCE_WORKTREE` | `enforce-worktree` | Set truthy (`1`/`true`/`yes`) to disable the primary-checkout block everywhere — the kill switch for the proving period; prefer `CADENCE_ALLOW_MAIN` per repo |
 | `CADENCE_SKIP_OVERSHARE_AUDIT` | `warn-overshare` | Set to `1` for a session-scoped bypass in repos that legitimately hold personal context |
 | `CADENCE_METRICS_PRICES` | `log-commit` | Path to a model price-table JSON; takes precedence over the `--prices` flag and the embedded default |
 | `CADENCE_METRICS_DIR` | metrics loggers | When set non-empty, the metrics root (JSONL files and the `state/` subdir live directly inside it); otherwise `<config_dir>/metrics` (honoring `CLAUDE_CONFIG_DIR`) |
@@ -186,3 +187,17 @@ cadence-hooks guardrails dismiss-main-branch-warn --for 2h
 The snooze marker lives at `<repo>/.git/cadence-hooks/main-branch-snoozed-until`, so it's per-repo and ignored by default (`.git/` is never committed). The hook's own warn output also points at the command, so it's discoverable when the warning fires.
 
 For a repo where `main` is the working branch by design, set `CADENCE_ALLOW_MAIN=true` in `.claude/settings.json` to silence the warning permanently instead.
+
+## Snoozing enforce-worktree
+
+`enforce-worktree` hard-blocks mutations in a primary checkout of a branch-mode repo. For the legitimate one-off — committing an approved plan doc on the default branch, a hotfix the user explicitly wants in the primary tree — snooze it per-repo:
+
+```bash
+# Default: 30 minutes
+cadence-hooks guardrails dismiss-enforce-worktree
+
+# Explicit duration: 2h, 1d, 45s, etc. Capped at 24h.
+cadence-hooks guardrails dismiss-enforce-worktree --for 2h
+```
+
+The marker lives at `<repo>/.git/cadence-hooks/enforce-worktree-snoozed-until` — independent of the `warn-main-branch` snooze, so unblocking the guard doesn't also silence the nudge. For a repo where `main` is the working branch by design, `CADENCE_ALLOW_MAIN=true` exempts it permanently; `CADENCE_NO_ENFORCE_WORKTREE=1` (user-global) disables the guard everywhere.
