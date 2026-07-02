@@ -24,6 +24,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **guard blocks no longer emit a schema-invalid JSON envelope on stdout**
+  (#165). The `run_check` `Block` arm exited 2 but *also* wrote a
+  `permissionDecision:"deny"` JSON envelope to stdout when a `BlockMetadata` was
+  present under `PreToolUse`. On exit 2 Claude Code ignores stdout entirely, so
+  that envelope delivered nothing — and its `additionalContext` was an object
+  (the metadata struct) where the schema requires a string, registering as an
+  output-schema validation failure in telemetry (observed: 99 fires from
+  `guard-gh-write` alone). Blocks are now stderr-only (exit-2 enforcement is
+  unchanged); the one machine-intended datum, `BlockMetadata::fix`, folds into
+  the stderr text as a `Fix:` line when the prose doesn't already carry one.
+  Output rendering is extracted into a pure `render_output` function so the
+  exit-code × output-shape matrix is unit-tested (the anti-regression assertion:
+  a block emits no stdout; a nudge's `additionalContext` is string-typed).
 - **nudge-polish-before-pr: see polish run in a subagent transcript** (#247 on
   claude-configurations). The pre-PR polish gate (and the `log-polish-nudge`
   metric) read only the *parent* session transcript, so `cadence-forge:polish`
