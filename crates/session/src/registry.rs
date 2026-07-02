@@ -333,26 +333,53 @@ pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
 /// inside a linked worktree still writes the exclude to the primary `.git` (#130,
 /// previously an early-return no-op that left worktree registries noisy). One
 /// write covers all checkouts and is idempotent with the dedupe below.
+///
+/// **Symlink safety.** The resolved common dir's contents are attacker-influenced:
+/// a crafted `.git` *file* can redirect resolution to any directory (bounded only
+/// by the resolver's HEAD-exists gate, which `exists()` satisfies *through*
+/// symlinks). Without care a planted `info/exclude` symlink would make us append
+/// the exclusion line to a victim-writable file. Two layers defend the write:
+/// (1) a pre-check refuses when `info` or `info/exclude` is a symlink (silent
+/// no-op, fail-open per ADR-0001 — a *nonexistent* exclude is the normal case and
+/// gets created); (2) the write goes through [`atomic_write`]'s O_EXCL-staged
+/// rename, so even a symlink re-planted at the leaf between check and write is
+/// replaced, never followed.
 pub fn ensure_git_excluded(repo_root: &Path) {
     const EXCLUDE_LINE: &str = ".claude/sessions/";
     let Some(common) = cadence_hooks_core::paths::resolve_git_common_dir(repo_root) else {
         return;
     };
-    let exclude_path = common.join("info").join("exclude");
+    let info_dir = common.join("info");
+    let exclude_path = info_dir.join("exclude");
+
+    // Refuse a symlinked info dir or exclude leaf — either would redirect the
+    // write to an attacker-chosen file. Fail open (no-op), never block.
+    if is_symlink(&info_dir) || is_symlink(&exclude_path) {
+        return;
+    }
+
     let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == EXCLUDE_LINE) {
         return;
     }
-    if let Some(parent) = exclude_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
+    let _ = fs::create_dir_all(&info_dir);
     let mut updated = existing;
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
     updated.push_str(EXCLUDE_LINE);
     updated.push('\n');
-    let _ = fs::write(&exclude_path, updated);
+    // O_EXCL-staged rename (never follows a symlink at the target), so a TOCTOU
+    // re-plant of the leaf between the check above and here can't be written
+    // through to a victim.
+    let _ = atomic_write(&exclude_path, updated.as_bytes());
+}
+
+/// True when `path` exists and is a symlink (`symlink_metadata` does not follow).
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -838,6 +865,62 @@ mod tests {
         .unwrap();
         ensure_git_excluded(tmp.path());
         assert!(tmp.path().join(".git").is_file(), ".git file untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_git_excluded_refuses_symlinked_exclude() {
+        // A crafted checkout: a `.git` FILE redirects to an `evil` dir with a
+        // planted HEAD (passing the resolver's HEAD gate) and an `info/exclude`
+        // symlinked at a victim file. Following that symlink on write would append
+        // the exclusion line to the victim; ensure_git_excluded must refuse.
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, "victim-original\n").unwrap();
+
+        let evil = tmp.path().join("evil");
+        fs::create_dir_all(evil.join("info")).unwrap();
+        fs::write(evil.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        symlink(&victim, evil.join("info").join("exclude")).unwrap();
+
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
+
+        ensure_git_excluded(&repo);
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "victim-original\n",
+            "a symlinked exclude must not be followed — victim untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_git_excluded_refuses_symlinked_info_dir() {
+        // The dir-level variant: `info` itself is a symlink into a victim dir.
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let victim_dir = tmp.path().join("victim_dir");
+        fs::create_dir_all(&victim_dir).unwrap();
+
+        let evil = tmp.path().join("evil");
+        fs::create_dir_all(&evil).unwrap();
+        fs::write(evil.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        symlink(&victim_dir, evil.join("info")).unwrap();
+
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
+
+        ensure_git_excluded(&repo);
+
+        assert!(
+            !victim_dir.join("exclude").exists(),
+            "a symlinked info dir must not be written through"
+        );
     }
 
     #[test]

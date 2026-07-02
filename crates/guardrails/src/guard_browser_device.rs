@@ -50,7 +50,7 @@ impl GuardBrowserDevice {
     /// The device handshake is once per *session*, independent of any repo, so
     /// the marker carries no repo scope. Delegates to the shared
     /// [`cadence_hooks_core::markers::session_marker`] primitive, which supplies
-    /// the session-id key (with the PPID→pid fallback) under the private 0700
+    /// the session-id key (with a per-process fallback) under the private 0700
     /// marker dir.
     fn marker_path(input: &HookInput) -> PathBuf {
         cadence_hooks_core::markers::session_marker(input, "browser-device", None)

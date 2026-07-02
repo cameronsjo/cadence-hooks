@@ -77,18 +77,18 @@ fn harden_marker_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// The session scope key: the Claude Code `session_id` when present, else the
-/// legacy `PPID`→`process::id()` fallback. Hooks are child processes, so `PPID`
-/// (the Claude Code process) is the stable identifier when a payload omits the
-/// session id; `process::id()` is the last-resort per-invocation value.
+/// The session scope key: the Claude Code `session_id` when present, else a
+/// per-process best-effort id.
+///
+/// No session_id in payload → per-process best-effort (advisory only; a future
+/// block-gating consumer must require session_id). The pre-CP0 `PPID` env read is
+/// gone — `PPID` is never exported into a hook's environment (the very bug #133
+/// fixed), so it only ever fell through to `process::id()` anyway.
 fn session_scope(input: &HookInput) -> String {
-    input.session_id().map(str::to_string).unwrap_or_else(|| {
-        std::env::var("PPID")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or_else(std::process::id)
-            .to_string()
-    })
+    input
+        .session_id()
+        .map(str::to_string)
+        .unwrap_or_else(|| std::process::id().to_string())
 }
 
 /// Non-cryptographic hash of `s`. `DefaultHasher::new()` uses fixed keys, so the
