@@ -869,7 +869,12 @@ mod tests {
             "session",
         ];
         // clap subcommands that are CLI actions, not hooks (no hooks.json wiring).
-        let non_hooks = ["dismiss-main-branch-warn", "declare", "status"];
+        let non_hooks = [
+            "dismiss-main-branch-warn",
+            "dismiss-enforce-worktree",
+            "declare",
+            "status",
+        ];
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();
         for ns in namespaces {
