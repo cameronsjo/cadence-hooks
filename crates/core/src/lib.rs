@@ -629,19 +629,113 @@ fn apply_feedback_footer(outcome: Outcome, msg: &str, footer: Option<&str>) -> S
     }
 }
 
+/// The stdout/stderr payloads to emit for a rendered check outcome.
+///
+/// Extracted as a pure value so the exit-code × output-shape matrix is
+/// unit-testable — [`run_check`] itself `process::exit`s and can't be asserted
+/// directly. A `None` stream means "write nothing to it."
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RenderedOutput {
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+/// Pure: compute what a check outcome writes to stdout/stderr, honoring Claude
+/// Code's exit-code contract.
+///
+/// The contract (code.claude.com/docs/en/hooks):
+/// - **Exit 0** (Allow/Nudge/LoopBlock): stdout JSON is parsed for control
+///   (`hookSpecificOutput`, `decision`); stderr is ignored.
+/// - **Exit 2** (Block): stdout is **ignored entirely** — only stderr is fed
+///   back to Claude. So a block emits *no* stdout: a JSON envelope there is
+///   never read, and a wrong-shaped one (e.g. an object-valued
+///   `additionalContext`) registers as an output-schema validation failure in
+///   telemetry while delivering nothing.
+///
+/// Structured block hints ([`BlockMetadata::fix`]) therefore ride the stderr
+/// channel: the `fix` is appended as a `Fix:` line *only when the prose doesn't
+/// already carry one*, so the machine-intended hint reaches Claude via the only
+/// channel exit 2 surfaces — without duplicating a fix the block message already
+/// spells out.
+///
+/// `footer` is the resolved feedback footer ([`feedback_footer`]); passing it in
+/// keeps this pure without touching process-global env.
+fn render_output(
+    outcome: Outcome,
+    message: Option<&str>,
+    block_metadata: Option<&BlockMetadata>,
+    event: HookEvent,
+    footer: Option<&str>,
+) -> RenderedOutput {
+    let Some(msg) = message else {
+        return RenderedOutput::default();
+    };
+    let event_name = event.name();
+    match outcome {
+        Outcome::Nudge => RenderedOutput {
+            stdout: Some(
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": msg,
+                    }
+                })
+                .to_string(),
+            ),
+            stderr: None,
+        },
+        Outcome::LoopBlock => RenderedOutput {
+            // PostToolUse re-prompt: the tool already ran, so exit 0 and use the
+            // `decision: block` convention to feed the reason back. Mirror it
+            // into additionalContext for clients that read that.
+            stdout: Some(
+                serde_json::json!({
+                    "decision": "block",
+                    "reason": msg,
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": msg,
+                    }
+                })
+                .to_string(),
+            ),
+            stderr: None,
+        },
+        Outcome::Block => {
+            // Exit 2 = stderr only. The structured `fix` (the one part that was
+            // JSON-only) folds into the prose here, on the channel exit 2
+            // surfaces — but only when the message doesn't already carry a
+            // `Fix:` line, to avoid a duplicate.
+            let mut body = msg.to_string();
+            if let Some(meta) = block_metadata {
+                let has_fix_line = msg.lines().any(|l| l.trim_start().starts_with("Fix:"));
+                if !meta.fix.is_empty() && !has_fix_line {
+                    body.push_str(&format!("\n   Fix: {}", meta.fix));
+                }
+            }
+            let mut full = apply_feedback_footer(Outcome::Block, &body, footer);
+            if !full.ends_with('\n') {
+                full.push('\n');
+            }
+            RenderedOutput {
+                stdout: None,
+                stderr: Some(full),
+            }
+        }
+        Outcome::Allow => RenderedOutput::default(),
+    }
+}
+
 /// Run a single check, emit output, and exit.
 ///
-/// Routing:
+/// Routing (delegated to the pure [`render_output`], then written and exited):
 /// - `skip_at_effort()` matches `$CLAUDE_EFFORT` → silent Allow (exit 0),
 ///   `check.run()` is not called.
-/// - Nudge → JSON to stdout with `additionalContext` (exit 0).
-///   Claude Code parses this and injects the message into Claude's context.
-///   The JSON format differs by event type (PreToolUse vs PostToolUse).
-/// - Block → plain text to stderr (exit 2). When the check supplied a
-///   [`BlockMetadata`] (via [`CheckResult::block_structured`]) and the event
-///   is `PreToolUse`, also emit a `permissionDecision: "deny"` JSON envelope
-///   on stdout so Claude reads a machine-parseable payload. Stderr is still
-///   written for clients that don't parse the envelope.
+/// - Nudge / LoopBlock → JSON to stdout (exit 0). Claude Code parses this and
+///   injects the message into Claude's context.
+/// - Block → text to stderr **only** (exit 2). Claude Code ignores stdout on a
+///   block, so no JSON envelope is emitted there; the structured [`BlockMetadata`]
+///   `fix` is folded into the stderr text instead (see [`render_output`]).
 /// - Allow → silent exit 0.
 pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
     let current_effort = std::env::var("CLAUDE_EFFORT").ok();
@@ -650,59 +744,18 @@ pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
     }
 
     let result = check.run(input);
-    if let Some(msg) = &result.message {
-        let event_name = event.name();
-        match result.outcome {
-            Outcome::Nudge => {
-                let json = serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": event_name,
-                        "additionalContext": msg
-                    }
-                });
-                println!("{json}");
-            }
-            Outcome::LoopBlock => {
-                // PostToolUse re-prompt: the tool already ran, so exit 0 and use
-                // the `decision: block` convention to feed the reason back. Also
-                // mirror it into additionalContext for clients that read that.
-                let json = serde_json::json!({
-                    "decision": "block",
-                    "reason": msg,
-                    "hookSpecificOutput": {
-                        "hookEventName": event_name,
-                        "additionalContext": msg
-                    }
-                });
-                println!("{json}");
-            }
-            Outcome::Block => {
-                let full = apply_feedback_footer(Outcome::Block, msg, feedback_footer().as_deref());
-                // Structured payload (when supplied) is delivered via the
-                // PreToolUse `deny` JSON envelope on stdout. The envelope
-                // names this only well-defined under PreToolUse — other
-                // events fall back to the legacy stderr-only path.
-                if let (Some(meta), HookEvent::PreToolUse) = (&result.block_metadata, event) {
-                    let json = serde_json::json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": event_name,
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": &full,
-                            "additionalContext": meta,
-                        }
-                    });
-                    println!("{json}");
-                }
-                // Legacy stderr surface — preserved unconditionally for
-                // backward compatibility and as the fallback when a client
-                // doesn't parse the JSON envelope.
-                eprint!("{full}");
-                if !full.ends_with('\n') {
-                    eprintln!();
-                }
-            }
-            Outcome::Allow => {}
-        }
+    let rendered = render_output(
+        result.outcome,
+        result.message.as_deref(),
+        result.block_metadata.as_ref(),
+        event,
+        feedback_footer().as_deref(),
+    );
+    if let Some(out) = rendered.stdout {
+        println!("{out}");
+    }
+    if let Some(err) = rendered.stderr {
+        eprint!("{err}");
     }
     process::exit(result.outcome.code());
 }
@@ -978,6 +1031,164 @@ mod tests {
         };
         let v = serde_json::to_value(meta).expect("serializes");
         assert_eq!(v["allowed_owners"], serde_json::json!([]));
+    }
+
+    // --- render_output: exit-code × output-shape matrix (#165) ---
+
+    #[test]
+    fn render_block_emits_no_stdout() {
+        // THE anti-regression assertion: a hard block (exit 2) must never write
+        // stdout. Claude Code ignores stdout on exit 2; a JSON envelope there is
+        // pure liability (#165 — 99 output-schema validation failures from one
+        // guard emitting an object-valued additionalContext on this ignored path).
+        let rendered = render_output(
+            Outcome::Block,
+            Some("🚫 blocked: target you don't own"),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert_eq!(rendered.stdout, None, "block must emit no stdout");
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(stderr.contains("target you don't own"));
+    }
+
+    #[test]
+    fn render_block_folds_fix_into_stderr_when_prose_lacks_one() {
+        // The structured `fix` was the only JSON-only datum; it must reach Claude
+        // via the exit-2-honored channel (stderr), appended as a Fix: line when
+        // the prose doesn't already carry one. This mirrors the reproduced #165
+        // case (`disallowed_message`, which has no prose Fix line).
+        let rendered = render_output(
+            Outcome::Block,
+            Some("🚫 blocked: no fix line here"),
+            Some(&sample_metadata()), // fix = "-R owner/repo"
+            HookEvent::PreToolUse,
+            None,
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            stderr.contains("Fix: -R owner/repo"),
+            "fix folded into stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn render_block_does_not_duplicate_existing_fix_line() {
+        // When the prose already spells out a Fix:, the metadata fix is NOT
+        // re-appended — exactly one Fix line survives.
+        let rendered = render_output(
+            Outcome::Block,
+            Some("🚫 blocked\n   Fix: add `-R owner/repo`"),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            None,
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        let fix_lines = stderr
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Fix:"))
+            .count();
+        assert_eq!(fix_lines, 1, "exactly one Fix line: {stderr}");
+    }
+
+    #[test]
+    fn render_block_without_metadata_is_stderr_only() {
+        let rendered = render_output(
+            Outcome::Block,
+            Some("plain block"),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert_eq!(rendered.stdout, None);
+        assert!(rendered.stderr.expect("stderr").contains("plain block"));
+    }
+
+    #[test]
+    fn render_block_stderr_ends_with_newline() {
+        let rendered = render_output(
+            Outcome::Block,
+            Some("no trailing newline"),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert!(rendered.stderr.expect("stderr").ends_with('\n'));
+    }
+
+    #[test]
+    fn render_block_appends_feedback_footer_when_present() {
+        let rendered = render_output(
+            Outcome::Block,
+            Some("blocked"),
+            None,
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        assert!(
+            rendered
+                .stderr
+                .expect("stderr")
+                .contains("/cadence:feedback")
+        );
+    }
+
+    #[test]
+    fn render_nudge_stdout_additional_context_is_string() {
+        // Locks the field TYPE: additionalContext must be a JSON string (schema
+        // requires a string, capped 10k chars), never a struct/object.
+        let rendered = render_output(
+            Outcome::Nudge,
+            Some("heads up: editing on main"),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert_eq!(rendered.stderr, None, "nudge writes no stderr");
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered.stdout.expect("nudge writes stdout"))
+                .expect("valid JSON");
+        assert!(
+            json["hookSpecificOutput"]["additionalContext"].is_string(),
+            "additionalContext must be a string, got {}",
+            json["hookSpecificOutput"]["additionalContext"]
+        );
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    }
+
+    #[test]
+    fn render_loop_block_shape() {
+        // Documents/guards the PostToolUse re-prompt shape: top-level decision +
+        // reason, plus the nested hookSpecificOutput mirror (string context).
+        let rendered = render_output(
+            Outcome::LoopBlock,
+            Some("rewrite this"),
+            None,
+            HookEvent::PostToolUse,
+            None,
+        );
+        assert_eq!(rendered.stderr, None);
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered.stdout.expect("loop_block writes stdout"))
+                .expect("valid JSON");
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["reason"], "rewrite this");
+        assert!(json["hookSpecificOutput"]["additionalContext"].is_string());
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    }
+
+    #[test]
+    fn render_allow_and_empty_message_emit_nothing() {
+        assert_eq!(
+            render_output(Outcome::Allow, None, None, HookEvent::PreToolUse, None),
+            RenderedOutput::default()
+        );
+        // A None message on any outcome emits nothing (the skip/allow path).
+        assert_eq!(
+            render_output(Outcome::Block, None, None, HookEvent::PreToolUse, None),
+            RenderedOutput::default()
+        );
     }
 
     #[test]
