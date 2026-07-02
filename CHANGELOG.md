@@ -4,7 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.43.0] - 2026-07-02
+## [Unreleased]
+
+### Added
+
+- **`metrics warn-stale` — telemetry staleness alarm at SessionStart + a
+  `doctor` surface (#161).** Warns once per day when the newest cadence-metrics
+  JSONL write is older than a threshold (`CADENCE_METRICS_STALE_DAYS`, default
+  4 days) — the signal the "second death" incident lacked, where the metrics
+  dir went silently quiet while sessions kept running (mis-wired hooks or a
+  disabled plugin). The pure `staleness()` core watches only top-level
+  `*.jsonl` mtimes (the `state/` marker dir never counts), and a dated
+  `state/stale_warn.date` marker throttles the nudge to once per calendar day.
+  `cadence-hooks doctor` reports the same staleness as a `Warning` (exit 1) in
+  its default scan — skipped under `--root` so a fixture run never reads the
+  dev machine's live telemetry. Fail-open everywhere (ADR-0001): a missing
+  dir, unreadable file, fresh install, bad env value, or marker IO error all
+  resolve to silence or a plain nudge — never a block. The SessionStart hook
+  wiring ships in the companion cadence-metrics plugin PR.
 
 ### Added
 

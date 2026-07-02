@@ -24,9 +24,12 @@ pub mod prices;
 pub mod scan_tokens;
 /// Snapshot HEAD before a `git commit`.
 pub mod snapshot;
+/// Warn at SessionStart when metrics telemetry has gone stale.
+pub mod warn_stale;
 
 pub use log_askuserquestion::LogAskUserQuestion;
 pub use log_commit::LogCommit;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_subagent::LogSubagent;
 pub use snapshot::Snapshot;
+pub use warn_stale::WarnStale;

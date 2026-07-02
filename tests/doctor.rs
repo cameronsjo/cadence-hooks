@@ -4,9 +4,19 @@
 //! `--root`, and assert exit code + stderr/stdout content.
 
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 fn cadence_hooks() -> Command {
     Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+}
+
+/// A HOME tempdir carrying an empty plugin cache, so the default (no-`--root`)
+/// doctor scan finds zero hooks.json findings and only the telemetry-staleness
+/// check can move the exit code.
+fn home_with_empty_cache() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".claude/plugins/cache")).unwrap();
+    home
 }
 
 /// Create `<root>/<plugin>/hooks/hooks.json` with the given JSON body.
@@ -175,8 +185,8 @@ fn doctor_quiet_warnings_print_summary_to_stdout() {
         "quiet mode with warnings must print a one-line summary to stdout"
     );
     assert!(
-        stdout.contains("missing"),
-        "summary should describe the skew: {stdout}"
+        stdout.contains("warning"),
+        "summary should describe the plugin warning(s): {stdout}"
     );
 }
 
@@ -404,6 +414,83 @@ fn doctor_default_scan_reads_installed_plugins_manifest() {
     assert!(
         stdout.contains("buggy-plugin@workbench"),
         "finding must be labeled with the manifest key: {stdout}"
+    );
+}
+
+// ── Telemetry staleness surface (default scan only) ────────────────────────
+
+#[test]
+fn doctor_default_scan_warns_on_stale_metrics() {
+    // A metrics dir whose newest .jsonl is older than the 4-day default must
+    // surface as a Warning (exit 1) in the default scan, even with a clean
+    // plugin cache.
+    let home = home_with_empty_cache();
+    let metrics = tempfile::tempdir().unwrap();
+    let jsonl = metrics.path().join("subagents.jsonl");
+    std::fs::write(&jsonl, "{}\n").unwrap();
+    // Backdate the mtime well past the default threshold.
+    let old = SystemTime::now() - Duration::from_secs(10 * 86_400);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&jsonl)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    let output = cadence_hooks()
+        .arg("doctor")
+        .env("HOME", home.path())
+        .env("CADENCE_METRICS_DIR", metrics.path())
+        .env_remove("CADENCE_METRICS_STALE_DAYS")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stale telemetry is a warning → exit 1.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("telemetry is stale"),
+        "diagnosis names staleness: {stdout}"
+    );
+    assert!(
+        stdout.contains("cadence-metrics"),
+        "finding is attributed to cadence-metrics: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_default_scan_clean_on_fresh_metrics() {
+    // A fresh metrics write (mtime ~now) is well within the threshold → clean.
+    let home = home_with_empty_cache();
+    let metrics = tempfile::tempdir().unwrap();
+    std::fs::write(metrics.path().join("subagents.jsonl"), "{}\n").unwrap();
+
+    let output = cadence_hooks()
+        .arg("doctor")
+        .env("HOME", home.path())
+        .env("CADENCE_METRICS_DIR", metrics.path())
+        .env_remove("CADENCE_METRICS_STALE_DAYS")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fresh telemetry + clean cache → exit 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("clean"),
+        "clean run reports clean: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
