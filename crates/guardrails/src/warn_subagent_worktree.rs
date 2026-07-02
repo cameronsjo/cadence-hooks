@@ -24,8 +24,6 @@
 
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Returns true if `repo_root` is a **primary checkout** — its `.git` is a
@@ -107,23 +105,16 @@ pub struct WarnSubagentWorktree;
 impl WarnSubagentWorktree {
     /// Build the per-session marker path scoped to a specific repo root.
     ///
-    /// Hashes the repo root so two repos with the same name don't share markers.
-    /// The PPID component ties the marker to the Claude Code session — hooks run
-    /// as separate child processes, so `process::id()` changes every invocation;
-    /// the parent PID (Claude Code) is stable across a session. Mirrors
-    /// `warn_main_branch::marker_path`.
-    fn marker_path(repo_root: &str) -> PathBuf {
-        let mut hasher = DefaultHasher::new();
-        repo_root.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let ppid = std::env::var("PPID")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or_else(std::process::id);
-
-        cadence_hooks_core::paths::marker_temp_dir()
-            .join(format!(".claude-subagent-worktree-warned-{hash:x}-{ppid}"))
+    /// Delegates to the shared [`cadence_hooks_core::markers::session_marker`]
+    /// primitive — keyed on the session id and repo-root hash under the private
+    /// 0700 marker dir. Migrated off the pre-CP0 `PPID`→pid scheme with the rest
+    /// of the marker family (#147); mirrors `warn_main_branch::marker_path`.
+    fn marker_path(input: &HookInput, repo_root: &str) -> PathBuf {
+        cadence_hooks_core::markers::session_marker(
+            input,
+            "subagent-worktree-warned",
+            Some(repo_root),
+        )
     }
 }
 
@@ -155,7 +146,7 @@ impl Check for WarnSubagentWorktree {
             .unwrap_or(false);
         let isolation_worktree = input.isolation() == Some("worktree");
 
-        let marker = Self::marker_path(&repo_root);
+        let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
         let allowed = is_subagent_from_main_allowed();
 
@@ -168,7 +159,7 @@ impl Check for WarnSubagentWorktree {
         );
 
         if result.outcome == Outcome::Nudge {
-            let _ = std::fs::write(&marker, "");
+            let _ = cadence_hooks_core::markers::write_marker(&marker, "");
         }
 
         result
@@ -331,25 +322,43 @@ mod tests {
 
     // --- marker path ---
 
+    fn input_with_session(sid: &str) -> HookInput {
+        HookInput {
+            session_id: Some(sid.into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn marker_path_differs_per_repo() {
-        let a = WarnSubagentWorktree::marker_path("/tmp/repo-a");
-        let b = WarnSubagentWorktree::marker_path("/tmp/repo-b");
+        let input = input_with_session("sid");
+        let a = WarnSubagentWorktree::marker_path(&input, "/tmp/repo-a");
+        let b = WarnSubagentWorktree::marker_path(&input, "/tmp/repo-b");
         assert_ne!(a, b, "marker path must include a repo-specific hash");
     }
 
     #[test]
     fn marker_path_stable_for_same_repo() {
-        let a = WarnSubagentWorktree::marker_path("/tmp/repo");
-        let b = WarnSubagentWorktree::marker_path("/tmp/repo");
+        let input = input_with_session("sid");
+        let a = WarnSubagentWorktree::marker_path(&input, "/tmp/repo");
+        let b = WarnSubagentWorktree::marker_path(&input, "/tmp/repo");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn marker_path_differs_per_session() {
+        // Session-scoped like the rest of the family (#147): two sessions in the
+        // same repo each get their own once-per-session nudge.
+        let a = WarnSubagentWorktree::marker_path(&input_with_session("sid-a"), "/tmp/repo");
+        let b = WarnSubagentWorktree::marker_path(&input_with_session("sid-b"), "/tmp/repo");
+        assert_ne!(a, b, "marker must be session-scoped");
     }
 
     #[test]
     fn marker_path_is_distinct_from_main_branch_marker() {
         // The two once-per-session guards must not collide on a marker name, or
         // one warning would suppress the other.
-        let m = WarnSubagentWorktree::marker_path("/tmp/repo");
+        let m = WarnSubagentWorktree::marker_path(&input_with_session("sid"), "/tmp/repo");
         assert!(
             m.to_string_lossy().contains("subagent-worktree-warned"),
             "marker name must be guard-specific: {}",

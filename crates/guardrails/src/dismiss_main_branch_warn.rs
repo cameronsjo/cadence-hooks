@@ -1,13 +1,24 @@
-//! Per-repo snooze for the `warn-main-branch` hook.
+//! Per-session snooze for the `warn-main-branch` hook (#135).
 //!
 //! Exposes:
-//! - `is_snoozed_now(repo_root)` — used by `warn-main-branch` to skip its nudge
+//! - `is_snoozed_now(input, repo_root)` — used by `warn-main-branch` to skip its nudge
 //! - `run_dismiss(duration_str)` — the `dismiss-main-branch-warn` subcommand entry point
 //!
-//! The marker file lives at `<repo_root>/.git/cadence-hooks/main-branch-snoozed-until`
-//! and contains a single Unix epoch-seconds line. `.git/` is gitignored by
-//! default, so the marker never accidentally gets committed.
+//! The snooze is **session-scoped**: each session dismisses the nudge for itself,
+//! and that consent does not transfer to peer sessions sharing the checkout. The
+//! marker lives in the private per-user marker dir (via
+//! [`cadence_hooks_core::markers::session_marker`], kind `main-branch-snooze`),
+//! keyed on the session id + repo hash, and holds a single Unix epoch-seconds
+//! expiry line. The 24h cap is enforced on **read** as well as write (clamped to
+//! `mtime + 24h`), so a tampered far-future body can't outlive the window.
+//!
+//! The legacy `<repo_root>/.git/cadence-hooks/main-branch-snoozed-until` location
+//! is no longer read or written by the snooze logic; [`marker_path`] is retained
+//! only as the distinctness reference the `dismiss-enforce-worktree` snooze pins
+//! against (its marker must differ from this one). Stale legacy files are
+//! orphaned harmlessly.
 
+use cadence_hooks_core::HookInput;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -47,16 +58,62 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     n.checked_mul(secs_per_unit).map(Duration::from_secs)
 }
 
-/// Marker file path for a given repo root.
+/// Legacy `.git/`-relative marker path, retained ONLY as the distinctness
+/// reference the `dismiss-enforce-worktree` snooze pins against (its marker must
+/// differ from the main-branch one). The session-scoped snooze no longer reads
+/// or writes here — see [`session_snooze_marker`].
 pub fn marker_path(repo_root: &Path) -> PathBuf {
     repo_root.join(SNOOZE_DIR).join(SNOOZE_FILE)
 }
 
+/// The session-scoped snooze marker: private per-user dir, keyed on the session
+/// id + repo hash. Both writer (`run_dismiss`) and reader ([`is_snoozed_now`])
+/// resolve it through this one helper so the paths always agree.
+fn session_snooze_marker(input: &HookInput, repo_root: &Path) -> PathBuf {
+    cadence_hooks_core::markers::session_marker(
+        input,
+        "main-branch-snooze",
+        Some(&repo_root.to_string_lossy()),
+    )
+}
+
 /// Pure: given the marker contents and current epoch, is the snooze active?
-/// Shared with `dismiss_enforce_worktree`, which uses the same marker format.
+/// Shared with `dismiss_enforce_worktree`, which uses the same marker format and
+/// stays repo-scoped by design (it exempts the shared primary checkout).
 pub(crate) fn is_snoozed_at(marker_contents: &str, now_epoch: u64) -> bool {
     let parsed: Option<u64> = marker_contents.trim().parse().ok();
     matches!(parsed, Some(until) if until > now_epoch)
+}
+
+/// Pure: is the session snooze active, with the parsed expiry **clamped** to
+/// `mtime_epoch + MAX_SNOOZE_SECONDS`? The 24h cap is thereby enforced on read,
+/// not just at write time — a marker whose body was tampered to a far-future
+/// epoch still expires 24h after it was last written (the second half of #135).
+fn is_snoozed_clamped(marker_contents: &str, mtime_epoch: u64, now_epoch: u64) -> bool {
+    let Some(parsed) = marker_contents.trim().parse::<u64>().ok() else {
+        return false;
+    };
+    let cap = mtime_epoch.saturating_add(MAX_SNOOZE_SECONDS);
+    parsed.min(cap) > now_epoch
+}
+
+/// A file's mtime as Unix epoch seconds, `None` when unreadable.
+fn file_mtime_epoch(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// The Claude Code session id for the dismiss CLI, from `CLAUDE_CODE_SESSION_ID`
+/// (exported into the Bash tool environment). Empty/unset → `None`.
+fn session_id_from_env() -> Option<String> {
+    std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Locate the current repo root via `git rev-parse --show-toplevel`.
@@ -82,28 +139,30 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-/// Convenience: read the marker for the given repo and decide if it's still
+/// Read this session's snooze marker for `repo_root` and decide if it's still
 /// active. Used by `warn-main-branch` before evaluating its own logic.
 ///
-/// The caller is responsible for resolving `repo_root` — typically via the
-/// same `git -C` query that drove branch detection. This keeps the snooze
-/// lookup keyed to the same repo as the marker write, which matters when the
-/// hook fires inside a nested repo (the outer CWD's repo would be the wrong
-/// key).
-pub fn is_snoozed_now(repo_root: &Path) -> bool {
-    let path = marker_path(repo_root);
+/// Session-scoped (#135): a peer session's snooze never suppresses this
+/// session's nudge. The caller resolves `repo_root` via the same `git -C` query
+/// that drove branch detection, so the snooze key matches the marker write even
+/// when the hook fires inside a nested repo. The parsed expiry is clamped to
+/// `mtime + 24h` on read, so a tampered body can't outlive the cap.
+pub fn is_snoozed_now(input: &HookInput, repo_root: &Path) -> bool {
+    let path = session_snooze_marker(input, repo_root);
     let Ok(contents) = fs::read_to_string(&path) else {
         return false;
     };
-    is_snoozed_at(&contents, now_epoch())
+    let mtime = file_mtime_epoch(&path).unwrap_or(0);
+    is_snoozed_clamped(&contents, mtime, now_epoch())
 }
 
 /// Entry point for the `dismiss-main-branch-warn` subcommand.
 ///
-/// Writes `<repo_root>/.git/cadence-hooks/main-branch-snoozed-until` with the
-/// epoch seconds when the snooze expires, then prints a confirmation. Exits 1
-/// on failure (missing repo, invalid duration, write error). Stays at exit 0
-/// on success — this is a user-facing CLI, not a hook.
+/// Writes the session-scoped snooze marker (private marker dir, keyed on the
+/// session id resolved from `CLAUDE_CODE_SESSION_ID`) with the epoch seconds when
+/// the snooze expires, then prints a confirmation. Exits 1 on failure (no session
+/// id, missing repo, invalid duration, write error). Stays at exit 0 on success —
+/// this is a user-facing CLI, not a hook.
 pub fn run_dismiss(duration_str: &str) -> ! {
     let duration = match parse_duration(duration_str) {
         Some(d) => d,
@@ -125,6 +184,16 @@ pub fn run_dismiss(duration_str: &str) -> ! {
         process::exit(1);
     }
 
+    // The snooze is session-scoped, so it needs the session id at write time.
+    let Some(session_id) = session_id_from_env() else {
+        eprintln!(
+            "cadence-hooks: no Claude Code session id\n   \
+             Run dismiss-main-branch-warn inside a Claude Code session \
+             (or export CLAUDE_CODE_SESSION_ID)."
+        );
+        process::exit(1);
+    };
+
     let Some(root) = repo_root() else {
         eprintln!(
             "cadence-hooks: not inside a git repository\n   \
@@ -133,22 +202,20 @@ pub fn run_dismiss(duration_str: &str) -> ! {
         process::exit(1);
     };
 
-    let path = marker_path(&root);
-    if let Some(parent) = path.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        eprintln!("cadence-hooks: could not create {}: {e}", parent.display());
-        process::exit(1);
-    }
+    let input = HookInput {
+        session_id: Some(session_id),
+        ..Default::default()
+    };
+    let path = session_snooze_marker(&input, &root);
 
     let until = now_epoch().saturating_add(secs);
-    if let Err(e) = fs::write(&path, format!("{until}\n")) {
+    if let Err(e) = cadence_hooks_core::markers::write_marker(&path, &format!("{until}\n")) {
         eprintln!("cadence-hooks: could not write {}: {e}", path.display());
         process::exit(1);
     }
 
     println!(
-        "warn-main-branch silenced for {duration_str} in {} (until epoch {until})",
+        "warn-main-branch silenced for this session for {duration_str} in {} (until epoch {until})",
         root.display()
     );
     process::exit(0);
@@ -256,10 +323,75 @@ mod tests {
 
     #[test]
     fn marker_path_is_under_dot_git() {
+        // Legacy path retained as the enforce-worktree distinctness reference.
         let p = marker_path(Path::new("/tmp/repo"));
         assert_eq!(
             p,
             Path::new("/tmp/repo/.git/cadence-hooks/main-branch-snoozed-until")
         );
+    }
+
+    // --- session-scoped snooze (#135) ---
+
+    fn input_with_session(sid: &str) -> HookInput {
+        HookInput {
+            session_id: Some(sid.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn snooze_is_session_scoped() {
+        // A snooze set by session A must not silence the nudge for peer session B
+        // sharing the same checkout — consent doesn't transfer (#135).
+        let repo = Path::new("/tmp/cp0-snooze-scope-repo");
+        let input_a = input_with_session("snooze-scope-a");
+        let input_b = input_with_session("snooze-scope-b");
+        let path_a = session_snooze_marker(&input_a, repo);
+        let until = now_epoch() + 3600;
+        cadence_hooks_core::markers::write_marker(&path_a, &format!("{until}\n")).unwrap();
+
+        assert!(is_snoozed_now(&input_a, repo), "A's own snooze is active");
+        assert!(
+            !is_snoozed_now(&input_b, repo),
+            "B is not snoozed by A's marker"
+        );
+
+        let _ = fs::remove_file(&path_a);
+    }
+
+    #[test]
+    fn read_path_clamps_expiry_to_cap() {
+        // A body tampered to a far-future epoch (year ~2100) is snoozed right
+        // after write, but the 24h read clamp expires it once we pass mtime+24h.
+        let mtime = 1_000_000_000;
+        let far_future = "4102444800"; // ~2100-01-01
+        assert!(
+            is_snoozed_clamped(far_future, mtime, mtime + 60),
+            "fresh far-future marker reads as snoozed within the cap"
+        );
+        assert!(
+            !is_snoozed_clamped(far_future, mtime, mtime + MAX_SNOOZE_SECONDS + 1),
+            "past mtime + 24h the clamp expires it despite the 2100 body"
+        );
+    }
+
+    #[test]
+    fn clamp_allows_normal_snooze_within_cap() {
+        // A within-cap 1h snooze behaves normally: active until its own expiry.
+        let mtime = 1_000_000_000;
+        let until = mtime + 3600;
+        assert!(is_snoozed_clamped(&until.to_string(), mtime, mtime + 60));
+        assert!(!is_snoozed_clamped(&until.to_string(), mtime, until + 1));
+    }
+
+    #[test]
+    fn clamp_rejects_unparseable() {
+        assert!(!is_snoozed_clamped(
+            "not-a-number",
+            1_000_000_000,
+            1_000_000_000
+        ));
+        assert!(!is_snoozed_clamped("", 1_000_000_000, 1_000_000_000));
     }
 }
