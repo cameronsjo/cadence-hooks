@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.42.0] - 2026-07-02
+## [0.43.0] - 2026-07-02
 
 ### Added
 
@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   switch, temp-rooted scratch repos, `.claude/` and `docs/plans/` paths, and a
   new `guardrails dismiss-enforce-worktree --for <duration>` snooze (24h cap).
   Fails open on any git/parse failure (ADR-0001).
+
+## [0.42.0] - 2026-07-02
+
+### Added
 
 - **Per-repo terminology exemptions (`.claude/terminology.json`).** The
   `terminology` guard now reads an optional `<git-root>/.claude/terminology.json`
