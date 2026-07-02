@@ -51,7 +51,8 @@ pub fn marker_path(repo_root: &Path) -> PathBuf {
 }
 
 /// Pure: given the marker contents and current epoch, is the snooze active?
-fn is_snoozed_at(marker_contents: &str, now_epoch: u64) -> bool {
+/// Shared with `dismiss_enforce_worktree`, which uses the same marker format.
+pub(crate) fn is_snoozed_at(marker_contents: &str, now_epoch: u64) -> bool {
     let parsed: Option<u64> = marker_contents.trim().parse().ok();
     matches!(parsed, Some(until) if until > now_epoch)
 }

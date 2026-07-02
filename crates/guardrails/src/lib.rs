@@ -5,8 +5,12 @@
 
 /// Nudge after idle periods between edits to re-check context.
 pub mod check_idle_return;
+/// Per-repo snooze command + helper consumed by `enforce_worktree`.
+pub mod dismiss_enforce_worktree;
 /// Per-repo snooze command + helper consumed by `warn_main_branch`.
 pub mod dismiss_main_branch_warn;
+/// Block mutations in a primary checkout of a branch-mode repo.
+pub mod enforce_worktree;
 /// Block the first Claude-in-Chrome action per session until the device is confirmed.
 pub mod guard_browser_device;
 /// Block direct edits to production dotfiles; redirect to chezmoi source.

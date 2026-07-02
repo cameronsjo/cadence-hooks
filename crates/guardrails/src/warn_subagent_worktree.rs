@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 /// repo's `.git/worktrees/`, so a `false` here means the session is already
 /// inside a worktree (and its subagents inherit that worktree). Mirrors the
 /// `.git`-dir primitive in `cadence_hooks_session::registry::ensure_git_excluded`.
-fn is_primary_checkout(repo_root: &str) -> bool {
+pub(crate) fn is_primary_checkout(repo_root: &str) -> bool {
     Path::new(repo_root).join(".git").is_dir()
 }
 

@@ -35,7 +35,7 @@ use std::process::Command;
 /// against the hook event's CWD, not the hook process's CWD. For Bash hooks
 /// (no file path), falls back to `input.cwd` then `.` so we still target the
 /// session's working directory rather than wherever the hook process started.
-fn git_dir_for_input(input: &HookInput) -> PathBuf {
+pub(crate) fn git_dir_for_input(input: &HookInput) -> PathBuf {
     let cwd = input
         .cwd
         .as_deref()
@@ -75,7 +75,7 @@ fn git_dir_for_input(input: &HookInput) -> PathBuf {
 ///
 /// Matches on an exact `.claude` path component, so look-alikes like
 /// `.claude-old` or `myclaude` are not exempt.
-fn is_claude_managed_dir(dir: &Path) -> bool {
+pub(crate) fn is_claude_managed_dir(dir: &Path) -> bool {
     dir.components().any(|c| c.as_os_str() == ".claude")
 }
 
@@ -90,7 +90,7 @@ fn is_claude_managed_dir(dir: &Path) -> bool {
 /// Matches consecutive `docs` → `plans` path components anywhere in the path, so
 /// a bare `plans/`, a non-adjacent `docs/foo/plans`, or a look-alike like
 /// `mydocs/plans` is not exempt.
-fn is_plan_doc_dir(dir: &Path) -> bool {
+pub(crate) fn is_plan_doc_dir(dir: &Path) -> bool {
     let comps: Vec<_> = dir.components().map(|c| c.as_os_str()).collect();
     comps.windows(2).any(|w| w[0] == "docs" && w[1] == "plans")
 }

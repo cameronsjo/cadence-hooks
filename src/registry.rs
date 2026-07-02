@@ -132,6 +132,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "enforce-worktree",
+        description: "Block mutations in a primary checkout of a branch-mode repo",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "warn-subagent-worktree",
         description: "Warn when dispatching a subagent from main while a sibling worktree exists",
         plugin: "guardrails",
@@ -429,6 +435,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // directory to resolve against.
         ("guardrails", "warn-subagent-worktree") => Some(
             r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
+        ),
+        // enforce-worktree only engages on a file mutation or git commit; the
+        // generic Bash sample would no-op. Note `try` substitutes the process
+        // cwd, so from a real primary checkout this smoke-tests live state.
+        ("guardrails", "enforce-worktree") => Some(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"/tmp/sample/file.txt"},"cwd":"/tmp"}"#,
         ),
         _ => None,
     }

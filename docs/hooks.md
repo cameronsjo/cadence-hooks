@@ -41,6 +41,7 @@ judgment to the model. It exempts retro paths and writes under `$OBSIDIAN_VAULT`
 | `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) |
 | `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` |
 | `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch |
+| `enforce-worktree` | PreToolUse (Write, Edit, Bash) | Block mutations and `git commit` in a primary checkout of a branch-mode repo — work in a worktree instead (exempt: `CADENCE_ALLOW_MAIN` repos, temp/scratch repos, `.claude/` + `docs/plans/` paths) |
 | `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base |
 | `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs |
 | `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
@@ -155,3 +156,4 @@ during maintenance.
 | `session declare` | Declare what this session is working on (`--intent`, `--touching`) so peers can assess collision risk |
 | `session status` | List live and stale sessions registered in this repo |
 | `guardrails dismiss-main-branch-warn` | Snooze `warn-main-branch` for this repo for a bounded window (`--for 2h`, capped at 24h) — see [Snoozing warn-main-branch](configuration.md#snoozing-warn-main-branch) |
+| `guardrails dismiss-enforce-worktree` | Snooze the `enforce-worktree` block for this repo for a bounded window (`--for 30m`, capped at 24h) — the one-off escape for a legitimate primary-checkout mutation |

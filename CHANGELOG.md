@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`guardrails enforce-worktree` — hard block on mutations in a primary
+  checkout of a branch-mode repo.** Enforces the worktree-isolation invariant
+  (every session in its own worktree, or in a `CADENCE_ALLOW_MAIN` repo where
+  main is the working branch by design) that replaces advisory multi-session
+  coordination — see claude-configurations ADR-0030. Blocks Edit/Write/MultiEdit
+  and leading-`git commit` (including `git -C <primary>` forms) when the target
+  repo's `.git` is a directory; linked worktrees (`.git` file) pass untouched.
+  Exemptions: `CADENCE_ALLOW_MAIN`, the `CADENCE_NO_ENFORCE_WORKTREE` kill
+  switch, temp-rooted scratch repos, `.claude/` and `docs/plans/` paths, and a
+  new `guardrails dismiss-enforce-worktree --for <duration>` snooze (24h cap).
+  Fails open on any git/parse failure (ADR-0001).
+
 - **Per-repo terminology exemptions (`.claude/terminology.json`).** The
   `terminology` guard now reads an optional `<git-root>/.claude/terminology.json`
   that softens its hard block for named files and terms — mirroring the
