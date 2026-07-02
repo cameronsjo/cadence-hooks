@@ -243,6 +243,8 @@ enum MetricsCommands {
     LogPolishNudge,
     /// Log AskUserQuestion stance + shape on every call (PreToolUse)
     LogAskUserQuestion,
+    /// Warn at SessionStart when metrics telemetry has gone stale (SessionStart)
+    WarnStale,
 }
 
 #[derive(Subcommand)]
@@ -350,6 +352,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::LogSubagent => "log-subagent",
             MetricsCommands::LogPolishNudge => "log-polish-nudge",
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
+            MetricsCommands::WarnStale => "warn-stale",
         }),
         Commands::Lab(l) => Some(match l {
             LabCommands::PersonaNudge => "persona-nudge",
@@ -798,6 +801,11 @@ fn main() {
                 &cadence_hooks_metrics::LogAskUserQuestion,
                 registry::sample_for("metrics", "log-ask-user-question"),
             ),
+            // warn-stale is a SessionStart *check*, not a logger — it reads the
+            // metrics dir's mtimes rather than reacting to a tool event.
+            MetricsCommands::WarnStale => {
+                run_check_from_stdin(&cadence_hooks_metrics::WarnStale, session)
+            }
         },
         Commands::Lab(cmd) => match cmd {
             LabCommands::PersonaNudge => {

@@ -14,6 +14,7 @@
 //! one-shot diagnostic.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::registry;
 
@@ -433,6 +434,30 @@ fn scan_root(root: &Path, channel: InstallChannel) -> Vec<Finding> {
     findings
 }
 
+/// Telemetry staleness as a doctor [`Finding`], or `None` when the metrics dir
+/// is fresh, missing, or empty (fail-open — a fresh install stays silent).
+///
+/// This is the diagnostic twin of the `metrics warn-stale` SessionStart check:
+/// same `staleness` core, but doctor consults no once-per-day marker — a
+/// diagnostic always reports the current state. A stale dir is a `Warning`
+/// (exit 1), never an `Error` — telemetry going quiet is advisory, not a
+/// shell bug.
+fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option<Finding> {
+    let report = cadence_hooks_metrics::warn_stale::staleness(dir, threshold, now)?;
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: "cadence-metrics".to_string(),
+        file: dir.to_path_buf(),
+        line: None,
+        snippet: report.newest_file.clone(),
+        diagnosis: cadence_hooks_metrics::warn_stale::staleness_summary(&report),
+        remediation: "compare wiring against a healthy machine — the metrics \
+                      plugin may be disabled or its hooks mis-wired \
+                      (`cadence-hooks list` shows what should be firing)"
+            .to_string(),
+    })
+}
+
 /// Entry point for the `doctor` subcommand. Returns the process exit code.
 ///
 /// Exit codes:
@@ -459,7 +484,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
     // Resolve the install channel once — it's process-invariant, so the scan
     // below shouldn't re-probe current_exe() per hook entry.
     let channel = install_channel();
-    let (findings, scanned) = match root_override {
+    let (mut findings, scanned) = match root_override {
         Some(root) => {
             if !root.exists() {
                 // Configuration error, not "clean" — exit 2 so a misconfigured
@@ -505,6 +530,19 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
         }
     };
 
+    // Telemetry staleness is a live-machine signal, not a hooks.json scan, so it
+    // belongs to default mode only. Under `--root` (the CI/fixture path) it would
+    // read *this* dev machine's real metrics dir and taint a fixture-scoped run.
+    if root_override.is_none()
+        && let Some(finding) = staleness_finding(
+            &cadence_hooks_metrics::warn_stale::metrics_dir(),
+            cadence_hooks_metrics::warn_stale::stale_threshold(),
+            SystemTime::now(),
+        )
+    {
+        findings.push(finding);
+    }
+
     let (errors, warnings): (Vec<&Finding>, Vec<&Finding>) =
         findings.iter().partition(|f| f.severity == Severity::Error);
 
@@ -520,9 +558,12 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
             return 2;
         }
         // Warnings only in quiet mode: one summary line to stdout, exit 0.
+        // Warnings are now version skew (missing subcommands) and/or stale
+        // telemetry, so the summary stays generic and defers the specifics to a
+        // full `cadence-hooks doctor` run.
         let version = env!("CARGO_PKG_VERSION");
         println!(
-            "cadence-hooks {version} is missing {} subcommand(s) referenced by installed plugins — {}",
+            "cadence-hooks {version}: {} plugin warning(s) — run 'cadence-hooks doctor' for details ({})",
             warnings.len(),
             upgrade_hint_short(channel)
         );
@@ -557,6 +598,45 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── staleness_finding tests ─────────────────────────────────────────────
+
+    #[test]
+    fn staleness_finding_stale_dir_is_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("subagents.jsonl"), "{}\n").unwrap();
+
+        let f = staleness_finding(tmp.path(), Duration::ZERO, SystemTime::now())
+            .expect("a stale dir must yield a finding");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.plugin, "cadence-metrics");
+        assert_eq!(f.snippet, "subagents.jsonl");
+        assert!(
+            f.diagnosis.contains("stale"),
+            "diagnosis names staleness: {}",
+            f.diagnosis
+        );
+        assert!(
+            f.remediation.contains("healthy machine"),
+            "remediation frames the compare-wiring fix: {}",
+            f.remediation
+        );
+    }
+
+    #[test]
+    fn staleness_finding_fresh_dir_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("subagents.jsonl"), "{}\n").unwrap();
+        let huge = Duration::from_secs(3650 * 86_400);
+        assert!(staleness_finding(tmp.path(), huge, SystemTime::now()).is_none());
+    }
+
+    #[test]
+    fn staleness_finding_missing_dir_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert!(staleness_finding(&missing, Duration::ZERO, SystemTime::now()).is_none());
+    }
 
     // ── extract_invocation table tests ──────────────────────────────────────
 

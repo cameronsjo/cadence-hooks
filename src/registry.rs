@@ -302,6 +302,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "metrics",
         event: None,
     },
+    HookEntry {
+        name: "warn-stale",
+        description: "Warn at SessionStart when metrics telemetry has gone stale",
+        plugin: "metrics",
+        event: Some(HookEvent::SessionStart),
+    },
     // lab
     HookEntry {
         name: "persona-nudge",
