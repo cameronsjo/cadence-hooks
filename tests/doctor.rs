@@ -495,6 +495,46 @@ fn doctor_default_scan_clean_on_fresh_metrics() {
 }
 
 #[test]
+fn doctor_root_scan_ignores_stale_metrics_env() {
+    // --root is the fixture/CI path: it must NEVER read live telemetry, even when
+    // CADENCE_METRICS_DIR points at a genuinely stale dir. Pins the
+    // "fixture scans never read live telemetry" guard (staleness skipped under
+    // --root) — the counterpart to the default-scan warning above.
+    let root = tempfile::tempdir().unwrap(); // empty scan root → clean
+    let metrics = tempfile::tempdir().unwrap();
+    let jsonl = metrics.path().join("subagents.jsonl");
+    std::fs::write(&jsonl, "{}\n").unwrap();
+    let old = SystemTime::now() - Duration::from_secs(10 * 86_400);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&jsonl)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    let output = cadence_hooks()
+        .args(["doctor", "--root"])
+        .arg(root.path())
+        .env("CADENCE_METRICS_DIR", metrics.path())
+        .env_remove("CADENCE_METRICS_STALE_DAYS")
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--root scan must ignore live telemetry staleness → exit 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("telemetry is stale"),
+        "no staleness finding under --root: {stdout}"
+    );
+}
+
+#[test]
 fn doctor_default_scan_falls_back_to_cache_walk_without_manifest() {
     // No installed_plugins.json — recursively walk the cache dir instead.
     let tmp = tempfile::tempdir().unwrap();

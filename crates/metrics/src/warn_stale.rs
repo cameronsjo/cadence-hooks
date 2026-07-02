@@ -23,6 +23,12 @@ const DEFAULT_STALE_DAYS: u64 = 4;
 
 const SECS_PER_DAY: u64 = 86_400;
 
+/// Slack past `now` before a file's mtime is treated as future-dated and
+/// excluded from the newest-write selection. Absorbs benign clock skew (NTP
+/// jitter, mtime-vs-`now` rounding) while still discarding a wildly
+/// future-stamped file that would otherwise mask a genuinely stale dir.
+const FUTURE_SLACK: Duration = Duration::from_secs(300);
+
 /// A staleness verdict: the dir's newest JSONL write is older than the
 /// threshold. Names the newest file so the message points at real telemetry.
 #[derive(Debug, PartialEq, Eq)]
@@ -68,12 +74,21 @@ pub fn metrics_dir() -> PathBuf {
 ///   `state/` subdir (markers) is never seen; the extension filter drops any
 ///   other file. The once-per-day marker therefore can never freshen the
 ///   signal it gates.
-/// - A file whose mtime is in the future (clock skew) is treated as fresh.
+/// - Files stamped more than [`FUTURE_SLACK`] into the future are **excluded**
+///   from the newest-write selection. A single clock-skewed or hostile
+///   future-dated file must not become a perpetual "newest" whose age underflows
+///   and silently reports the whole dir fresh — the exact blind spot the alarm
+///   exists to avoid. Staleness is computed from the newest *non-future* file.
+/// - Residual case: when *every* `*.jsonl` is future-dated (all excluded), there
+///   is no non-future write to judge, so the result is `None` (fail-open). A
+///   wholly future-stamped dir is a broken clock, not evidence of staleness, and
+///   silence is the safe direction.
 /// - Missing dir, unreadable dir, or no `*.jsonl` → `None` (fail-open: a fresh
 ///   install is indistinguishable from a healthy one, so it stays silent).
 pub fn staleness(dir: &Path, threshold: Duration, now: SystemTime) -> Option<StaleReport> {
     let entries = std::fs::read_dir(dir).ok()?;
 
+    let future_cutoff = now + FUTURE_SLACK;
     let mut newest: Option<(SystemTime, String)> = None;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -89,6 +104,11 @@ pub fn staleness(dir: &Path, threshold: Duration, now: SystemTime) -> Option<Sta
         let Ok(mtime) = meta.modified() else {
             continue;
         };
+        // Skip a far-future file so it can never mask a stale dir by winning the
+        // newest-write race.
+        if mtime > future_cutoff {
+            continue;
+        }
         let is_newer = newest.as_ref().is_none_or(|(seen, _)| mtime > *seen);
         if is_newer {
             let name = path
@@ -100,8 +120,9 @@ pub fn staleness(dir: &Path, threshold: Duration, now: SystemTime) -> Option<Sta
     }
 
     let (mtime, name) = newest?;
-    // A future mtime (clock skew) makes `duration_since` err → treat as fresh.
-    let age = now.duration_since(mtime).ok()?;
+    // The newest file is within `FUTURE_SLACK` of now, so a within-slack skew
+    // makes `duration_since` err → clamp to zero (fresh), never underflow.
+    let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
     if age <= threshold {
         return None;
     }
@@ -317,6 +338,59 @@ mod tests {
             matches!(r.outcome, Outcome::Allow | Outcome::Nudge),
             "warn-stale must never block: {:?}",
             r.outcome
+        );
+    }
+
+    /// Stamp `name`'s mtime `secs` into the future — the clock-skew fixture.
+    fn write_future_jsonl(dir: &Path, name: &str, secs: u64) {
+        let path = dir.join(name);
+        fs::write(&path, "{}\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    // 10. A future-dated file must not mask a genuinely stale dir: staleness is
+    //     computed from the newest NON-future file, so the alarm still fires and
+    //     names that file, not the future one.
+    #[test]
+    fn future_mtime_ignored_uses_non_future_file() {
+        let tmp = TempDir::new().unwrap();
+        write_jsonl(tmp.path(), "subagents.jsonl"); // ~now → stale under ZERO
+        write_future_jsonl(tmp.path(), "commits.jsonl", 10 * SECS_PER_DAY);
+
+        let r = run_warn_stale(tmp.path(), Duration::ZERO, SystemTime::now());
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "future file must not mask staleness"
+        );
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("subagents.jsonl"),
+            "reports the non-future file: {msg}"
+        );
+        assert!(
+            !msg.contains("commits.jsonl"),
+            "future file excluded: {msg}"
+        );
+    }
+
+    // 11. When EVERY .jsonl is future-dated, there is no non-future write to
+    //     judge → fail-open silent (a broken clock is not evidence of staleness).
+    #[test]
+    fn all_future_silent() {
+        let tmp = TempDir::new().unwrap();
+        write_future_jsonl(tmp.path(), "subagents.jsonl", 10 * SECS_PER_DAY);
+
+        let r = run_warn_stale(tmp.path(), Duration::ZERO, SystemTime::now());
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "all-future dir is fail-open silent"
         );
     }
 }
