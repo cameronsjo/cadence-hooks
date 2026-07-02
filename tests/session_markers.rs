@@ -54,14 +54,21 @@ fn init_main_repo() -> tempfile::TempDir {
 
 /// A payload unique per run so markers from prior test runs (which persist in
 /// the temp marker dir) never mask the assertion.
+///
+/// Built with a JSON serializer, NOT `format!`: on Windows the repo/file paths
+/// carry backslashes (`C:\Users\...`), and a raw `\U`/`\r` in a JSON string is an
+/// invalid escape — a hand-built payload fails `HookInput::from_stdin`, the hook
+/// fails open (exit 0, silent), and invocation 1 never nudges. Serializing
+/// escapes the backslashes so the payload parses on every platform.
 fn edit_payload(repo: &std::path::Path, session_id: &str) -> String {
     let file = repo.join("f.txt");
-    format!(
-        r#"{{"session_id":"{}","cwd":"{}","tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#,
-        session_id,
-        repo.display(),
-        file.display()
-    )
+    serde_json::json!({
+        "session_id": session_id,
+        "cwd": repo.to_string_lossy(),
+        "tool_name": "Edit",
+        "tool_input": { "file_path": file.to_string_lossy() },
+    })
+    .to_string()
 }
 
 #[test]
