@@ -183,22 +183,11 @@ pub fn is_safe_session_id(session_id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// True when `path` resolves inside `dir` (string-prefix on normalized paths).
-///
-/// `path` arrives forward-slash-normalized (from `HookInput::file_path`), but
-/// `dir` is a native `PathBuf` whose `to_string_lossy` is backslash-joined on
-/// Windows. Normalize both sides so the prefix test is separator-agnostic —
-/// otherwise the gate never recognizes its own staging dir on Windows.
+/// True when `path` resolves inside `dir`. Delegates to the shared
+/// [`cadence_hooks_core::paths::is_within`] so the containment primitive lives in
+/// one place (promoted there for the #139 terminology-guard narrowing).
 pub fn is_within(path: &str, dir: &Path) -> bool {
-    let path = cadence_hooks_core::normalize_path(path);
-    if path.contains("..") {
-        return false;
-    }
-    let needle = format!(
-        "{}/",
-        cadence_hooks_core::normalize_path(&dir.to_string_lossy())
-    );
-    path.starts_with(&needle)
+    cadence_hooks_core::paths::is_within(path, dir)
 }
 
 #[cfg(test)]
