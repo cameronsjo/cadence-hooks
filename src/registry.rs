@@ -186,6 +186,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "guard-read-model",
+        description: "Block Read/Grep by resolved session model (opt-in)",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "warn-pr-issue-link",
         description: "Nudge when gh pr create has no closing issue keyword",
         plugin: "guardrails",
@@ -496,6 +502,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("guardrails", "enforce-worktree") => Some(
             r#"{"tool_name":"Edit","tool_input":{"file_path":"/tmp/sample/file.txt"},"cwd":"/tmp"}"#,
         ),
+        // guard-read-model only gates Read/Grep; the generic Bash PreToolUse
+        // sample would no-op. Carry a Read payload so `try`/list fail-open cleanly
+        // (no MODELS env in a smoke run → disabled → allow).
+        ("guardrails", "guard-read-model") => {
+            Some(r#"{"tool_name":"Read","tool_input":{"file_path":"/tmp/x"},"cwd":"/tmp"}"#)
+        }
         _ => None,
     }
 }

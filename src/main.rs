@@ -38,6 +38,7 @@ const PROTECTED_GUARDS: &[&str] = &[
     "guard-op-vault-scan",
     "guard-browser-device",
     "guard-dotfiles",
+    "guard-read-model",
     "trash-guard",
 ];
 
@@ -184,6 +185,8 @@ enum GuardrailsCommands {
     WarnUntracked,
     /// Block direct edits to production dotfiles (opt-in via CADENCE_GUARD_DOTFILES=1)
     GuardDotfiles,
+    /// Block Read/Grep by resolved session model (opt-in via CADENCE_READ_MODEL_GUARD_MODELS)
+    GuardReadModel,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
     WarnPrIssueLink,
     /// Nudge when `gh issue create` targets a repo other than the canonical issue tracker
@@ -347,6 +350,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
             GuardrailsCommands::WarnUntracked => "warn-untracked",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
+            GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
             GuardrailsCommands::WarnGoingPublic => "warn-going-public",
@@ -784,6 +788,11 @@ fn main() {
             ),
             GuardrailsCommands::GuardDotfiles => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::GuardReadModel => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_read_model::GuardReadModel,
                 pre,
                 canonical_hook,
             ),

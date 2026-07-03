@@ -25,6 +25,8 @@ pub mod guard_git_init;
 pub mod guard_op_vault_scan;
 /// Block `git push` to remotes owned by others.
 pub mod guard_push_remote;
+/// Opt-in per-model Read/Grep guard; block reads by the resolved session model.
+pub mod guard_read_model;
 /// Inject the gh-write allowlist + `-R` rule on SessionStart.
 pub mod inject_gh_context;
 /// Shared closing-keyword detection for GitHub issue references.
