@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`effective_content()` reads the literal write target, not the normalized path (#129).** For Edit/MultiEdit the helper now simulates against the file actually being written — a trailing-space/backslash/null path variant no longer makes a guard validate a different (or missing) file. Fail-open on an unreadable/non-UTF-8 file is preserved (ADR-0001) and documented; a future *blocking* content-security guard must supply its own fail-closed default.
+
+### Security
+
+- **`check-security-patterns` scans the simulated post-edit document and gains RCE/XSS coverage (#131).** The guard now routes through `effective_content()` (correct line numbers; no more scanning an Edit fragment or a MultiEdit's stale pre-edit file), and flags Python `eval(`/`exec(`/`os.system(`/`pickle.load(` and JS `eval(`/`document.write(`/`dangerouslySetInnerHTML`. Advisory-only (never blocks).
 ### Security
 
 - **Harden untrusted `.claude/*.json` config reads against a local special-file DoS (#157).** The per-repo `terminology.json` and `redaction.json` readers used an unbounded `fs::read_to_string` with no file-type check, so a `.claude/*.json` that was a symlink to an endless special file (`/dev/zero`, a FIFO) or a multi-GB blob could hang or OOM the hook when it fired inside a cloned/shared repo. Both now route through a new `core::paths::read_untrusted_config`, which rejects anything that is not a regular file (on `stat`, before any blocking read) and caps the read at 1 MiB, failing open (ADR-0001) — a rejected config is treated as absent.

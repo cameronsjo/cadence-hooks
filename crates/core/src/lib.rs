@@ -341,10 +341,18 @@ impl HookInput {
     /// The full document the tool call will produce.
     ///
     /// - Write (`content` present) → the content as-is.
-    /// - Edit (`old_string`/`new_string` present) → reads `file_path` from disk,
-    ///   applies the replacement (honoring `replace_all`), returns the result.
+    /// - Edit (`old_string`/`new_string` present) → reads the **literal**
+    ///   `file_path` (falling back to `path`) from disk — *not* the
+    ///   `normalize_path`-processed value — applies the replacement (honoring
+    ///   `replace_all`), returns the result. Simulating against the literal
+    ///   write target keeps a guard validating the same file Claude Code will
+    ///   actually write, even when the path carries a trailing space/backslash
+    ///   or null byte.
     /// - MultiEdit (`edits[]` present) → reads the file, applies each edit in order.
-    /// - File unreadable or missing for Edit/MultiEdit → `None` (fail open, ADR-0001).
+    /// - File unreadable, missing, or non-UTF-8 for Edit/MultiEdit → `None`
+    ///   (fail open, ADR-0001). A future *blocking* content-security guard that
+    ///   adopts this helper must supply its own fail-closed default rather than
+    ///   treating `None` as "allow".
     pub fn effective_content(&self) -> Option<String> {
         let ti = self.tool_input.as_ref()?;
 
@@ -353,9 +361,11 @@ impl HookInput {
             return Some(content.to_string());
         }
 
-        // Edit / MultiEdit: simulate the edit against the on-disk file.
-        let path = self.file_path()?;
-        let on_disk = std::fs::read_to_string(&path).ok()?;
+        // Edit / MultiEdit: simulate the edit against the on-disk file, reading
+        // the LITERAL write target (not the normalized path) so the simulation
+        // matches the exact file Claude Code will write.
+        let path = ti.file_path.as_deref().or(ti.path.as_deref())?;
+        let on_disk = std::fs::read_to_string(path).ok()?;
 
         if let (Some(old), Some(new)) = (ti.old_string.as_deref(), ti.new_string.as_deref()) {
             return Some(apply_edit(
@@ -1520,6 +1530,32 @@ mod tests {
     fn effective_content_edit_missing_file_is_none() {
         let input = make_disk_edit("/nonexistent/path/doc.md", "a", "b", None);
         assert_eq!(input.effective_content(), None);
+    }
+
+    #[test]
+    fn effective_content_edit_reads_literal_not_normalized_path() {
+        // A path with a trailing space: normalize_path() would trim it and read
+        // a *different* (nonexistent) file. effective_content() must read the
+        // LITERAL write target so a guard validates the same file Claude Code
+        // actually writes (#129).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md ");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+
+        let literal = path.to_str().unwrap();
+        assert!(
+            literal.ends_with(' '),
+            "test path must retain its trailing space, got {literal:?}"
+        );
+        // The normalized form trims the space and points at a nonexistent file.
+        assert_ne!(normalize_path(literal), literal);
+
+        let input = make_disk_edit(literal, "line two", "line 2", None);
+        assert_eq!(
+            input.effective_content().as_deref(),
+            Some("line one\nline 2\n"),
+            "should simulate against the literal trailing-space path, not the trimmed one"
+        );
     }
 
     #[test]
