@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - threshold-gated hook self-timing — hooks slower than CADENCE_HOOK_TIMING_THRESHOLD_MS (default 1000) are logged to hooks.jsonl (#143)
 - warn-subagent-concurrency — nudges when live subagents reach CADENCE_MAX_CONCURRENT_SUBAGENTS (default 5) (#145)
+- warn-branch-intent — nudges when new work starts on a stale, unrelated branch; once per session, opt out with CADENCE_ALLOW_BRANCH_INTENT (#155)
 
 ### Fixed
 
