@@ -248,6 +248,13 @@ enum MetricsCommands {
     },
     /// Log subagent lifecycle (SubagentStart / SubagentStop)
     LogSubagent,
+    /// Log per-session cost at SessionEnd (SessionEnd)
+    LogSession {
+        /// Override path to the model price table (JSON). Falls back to the
+        /// embedded default; `CADENCE_METRICS_PRICES` env takes precedence.
+        #[arg(long, value_name = "PATH")]
+        prices: Option<String>,
+    },
     /// Log polish-nudge skips: `gh pr create` + whether /polish ran (PostToolUse)
     LogPolishNudge,
     /// Log AskUserQuestion stance + shape on every call (PreToolUse)
@@ -363,6 +370,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::Snapshot => "snapshot",
             MetricsCommands::LogCommit { .. } => "log-commit",
             MetricsCommands::LogSubagent => "log-subagent",
+            MetricsCommands::LogSession { .. } => "log-session",
             MetricsCommands::LogPolishNudge => "log-polish-nudge",
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
             MetricsCommands::WarnStale => "warn-stale",
@@ -812,6 +820,12 @@ fn main() {
             MetricsCommands::LogSubagent => run_logger_from_stdin(
                 &cadence_hooks_metrics::LogSubagent,
                 registry::sample_for("metrics", "log-subagent"),
+            ),
+            MetricsCommands::LogSession { prices } => run_logger_from_stdin(
+                &cadence_hooks_metrics::LogSession {
+                    prices_path: prices,
+                },
+                registry::sample_for("metrics", "log-session"),
             ),
             MetricsCommands::LogPolishNudge => run_logger_from_stdin(
                 &cadence_hooks_metrics::LogPolishNudge,

@@ -439,6 +439,10 @@ pub struct MetricsInput {
     pub parent_agent_id: Option<String>,
     pub source_agent_id: Option<String>,
     pub duration_ms: Option<u64>,
+    /// SessionEnd exit reason (e.g. `other`, `prompt_input_exit`, `resume`),
+    /// when the payload carries it. Recorded on the `sessions.jsonl` row so a
+    /// session's terminal cause is greppable; deserializes to `None` when absent.
+    pub reason: Option<String>,
     /// Model id for the session (e.g. `claude-opus-4-8`), when the payload
     /// carries it (SessionStart and some Pre/PostToolUse payloads). Mirrors
     /// [`HookInput::model`]; deserializes to `None` when absent.
@@ -1774,7 +1778,17 @@ mod tests {
         assert_eq!(input.transcript_path, None);
         assert_eq!(input.agent_id, None);
         assert_eq!(input.duration_ms, None);
+        assert_eq!(input.reason, None);
         assert_eq!(input.command(), None);
+    }
+
+    #[test]
+    fn metrics_input_parses_session_end_reason() {
+        // The SessionEnd payload carries `reason`; it lands on the
+        // `sessions.jsonl` row so a session's terminal cause is greppable.
+        let json = r#"{"session_id":"s1","hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#;
+        let input = MetricsInput::from_json(json).unwrap();
+        assert_eq!(input.reason.as_deref(), Some("prompt_input_exit"));
     }
 
     #[test]

@@ -1,0 +1,163 @@
+//! Integration tests for `metrics log-session` — the `sessions.jsonl` writer
+//! that fires at `SessionEnd` (O3).
+//!
+//! The binary is spawned as a child process with `CADENCE_METRICS_DIR` pointed
+//! at a per-test tempdir, so the write lands nowhere real and the env override
+//! is isolated (never touches the test runner's process-global env).
+
+use std::io::Write;
+use std::process::Command;
+
+fn cadence_hooks() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    // Don't inherit env that would bypass, disable, or re-price the logger.
+    cmd.env_remove("CADENCE_BYPASS");
+    cmd.env_remove("CADENCE_DISABLE");
+    cmd.env_remove("CLAUDECODE");
+    cmd.env_remove("CADENCE_METRICS_PRICES");
+    cmd
+}
+
+/// Spawn the binary with JSON on stdin and return the completed output.
+fn run_with_stdin(mut cmd: Command, input: &str) -> std::process::Output {
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to execute binary");
+    if let Some(ref mut stdin) = child.stdin {
+        match stdin.write_all(input.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("failed to write to child stdin: {e}"),
+        }
+    }
+    child.wait_with_output().expect("failed to wait on binary")
+}
+
+/// A transcript with two priced assistant messages. Written to `path`.
+fn write_transcript(path: &std::path::Path) {
+    let transcript = [
+        r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+        r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":100}}}"#,
+        r#"{"message":{"id":"m2","role":"assistant","model":"claude-opus-4-7","usage":{"input_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":200}}}"#,
+    ]
+    .join("\n");
+    std::fs::write(path, transcript).expect("write transcript");
+}
+
+// ── RED-first: no row without a SessionEnd event ─────────────────────────
+
+#[test]
+fn non_session_end_event_writes_no_row() {
+    // The gate: a PostToolUse payload (wrong event) must not write a session
+    // row. This is the RED assertion — the absence the writer must respect.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_METRICS_DIR", dir.path());
+    cmd.args(["metrics", "log-session"]);
+    let payload = format!(
+        r#"{{"session_id":"sess-1","hook_event_name":"PostToolUse","transcript_path":"{}","cwd":"/tmp"}}"#,
+        transcript.display()
+    );
+    let output = run_with_stdin(cmd, &payload);
+
+    assert_eq!(output.status.code(), Some(0), "loggers always exit 0");
+    assert!(
+        !dir.path().join("sessions.jsonl").exists(),
+        "no row for a non-SessionEnd event"
+    );
+}
+
+// ── GREEN: one row at SessionEnd, with the full schema ───────────────────
+
+#[test]
+fn session_end_writes_one_priced_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_METRICS_DIR", dir.path());
+    cmd.args(["metrics", "log-session"]);
+    let payload = format!(
+        r#"{{"session_id":"sess-1","hook_event_name":"SessionEnd","transcript_path":"{}","cwd":"/tmp","reason":"prompt_input_exit"}}"#,
+        transcript.display()
+    );
+    let output = run_with_stdin(cmd, &payload);
+    assert_eq!(output.status.code(), Some(0), "loggers always exit 0");
+
+    let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl"))
+        .expect("sessions.jsonl must exist after SessionEnd");
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "exactly one row, got: {contents}");
+
+    let row: serde_json::Value = serde_json::from_str(lines[0]).expect("row parses as JSON");
+    assert_eq!(row["sessionId"], "sess-1");
+    assert_eq!(row["reason"], "prompt_input_exit");
+    assert_eq!(row["model"], "claude-opus-4-7");
+    // tokens == whole-transcript sum (m1 + m2).
+    assert_eq!(row["tokens"]["input"], 3000);
+    assert_eq!(row["tokens"]["output"], 300);
+    assert_eq!(row["messagesScanned"], 2);
+    // A priced model → positive cost, non-empty byModel, empty unpricedModels.
+    assert!(row["costUsd"].as_f64().unwrap() > 0.0, "priced model costs > 0");
+    assert!(!row["byModel"].as_array().unwrap().is_empty());
+    assert!(row["unpricedModels"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn unpriced_model_lands_in_unpriced_never_silently_zero() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    // `gpt-9` is absent from the embedded price table (#95).
+    std::fs::write(
+        &transcript,
+        r#"{"message":{"id":"m1","role":"assistant","model":"gpt-9","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+    )
+    .expect("write transcript");
+
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_METRICS_DIR", dir.path());
+    cmd.args(["metrics", "log-session"]);
+    let payload = format!(
+        r#"{{"session_id":"sess-2","hook_event_name":"SessionEnd","transcript_path":"{}","cwd":"/tmp"}}"#,
+        transcript.display()
+    );
+    let output = run_with_stdin(cmd, &payload);
+    assert_eq!(output.status.code(), Some(0));
+
+    let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl")).expect("row written");
+    let row: serde_json::Value =
+        serde_json::from_str(contents.lines().next().unwrap()).expect("parse");
+    let unpriced = row["unpricedModels"].as_array().unwrap();
+    assert_eq!(unpriced.len(), 1);
+    assert_eq!(unpriced[0], "gpt-9");
+    assert!(row["reason"].is_null(), "absent reason → null");
+}
+
+// ── Fail-open: an unwritable metrics dir never perturbs the exit code ─────
+
+#[test]
+fn unwritable_metrics_dir_fails_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+
+    // Point CADENCE_METRICS_DIR at a *file* — create_dir_all fails, the write
+    // is skipped, and the logger still exits 0 without panicking.
+    let blocker = dir.path().join("not-a-dir");
+    std::fs::write(&blocker, "x").expect("write blocker file");
+
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_METRICS_DIR", &blocker);
+    cmd.args(["metrics", "log-session"]);
+    let payload = format!(
+        r#"{{"session_id":"sess-3","hook_event_name":"SessionEnd","transcript_path":"{}","cwd":"/tmp"}}"#,
+        transcript.display()
+    );
+    let output = run_with_stdin(cmd, &payload);
+    assert_eq!(output.status.code(), Some(0), "fail-open: still exits 0");
+}

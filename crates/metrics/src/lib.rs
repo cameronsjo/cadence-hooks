@@ -16,8 +16,12 @@ pub mod log_askuserquestion;
 pub mod log_commit;
 /// Append polish-nudge (`gh pr create`) records to `polish_nudges.jsonl`.
 pub mod log_polish_nudge;
+/// Append per-session cost records to `sessions.jsonl` at `SessionEnd`.
+pub mod log_session;
 /// Append subagent lifecycle records to `subagents.jsonl`.
 pub mod log_subagent;
+/// Shared per-model breakdown builders for `byModel[]` / `unpricedModels[]`.
+pub mod model_breakdown;
 /// Embedded + overridable model price table.
 pub mod prices;
 /// Sum transcript token usage over a range.
@@ -30,6 +34,7 @@ pub mod warn_stale;
 pub use log_askuserquestion::LogAskUserQuestion;
 pub use log_commit::LogCommit;
 pub use log_polish_nudge::LogPolishNudge;
+pub use log_session::LogSession;
 pub use log_subagent::LogSubagent;
 pub use snapshot::Snapshot;
 pub use warn_stale::WarnStale;

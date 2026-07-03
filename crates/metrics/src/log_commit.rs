@@ -5,7 +5,8 @@
 //! Port of `log-commit.sh`. Silent no-op on any failure — never blocks.
 
 use crate::common;
-use crate::compute_cost::{compute_cost, compute_cost_by_model};
+use crate::compute_cost::compute_cost_by_model;
+use crate::model_breakdown::{by_model_json, unpriced_models};
 use crate::prices::Prices;
 use crate::scan_tokens::{ScanResult, scan_tokens};
 use cadence_hooks_core::{Logger, MetricsInput};
@@ -146,35 +147,11 @@ fn build_commit_record(
     since_marker: &str,
     prices: &Prices,
 ) -> Value {
-    // Per-model breakdown for the byModel field.
-    let by_model: Vec<Value> = scan
-        .by_model
-        .iter()
-        .map(|(model, tokens)| {
-            let bucket_cost = compute_cost(tokens, model, prices);
-            json!({
-                "model": model,
-                "tokens": {
-                    "input": tokens.input,
-                    "cacheCreate": tokens.cache_create,
-                    "cacheRead": tokens.cache_read,
-                    "output": tokens.output,
-                },
-                "costUsd": bucket_cost,
-            })
-        })
-        .collect();
-
-    // Models absent from the price table compute to $0 silently (#95). Record
-    // them so an unknown/unpriced model is loud in the data — a non-empty array
-    // means costUsd is understated and a reprocessing pass can recompute once
-    // the table is patched. Empty in the normal (all-priced) case.
-    let unpriced: Vec<&str> = scan
-        .by_model
-        .iter()
-        .filter(|(model, _)| prices.get(model).is_none())
-        .map(|(model, _)| model.as_str())
-        .collect();
+    // Per-model breakdown + unpriced-model flags, shared verbatim with
+    // `log_session` so the two loggers' shapes cannot drift (see
+    // `crate::model_breakdown`).
+    let by_model = by_model_json(&scan.by_model, prices);
+    let unpriced = unpriced_models(&scan.by_model, prices);
 
     json!({
         "ts": ts,
