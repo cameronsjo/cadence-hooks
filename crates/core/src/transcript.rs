@@ -8,8 +8,50 @@
 //! gate that blocks an evidenced polish-skip share one implementation and one
 //! set of tests.
 
+use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+/// Minimal transcript-line shape for model resolution. Only the fields
+/// [`last_assistant_model`] needs are deserialized; every other key is ignored.
+/// Deliberately local (not shared with `metrics::scan_tokens`) so the guardrails
+/// path carries no `metrics` dependency — see the reference implementation
+/// `metrics::scan_tokens::scan_tokens`, which resolves the same last-assistant
+/// model as a side effect of token accounting.
+#[derive(Deserialize)]
+struct ModelLine {
+    message: Option<ModelMessage>,
+}
+
+#[derive(Deserialize)]
+struct ModelMessage {
+    role: Option<String>,
+    model: Option<String>,
+}
+
+/// The model id of the *last* assistant message in a session transcript, or
+/// `None` when no assistant message carries a non-empty `model`.
+///
+/// Scans lines from the tail (`.lines().rev()`) and returns the first that
+/// parses as a message with `role == "assistant"` and a non-empty `model` —
+/// so the newest model wins and a short transcript with a late model is cheap.
+/// Corrupt lines, non-assistant messages, and assistant messages without a
+/// model are skipped, never fatal. Pure — operates on the transcript text, no
+/// I/O.
+///
+/// Reference implementation: `metrics::scan_tokens::scan_tokens` resolves the
+/// same last-assistant model while accounting tokens; this is the minimal,
+/// dependency-free variant the read-model guard needs.
+pub fn last_assistant_model(transcript: &str) -> Option<String> {
+    transcript.lines().rev().find_map(|line| {
+        let parsed = serde_json::from_str::<ModelLine>(line).ok()?;
+        let message = parsed.message?;
+        if message.role.as_deref() != Some("assistant") {
+            return None;
+        }
+        message.model.filter(|m| !m.is_empty())
+    })
+}
 
 /// True when the session transcript contains a `cadence-forge:polish` Skill
 /// invocation. Pure — operates on the transcript text, no I/O.
@@ -273,5 +315,72 @@ mod tests {
         )
         .unwrap();
         assert!(!subagent_transcripts_have_polish_run(&parent));
+    }
+
+    // --- last_assistant_model (#144) ---
+
+    fn model_line(role: &str, model: &str) -> String {
+        format!(r#"{{"message":{{"role":"{role}","model":"{model}"}}}}"#)
+    }
+
+    #[test]
+    fn last_assistant_model_returns_newest() {
+        // Two assistant models in order — the last (tail-most) wins.
+        let transcript = [
+            model_line("assistant", "claude-sonnet-4-5"),
+            model_line("assistant", "claude-opus-4-8"),
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_model(&transcript).as_deref(),
+            Some("claude-opus-4-8"),
+            "the last assistant model must win over earlier ones"
+        );
+    }
+
+    #[test]
+    fn last_assistant_model_skips_trailing_user_and_corrupt_lines() {
+        // A trailing user turn and a corrupt line after the assistant model must
+        // not shadow it — the scan skips non-assistant and unparseable lines.
+        let transcript = [
+            model_line("assistant", "claude-opus-4-8"),
+            r#"{"message":{"role":"user","content":"next"}}"#.to_string(),
+            "not json {{".to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_model(&transcript).as_deref(),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn last_assistant_model_none_without_assistant() {
+        // Only user turns → no model to resolve.
+        let transcript = [
+            r#"{"message":{"role":"user","content":"hi"}}"#,
+            r#"{"message":{"role":"user","content":"still hi"}}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_assistant_model(&transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_model_none_when_assistant_has_no_model() {
+        // Assistant messages without a `model` field yield None, not a panic.
+        let transcript = r#"{"message":{"role":"assistant","content":"thinking"}}"#;
+        assert_eq!(last_assistant_model(transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_model_ignores_empty_model_string() {
+        // A present-but-empty model is treated as absent.
+        let transcript = model_line("assistant", "");
+        assert_eq!(last_assistant_model(&transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_model_empty_transcript_is_none() {
+        assert_eq!(last_assistant_model(""), None);
     }
 }

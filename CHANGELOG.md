@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - threshold-gated hook self-timing — hooks slower than CADENCE_HOOK_TIMING_THRESHOLD_MS (default 1000) are logged to hooks.jsonl (#143)
 - warn-subagent-concurrency — nudges when live subagents reach CADENCE_MAX_CONCURRENT_SUBAGENTS (default 5) (#145)
 - warn-branch-intent — nudges when new work starts on a stale, unrelated branch; once per session, opt out with CADENCE_ALLOW_BRANCH_INTENT (#155)
+- **guard-read-model — opt-in per-model Read/Grep guard (#144).** Resolves the current session model from the transcript tail (`core::transcript::last_assistant_model`, no metrics dep) and blocks Read/Grep per `CADENCE_READ_MODEL_GUARD_*` policy: `CADENCE_READ_MODEL_GUARD_MODELS` (space/comma list of family keywords or full ids; unset → disabled), `CADENCE_READ_MODEL_GUARD_MODE` (`deny`|`allow`, default `deny`), `CADENCE_READ_MODEL_GUARD_ON_UNKNOWN` (`block`|`allow`, default `allow`). Matching is case-insensitive substring (`opus` matches `claude-opus-4-8`). Blocks ONLY on a positively-identified denied model; fail-open on unknown — a missing/empty/unreadable transcript never bricks reads (ADR-0001).
 
 ### Fixed
 

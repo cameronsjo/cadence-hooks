@@ -124,6 +124,39 @@ pub fn make_agent(subagent_type: Option<&str>, isolation: Option<&str>, cwd: &st
     }
 }
 
+/// Build a `HookInput` for a `Read` tool invocation, optionally carrying the
+/// session `transcript_path` the read-model guard resolves the model from.
+pub fn make_read(path: &str, transcript_path: Option<&str>) -> HookInput {
+    HookInput {
+        tool_name: Some("Read".into()),
+        tool_input: Some(ToolInput {
+            file_path: Some(path.into()),
+            ..Default::default()
+        }),
+        transcript_path: transcript_path.map(Into::into),
+        ..Default::default()
+    }
+}
+
+/// Build a `HookInput` for a `Grep` tool invocation, optionally carrying the
+/// session `transcript_path`.
+///
+/// Grep's `pattern` has no dedicated `ToolInput` field, and the read-model guard
+/// branches only on `tool_name` + `transcript_path` (never on tool-input
+/// content), so the pattern rides in `command` purely to preserve the caller's
+/// value.
+pub fn make_grep(pattern: &str, transcript_path: Option<&str>) -> HookInput {
+    HookInput {
+        tool_name: Some("Grep".into()),
+        tool_input: Some(ToolInput {
+            command: Some(pattern.into()),
+            ..Default::default()
+        }),
+        transcript_path: transcript_path.map(Into::into),
+        ..Default::default()
+    }
+}
+
 /// Build a `HookInput` for a `SessionStart` event with the given session id and
 /// source (`startup` | `resume` | `clear` | `compact`).
 pub fn make_session(session_id: &str, source: &str) -> HookInput {
