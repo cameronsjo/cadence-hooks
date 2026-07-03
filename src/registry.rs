@@ -144,6 +144,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-subagent-concurrency",
+        description: "Nudge when live subagents reach the concurrency cap on an Agent/Task spawn",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "check-idle-return",
         description: "Nudge after idle periods between edits",
         plugin: "guardrails",
@@ -458,6 +464,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a
         // directory to resolve against.
         ("guardrails", "warn-subagent-worktree") => Some(
+            r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
+        ),
+        // warn-subagent-concurrency only engages on an Agent/Task spawn; the
+        // generic Bash PreToolUse sample would no-op before the log read.
+        ("guardrails", "warn-subagent-concurrency") => Some(
             r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
         ),
         // enforce-worktree only engages on a file mutation or git commit; the
