@@ -95,6 +95,23 @@ pub fn find_git_root(start: &str) -> Option<PathBuf> {
     }
 }
 
+/// True when `path` resolves inside `dir` (string-prefix on normalized paths).
+///
+/// Existence-independent — a purely lexical containment test, so it holds for a
+/// Write to a not-yet-created file. `path` arrives forward-slash-normalized
+/// (from `HookInput::file_path`), but `dir` is a native `PathBuf` whose
+/// `to_string_lossy` is backslash-joined on Windows. Normalize both sides so the
+/// prefix test is separator-agnostic. Any `..` in `path` is rejected outright so
+/// a traversal target can never be judged "within".
+pub fn is_within(path: &str, dir: &Path) -> bool {
+    let path = crate::normalize_path(path);
+    if path.contains("..") {
+        return false;
+    }
+    let needle = format!("{}/", crate::normalize_path(&dir.to_string_lossy()));
+    path.starts_with(&needle)
+}
+
 /// Cap for an untrusted per-repo `.claude/*.json` read. These are tiny
 /// hand-authored exemption lists; 1 MiB is ~100–1000x any legitimate size and
 /// bounds a pathological/malicious multi-GB blob from OOM-ing the hook.
@@ -448,6 +465,46 @@ mod tests {
             expand_tilde_with("/abs/path", "/home/test"),
             PathBuf::from("/abs/path")
         );
+    }
+
+    // --- is_within (containment primitive, promoted from lab #139) ---
+
+    #[test]
+    fn is_within_checks_prefix_and_traversal() {
+        let dir = Path::new("/home/u/.claude/persona/staging");
+        assert!(is_within("/home/u/.claude/persona/staging/s1.json", dir));
+        assert!(!is_within("/home/u/.claude/persona/personas.jsonl", dir));
+        assert!(!is_within("/etc/passwd", dir));
+        assert!(!is_within(
+            "/home/u/.claude/persona/staging/../personas.jsonl",
+            dir
+        ));
+    }
+
+    #[test]
+    fn is_within_rejects_any_traversal_component() {
+        let dir = Path::new("/home/u/cadence-hooks");
+        // A `..` anywhere in the candidate path is rejected outright.
+        assert!(!is_within("/home/u/cadence-hooks/../evil.md", dir));
+        assert!(!is_within("/home/u/cadence-hooks/a/../../evil.md", dir));
+    }
+
+    #[test]
+    fn is_within_normalizes_backslash_dir() {
+        // On Windows the dir is backslash-joined while the hook path is
+        // forward-slash-normalized; both sides must normalize to match.
+        let dir = Path::new(r"C:\Users\u\.claude\persona\staging");
+        assert!(is_within("C:/Users/u/.claude/persona/staging/s1.json", dir));
+        assert!(!is_within("C:/Users/u/.claude/persona/personas.jsonl", dir));
+    }
+
+    #[test]
+    fn is_within_prefix_boundary_needs_separator() {
+        // A sibling dir sharing a name prefix must NOT be judged "within" —
+        // the trailing `/` on the needle enforces the component boundary.
+        let dir = Path::new("/home/u/cadence-hooks");
+        assert!(is_within("/home/u/cadence-hooks/crates/x.rs", dir));
+        assert!(!is_within("/home/u/cadence-hooks-legacy/x.rs", dir));
     }
 
     // --- read_untrusted_config (#157 special-file DoS hardening) ---

@@ -3,6 +3,7 @@
 //! Detects prohibited terms and suggests neutral alternatives.
 //! Case-insensitive with word-boundary matching to avoid false positives.
 
+use cadence_hooks_core::paths::{find_git_root, is_within, resolve_git_common_dir};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use glob::{MatchOptions, Pattern};
 use regex::RegexSet;
@@ -126,11 +127,13 @@ pub fn check_terminology(content: &str) -> TerminologyResult {
 /// that merely *contained* the fragment — an unrelated sibling repo
 /// (`legacy-cadence-hooks/`), a scratch dir, or a spoofed segment
 /// (`x.claude/hooks/`, `evilclaude.md`) — trivially self-grantable (#91).
-/// Component matching closes those over-matches. A directory whose component is
-/// exactly `cadence-hooks` is still exempt by design: the exemption is
-/// whole-repo (repro scripts, fixtures, docs all legitimately carry the
-/// literals), and the guard has no ground truth for the real checkout's root.
-fn is_excluded_path(path: &str) -> bool {
+/// Component matching closes those over-matches. The `cadence-hooks` arm is
+/// further gated on the *active checkout* (`cwd`): a bare `cadence-hooks`
+/// component no longer self-grants the exemption — the edit must target a file
+/// inside the current checkout, and that checkout must genuinely be the
+/// cadence-hooks repo (identified by its primary-checkout dir name via the git
+/// common dir). This closes the `mkdir /tmp/cadence-hooks` + doc self-grant (#139).
+fn is_excluded_path(path: &str, cwd: Option<&str>) -> bool {
     let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
 
     // CLAUDE.md (any case) — basename only, so `evilclaude.md` does not match.
@@ -141,9 +144,28 @@ fn is_excluded_path(path: &str) -> bool {
         return true;
     }
 
-    // A directory component named exactly `cadence-hooks` (this repo's source).
-    // `legacy-cadence-hooks` and other decorated names no longer match.
-    if components.contains(&"cadence-hooks") {
+    // `cadence-hooks` repo source — only when the edit targets a file inside the
+    // ACTIVE checkout and that checkout is genuinely the cadence-hooks repo. The
+    // repo is identified by its PRIMARY checkout dir name via the git common dir
+    // (`resolve_git_common_dir().parent().file_name()`), so the exemption still
+    // works for linked worktrees (whose own dir isn't named cadence-hooks) and
+    // rejects unrelated repos merely nested under a cadence-hooks-named ancestor.
+    // Every failure path falls through to `false` → the block stands (fail-safe).
+    // Canonicalize before naming the primary checkout: a linked worktree's common
+    // dir is `<primary>/.git/worktrees/wt/../..`, and `Path::file_name` returns
+    // None for a `..`-terminated path — so the raw parent name would miss the
+    // worktree case. The dir exists (resolve_git_common_dir verified HEAD), so
+    // canonicalize succeeds; every failure path short-circuits to a block.
+    if let Some(cwd) = cwd
+        && let Some(root) = find_git_root(cwd)
+        && is_within(path, &root)
+        && let Some(common) = resolve_git_common_dir(&root)
+        && let Ok(canon) = std::fs::canonicalize(&common)
+        && canon
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "cadence-hooks")
+    {
         return true;
     }
 
@@ -345,7 +367,7 @@ impl Check for TerminologyGuard {
         };
 
         if let Some(ref path) = input.file_path()
-            && is_excluded_path(path)
+            && is_excluded_path(path, input.cwd.as_deref())
         {
             return CheckResult::allow();
         }
@@ -534,14 +556,13 @@ mod tests {
 
     #[test]
     fn excluded_paths_allowed() {
-        assert!(is_excluded_path("/project/CLAUDE.md"));
+        // CLAUDE.md basename and `.claude/hooks` dirs are cwd-independent.
+        assert!(is_excluded_path("/project/CLAUDE.md", None));
         assert!(is_excluded_path(
-            "/home/dev/cadence-hooks/crates/cadence/src/foo.rs"
+            "/home/dev/.claude/hooks/enforcement/foo.sh",
+            None
         ));
-        assert!(is_excluded_path(
-            "/home/dev/.claude/hooks/enforcement/foo.sh"
-        ));
-        assert!(!is_excluded_path("/project/src/main.rs"));
+        assert!(!is_excluded_path("/project/src/main.rs", None));
     }
 
     // --- #91: component-anchored exclusion (no substring free pass) ---
@@ -549,40 +570,198 @@ mod tests {
     #[test]
     fn sibling_repo_substring_not_excluded() {
         // `legacy-cadence-hooks` contains the substring but is not a component.
-        assert!(!is_excluded_path("/home/dev/legacy-cadence-hooks/notes.md"));
+        assert!(!is_excluded_path(
+            "/home/dev/legacy-cadence-hooks/notes.md",
+            None
+        ));
     }
 
     #[test]
     fn spoofed_claude_hooks_segment_not_excluded() {
-        assert!(!is_excluded_path("/tmp/x.claude/hooks/y.md"));
-        assert!(!is_excluded_path("/tmp/foo.claude/rules/y.md"));
+        assert!(!is_excluded_path("/tmp/x.claude/hooks/y.md", None));
+        assert!(!is_excluded_path("/tmp/foo.claude/rules/y.md", None));
     }
 
     #[test]
     fn evilclaude_basename_not_excluded() {
-        assert!(!is_excluded_path("/tmp/evilclaude.md"));
+        assert!(!is_excluded_path("/tmp/evilclaude.md", None));
     }
 
     #[test]
     fn claude_md_basename_still_excluded() {
-        assert!(is_excluded_path("/project/CLAUDE.md"));
-        assert!(is_excluded_path("/project/sub/claude.md")); // case-insensitive
+        assert!(is_excluded_path("/project/CLAUDE.md", None));
+        assert!(is_excluded_path("/project/sub/claude.md", None)); // case-insensitive
     }
 
     #[test]
-    fn this_repo_source_still_excluded() {
+    fn dot_claude_dirs_still_excluded() {
+        // `.claude/hooks` and `.claude/rules` remain exempt regardless of cwd.
         assert!(is_excluded_path(
-            "/Users/x/Projects/cadence-hooks/crates/cadence/src/foo.rs"
+            "/home/dev/.claude/hooks/enforcement/x.sh",
+            None
         ));
-        assert!(is_excluded_path("/home/dev/.claude/hooks/enforcement/x.sh"));
-        assert!(is_excluded_path("/home/dev/.claude/rules/terminology.md"));
+        assert!(is_excluded_path(
+            "/home/dev/.claude/rules/terminology.md",
+            None
+        ));
+    }
+
+    // --- #139: cadence-hooks exemption scoped to the active checkout ---
+    //
+    // The exemption fires only when the edit targets a file inside the current
+    // checkout AND that checkout is genuinely the cadence-hooks repo (its primary
+    // checkout dir is named `cadence-hooks`). A bare `cadence-hooks` path
+    // component no longer self-grants. These drive `TerminologyGuard.run` with a
+    // real temp git root so the checkout resolution runs end-to-end.
+
+    /// A temp git root whose checkout dir is literally named `cadence-hooks`,
+    /// with a real `.git/HEAD` so `resolve_git_common_dir` classifies it. Returns
+    /// the outer TempDir (keep it alive) and the `cadence-hooks` root path.
+    fn temp_cadence_hooks_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("cadence-hooks");
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        (outer, root)
+    }
+
+    /// A Write HookInput for `target` (created on disk) with `content` and `cwd`.
+    fn write_with_cwd(target: &std::path::Path, content: &str, cwd: &str) -> HookInput {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(target.to_string_lossy().into_owned()),
+                content: Some(content.into()),
+                ..Default::default()
+            }),
+            cwd: Some(cwd.into()),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn cadence_hooks_component_still_exempt_by_design() {
-        // Documented residual: a dir named exactly `cadence-hooks` is whole-repo
-        // exempt; closing this needs repo-root resolution (#91).
-        assert!(is_excluded_path("/tmp/cadence-hooks/x.md"));
+    fn exempt_inside_real_cadence_hooks_checkout() {
+        // (a) acceptance: a flagged literal in a file inside the real checkout,
+        // with cwd = that checkout, is exempt → Allow.
+        let (_outer, root) = temp_cadence_hooks_repo();
+        let target = root.join("crates/cadence/src/foo.rs");
+        let input = write_with_cwd(&target, BLOCK_VIOLATIONS[0].0, &root.to_string_lossy());
+        assert_eq!(
+            TerminologyGuard.run(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn closed_bypass_cadence_hooks_component_outside_cwd() {
+        // (b) acceptance — the exact #139 self-grant: a doc under a
+        // `cadence-hooks`-named dir that is NOT inside the active checkout. cwd is
+        // an unrelated real git repo → is_within fails → no exemption → Block.
+        let unrelated = temp_repo_no_config();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let bypass_target = elsewhere.path().join("cadence-hooks/x.md");
+        let input = write_with_cwd(
+            &bypass_target,
+            BLOCK_VIOLATIONS[0].0,
+            &unrelated.path().to_string_lossy(),
+        );
+        assert_eq!(
+            TerminologyGuard.run(&input).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn no_cwd_cadence_hooks_component_not_exempt() {
+        // cwd None + a `cadence-hooks` path component → no checkout to consult →
+        // the exemption cannot fire → Block.
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some("/home/dev/cadence-hooks/x.md".into()),
+                content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
+                ..Default::default()
+            }),
+            cwd: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            TerminologyGuard.run(&input).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn non_repo_cwd_not_exempt() {
+        // cwd is a real dir with no `.git` ancestor → find_git_root None → Block,
+        // even though the target carries a `cadence-hooks` component.
+        let plain = tempfile::tempdir().unwrap();
+        let target = plain.path().join("cadence-hooks/x.md");
+        let input = write_with_cwd(
+            &target,
+            BLOCK_VIOLATIONS[0].0,
+            &plain.path().to_string_lossy(),
+        );
+        assert_eq!(
+            TerminologyGuard.run(&input).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn linked_worktree_of_cadence_hooks_still_exempt() {
+        // A linked worktree whose OWN dir is not named cadence-hooks resolves to
+        // the primary checkout (named cadence-hooks) via the git common dir → the
+        // exemption is retained for worktrees.
+        let outer = tempfile::tempdir().unwrap();
+        let primary_git = outer.path().join("cadence-hooks").join(".git");
+        std::fs::create_dir_all(&primary_git).unwrap();
+        std::fs::write(primary_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let admin = primary_git.join("worktrees").join("wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+
+        let linked = outer.path().join("wt-feature");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+
+        let target = linked.join("crates/cadence/src/foo.rs");
+        let input = write_with_cwd(&target, BLOCK_VIOLATIONS[0].0, &linked.to_string_lossy());
+        assert_eq!(
+            TerminologyGuard.run(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn is_within_rejects_traversal_target_for_exemption() {
+        // A `..`-traversal target inside the real checkout is rejected by
+        // is_within → the exemption cannot fire → Block (defense in depth).
+        let (_outer, root) = temp_cadence_hooks_repo();
+        let traversal = format!("{}/../cadence-hooks/x.md", root.to_string_lossy());
+        let input = HookInput {
+            tool_name: Some("Write".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(traversal),
+                content: Some(BLOCK_VIOLATIONS[0].0.to_string()),
+                ..Default::default()
+            }),
+            cwd: Some(root.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            TerminologyGuard.run(&input).outcome,
+            cadence_hooks_core::Outcome::Block
+        );
     }
 
     #[test]
