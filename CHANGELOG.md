@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-gh-write` no longer blocks explicit-target `gh` reads in a loop (#158).** The `AllTargetsExplicit` loop branch ownership-gated every command, so a loop of `-R`/`--repo` reads against an unowned repo false-blocked. Reads are owner-independent; the branch now gates on `is_write_command`, mirroring the `MissingTargets` path. Unowned looped writes still block.
+
 ## [0.44.0] - 2026-07-02
 
 ### Added
