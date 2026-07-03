@@ -7,7 +7,10 @@
 //! metadata-safe allowlist (#65, #66). Safe templates (.env.example,
 //! .env.test) are always allowed.
 
-use crate::secret_patterns::{is_ambiguous, is_blocked, is_dangerous_env_token, is_safe_template};
+use crate::secret_patterns::{
+    command_may_reference_secret, is_ambiguous, is_blocked, is_dangerous_secret_token,
+    is_safe_template,
+};
 use cadence_hooks_core::shell::{command_segments, split_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -52,7 +55,7 @@ fn segment_env_read(segment: &str) -> Option<(String, String)> {
     }
     tokens[1..]
         .iter()
-        .find(|t| !t.chars().any(char::is_whitespace) && is_dangerous_env_token(t))
+        .find(|t| !t.chars().any(char::is_whitespace) && is_dangerous_secret_token(t))
         .map(|t| (cmd_word.to_string(), t.clone()))
 }
 
@@ -74,7 +77,7 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
     }
     tokens
         .iter()
-        .find(|t| !t.chars().any(char::is_whitespace) && is_dangerous_env_token(t))
+        .find(|t| !t.chars().any(char::is_whitespace) && is_dangerous_secret_token(t))
         .map(|t| (sub_word.to_string(), t.clone()))
 }
 
@@ -108,19 +111,20 @@ fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
 fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     let lower = command.to_lowercase();
 
-    // Block: a dangerous .env-family operand handed to any command that is
-    // not metadata-safe (#65, #66). Judged per segment so a chained or
-    // `sh -c`-wrapped read is still seen.
-    if lower.contains(".env") {
+    // Block: a dangerous deny-set operand (the `.env` family plus the non-`.env`
+    // credential stores) handed to any command that is not metadata-safe
+    // (#65, #66, #138). Judged per segment so a chained or `sh -c`-wrapped read
+    // is still seen.
+    if command_may_reference_secret(&lower) {
         for segment in command_segments(&lower) {
             if let Some((cmd_word, token)) = segment_env_read(&segment) {
                 return Some(CheckResult::block(format!(
-                    "🚫 BLOCKED: prevent-secret-leaks: command would expose .env file contents\n\
+                    "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
                      Found: `{token}` as an operand of `{cmd_word}`\n\
                      Fix: secrets are available to programs via direnv (`direnv allow`) — \
-                     run the program directly instead of reading its env file.\n\
+                     run the program directly instead of reading its secret file.\n\
                      Allowed: metadata-only commands (ls, stat, wc, rm, touch, …) and \
-                     safe templates (.env.example, .env.test, …)."
+                     safe templates (.env.example, id_rsa.pub, .aws/credentials.example, …)."
                 )));
             }
         }
@@ -1359,5 +1363,79 @@ mod tests {
     fn bash_echo_plain_text_allowed() {
         let result = SecretLeaksGuard.run(&make_bash_input("echo hello world"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // ---------------------------------------------------------------
+    // #138: Bash-path coverage for non-.env deny-set secret files
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bash_cat_aws_credentials_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cat ~/.aws/credentials"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_id_rsa_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cat ~/.ssh/id_rsa"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_grep_git_credentials_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("grep password ~/.git-credentials"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_pgpass_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cat ~/.pgpass"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_kube_config_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cat ~/.kube/config"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_netrc_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("cat ~/.netrc"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_base64_id_rsa_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("base64 ~/.ssh/id_rsa"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_id_rsa_pub_allowed() {
+        // Safe template (.pub) short-circuits.
+        let result = SecretLeaksGuard.run(&make_bash_input("cat ~/.ssh/id_rsa.pub"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_cat_config_toml_allowed() {
+        // No deny-set filename/fragment — gate rejects early.
+        let result = SecretLeaksGuard.run(&make_bash_input("cat config.toml"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_ls_id_rsa_allowed() {
+        // Metadata-safe command never emits contents.
+        let result = SecretLeaksGuard.run(&make_bash_input("ls -la ~/.ssh/id_rsa"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_cat_envrc_still_blocked_138() {
+        // #149 contract: `.envrc` keeps its Bash name-block.
+        let result = SecretLeaksGuard.run(&make_bash_input("cat .envrc"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 }

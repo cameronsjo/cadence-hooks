@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bash-path coverage for non-`.env` deny-set secret files (#138).** The secret guards' Bash arms judged only the `.env` family, so `cat ~/.aws/credentials`, `cat ~/.ssh/id_rsa`, `cat ~/.git-credentials`, `cat ~/.pgpass`, `cat ~/.kube/config`, and `cat ~/.netrc` — all already blocked on the tool paths — read and wrote freely over Bash. A new `is_dangerous_secret_token` classifier consults the full `BLOCKED_FILENAMES` / `BLOCKED_PATH_FRAGMENTS` deny-sets, and a `command_may_reference_secret` pre-filter generalizes the old `.env`-only gate. Safe templates short-circuit so `id_rsa.pub` and `.aws/credentials.example` stay readable. `.envrc` keeps its Bash name-block (content carve-out stays tool-path-only, #149).
+
 ## [0.44.0] - 2026-07-02
 
 ### Added

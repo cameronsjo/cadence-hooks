@@ -150,6 +150,40 @@ pub fn is_dangerous_env_token(token: &str) -> bool {
     is_env_family_secret(component)
 }
 
+/// True if a shell token resolves to ANY deny-set secret file — the whole
+/// `.env` family (via `is_env_family_secret`) plus the non-`.env` credential
+/// stores in `BLOCKED_FILENAMES` and dir-qualified `BLOCKED_PATH_FRAGMENTS`.
+/// Generalizes `is_dangerous_env_token` so the Bash arms judge the same
+/// deny-sets the tool paths already do via `is_blocked` (#138). Safe templates
+/// (`SAFE_SUFFIXES`) short-circuit FIRST so `id_rsa.pub` / `.aws/credentials.example`
+/// stay clean. Filenames match the final path component exactly; fragments
+/// match as a substring of the whole token.
+pub fn is_dangerous_secret_token(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    let trimmed = lower.strip_prefix('@').unwrap_or(&lower);
+    let trimmed = trimmed.trim_end_matches(')');
+    let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if is_safe_template(component) {
+        return false;
+    }
+    is_env_family_secret(component)
+        || BLOCKED_FILENAMES.contains(&component)
+        || BLOCKED_PATH_FRAGMENTS
+            .iter()
+            .any(|frag| trimmed.contains(frag))
+}
+
+/// Cheap superset pre-filter for the Bash arms: might this lowercased command
+/// mention any deny-set secret file? A false positive only costs a tokenize.
+/// Generalizes the old `command.contains(".env")` gate (#138). Input must be
+/// already lowercased.
+pub fn command_may_reference_secret(lower_command: &str) -> bool {
+    BLOCKED_FILENAMES.iter().any(|&f| lower_command.contains(f))
+        || BLOCKED_PATH_FRAGMENTS
+            .iter()
+            .any(|frag| lower_command.contains(frag))
+}
+
 /// High-confidence secret-*value* patterns: `(human name, regex)`.
 ///
 /// Each is deliberately provider-prefixed and length-bounded so a match means
@@ -408,6 +442,57 @@ mod tests {
         assert!(!is_dangerous_env_token("env"));
         assert!(!is_dangerous_env_token("-env"));
         assert!(!is_dangerous_env_token("feat/allow-main-branch-env"));
+    }
+
+    #[test]
+    fn dangerous_secret_tokens_detected() {
+        // #138: the full deny-set, not just the .env family, on the Bash path.
+        assert!(is_dangerous_secret_token("id_rsa"));
+        assert!(is_dangerous_secret_token("/home/user/.ssh/id_rsa"));
+        assert!(is_dangerous_secret_token(".netrc"));
+        assert!(is_dangerous_secret_token(".git-credentials"));
+        assert!(is_dangerous_secret_token(".pgpass"));
+        assert!(is_dangerous_secret_token(".npmrc"));
+        assert!(is_dangerous_secret_token("credentials.json"));
+        // Dir-qualified fragments.
+        assert!(is_dangerous_secret_token("/home/user/.aws/credentials"));
+        assert!(is_dangerous_secret_token("/home/user/.kube/config"));
+        // The .env family still classifies.
+        assert!(is_dangerous_secret_token(".env"));
+        assert!(is_dangerous_secret_token(".env.prod"));
+        // Curl upload idiom and subshell-close trims still apply.
+        assert!(is_dangerous_secret_token("@.env"));
+        assert!(is_dangerous_secret_token("@id_rsa"));
+        assert!(is_dangerous_secret_token(".pgpass)"));
+    }
+
+    #[test]
+    fn clean_secret_lookalike_tokens_pass() {
+        // Safe template short-circuits first.
+        assert!(!is_dangerous_secret_token("id_rsa.pub"));
+        // Bare generic basenames are fragments, not filenames — not dangerous
+        // outside their credential dirs.
+        assert!(!is_dangerous_secret_token("config"));
+        assert!(!is_dangerous_secret_token("credentials"));
+        assert!(!is_dangerous_secret_token(
+            "/home/user/.aws/credentials.example"
+        ));
+        assert!(!is_dangerous_secret_token("main.rs"));
+        assert!(!is_dangerous_secret_token("config.toml"));
+    }
+
+    #[test]
+    fn command_may_reference_secret_gate() {
+        assert!(command_may_reference_secret("cat ~/.aws/credentials"));
+        assert!(command_may_reference_secret("cat ~/.ssh/id_rsa"));
+        assert!(command_may_reference_secret("grep pw ~/.git-credentials"));
+        assert!(command_may_reference_secret("cat ~/.pgpass"));
+        assert!(command_may_reference_secret("cat ~/.kube/config"));
+        assert!(command_may_reference_secret("cat ~/.netrc"));
+        // Negatives: no deny-set filename or fragment mentioned.
+        assert!(!command_may_reference_secret("cargo test"));
+        assert!(!command_may_reference_secret("cat config.toml"));
+        assert!(!command_may_reference_secret("git status"));
     }
 
     // --- #85: secret-value content scanner ---
