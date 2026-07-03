@@ -161,6 +161,11 @@ pub struct HookInput {
     pub source: Option<String>,
     /// Model id for the session (e.g. `claude-opus-4-8`), when supplied.
     pub model: Option<String>,
+    /// Subagent id for a dispatched agent, when the payload carries it. Mirrors
+    /// [`MetricsInput::agent_id`]; deserializes to `None` on the main thread and
+    /// on payloads that omit it. Carried so the denial audit log can attribute a
+    /// guard fire to the subagent that triggered it.
+    pub agent_id: Option<String>,
 }
 
 /// Tool-specific fields from the hook input.
@@ -401,6 +406,11 @@ impl HookInput {
     /// The session model id, if present.
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    /// The subagent id, if the payload carried one (`None` on the main thread).
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
     }
 
     /// The stdout from the tool response (PostToolUse only).
@@ -743,12 +753,35 @@ fn render_output(
 ///   `fix` is folded into the stderr text instead (see [`render_output`]).
 /// - Allow → silent exit 0.
 pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
+    match decide_check(check, input) {
+        None => process::exit(Outcome::Allow.code()),
+        Some(result) => emit_and_exit(&result, event),
+    }
+}
+
+/// The decide half of [`run_check`]: honor `skip_at_effort()`, then run the
+/// check. `None` means the check was short-circuited to Allow for the current
+/// `$CLAUDE_EFFORT` and `check.run()` was **not** called — the caller must treat
+/// it as a silent Allow. `Some(result)` carries the check's outcome.
+///
+/// Split out so a caller (the binary's logged-dispatch wrapper) can observe the
+/// [`CheckResult`] — e.g. to record a denial — between deciding and exiting,
+/// without changing what [`run_check`] itself does.
+pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult> {
     let current_effort = std::env::var("CLAUDE_EFFORT").ok();
     if should_skip_for_effort(check.skip_at_effort(), current_effort.as_deref()) {
-        process::exit(Outcome::Allow.code());
+        return None;
     }
+    Some(check.run(input))
+}
 
-    let result = check.run(input);
+/// The emit-and-exit half of [`run_check`]: render the outcome to stdout/stderr
+/// per Claude Code's exit-code contract, then `process::exit` with the outcome's
+/// code. Never returns.
+///
+/// Behaviourally identical to the tail of the pre-split [`run_check`], so the
+/// `render_output` matrix tests remain the safety net for the output shape.
+pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
     let rendered = render_output(
         result.outcome,
         result.message.as_deref(),
@@ -830,7 +863,10 @@ pub fn interactive_terminal_help(
 /// misuse is not a hook context, and a hook's own non-hook situation must
 /// never block (ADR-0001). Invisible in production: Claude Code always pipes,
 /// so `is_terminal()` is false there.
-fn guard_interactive_terminal(
+///
+/// `pub` so the binary's logged-dispatch wrapper ([`crate`] consumers in `src/`)
+/// can reuse the same interactive-terminal guard as [`run_check_from_stdin`].
+pub fn guard_interactive_terminal(
     hook_name: &str,
     event: Option<HookEvent>,
     sample_override: Option<&str>,
