@@ -19,7 +19,7 @@
 
 use crate::dismiss_main_branch_warn;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// Resolve the directory to pass to `git -C` for a given hook input.
@@ -58,6 +58,30 @@ pub(crate) fn git_dir_for_input(input: &HookInput) -> PathBuf {
         .unwrap_or(cwd)
 }
 
+/// Lexically normalize `dir`'s components — resolving `.` and `..` without
+/// touching the filesystem — returning the surviving component `OsString`s
+/// (root/prefix dropped; carve-outs match only normal segments).
+///
+/// A guard must not hit disk (ADR-0001, fail-open), so a `ParentDir` *pops*
+/// the preceding normal component rather than following a symlink. This stops
+/// a crafted `file_path` like `docs/plans/../../src/main.rs` from spoofing a
+/// carve-out: its parent `docs/plans/../../src` normalizes to `src`, so the
+/// real product file still warns (#152). Merely *removing* `..` would leave
+/// `docs/plans/src` and keep matching — the preceding-pop is what closes it.
+fn normalized_components(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    for c in dir.components() {
+        match c {
+            Component::Normal(s) => out.push(s.to_os_string()),
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
 /// Returns true if `dir` lives inside a `.claude/` directory.
 ///
 /// These paths hold Claude Code tooling and state, never the branch-worthy
@@ -74,7 +98,9 @@ pub(crate) fn git_dir_for_input(input: &HookInput) -> PathBuf {
 /// Matches on an exact `.claude` path component, so look-alikes like
 /// `.claude-old` or `myclaude` are not exempt.
 pub(crate) fn is_claude_managed_dir(dir: &Path) -> bool {
-    dir.components().any(|c| c.as_os_str() == ".claude")
+    normalized_components(dir)
+        .iter()
+        .any(|c| c.as_os_str() == ".claude")
 }
 
 /// Returns true if `dir` is a cadence plan-document directory (`docs/plans`).
@@ -89,8 +115,10 @@ pub(crate) fn is_claude_managed_dir(dir: &Path) -> bool {
 /// a bare `plans/`, a non-adjacent `docs/foo/plans`, or a look-alike like
 /// `mydocs/plans` is not exempt.
 pub(crate) fn is_plan_doc_dir(dir: &Path) -> bool {
-    let comps: Vec<_> = dir.components().map(|c| c.as_os_str()).collect();
-    comps.windows(2).any(|w| w[0] == "docs" && w[1] == "plans")
+    let comps = normalized_components(dir);
+    comps
+        .windows(2)
+        .any(|w| w[0].as_os_str() == "docs" && w[1].as_os_str() == "plans")
 }
 
 /// Returns true if the branch name is a default branch (`main` or `master`).
@@ -606,6 +634,23 @@ mod tests {
         assert!(!is_claude_managed_dir(Path::new(".")));
     }
 
+    #[test]
+    fn claude_parentdir_escape_still_warns() {
+        // #152: a crafted `..` that escapes the `.claude` segment must not spoof
+        // the carve-out — the normalized dir is `.../src`, so it still warns.
+        assert!(!is_claude_managed_dir(Path::new(
+            "/Users/x/repo/.claude/../src"
+        )));
+    }
+
+    #[test]
+    fn claude_curdir_segment_still_managed() {
+        // A `.` segment inside a `.claude` path is a no-op and stays exempt.
+        assert!(is_claude_managed_dir(Path::new(
+            "/Users/x/repo/.claude/./worktrees/f"
+        )));
+    }
+
     // --- docs/plans carve-out (#226) ---
     // Approved plans are copied to docs/plans/ on the default branch by design
     // (cadence's plan-execution rule mandates it), so plan-doc authoring there
@@ -652,5 +697,27 @@ mod tests {
     fn plan_doc_dir_components_must_be_consecutive() {
         // `docs/` then a different dir then `plans/` is not the canonical path.
         assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/docs/foo/plans")));
+    }
+
+    #[test]
+    fn plan_doc_parentdir_escape_still_warns() {
+        // #152: `docs/plans/../../src` normalizes to `.../src`, so a crafted `..`
+        // escaping the plan-doc carve-out must still warn for a real product file.
+        assert!(!is_plan_doc_dir(Path::new(
+            "/Users/x/repo/docs/plans/../../src"
+        )));
+    }
+
+    #[test]
+    fn plan_doc_curdir_segment_still_exempt() {
+        // A `.` segment inside docs/plans is a no-op and stays exempt.
+        assert!(is_plan_doc_dir(Path::new("/Users/x/repo/docs/plans/./q2")));
+    }
+
+    #[test]
+    fn plan_doc_leading_parentdir_relative_still_exempt() {
+        // A leading `..` with no preceding component to pop leaves `docs/plans`
+        // intact, so a relative plan-doc path stays exempt.
+        assert!(is_plan_doc_dir(Path::new("../docs/plans")));
     }
 }

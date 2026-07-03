@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `warn-main-branch` carve-outs (`.claude/`, `docs/plans/`) now lexically resolve `..`/`.` in the path before matching, so a crafted `file_path` like `docs/plans/../../src/main.rs` can no longer suppress the main-branch nudge for a real product file (#152).
 - **`log-polish-nudge` now records the branch-scoped marker signal the pre-PR
   gate acts on, not just a session-log scan (#177).** A new
   `polish_marker_present(command, cwd)` helper in core is the single source of
