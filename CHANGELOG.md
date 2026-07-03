@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`obsidian trash-guard` now catches non-`rm` deletion verbs (#136).** The guard gated solely on `command.contains("rm")`, so `unlink note.md`, `find … -delete`, `shred -u note.md`, and `truncate -s 0 note.md` destroyed vault files while bypassing Obsidian's `.trash/`. A shared `is_destructive` gate now matches all four (token-based, so `find` without `-delete` stays read-only and allowed), reusing the existing vault-targeting logic unchanged.
 - **`guard-gh-write` no longer blocks explicit-target `gh` reads in a loop (#158).** The `AllTargetsExplicit` loop branch ownership-gated every command, so a loop of `-R`/`--repo` reads against an unowned repo false-blocked. Reads are owner-independent; the branch now gates on `is_write_command`, mirroring the `MissingTargets` path. Unowned looped writes still block.
 - `warn-main-branch` carve-outs (`.claude/`, `docs/plans/`) now lexically resolve `..`/`.` in the path before matching, so a crafted `file_path` like `docs/plans/../../src/main.rs` can no longer suppress the main-branch nudge for a real product file (#152).
 - **`log-polish-nudge` now records the branch-scoped marker signal the pre-PR
