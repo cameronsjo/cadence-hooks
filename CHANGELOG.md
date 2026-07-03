@@ -15,6 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - warn-recommended-option now allows a declared "no clear recommendation" stance (fires only on true silence) (#148)
 - **terminology guard's `cadence-hooks` exemption is now scoped to the active checkout, closing a self-grantable bypass (#139).** The exemption fired on any path with a `cadence-hooks` component, so `mkdir /tmp/cadence-hooks` plus a doc carrying a blocked term self-granted the free pass. It now fires only when the edit targets a file inside the current checkout AND that checkout is genuinely the cadence-hooks repo (identified by its primary-checkout dir name via the git common dir), so linked worktrees stay exempt while unrelated repos merely nested under a `cadence-hooks`-named ancestor no longer do. The `is_within` containment primitive (which rejects `..` traversal) is promoted from `crates/lab` to `crates/core` as the single implementation. Fail-safe: every failure path falls through to a block.
+### Added
+
+- audience-aware redaction — redact-external-content now gates each hit on destination-tier vs per-category ceiling (d>c), nudge-only (#159)
 
 ## [0.45.0] - 2026-07-03
 
