@@ -1,0 +1,38 @@
+name: Feedback (session friction)
+description: A cadence-hooks guard fired in error or a hook behavior created friction. Mirrors /cadence:feedback.
+title: "feedback(cadence-hooks): "
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Evidence should be transcript-free — a redacted command + the hook's output.
+  - type: input
+    id: hook
+    attributes:
+      label: Hook / guard
+      description: The subcommand that fired (e.g. guard-gh-write). `cadence-hooks <namespace> --help` lists them.
+      placeholder: "guard-gh-write"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What fired, and what you were doing when it did.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence (redacted)
+      description: The command + the hook message. Redact paths, hostnames, emails.
+      render: shell
+    validations:
+      required: false
