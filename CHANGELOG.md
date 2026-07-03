@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Content-aware `.envrc` carve-out on the secret guards' tool paths (#149).** A `.envrc` of pure direnv loader directives (`use flake`, `dotenv`, `layout`, `source`, `PATH_add`, comments, `PATH`/`MANPATH` assignments) is a committed config loader, not a secret store — but `prevent-secret-writes` / `prevent-secret-leaks` hard-blocked every `.envrc` by name. Write/Edit now consult the resulting content (`effective_content`) and Read/Grep read the file to classify it; a proven pure-loader `.envrc` is allowed, while a `.envrc` carrying a `KEY=<value>` assignment or any provider-shaped secret value still blocks. Fail-closed: unreadable/unrecognized content stays blocked, and only `.envrc` is eligible — the rest of the `.env` family remains secret by name. The Bash arms (`cat .envrc`, `cat > .envrc`) still name-block pending a follow-up.
 - **`effective_content()` reads the literal write target, not the normalized path (#129).** For Edit/MultiEdit the helper now simulates against the file actually being written — a trailing-space/backslash/null path variant no longer makes a guard validate a different (or missing) file. Fail-open on an unreadable/non-UTF-8 file is preserved (ADR-0001) and documented; a future *blocking* content-security guard must supply its own fail-closed default.
 
 ### Security
