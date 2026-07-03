@@ -198,6 +198,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-going-public",
+        description: "Nudge on repo create/publicize when name or description telegraphs sensitive content",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "verify-pr-autoclose",
         description: "Verify and repair issue auto-close after PR create/merge",
         plugin: "guardrails",
