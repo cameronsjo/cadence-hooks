@@ -1786,7 +1786,8 @@ mod tests {
     fn metrics_input_parses_session_end_reason() {
         // The SessionEnd payload carries `reason`; it lands on the
         // `sessions.jsonl` row so a session's terminal cause is greppable.
-        let json = r#"{"session_id":"s1","hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#;
+        let json =
+            r#"{"session_id":"s1","hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#;
         let input = MetricsInput::from_json(json).unwrap();
         assert_eq!(input.reason.as_deref(), Some("prompt_input_exit"));
     }

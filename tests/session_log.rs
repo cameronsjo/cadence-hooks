@@ -103,7 +103,10 @@ fn session_end_writes_one_priced_row() {
     assert_eq!(row["tokens"]["output"], 300);
     assert_eq!(row["messagesScanned"], 2);
     // A priced model → positive cost, non-empty byModel, empty unpricedModels.
-    assert!(row["costUsd"].as_f64().unwrap() > 0.0, "priced model costs > 0");
+    assert!(
+        row["costUsd"].as_f64().unwrap() > 0.0,
+        "priced model costs > 0"
+    );
     assert!(!row["byModel"].as_array().unwrap().is_empty());
     assert!(row["unpricedModels"].as_array().unwrap().is_empty());
 }
