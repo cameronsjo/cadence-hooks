@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`warn-issue-tracker` is now decentralization-aware (#166).** The guard hardcoded `cameronsjo/claude-configurations` as the single canonical tracker and misfired on the legitimate post-2026-06-30 trackers. It now checks the filing target against a set of known ecosystem trackers (`cadence`, `cadence-hooks`, `forgectl`, `claude-configurations`), nudging only when an *owned* repo is none of them. New `CADENCE_ISSUE_TRACKERS` (plural, comma-separated) overrides the set; the legacy singular `CADENCE_ISSUE_TRACKER` still works. Still nudge-only, never blocks (ADR-0001).
 - **docs(changelog): backfilled the missing `[0.30.0] - 2026-06-16` section**
   (#140). The changelog jumped `[0.31.0]` → `[0.29.0]`; the three fixes that
   shipped in v0.30.0 are now stamped into a versioned section.

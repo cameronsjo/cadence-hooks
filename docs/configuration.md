@@ -81,7 +81,8 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space- or comma-separated `owner/repo` pairs |
 | `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host |
 | `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
-| `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Override the canonical issue-tracker repo (`owner/repo`) the nudge steers `gh issue create` toward (default `cameronsjo/claude-configurations`) |
+| `CADENCE_ISSUE_TRACKERS` | `warn-issue-tracker` | Comma-separated set of known ecosystem trackers (`owner/repo`) — replaces the default set (`cameronsjo/cadence`, `cameronsjo/cadence-hooks`, `cameronsjo/forgectl`, `cameronsjo/claude-configurations`); the nudge fires only when an owned target is none of them |
+| `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Legacy singular override — sets a single known tracker (`owner/repo`), replacing the default set. Superseded by `CADENCE_ISSUE_TRACKERS`; still honored when the plural is unset |
 | `CADENCE_GUARD_DOTFILES` | `guard-dotfiles` | Set to `1` to block direct edits to production dotfiles (clean no-op otherwise) |
 | `CADENCE_ALLOW_MAIN` | `warn-main-branch`, `enforce-worktree` | Set truthy (`1`/`true`/`yes`) in a repo's `.claude/settings.json` `env` block to mark a repo where `main` is the working branch by design (dotfiles, vaults, scratchpads) — silences the main-branch warning and exempts the repo from worktree enforcement |
 | `CADENCE_NO_ENFORCE_WORKTREE` | `enforce-worktree` | Set truthy (`1`/`true`/`yes`) to disable the primary-checkout block everywhere — the kill switch for the proving period; prefer `CADENCE_ALLOW_MAIN` per repo |
