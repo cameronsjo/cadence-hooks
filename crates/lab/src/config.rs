@@ -58,6 +58,9 @@ pub struct Config {
     pub max_blocks: u32,
     /// Sweep staging files older than this many hours on session start.
     pub stale_hours: u64,
+    /// Cap on `personas.jsonl` line count; the gate rotates past this on
+    /// promote. `0` disables rotation.
+    pub ledger_max_entries: usize,
 }
 
 impl Config {
@@ -73,6 +76,7 @@ impl Config {
             limits: Limits::default(),
             max_blocks: 3,
             stale_hours: 24,
+            ledger_max_entries: 1000,
         }
     }
 
@@ -122,6 +126,7 @@ struct RawConfig {
     limits: Option<RawLimits>,
     max_blocks: Option<u32>,
     stale_hours: Option<u64>,
+    ledger_max_entries: Option<usize>,
 }
 
 impl RawConfig {
@@ -143,6 +148,9 @@ impl RawConfig {
         }
         if let Some(h) = self.stale_hours {
             cfg.stale_hours = h;
+        }
+        if let Some(m) = self.ledger_max_entries {
+            cfg.ledger_max_entries = m;
         }
         if let Some(l) = self.limits {
             let d = &mut cfg.limits;
@@ -205,6 +213,7 @@ mod tests {
         assert_eq!(cfg.cheek_mode, CheekMode::Warn);
         assert_eq!(cfg.nudge_on_sources, vec!["startup", "clear"]);
         assert_eq!(cfg.limits, Limits::default());
+        assert_eq!(cfg.ledger_max_entries, 1000);
     }
 
     #[test]
@@ -220,6 +229,15 @@ mod tests {
         assert_eq!(cfg.limits.stance_max_words, 30);
         // untouched fields keep defaults
         assert_eq!(cfg.limits.qualities_max, 4);
+        assert_eq!(cfg.ledger_max_entries, 1000);
+    }
+
+    #[test]
+    fn override_applies_ledger_max_entries() {
+        let mut cfg = Config::with_root("/x/persona");
+        let raw: RawConfig = serde_json::from_str(r#"{"ledger_max_entries":50}"#).unwrap();
+        raw.apply(&mut cfg);
+        assert_eq!(cfg.ledger_max_entries, 50);
     }
 
     #[test]
