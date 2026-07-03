@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`effective_content()` reads the literal write target, not the normalized path (#129).** For Edit/MultiEdit the helper now simulates against the file actually being written — a trailing-space/backslash/null path variant no longer makes a guard validate a different (or missing) file. Fail-open on an unreadable/non-UTF-8 file is preserved (ADR-0001) and documented; a future *blocking* content-security guard must supply its own fail-closed default.
+
+### Security
+
+- **`check-security-patterns` scans the simulated post-edit document and gains RCE/XSS coverage (#131).** The guard now routes through `effective_content()` (correct line numbers; no more scanning an Edit fragment or a MultiEdit's stale pre-edit file), and flags Python `eval(`/`exec(`/`os.system(`/`pickle.load(` and JS `eval(`/`document.write(`/`dangerouslySetInnerHTML`. Advisory-only (never blocks).
+
 ## [0.44.0] - 2026-07-02
 
 ### Added
