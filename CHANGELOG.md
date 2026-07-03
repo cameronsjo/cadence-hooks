@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **feat(doctor): plugin-cache health check (#162).** `doctor` now flags orphaned SHA-pinned cache version dirs (with a byte count), missing/empty pinned dirs, and marketplace checkouts whose `git remote` diverges from their declared `known_marketplaces.json` source ("cache may not be canonical — verify before citing"). All advisory (Warning/exit 1), live-machine only (skipped under `--root`), fail-open throughout (ADR-0001). Orphan counts surface in verbose mode only to avoid perennial SessionStart nags; detection-only — `--fix` prune deferred.
+
 ### Changed
 
 - **docs(changelog): backfilled the missing `[0.30.0] - 2026-06-16` section**
