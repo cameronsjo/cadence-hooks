@@ -57,3 +57,27 @@ Writing or debugging a check? See
 [CONTRIBUTING.md → Reproducing a Check by Hand](../CONTRIBUTING.md#reproducing-a-check-by-hand)
 for the check-author's debugging loop and the per-tool payload shapes
 (Write/Edit/MultiEdit carry their content in different fields).
+
+## Is a block the binary or the wrapper?
+
+A guard firing is unambiguous — the `cadence-hooks` binary decided to block
+and the tool call exits **2**. A silent allow is not: it can mean the binary
+ran and chose to allow, or it can mean the `run-cadence-hooks.sh` wrapper
+**failed open** (the binary is missing from `PATH`, or is stale enough that
+the wrapper hands it a subcommand it no longer recognizes) and no guard ran
+at all.
+
+To tell them apart, isolate the binary from the wrapper — pipe the same
+payload (or use `try`, above) straight to the subcommand and read the exit
+code directly, bypassing `run-cadence-hooks.sh`:
+
+```bash
+echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}' \
+  | cadence-hooks guardrails guard-push-remote; echo "exit: $?"
+```
+
+A `2` there is a real block from the binary. If it's `0` with no output, the
+binary allowed it — but if guards feel inert across the board, the wrapper is
+the next suspect, not the binary. A failed-open wrapper now emits a once/day
+stderr notice (`cameronsjo/cadence#223`) — that notice, not a silent `exit 0`,
+is the signal that guards aren't running.

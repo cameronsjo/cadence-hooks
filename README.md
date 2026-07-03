@@ -117,7 +117,7 @@ cadence-hooks --help
 
 - [docs/hooks.md](docs/hooks.md) — full hook catalog (all 45 hooks + CLI actions)
 - [docs/configuration.md](docs/configuration.md) — `hooks.json` wiring, environment variables, the `doctor` audit, snoozing `warn-main-branch`
-- [docs/testing.md](docs/testing.md) — run any hook against a sample payload by hand
+- [docs/testing.md](docs/testing.md) — run any hook against a sample payload by hand, including how to tell a real binary block from a wrapper fail-open
 - [CONTRIBUTING.md](CONTRIBUTING.md) — adding a hook and the check-author debugging loop
 - [SECURITY.md](SECURITY.md) — release signing, SBOM, and verification
 

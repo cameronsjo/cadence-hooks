@@ -5,7 +5,9 @@
 //! a blocked staging write is not the ledger.
 
 use crate::config::{self, CheekMode, Config};
-use crate::persona::{build_record, detect_cheek, ledger_contains, utc_timestamp, validate_tier1};
+use crate::persona::{
+    build_record, detect_cheek, ledger_contains, rotate_lines, utc_timestamp, validate_tier1,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use serde_json::Value;
 use std::fs;
@@ -138,8 +140,38 @@ fn promote(
         let _ = file.sync_all();
     }
 
+    rotate_ledger(cfg);
     cleanup(cfg, session_id, staging_path);
     CheckResult::allow()
+}
+
+/// Bound the ledger to `cfg.ledger_max_entries` after an append. Fail-open
+/// throughout — a rotation error must leave the already-appended ledger intact
+/// and never block. Lives only on this PostToolUse promote path, never in the
+/// SessionStart nudge. (#137)
+///
+/// Not concurrency-safe: this is a read-modify-write-rename with no lock (by
+/// design — mirrors the lock-free append above; a `flock` here would fight
+/// that). A session appending between our read and rename can have its record
+/// clobbered by our rename. Low blast radius on a self-representation ledger
+/// (ADR-0001 fail-open) and self-corrects: the clobbered session re-nudges and
+/// re-promotes on its next SessionStart.
+fn rotate_ledger(cfg: &Config) {
+    if cfg.ledger_max_entries == 0 {
+        return;
+    }
+    let Ok(contents) = fs::read_to_string(&cfg.ledger_path) else {
+        return;
+    };
+    let Some(rotated) = rotate_lines(&contents, cfg.ledger_max_entries) else {
+        return;
+    };
+    // Atomic rewrite: write to a sibling temp path, then rename over the ledger,
+    // so a crash mid-write never leaves a truncated ledger.
+    let tmp_path = cfg.ledger_path.with_extension("jsonl.tmp");
+    if fs::write(&tmp_path, rotated).is_ok() {
+        let _ = fs::rename(&tmp_path, &cfg.ledger_path);
+    }
 }
 
 /// Remove the staging candidate and its block-count sidecar.
@@ -350,5 +382,72 @@ mod tests {
         assert_eq!(rec["flags"][0], "forced-accept");
         // block-count sidecar cleaned up on accept.
         assert!(!block_count_path(&cfg, "stubborn").exists());
+    }
+
+    // --- rotation (#137) ---
+
+    fn seed_ledger(cfg: &Config, session_ids: &[&str]) {
+        if let Some(parent) = cfg.ledger_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut contents = String::new();
+        for sid in session_ids {
+            contents.push_str(&format!("{{\"session_id\":\"{sid}\",\"form\":{{}}}}\n"));
+        }
+        fs::write(&cfg.ledger_path, contents).unwrap();
+    }
+
+    #[test]
+    fn promote_rotates_when_over_cap() {
+        let (_tmp, mut cfg) = test_cfg();
+        cfg.ledger_max_entries = 3;
+        seed_ledger(&cfg, &["s1", "s2", "s3"]);
+
+        let sp = staging_path(&cfg, "s4");
+        let input = make_write(&sp, &valid_json());
+        let r = run_gate(&input, &cfg);
+        assert_eq!(r.outcome, Outcome::Allow);
+
+        let ledger = fs::read_to_string(&cfg.ledger_path).unwrap();
+        assert_eq!(ledger.lines().count(), 3, "trimmed to cap");
+        assert!(!ledger.contains("\"session_id\":\"s1\""), "oldest dropped");
+        assert!(ledger.contains("\"session_id\":\"s4\""), "newest present");
+    }
+
+    #[test]
+    fn rotation_disabled_when_zero() {
+        let (_tmp, mut cfg) = test_cfg();
+        cfg.ledger_max_entries = 0;
+        seed_ledger(&cfg, &["s1", "s2", "s3"]);
+
+        let sp = staging_path(&cfg, "s4");
+        let input = make_write(&sp, &valid_json());
+        run_gate(&input, &cfg);
+
+        let ledger = fs::read_to_string(&cfg.ledger_path).unwrap();
+        assert_eq!(ledger.lines().count(), 4, "nothing trimmed when disabled");
+    }
+
+    #[test]
+    fn promote_trims_legacy_over_cap_ledger() {
+        // A ledger seeded before rotation shipped can already be over cap; the
+        // first promote after upgrading must trim it back down.
+        let (_tmp, mut cfg) = test_cfg();
+        cfg.ledger_max_entries = 2;
+        seed_ledger(&cfg, &["s1", "s2", "s3", "s4", "s5"]);
+
+        let sp = staging_path(&cfg, "s6");
+        let input = make_write(&sp, &valid_json());
+        run_gate(&input, &cfg);
+
+        let ledger = fs::read_to_string(&cfg.ledger_path).unwrap();
+        assert_eq!(ledger.lines().count(), 2, "trimmed to cap");
+        for line in ledger.lines() {
+            assert!(
+                serde_json::from_str::<Value>(line).is_ok(),
+                "every retained line must be valid JSON: {line}"
+            );
+        }
+        assert!(ledger.contains("\"session_id\":\"s6\""), "newest present");
     }
 }

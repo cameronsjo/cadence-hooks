@@ -261,11 +261,67 @@ pub fn build_record(
 }
 
 /// True when `personas.jsonl` contents already contain a line for `session_id`.
-pub fn ledger_contains(contents: &str, session_id: &str) -> bool {
-    contents
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .any(|v| v.get("session_id").and_then(Value::as_str) == Some(session_id))
+pub(crate) fn ledger_contains(contents: &str, session_id: &str) -> bool {
+    // Cheap dedupe: match the serde-emitted `"session_id":<value>` key, where
+    // `<value>` is `session_id` re-serialized through `serde_json::to_string` so
+    // it matches byte-for-byte whatever `build_record` wrote (quoted AND escaped
+    // the same way). The promote-path `sid` comes straight from a staging
+    // filename stem, so it isn't guaranteed to be the validated
+    // `[A-Za-z0-9_-]+` charset — a `"` or `\` in it must still match its own
+    // escaped ledger line, not silently miss and duplicate. Both quotes stay in
+    // the needle so a prefix can't false-match (`"session_id":"abc"` does not
+    // contain needle `"session_id":"ab"`). Reverse scan: a same-session dup is
+    // always the most recent line. (#137)
+    let Ok(escaped) = serde_json::to_string(session_id) else {
+        return false;
+    };
+    let needle = format!("\"session_id\":{escaped}");
+    contents.lines().rev().any(|line| line.contains(&needle))
+}
+
+/// Trim the ledger to at most `max_entries`, keeping the newest records and
+/// collapsing duplicate `session_id`s to their latest occurrence. Returns
+/// `Some(new_contents)` when a rewrite is needed, `None` when already within cap
+/// (caller skips the write). Pure — no I/O. (#137)
+pub(crate) fn rotate_lines(contents: &str, max_entries: usize) -> Option<String> {
+    let mut deduped: Vec<&str> = Vec::new();
+    for line in contents.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Extract session_id when the line parses; a line without a parseable
+        // session_id is permissive/fail-open — kept as-is, only the cap can drop
+        // it. Dedupe keeps the LAST occurrence per session_id, preserving order.
+        let sid = serde_json::from_str::<Value>(line).ok().and_then(|v| {
+            v.get("session_id")
+                .and_then(Value::as_str)
+                .map(String::from)
+        });
+        match sid {
+            Some(sid) => {
+                if let Some(pos) = deduped.iter().position(|existing| {
+                    serde_json::from_str::<Value>(existing).ok().and_then(|v| {
+                        v.get("session_id")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    }) == Some(sid.clone())
+                }) {
+                    deduped.remove(pos);
+                }
+                deduped.push(line);
+            }
+            None => deduped.push(line),
+        }
+    }
+
+    if deduped.len() <= max_entries {
+        return None;
+    }
+
+    let kept = &deduped[deduped.len() - max_entries..];
+    let mut out = kept.join("\n");
+    out.push('\n');
+    Some(out)
 }
 
 // ---------- Injected contract (H1) ----------
@@ -466,6 +522,87 @@ mod tests {
         assert!(ledger_contains(&jsonl, "b"));
         assert!(!ledger_contains(&jsonl, "c"));
         assert!(!ledger_contains("", "a"));
+    }
+
+    #[test]
+    fn ledger_contains_rejects_prefix_collision() {
+        let jsonl = r#"{"session_id":"abc","form":{}}"#;
+        assert!(ledger_contains(jsonl, "abc"));
+        assert!(!ledger_contains(jsonl, "a"));
+        assert!(!ledger_contains(jsonl, "ab"));
+    }
+
+    #[test]
+    fn ledger_contains_matches_escaped_special_chars() {
+        // The promote-path `sid` comes from a staging filename stem, not the
+        // validated `[A-Za-z0-9_-]+` session_id charset — a `"` or `\` must
+        // still match the serde-escaped form `build_record` actually wrote.
+        let sid = "a\"b\\c";
+        let record = build_record(&json!({}), sid, "t", None, &[]);
+        let mut jsonl = record.to_string();
+        jsonl.push('\n');
+        assert!(ledger_contains(&jsonl, sid));
+        assert!(!ledger_contains(&jsonl, "a"));
+        assert!(!ledger_contains(&jsonl, "a\"b"));
+    }
+
+    // --- rotation ---
+
+    #[test]
+    fn rotate_lines_under_cap_is_none() {
+        let jsonl = [
+            r#"{"session_id":"a","form":{}}"#,
+            r#"{"session_id":"b","form":{}}"#,
+        ]
+        .join("\n");
+        assert!(rotate_lines(&jsonl, 5).is_none());
+    }
+
+    #[test]
+    fn rotate_lines_over_cap_keeps_newest() {
+        let jsonl = [
+            r#"{"session_id":"a","form":{}}"#,
+            r#"{"session_id":"b","form":{}}"#,
+            r#"{"session_id":"c","form":{}}"#,
+            r#"{"session_id":"d","form":{}}"#,
+        ]
+        .join("\n");
+        let out = rotate_lines(&jsonl, 2).expect("over cap must rotate");
+        assert_eq!(out.lines().count(), 2);
+        assert!(!out.contains("\"session_id\":\"a\""));
+        assert!(!out.contains("\"session_id\":\"b\""));
+        assert!(out.contains("\"session_id\":\"c\""));
+        assert!(out.contains("\"session_id\":\"d\""));
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn rotate_lines_collapses_duplicate_session_to_latest() {
+        let jsonl = [
+            r#"{"session_id":"a","form":{"kind":"old"}}"#,
+            r#"{"session_id":"b","form":{}}"#,
+            r#"{"session_id":"a","form":{"kind":"new"}}"#,
+        ]
+        .join("\n");
+        // Deduped to 2 entries (a, b) — within a cap of 2, so no rotation needed,
+        // but the "a" that survives must be the latest occurrence.
+        assert!(rotate_lines(&jsonl, 2).is_none());
+        let out = rotate_lines(&jsonl, 1).expect("cap of 1 forces rotation");
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("\"kind\":\"new\""));
+    }
+
+    #[test]
+    fn rotate_lines_ignores_blank_lines() {
+        let jsonl =
+            "\n\n{\"session_id\":\"a\",\"form\":{}}\n\n{\"session_id\":\"b\",\"form\":{}}\n\n";
+        // 2 real lines, blanks stripped; cap of 2 means no rotation needed.
+        assert!(rotate_lines(jsonl, 2).is_none());
+        // cap of 1 forces rotation, dropping the blank lines and the older entry.
+        let out = rotate_lines(jsonl, 1).expect("cap of 1 forces rotation");
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("\"session_id\":\"b\""));
+        assert!(out.ends_with('\n'));
     }
 
     // --- contract ---
