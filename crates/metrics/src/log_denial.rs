@@ -194,9 +194,10 @@ mod tests {
 
     // --- log_denial end-to-end (tempdir) ---
 
-    /// Serialize the env-mutating tests: `CADENCE_METRICS_DIR` and
-    /// `CADENCE_LOG_NUDGES` are process-global.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Serialize the env-mutating tests against every other module's: the
+    /// process-global `CADENCE_METRICS_DIR` / `CADENCE_LOG_NUDGES` are shared with
+    /// sibling loggers' tests (`log_timing`), so all hold the one crate-wide lock.
+    use crate::common::ENV_LOCK;
 
     fn with_metrics_dir<F: FnOnce()>(dir: &std::path::Path, nudges: Option<&str>, f: F) {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());

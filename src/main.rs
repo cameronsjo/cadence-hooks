@@ -865,33 +865,39 @@ fn main() {
             ),
         },
         Commands::Metrics(cmd) => match cmd {
-            MetricsCommands::Snapshot => run_logger_from_stdin(
+            MetricsCommands::Snapshot => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::Snapshot,
                 registry::sample_for("metrics", "snapshot"),
+                canonical_hook,
             ),
-            MetricsCommands::LogCommit { prices } => run_logger_from_stdin(
+            MetricsCommands::LogCommit { prices } => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogCommit {
                     prices_path: prices,
                 },
                 registry::sample_for("metrics", "log-commit"),
+                canonical_hook,
             ),
-            MetricsCommands::LogSubagent => run_logger_from_stdin(
+            MetricsCommands::LogSubagent => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogSubagent,
                 registry::sample_for("metrics", "log-subagent"),
+                canonical_hook,
             ),
-            MetricsCommands::LogSession { prices } => run_logger_from_stdin(
+            MetricsCommands::LogSession { prices } => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogSession {
                     prices_path: prices,
                 },
                 registry::sample_for("metrics", "log-session"),
+                canonical_hook,
             ),
-            MetricsCommands::LogPolishNudge => run_logger_from_stdin(
+            MetricsCommands::LogPolishNudge => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogPolishNudge,
                 registry::sample_for("metrics", "log-polish-nudge"),
+                canonical_hook,
             ),
-            MetricsCommands::LogAskUserQuestion => run_logger_from_stdin(
+            MetricsCommands::LogAskUserQuestion => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogAskUserQuestion,
                 registry::sample_for("metrics", "log-ask-user-question"),
+                canonical_hook,
             ),
             // warn-stale is a SessionStart *check*, not a logger — it reads the
             // metrics dir's mtimes rather than reacting to a tool event.

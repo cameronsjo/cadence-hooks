@@ -22,6 +22,8 @@ pub mod log_polish_nudge;
 pub mod log_session;
 /// Append subagent lifecycle records to `subagents.jsonl`.
 pub mod log_subagent;
+/// Append threshold-gated hook self-timing records to `hooks.jsonl`.
+pub mod log_timing;
 /// Shared per-model breakdown builders for `byModel[]` / `unpricedModels[]`.
 pub mod model_breakdown;
 /// Embedded + overridable model price table.
@@ -39,5 +41,6 @@ pub use log_denial::log_denial;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_session::LogSession;
 pub use log_subagent::LogSubagent;
+pub use log_timing::log_timing;
 pub use snapshot::Snapshot;
 pub use warn_stale::WarnStale;
