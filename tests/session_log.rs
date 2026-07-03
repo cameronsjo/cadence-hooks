@@ -34,6 +34,32 @@ fn run_with_stdin(mut cmd: Command, input: &str) -> std::process::Output {
     child.wait_with_output().expect("failed to wait on binary")
 }
 
+/// Build a SessionEnd payload with **structural** JSON escaping.
+///
+/// The transcript path is a tempdir path — on Windows that's `C:\Users\...`,
+/// whose backslashes are invalid JSON escapes. Interpolating it into a raw
+/// string template with `format!` would produce unparseable JSON, `MetricsInput`
+/// would fail to deserialize, and the logger would silently fail open (no row).
+/// Building the payload with `serde_json::json!` escapes the path correctly on
+/// every platform (#170).
+fn session_payload(
+    session_id: &str,
+    event: &str,
+    transcript: &std::path::Path,
+    reason: Option<&str>,
+) -> String {
+    let mut obj = serde_json::json!({
+        "session_id": session_id,
+        "hook_event_name": event,
+        "transcript_path": transcript.to_string_lossy(),
+        "cwd": "/tmp",
+    });
+    if let Some(r) = reason {
+        obj["reason"] = serde_json::Value::String(r.to_string());
+    }
+    obj.to_string()
+}
+
 /// A transcript with two priced assistant messages. Written to `path`.
 fn write_transcript(path: &std::path::Path) {
     let transcript = [
@@ -58,10 +84,7 @@ fn non_session_end_event_writes_no_row() {
     let mut cmd = cadence_hooks();
     cmd.env("CADENCE_METRICS_DIR", dir.path());
     cmd.args(["metrics", "log-session"]);
-    let payload = format!(
-        r#"{{"session_id":"sess-1","hook_event_name":"PostToolUse","transcript_path":"{}","cwd":"/tmp"}}"#,
-        transcript.display()
-    );
+    let payload = session_payload("sess-1", "PostToolUse", &transcript, None);
     let output = run_with_stdin(cmd, &payload);
 
     assert_eq!(output.status.code(), Some(0), "loggers always exit 0");
@@ -82,9 +105,11 @@ fn session_end_writes_one_priced_row() {
     let mut cmd = cadence_hooks();
     cmd.env("CADENCE_METRICS_DIR", dir.path());
     cmd.args(["metrics", "log-session"]);
-    let payload = format!(
-        r#"{{"session_id":"sess-1","hook_event_name":"SessionEnd","transcript_path":"{}","cwd":"/tmp","reason":"prompt_input_exit"}}"#,
-        transcript.display()
+    let payload = session_payload(
+        "sess-1",
+        "SessionEnd",
+        &transcript,
+        Some("prompt_input_exit"),
     );
     let output = run_with_stdin(cmd, &payload);
     assert_eq!(output.status.code(), Some(0), "loggers always exit 0");
@@ -125,10 +150,7 @@ fn unpriced_model_lands_in_unpriced_never_silently_zero() {
     let mut cmd = cadence_hooks();
     cmd.env("CADENCE_METRICS_DIR", dir.path());
     cmd.args(["metrics", "log-session"]);
-    let payload = format!(
-        r#"{{"session_id":"sess-2","hook_event_name":"SessionEnd","transcript_path":"{}","cwd":"/tmp"}}"#,
-        transcript.display()
-    );
+    let payload = session_payload("sess-2", "SessionEnd", &transcript, None);
     let output = run_with_stdin(cmd, &payload);
     assert_eq!(output.status.code(), Some(0));
 
@@ -157,10 +179,7 @@ fn unwritable_metrics_dir_fails_open() {
     let mut cmd = cadence_hooks();
     cmd.env("CADENCE_METRICS_DIR", &blocker);
     cmd.args(["metrics", "log-session"]);
-    let payload = format!(
-        r#"{{"session_id":"sess-3","hook_event_name":"SessionEnd","transcript_path":"{}","cwd":"/tmp"}}"#,
-        transcript.display()
-    );
+    let payload = session_payload("sess-3", "SessionEnd", &transcript, None);
     let output = run_with_stdin(cmd, &payload);
     assert_eq!(output.status.code(), Some(0), "fail-open: still exits 0");
 }

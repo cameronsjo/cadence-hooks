@@ -22,6 +22,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   dir, unreadable file, fresh install, bad env value, or marker IO error all
   resolve to silence or a plain nudge — never a block. The SessionStart hook
   wiring ships in the companion cadence-metrics plugin PR.
+- **`metrics log-session` — per-session cost at `SessionEnd`
+  (`sessions.jsonl`).** A fifth `log-*` logger that scans the whole transcript
+  once at session end, prices it per-model, and appends one row with
+  `sessionId`, `repo`, `branch`, `reason`, `durationApproxMs`, `tokens`,
+  `costUsd`, `byModel[]`, `unpricedModels[]`, `messagesScanned`,
+  `lastMessageId`, `agentId`, `parentSessionId`. Where `log-commit` prices the
+  range since the last commit marker, `log-session` prices the whole transcript,
+  so `sum(commits) ≤ session` — the gap is uncommitted-work cost, and each
+  `/clear` segment writes its own row. Adds `MetricsInput.reason` (the
+  SessionEnd exit reason) and extracts the `byModel[]` / `unpricedModels[]`
+  builders into a shared `model_breakdown` module so `log-commit` and
+  `log-session` emit identical shapes. Gated on
+  `hook_event_name == "SessionEnd"` and fail-open (ADR-0001); the SessionEnd
+  hook wiring ships in the companion cadence-metrics plugin PR. Refs
+  cameronsjo/cadence#141.
 
 ### Added
 
