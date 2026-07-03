@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (#140). The changelog jumped `[0.31.0]` → `[0.29.0]`; the three fixes that
   shipped in v0.30.0 are now stamped into a versioned section.
 - docs(hooks): add missing metrics-logger rows (`log-session`, `log-polish-nudge`, `log-ask-user-question`) to the cadence-metrics table in `docs/hooks.md` (#178)
+- docs(testing): document isolating a block to the binary vs the run-cadence-hooks wrapper, and the wrapper's fail-open signal (#69)
 
 ### Fixed
 
