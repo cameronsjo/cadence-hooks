@@ -50,6 +50,16 @@ impl Logger for LogSession {
             return;
         }
 
+        // The marker from the `log-session-start` SessionStart partner. Consume
+        // it (mirrors `log_commit`'s `.before` handling) so a later session
+        // can't reuse a stale timestamp.
+        let start_marker = common::state_dir().join(format!("{session_id}.start"));
+        let start_ts = std::fs::read_to_string(&start_marker)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let _ = std::fs::remove_file(&start_marker);
+
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
         };
@@ -63,9 +73,20 @@ impl Logger for LogSession {
 
         let branch = common::branch(input.cwd.as_deref());
         let repo = common::repo_basename(input.cwd.as_deref());
+        let ts = common::utc_timestamp();
+
+        let dir = common::metrics_dir();
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let commits_path = dir.join("commits.jsonl");
+        let commits = std::fs::read_to_string(&commits_path)
+            .ok()
+            .map(|contents| count_commits(&contents, session_id))
+            .unwrap_or(0);
 
         let record = build_session_record(
-            &common::utc_timestamp(),
+            &ts,
             input,
             session_id,
             &branch,
@@ -73,12 +94,10 @@ impl Logger for LogSession {
             &scan,
             cost,
             &prices,
+            start_ts.as_deref(),
+            commits,
         );
 
-        let dir = common::metrics_dir();
-        if std::fs::create_dir_all(&dir).is_err() {
-            return;
-        }
         let sessions_path = dir.join("sessions.jsonl");
 
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -97,6 +116,31 @@ impl Logger for LogSession {
     }
 }
 
+/// Count `commits.jsonl` rows belonging to `session_id`. Pure — operates on
+/// file contents, no I/O. Patterned on `log_commit::parse_last_message_id`.
+fn count_commits(commits_jsonl: &str, session_id: &str) -> u64 {
+    commits_jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v.get("sessionId").and_then(Value::as_str) == Some(session_id))
+        .count() as u64
+}
+
+/// Session wall-clock duration in milliseconds, from the `log-session-start`
+/// marker (`start_ts`) to this record's own `ts`. Both are second-precision
+/// ISO 8601 timestamps from the same [`common::utc_timestamp`] source, so this
+/// is second-granular — a coarser fallback than `durationApproxMs` (which
+/// carries Claude Code's own millisecond-precision session timer, when the
+/// payload provides one). `None` when there's no start marker (e.g. a session
+/// that started before this feature shipped) or either timestamp fails to
+/// parse.
+fn session_duration_ms(start_ts: Option<&str>, ts: &str) -> Option<i64> {
+    let start: jiff::Timestamp = start_ts?.parse().ok()?;
+    let end: jiff::Timestamp = ts.parse().ok()?;
+    let diff = end.duration_since(start);
+    Some(diff.as_secs() * 1000 + i64::from(diff.subsec_millis()))
+}
+
 /// Build the `sessions.jsonl` record. Pure — no I/O. The `byModel`/`unpricedModels`
 /// shapes come from [`crate::model_breakdown`], shared verbatim with `log_commit`.
 #[allow(clippy::too_many_arguments)]
@@ -109,9 +153,12 @@ fn build_session_record(
     scan: &ScanResult,
     cost: f64,
     prices: &Prices,
+    start_ts: Option<&str>,
+    commits: u64,
 ) -> Value {
     let by_model = by_model_json(&scan.by_model, prices);
     let unpriced = unpriced_models(&scan.by_model, prices);
+    let duration_ms = session_duration_ms(start_ts, ts);
 
     json!({
         "ts": ts,
@@ -121,6 +168,10 @@ fn build_session_record(
         "branch": branch,
         "reason": input.reason,
         "durationApproxMs": input.duration_ms,
+        "startTs": start_ts,
+        "endTs": ts,
+        "durationMs": duration_ms,
+        "commits": commits,
         "model": scan.model,
         "tokens": {
             "input": scan.tokens.input,
@@ -196,6 +247,8 @@ mod tests {
             &sample_scan(),
             0.001234,
             &prices,
+            None,
+            2,
         );
         assert_eq!(record["sessionId"], "s1");
         assert_eq!(record["transcriptPath"], "/tmp/t.jsonl");
@@ -203,6 +256,7 @@ mod tests {
         assert_eq!(record["branch"], "feat/x");
         assert_eq!(record["reason"], "prompt_input_exit");
         assert_eq!(record["durationApproxMs"], 4567);
+        assert_eq!(record["commits"], 2);
         assert_eq!(record["model"], "claude-opus-4-7");
         assert_eq!(record["tokens"]["input"], 100);
         assert_eq!(record["tokens"]["cacheCreate"], 50);
@@ -239,6 +293,8 @@ mod tests {
             &sample_scan(),
             0.0,
             &prices,
+            None,
+            0,
         );
         // Absent → null, not omitted.
         assert!(record["reason"].is_null());
@@ -246,6 +302,11 @@ mod tests {
         assert!(record["agentId"].is_null());
         assert!(record["parentSessionId"].is_null());
         assert_eq!(record["branch"], "");
+        // No start marker → startTs/durationMs null, endTs still stamped, commits 0.
+        assert!(record["startTs"].is_null());
+        assert!(record["durationMs"].is_null());
+        assert_eq!(record["endTs"], "2026-07-02T00:00:00Z");
+        assert_eq!(record["commits"], 0);
     }
 
     #[test]
@@ -278,10 +339,57 @@ mod tests {
             &scan,
             0.0,
             &prices,
+            None,
+            0,
         );
         let unpriced = record["unpricedModels"].as_array().unwrap();
         assert_eq!(unpriced.len(), 1);
         assert_eq!(unpriced[0], "gpt-9");
+    }
+
+    #[test]
+    fn session_record_start_ts_present_computes_duration() {
+        let prices = Prices::embedded();
+        let record = build_session_record(
+            "2026-07-02T00:10:30Z",
+            &sample_input(),
+            "s1",
+            "main",
+            "r",
+            &sample_scan(),
+            0.0,
+            &prices,
+            Some("2026-07-02T00:10:00Z"),
+            5,
+        );
+        assert_eq!(record["startTs"], "2026-07-02T00:10:00Z");
+        assert_eq!(record["endTs"], "2026-07-02T00:10:30Z");
+        assert_eq!(record["durationMs"], 30_000);
+        assert_eq!(record["commits"], 5);
+    }
+
+    #[test]
+    fn session_duration_ms_unparseable_start_is_none() {
+        assert_eq!(
+            session_duration_ms(Some("not-a-timestamp"), "2026-07-02T00:00:00Z"),
+            None
+        );
+        assert_eq!(session_duration_ms(None, "2026-07-02T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn count_commits_counts_matching_session_rows() {
+        let jsonl = [
+            r#"{"sessionId":"s1"}"#,
+            r#"{"sessionId":"s2"}"#,
+            r#"{"sessionId":"s1"}"#,
+            r#"{"sessionId":"s1"}"#,
+        ]
+        .join("\n");
+        assert_eq!(count_commits(&jsonl, "s1"), 3);
+        assert_eq!(count_commits(&jsonl, "s2"), 1);
+        assert_eq!(count_commits(&jsonl, "other"), 0);
+        assert_eq!(count_commits("", "s1"), 0);
     }
 
     /// Whole ≥ parts: a session scan of the full transcript costs at least as

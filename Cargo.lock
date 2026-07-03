@@ -245,6 +245,7 @@ version = "0.45.0"
 dependencies = [
  "cadence-hooks-core",
  "cadence-hooks-rules",
+ "jiff",
  "regex",
  "serde",
  "serde_json",

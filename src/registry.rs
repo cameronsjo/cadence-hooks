@@ -315,6 +315,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: None,
     },
     HookEntry {
+        name: "log-session-start",
+        description: "Capture session start timestamp (SessionStart)",
+        plugin: "metrics",
+        event: None,
+    },
+    HookEntry {
         name: "log-polish-nudge",
         description: "Log polish-nudge skips: gh pr create + whether /polish ran (PostToolUse)",
         plugin: "metrics",
@@ -440,6 +446,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("metrics", "log-session") => Some(
             r#"{"session_id":"test","hook_event_name":"SessionEnd","transcript_path":"/tmp/transcript.jsonl","cwd":"/tmp","reason":"prompt_input_exit"}"#,
         ),
+        // log-session-start gates on hook_event_name == "SessionStart"; the
+        // generic logger sample carries a different event and would no-op.
+        ("metrics", "log-session-start") => {
+            Some(r#"{"session_id":"test","hook_event_name":"SessionStart","cwd":"/tmp"}"#)
+        }
         // log-polish-nudge gates on a `gh pr create` command (the nudge denominator)
         ("metrics", "log-polish-nudge") => Some(
             r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"gh pr create --title test"},"transcript_path":"/tmp/transcript.jsonl"}"#,
@@ -614,6 +625,7 @@ mod tests {
             "log-commit",
             "log-subagent",
             "log-session",
+            "log-session-start",
             "log-polish-nudge",
             "log-ask-user-question",
             "heartbeat",

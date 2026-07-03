@@ -23,6 +23,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **`dismiss-enforce-worktree` marker now resolves the git common dir, so snoozing works from a linked worktree (#179).** The marker was written under the passed directory's own `.git/cadence-hooks/`, which for a linked worktree is the per-worktree git dir — invisible to the primary checkout where the guard fires. Both the reader and the dismiss CLI now resolve the shared common dir via `git rev-parse --git-common-dir`, so a snooze recorded from any worktree is honoured at the primary. Fail-open on non-repos preserved (ADR-0001).
+### Added
+
+- session bounds (startTs/endTs/durationMs) and commits count on sessions.jsonl, plus a log-session-start hook to stamp SessionStart (#182)
 
 ## [0.45.0] - 2026-07-03
 

@@ -163,6 +163,107 @@ fn unpriced_model_lands_in_unpriced_never_silently_zero() {
     assert!(row["reason"].is_null(), "absent reason → null");
 }
 
+// ── Session bounds: log-session-start / log-session round trip (#182) ────
+
+/// Build a SessionStart payload for `metrics log-session-start`.
+fn session_start_payload(session_id: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        "hook_event_name": "SessionStart",
+        "cwd": "/tmp",
+    })
+    .to_string()
+}
+
+#[test]
+fn session_start_then_end_round_trip_computes_duration() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+
+    let mut start_cmd = cadence_hooks();
+    start_cmd.env("CADENCE_METRICS_DIR", dir.path());
+    start_cmd.args(["metrics", "log-session-start"]);
+    let start_output = run_with_stdin(start_cmd, &session_start_payload("sess-bounds"));
+    assert_eq!(start_output.status.code(), Some(0), "loggers always exit 0");
+
+    let mut end_cmd = cadence_hooks();
+    end_cmd.env("CADENCE_METRICS_DIR", dir.path());
+    end_cmd.args(["metrics", "log-session"]);
+    let payload = session_payload("sess-bounds", "SessionEnd", &transcript, None);
+    let end_output = run_with_stdin(end_cmd, &payload);
+    assert_eq!(end_output.status.code(), Some(0), "loggers always exit 0");
+
+    let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl"))
+        .expect("sessions.jsonl must exist after SessionEnd");
+    let row: serde_json::Value =
+        serde_json::from_str(contents.lines().next().unwrap()).expect("row parses as JSON");
+    assert!(row["startTs"].is_string(), "startTs should be stamped");
+    assert!(row["endTs"].is_string(), "endTs should be stamped");
+    assert!(
+        row["durationMs"].as_i64().unwrap() >= 0,
+        "durationMs should be a non-negative number: {row}"
+    );
+
+    // The `.start` marker is consumed — a second SessionEnd for the same
+    // session must not see a stale duration.
+    assert!(
+        !dir.path().join("state").join("sess-bounds.start").exists(),
+        "start marker must be consumed"
+    );
+}
+
+#[test]
+fn session_end_without_start_marker_has_null_bounds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+
+    // No log-session-start ran for this session — SessionEnd fires on its own.
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_METRICS_DIR", dir.path());
+    cmd.args(["metrics", "log-session"]);
+    let payload = session_payload("sess-no-start", "SessionEnd", &transcript, None);
+    let output = run_with_stdin(cmd, &payload);
+    assert_eq!(output.status.code(), Some(0));
+
+    let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl")).expect("row written");
+    let row: serde_json::Value =
+        serde_json::from_str(contents.lines().next().unwrap()).expect("parse");
+    assert!(row["startTs"].is_null(), "no marker → startTs null");
+    assert!(row["durationMs"].is_null(), "no marker → durationMs null");
+    assert!(row["endTs"].is_string(), "endTs is always stamped");
+    assert_eq!(row["commits"], 0, "no commits.jsonl → commits 0");
+}
+
+#[test]
+fn session_end_counts_commits_for_this_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_transcript(&transcript);
+
+    // Seed commits.jsonl with 2 rows for this session and 1 for another.
+    let commits_jsonl = [
+        r#"{"sessionId":"sess-commits"}"#,
+        r#"{"sessionId":"other-session"}"#,
+        r#"{"sessionId":"sess-commits"}"#,
+    ]
+    .join("\n");
+    std::fs::write(dir.path().join("commits.jsonl"), commits_jsonl).expect("seed commits.jsonl");
+
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_METRICS_DIR", dir.path());
+    cmd.args(["metrics", "log-session"]);
+    let payload = session_payload("sess-commits", "SessionEnd", &transcript, None);
+    let output = run_with_stdin(cmd, &payload);
+    assert_eq!(output.status.code(), Some(0));
+
+    let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl")).expect("row written");
+    let row: serde_json::Value =
+        serde_json::from_str(contents.lines().next().unwrap()).expect("parse");
+    assert_eq!(row["commits"], 2, "only this session's commit rows count");
+}
+
 // ── Fail-open: an unwritable metrics dir never perturbs the exit code ─────
 
 #[test]
