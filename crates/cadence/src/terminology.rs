@@ -264,7 +264,7 @@ fn glob_match(pattern: &str, rel_path: &str, basename: &str) -> bool {
 /// all yield the default (empty) config (fail-open, ADR-0001).
 fn load_terminology_config(root: &Path) -> TerminologyConfig {
     let path = root.join(".claude/terminology.json");
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Some(content) = cadence_hooks_core::paths::read_untrusted_config(&path) else {
         return TerminologyConfig::default();
     };
     serde_json::from_str(&content).unwrap_or_default()
@@ -1182,6 +1182,22 @@ mod tests {
     fn invalid_json_fails_open_and_still_blocks() {
         let repo = temp_repo("{not valid json");
         let input = write_at(repo.path(), "acl.yml", BLOCK_VIOLATIONS[0].0);
+        assert_eq!(outcome(&input), Outcome::Block);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_file_config_fails_open_and_does_not_hang() {
+        // #157: a `.claude/terminology.json` that is a symlink to an endless
+        // special file (`/dev/zero`) must be rejected on stat — the guard falls
+        // open to the default (empty) config and a flagged term still blocks,
+        // without an unbounded read hanging the hook.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join(".claude/terminology.json"))
+            .unwrap();
+        let input = write_at(dir.path(), "src/main.rs", BLOCK_VIOLATIONS[0].0);
         assert_eq!(outcome(&input), Outcome::Block);
     }
 

@@ -20,6 +20,7 @@
 
 use crate::HookInput;
 use crate::paths;
+use crate::shell::{git_command, parse_work_dir};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -138,6 +139,27 @@ pub fn polish_marker(repo_root: &str, branch: &str) -> PathBuf {
         hash_of(repo_root),
         hash_of(branch)
     ))
+}
+
+/// True when a branch-scoped polish marker exists for the `(repo, branch)` a
+/// `gh pr create` command targets. Single source of truth for "did `/polish`
+/// record for this PR's branch" — the pre-PR gate acts on it and the
+/// polish-nudge metric records it, so the two cannot disagree (#177).
+///
+/// Resolves `repo_root` (`git rev-parse --show-toplevel`) and `branch`
+/// (`git branch --show-current`) from `cwd`, honoring a `cd`-prefixed command
+/// via [`parse_work_dir`] — mirrors the record side. Any missing piece (no cwd,
+/// not a repo, detached HEAD) yields `false` (fail-open, ADR-0001).
+pub fn polish_marker_present(command: &str, cwd: Option<&str>) -> bool {
+    let Some(cwd) = cwd else { return false };
+    let dir = parse_work_dir(command, cwd);
+    let Some(repo_root) = git_command(&dir, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    let Some(branch) = git_command(&dir, &["branch", "--show-current"]) else {
+        return false;
+    };
+    polish_marker(&repo_root, &branch).is_file()
 }
 
 /// Write `contents` to a marker path symlink-safely.
@@ -348,5 +370,68 @@ mod tests {
         write_marker(&target, "first").unwrap();
         write_marker(&target, "second").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+    }
+
+    // --- polish_marker_present (shared gate/metric helper, #177) ---
+
+    /// Init a git repo in a fresh tempdir, checked out on `branch`, and return
+    /// the tempdir plus the git-resolved (canonicalized) repo root — mirrors the
+    /// gate's own `init_repo_on_branch` so both sides key markers identically.
+    fn init_repo_on_branch(branch: &str) -> (tempfile::TempDir, String) {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["checkout", "-q", "-b", branch]);
+        let root = crate::shell::git_command(&dir, &["rev-parse", "--show-toplevel"])
+            .expect("temp repo resolves a toplevel");
+        (tmp, root)
+    }
+
+    #[test]
+    fn polish_marker_present_true_for_current_branch_with_marker() {
+        let (tmp, root) = init_repo_on_branch("feat/thing");
+        write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
+        assert!(polish_marker_present(
+            "gh pr create --title x",
+            Some(tmp.path().to_str().unwrap())
+        ));
+    }
+
+    #[test]
+    fn polish_marker_present_false_for_different_branch_marker() {
+        // A marker for branch A must NOT satisfy a repo checked out on branch B.
+        let (tmp, root) = init_repo_on_branch("branch-b");
+        write_marker(&polish_marker(&root, "branch-a"), "{}").unwrap();
+        assert!(!polish_marker_present(
+            "gh pr create --title x",
+            Some(tmp.path().to_str().unwrap())
+        ));
+    }
+
+    #[test]
+    fn polish_marker_present_false_when_no_marker() {
+        let (tmp, _root) = init_repo_on_branch("feat/unmarked");
+        assert!(!polish_marker_present(
+            "gh pr create --title x",
+            Some(tmp.path().to_str().unwrap())
+        ));
+    }
+
+    #[test]
+    fn polish_marker_present_false_when_cwd_none() {
+        // No cwd → unresolved → false (fail-open, ADR-0001).
+        assert!(!polish_marker_present("gh pr create --title x", None));
     }
 }
