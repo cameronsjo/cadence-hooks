@@ -7,7 +7,9 @@
 //! metadata-safe allowlist (#65, #66). Safe templates (.env.example,
 //! .env.test) are always allowed.
 
-use crate::secret_patterns::{is_ambiguous, is_blocked, is_dangerous_env_token, is_safe_template};
+use crate::secret_patterns::{
+    envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_env_token, is_safe_template,
+};
 use cadence_hooks_core::shell::{command_segments, split_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -163,6 +165,38 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     None
 }
 
+/// The LITERAL, un-normalized tool-input path (`file_path`, falling back to
+/// `path`) — NOT [`HookInput::file_path`], whose normalization strips trailing
+/// whitespace, converts backslashes, and removes null bytes. The carve-out must
+/// classify the exact file the Read/Grep tool opens, not a normalized sibling.
+fn raw_file_path(input: &HookInput) -> Option<&str> {
+    let ti = input.tool_input.as_ref()?;
+    ti.file_path.as_deref().or(ti.path.as_deref())
+}
+
+/// Read the on-disk `.envrc` and classify it for a content-aware carve-out
+/// (#149): true = a proven pure-loader `.envrc` that Read/Grep may see. Only
+/// `.envrc` triggers a disk read; an unreadable or absent file yields `None`
+/// and stays blocked (fail-closed).
+///
+/// `raw_path` is the LITERAL tool-input path, not the normalized one. Reading
+/// the normalized path would classify the wrong file: an attacker who places a
+/// clean-loader `.envrc` beside a secret `.envrc ` (trailing space) and Reads
+/// the trailing-space variant would get the CLEAN file classified (post-
+/// normalization) while the Read tool surfaces the SECRET file — the guard
+/// would `allow()` the leak. Classifying the literal target closes that
+/// (mirrors the #129 fix on `effective_content`'s Edit path). The guard
+/// reading the file to classify it is internal — the body is never echoed.
+fn envrc_read_allowed(filename: &str, raw_path: Option<&str>) -> bool {
+    filename.eq_ignore_ascii_case(".envrc")
+        && envrc_carveout_allows(
+            filename,
+            raw_path
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .as_deref(),
+        )
+}
+
 /// Blocks reading secrets into context via Read, Grep, or Bash.
 pub struct SecretLeaksGuard;
 
@@ -186,6 +220,9 @@ impl Check for SecretLeaksGuard {
                 }
 
                 if is_blocked(filename, &path) {
+                    if envrc_read_allowed(filename, raw_file_path(input)) {
+                        return CheckResult::allow();
+                    }
                     return CheckResult::block(format!(
                         "🚫 BLOCKED (Read): '{filename}' contains secrets. \
                          Use direnv or shell env to make secrets available."
@@ -212,6 +249,9 @@ impl Check for SecretLeaksGuard {
                 }
 
                 if is_blocked(filename, &path) {
+                    if envrc_read_allowed(filename, raw_file_path(input)) {
+                        return CheckResult::allow();
+                    }
                     return CheckResult::block(format!(
                         "🚫 BLOCKED (Grep): '{filename}' contains secrets. \
                          Use direnv or shell env to make secrets available."
@@ -601,6 +641,60 @@ mod tests {
     fn read_envrc_example_allowed() {
         let result = SecretLeaksGuard.run(&make_read_input("/project/.envrc.example"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- #149: content-aware .envrc carve-out on the Read/Grep arms ---
+
+    #[test]
+    fn read_envrc_loader_allowed() {
+        // A pure direnv loader .envrc is read to classify and allowed through.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".envrc");
+        std::fs::write(&path, "use flake\ndotenv .env.local\nPATH_add ./bin\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_read_input(path.to_str().unwrap()));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn grep_envrc_loader_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".envrc");
+        std::fs::write(&path, "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_grep_input(path.to_str().unwrap()));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn read_envrc_secret_content_still_blocked() {
+        // A .envrc carrying a KEY=<value> assignment stays blocked.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".envrc");
+        std::fs::write(&path, "export SECRET_TOKEN=hunter2\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_read_input(path.to_str().unwrap()));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_envrc_missing_file_fails_closed() {
+        // No on-disk file → None → fail-closed, still blocked.
+        let result = SecretLeaksGuard.run(&make_read_input("/nonexistent/dir/.envrc"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn read_envrc_trailing_space_classifies_literal_not_normalized() {
+        // #129 class: a clean-loader `.envrc` sits beside a secret `.envrc `
+        // (trailing space). `input.file_path()` normalizes the trailing space
+        // away, so the guard's filename is `.envrc` — but the Read tool opens
+        // the LITERAL `.envrc ` secret file. Classifying the literal path keeps
+        // it blocked; a normalized-path read would find the clean loader and
+        // wrongly allow the leak.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let secret_path = dir.path().join(".envrc "); // trailing space — distinct file
+        std::fs::write(&secret_path, "export SECRET_TOKEN=hunter2\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_read_input(secret_path.to_str().unwrap()));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
