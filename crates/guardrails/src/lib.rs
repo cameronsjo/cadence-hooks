@@ -51,6 +51,8 @@ pub mod warn_issue_tracker;
 pub mod warn_main_branch;
 /// Remind on `gh pr create` when the PR body has no closing keyword linking to an issue.
 pub mod warn_pr_issue_link;
+/// Nudge when the live subagent count is at or over the configured cap.
+pub mod warn_subagent_concurrency;
 /// Warn when dispatching a subagent from main while a sibling worktree exists.
 pub mod warn_subagent_worktree;
 /// Warn about untracked files during git commit operations.
