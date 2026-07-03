@@ -1,12 +1,16 @@
 //! Nudge when `gh issue create` (or a `gh api .../issues` POST) targets an
-//! owned repo other than the canonical issue tracker.
+//! owned repo that is not a known ecosystem issue tracker.
 //!
 //! Fires as a PreToolUse hook on Bash. Detects `gh issue create` commands and
 //! `gh api` POST calls to `.../repos/OWNER/REPO/issues` endpoints. Nudges
-//! (never blocks) when the resolved target is an owned repo that is not the
-//! canonical issue tracker (`cameronsjo/claude-configurations` by default,
-//! overridable via `CADENCE_ISSUE_TRACKER`). Unowned repos and third-party
-//! projects are silently allowed — the nudge only fires for repos you control.
+//! (never blocks) when the resolved target is an owned repo that is not among
+//! the known ecosystem trackers. Since the 2026-06-30 decentralization, issues
+//! route by the component that owns the defect, so the guard checks the target
+//! against a *set* of trackers (`cadence`, `cadence-hooks`, `forgectl`,
+//! `claude-configurations`) rather than a single canonical repo. Override the
+//! set with `CADENCE_ISSUE_TRACKERS` (plural, comma-separated) or the legacy
+//! singular `CADENCE_ISSUE_TRACKER`. Unowned repos and third-party projects are
+//! silently allowed — the nudge only fires for repos you control.
 
 use cadence_hooks_core::config::{self, default_host, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::shell::{
@@ -17,18 +21,44 @@ use regex::Regex;
 use std::path::Path;
 use std::sync::LazyLock;
 
-/// Default canonical issue tracker. Overridable via `CADENCE_ISSUE_TRACKER`.
-const CANONICAL: &str = "cameronsjo/claude-configurations";
+/// Default set of canonical ecosystem issue trackers (2026-06-30 decentralization).
+/// Overridable via `CADENCE_ISSUE_TRACKERS` (plural, comma-separated) or the legacy
+/// singular `CADENCE_ISSUE_TRACKER`.
+const DEFAULT_TRACKERS: &[&str] = &[
+    "cameronsjo/cadence",               // 12 cadence plugins
+    "cameronsjo/cadence-hooks",         // this binary
+    "cameronsjo/forgectl",              // forgectl + claunch
+    "cameronsjo/claude-configurations", // meta / orchestration
+];
 
-/// Return the effective canonical issue tracker.
+/// Return the effective set of known ecosystem issue trackers (lowercased).
 ///
-/// Returns the `CADENCE_ISSUE_TRACKER` env value when set and non-empty;
-/// falls back to `CANONICAL`.
-fn canonical() -> String {
-    std::env::var("CADENCE_ISSUE_TRACKER")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| CANONICAL.to_string())
+/// Precedence: `CADENCE_ISSUE_TRACKERS` (plural, comma-separated — replaces the
+/// default set) → the legacy singular `CADENCE_ISSUE_TRACKER` → `DEFAULT_TRACKERS`.
+fn trackers() -> Vec<String> {
+    if let Ok(v) = std::env::var("CADENCE_ISSUE_TRACKERS") {
+        // Parse first, then check: a value that is all commas/whitespace
+        // (e.g. ",") is non-empty at the string level but yields no entries.
+        // Fall through to the default set rather than returning an empty vec
+        // (which would make every owned repo nudge).
+        let parsed: Vec<String> = v
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    if let Ok(v) = std::env::var("CADENCE_ISSUE_TRACKER") {
+        // Trim before the emptiness check so a whitespace-only value
+        // (e.g. " ") behaves as unset instead of a single-space "tracker".
+        let t = v.trim();
+        if !t.is_empty() {
+            return vec![t.to_lowercase()];
+        }
+    }
+    DEFAULT_TRACKERS.iter().map(|s| s.to_lowercase()).collect()
 }
 
 /// Matches `gh api /?repos/OWNER/REPO/issues` where `/issues` is the final
@@ -101,7 +131,7 @@ fn is_issue_create(stripped: &str) -> bool {
 /// - A target `owner/repo` resolves via `-R` flag, API path, or git remote
 /// - The target host is the default host (`github.com` unless `GH_HOST` is set)
 /// - The target owner is in `CADENCE_ALLOWED_OWNERS`
-/// - The target is not the canonical issue tracker
+/// - The target is not among the known ecosystem issue trackers
 pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
     let stripped = strip_quotes(command);
 
@@ -154,8 +184,8 @@ pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
         return None;
     }
 
-    // Gate: not the canonical tracker.
-    if target == canonical().to_lowercase() {
+    // Gate: target must not be a known ecosystem tracker.
+    if trackers().iter().any(|t| t == &target) {
         return None;
     }
 
@@ -163,16 +193,17 @@ pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
 }
 
 fn nudge_message(target: &str) -> String {
-    let c = canonical();
     format!(
-        "warn-issue-tracker: GitHub issues now consolidate to {c}.\n\
-         This filing targets {target}. If that's deliberate — a genuinely external project —\n\
-         carry on. Otherwise refile with -R {c}."
+        "warn-issue-tracker: {target} isn't a known cadence ecosystem issue tracker.\n\
+         Issues route by the component that owns the defect:\n\
+         cadence plugins → cameronsjo/cadence · cadence-hooks → cameronsjo/cadence-hooks ·\n\
+         forgectl/claunch → cameronsjo/forgectl · meta/orchestration → cameronsjo/claude-configurations.\n\
+         If this filing is deliberate — a genuinely external or new tracker — carry on."
     )
 }
 
 /// Nudges when `gh issue create` (or a `gh api .../issues` POST) targets an
-/// owned repo that is not the canonical issue tracker.
+/// owned repo that is not among the known ecosystem issue trackers.
 pub struct WarnIssueTracker;
 
 impl Check for WarnIssueTracker {
@@ -216,7 +247,7 @@ mod tests {
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
     use std::path::PathBuf;
 
-    // Serialize tests that mutate CADENCE_ALLOWED_OWNERS / CADENCE_ISSUE_TRACKER
+    // Serialize tests that mutate CADENCE_ALLOWED_OWNERS / CADENCE_ISSUE_TRACKER(S)
     // so they don't race each other.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -449,6 +480,163 @@ mod tests {
                     nudge,
                     Some("cameronsjo/claude-configurations".to_string()),
                     "non-canonical owned repo should nudge when override is active"
+                );
+            },
+        );
+    }
+
+    // ---- decentralization regression tests (#166) ----
+    // Since 2026-06-30 issues route by owning component, so each of these
+    // ecosystem trackers must be silent. The pre-#166 single-canonical guard
+    // wrongly nudged all three (only claude-configurations was exempt).
+
+    // `cameronsjo/cadence` (the 12 plugins) is a known tracker — no nudge.
+    #[test]
+    fn cadence_repo_not_nudged() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R cameronsjo/cadence --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(result.is_none(), "cadence is a known tracker: {result:?}");
+            },
+        );
+    }
+
+    // `cameronsjo/cadence-hooks` (this binary) is a known tracker — no nudge.
+    #[test]
+    fn cadence_hooks_repo_not_nudged() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R cameronsjo/cadence-hooks --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    result.is_none(),
+                    "cadence-hooks is a known tracker: {result:?}"
+                );
+            },
+        );
+    }
+
+    // `cameronsjo/forgectl` (forgectl + claunch) is a known tracker — no nudge.
+    #[test]
+    fn forgectl_repo_not_nudged() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R cameronsjo/forgectl --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(result.is_none(), "forgectl is a known tracker: {result:?}");
+            },
+        );
+    }
+
+    // `CADENCE_ISSUE_TRACKERS` (plural) REPLACES the default set: the listed
+    // repos go silent and the former defaults (e.g. cadence) now nudge.
+    #[test]
+    fn plural_env_override_sets_tracker_set() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                (
+                    "CADENCE_ISSUE_TRACKERS",
+                    Some("cameronsjo/foo, cameronsjo/bar"),
+                ),
+            ],
+            || {
+                // Both listed repos are now known trackers — silent.
+                assert!(
+                    judge_issue_target(
+                        "gh issue create -R cameronsjo/foo --title x",
+                        &workdir("/tmp"),
+                    )
+                    .is_none(),
+                    "foo is in the override set — no nudge"
+                );
+                assert!(
+                    judge_issue_target(
+                        "gh issue create -R cameronsjo/bar --title x",
+                        &workdir("/tmp"),
+                    )
+                    .is_none(),
+                    "bar is in the override set — no nudge"
+                );
+
+                // A former default (cadence) is no longer in the set — nudges.
+                let nudge = judge_issue_target(
+                    "gh issue create -R cameronsjo/cadence --title x",
+                    &workdir("/tmp"),
+                );
+                assert_eq!(
+                    nudge,
+                    Some("cameronsjo/cadence".to_string()),
+                    "plural override replaces the default set, so cadence now nudges"
+                );
+            },
+        );
+    }
+
+    // A whitespace-only singular override behaves as unset — the default set
+    // still applies, so a known tracker is not spuriously nudged.
+    #[test]
+    fn whitespace_singular_env_behaves_as_unset() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", Some(" ")),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R cameronsjo/cadence --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    result.is_none(),
+                    "whitespace-only singular override should fall back to the default set: {result:?}"
+                );
+            },
+        );
+    }
+
+    // A plural override that filters to nothing (all commas/whitespace) falls
+    // back to the default set rather than making every owned repo nudge.
+    #[test]
+    fn empty_plural_env_falls_back_to_default_set() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", Some(",")),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R cameronsjo/cadence --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    result.is_none(),
+                    "empty plural override should fall back to the default set: {result:?}"
                 );
             },
         );
