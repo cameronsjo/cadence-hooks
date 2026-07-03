@@ -12,6 +12,7 @@
 //! races parallel tests), mirroring the `expand_tilde`/`expand_tilde_with`
 //! split elsewhere in the workspace.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// The current user's home directory, portably.
@@ -92,6 +93,34 @@ pub fn find_git_root(start: &str) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+/// Cap for an untrusted per-repo `.claude/*.json` read. These are tiny
+/// hand-authored exemption lists; 1 MiB is ~100–1000x any legitimate size and
+/// bounds a pathological/malicious multi-GB blob from OOM-ing the hook.
+const MAX_UNTRUSTED_CONFIG_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Read a per-repo, repo-controlled `.claude/*.json` config safely.
+///
+/// Rejects anything that is not a **regular file** (metadata() follows
+/// symlinks, so a link to /dev/zero or a FIFO resolves to a non-regular
+/// target and is rejected on `stat`, before any blocking read) and caps the
+/// read at [`MAX_UNTRUSTED_CONFIG_BYTES`]. Returns `None` on any rejection or
+/// IO error so callers fail open (ADR-0001): a rejected config == a missing one.
+pub fn read_untrusted_config(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None; // FIFO / device / dir / broken symlink
+    }
+    if meta.len() > MAX_UNTRUSTED_CONFIG_BYTES {
+        return None; // oversized regular file
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = String::new();
+    file.take(MAX_UNTRUSTED_CONFIG_BYTES) // TOCTOU belt-and-suspenders
+        .read_to_string(&mut buf)
+        .ok()?; // non-UTF8 → None (same as read_to_string)
+    Some(buf)
 }
 
 /// Resolve a checkout's git **common directory** — the shared `.git` that holds
@@ -419,5 +448,77 @@ mod tests {
             expand_tilde_with("/abs/path", "/home/test"),
             PathBuf::from("/abs/path")
         );
+    }
+
+    // --- read_untrusted_config (#157 special-file DoS hardening) ---
+
+    #[test]
+    fn read_untrusted_config_reads_small_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(&path, r#"{"ok":true}"#).unwrap();
+        assert_eq!(
+            read_untrusted_config(&path),
+            Some(r#"{"ok":true}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn read_untrusted_config_missing_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_untrusted_config(&tmp.path().join("absent.json")), None);
+    }
+
+    #[test]
+    fn read_untrusted_config_rejects_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_untrusted_config(tmp.path()), None);
+    }
+
+    #[test]
+    fn read_untrusted_config_rejects_oversized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.json");
+        // One byte over the 1 MiB cap.
+        std::fs::write(&path, vec![b'x'; (1024 * 1024) + 1]).unwrap();
+        assert_eq!(read_untrusted_config(&path), None);
+    }
+
+    #[test]
+    fn read_untrusted_config_reads_at_or_below_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("atcap.json");
+        // Just under the cap → accepted.
+        let body = vec![b'y'; (1024 * 1024) - 1];
+        std::fs::write(&path, &body).unwrap();
+        let read = read_untrusted_config(&path).expect("under-cap file reads");
+        assert_eq!(read.len(), body.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_untrusted_config_rejects_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fifo.json");
+        // mkfifo via the system binary keeps the dev-deps unchanged.
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        // A FIFO is not a regular file → rejected on stat, no blocking read.
+        assert_eq!(read_untrusted_config(&path), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_untrusted_config_rejects_symlink_to_dev_zero() {
+        // The headline DoS: a symlink to an endless special file. metadata()
+        // follows the link to a non-regular target, so it is rejected on stat —
+        // this test must NOT hang.
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("evil.json");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        assert_eq!(read_untrusted_config(&link), None);
     }
 }
