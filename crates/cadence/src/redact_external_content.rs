@@ -314,7 +314,7 @@ fn load_redaction_config(base_dir: &str) -> RedactionConfig {
         return RedactionConfig::default();
     };
     let path = root.join(".claude/redaction.json");
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Some(content) = cadence_hooks_core::paths::read_untrusted_config(&path) else {
         return RedactionConfig::default();
     };
     serde_json::from_str(&content).unwrap_or_default()
@@ -724,6 +724,22 @@ mod tests {
         // Universal scan still works despite the broken config.
         let cmd = "gh pr create --body \"see cadence:attune\"";
         let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_file_config_fails_open_and_does_not_hang() {
+        // #157: a `.claude/redaction.json` symlinked to an endless special file
+        // (`/dev/zero`) is rejected on stat — the loader falls open to the
+        // default config and the universal scan still nudges a skill id, without
+        // an unbounded read hanging the hook.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join(".claude/redaction.json")).unwrap();
+        let cmd = "gh pr create --body \"see cadence:attune\"";
+        let input = make_bash_with_cwd(cmd, dir.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
     }
 
