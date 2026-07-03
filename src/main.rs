@@ -188,6 +188,8 @@ enum GuardrailsCommands {
     WarnPrIssueLink,
     /// Nudge when `gh issue create` targets a repo other than the canonical issue tracker
     WarnIssueTracker,
+    /// Nudge on repo create/publicize when name or description telegraphs sensitive content
+    WarnGoingPublic,
     /// Verify issue auto-close after PR create/merge; close stragglers
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
@@ -345,6 +347,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
+            GuardrailsCommands::WarnGoingPublic => "warn-going-public",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
@@ -788,6 +791,11 @@ fn main() {
             ),
             GuardrailsCommands::WarnIssueTracker => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_issue_tracker::WarnIssueTracker,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::WarnGoingPublic => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::warn_going_public::GoingPublicGuard,
                 pre,
                 canonical_hook,
             ),

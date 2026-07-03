@@ -45,6 +45,8 @@ pub mod warn_cron_datetime;
 pub mod warn_curl_alias;
 /// Pre-flight checklist nudge before `gh pr merge` (draft, worktree, verify).
 pub mod warn_gh_merge_preflight;
+/// Warn when creating/publicizing a repo whose name or description telegraphs sensitive content.
+pub mod warn_going_public;
 /// Nudge when `gh issue create` targets an owned repo other than the canonical issue tracker.
 pub mod warn_issue_tracker;
 /// Warn when editing files directly on main/master branch.
