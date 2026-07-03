@@ -10,9 +10,12 @@
 //! `select_browser`/`switch_browser` for exactly this, and
 //! `list_connected_browsers`'s description *mandates* an `AskUserQuestion`
 //! listing every browser — but that mandate is advisory; the model can skip
-//! it. This guard makes the handshake enforced: it blocks the **first**
-//! claude-in-chrome tool call of a session (exit 2, re-clarify message),
-//! writes a per-session marker, and allows every subsequent call.
+//! it. This guard surfaces the handshake with a one-time hard stop: it blocks
+//! the **first** claude-in-chrome tool call of a session (exit 2, re-clarify
+//! message), writes a per-session marker, and allows every subsequent call —
+//! including a blind retry of the same call. It *prompts* the selection; it
+//! does not *enforce* that a device was actually chosen (see the policy note
+//! below). By design a deliberate soft confirmation, not a hard gate.
 //!
 //! **Policy note (deliberate exception to `developing-guards`).** The
 //! block-vs-nudge heuristic would route "a single connected browser makes
