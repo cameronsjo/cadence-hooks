@@ -6,8 +6,8 @@
 //! Safe templates (.env.example, .env.test) are always allowed.
 
 use crate::secret_patterns::{
-    envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_env_token, is_safe_template,
-    is_secret_scan_exempt, scan_secret_values,
+    command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
+    is_dangerous_secret_token, is_safe_template, is_secret_scan_exempt, scan_secret_values,
 };
 use cadence_hooks_core::shell::{command_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -214,8 +214,10 @@ fn find_writes(args: &[String]) -> bool {
 
 /// Check if a bash command targets .env files destructively.
 fn bash_targets_env_file(command: &str) -> bool {
-    // Quick reject: nothing to guard if no `.env` token appears anywhere.
-    if !command.to_lowercase().contains(".env") {
+    // Quick reject: nothing to guard if no deny-set secret file is mentioned
+    // anywhere (the `.env` family plus the non-`.env` credential stores) (#138).
+    let lower = command.to_lowercase();
+    if !command_may_reference_secret(&lower) {
         return false;
     }
 
@@ -227,7 +229,7 @@ fn bash_targets_env_file(command: &str) -> bool {
         if redirect_targets(&segment)
             .iter()
             .chain(writer_targets(&segment).iter())
-            .any(|t| is_dangerous_env_token(t))
+            .any(|t| is_dangerous_secret_token(t))
         {
             return true;
         }
@@ -316,10 +318,10 @@ impl Check for SecretWritesGuard {
 
                 if bash_targets_env_file(command) {
                     return CheckResult::block(
-                        "🚫 BLOCKED: prevent-secret-writes: command would write or delete a .env file\n\
-                         Found: a redirect or writer verb (tee, cp/mv/install, dd, truncate, rm) targeting a .env-family file\n\
-                         Fix: modify .env files manually outside Claude Code.\n\
-                         Allowed: safe templates (.env.example, .env.test, …) and non-.env targets.",
+                        "🚫 BLOCKED: prevent-secret-writes: command would write or delete a secret file\n\
+                         Found: a redirect or writer verb (tee, cp/mv/install, dd, truncate, rm) targeting a deny-set secret file (.env family, id_rsa, .aws/credentials, .git-credentials, .pgpass, .kube/config, .netrc, …)\n\
+                         Fix: modify secret files manually outside Claude Code.\n\
+                         Allowed: safe templates (.env.example, id_rsa.pub, …) and non-secret targets.",
                     );
                 }
 
@@ -723,6 +725,56 @@ mod tests {
     #[test]
     fn bash_rm_rf_env_blocked() {
         assert!(bash_targets_env_file("rm -rf .env"));
+    }
+
+    // --- #138: Bash-path writes/deletes for non-.env deny-set files ---
+
+    #[test]
+    fn bash_rm_id_rsa_blocked() {
+        assert!(bash_targets_env_file("rm ~/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn bash_redirect_git_credentials_blocked() {
+        assert!(bash_targets_env_file("echo token > ~/.git-credentials"));
+    }
+
+    #[test]
+    fn bash_tee_pgpass_blocked() {
+        assert!(bash_targets_env_file("echo pw | tee ~/.pgpass"));
+    }
+
+    #[test]
+    fn bash_cp_aws_credentials_blocked() {
+        assert!(bash_targets_env_file("cp tmp ~/.aws/credentials"));
+    }
+
+    #[test]
+    fn bash_rm_kube_config_blocked() {
+        assert!(bash_targets_env_file("rm ~/.kube/config"));
+    }
+
+    #[test]
+    fn bash_rm_netrc_blocked() {
+        assert!(bash_targets_env_file("rm ~/.netrc"));
+    }
+
+    #[test]
+    fn bash_rm_id_rsa_pub_allowed() {
+        // Safe template (.pub) is not a secret write.
+        assert!(!bash_targets_env_file("rm ~/.ssh/id_rsa.pub"));
+    }
+
+    #[test]
+    fn bash_rm_config_toml_allowed() {
+        // No deny-set filename/fragment — gate rejects early.
+        assert!(!bash_targets_env_file("rm ./config.toml"));
+    }
+
+    #[test]
+    fn bash_cp_to_id_rsa_blocked_via_run() {
+        let result = SecretWritesGuard.run(&make_bash_input("cp key ~/.ssh/id_rsa"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
