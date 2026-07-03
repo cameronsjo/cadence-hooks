@@ -144,6 +144,15 @@ enum CadenceCommands {
     MarkdownLint,
     /// Nudge when an external post mentions internal harness vocabulary
     RedactExternalContent,
+    /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
+    RecordPolish {
+        #[arg(long, value_name = "PATH")]
+        repo_root: Option<String>,
+        #[arg(long, value_name = "NAME")]
+        branch: Option<String>,
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -305,6 +314,10 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::RedactExternalContent => "redact-external-content",
+            // record-polish is a CLI action, not a hook — no hooks.json wiring
+            // and not subject to CADENCE_DISABLE (same treatment as declare /
+            // status / dismiss-*).
+            CadenceCommands::RecordPolish { .. } => return None,
         }),
         Commands::Guardrails(g) => Some(match g {
             GuardrailsCommands::GuardPushRemote => "guard-push-remote",
@@ -654,6 +667,13 @@ fn main() {
                 &cadence_hooks_cadence::redact_external_content::RedactExternalContent,
                 pre,
             ),
+            CadenceCommands::RecordPolish {
+                repo_root,
+                branch,
+                scope,
+            } => {
+                cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope);
+            }
         },
         Commands::Guardrails(cmd) => match cmd {
             GuardrailsCommands::GuardPushRemote => run_check_from_stdin(
@@ -882,6 +902,7 @@ mod tests {
             "dismiss-enforce-worktree",
             "declare",
             "status",
+            "record-polish",
         ];
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();

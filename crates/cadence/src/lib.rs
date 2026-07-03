@@ -15,6 +15,8 @@ pub mod memory_guard;
 pub mod nudge_polish_before_pr;
 /// Block reading secrets (.env, credentials, private keys) into context.
 pub mod prevent_secret_leaks;
+/// Record that `/polish` ran on this branch (writes a branch-scoped marker). CLI action.
+pub mod record_polish;
 /// Block writing or deleting secrets (.env, credentials, private keys).
 pub mod prevent_secret_writes;
 /// Nudge before internal harness vocabulary leaks into an external post.

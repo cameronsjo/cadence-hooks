@@ -122,6 +122,24 @@ pub fn session_marker(input: &HookInput, kind: &str, repo_root: Option<&str>) ->
     marker_dir().join(name)
 }
 
+/// A repo+branch-keyed marker path under the private [`marker_dir`], session-
+/// independent so a delegated (subagent) polish and the parent PR resolve the
+/// same path. Both `repo_root` and `branch` are payload/git-derived strings, so
+/// they are ALWAYS hashed, never used as path components — a crafted branch name
+/// like `../../x` is inert (the result is a direct child of [`marker_dir`]).
+///
+/// Keyed per-`(repo, branch)` on purpose: two sessions polishing two branches of
+/// one repo don't clobber each other's marker, and a different-branch marker is a
+/// key-miss by construction — the property the pre-PR gate keys its branch
+/// scoping on.
+pub fn polish_marker(repo_root: &str, branch: &str) -> PathBuf {
+    marker_dir().join(format!(
+        "polish-{:x}-{:x}",
+        hash_of(repo_root),
+        hash_of(branch)
+    ))
+}
+
 /// Write `contents` to a marker path symlink-safely.
 ///
 /// Stage to a uniquely-named `.{name}.{pid}.tmp` sibling with `create_new`
@@ -218,6 +236,44 @@ mod tests {
         // result is always a direct child of marker_dir(), never an escape.
         let input = input_with_session("../../evil");
         let p = session_marker(&input, "test-kind", None);
+        assert_eq!(
+            p.parent(),
+            Some(marker_dir().as_path()),
+            "marker must be a direct child of the private dir: {p:?}"
+        );
+        let name = p.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.contains('/') && !name.contains(".."),
+            "filename must carry no traversal: {name}"
+        );
+    }
+
+    #[test]
+    fn polish_marker_differs_per_branch() {
+        let a = polish_marker("/tmp/repo", "branch-a");
+        let b = polish_marker("/tmp/repo", "branch-b");
+        assert_ne!(a, b, "distinct branches must not share a marker");
+    }
+
+    #[test]
+    fn polish_marker_differs_per_repo() {
+        let a = polish_marker("/tmp/repo-a", "main");
+        let b = polish_marker("/tmp/repo-b", "main");
+        assert_ne!(a, b, "distinct repos must not share a marker");
+    }
+
+    #[test]
+    fn polish_marker_stable_for_same_inputs() {
+        let a = polish_marker("/tmp/repo", "main");
+        let b = polish_marker("/tmp/repo", "main");
+        assert_eq!(a, b, "same inputs must produce the same marker");
+    }
+
+    #[test]
+    fn polish_marker_never_embeds_raw_branch_or_repo() {
+        // A path-traversal branch/repo must be hashed to a plain filename — the
+        // result is always a direct child of marker_dir(), never an escape.
+        let p = polish_marker("../../evil-repo", "../../evil-branch");
         assert_eq!(
             p.parent(),
             Some(marker_dir().as_path()),
