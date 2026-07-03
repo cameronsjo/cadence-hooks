@@ -23,6 +23,7 @@
 //! | `heartbeat`         | PostToolUse  | [`heartbeat`]   |
 //! | `guard`             | PreToolUse   | [`guard`]       |
 //! | `warn-branch-drift` | PreToolUse   | [`branch_drift`]|
+//! | `warn-branch-intent`| PreToolUse   | [`branch_intent`]|
 //! | `declare`           | CLI action   | [`cli`]         |
 //! | `status`            | CLI action   | [`cli`]         |
 //! | `end`               | SessionEnd   | [`end`]         |
@@ -33,6 +34,8 @@
 pub mod backstop;
 /// PreToolUse commit-time branch-drift warning — never blocks.
 pub mod branch_drift;
+/// PreToolUse stale-branch nudge: new work on an old, unrelated branch (#155).
+pub mod branch_intent;
 /// CLI actions: `declare` (lane declaration) and `status` (registry listing).
 pub mod cli;
 /// SessionEnd logger: deregister this session's registry file (#97).

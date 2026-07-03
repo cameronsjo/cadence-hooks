@@ -286,6 +286,8 @@ enum SessionCommands {
     Guard,
     /// Warn when HEAD drifted from the session's recorded branch at git commit (PreToolUse)
     WarnBranchDrift,
+    /// Nudge when new work starts on a stale, unrelated feature branch (PreToolUse)
+    WarnBranchIntent,
     /// Deregister this session's registry file when it ends (SessionEnd logger)
     End,
     /// Record loose ends when the session ends, for the next start to surface (SessionEnd logger)
@@ -391,6 +393,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::Heartbeat => "heartbeat",
             SessionCommands::Guard => "guard",
             SessionCommands::WarnBranchDrift => "warn-branch-drift",
+            SessionCommands::WarnBranchIntent => "warn-branch-intent",
             SessionCommands::End => "end",
             SessionCommands::BackstopRecord => "backstop-record",
             SessionCommands::BackstopWarn => "backstop-warn",
@@ -952,6 +955,11 @@ fn main() {
             ),
             SessionCommands::WarnBranchDrift => dispatch::run_logged_check(
                 &cadence_hooks_session::branch_drift::WarnBranchDrift,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::WarnBranchIntent => dispatch::run_logged_check(
+                &cadence_hooks_session::branch_intent::WarnBranchIntent,
                 pre,
                 canonical_hook,
             ),

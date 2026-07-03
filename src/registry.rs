@@ -365,6 +365,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-branch-intent",
+        description: "Nudge when new work starts on a stale, unrelated feature branch",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "end",
         description: "Deregister this session's registry file when it ends (SessionEnd)",
         plugin: "session",
@@ -442,6 +448,13 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // drift comparison.
         ("session", "warn-branch-drift") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}"#,
+        ),
+        // warn-branch-intent gates on an Edit/Write mutation; the generic
+        // PreToolUse sample carries no cwd, so it would fail open before the
+        // registry/git evaluation. This Edit payload exercises the guard path
+        // and fail-opens cleanly (cwd not a registered session).
+        ("session", "warn-branch-intent") => Some(
+            r#"{"session_id":"test","tool_name":"Edit","cwd":"/tmp","tool_input":{"file_path":"/tmp/x.rs"}}"#,
         ),
         // end gates on hook_event_name == "SessionEnd"; the generic logger
         // sample carries a different event and would no-op before the gate.
