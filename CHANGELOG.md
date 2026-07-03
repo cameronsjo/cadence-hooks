@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `warn-main-branch` carve-outs (`.claude/`, `docs/plans/`) now lexically resolve `..`/`.` in the path before matching, so a crafted `file_path` like `docs/plans/../../src/main.rs` can no longer suppress the main-branch nudge for a real product file (#152).
+
 ## [0.44.0] - 2026-07-02
 
 ### Added
