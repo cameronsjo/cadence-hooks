@@ -543,16 +543,19 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
 
     let mut result = BTreeMap::new();
 
-    // Find `run_check_from_stdin(&module::Check, pre)` or `post)` patterns.
-    // The callsite format is: run_check_from_stdin(&..., pre) or run_check_from_stdin(&..., post)
-    // We need to correlate with the match arm above it to get the subcommand name.
+    // Find `dispatch::run_logged_check(&module::Check, pre, canonical_hook)` (the
+    // logged-dispatch wrapper that records denials) or the legacy
+    // `run_check_from_stdin(&..., pre)` form. The event variable (`pre`/`post`/
+    // `session`) sits in the same position in both — the trailing `canonical_hook`
+    // arg lands beyond the 3-line correlation window, so the event scan is
+    // unaffected. We correlate with the match arm above to get the subcommand.
     //
-    // Strategy: scan for lines containing `run_check_from_stdin` and extract the event
-    // variable (`pre` or `post`), then look backwards for the enum variant.
+    // Strategy: scan for lines containing the dispatch call, extract the event
+    // variable, then look backwards for the enum variant.
 
     let lines: Vec<&str> = content.lines().collect();
     for (i, line) in lines.iter().enumerate() {
-        if !line.contains("run_check_from_stdin") {
+        if !line.contains("run_logged_check") && !line.contains("run_check_from_stdin") {
             continue;
         }
 
@@ -579,37 +582,45 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
         for j in (0..=i).rev() {
             let prev = lines[j];
             if prev.contains("Commands::") {
-                // Extract variant name, convert to kebab-case subcommand
-                if let Some(variant) = prev.split("::").last() {
-                    // Strip everything after => (handles both `Variant => {` and
-                    // `Variant => run_check_from_stdin(` formatting)
-                    let variant = variant.split("=>").next().unwrap_or("").trim();
-                    let subcmd = to_kebab_case(variant);
+                // Extract the variant name, convert to kebab-case subcommand.
+                //
+                // rustfmt collapses a single-expression arm onto one line
+                // (`CadenceCommands::Terminology => dispatch::run_logged_check(`),
+                // so the arm line also carries the `dispatch::run_logged_check`
+                // call — `split("::").last()` would grab the call token. Take the
+                // identifier immediately after the FIRST `Commands::` instead;
+                // this reads the variant cleanly from both the collapsed form and
+                // the older `Variant => {` block form.
+                let after = prev.split("Commands::").nth(1).unwrap_or("");
+                let variant: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let subcmd = to_kebab_case(&variant);
 
-                    // Determine plugin group from the Commands enum.
-                    //
-                    // Logger-dispatched hooks (metrics, session heartbeat) use
-                    // run_logger_from_stdin and carry no HookEvent, so they
-                    // never reach this scan — only Check-dispatched hooks are
-                    // mapped here.
-                    let plugin = if prev.contains("CadenceCommands") {
-                        "cadence"
-                    } else if prev.contains("GuardrailsCommands") {
-                        "guardrails"
-                    } else if prev.contains("RulesCommands") {
-                        "rules"
-                    } else if prev.contains("ObsidianCommands") {
-                        "obsidian"
-                    } else if prev.contains("LabCommands") {
-                        "lab"
-                    } else if prev.contains("SessionCommands") {
-                        "session"
-                    } else {
-                        continue;
-                    };
+                // Determine plugin group from the Commands enum.
+                //
+                // Logger-dispatched hooks (metrics, session heartbeat) use
+                // run_logger_from_stdin and carry no HookEvent, so they
+                // never reach this scan — only Check-dispatched hooks are
+                // mapped here.
+                let plugin = if prev.contains("CadenceCommands") {
+                    "cadence"
+                } else if prev.contains("GuardrailsCommands") {
+                    "guardrails"
+                } else if prev.contains("RulesCommands") {
+                    "rules"
+                } else if prev.contains("ObsidianCommands") {
+                    "obsidian"
+                } else if prev.contains("LabCommands") {
+                    "lab"
+                } else if prev.contains("SessionCommands") {
+                    "session"
+                } else {
+                    continue;
+                };
 
-                    result.insert(format!("{plugin} {subcmd}"), event.to_string());
-                }
+                result.insert(format!("{plugin} {subcmd}"), event.to_string());
                 break;
             }
         }

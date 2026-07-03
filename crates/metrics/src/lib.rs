@@ -14,6 +14,8 @@ pub mod compute_cost;
 pub mod log_askuserquestion;
 /// Append cost-per-commit records to `commits.jsonl`.
 pub mod log_commit;
+/// Append guard-denial audit records to `denials.jsonl`.
+pub mod log_denial;
 /// Append polish-nudge (`gh pr create`) records to `polish_nudges.jsonl`.
 pub mod log_polish_nudge;
 /// Append per-session cost records to `sessions.jsonl` at `SessionEnd`.
@@ -33,6 +35,7 @@ pub mod warn_stale;
 
 pub use log_askuserquestion::LogAskUserQuestion;
 pub use log_commit::LogCommit;
+pub use log_denial::log_denial;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_session::LogSession;
 pub use log_subagent::LogSubagent;

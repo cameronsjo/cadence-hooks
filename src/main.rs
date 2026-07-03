@@ -5,7 +5,7 @@
 //! with 0 (allow), 1 (warn), or 2 (block). The CLI commands (`list`, `doctor`,
 //! `configure`, `try`, `session declare`/`status`) take no stdin.
 
-use cadence_hooks_core::{HookEvent, run_check_from_stdin, run_logger_from_stdin};
+use cadence_hooks_core::{HookEvent, run_logger_from_stdin};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::process;
 
@@ -18,6 +18,7 @@ fn under_claude_code() -> bool {
 }
 
 mod configure;
+mod dispatch;
 mod doctor;
 mod registry;
 mod try_hook;
@@ -586,6 +587,15 @@ fn main() {
         }
     }
 
+    // The canonical registry hook name for the dispatched subcommand, threaded
+    // into the logged-dispatch wrapper so `denials.jsonl` records the name that
+    // cross-references `registry::HOOKS` / `hookFiredTotal` — not the divergent
+    // `Check::name()` (e.g. `terminology`, not `terminology-guard`). `Copy`
+    // (`Option<&'static str>`), so binding it here borrows `&cli.command` before
+    // the `match` below moves it. `None` for the CLI-action subcommands, which
+    // never dispatch a check.
+    let canonical_hook = hook_name(&cli.command);
+
     // Event type aliases for readability at callsites.
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
@@ -629,51 +639,70 @@ fn main() {
             process::exit(doctor::run(root.as_deref(), quiet).into());
         }
         Commands::Cadence(cmd) => match cmd {
-            CadenceCommands::Terminology => {
-                run_check_from_stdin(&cadence_hooks_cadence::terminology::TerminologyGuard, pre)
-            }
-            CadenceCommands::OrphanedTodos => run_check_from_stdin(
+            CadenceCommands::Terminology => dispatch::run_logged_check(
+                &cadence_hooks_cadence::terminology::TerminologyGuard,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::OrphanedTodos => dispatch::run_logged_check(
                 &cadence_hooks_cadence::block_orphaned_todos::OrphanedTodoGuard,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::PreventSecretLeaks => run_check_from_stdin(
+            CadenceCommands::PreventSecretLeaks => dispatch::run_logged_check(
                 &cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::PreventSecretWrites => run_check_from_stdin(
+            CadenceCommands::PreventSecretWrites => dispatch::run_logged_check(
                 &cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::MemoryGuard => {
-                run_check_from_stdin(&cadence_hooks_cadence::memory_guard::MemoryGuard, pre)
-            }
-            CadenceCommands::GitSafety => {
-                run_check_from_stdin(&cadence_hooks_cadence::git_safety::GitSafetyGuard, pre)
-            }
-            CadenceCommands::LineEndings => run_check_from_stdin(
+            CadenceCommands::MemoryGuard => dispatch::run_logged_check(
+                &cadence_hooks_cadence::memory_guard::MemoryGuard,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::GitSafety => dispatch::run_logged_check(
+                &cadence_hooks_cadence::git_safety::GitSafetyGuard,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::LineEndings => dispatch::run_logged_check(
                 &cadence_hooks_cadence::validate_line_endings::LineEndingsGuard,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::EnvVars => {
-                run_check_from_stdin(&cadence_hooks_cadence::validate_env_vars::EnvVarGuard, pre)
-            }
-            CadenceCommands::WarnDocsUpdate => run_check_from_stdin(
+            CadenceCommands::EnvVars => dispatch::run_logged_check(
+                &cadence_hooks_cadence::validate_env_vars::EnvVarGuard,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::WarnDocsUpdate => dispatch::run_logged_check(
                 &cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::WarnOvershare => {
-                run_check_from_stdin(&cadence_hooks_cadence::warn_overshare::WarnOvershare, pre)
-            }
-            CadenceCommands::NudgePolishBeforePr => run_check_from_stdin(
+            CadenceCommands::WarnOvershare => dispatch::run_logged_check(
+                &cadence_hooks_cadence::warn_overshare::WarnOvershare,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::NudgePolishBeforePr => dispatch::run_logged_check(
                 &cadence_hooks_cadence::nudge_polish_before_pr::NudgePolishBeforePr,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::MarkdownLint => {
-                run_check_from_stdin(&cadence_hooks_cadence::markdown_lint::MarkdownLint, pre)
-            }
-            CadenceCommands::RedactExternalContent => run_check_from_stdin(
+            CadenceCommands::MarkdownLint => dispatch::run_logged_check(
+                &cadence_hooks_cadence::markdown_lint::MarkdownLint,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::RedactExternalContent => dispatch::run_logged_check(
                 &cadence_hooks_cadence::redact_external_content::RedactExternalContent,
                 pre,
+                canonical_hook,
             ),
             CadenceCommands::RecordPolish {
                 repo_root,
@@ -684,96 +713,120 @@ fn main() {
             }
         },
         Commands::Guardrails(cmd) => match cmd {
-            GuardrailsCommands::GuardPushRemote => run_check_from_stdin(
+            GuardrailsCommands::GuardPushRemote => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_push_remote::PushRemoteGuard,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardGhDangerous => run_check_from_stdin(
+            GuardrailsCommands::GuardGhDangerous => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_gh_dangerous::GhDangerousGuard,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardGhWrite => {
-                run_check_from_stdin(&cadence_hooks_guardrails::guard_gh_write::GhWriteGuard, pre)
-            }
-            GuardrailsCommands::GuardGitInit => run_check_from_stdin(
+            GuardrailsCommands::GuardGhWrite => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_gh_write::GhWriteGuard,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::GuardGitInit => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_git_init::GuardGitInit,
                 post,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnMainBranch => run_check_from_stdin(
+            GuardrailsCommands::WarnMainBranch => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_main_branch::WarnMainBranch,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnSubagentWorktree => run_check_from_stdin(
+            GuardrailsCommands::WarnSubagentWorktree => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_subagent_worktree::WarnSubagentWorktree,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::CheckIdleReturn => run_check_from_stdin(
+            GuardrailsCommands::CheckIdleReturn => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::check_idle_return::CheckIdleReturn,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnBranchBase => run_check_from_stdin(
+            GuardrailsCommands::WarnBranchBase => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_branch_base::WarnBranchBase,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnCronDatetime => run_check_from_stdin(
+            GuardrailsCommands::WarnCronDatetime => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_cron_datetime::WarnCronDatetime,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::NudgeUpgradeAfterPush => run_check_from_stdin(
+            GuardrailsCommands::NudgeUpgradeAfterPush => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::nudge_upgrade_after_push::NudgeUpgradeAfterPush,
                 post,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnUntracked => run_check_from_stdin(
+            GuardrailsCommands::WarnUntracked => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardDotfiles => run_check_from_stdin(
+            GuardrailsCommands::GuardDotfiles => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnPrIssueLink => run_check_from_stdin(
+            GuardrailsCommands::WarnPrIssueLink => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_pr_issue_link::WarnPrIssueLink,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnIssueTracker => run_check_from_stdin(
+            GuardrailsCommands::WarnIssueTracker => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_issue_tracker::WarnIssueTracker,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::VerifyPrAutoclose => run_check_from_stdin(
+            GuardrailsCommands::VerifyPrAutoclose => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::verify_pr_autoclose::VerifyPrAutoclose,
                 post,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardOpVaultScan => run_check_from_stdin(
+            GuardrailsCommands::GuardOpVaultScan => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_op_vault_scan::OpVaultScanGuard,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnCurlAlias => run_check_from_stdin(
+            GuardrailsCommands::WarnCurlAlias => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnGhMergePreflight => run_check_from_stdin(
+            GuardrailsCommands::WarnGhMergePreflight => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_gh_merge_preflight::WarnGhMergePreflight,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnCoderabbitRetrigger => run_check_from_stdin(
+            GuardrailsCommands::WarnCoderabbitRetrigger => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_coderabbit_retrigger::WarnCoderabbitRetrigger,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnAliasParsing => run_check_from_stdin(
+            GuardrailsCommands::WarnAliasParsing => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_alias_parsing::WarnAliasParsing,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardBrowserDevice => run_check_from_stdin(
+            GuardrailsCommands::GuardBrowserDevice => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_browser_device::GuardBrowserDevice,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::InjectGhContext => run_check_from_stdin(
+            GuardrailsCommands::InjectGhContext => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::inject_gh_context::InjectGhContext,
                 session,
+                canonical_hook,
             ),
-            GuardrailsCommands::EnforceWorktree => run_check_from_stdin(
+            GuardrailsCommands::EnforceWorktree => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::enforce_worktree::EnforceWorktree,
                 pre,
+                canonical_hook,
             ),
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {
                 cadence_hooks_guardrails::dismiss_main_branch_warn::run_dismiss(&for_);
@@ -783,27 +836,32 @@ fn main() {
             }
         },
         Commands::Rules(cmd) => match cmd {
-            RulesCommands::ValidateFrontmatter => run_check_from_stdin(
+            RulesCommands::ValidateFrontmatter => dispatch::run_logged_check(
                 &cadence_hooks_rules::validate_skill_frontmatter::ValidateSkillFrontmatter,
                 pre,
+                canonical_hook,
             ),
-            RulesCommands::SecurityPatterns => run_check_from_stdin(
+            RulesCommands::SecurityPatterns => dispatch::run_logged_check(
                 &cadence_hooks_rules::check_security_patterns::SecurityPatternScanner,
                 post,
+                canonical_hook,
             ),
-            RulesCommands::WarnRecommendedOption => run_check_from_stdin(
+            RulesCommands::WarnRecommendedOption => dispatch::run_logged_check(
                 &cadence_hooks_rules::askuserquestion::WarnRecommendedOption,
                 pre,
+                canonical_hook,
             ),
-            RulesCommands::WarnEmptyAnswers => run_check_from_stdin(
+            RulesCommands::WarnEmptyAnswers => dispatch::run_logged_check(
                 &cadence_hooks_rules::askuserquestion::WarnEmptyAnswers,
                 post,
+                canonical_hook,
             ),
         },
         Commands::Obsidian(cmd) => match cmd {
-            ObsidianCommands::TrashGuard => run_check_from_stdin(
+            ObsidianCommands::TrashGuard => dispatch::run_logged_check(
                 &cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard,
                 pre,
+                canonical_hook,
             ),
         },
         Commands::Metrics(cmd) => match cmd {
@@ -837,32 +895,44 @@ fn main() {
             ),
             // warn-stale is a SessionStart *check*, not a logger — it reads the
             // metrics dir's mtimes rather than reacting to a tool event.
-            MetricsCommands::WarnStale => {
-                run_check_from_stdin(&cadence_hooks_metrics::WarnStale, session)
-            }
+            MetricsCommands::WarnStale => dispatch::run_logged_check(
+                &cadence_hooks_metrics::WarnStale,
+                session,
+                canonical_hook,
+            ),
         },
         Commands::Lab(cmd) => match cmd {
-            LabCommands::PersonaNudge => {
-                run_check_from_stdin(&cadence_hooks_lab::nudge::PersonaNudge, session)
-            }
-            LabCommands::PersonaGate => {
-                run_check_from_stdin(&cadence_hooks_lab::gate::PersonaGate, post)
-            }
+            LabCommands::PersonaNudge => dispatch::run_logged_check(
+                &cadence_hooks_lab::nudge::PersonaNudge,
+                session,
+                canonical_hook,
+            ),
+            LabCommands::PersonaGate => dispatch::run_logged_check(
+                &cadence_hooks_lab::gate::PersonaGate,
+                post,
+                canonical_hook,
+            ),
         },
         Commands::Session(cmd) => match cmd {
-            SessionCommands::Start => {
-                run_check_from_stdin(&cadence_hooks_session::start::Start, session)
-            }
+            SessionCommands::Start => dispatch::run_logged_check(
+                &cadence_hooks_session::start::Start,
+                session,
+                canonical_hook,
+            ),
             SessionCommands::Heartbeat => run_logger_from_stdin(
                 &cadence_hooks_session::heartbeat::Heartbeat,
                 registry::sample_for("session", "heartbeat"),
             ),
-            SessionCommands::Guard => {
-                run_check_from_stdin(&cadence_hooks_session::guard::Guard, pre)
-            }
-            SessionCommands::WarnBranchDrift => {
-                run_check_from_stdin(&cadence_hooks_session::branch_drift::WarnBranchDrift, pre)
-            }
+            SessionCommands::Guard => dispatch::run_logged_check(
+                &cadence_hooks_session::guard::Guard,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::WarnBranchDrift => dispatch::run_logged_check(
+                &cadence_hooks_session::branch_drift::WarnBranchDrift,
+                pre,
+                canonical_hook,
+            ),
             SessionCommands::End => run_logger_from_stdin(
                 &cadence_hooks_session::end::End,
                 registry::sample_for("session", "end"),
@@ -871,9 +941,11 @@ fn main() {
                 &cadence_hooks_session::backstop::BackstopRecord,
                 registry::sample_for("session", "backstop-record"),
             ),
-            SessionCommands::BackstopWarn => {
-                run_check_from_stdin(&cadence_hooks_session::backstop::BackstopWarn, session)
-            }
+            SessionCommands::BackstopWarn => dispatch::run_logged_check(
+                &cadence_hooks_session::backstop::BackstopWarn,
+                session,
+                canonical_hook,
+            ),
             SessionCommands::Declare {
                 intent,
                 touching,

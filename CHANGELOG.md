@@ -37,6 +37,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `hook_event_name == "SessionEnd"` and fail-open (ADR-0001); the SessionEnd
   hook wiring ships in the companion cadence-metrics plugin PR. Refs
   cameronsjo/cadence#141.
+- **`denials.jsonl` — guard-denial audit log at the dispatch outcome→exit-code
+  seam.** Records one append-only line per guard `deny` (a hard block, exit 2),
+  and per `nudge` when `CADENCE_LOG_NUDGES` is set — fields `ts`, `hook`,
+  `event`, `decision`, `tool`, `repo`, `sessionId`, `agentId`. A PreToolUse
+  block was previously prose-only, invisible to attachment counting and leaving
+  zero on-disk trace when a false positive fired. The write lives at the single
+  `run_check` seam (split into `decide_check` + `emit_and_exit`) via a
+  binary-level `run_logged_check` wrapper that threads the canonical registry
+  hook name; every block-capable check arm routes through it, loggers are
+  untouched. **Privacy by construction:** the record names which guard fired on
+  which tool in which repo, never the command text, file path, or edited
+  content. Fail-open (ADR-0001): a full disk or unwritable metrics dir degrades
+  to a no-op and the block still exits 2 with byte-identical stderr. Consumer:
+  `claude-configurations` `profiler_tally.py` renders a denies-by-hook table.
 
 ### Added
 
