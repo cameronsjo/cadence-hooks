@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **feat(doctor): plugin-cache health check (#162).** `doctor` now flags orphaned SHA-pinned cache version dirs (with a byte count), missing/empty pinned dirs, and marketplace checkouts whose `git remote` diverges from their declared `known_marketplaces.json` source ("cache may not be canonical — verify before citing"). All advisory (Warning/exit 1), live-machine only (skipped under `--root`), fail-open throughout (ADR-0001). Orphan counts surface in verbose mode only to avoid perennial SessionStart nags; detection-only — `--fix` prune deferred.
+
 ### Changed
 
 - **`warn-issue-tracker` is now decentralization-aware (#166).** The guard hardcoded `cameronsjo/claude-configurations` as the single canonical tracker and misfired on the legitimate post-2026-06-30 trackers. It now checks the filing target against a set of known ecosystem trackers (`cadence`, `cadence-hooks`, `forgectl`, `claude-configurations`), nudging only when an *owned* repo is none of them. New `CADENCE_ISSUE_TRACKERS` (plural, comma-separated) overrides the set; the legacy singular `CADENCE_ISSUE_TRACKER` still works. Still nudge-only, never blocks (ADR-0001).

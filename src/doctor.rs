@@ -458,6 +458,214 @@ fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option
     })
 }
 
+/// Sum the byte size of every regular file under `dir`, walking recursively.
+///
+/// Symlinks are skipped (mirrors [`scan_root`]'s cycle guard) — including
+/// `dir` itself: a caller that hands us a symlinked top-level path (e.g. a
+/// planted symlink masquerading as an orphaned cache dir) gets `0`, not a
+/// recursive sum of whatever the link actually points at. The walk is also
+/// best-effort: an unreadable subdirectory just contributes 0 rather than
+/// failing the whole count.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    // `is_dir()`/`read_dir` follow symlinks; `symlink_metadata` does not, so
+    // this catches a symlinked `dir` argument before ever following it.
+    if std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return 0;
+    }
+
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if is_symlink {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+
+    total
+}
+
+/// Findings for orphaned and missing/empty pinned plugin-cache version dirs.
+///
+/// `pinned` is `(label, install_path)` from [`manifest_install_paths`] — the
+/// version dir the manifest actually points at. Any sibling directory under
+/// `install_path`'s parent that isn't the pinned basename is an orphan: a
+/// stale SHA-pinned version left behind by an update, since the cache never
+/// garbage-collects.
+///
+/// The missing/empty-pinned-dir warning fires in both quiet and verbose modes
+/// (it means the active plugin literally won't load). The orphan-count
+/// warning is `quiet`-suppressed — orphans are cosmetic cache bloat, not a
+/// functional break, and would otherwise nag every SessionStart forever.
+fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    for (label, install_path) in pinned {
+        let content_missing = match std::fs::read_dir(install_path) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(_) => true,
+        };
+        if content_missing {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                plugin: label.clone(),
+                file: install_path.clone(),
+                line: None,
+                snippet: install_path.display().to_string(),
+                diagnosis: "pinned cache dir missing or empty".to_string(),
+                remediation: "reinstall the plugin (`cadence-hooks list` shows install state, \
+                              or reload via the marketplace)"
+                    .to_string(),
+            });
+            continue;
+        }
+
+        if quiet {
+            continue;
+        }
+
+        let Some(parent) = install_path.parent() else {
+            continue;
+        };
+        let Some(pinned_name) = install_path.file_name() else {
+            continue;
+        };
+        let Ok(siblings) = std::fs::read_dir(parent) else {
+            continue;
+        };
+
+        let mut orphan_count = 0u32;
+        let mut orphan_bytes = 0u64;
+        for sibling in siblings.flatten() {
+            // `DirEntry::file_type()` does NOT follow symlinks (unlike
+            // `sibling.path().is_dir()`, which does) — a symlinked sibling
+            // must never be treated as an orphan version dir to recurse
+            // into, or a planted symlink (e.g. pointing at `$HOME` or `/`)
+            // gets summed as if it were real cache content.
+            let is_real_dir = sibling.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_real_dir {
+                continue;
+            }
+            if sibling.file_name() == pinned_name {
+                continue;
+            }
+            orphan_count += 1;
+            orphan_bytes += dir_size_bytes(&sibling.path());
+        }
+
+        if orphan_count > 0 {
+            let mib = orphan_bytes as f64 / (1024.0 * 1024.0);
+            findings.push(Finding {
+                severity: Severity::Warning,
+                plugin: label.clone(),
+                file: parent.to_path_buf(),
+                line: None,
+                snippet: format!("{orphan_count} orphaned version dir(s)"),
+                diagnosis: format!(
+                    "{orphan_count} orphaned version dir(s) (~{mib:.1} MiB) left in cache"
+                ),
+                remediation: "safe to prune — not the active pinned version".to_string(),
+            });
+        }
+    }
+
+    findings
+}
+
+/// One `(marketplace, install_location, declared_repo)` from
+/// `known_marketplaces.json` for every entry sourced from GitHub.
+///
+/// `directory`-sourced marketplaces (a local path, no remote to verify) are
+/// skipped. Fails open — a missing or unparseable file yields an empty vec,
+/// never an error — this is an advisory check, not a hard dependency.
+fn known_marketplace_sources(path: &Path) -> Vec<(String, PathBuf, String)> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(entries) = json.as_object() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for (name, entry) in entries {
+        let source = entry.get("source");
+        let is_github = source
+            .and_then(|s| s.get("source"))
+            .and_then(|v| v.as_str())
+            == Some("github");
+        if !is_github {
+            continue;
+        }
+        let Some(repo) = source.and_then(|s| s.get("repo")).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(install_location) = entry.get("installLocation").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        out.push((
+            name.clone(),
+            PathBuf::from(install_location),
+            repo.to_string(),
+        ));
+    }
+    out
+}
+
+/// A marketplace checkout finding when its `git remote` diverges from its
+/// declared `known_marketplaces.json` source, or `None` when they match.
+///
+/// Pure — the caller runs the actual `git remote get-url origin` (via
+/// [`cadence_hooks_core::shell::git_command`]) and passes the result in, so
+/// this stays testable without touching the filesystem or a git checkout.
+/// `actual_remote: None` (no `.git`, or the git call failed) fails open —
+/// a marketplace checkout not backed by git yet is not itself a problem this
+/// check exists to catch.
+fn canonical_remote_finding(
+    marketplace: &str,
+    install_dir: &Path,
+    declared_repo: &str,
+    actual_remote: Option<&str>,
+) -> Option<Finding> {
+    let actual = actual_remote?;
+    let actual_repo = cadence_hooks_core::shell::repo_from_url(actual)?;
+
+    if actual_repo.eq_ignore_ascii_case(declared_repo) {
+        return None;
+    }
+
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: marketplace.to_string(),
+        file: install_dir.to_path_buf(),
+        line: None,
+        snippet: actual.to_string(),
+        diagnosis: format!(
+            "marketplace checkout remote '{actual_repo}' does not match declared source '{declared_repo}'"
+        ),
+        remediation: "cache may not be canonical — verify before citing, or re-add the \
+                      marketplace from its declared source"
+            .to_string(),
+    })
+}
+
 /// Entry point for the `doctor` subcommand. Returns the process exit code.
 ///
 /// Exit codes:
@@ -541,6 +749,37 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
         )
     {
         findings.push(finding);
+    }
+
+    // Plugin-cache health: orphaned/missing version dirs and canonical-remote
+    // drift. Same live-machine-only rationale as staleness above — under
+    // `--root` this would read the dev machine's real cache, not the fixture.
+    if root_override.is_none()
+        && let Some(plugins) = plugins_dir()
+    {
+        if let Some(pinned) = manifest_install_paths(&plugins.join("installed_plugins.json")) {
+            findings.extend(orphan_findings(&pinned, quiet));
+        }
+
+        for (marketplace, install_dir, declared_repo) in
+            known_marketplace_sources(&plugins.join("known_marketplaces.json"))
+        {
+            if !install_dir.join(".git").exists() {
+                continue;
+            }
+            let actual = cadence_hooks_core::shell::git_command(
+                &install_dir.to_string_lossy(),
+                &["remote", "get-url", "origin"],
+            );
+            if let Some(finding) = canonical_remote_finding(
+                &marketplace,
+                &install_dir,
+                &declared_repo,
+                actual.as_deref(),
+            ) {
+                findings.push(finding);
+            }
+        }
     }
 
     let (errors, warnings): (Vec<&Finding>, Vec<&Finding>) =
@@ -822,6 +1061,245 @@ mod tests {
         let manifest = tmp.path().join("installed_plugins.json");
         fs::write(&manifest, "{ not json").unwrap();
         assert!(manifest_install_paths(&manifest).is_none());
+    }
+
+    // ── dir_size_bytes ───────────────────────────────────────────────────────
+
+    #[test]
+    fn dir_size_bytes_sums_known_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "12345").unwrap(); // 5 bytes
+        let sub = tmp.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("b.txt"), "1234567890").unwrap(); // 10 bytes
+
+        assert_eq!(dir_size_bytes(tmp.path()), 15);
+    }
+
+    #[test]
+    fn dir_size_bytes_missing_dir_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(dir_size_bytes(&missing), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dir_size_bytes_symlinked_top_level_dir_is_zero() {
+        // A symlinked `dir` argument must return 0 rather than following the
+        // link and summing whatever it points at (e.g. `$HOME` or `/`).
+        let tmp = tempfile::tempdir().unwrap();
+        let real_target = tmp.path().join("real-target");
+        fs::create_dir_all(&real_target).unwrap();
+        fs::write(real_target.join("file"), "some content here").unwrap();
+
+        let link = tmp.path().join("link-to-target");
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+        assert_eq!(dir_size_bytes(&link), 0);
+        // Sanity: the real target itself does report nonzero.
+        assert!(dir_size_bytes(&real_target) > 0);
+    }
+
+    // ── orphan_findings ──────────────────────────────────────────────────────
+
+    #[test]
+    fn orphan_findings_flags_siblings_of_pinned_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        for sha in ["sha1", "sha2", "sha3"] {
+            let dir = plugin_dir.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+        let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
+
+        let findings = orphan_findings(&pinned, false);
+        let orphan_finding = findings
+            .iter()
+            .find(|f| f.diagnosis.contains("orphaned"))
+            .expect("should report orphans");
+        assert!(
+            orphan_finding.diagnosis.contains("2 orphaned"),
+            "diagnosis: {}",
+            orphan_finding.diagnosis
+        );
+    }
+
+    #[test]
+    fn orphan_findings_missing_pinned_dir_is_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("mp/plugin/sha-gone");
+        let pinned = vec![("plugin@mp".to_string(), missing)];
+
+        let findings = orphan_findings(&pinned, false);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].diagnosis.contains("missing or empty"));
+    }
+
+    #[test]
+    fn orphan_findings_only_pinned_dir_present_is_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        let pinned_dir = plugin_dir.join("sha1");
+        fs::create_dir_all(&pinned_dir).unwrap();
+        fs::write(pinned_dir.join("marker"), "x").unwrap();
+        let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
+
+        assert!(orphan_findings(&pinned, false).is_empty());
+    }
+
+    #[test]
+    fn orphan_findings_quiet_suppresses_orphan_count_but_not_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        for sha in ["sha1", "sha2"] {
+            let dir = plugin_dir.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+        let missing = tmp.path().join("mp/other/sha-gone");
+
+        let pinned = vec![
+            ("plugin@mp".to_string(), plugin_dir.join("sha1")),
+            ("other@mp".to_string(), missing),
+        ];
+
+        let findings = orphan_findings(&pinned, true);
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the missing-dir warning fires quiet"
+        );
+        assert!(findings[0].diagnosis.contains("missing or empty"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn orphan_findings_does_not_follow_symlinked_sibling() {
+        // A symlinked sibling must never be treated as an orphan version dir
+        // to recurse into — a planted symlink pointing at, say, `$HOME`
+        // would otherwise get walked and summed by `dir_size_bytes`.
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        let pinned_dir = plugin_dir.join("sha1");
+        fs::create_dir_all(&pinned_dir).unwrap();
+        fs::write(pinned_dir.join("marker"), "x").unwrap();
+
+        // A real directory elsewhere with content the walk must NOT reach.
+        let escape_target = tmp.path().join("escape-target");
+        fs::create_dir_all(&escape_target).unwrap();
+        fs::write(escape_target.join("secret"), "should not be counted").unwrap();
+
+        // The planted symlinked "orphan" sibling, pointing outside the cache.
+        let symlinked_sibling = plugin_dir.join("sha-evil-link");
+        std::os::unix::fs::symlink(&escape_target, &symlinked_sibling).unwrap();
+
+        let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
+        let findings = orphan_findings(&pinned, false);
+
+        assert!(
+            findings.is_empty(),
+            "a symlinked sibling must not be reported as an orphan, found {} finding(s): {:?}",
+            findings.len(),
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+    }
+
+    // ── known_marketplace_sources ────────────────────────────────────────────
+
+    #[test]
+    fn known_marketplace_sources_reads_github_entries_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("known_marketplaces.json");
+        fs::write(
+            &manifest,
+            r#"{
+  "workbench": {
+    "source": { "source": "github", "repo": "cameronsjo/workbench" },
+    "installLocation": "/home/x/.claude/plugins/marketplaces/workbench"
+  },
+  "local-dev": {
+    "source": { "source": "directory", "path": "/home/x/dev/plugin" },
+    "installLocation": "/home/x/dev/plugin"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let sources = known_marketplace_sources(&manifest);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].0, "workbench");
+        assert_eq!(sources[0].2, "cameronsjo/workbench");
+    }
+
+    #[test]
+    fn known_marketplace_sources_missing_file_is_empty() {
+        assert!(
+            known_marketplace_sources(Path::new("/nonexistent/known_marketplaces.json")).is_empty()
+        );
+    }
+
+    #[test]
+    fn known_marketplace_sources_invalid_json_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("known_marketplaces.json");
+        fs::write(&manifest, "{ not json").unwrap();
+        assert!(known_marketplace_sources(&manifest).is_empty());
+    }
+
+    // ── canonical_remote_finding ─────────────────────────────────────────────
+
+    #[test]
+    fn canonical_remote_finding_matching_https_remote_is_none() {
+        assert!(
+            canonical_remote_finding(
+                "workbench",
+                Path::new("/x"),
+                "cameronsjo/workbench",
+                Some("https://github.com/cameronsjo/workbench.git"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_remote_finding_matching_scp_remote_is_none() {
+        assert!(
+            canonical_remote_finding(
+                "workbench",
+                Path::new("/x"),
+                "cameronsjo/workbench",
+                Some("git@github.com:cameronsjo/workbench.git"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_remote_finding_mismatched_repo_is_warning() {
+        let f = canonical_remote_finding(
+            "workbench",
+            Path::new("/x"),
+            "cameronsjo/workbench",
+            Some("https://github.com/someone-else/fork.git"),
+        )
+        .expect("mismatch should warn");
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.diagnosis.contains("someone-else/fork"), "{}", f.diagnosis);
+        assert!(
+            f.diagnosis.contains("cameronsjo/workbench"),
+            "{}",
+            f.diagnosis
+        );
+    }
+
+    #[test]
+    fn canonical_remote_finding_no_actual_remote_is_none() {
+        assert!(
+            canonical_remote_finding("workbench", Path::new("/x"), "cameronsjo/workbench", None)
+                .is_none()
+        );
     }
 
     // ── judge_invocation tests ───────────────────────────────────────────────
