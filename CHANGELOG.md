@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`warn-issue-tracker` is now decentralization-aware (#166).** The guard hardcoded `cameronsjo/claude-configurations` as the single canonical tracker and misfired on the legitimate post-2026-06-30 trackers. It now checks the filing target against a set of known ecosystem trackers (`cadence`, `cadence-hooks`, `forgectl`, `claude-configurations`), nudging only when an *owned* repo is none of them. New `CADENCE_ISSUE_TRACKERS` (plural, comma-separated) overrides the set; the legacy singular `CADENCE_ISSUE_TRACKER` still works. Still nudge-only, never blocks (ADR-0001).
 - **docs(changelog): backfilled the missing `[0.30.0] - 2026-06-16` section**
   (#140). The changelog jumped `[0.31.0]` → `[0.29.0]`; the three fixes that
   shipped in v0.30.0 are now stamped into a versioned section.
@@ -16,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Persona ledger is now bounded and its session-start dedupe no longer full-parses every line (#137).** The append-only `personas.jsonl` grew without limit and every SessionStart re-parsed the whole file (one `serde_json::Value` per line) just to dedupe one `session_id`. `ledger_contains` is now a reverse substring scan (no per-line JSON parse), and `promote` rotates the ledger to a configurable `ledger_max_entries` cap (default 1000; `0` disables), keeping the newest records and collapsing duplicate `session_id`s. Rotation is confined to the PostToolUse promote path and atomic (temp-write + rename), fail-open throughout (ADR-0001).
 - **`obsidian trash-guard` now catches non-`rm` deletion verbs (#136).** The guard gated solely on `command.contains("rm")`, so `unlink note.md`, `find … -delete`, `shred -u note.md`, and `truncate -s 0 note.md` destroyed vault files while bypassing Obsidian's `.trash/`. A shared `is_destructive` gate now matches all four (token-based, so `find` without `-delete` stays read-only and allowed), reusing the existing vault-targeting logic unchanged.
 - **`guard-gh-write` no longer blocks explicit-target `gh` reads in a loop (#158).** The `AllTargetsExplicit` loop branch ownership-gated every command, so a loop of `-R`/`--repo` reads against an unowned repo false-blocked. Reads are owner-independent; the branch now gates on `is_write_command`, mirroring the `MissingTargets` path. Unowned looped writes still block.
 - `warn-main-branch` carve-outs (`.claude/`, `docs/plans/`) now lexically resolve `..`/`.` in the path before matching, so a crafted `file_path` like `docs/plans/../../src/main.rs` can no longer suppress the main-branch nudge for a real product file (#152).
