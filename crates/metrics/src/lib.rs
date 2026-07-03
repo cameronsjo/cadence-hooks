@@ -20,6 +20,8 @@ pub mod log_denial;
 pub mod log_polish_nudge;
 /// Append per-session cost records to `sessions.jsonl` at `SessionEnd`.
 pub mod log_session;
+/// Stamp this session's start timestamp at `SessionStart`.
+pub mod log_session_start;
 /// Append subagent lifecycle records to `subagents.jsonl`.
 pub mod log_subagent;
 /// Append threshold-gated hook self-timing records to `hooks.jsonl`.
@@ -40,6 +42,7 @@ pub use log_commit::LogCommit;
 pub use log_denial::log_denial;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_session::LogSession;
+pub use log_session_start::LogSessionStart;
 pub use log_subagent::LogSubagent;
 pub use log_timing::log_timing;
 pub use snapshot::Snapshot;

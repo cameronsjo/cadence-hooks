@@ -263,6 +263,8 @@ enum MetricsCommands {
         #[arg(long, value_name = "PATH")]
         prices: Option<String>,
     },
+    /// Capture session start timestamp (SessionStart)
+    LogSessionStart,
     /// Log polish-nudge skips: `gh pr create` + whether /polish ran (PostToolUse)
     LogPolishNudge,
     /// Log AskUserQuestion stance + shape on every call (PreToolUse)
@@ -384,6 +386,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::LogCommit { .. } => "log-commit",
             MetricsCommands::LogSubagent => "log-subagent",
             MetricsCommands::LogSession { .. } => "log-session",
+            MetricsCommands::LogSessionStart => "log-session-start",
             MetricsCommands::LogPolishNudge => "log-polish-nudge",
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
             MetricsCommands::WarnStale => "warn-stale",
@@ -915,6 +918,11 @@ fn main() {
                     prices_path: prices,
                 },
                 registry::sample_for("metrics", "log-session"),
+                canonical_hook,
+            ),
+            MetricsCommands::LogSessionStart => dispatch::run_logged_logger(
+                &cadence_hooks_metrics::LogSessionStart,
+                registry::sample_for("metrics", "log-session-start"),
                 canonical_hook,
             ),
             MetricsCommands::LogPolishNudge => dispatch::run_logged_logger(
