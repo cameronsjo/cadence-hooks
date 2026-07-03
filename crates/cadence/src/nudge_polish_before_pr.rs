@@ -181,10 +181,7 @@ mod tests {
     fn decide_non_pr_create_allows_regardless_of_marker() {
         // The matcher only scopes the process spawn; decide() still guards
         // against a non-create gh command slipping through.
-        assert_eq!(
-            decide("gh pr list", false).outcome,
-            Outcome::Allow
-        );
+        assert_eq!(decide("gh pr list", false).outcome, Outcome::Allow);
         assert_eq!(decide("git commit -m x", true).outcome, Outcome::Allow);
     }
 
@@ -238,7 +235,10 @@ mod tests {
         let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
         let result = NudgePolishBeforePr.run(&input);
         assert_eq!(result.outcome, Outcome::Allow);
-        assert!(result.message.is_none(), "a recorded polish allows silently");
+        assert!(
+            result.message.is_none(),
+            "a recorded polish allows silently"
+        );
     }
 
     #[test]
@@ -284,7 +284,9 @@ mod tests {
     #[test]
     fn gh_pr_view_allowed() {
         assert_eq!(
-            NudgePolishBeforePr.run(&make_bash("gh pr view 123")).outcome,
+            NudgePolishBeforePr
+                .run(&make_bash("gh pr view 123"))
+                .outcome,
             Outcome::Allow
         );
     }

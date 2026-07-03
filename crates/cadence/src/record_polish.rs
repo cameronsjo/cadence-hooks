@@ -32,8 +32,7 @@ fn resolve(
     repo_root: Option<String>,
     branch: Option<String>,
 ) -> Option<(String, String, String)> {
-    let repo_root =
-        repo_root.or_else(|| git_command(dir, &["rev-parse", "--show-toplevel"]))?;
+    let repo_root = repo_root.or_else(|| git_command(dir, &["rev-parse", "--show-toplevel"]))?;
     let branch = branch.or_else(|| git_command(dir, &["branch", "--show-current"]))?;
     // Polish does not commit (SKILL.md), so this is the pre-polish base SHA — a
     // provenance breadcrumb for CP2, never an exact-match key. Empty when the
@@ -76,7 +75,9 @@ pub fn run_record(repo_root: Option<String>, branch: Option<String>, scope: Opti
     let content = marker_content(&branch, &head_sha, &scope);
     let path = polish_marker(&repo_root, &branch);
     if let Err(e) = write_marker(&path, &content) {
-        eprintln!("cadence-hooks record-polish: marker write failed ({e}) — pre-PR gate may re-nudge.");
+        eprintln!(
+            "cadence-hooks record-polish: marker write failed ({e}) — pre-PR gate may re-nudge."
+        );
     }
 }
 
