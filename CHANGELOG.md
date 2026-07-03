@@ -9,6 +9,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Security
 
 - **Harden untrusted `.claude/*.json` config reads against a local special-file DoS (#157).** The per-repo `terminology.json` and `redaction.json` readers used an unbounded `fs::read_to_string` with no file-type check, so a `.claude/*.json` that was a symlink to an endless special file (`/dev/zero`, a FIFO) or a multi-GB blob could hang or OOM the hook when it fired inside a cloned/shared repo. Both now route through a new `core::paths::read_untrusted_config`, which rejects anything that is not a regular file (on `stat`, before any blocking read) and caps the read at 1 MiB, failing open (ADR-0001) — a rejected config is treated as absent.
+### Fixed
+
+- **`obsidian trash-guard` now catches non-`rm` deletion verbs (#136).** The guard gated solely on `command.contains("rm")`, so `unlink note.md`, `find … -delete`, `shred -u note.md`, and `truncate -s 0 note.md` destroyed vault files while bypassing Obsidian's `.trash/`. A shared `is_destructive` gate now matches all four (token-based, so `find` without `-delete` stays read-only and allowed), reusing the existing vault-targeting logic unchanged.
+- **`guard-gh-write` no longer blocks explicit-target `gh` reads in a loop (#158).** The `AllTargetsExplicit` loop branch ownership-gated every command, so a loop of `-R`/`--repo` reads against an unowned repo false-blocked. Reads are owner-independent; the branch now gates on `is_write_command`, mirroring the `MissingTargets` path. Unowned looped writes still block.
+- `warn-main-branch` carve-outs (`.claude/`, `docs/plans/`) now lexically resolve `..`/`.` in the path before matching, so a crafted `file_path` like `docs/plans/../../src/main.rs` can no longer suppress the main-branch nudge for a real product file (#152).
+- **`log-polish-nudge` now records the branch-scoped marker signal the pre-PR
+  gate acts on, not just a session-log scan (#177).** A new
+  `polish_marker_present(command, cwd)` helper in core is the single source of
+  truth both the `nudge-polish-before-pr` gate and the metric call; the metric
+  emits `markerPresent` alongside `polished`, making the gate-truth denominator
+  queryable and the scan-vs-marker drift measurable. Fail-open throughout
+  (ADR-0001).
+- docs(hooks): add missing metrics-logger rows (`log-session`, `log-polish-nudge`, `log-ask-user-question`) to the cadence-metrics table in `docs/hooks.md` (#178)
+### Changed
+
+- **docs(changelog): backfilled the missing `[0.30.0] - 2026-06-16` section**
+  (#140). The changelog jumped `[0.31.0]` → `[0.29.0]`; the three fixes that
+  shipped in v0.30.0 are now stamped into a versioned section.
 
 ## [0.44.0] - 2026-07-02
 
@@ -495,6 +513,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   field so an unknown model is loud rather than a silent zero. `scan-tokens`
   parsed the entire transcript on every commit; it now byte-scans past the
   marker and only JSON-parses the tail, bounding the per-commit hot-path cost.
+
+## [0.30.0] - 2026-06-16
+
+### Fixed
+
+- **cadence secret guards: block the `.env.<x>` family on Read/Grep/Write/Edit**
+  (#64 on claude-configurations). The `.env` family was classified two ways: the
+  Bash path used a component substring-minus-safe-suffix predicate over
+  `.env.<x>`, while the Read/Grep/Write/Edit tool path used exact membership
+  against `BLOCKED_FILENAMES` — which omitted `.env.prod`, `.env.dev`,
+  `.env.development.local`, `.env.docker`, and the rest. So `Read .env.prod` was
+  allowed while `cat .env.prod` was blocked — the most-used ingestion tools were
+  the weakest check. The family logic is now a single shared
+  `is_env_family_secret` helper called from both predicates, so the tool and
+  shell paths agree on one rule.
+- **guardrails: validate an explicit `git push <URL>` against ownership**
+  (#68 on claude-configurations). `extract_remote` rejected any non-remote token,
+  so an explicit push URL (HTTPS or SCP) was discarded and the guard resolved and
+  validated `origin` in its place — allowing an irrecoverable push to an
+  arbitrary unowned host whenever `origin` happened to be owned. The new
+  `extract_push_target` classifies the positional target as `Named`, `Url`, or
+  `None` (tracking fallback); a `Url` is validated directly via `check_owner`,
+  blocking unowned hosts and naming the actual URL in the block message, while
+  `Named`/`None` keep the existing resolve-through-git behavior. URL detection
+  reuses `host_and_repo_from_url` (the same parser `check_owner` uses) and covers
+  the user-less SCP form (`host:owner/repo.git`).
+- **session: the stale-sweep no longer prunes live peers, and drift baselines on
+  a declared branch** (#69, #70 on claude-configurations). `run_start` now
+  reads/builds/writes its own record (refreshing mtime) *before* calling
+  `sweep_stale`, eliminating the self-sweep-then-minimal-rebuild path that
+  stripped a quiet session's intent/touching on `/clear` or compaction;
+  `sweep_stale` also excludes the caller's own file, and the staleness threshold
+  rises 10 → 30 minutes so a long read/think phase stays out of reach. The
+  commit-time drift warning now baselines against a new `declared_branch` field
+  that moves only when *this* session runs its own checkout/switch (detected via
+  the heredoc-aware `is_branch_switch`), so a peer moving shared HEAD no longer
+  masks divergence. Old records parse with `declared_branch=None` via serde
+  defaults (fail-open) and self-heal on the next session start — no migration.
 
 ## [0.29.0] - 2026-06-10
 
