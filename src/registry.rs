@@ -291,6 +291,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: None,
     },
     HookEntry {
+        name: "log-session",
+        description: "Log per-session cost at SessionEnd (SessionEnd)",
+        plugin: "metrics",
+        event: None,
+    },
+    HookEntry {
         name: "log-polish-nudge",
         description: "Log polish-nudge skips: gh pr create + whether /polish ran (PostToolUse)",
         plugin: "metrics",
@@ -397,6 +403,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // log-subagent only reacts to SubagentStart / SubagentStop
         ("metrics", "log-subagent") => Some(
             r#"{"session_id":"test","hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"Explore","duration_ms":1234}"#,
+        ),
+        // log-session gates on hook_event_name == "SessionEnd" and scans the
+        // transcript; the generic logger sample carries a different event and
+        // no transcript, so it would no-op before writing a row.
+        ("metrics", "log-session") => Some(
+            r#"{"session_id":"test","hook_event_name":"SessionEnd","transcript_path":"/tmp/transcript.jsonl","cwd":"/tmp","reason":"prompt_input_exit"}"#,
         ),
         // log-polish-nudge gates on a `gh pr create` command (the nudge denominator)
         ("metrics", "log-polish-nudge") => Some(
@@ -509,9 +521,9 @@ mod tests {
 
     #[test]
     fn sample_overrides_exist_for_event_gated_loggers() {
-        // These three loggers gate on specific hook_event_name values or
-        // command shapes — the generic fallback would no-op them.
-        for name in ["snapshot", "log-commit", "log-subagent"] {
+        // These loggers gate on specific hook_event_name values or command
+        // shapes — the generic fallback would no-op them.
+        for name in ["snapshot", "log-commit", "log-subagent", "log-session"] {
             assert!(
                 sample_for("metrics", name).is_some(),
                 "{name} needs a sample override"
@@ -553,6 +565,7 @@ mod tests {
             "snapshot",
             "log-commit",
             "log-subagent",
+            "log-session",
             "log-polish-nudge",
             "log-ask-user-question",
             "heartbeat",
