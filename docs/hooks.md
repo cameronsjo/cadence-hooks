@@ -45,7 +45,6 @@ judgment to the model. It exempts retro paths and writes under `$OBSIDIAN_VAULT`
 | `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base |
 | `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs |
 | `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
-| `check-idle-return` | PreToolUse | Nudge after idle periods between edits |
 | `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main |
 | `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) |
 | `warn-pr-issue-link` | PreToolUse (Bash) | Nudge when `gh pr create` has no closing issue keyword (`Closes #N`) in the body |

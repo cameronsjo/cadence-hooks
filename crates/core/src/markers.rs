@@ -1,7 +1,7 @@
 //! Session-scoped, per-user marker primitive for the advisory marker family.
 //!
 //! The once-per-session guards (`warn-main-branch`, `warn-subagent-worktree`,
-//! `guard-browser-device`, `check-idle-return`, and the main-branch snooze) all
+//! `guard-browser-device`, and the main-branch snooze) all
 //! record state in a temp-file marker. Before CP0 each rolled its own path
 //! scheme, keyed on `PPID`→`process::id()` — but `PPID` is a shell builtin that
 //! is never exported into a hook's environment, so the fallback fired and every

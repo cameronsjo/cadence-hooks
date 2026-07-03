@@ -173,8 +173,6 @@ enum GuardrailsCommands {
     WarnSubagentWorktree,
     /// Nudge when the live subagent count is at or over the concurrency cap
     WarnSubagentConcurrency,
-    /// Nudge after idle periods between edits
-    CheckIdleReturn,
     /// Warn when creating a branch from a non-main base
     WarnBranchBase,
     /// Remind to check datetime before scheduling cron jobs
@@ -346,7 +344,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
             GuardrailsCommands::WarnSubagentWorktree => "warn-subagent-worktree",
             GuardrailsCommands::WarnSubagentConcurrency => "warn-subagent-concurrency",
-            GuardrailsCommands::CheckIdleReturn => "check-idle-return",
             GuardrailsCommands::WarnBranchBase => "warn-branch-base",
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
@@ -761,11 +758,6 @@ fn main() {
             ),
             GuardrailsCommands::WarnSubagentConcurrency => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_subagent_concurrency::WarnSubagentConcurrency,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::CheckIdleReturn => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::check_idle_return::CheckIdleReturn,
                 pre,
                 canonical_hook,
             ),
