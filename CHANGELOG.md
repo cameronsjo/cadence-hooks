@@ -6,18 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- **Bash-path coverage for non-`.env` deny-set secret files (#138).** The secret guards' Bash arms judged only the `.env` family, so `cat ~/.aws/credentials`, `cat ~/.ssh/id_rsa`, `cat ~/.git-credentials`, `cat ~/.pgpass`, `cat ~/.kube/config`, and `cat ~/.netrc` — all already blocked on the tool paths — read and wrote freely over Bash. A new `is_dangerous_secret_token` classifier consults the full `BLOCKED_FILENAMES` / `BLOCKED_PATH_FRAGMENTS` deny-sets, and a `command_may_reference_secret` pre-filter generalizes the old `.env`-only gate. Safe templates short-circuit so `id_rsa.pub` and `.aws/credentials.example` stay readable. `.envrc` keeps its Bash name-block (content carve-out stays tool-path-only, #149).
-- **Content-aware `.envrc` carve-out on the secret guards' tool paths (#149).** A `.envrc` of pure direnv loader directives (`use flake`, `dotenv`, `layout`, `source`, `PATH_add`, comments, `PATH`/`MANPATH` assignments) is a committed config loader, not a secret store — but `prevent-secret-writes` / `prevent-secret-leaks` hard-blocked every `.envrc` by name. Write/Edit now consult the resulting content (`effective_content`) and Read/Grep read the file to classify it; a proven pure-loader `.envrc` is allowed, while a `.envrc` carrying a `KEY=<value>` assignment or any provider-shaped secret value still blocks. Fail-closed: unreadable/unrecognized content stays blocked, and only `.envrc` is eligible — the rest of the `.env` family remains secret by name. The Bash arms (`cat .envrc`, `cat > .envrc`) still name-block pending a follow-up.
-- **`effective_content()` reads the literal write target, not the normalized path (#129).** For Edit/MultiEdit the helper now simulates against the file actually being written — a trailing-space/backslash/null path variant no longer makes a guard validate a different (or missing) file. Fail-open on an unreadable/non-UTF-8 file is preserved (ADR-0001) and documented; a future *blocking* content-security guard must supply its own fail-closed default.
+- **docs(changelog): backfilled the missing `[0.30.0] - 2026-06-16` section**
+  (#140). The changelog jumped `[0.31.0]` → `[0.29.0]`; the three fixes that
+  shipped in v0.30.0 are now stamped into a versioned section.
+- docs(hooks): add missing metrics-logger rows (`log-session`, `log-polish-nudge`, `log-ask-user-question`) to the cadence-metrics table in `docs/hooks.md` (#178)
 
-### Security
-
-- **`check-security-patterns` scans the simulated post-edit document and gains RCE/XSS coverage (#131).** The guard now routes through `effective_content()` (correct line numbers; no more scanning an Edit fragment or a MultiEdit's stale pre-edit file), and flags Python `eval(`/`exec(`/`os.system(`/`pickle.load(` and JS `eval(`/`document.write(`/`dangerouslySetInnerHTML`. Advisory-only (never blocks).
-### Security
-
-- **Harden untrusted `.claude/*.json` config reads against a local special-file DoS (#157).** The per-repo `terminology.json` and `redaction.json` readers used an unbounded `fs::read_to_string` with no file-type check, so a `.claude/*.json` that was a symlink to an endless special file (`/dev/zero`, a FIFO) or a multi-GB blob could hang or OOM the hook when it fired inside a cloned/shared repo. Both now route through a new `core::paths::read_untrusted_config`, which rejects anything that is not a regular file (on `stat`, before any blocking read) and caps the read at 1 MiB, failing open (ADR-0001) — a rejected config is treated as absent.
 ### Fixed
 
 - **`obsidian trash-guard` now catches non-`rm` deletion verbs (#136).** The guard gated solely on `command.contains("rm")`, so `unlink note.md`, `find … -delete`, `shred -u note.md`, and `truncate -s 0 note.md` destroyed vault files while bypassing Obsidian's `.trash/`. A shared `is_destructive` gate now matches all four (token-based, so `find` without `-delete` stays read-only and allowed), reusing the existing vault-targeting logic unchanged.
@@ -30,12 +25,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   emits `markerPresent` alongside `polished`, making the gate-truth denominator
   queryable and the scan-vs-marker drift measurable. Fail-open throughout
   (ADR-0001).
-- docs(hooks): add missing metrics-logger rows (`log-session`, `log-polish-nudge`, `log-ask-user-question`) to the cadence-metrics table in `docs/hooks.md` (#178)
-### Changed
+- **`effective_content()` reads the literal write target, not the normalized path (#129).** For Edit/MultiEdit the helper now simulates against the file actually being written — a trailing-space/backslash/null path variant no longer makes a guard validate a different (or missing) file. Fail-open on an unreadable/non-UTF-8 file is preserved (ADR-0001) and documented; a future *blocking* content-security guard must supply its own fail-closed default.
+- **Content-aware `.envrc` carve-out on the secret guards' tool paths (#149).** A `.envrc` of pure direnv loader directives (`use flake`, `dotenv`, `layout`, `source`, `PATH_add`, comments, `PATH`/`MANPATH` assignments) is a committed config loader, not a secret store — but `prevent-secret-writes` / `prevent-secret-leaks` hard-blocked every `.envrc` by name. Write/Edit now consult the resulting content (`effective_content`) and Read/Grep read the file to classify it; a proven pure-loader `.envrc` is allowed, while a `.envrc` carrying a `KEY=<value>` assignment or any provider-shaped secret value still blocks. Fail-closed: unreadable/unrecognized content stays blocked, and only `.envrc` is eligible — the rest of the `.env` family remains secret by name. The Bash arms (`cat .envrc`, `cat > .envrc`) still name-block pending a follow-up.
+- **Bash-path coverage for non-`.env` deny-set secret files (#138).** The secret guards' Bash arms judged only the `.env` family, so `cat ~/.aws/credentials`, `cat ~/.ssh/id_rsa`, `cat ~/.git-credentials`, `cat ~/.pgpass`, `cat ~/.kube/config`, and `cat ~/.netrc` — all already blocked on the tool paths — read and wrote freely over Bash. A new `is_dangerous_secret_token` classifier consults the full `BLOCKED_FILENAMES` / `BLOCKED_PATH_FRAGMENTS` deny-sets, and a `command_may_reference_secret` pre-filter generalizes the old `.env`-only gate. Safe templates short-circuit so `id_rsa.pub` and `.aws/credentials.example` stay readable. `.envrc` keeps its Bash name-block (content carve-out stays tool-path-only, #149).
 
-- **docs(changelog): backfilled the missing `[0.30.0] - 2026-06-16` section**
-  (#140). The changelog jumped `[0.31.0]` → `[0.29.0]`; the three fixes that
-  shipped in v0.30.0 are now stamped into a versioned section.
+### Security
+
+- **`check-security-patterns` scans the simulated post-edit document and gains RCE/XSS coverage (#131).** The guard now routes through `effective_content()` (correct line numbers; no more scanning an Edit fragment or a MultiEdit's stale pre-edit file), and flags Python `eval(`/`exec(`/`os.system(`/`pickle.load(` and JS `eval(`/`document.write(`/`dangerouslySetInnerHTML`. Advisory-only (never blocks).
+- **Harden untrusted `.claude/*.json` config reads against a local special-file DoS (#157).** The per-repo `terminology.json` and `redaction.json` readers used an unbounded `fs::read_to_string` with no file-type check, so a `.claude/*.json` that was a symlink to an endless special file (`/dev/zero`, a FIFO) or a multi-GB blob could hang or OOM the hook when it fired inside a cloned/shared repo. Both now route through a new `core::paths::read_untrusted_config`, which rejects anything that is not a regular file (on `stat`, before any blocking read) and caps the read at 1 MiB, failing open (ADR-0001) — a rejected config is treated as absent.
 
 ## [0.44.0] - 2026-07-02
 
