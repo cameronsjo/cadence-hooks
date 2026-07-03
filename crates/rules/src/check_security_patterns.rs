@@ -114,6 +114,43 @@ const PATTERNS: &[SecurityPattern] = &[
         pattern: r"UserDefaults.*(password|secret|token|apiKey)",
         message: "Store secrets in Keychain",
     },
+    // Python — RCE / command injection
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"\beval\s*[(]",
+        message: "RCE risk: eval() executes arbitrary code",
+    },
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"\bexec\s*[(]",
+        message: "RCE risk: exec() runs arbitrary code",
+    },
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"\bos[.]system\s*[(]",
+        message: "Command injection risk: use subprocess with an arg list",
+    },
+    SecurityPattern {
+        extensions: &["py"],
+        pattern: r"pickle[.]load[(]",
+        message: "RCE risk: use json or msgpack instead of pickle",
+    },
+    // JS/JSX — RCE / XSS
+    SecurityPattern {
+        extensions: &["js", "jsx", "mjs", "cjs"],
+        pattern: r"\beval\s*[(]",
+        message: "RCE risk: eval() executes arbitrary code",
+    },
+    SecurityPattern {
+        extensions: &["js", "jsx", "mjs", "cjs"],
+        pattern: r"\bdocument[.]write\s*[(]",
+        message: "XSS risk: avoid document.write()",
+    },
+    SecurityPattern {
+        extensions: &["jsx", "tsx"],
+        pattern: r"dangerouslySetInnerHTML",
+        message: "XSS risk: sanitize before dangerouslySetInnerHTML",
+    },
 ];
 
 /// Scan content for security anti-patterns matching the given file extension.
@@ -165,9 +202,14 @@ impl Check for SecurityPatternScanner {
 
         let ext = path.rsplit('.').next().unwrap_or("");
 
-        // Prefer content from the tool input (Write/Edit); fall back to disk (Read/Grep)
-        let content = match input.content() {
-            Some(c) => c.to_string(),
+        // Scan the *resulting* document, not the raw edit fragment (#131).
+        // effective_content() simulates Edit/MultiEdit against the on-disk file
+        // (correct line numbers, no stale pre-edit content); for Write it's the
+        // content as-is. Fall back to the current on-disk file when the payload
+        // carries no editable text, and fail open (allow) when neither is
+        // available (ADR-0001) — this guard is advisory only.
+        let content = match input.effective_content() {
+            Some(c) => c,
             None => match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => return CheckResult::allow(),
@@ -570,5 +612,140 @@ mod tests {
         };
         let result = SecurityPatternScanner.run(&input);
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    // --- new RCE / XSS pattern coverage (#131) ---
+
+    #[test]
+    fn py_eval() {
+        let results = scan_content("result = eval(user_input)", "py");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("eval"));
+    }
+
+    #[test]
+    fn py_exec() {
+        let results = scan_content("exec(compiled)", "py");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("exec"));
+    }
+
+    #[test]
+    fn py_os_system() {
+        let results = scan_content("os.system(cmd)", "py");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("injection"));
+    }
+
+    #[test]
+    fn py_pickle_load() {
+        let results = scan_content("obj = pickle.load(f)", "py");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("pickle"));
+    }
+
+    #[test]
+    fn js_eval() {
+        let results = scan_content("eval(payload)", "js");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("eval"));
+    }
+
+    #[test]
+    fn js_document_write() {
+        let results = scan_content("document.write(html)", "js");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("XSS"));
+    }
+
+    #[test]
+    fn jsx_dangerously_set_inner_html() {
+        let results = scan_content("<div dangerouslySetInnerHTML={{ __html: raw }} />", "jsx");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("sanitize"));
+    }
+
+    // --- false-positive regressions for the new patterns ---
+
+    #[test]
+    fn py_retrieval_not_flagged() {
+        // `retrieval(` embeds "eval(" but the \b boundary before eval fails.
+        let results = scan_content("retrieval(query)", "py");
+        assert!(
+            results.is_empty(),
+            "retrieval() must not trip eval, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn py_execute_not_flagged() {
+        // `execute(` embeds "exec" but the required `[(]` after exec is absent.
+        let results = scan_content("cursor.execute(sql)", "py");
+        assert!(
+            results.is_empty(),
+            "execute() must not trip exec, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn py_pickle_loads_not_double_counted() {
+        // pickle.loads matches only the existing `pickle[.]loads` pattern; the
+        // new `pickle[.]load[(]` requires "load(" and must not also fire.
+        let results = scan_content("pickle.loads(blob)", "py");
+        assert_eq!(
+            results.len(),
+            1,
+            "pickle.loads must match exactly once, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn js_medieval_not_flagged() {
+        let results = scan_content("medieval(theme)", "js");
+        assert!(
+            results.is_empty(),
+            "medieval() must not trip eval, got {results:?}"
+        );
+    }
+
+    // --- run() routing through effective_content (#129, #131) ---
+
+    use cadence_hooks_core::test_builders::{make_edit, make_multi_edit};
+
+    /// Write source into a temp file with the given extension; returns
+    /// (tempdir guard, absolute path).
+    fn on_disk_source(ext: &str, content: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("code.{ext}"));
+        std::fs::write(&path, content).unwrap();
+        (dir, path.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn run_edit_introducing_pattern_scans_effective_content() {
+        // An Edit whose new_string introduces os.system on line 2 must be
+        // flagged with the correct post-edit line number — proving the guard
+        // scans the simulated document, not the raw edit fragment.
+        let (_dir, path) = on_disk_source("py", "import os\nplaceholder()\n");
+        let input = make_edit(&path, "placeholder()", r#"os.system("rm -rf /")"#);
+        let result = SecurityPatternScanner.run(&input);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap();
+        assert!(msg.contains("L2"), "expected line 2, got: {msg}");
+        assert!(
+            msg.contains("injection"),
+            "expected injection hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_multi_edit_scans_resulting_document_not_stale() {
+        // The on-disk file is clean; only the applied MultiEdit introduces the
+        // pattern. A stale pre-edit scan would miss it.
+        let (_dir, path) = on_disk_source("py", "import os\nprint('hi')\n");
+        let input = make_multi_edit(&path, &[("print('hi')", "os.system('x')")]);
+        let result = SecurityPatternScanner.run(&input);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        assert!(result.message.unwrap().contains("injection"));
     }
 }

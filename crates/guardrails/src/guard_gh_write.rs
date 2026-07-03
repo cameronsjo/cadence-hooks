@@ -639,19 +639,25 @@ impl Check for GhWriteGuard {
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_gh_loops(command) {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
-                // All gh commands in loops have explicit -R flags — check ownership
-                // -R targets are always on the default host (gh CLI convention)
+                // Only writes are ownership-gated; reads (gh pr view, issue list) are
+                // owner-independent and safe against any repo — mirror the MissingTargets
+                // branch, which already gates on is_write_command (#158). -R targets are
+                // always on the default host (gh CLI convention).
                 let dh = default_host();
-                let all_owned = cmds.iter().all(|c| {
-                    c.explicit_repo
-                        .as_ref()
-                        .is_some_and(|r| is_allowed(&dh, r, &allowed_owners, &allowed_repos))
-                });
-                if !all_owned {
-                    let targets: Vec<&str> = cmds
-                        .iter()
-                        .filter_map(|c| c.explicit_repo.as_deref())
-                        .collect();
+                let unowned_write_targets: Vec<&str> = cmds
+                    .iter()
+                    .filter(|c| {
+                        let reconstructed = format!("gh {}", c.args.join(" "));
+                        is_write_command(&reconstructed)
+                    })
+                    .filter(|c| {
+                        !c.explicit_repo
+                            .as_ref()
+                            .is_some_and(|r| is_allowed(&dh, r, &allowed_owners, &allowed_repos))
+                    })
+                    .filter_map(|c| c.explicit_repo.as_deref())
+                    .collect();
+                if !unowned_write_targets.is_empty() {
                     let all_entries: Vec<String> = allowed_owners
                         .iter()
                         .chain(allowed_repos.iter())
@@ -662,11 +668,11 @@ impl Check for GhWriteGuard {
                          Found: {}\n   \
                          Allowed: {}\n   \
                          Fix: use `-R owner/repo` to target an owned repo",
-                        targets.join(", "),
+                        unowned_write_targets.join(", "),
                         all_entries.join(" "),
                     ));
                 }
-                // All targets owned — allow the loop
+                // All write targets owned (or the loop is read-only) — allow the loop
             }
             LoopAnalysis::MissingTargets(cmds) => {
                 // Only block if any looped gh command is a write — read-only
@@ -2162,6 +2168,63 @@ mod tests {
         // Non-api gh writes keep the cwd-remote fallback — routine work stays green.
         with_env(&owners_env(), || {
             let input = input_with("gh pr create --title hi", OWNED_DIR);
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    // --- #158: explicit-target reads in loops must not be ownership-gated ---
+
+    #[test]
+    fn loop_all_explicit_read_unowned_allows() {
+        // #158: a loop of explicit-target READS to an unowned repo must PASS —
+        // reads are owner-independent (was false-blocked by the arm's blanket
+        // ownership check over every command).
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for q in a b; do gh issue list --repo anthropics/claude-code --limit 8; done",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn loop_all_explicit_write_unowned_blocks() {
+        // Regression: an explicit-target WRITE loop to an unowned repo still BLOCKS.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for i in 1 2; do gh issue close $i -R stranger/repo; done",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn loop_all_explicit_write_owned_allows() {
+        // An explicit-target WRITE loop to an owned repo passes.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for i in 1 2; do gh issue close $i -R cameronsjo/repo; done",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn loop_all_explicit_mixed_read_unowned_write_owned_allows() {
+        // Precision: an unowned READ + an owned WRITE in the same loop allows —
+        // ownership is judged only on the write.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for i in 1 2; do gh pr view $i -R anthropics/claude-code && gh issue close $i -R cameronsjo/repo; done",
+                "/tmp",
+            );
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
