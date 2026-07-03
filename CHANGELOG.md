@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - audience-aware redaction — redact-external-content now gates each hit on destination-tier vs per-category ceiling (d>c), nudge-only (#159)
+### Fixed
+
+- **`dismiss-enforce-worktree` marker now resolves the git common dir, so snoozing works from a linked worktree (#179).** The marker was written under the passed directory's own `.git/cadence-hooks/`, which for a linked worktree is the per-worktree git dir — invisible to the primary checkout where the guard fires. Both the reader and the dismiss CLI now resolve the shared common dir via `git rev-parse --git-common-dir`, so a snooze recorded from any worktree is honoured at the primary. Fail-open on non-repos preserved (ADR-0001).
 
 ## [0.45.0] - 2026-07-03
 

@@ -582,7 +582,7 @@ mod tests {
         let scratch = Scratch::new("snooze");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
-        let marker = dismiss_enforce_worktree::marker_path(&primary);
+        let marker = dismiss_enforce_worktree::marker_path_for(&primary).unwrap();
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         let until = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
