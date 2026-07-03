@@ -27,8 +27,8 @@
 //! CP2 escalates the absent-marker nudge to a block once the skill's marker
 //! write has propagated.
 
-use cadence_hooks_core::markers::polish_marker;
-use cadence_hooks_core::shell::{git_command, is_gh_pr_create, parse_work_dir};
+use cadence_hooks_core::markers::polish_marker_present;
+use cadence_hooks_core::shell::is_gh_pr_create;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Gates `/polish` (cadence-forge:polish) before opening a PR — conditional on a
@@ -46,31 +46,10 @@ impl Check for NudgePolishBeforePr {
         };
         // Only a `gh pr create` pays the git-resolution cost; every other
         // command short-circuits to allow inside `decide`.
-        let marker_present = is_gh_pr_create(command) && marker_present_for(command, input);
+        let marker_present =
+            is_gh_pr_create(command) && polish_marker_present(command, input.cwd.as_deref());
         decide(command, marker_present)
     }
-}
-
-/// Resolve the PR's `(repo_root, branch)` and report whether a polish marker
-/// exists for it. Mirrors the record side's resolution (`parse_work_dir` for a
-/// `cd`-prefixed command, then `git rev-parse --show-toplevel` + `git branch
-/// --show-current`) so a subdir cwd normalizes to the same key on both sides.
-///
-/// Any missing piece — no cwd, not a repo, detached HEAD — yields `false`, and
-/// `decide` then fails open to a nudge (ADR-0001); we never block on our own
-/// missing data.
-fn marker_present_for(command: &str, input: &HookInput) -> bool {
-    let Some(cwd) = input.cwd.as_deref() else {
-        return false;
-    };
-    let dir = parse_work_dir(command, cwd);
-    let Some(repo_root) = git_command(&dir, &["rev-parse", "--show-toplevel"]) else {
-        return false;
-    };
-    let Some(branch) = git_command(&dir, &["branch", "--show-current"]) else {
-        return false;
-    };
-    polish_marker(&repo_root, &branch).is_file()
 }
 
 /// The pure 2-way conditional — no I/O, so the gate logic is unit-tested without

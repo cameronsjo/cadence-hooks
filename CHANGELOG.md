@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`log-polish-nudge` now records the branch-scoped marker signal the pre-PR
+  gate acts on, not just a session-log scan (#177).** A new
+  `polish_marker_present(command, cwd)` helper in core is the single source of
+  truth both the `nudge-polish-before-pr` gate and the metric call; the metric
+  emits `markerPresent` alongside `polished`, making the gate-truth denominator
+  queryable and the scan-vs-marker drift measurable. Fail-open throughout
+  (ADR-0001).
+
 ## [0.44.0] - 2026-07-02
 
 ### Added
