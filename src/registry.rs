@@ -150,12 +150,6 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
-        name: "check-idle-return",
-        description: "Nudge after idle periods between edits",
-        plugin: "guardrails",
-        event: Some(HookEvent::PreToolUse),
-    },
-    HookEntry {
         name: "warn-branch-base",
         description: "Warn when creating a branch from a non-main base",
         plugin: "guardrails",

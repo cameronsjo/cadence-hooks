@@ -3,8 +3,6 @@
 //! Ownership-aware guards that prevent Claude Code from pushing to repos
 //! you don't own, writing to upstream issues, or running irreversible operations.
 
-/// Nudge after idle periods between edits to re-check context.
-pub mod check_idle_return;
 /// Per-repo snooze command + helper consumed by `enforce_worktree`.
 pub mod dismiss_enforce_worktree;
 /// Per-repo snooze command + helper consumed by `warn_main_branch`.

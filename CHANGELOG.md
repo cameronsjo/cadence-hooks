@@ -26,6 +26,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - session bounds (startTs/endTs/durationMs) and commits count on sessions.jsonl, plus a log-session-start hook to stamp SessionStart (#182)
+### Removed
+
+- Retired check-idle-return guard — moot once a hook must execute to run (it re-caches anyway) (#151)
 
 ## [0.45.0] - 2026-07-03
 
