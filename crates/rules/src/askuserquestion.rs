@@ -113,18 +113,17 @@ impl Check for WarnRecommendedOption {
         if questions.is_empty() {
             return CheckResult::allow();
         }
-        // Stage 1 (diagnose): behavior unchanged — still nudge whenever no option
-        // is labeled "(Recommended)". Stage 2 will gate this on `stance(...) ==
-        // Silent` so a declared "no clear recommendation" stops tripping it.
-        if has_recommended(questions) {
-            CheckResult::allow()
-        } else {
+        // Stage 2: nudge only on true silence. A declared "no clear
+        // recommendation" (DeclaredNoRec) is a legible stance, so it no longer trips.
+        if stance(questions) == Stance::Silent {
             CheckResult::nudge(
                 "None of these AskUserQuestion options is labeled \"(Recommended)\". \
                  If one option is your clear recommendation, label it \"(Recommended)\" \
                  and list it first so the user can decide faster. If the options are \
                  genuinely equivalent, no change is needed.",
             )
+        } else {
+            CheckResult::allow()
         }
     }
 }
@@ -291,6 +290,27 @@ mod tests {
                         ..Default::default()
                     },
                 ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            WarnRecommendedOption.run(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn pre_declared_no_rec_allows() {
+        // A declared "no clear recommendation" is a legible stance (DeclaredNoRec),
+        // not silence — the nudge should not trip even with no labeled option.
+        let input = HookInput {
+            tool_name: Some("AskUserQuestion".into()),
+            tool_input: Some(ToolInput {
+                questions: Some(vec![q(
+                    "Which approach? — no clear recommendation",
+                    &["A", "B"],
+                )]),
                 ..Default::default()
             }),
             ..Default::default()
