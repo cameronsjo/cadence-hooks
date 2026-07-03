@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- threshold-gated hook self-timing — hooks slower than CADENCE_HOOK_TIMING_THRESHOLD_MS (default 1000) are logged to hooks.jsonl (#143)
+
 ### Fixed
 
 - warn-recommended-option now allows a declared "no clear recommendation" stance (fires only on true silence) (#148)

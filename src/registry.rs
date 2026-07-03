@@ -379,6 +379,12 @@ pub fn entry(namespace: &str, subcommand: &str) -> Option<&'static HookEntry> {
         .find(|h| h.plugin == namespace && h.name == subcommand)
 }
 
+/// The plugin namespace for a canonical hook `name`, if it is registered.
+/// Used by the dispatch self-timing write to tag which plugin owns a slow hook.
+pub fn plugin_for(name: &str) -> Option<&'static str> {
+    HOOKS.iter().find(|h| h.name == name).map(|h| h.plugin)
+}
+
 /// Per-hook sample payload overrides for `try` and the interactive-terminal
 /// guidance.
 ///

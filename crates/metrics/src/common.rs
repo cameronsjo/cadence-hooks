@@ -124,6 +124,15 @@ pub fn utc_timestamp() -> String {
     cadence_hooks_core::time::utc_timestamp()
 }
 
+/// Crate-wide serialization lock for env-mutating tests.
+///
+/// `CADENCE_METRICS_DIR` and its siblings are process-global, so every test that
+/// `set_var`/`remove_var`s one must hold *this one* lock — a per-module lock only
+/// serializes within its own module and lets tests in different modules
+/// (`log_denial`, `log_timing`, …) race on the same global.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
