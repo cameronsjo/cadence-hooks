@@ -6,26 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-07-03
+
 ### Added
 
 - threshold-gated hook self-timing — hooks slower than CADENCE_HOOK_TIMING_THRESHOLD_MS (default 1000) are logged to hooks.jsonl (#143)
 - warn-subagent-concurrency — nudges when live subagents reach CADENCE_MAX_CONCURRENT_SUBAGENTS (default 5) (#145)
 - warn-branch-intent — nudges when new work starts on a stale, unrelated branch; once per session, opt out with CADENCE_ALLOW_BRANCH_INTENT (#155)
 - **guard-read-model — opt-in per-model Read/Grep guard (#144).** Resolves the current session model from the transcript tail (`core::transcript::last_assistant_model`, no metrics dep) and blocks Read/Grep per `CADENCE_READ_MODEL_GUARD_*` policy: `CADENCE_READ_MODEL_GUARD_MODELS` (space/comma list of family keywords or full ids; unset → disabled), `CADENCE_READ_MODEL_GUARD_MODE` (`deny`|`allow`, default `deny`), `CADENCE_READ_MODEL_GUARD_ON_UNKNOWN` (`block`|`allow`, default `allow`). Matching is case-insensitive substring (`opus` matches `claude-opus-4-8`). Blocks ONLY on a positively-identified denied model; fail-open on unknown — a missing/empty/unreadable transcript never bricks reads (ADR-0001).
+- audience-aware redaction — redact-external-content now gates each hit on destination-tier vs per-category ceiling (d>c), nudge-only (#159)
+- session bounds (startTs/endTs/durationMs) and commits count on sessions.jsonl, plus a log-session-start hook to stamp SessionStart (#182)
+- **warn-going-public — nudges on repo create/edit when the repo name or description telegraphs sensitive content; sensitive terms via `CADENCE_GOING_PUBLIC_TERMS`, relief via `CADENCE_GOING_PUBLIC_IGNORE` (#128).**
 
 ### Fixed
 
 - warn-recommended-option now allows a declared "no clear recommendation" stance (fires only on true silence) (#148)
 - **terminology guard's `cadence-hooks` exemption is now scoped to the active checkout, closing a self-grantable bypass (#139).** The exemption fired on any path with a `cadence-hooks` component, so `mkdir /tmp/cadence-hooks` plus a doc carrying a blocked term self-granted the free pass. It now fires only when the edit targets a file inside the current checkout AND that checkout is genuinely the cadence-hooks repo (identified by its primary-checkout dir name via the git common dir), so linked worktrees stay exempt while unrelated repos merely nested under a `cadence-hooks`-named ancestor no longer do. The `is_within` containment primitive (which rejects `..` traversal) is promoted from `crates/lab` to `crates/core` as the single implementation. Fail-safe: every failure path falls through to a block.
-### Added
-
-- audience-aware redaction — redact-external-content now gates each hit on destination-tier vs per-category ceiling (d>c), nudge-only (#159)
-### Fixed
-
 - **`dismiss-enforce-worktree` marker now resolves the git common dir, so snoozing works from a linked worktree (#179).** The marker was written under the passed directory's own `.git/cadence-hooks/`, which for a linked worktree is the per-worktree git dir — invisible to the primary checkout where the guard fires. Both the reader and the dismiss CLI now resolve the shared common dir via `git rev-parse --git-common-dir`, so a snooze recorded from any worktree is honoured at the primary. Fail-open on non-repos preserved (ADR-0001).
-### Added
 
-- session bounds (startTs/endTs/durationMs) and commits count on sessions.jsonl, plus a log-session-start hook to stamp SessionStart (#182)
 ### Removed
 
 - Retired check-idle-return guard — moot once a hook must execute to run (it re-caches anyway) (#151)
@@ -34,7 +32,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **feat(guardrails): warn-going-public — nudges on `gh repo create`/`gh repo edit` when the repo name or description telegraphs sensitive content; sensitive terms via `CADENCE_GOING_PUBLIC_TERMS`, relief via `CADENCE_GOING_PUBLIC_IGNORE` (#128).**
 - **feat(doctor): plugin-cache health check (#162).** `doctor` now flags orphaned SHA-pinned cache version dirs (with a byte count), missing/empty pinned dirs, and marketplace checkouts whose `git remote` diverges from their declared `known_marketplaces.json` source ("cache may not be canonical — verify before citing"). All advisory (Warning/exit 1), live-machine only (skipped under `--root`), fail-open throughout (ADR-0001). Orphan counts surface in verbose mode only to avoid perennial SessionStart nags; detection-only — `--fix` prune deferred.
 
 ### Changed
