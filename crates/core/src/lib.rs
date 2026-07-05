@@ -467,6 +467,11 @@ pub struct MetricsInput {
     /// carries it (SessionStart and some Pre/PostToolUse payloads). Mirrors
     /// [`HookInput::model`]; deserializes to `None` when absent.
     pub model: Option<String>,
+    /// The tool that fired this event (e.g. `EnterPlanMode`, `ExitPlanMode`,
+    /// `Bash`). Mirrors [`HookInput::tool_name`]; deserializes to `None` when
+    /// absent. Powers event-derivation loggers like `log-plan-phase` that key
+    /// off which tool ran rather than a fixed `hook_event_name`.
+    pub tool_name: Option<String>,
     /// Top-level keys present in the raw payload. Populated by [`Self::from_json`],
     /// not deserialized — powers the `CADENCE_METRICS_DEBUG` `_keys` field that
     /// surfaces schema additions across Claude Code releases.
@@ -1874,6 +1879,15 @@ mod tests {
     #[test]
     fn metrics_input_rejects_malformed_json() {
         assert!(MetricsInput::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn metrics_input_parses_tool_name_from_post_tool_use() {
+        // log-plan-phase keys its event derivation off this field.
+        let json =
+            r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"ExitPlanMode"}"#;
+        let input = MetricsInput::from_json(json).unwrap();
+        assert_eq!(input.tool_name.as_deref(), Some("ExitPlanMode"));
     }
 
     // --- Interactive terminal guidance ---

@@ -16,6 +16,8 @@ pub mod log_askuserquestion;
 pub mod log_commit;
 /// Append guard-denial audit records to `denials.jsonl`.
 pub mod log_denial;
+/// Append plan-lifecycle records (EnterPlanMode/ExitPlanMode) to `plan-phases.jsonl`.
+pub mod log_plan_phase;
 /// Append polish-nudge (`gh pr create`) records to `polish_nudges.jsonl`.
 pub mod log_polish_nudge;
 /// Append per-session cost records to `sessions.jsonl` at `SessionEnd`.
@@ -40,6 +42,7 @@ pub mod warn_stale;
 pub use log_askuserquestion::LogAskUserQuestion;
 pub use log_commit::LogCommit;
 pub use log_denial::log_denial;
+pub use log_plan_phase::LogPlanPhase;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_session::LogSession;
 pub use log_session_start::LogSessionStart;

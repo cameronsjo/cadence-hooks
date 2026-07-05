@@ -96,6 +96,7 @@ exit 0. They never block a tool call (see
 | `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` |
 | `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, append to `sessions.jsonl` |
 | `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd` |
+| `log-plan-phase` | PostToolUse (`EnterPlanMode` / `ExitPlanMode`) | Append a plan-lifecycle record (with a whole-transcript token/cost scan) to `plan-phases.jsonl` |
 | `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` |
 | `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` |
 
