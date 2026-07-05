@@ -12,6 +12,8 @@ mod common;
 pub mod compute_cost;
 /// Append AskUserQuestion stance/shape records to `askuserquestion.jsonl`.
 pub mod log_askuserquestion;
+/// Append guard-bypass audit records (armed/used) to `bypasses.jsonl`.
+pub mod log_bypass;
 /// Append cost-per-commit records to `commits.jsonl`.
 pub mod log_commit;
 /// Append guard-denial audit records to `denials.jsonl`.
@@ -40,6 +42,7 @@ pub mod snapshot;
 pub mod warn_stale;
 
 pub use log_askuserquestion::LogAskUserQuestion;
+pub use log_bypass::{BypassEvent, log_bypass};
 pub use log_commit::LogCommit;
 pub use log_denial::log_denial;
 pub use log_plan_phase::LogPlanPhase;

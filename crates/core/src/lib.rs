@@ -538,6 +538,56 @@ pub struct BlockMetadata {
     pub severity: &'static str,
 }
 
+/// Why a guard allowed an operation it would otherwise have acted on.
+///
+/// v1 distinguishes a time-bounded `dismiss-*` snooze from a per-guard
+/// environment switch. Future kinds (`GlobalBypass`/`GlobalDisable` for the
+/// `main.rs` gates, `Exemption`, `EffortSkip`) extend this as the remaining
+/// bypass surface opts in — see the deferred follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassKind {
+    /// A `cadence-hooks guardrails dismiss-*` snooze marker was active.
+    Dismissal,
+    /// A per-guard environment switch (e.g. `CADENCE_ALLOW_MAIN`,
+    /// `CADENCE_NO_ENFORCE_WORKTREE`) suppressed the guard.
+    EnvSwitch,
+}
+
+impl BypassKind {
+    /// Stable snake_case wire token, so the metrics record shape doesn't couple
+    /// to the Rust variant spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BypassKind::Dismissal => "dismissal",
+            BypassKind::EnvSwitch => "env_switch",
+        }
+    }
+}
+
+/// Attribution for a bypass-allow: *why* a guard let an operation through that
+/// its own invariant would otherwise have blocked or nudged. Rides on
+/// [`CheckResult::bypass`] so the dispatch seam can record the ride-through
+/// (in `src/dispatch.rs`) without a new [`Outcome`] variant.
+///
+/// **Privacy contract (inherited from the denial log):** carries only the
+/// mechanism, a user-authored `reason`, the arming session, and the expiry —
+/// never a command, path, or edited content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BypassProvenance {
+    /// Dismissal vs env-switch.
+    pub kind: BypassKind,
+    /// The concrete mechanism, e.g. `dismiss-enforce-worktree` or
+    /// `CADENCE_ALLOW_MAIN`.
+    pub mechanism: String,
+    /// The user-authored `--reason` from a `dismiss-*` snooze, when present.
+    /// Always `None` for an env-switch (there is nowhere to author one).
+    pub reason: Option<String>,
+    /// Unix epoch seconds when the dismissal expires, when known.
+    pub expires_at: Option<i64>,
+    /// The session id that armed the dismissal, when the sidecar recorded it.
+    pub armed_by_session: Option<String>,
+}
+
 /// Result of running a single check.
 pub struct CheckResult {
     pub outcome: Outcome,
@@ -547,6 +597,11 @@ pub struct CheckResult {
     /// it). When `Some`, `run_check` emits a `permissionDecision: "deny"`
     /// JSON envelope alongside the legacy stderr message.
     pub block_metadata: Option<BlockMetadata>,
+    /// Attribution when the guard allowed *because a bypass was active* — a
+    /// snooze marker or an env switch — rather than because the operation was
+    /// fine on its own. `None` for a normal allow/nudge/block. When `Some`, the
+    /// dispatch seam records a `used` line in `bypasses.jsonl`.
+    pub bypass: Option<BypassProvenance>,
 }
 
 impl CheckResult {
@@ -555,6 +610,7 @@ impl CheckResult {
             outcome: Outcome::Allow,
             message: None,
             block_metadata: None,
+            bypass: None,
         }
     }
 
@@ -563,6 +619,7 @@ impl CheckResult {
             outcome: Outcome::Nudge,
             message: Some(message.into()),
             block_metadata: None,
+            bypass: None,
         }
     }
 
@@ -571,6 +628,7 @@ impl CheckResult {
             outcome: Outcome::Block,
             message: Some(message.into()),
             block_metadata: None,
+            bypass: None,
         }
     }
 
@@ -582,6 +640,7 @@ impl CheckResult {
             outcome: Outcome::Block,
             message: Some(message.into()),
             block_metadata: Some(meta),
+            bypass: None,
         }
     }
 
@@ -592,6 +651,20 @@ impl CheckResult {
             outcome: Outcome::LoopBlock,
             message: Some(message.into()),
             block_metadata: None,
+            bypass: None,
+        }
+    }
+
+    /// An [`Outcome::Allow`] that carries [`BypassProvenance`]: the guard let the
+    /// operation through *because a bypass was active*, not because the operation
+    /// was fine on its own. Exit code is still 0 — the provenance rides the result
+    /// so the dispatch seam records a `used` line in `bypasses.jsonl`.
+    pub fn allow_bypassed(bypass: BypassProvenance) -> Self {
+        Self {
+            outcome: Outcome::Allow,
+            message: None,
+            block_metadata: None,
+            bypass: Some(bypass),
         }
     }
 }
@@ -1659,6 +1732,39 @@ mod tests {
     fn check_result_accepts_string() {
         let r = CheckResult::nudge(String::from("owned"));
         assert_eq!(r.message.as_deref(), Some("owned"));
+    }
+
+    // --- bypass provenance ---
+
+    #[test]
+    fn plain_constructors_carry_no_bypass() {
+        // Only allow_bypassed sets provenance; every other constructor leaves it
+        // None so the dispatch seam records nothing for a normal allow/block.
+        assert!(CheckResult::allow().bypass.is_none());
+        assert!(CheckResult::nudge("x").bypass.is_none());
+        assert!(CheckResult::block("y").bypass.is_none());
+        assert!(CheckResult::loop_block("z").bypass.is_none());
+    }
+
+    #[test]
+    fn allow_bypassed_carries_provenance() {
+        let prov = BypassProvenance {
+            kind: BypassKind::Dismissal,
+            mechanism: "dismiss-enforce-worktree".to_string(),
+            reason: Some("dogfooding vault symlink".to_string()),
+            expires_at: Some(2_000_000_000),
+            armed_by_session: Some("sess-1".to_string()),
+        };
+        let r = CheckResult::allow_bypassed(prov.clone());
+        assert_eq!(r.outcome, Outcome::Allow, "bypass-allow still exits 0");
+        assert_eq!(r.bypass.as_ref(), Some(&prov));
+    }
+
+    #[test]
+    fn bypass_kind_wire_tokens_are_stable() {
+        // Metrics records key off these; a rename would silently break greps.
+        assert_eq!(BypassKind::Dismissal.as_str(), "dismissal");
+        assert_eq!(BypassKind::EnvSwitch.as_str(), "env_switch");
     }
 
     // --- JSON deserialization ---

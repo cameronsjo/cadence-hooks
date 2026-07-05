@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **guard-bypass provenance — every guardrail bypass now leaves a durable, privacy-safe audit line.** A new `bypasses.jsonl` metrics stream records two events: `armed` (a `dismiss-*` snooze was set) and `used` (a write rode through an active dismissal or env switch, which the denial log can't see because a bypass is an allow). Each line carries the guard, mechanism, kind (`dismissal`/`env_switch`), session, repo **basename**, a user-authored reason, and the expiry — never a command, path, or edited content (privacy-by-construction, like `denials.jsonl`). Both `dismiss-enforce-worktree` and `dismiss-main-branch-warn` gain `--reason`, **required for a dismissal longer than 1h** and nudged at or under it; the reason/session/expiry also land in a provenance sidecar beside the snooze marker (the load-bearing `{epoch}` marker is unchanged). v1 wires the two highest-value guards (`enforce-worktree`, `warn-main-branch`); the remaining guards, the global gates, and read-side surfacing are a tracked follow-up. Fully fail-open (ADR-0001) — a failed audit write never turns an allow into a block.
+
 ## [0.47.0] - 2026-07-05
 
 ### Added
