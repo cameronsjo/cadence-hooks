@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-07-05
+
 ### Added
 
 - log-plan-phase — appends EnterPlanMode/ExitPlanMode lifecycle records (with a whole-transcript token/cost scan) to `plan-phases.jsonl`; pilots the `schemaVersion` convention (#218)
