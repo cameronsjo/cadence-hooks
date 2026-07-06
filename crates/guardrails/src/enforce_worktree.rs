@@ -12,6 +12,18 @@
 //! branch-mode repo. A linked worktree's `.git` is a file, so worktrees pass
 //! untouched — that is the point.
 //!
+//! The two arms differ in *scope* by design (#238). The **Edit/Write arm** only
+//! enforces on the session's **own** checkout — the target file's repo must be
+//! the same repo the session's cwd is in. A write into any *other* repo (a note
+//! into an Obsidian vault, a field report into `~/Documents`, a file dropped in
+//! a sibling repo) is a foreign artifact-drop, not feature work in the session's
+//! own shared tree, so it is out of scope and allowed. The **`git commit` arm**
+//! is deliberately *not* so scoped: it judges every commit target, so
+//! *persisting* into a foreign primary still blocks (issue #224) even where
+//! *writing* a file there does not. The asymmetry is intentional — a stray write
+//! is cheap and reversible; a commit onto another checkout's `main` is the
+//! collision this guard exists to stop.
+//!
 //! Exemptions (→ allow):
 //! - `CADENCE_ALLOW_MAIN` truthy — the existing main-only-repo marker; a repo
 //!   that works on `main` by design has no worktree discipline to enforce.
@@ -409,7 +421,29 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 // No target file — nothing to assess, fail open.
                 return CheckResult::allow();
             }
-            assess_dir(&git_dir_for_input(input), cfg, None, &mut repo_allow)
+            // Worktree discipline is about the checkout the SESSION is working
+            // in. A mutation into a repo *other* than the one the session sits
+            // in is a foreign artifact-drop — a field report into an Obsidian
+            // vault, a note into `~/Documents`, a file into a sibling repo —
+            // not feature work in the session's own shared tree, so it is out
+            // of scope for this guard. Enforce only when the target file's
+            // checkout is the very checkout the session's cwd is in; a
+            // different repo, or a target/cwd git can't resolve to a repo,
+            // falls through to allow. The Edit/Write arm is deliberately more
+            // permissive than the git-commit arm: the commit arm keeps its own
+            // cross-repo guard, so *persisting* into a foreign primary still
+            // blocks (#224) even though *writing* a file there does not.
+            // Charter is fail-open (ADR-0001) — a missed nudge is cheap, a
+            // false block is friction — so scoping an over-broad arm is
+            // aligned. `input.cwd` is always sent by Claude Code. (#238)
+            let target_dir = git_dir_for_input(input);
+            let cwd = input.cwd.as_deref().unwrap_or(".");
+            match (repo_root_for(&target_dir), repo_root_for(Path::new(cwd))) {
+                (Some(target_repo), Some(cwd_repo)) if target_repo == cwd_repo => {
+                    assess_dir(&target_dir, cfg, None, &mut repo_allow)
+                }
+                _ => CheckResult::allow(),
+            }
         }
         Some("Bash") => {
             let Some(command) = input.command() else {
@@ -470,6 +504,19 @@ mod tests {
             kill_switch,
             tmpdir: None,
         }
+    }
+
+    /// An Edit whose session cwd is `session_dir`. The Edit/Write arm scopes
+    /// enforcement to the session's own checkout (#238): it enforces only when
+    /// the target file's repo is the same repo the session sits in. So a test
+    /// that exercises the block/exemption path must place the session *inside*
+    /// the repo under test — otherwise the write is judged "foreign" and always
+    /// allowed. `make_edit` alone leaves cwd unset (→ the test runner's cwd,
+    /// a *different* repo), which would false-allow every would-be block.
+    fn edit_in(session_dir: &Path, file: &Path) -> HookInput {
+        let mut input = make_edit(&file.to_string_lossy(), "a", "b");
+        input.cwd = Some(session_dir.to_string_lossy().into_owned());
+        input
     }
 
     // --- should_block (pure decision) ---
@@ -892,14 +939,14 @@ mod tests {
         let (primary, wt) = primary_and_worktree(&scratch);
 
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Block, "primary checkout must block");
         let msg = r.message.unwrap();
         assert!(msg.contains("worktree"), "fix named in message: {msg}");
 
         let file = wt.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&wt, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow, "linked worktree must pass");
     }
@@ -909,7 +956,7 @@ mod tests {
         let scratch = Scratch::new("env");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
 
         let r = run_enforce(&input, &cfg(true, false));
         assert_eq!(r.outcome, Outcome::Allow, "CADENCE_ALLOW_MAIN exempts");
@@ -929,7 +976,7 @@ mod tests {
         for sub in [".claude/worktrees/x/src.rs", "docs/plans/2026-07-02-p.md"] {
             let file = primary.join(sub);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            let input = make_edit(&file.to_string_lossy(), "a", "b");
+            let input = edit_in(&primary, &file);
             let r = run_enforce(&input, &cfg(false, false));
             assert_eq!(r.outcome, Outcome::Allow, "carve-out for {sub}");
         }
@@ -963,7 +1010,7 @@ mod tests {
         .unwrap();
 
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow, "active snooze exempts");
         let prov = r.bypass.expect("snooze allow carries provenance");
@@ -989,7 +1036,7 @@ mod tests {
         std::fs::write(&marker, format!("{until}\n")).unwrap();
 
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("snooze still attributes a dismissal");
@@ -1005,7 +1052,7 @@ mod tests {
         let scratch = Scratch::new("env-bypass");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
 
         let r = run_enforce(&input, &cfg(true, false));
         let prov = r.bypass.expect("allow_main carries provenance");
@@ -1026,7 +1073,7 @@ mod tests {
         let scratch = Scratch::new("wt-nobypass");
         let (_primary, wt) = primary_and_worktree(&scratch);
         let file = wt.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&wt, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(r.bypass.is_none(), "normal worktree allow is not a bypass");
@@ -1386,7 +1433,7 @@ mod tests {
         );
 
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("repo-declared allow carries provenance");
@@ -1411,7 +1458,7 @@ mod tests {
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         );
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(
             r.outcome,
@@ -1428,7 +1475,7 @@ mod tests {
             "settings.local.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         );
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow, "local truthy alone allows");
 
@@ -1441,7 +1488,7 @@ mod tests {
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
         );
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Block, "shared falsy 'false' blocks");
 
@@ -1454,7 +1501,7 @@ mod tests {
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"0"}}"#,
         );
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Block, "shared falsy '0' blocks");
 
@@ -1463,7 +1510,7 @@ mod tests {
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
         write_settings(&primary, "settings.json", "{not valid json");
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(
             r.outcome,
@@ -1488,7 +1535,7 @@ mod tests {
             r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
         );
 
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(true, false));
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("env override carries provenance");
@@ -1511,7 +1558,7 @@ mod tests {
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         );
 
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(true, false));
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("env override carries provenance");
@@ -1580,6 +1627,112 @@ mod tests {
         assert!(
             msg.contains(&expected),
             "message names the target repo's settings path: {msg}"
+        );
+    }
+
+    // --- #238: Edit/Write enforcement scoped to the session's own checkout ---
+
+    #[test]
+    fn foreign_repo_write_allows_even_into_a_primary_on_main() {
+        // The headline fix: the session sits in primary A, but the Write targets
+        // a SEPARATE primary B on main (an Obsidian vault, a sibling repo, a
+        // notes dir). B has no CADENCE_ALLOW_MAIN. Pre-#238 the arm judged only
+        // B and blocked; now a foreign-location write is out of scope → allow.
+        let scratch = Scratch::new("foreign-write");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let foreign = scratch.0.join("foreign-repo");
+        std::fs::create_dir(&foreign).unwrap();
+        init_repo(&foreign);
+
+        let input = edit_in(&primary_a, &foreign.join("note.md"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a write into a repo other than the session's own is a foreign drop"
+        );
+        assert!(r.bypass.is_none(), "a foreign allow is not a bypass");
+    }
+
+    #[test]
+    fn write_into_parent_repo_from_foreign_cwd_allows() {
+        // Branch 5: the target file has no `.git` of its own, so repo_root_for
+        // walks UP to an enclosing parent repo (a note under `~/Documents`, say).
+        // When the session isn't in that parent, it's still a foreign write →
+        // allow (pre-#238 this blocked, naming the parent).
+        let scratch = Scratch::new("foreign-parent");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let parent = scratch.0.join("parent-repo");
+        std::fs::create_dir(&parent).unwrap();
+        init_repo(&parent);
+        let deep = parent.join("notes/sub");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let input = edit_in(&primary_a, &deep.join("note.md"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a write into a dir enclosed by a foreign parent repo allows"
+        );
+    }
+
+    #[test]
+    fn own_repo_write_still_blocks_after_scoping() {
+        // Regression: the core case is preserved — the session in primary A
+        // editing A's OWN tree still blocks (edit_in sets cwd = that primary).
+        let scratch = Scratch::new("own-repo-block");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let input = edit_in(&primary_a, &primary_a.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "editing your OWN primary checkout still blocks"
+        );
+    }
+
+    #[test]
+    fn cwd_not_in_any_repo_write_into_primary_allows() {
+        // Session cwd is a plain non-git dir; the target lands in a primary on
+        // main. There is no "session repo" to match → foreign → allow.
+        let scratch = Scratch::new("cwd-no-repo");
+        let non_repo = scratch.0.join("plain");
+        std::fs::create_dir(&non_repo).unwrap();
+        let target = scratch.0.join("target-repo");
+        std::fs::create_dir(&target).unwrap();
+        init_repo(&target);
+
+        let input = edit_in(&non_repo, &target.join("f.md"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "no session repo to match → foreign → allow"
+        );
+    }
+
+    #[test]
+    fn scoping_does_not_relax_the_commit_arm_cross_repo_block() {
+        // The Edit/Write scoping is deliberately arm-local: committing into a
+        // DIFFERENT primary checkout than the session's cwd still blocks (#224),
+        // so persistence into a foreign primary is unaffected by #238.
+        let scratch = Scratch::new("scope-commit-unchanged");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let other_primary = scratch.0.join("other-repo");
+        std::fs::create_dir(&other_primary).unwrap();
+        init_repo(&other_primary);
+
+        let mut input = make_bash(&format!(
+            "git -C {} commit -m 'x'",
+            other_primary.to_string_lossy()
+        ));
+        input.cwd = Some(primary_a.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "a commit into a foreign primary still blocks — commit arm is untouched"
         );
     }
 }

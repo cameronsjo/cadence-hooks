@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`enforce-worktree`'s `Edit`/`Write`/`MultiEdit` arm is now scoped to the session's own checkout (#238).** The arm judged only the *target file's* enclosing repo — `git rev-parse --show-toplevel` walking up from the file — in isolation from the session, so a legitimate foreign-location write blocked whenever the target happened to land in some primary checkout on `main`: a field report dropped into a git-backed Obsidian vault, a note into a version-controlled `~/Documents` tree, a file into a sibling repo. All three are foreign artifact-drops, not feature work in the session's own shared tree, yet the guard imposed worktree discipline on them — and the block message told the user to `git worktree add` inside a *vault*. The arm now enforces only when the target file's repo is the same repo the session's cwd is in; a write into any *other* repo — or a target/cwd git can't resolve to a repo — is out of scope and allowed. The **`git commit` arm is unchanged**: it still judges every commit target, so *persisting* into a foreign primary still blocks (#224) even where *writing* a file there does not — a deliberate asymmetry, since a stray write is cheap and reversible while a commit onto another checkout's `main` is the collision this guard exists to stop. This also retires the misdirecting foreign-repo block message and the auto-memory/`~/.claude` false-block, both of which only fired because those writes were judged against a foreign repo. `CADENCE_ALLOW_MAIN` continues to cover the orthogonal "session rooted in a main-mode repo (vault/dotfiles)" case. Fail-open per ADR-0001 — this is a discipline nudge, not a security boundary, so relaxing an over-broad arm is aligned: a missed nudge is cheap, a false block is friction.
+
 ## [0.48.0] - 2026-07-06
 
 ### Fixed
