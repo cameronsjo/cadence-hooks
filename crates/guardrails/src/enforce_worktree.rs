@@ -49,7 +49,7 @@ use crate::dismiss_enforce_worktree;
 use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
 use crate::warn_subagent_worktree::is_primary_checkout;
 use cadence_hooks_core::shell::{resolve_cd_target, split_segments_with_ops, tokenize};
-use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
+use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -254,7 +254,8 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
          not the shared primary tree.\n\
          Create one: `git worktree add .claude/worktrees/<slug> -b feat/<slug>` \
          (or EnterWorktree / `/worktree create feat <slug>`), then work there.\n\
-         One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m`\n\
+         One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m` \
+         (add `--reason \"<why>\"` — required over 1h; it's recorded in the repo-visible bypass log)\n\
          Repo works on main by design (dotfiles, vaults)? Set CADENCE_ALLOW_MAIN=true in \
          .claude/settings.json's env block.\n\
          Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1"
@@ -294,17 +295,65 @@ fn assess_dir(dir: &Path, cfg: &EnvConfig, origin_repo: Option<&str>) -> CheckRe
         // Not a git repo (or a bare container dir) — nothing to enforce.
         return CheckResult::allow();
     };
+    let is_primary = is_primary_checkout(&repo_root);
+    let temp_root = is_temp_root(Path::new(&repo_root), cfg.tmpdir.as_deref());
+    let snoozed = dismiss_enforce_worktree::is_snoozed_now(Path::new(&repo_root));
     let blocked = should_block(
-        is_primary_checkout(&repo_root),
+        is_primary,
         cfg.allow_main,
         cfg.kill_switch,
-        is_temp_root(Path::new(&repo_root), cfg.tmpdir.as_deref()),
-        dismiss_enforce_worktree::is_snoozed_now(Path::new(&repo_root)),
+        temp_root,
+        snoozed,
     );
     if blocked {
-        CheckResult::block(block_message(&repo_root, origin_repo))
-    } else {
-        CheckResult::allow()
+        return CheckResult::block(block_message(&repo_root, origin_repo));
+    }
+
+    // Allowed. Attribute *why* only when the guard WOULD have blocked absent a
+    // bypass — a primary checkout that isn't a temp root. A worktree, a temp
+    // repo, or a carve-out is a normal allow with no bypass. Priority: an active
+    // dismissal, then the env switches (snooze is the more deliberate act).
+    //
+    // This DELIBERATELY differs from `warn-main-branch`, which tags only the
+    // snooze and leaves `CADENCE_ALLOW_MAIN` a bare allow. The asymmetry is by
+    // guard *severity*: enforce is a hard **block** on a shared primary checkout,
+    // and the guard can't tell a by-design main-mode repo (dotfiles/vault) from
+    // a session that set `CADENCE_ALLOW_MAIN`/`CADENCE_NO_ENFORCE_WORKTREE`
+    // specifically to disable enforcement — the bypass log is exactly where you'd
+    // look to answer "who lowered the hard block here", so a standing env switch
+    // is worth a line even if repetitive. warn's nudge is advisory, so the same
+    // static config there is noise, not signal. The deferred read-side surfacing
+    // aggregates the repetition.
+    if is_primary && !temp_root {
+        if snoozed {
+            let meta = dismiss_enforce_worktree::read_meta(Path::new(&repo_root));
+            return CheckResult::allow_bypassed(BypassProvenance {
+                kind: BypassKind::Dismissal,
+                mechanism: "dismiss-enforce-worktree".to_string(),
+                reason: meta.as_ref().and_then(|m| m.reason.clone()),
+                expires_at: meta.as_ref().and_then(|m| m.expires_at),
+                armed_by_session: meta.and_then(|m| m.session_id),
+            });
+        }
+        if cfg.allow_main {
+            return CheckResult::allow_bypassed(env_switch("CADENCE_ALLOW_MAIN"));
+        }
+        if cfg.kill_switch {
+            return CheckResult::allow_bypassed(env_switch("CADENCE_NO_ENFORCE_WORKTREE"));
+        }
+    }
+    CheckResult::allow()
+}
+
+/// Build an env-switch bypass provenance (no reason/expiry/session — an env var
+/// carries none of those).
+fn env_switch(var: &str) -> BypassProvenance {
+    BypassProvenance {
+        kind: BypassKind::EnvSwitch,
+        mechanism: var.to_string(),
+        reason: None,
+        expires_at: None,
+        armed_by_session: None,
     }
 }
 
@@ -821,10 +870,49 @@ mod tests {
     }
 
     #[test]
-    fn snooze_marker_exempts_primary() {
+    fn snooze_marker_exempts_primary_and_attributes_dismissal() {
         let scratch = Scratch::new("snooze");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
+        let marker = dismiss_enforce_worktree::marker_path_for(&primary).unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(&marker, format!("{until}\n")).unwrap();
+        // Provenance sidecar written by the dismiss command.
+        let sidecar = dismiss_enforce_worktree::meta_path_for(&primary).unwrap();
+        std::fs::write(
+            &sidecar,
+            crate::snooze_meta::SnoozeMeta {
+                reason: Some("dogfooding vault symlink".into()),
+                session_id: Some("sess-1".into()),
+                armed_at: Some(1),
+                expires_at: Some(until as i64),
+            }
+            .to_json(),
+        )
+        .unwrap();
+
+        let file = primary.join("src.rs");
+        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow, "active snooze exempts");
+        let prov = r.bypass.expect("snooze allow carries provenance");
+        assert_eq!(prov.kind, BypassKind::Dismissal);
+        assert_eq!(prov.mechanism, "dismiss-enforce-worktree");
+        assert_eq!(prov.reason.as_deref(), Some("dogfooding vault symlink"));
+        assert_eq!(prov.armed_by_session.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn snooze_without_sidecar_allows_with_none_reason() {
+        // An older marker armed before the sidecar existed: the guard still
+        // allows and attributes a Dismissal, just with no reason/session.
+        let scratch = Scratch::new("snooze-legacy");
+        let (primary, _wt) = primary_and_worktree(&scratch);
         let marker = dismiss_enforce_worktree::marker_path_for(&primary).unwrap();
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         let until = std::time::SystemTime::now()
@@ -837,7 +925,45 @@ mod tests {
         let file = primary.join("src.rs");
         let input = make_edit(&file.to_string_lossy(), "a", "b");
         let r = run_enforce(&input, &cfg(false, false));
-        assert_eq!(r.outcome, Outcome::Allow, "active snooze exempts");
+        assert_eq!(r.outcome, Outcome::Allow);
+        let prov = r.bypass.expect("snooze still attributes a dismissal");
+        assert_eq!(prov.kind, BypassKind::Dismissal);
+        assert_eq!(prov.reason, None, "missing sidecar → no reason");
+        assert_eq!(prov.armed_by_session, None);
+    }
+
+    #[test]
+    fn env_switch_allow_attributes_env_switch() {
+        // CADENCE_ALLOW_MAIN / CADENCE_NO_ENFORCE_WORKTREE suppress the block on a
+        // primary checkout — the allow must carry an EnvSwitch bypass naming which.
+        let scratch = Scratch::new("env-bypass");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let file = primary.join("src.rs");
+        let input = make_edit(&file.to_string_lossy(), "a", "b");
+
+        let r = run_enforce(&input, &cfg(true, false));
+        let prov = r.bypass.expect("allow_main carries provenance");
+        assert_eq!(prov.kind, BypassKind::EnvSwitch);
+        assert_eq!(prov.mechanism, "CADENCE_ALLOW_MAIN");
+        assert_eq!(prov.reason, None);
+
+        let r = run_enforce(&input, &cfg(false, true));
+        let prov = r.bypass.expect("kill switch carries provenance");
+        assert_eq!(prov.kind, BypassKind::EnvSwitch);
+        assert_eq!(prov.mechanism, "CADENCE_NO_ENFORCE_WORKTREE");
+    }
+
+    #[test]
+    fn worktree_allow_carries_no_bypass() {
+        // A normal worktree edit is fine on its own — no guard was stepped
+        // outside of, so the allow stays bare (no bypasses.jsonl line).
+        let scratch = Scratch::new("wt-nobypass");
+        let (_primary, wt) = primary_and_worktree(&scratch);
+        let file = wt.join("src.rs");
+        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(r.bypass.is_none(), "normal worktree allow is not a bypass");
     }
 
     #[test]
@@ -1042,8 +1168,9 @@ mod tests {
     #[test]
     fn dismiss_repo_flag_snoozes_target_not_cwd() {
         // Mirrors what `dismiss-enforce-worktree --repo <other_primary>` writes
-        // (run_dismiss exits the process, so it isn't unit-testable directly —
-        // same pattern as `snooze_marker_exempts_primary` above). Confirms the
+        // (perform_dismiss's success path writes into the process cwd's repo, so
+        // the --repo targeting isn't unit-testable directly — same pattern as
+        // `snooze_marker_exempts_primary` above). Confirms the
         // guard reads the snooze off the *target* repo, so a dismiss keyed to
         // the target (not the shell's cwd) is what actually unblocks it.
         let scratch = Scratch::new("dismiss-repo");

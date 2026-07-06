@@ -18,10 +18,11 @@
 //! against (its marker must differ from this one). Stale legacy files are
 //! orphaned harmlessly.
 
+use crate::snooze_meta::{self, DismissArmed, SnoozeMeta};
 use cadence_hooks_core::HookInput;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SNOOZE_DIR: &str = ".git/cadence-hooks";
@@ -77,6 +78,16 @@ fn session_snooze_marker(input: &HookInput, repo_root: &Path) -> PathBuf {
     )
 }
 
+/// Read the provenance sidecar for this session's active snooze of `repo_root`.
+/// `None` when the sidecar is missing/unreadable (a snooze armed before this
+/// feature, or a fail-open sidecar write) — the guard then attributes the bypass
+/// with a `None` reason and still allows. Resolved through the same session
+/// marker as the read path, so the key always agrees.
+pub fn read_meta(input: &HookInput, repo_root: &Path) -> Option<SnoozeMeta> {
+    let sidecar = snooze_meta::sidecar_for(&session_snooze_marker(input, repo_root));
+    SnoozeMeta::read(&sidecar)
+}
+
 /// Pure: given the marker contents and current epoch, is the snooze active?
 /// Shared with `dismiss_enforce_worktree`, which uses the same marker format and
 /// stays repo-scoped by design (it exempts the shared primary checkout).
@@ -110,7 +121,10 @@ fn file_mtime_epoch(path: &Path) -> Option<u64> {
 
 /// The Claude Code session id for the dismiss CLI, from `CLAUDE_CODE_SESSION_ID`
 /// (exported into the Bash tool environment). Empty/unset → `None`.
-fn session_id_from_env() -> Option<String> {
+///
+/// `pub(crate)` so the sibling `dismiss-enforce-worktree` snooze records the same
+/// arming session in its provenance sidecar.
+pub(crate) fn session_id_from_env() -> Option<String> {
     std::env::var("CLAUDE_CODE_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty())
@@ -156,14 +170,26 @@ pub fn is_snoozed_now(input: &HookInput, repo_root: &Path) -> bool {
     is_snoozed_clamped(&contents, mtime, now_epoch())
 }
 
-/// Entry point for the `dismiss-main-branch-warn` subcommand.
+/// The dismiss mechanism name recorded in bypass provenance.
+const MECHANISM: &str = "dismiss-main-branch-warn";
+
+/// Perform the `dismiss-main-branch-warn` action: validate, gate on `--reason`,
+/// write the session-scoped snooze marker **and** its provenance sidecar (both
+/// in the private marker dir, symlink-safe). Returns [`DismissArmed`] for the
+/// binary to log + confirm.
 ///
-/// Writes the session-scoped snooze marker (private marker dir, keyed on the
-/// session id resolved from `CLAUDE_CODE_SESSION_ID`) with the epoch seconds when
-/// the snooze expires, then prints a confirmation. Exits 1 on failure (no session
-/// id, missing repo, invalid duration, write error). Stays at exit 0 on success —
-/// this is a user-facing CLI, not a hook.
-pub fn run_dismiss(duration_str: &str) -> ! {
+/// Prints every error to stderr and returns `Err(())` (the binary exits 1) — no
+/// session id, missing repo, invalid duration, over-cap, or a missing `--reason`
+/// for a snooze longer than 1h. On success prints nothing and returns `Ok`.
+///
+/// The load-bearing marker stays exactly `{until}\n`; provenance rides in the
+/// sibling sidecar. The sidecar write is best-effort — a failure warns but does
+/// not fail the snooze (ADR-0001).
+///
+/// The `Err` is unit on purpose: this function prints every error to stderr
+/// itself, so the caller only needs pass/fail to pick an exit code.
+#[allow(clippy::result_unit_err)]
+pub fn perform_dismiss(duration_str: &str, reason: Option<&str>) -> Result<DismissArmed, ()> {
     let duration = match parse_duration(duration_str) {
         Some(d) => d,
         None => {
@@ -171,7 +197,7 @@ pub fn run_dismiss(duration_str: &str) -> ! {
                 "cadence-hooks: invalid duration '{duration_str}'\n   \
                  Expected: <number><s|m|h|d>, e.g. `30m`, `2h`, `1d`"
             );
-            process::exit(1);
+            return Err(());
         }
     };
 
@@ -181,8 +207,17 @@ pub fn run_dismiss(duration_str: &str) -> ! {
             "cadence-hooks: snooze duration capped at 24h (got {duration_str})\n   \
              Re-run with a smaller window, or run again later to renew."
         );
-        process::exit(1);
+        return Err(());
     }
+
+    // Reason gate: required over 1h, nudged at or under.
+    let nudge = match snooze_meta::reason_gate(secs, reason, MECHANISM, duration_str) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Err(());
+        }
+    };
 
     // The snooze is session-scoped, so it needs the session id at write time.
     let Some(session_id) = session_id_from_env() else {
@@ -191,7 +226,7 @@ pub fn run_dismiss(duration_str: &str) -> ! {
              Run dismiss-main-branch-warn inside a Claude Code session \
              (or export CLAUDE_CODE_SESSION_ID)."
         );
-        process::exit(1);
+        return Err(());
     };
 
     let Some(root) = repo_root() else {
@@ -199,26 +234,56 @@ pub fn run_dismiss(duration_str: &str) -> ! {
             "cadence-hooks: not inside a git repository\n   \
              dismiss-main-branch-warn must be run from within the repo you want to silence."
         );
-        process::exit(1);
+        return Err(());
     };
 
     let input = HookInput {
-        session_id: Some(session_id),
+        session_id: Some(session_id.clone()),
         ..Default::default()
     };
     let path = session_snooze_marker(&input, &root);
 
-    let until = now_epoch().saturating_add(secs);
+    let armed_at = now_epoch();
+    let until = armed_at.saturating_add(secs);
     if let Err(e) = cadence_hooks_core::markers::write_marker(&path, &format!("{until}\n")) {
         eprintln!("cadence-hooks: could not write {}: {e}", path.display());
-        process::exit(1);
+        return Err(());
     }
 
-    println!(
+    // Provenance sidecar — best-effort, symlink-safe like the marker.
+    let reason = snooze_meta::normalize_reason(reason);
+    let meta = SnoozeMeta {
+        reason: reason.clone(),
+        session_id: Some(session_id.clone()),
+        armed_at: Some(armed_at as i64),
+        expires_at: Some(until as i64),
+    };
+    let sidecar = snooze_meta::sidecar_for(&path);
+    if let Err(e) = cadence_hooks_core::markers::write_marker(&sidecar, &meta.to_json()) {
+        eprintln!(
+            "cadence-hooks: note — snooze set, but provenance sidecar could not be written: {e}"
+        );
+    }
+
+    let mut confirmation = format!(
         "warn-main-branch silenced for this session for {duration_str} in {} (until epoch {until})",
         root.display()
     );
-    process::exit(0);
+    if let Some(n) = nudge {
+        confirmation.push_str("\n   ");
+        confirmation.push_str(&n);
+    }
+
+    Ok(DismissArmed {
+        guard_hook: "warn-main-branch",
+        mechanism: MECHANISM,
+        reason,
+        session_id: Some(session_id),
+        repo_root: Some(root.to_string_lossy().into_owned()),
+        armed_at: armed_at as i64,
+        expires_at: until as i64,
+        confirmation,
+    })
 }
 
 #[cfg(test)]

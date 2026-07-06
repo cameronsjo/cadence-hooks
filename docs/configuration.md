@@ -184,9 +184,14 @@ cadence-hooks guardrails dismiss-main-branch-warn
 
 # Explicit duration: 2h, 1d, 45s, etc. Capped at 24h.
 cadence-hooks guardrails dismiss-main-branch-warn --for 2h
+
+# Longer dismissals must say why (recorded in the bypass log):
+cadence-hooks guardrails dismiss-main-branch-warn --for 4h --reason "wrap-up edits on dotfiles"
 ```
 
 The snooze marker lives at `<repo>/.git/cadence-hooks/main-branch-snoozed-until`, so it's per-repo and ignored by default (`.git/` is never committed). The hook's own warn output also points at the command, so it's discoverable when the warning fires.
+
+`--reason` is **required for a dismissal longer than 1h** and nudged (but optional) at or under it. The reason, the arming session, and the expiry are written to a provenance sidecar next to the marker and recorded in the bypass log (see [Bypass provenance](#bypass-provenance) below).
 
 For a repo where `main` is the working branch by design, set `CADENCE_ALLOW_MAIN=true` in `.claude/settings.json` to silence the warning permanently instead.
 
@@ -200,6 +205,19 @@ cadence-hooks guardrails dismiss-enforce-worktree
 
 # Explicit duration: 2h, 1d, 45s, etc. Capped at 24h.
 cadence-hooks guardrails dismiss-enforce-worktree --for 2h
+
+# Longer dismissals must say why (recorded in the repo-visible bypass log):
+cadence-hooks guardrails dismiss-enforce-worktree --for 4h --reason "committing approved plan doc on main"
 ```
 
 The marker lives at `<repo>/.git/cadence-hooks/enforce-worktree-snoozed-until` — independent of the `warn-main-branch` snooze, so unblocking the guard doesn't also silence the nudge. For a repo where `main` is the working branch by design, `CADENCE_ALLOW_MAIN=true` exempts it permanently; `CADENCE_NO_ENFORCE_WORKTREE=1` (user-global) disables the guard everywhere.
+
+This dismissal is **repo-scoped** — on a shared checkout it lowers the guard for every session, not just yours — so `--reason` is **required over 1h** (nudged at or under). The reason, arming session, and expiry land in a provenance sidecar (`enforce-worktree-snoozed-meta.json`, next to the marker) and in the bypass log below.
+
+## Bypass provenance
+
+Every guard bypass — a `dismiss-*` snooze being **armed**, and an operation later **riding through** an active dismissal or env switch — is recorded to `<metrics_dir>/bypasses.jsonl`, one JSON line per event. This answers *who / why / how long / which guard* for the times a guardrail was stepped outside of, which the denial log (`denials.jsonl`) can't see because a bypass is an allow.
+
+Each line carries `event` (`armed` | `used`), the `hook` (guard) and `mechanism` (`dismiss-enforce-worktree`, `CADENCE_ALLOW_MAIN`, …), the `kind` (`dismissal` | `env_switch`), the `sessionId`, the repo **basename**, the user-authored `reason`, and the expiry. Following the denial log's **privacy-by-construction** contract, it never records a command, file path, or edited content — only which guard was bypassed, how, and why.
+
+Writes are fully fail-open (ADR-0001): an unwritable metrics dir degrades to a no-op and never perturbs the operation or its exit code. The log lives under the metrics directory (`CADENCE_METRICS_DIR`, else `<config_dir>/metrics`).
