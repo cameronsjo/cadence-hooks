@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`read_body_file` no longer shares the #157 unbounded-read DoS shape (#194).** The `redact_external_content` reader for `gh`/`git` `--body-file`/`-F` arguments used an unbounded `fs::read_to_string`, so a body-file path resolving to a symlink to an endless special file (`/dev/zero`, a FIFO) or a multi-GB blob could hang or OOM the hook. It now routes through the same `core::paths::read_untrusted_config` #157 introduced — rejecting anything that is not a regular file and capping the read at 1 MiB — failing open (ADR-0001).
+
 ## [0.47.0] - 2026-07-05
 
 ### Added
