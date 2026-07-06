@@ -12,6 +12,18 @@
 //! branch-mode repo. A linked worktree's `.git` is a file, so worktrees pass
 //! untouched — that is the point.
 //!
+//! The two arms differ in *scope* by design (#238). The **Edit/Write arm** only
+//! enforces on the session's **own** checkout — the target file's repo must be
+//! the same repo the session's cwd is in. A write into any *other* repo (a note
+//! into an Obsidian vault, a field report into `~/Documents`, a file dropped in
+//! a sibling repo) is a foreign artifact-drop, not feature work in the session's
+//! own shared tree, so it is out of scope and allowed. The **`git commit` arm**
+//! is deliberately *not* so scoped: it judges every commit target, so
+//! *persisting* into a foreign primary still blocks (issue #224) even where
+//! *writing* a file there does not. The asymmetry is intentional — a stray write
+//! is cheap and reversible; a commit onto another checkout's `main` is the
+//! collision this guard exists to stop.
+//!
 //! Exemptions (→ allow):
 //! - `CADENCE_ALLOW_MAIN` truthy — the existing main-only-repo marker; a repo
 //!   that works on `main` by design has no worktree discipline to enforce.
@@ -57,7 +69,7 @@ use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_
 use crate::warn_subagent_worktree::is_primary_checkout;
 use cadence_hooks_core::shell::{resolve_cd_target, split_segments_with_ops, tokenize};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -187,12 +199,49 @@ type CommitTarget = String;
 /// The leading-word discipline mirrors `is_branch_switch` in the session
 /// crate: a `git commit` quoted in prose or a heredoc body is not this session
 /// committing.
+///
+/// Both the `cd` and `git` arms share one **quote-aware** token stream from
+/// `tokenize`. The pre-fix git arm used quote-blind `split_whitespace`, so a
+/// quoted `-C "/spaced/path"` or `-c key="a b"` value split mid-token and the
+/// `commit` subcommand was never found — a real bypass and an asymmetry with
+/// the `cd` arm (#239 F5/F9, issue #230). Each segment is also stripped of
+/// shell grouping (`(`/`{` … `)`/`}`) and transparent command prefixes
+/// (`command`/`exec`/`time`/…) so `(git commit)`, `{ git commit; }`, and
+/// `command git commit` are detected rather than slipping past the leading-word
+/// gate (#239 F4).
+fn strip_group_wrappers(segment: &str) -> &str {
+    segment
+        .trim()
+        .trim_start_matches(['(', '{', ' ', '\t'])
+        .trim_end_matches([')', '}', ';', ' ', '\t'])
+}
+
+/// Skip transparent command prefixes that run their argument as the command, so
+/// `command git commit` / `time git commit` still surface `git` as the leading
+/// word. Only skips a prefix when the following token is not an option, so a
+/// prefix's own flags are never misparsed (`nice -n 10 git commit` stays a
+/// documented miss rather than risking a wrong resolution).
+fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
+    const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup"];
+    let mut start = 0;
+    while start + 1 < tokens.len()
+        && TRANSPARENT.contains(&tokens[start].as_str())
+        && !tokens[start + 1].starts_with('-')
+    {
+        start += 1;
+    }
+    &tokens[start..]
+}
+
 fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
     let mut targets = Vec::new();
     let mut effective_dir = cwd.to_string();
 
     for (segment, _next_op) in split_segments_with_ops(command) {
-        let tokens = tokenize(&segment);
+        // Group-strip first (subshell/brace wrappers), then tokenize once —
+        // quote-aware, shared by both arms (#239 F4/F5/F9).
+        let segment = strip_group_wrappers(&segment);
+        let tokens = tokenize(segment);
         if tokens.first().map(String::as_str) == Some("cd") {
             // Always assume the cd succeeds — see the doc comment above for
             // why this path cannot reuse parse_work_dir's `|| means no-op`
@@ -222,22 +271,36 @@ fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
             continue;
         }
 
-        let ws_tokens: Vec<&str> = segment.split_whitespace().collect();
-        if ws_tokens.first() != Some(&"git") {
+        // Skip transparent prefixes (`command git commit`, …) then require a
+        // leading `git` (#239 F4).
+        let argv = skip_transparent_prefixes(&tokens);
+        if argv.first().map(String::as_str) != Some("git") {
             continue;
         }
         // Walk git's own global flags to find the subcommand, capturing a
-        // `-C <path>` redirect on the way.
+        // `-C <path>` redirect on the way. Indices are into the quote-aware
+        // token stream, so a spaced quoted `-C`/`-c` value stays one token.
+        // git globals that take a SEPARATE value token — the value must be
+        // consumed or the walk stops on it and never reaches `commit`, failing
+        // open (CodeRabbit, PR #241). `-C`/`-c` are here too (redirect / inline
+        // config); the `--work-tree`/`--git-dir` value forms are caught by the
+        // ambiguity check below and skip the whole segment.
+        const VALUE_GLOBALS: &[&str] = &[
+            "-C",
+            "-c",
+            "--namespace",
+            "--super-prefix",
+            "--config-env",
+            "--attr-source",
+        ];
         let mut redirect: Option<&str> = None;
         let mut ambiguous = false;
         let mut idx = 1;
-        while idx < ws_tokens.len()
-            && (ws_tokens[idx].starts_with('-')
-                || ws_tokens[idx - 1] == "-C"
-                || ws_tokens[idx - 1] == "-c")
+        while idx < argv.len()
+            && (argv[idx].starts_with('-') || VALUE_GLOBALS.contains(&argv[idx - 1].as_str()))
         {
-            let t = ws_tokens[idx];
-            if ws_tokens[idx - 1] == "-C" {
+            let t = argv[idx].as_str();
+            if argv[idx - 1] == "-C" {
                 redirect = Some(t);
             } else if t == "--work-tree"
                 || t == "--git-dir"
@@ -251,7 +314,7 @@ fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
         if ambiguous {
             continue;
         }
-        if ws_tokens.get(idx) == Some(&"commit") {
+        if argv.get(idx).map(String::as_str) == Some("commit") {
             let target = match redirect {
                 Some(path) if Path::new(path).is_absolute() => path.to_string(),
                 Some(path) => format!("{effective_dir}/{path}"),
@@ -315,20 +378,60 @@ fn repo_root_for(dir: &Path) -> Option<String> {
     if root.is_empty() { None } else { Some(root) }
 }
 
+/// Ascend from `dir` to the nearest ancestor that exists on disk. A `Write` can
+/// name a file in a not-yet-created subtree, so the file's parent dir may not
+/// exist yet — and `git rev-parse` needs a real directory to resolve the repo,
+/// so an unresolvable parent would fail open (`repo_root_for` → `None`) and let
+/// a new-module write into the primary slip past the Edit arm (#239 F1). This
+/// walks up until it hits an existing directory. A `dir` that already exists is
+/// returned unchanged, so the common path is a single `exists()` stat and no
+/// behavior changes for edits to existing files.
+fn nearest_existing_ancestor(dir: &Path) -> PathBuf {
+    let mut cur = dir;
+    loop {
+        if cur.exists() {
+            return cur.to_path_buf();
+        }
+        match cur.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cur = parent,
+            _ => return dir.to_path_buf(),
+        }
+    }
+}
+
+/// The absolute git common dir enclosing `dir`, via
+/// `git rev-parse --path-format=absolute --git-common-dir`. Unlike the toplevel
+/// (`repo_root_for`), this is shared across every worktree of one repo (#179),
+/// so it is the right identity for "the session's own repo" in the Edit/Write
+/// scoping (#238). `None` when `dir` isn't in a git repo or git is unavailable —
+/// callers fail open (ADR-0001).
+fn git_common_dir(dir: &Path) -> Option<String> {
+    cadence_hooks_core::shell::git_command(
+        &dir.to_string_lossy(),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+}
+
 /// Evaluate one candidate directory: allow, or block with the message.
 /// `origin_repo`, when set, names the repo the command's cwd started in — used
 /// only to decide whether the block message needs to acknowledge a `cd`/`-C`
 /// redirect to a *different* repo (issue #224); `None` for the Edit/Write arm,
 /// where there is no such redirect to name.
+///
+/// The `.claude/` and `docs/plans/` carve-outs are **not** applied here — they
+/// are the Edit/Write arm's concern (the *file being edited* is Claude-managed
+/// state or an approved plan doc). Applying them in this shared assessor leaked
+/// the carve-out onto the commit arm, where `dir` is a commit *target*, so
+/// `cd .claude && git commit` / `cd docs/plans && git commit` punched a
+/// disk-free hole in the block and even defeated the #224 cross-repo guard
+/// (#239 F6/F7). The sanctioned plan-doc-commit-on-`main` path is the `dismiss`
+/// snooze, so the commit arm needs no carve-out of its own.
 fn assess_dir(
     dir: &Path,
     cfg: &EnvConfig,
     origin_repo: Option<&str>,
     repo_allow: &mut RepoAllowMain,
 ) -> CheckResult {
-    if is_claude_managed_dir(dir) || is_plan_doc_dir(dir) {
-        return CheckResult::allow();
-    }
     let Some(repo_root) = repo_root_for(dir) else {
         // Not a git repo (or a bare container dir) — nothing to enforce.
         return CheckResult::allow();
@@ -409,7 +512,51 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 // No target file — nothing to assess, fail open.
                 return CheckResult::allow();
             }
-            assess_dir(&git_dir_for_input(input), cfg, None, &mut repo_allow)
+            // Worktree discipline is about the checkout the SESSION is working
+            // in. A mutation into a repo *other* than the one the session sits
+            // in is a foreign artifact-drop — a field report into an Obsidian
+            // vault, a note into `~/Documents`, a file into a sibling repo —
+            // not feature work in the session's own shared tree, so it is out
+            // of scope for this guard. Enforce only when the target file is in
+            // the session's own repo (compared by git common dir below); a
+            // different repo, or a target/cwd git can't resolve to a repo,
+            // falls through to allow. The Edit/Write arm is deliberately more
+            // permissive than the git-commit arm: the commit arm keeps its own
+            // cross-repo guard, so *persisting* into a foreign primary still
+            // blocks (#224) even though *writing* a file there does not.
+            // Charter is fail-open (ADR-0001) — a missed nudge is cheap, a
+            // false block is friction — so scoping an over-broad arm is
+            // aligned. `input.cwd` is always sent by Claude Code. (#238)
+            let target_dir = git_dir_for_input(input);
+            // Carve-outs live HERE, on the Edit/Write arm, not in the shared
+            // `assess_dir` (which the commit arm also calls): the *file being
+            // edited* being Claude-managed state or an approved plan doc is what
+            // the carve-out is for. Checked on the lexical target path, before
+            // the ancestor ascent, so a new file under `.claude/` or
+            // `docs/plans/` is still exempt even when its dir doesn't exist yet.
+            if is_claude_managed_dir(&target_dir) || is_plan_doc_dir(&target_dir) {
+                return CheckResult::allow();
+            }
+            // A Write may name a file in a not-yet-created subtree, whose parent
+            // dir git can't resolve — ascend to the nearest existing ancestor so
+            // a new dir in the session's OWN primary is still judged rather than
+            // silently allowed (#239 F1). Existing dirs are returned unchanged.
+            let target_dir = nearest_existing_ancestor(&target_dir);
+            let cwd = input.cwd.as_deref().unwrap_or(".");
+            // "Same checkout" is compared by **git common dir**, not toplevel: a
+            // repo and each of its linked worktrees share one common dir (#179)
+            // but have distinct toplevels. Comparing toplevels would wrongly
+            // treat a write into the session's OWN primary tree from one of its
+            // worktrees as foreign — the exact ADR-0030 collision the guard
+            // exists to stop. Comparing common dirs keeps a cross-*repo* write
+            // foreign (a vault, a sibling repo — different common dir) while
+            // still enforcing on any tree of the session's own repo.
+            match (git_common_dir(&target_dir), git_common_dir(Path::new(cwd))) {
+                (Some(target_repo), Some(cwd_repo)) if target_repo == cwd_repo => {
+                    assess_dir(&target_dir, cfg, None, &mut repo_allow)
+                }
+                _ => CheckResult::allow(),
+            }
         }
         Some("Bash") => {
             let Some(command) = input.command() else {
@@ -430,7 +577,14 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // recorded (every existing provenance test drove the Edit arm, so
             // this Bash-arm gap went unseen until the repo-settings case).
             let mut bypassed: Option<CheckResult> = None;
+            // Dedup identical targets so a pathological command (`git commit;`
+            // ×N) can't fan out into N synchronous `git rev-parse` spawns and
+            // stall the hook — each distinct target is assessed once (#239 F11).
+            let mut seen: HashSet<String> = HashSet::new();
             for target in git_commit_targets(command, cwd) {
+                if !seen.insert(target.clone()) {
+                    continue;
+                }
                 let dir = PathBuf::from(&target);
                 let result = assess_dir(&dir, cfg, cwd_repo_root.as_deref(), &mut repo_allow);
                 if result.outcome != Outcome::Allow {
@@ -470,6 +624,19 @@ mod tests {
             kill_switch,
             tmpdir: None,
         }
+    }
+
+    /// An Edit whose session cwd is `session_dir`. The Edit/Write arm scopes
+    /// enforcement to the session's own checkout (#238): it enforces only when
+    /// the target file's repo is the same repo the session sits in. So a test
+    /// that exercises the block/exemption path must place the session *inside*
+    /// the repo under test — otherwise the write is judged "foreign" and always
+    /// allowed. `make_edit` alone leaves cwd unset (→ the test runner's cwd,
+    /// a *different* repo), which would false-allow every would-be block.
+    fn edit_in(session_dir: &Path, file: &Path) -> HookInput {
+        let mut input = make_edit(&file.to_string_lossy(), "a", "b");
+        input.cwd = Some(session_dir.to_string_lossy().into_owned());
+        input
     }
 
     // --- should_block (pure decision) ---
@@ -666,6 +833,97 @@ mod tests {
         assert_eq!(
             git_commit_targets("git -C /a commit -m x; git commit -m y", "/cwd"),
             vec!["/a".to_string(), "/cwd".to_string()]
+        );
+    }
+
+    // --- git_commit_targets: grouping / prefixes / quoting (#239 F4/F5/F9) ---
+
+    #[test]
+    fn subshell_and_brace_group_commit_detected() {
+        // F4: shell grouping around a commit no longer hides it.
+        assert_eq!(
+            git_commit_targets("(git commit -m x)", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("( git commit -m x )", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("{ git commit -m x; }", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn subshell_cd_then_commit_resolves_target() {
+        // F4: `(cd <dir> && git commit)` — the `(cd` no longer hides the cd, so
+        // the commit resolves to the cd target rather than the shell's cwd.
+        assert_eq!(
+            git_commit_targets("(cd /wt && git commit -m x)", "/cwd"),
+            vec!["/wt".to_string()]
+        );
+    }
+
+    #[test]
+    fn transparent_prefix_commit_detected() {
+        // F4: command/exec/time run their argument as the command.
+        for cmd in [
+            "command git commit -m x",
+            "exec git commit -m x",
+            "time git commit -m x",
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "prefix not seen through: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_prefix_with_option_is_a_miss_not_a_misparse() {
+        // `nice -n 10 git commit` — we don't parse the prefix's own flags, so
+        // this stays a documented miss (empty), never a wrong target.
+        assert!(git_commit_targets("nice -n 10 git commit -m x", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn quoted_dash_c_path_with_space_detected() {
+        // F5 / issue #230: quote-aware tokenize keeps the spaced -C path one
+        // token, so the redirect resolves and the commit is found.
+        assert_eq!(
+            git_commit_targets(r#"git -C "/path with space" commit -m x"#, "/cwd"),
+            vec!["/path with space".to_string()]
+        );
+    }
+
+    #[test]
+    fn quoted_inline_config_space_value_detected() {
+        // F9: a spaced -c value no longer splits the token stream and hides the
+        // `commit` subcommand.
+        assert_eq!(
+            git_commit_targets(r#"git -c user.name="A B" commit -m x"#, "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn separate_value_git_globals_do_not_hide_commit() {
+        // CodeRabbit (PR #241): a git global taking a SEPARATE value token must
+        // be consumed, or the walk stops on the value and never sees `commit`.
+        assert_eq!(
+            git_commit_targets("git --namespace ns commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("git --attr-source HEAD commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        // …and a -C redirect still resolves when mixed with a value-global.
+        assert_eq!(
+            git_commit_targets("git --namespace ns -C /wt commit -m x", "/cwd"),
+            vec!["/wt".to_string()]
         );
     }
 
@@ -892,14 +1150,14 @@ mod tests {
         let (primary, wt) = primary_and_worktree(&scratch);
 
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Block, "primary checkout must block");
         let msg = r.message.unwrap();
         assert!(msg.contains("worktree"), "fix named in message: {msg}");
 
         let file = wt.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&wt, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow, "linked worktree must pass");
     }
@@ -909,7 +1167,7 @@ mod tests {
         let scratch = Scratch::new("env");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
 
         let r = run_enforce(&input, &cfg(true, false));
         assert_eq!(r.outcome, Outcome::Allow, "CADENCE_ALLOW_MAIN exempts");
@@ -929,7 +1187,7 @@ mod tests {
         for sub in [".claude/worktrees/x/src.rs", "docs/plans/2026-07-02-p.md"] {
             let file = primary.join(sub);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            let input = make_edit(&file.to_string_lossy(), "a", "b");
+            let input = edit_in(&primary, &file);
             let r = run_enforce(&input, &cfg(false, false));
             assert_eq!(r.outcome, Outcome::Allow, "carve-out for {sub}");
         }
@@ -963,7 +1221,7 @@ mod tests {
         .unwrap();
 
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow, "active snooze exempts");
         let prov = r.bypass.expect("snooze allow carries provenance");
@@ -989,7 +1247,7 @@ mod tests {
         std::fs::write(&marker, format!("{until}\n")).unwrap();
 
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("snooze still attributes a dismissal");
@@ -1005,7 +1263,7 @@ mod tests {
         let scratch = Scratch::new("env-bypass");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
 
         let r = run_enforce(&input, &cfg(true, false));
         let prov = r.bypass.expect("allow_main carries provenance");
@@ -1026,7 +1284,7 @@ mod tests {
         let scratch = Scratch::new("wt-nobypass");
         let (_primary, wt) = primary_and_worktree(&scratch);
         let file = wt.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&wt, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(r.bypass.is_none(), "normal worktree allow is not a bypass");
@@ -1386,7 +1644,7 @@ mod tests {
         );
 
         let file = primary.join("src.rs");
-        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &file);
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("repo-declared allow carries provenance");
@@ -1411,7 +1669,7 @@ mod tests {
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         );
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(
             r.outcome,
@@ -1428,7 +1686,7 @@ mod tests {
             "settings.local.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         );
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow, "local truthy alone allows");
 
@@ -1441,7 +1699,7 @@ mod tests {
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
         );
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Block, "shared falsy 'false' blocks");
 
@@ -1454,7 +1712,7 @@ mod tests {
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"0"}}"#,
         );
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Block, "shared falsy '0' blocks");
 
@@ -1463,7 +1721,7 @@ mod tests {
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
         write_settings(&primary, "settings.json", "{not valid json");
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(
             r.outcome,
@@ -1488,7 +1746,7 @@ mod tests {
             r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
         );
 
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(true, false));
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("env override carries provenance");
@@ -1511,7 +1769,7 @@ mod tests {
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         );
 
-        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let input = edit_in(&primary, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(true, false));
         assert_eq!(r.outcome, Outcome::Allow);
         let prov = r.bypass.expect("env override carries provenance");
@@ -1580,6 +1838,210 @@ mod tests {
         assert!(
             msg.contains(&expected),
             "message names the target repo's settings path: {msg}"
+        );
+    }
+
+    // --- #238: Edit/Write enforcement scoped to the session's own checkout ---
+
+    #[test]
+    fn foreign_repo_write_allows_even_into_a_primary_on_main() {
+        // The headline fix: the session sits in primary A, but the Write targets
+        // a SEPARATE primary B on main (an Obsidian vault, a sibling repo, a
+        // notes dir). B has no CADENCE_ALLOW_MAIN. Pre-#238 the arm judged only
+        // B and blocked; now a foreign-location write is out of scope → allow.
+        let scratch = Scratch::new("foreign-write");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let foreign = scratch.0.join("foreign-repo");
+        std::fs::create_dir(&foreign).unwrap();
+        init_repo(&foreign);
+
+        let input = edit_in(&primary_a, &foreign.join("note.md"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a write into a repo other than the session's own is a foreign drop"
+        );
+        assert!(r.bypass.is_none(), "a foreign allow is not a bypass");
+    }
+
+    #[test]
+    fn write_into_parent_repo_from_foreign_cwd_allows() {
+        // Branch 5: the target file has no `.git` of its own, so repo_root_for
+        // walks UP to an enclosing parent repo (a note under `~/Documents`, say).
+        // When the session isn't in that parent, it's still a foreign write →
+        // allow (pre-#238 this blocked, naming the parent).
+        let scratch = Scratch::new("foreign-parent");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let parent = scratch.0.join("parent-repo");
+        std::fs::create_dir(&parent).unwrap();
+        init_repo(&parent);
+        let deep = parent.join("notes/sub");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let input = edit_in(&primary_a, &deep.join("note.md"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a write into a dir enclosed by a foreign parent repo allows"
+        );
+    }
+
+    #[test]
+    fn own_repo_write_still_blocks_after_scoping() {
+        // Regression: the core case is preserved — the session in primary A
+        // editing A's OWN tree still blocks (edit_in sets cwd = that primary).
+        let scratch = Scratch::new("own-repo-block");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let input = edit_in(&primary_a, &primary_a.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "editing your OWN primary checkout still blocks"
+        );
+    }
+
+    #[test]
+    fn edit_into_own_primary_from_a_worktree_blocks() {
+        // Scoping is by git common dir, not toplevel: a session sitting in a
+        // worktree of repo R, writing into R's OWN primary tree, is the same
+        // repo (shared common dir) — not a foreign drop — so it still blocks
+        // (the ADR-0030 collision). Comparing toplevels (distinct per worktree)
+        // would have wrongly allowed this.
+        let scratch = Scratch::new("wt-into-primary");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let input = edit_in(&wt, &primary.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "writing into your own primary from a worktree still blocks"
+        );
+    }
+
+    #[test]
+    fn edit_into_a_worktree_from_the_primary_allows() {
+        // The mirror: writing into a linked worktree from the primary session
+        // is the same repo, but the target is a worktree (not a primary), so
+        // `is_primary_checkout` lets it through.
+        let scratch = Scratch::new("primary-into-wt");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let input = edit_in(&primary, &wt.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "writing into a worktree from the primary is fine (target isn't primary)"
+        );
+    }
+
+    #[test]
+    fn cwd_not_in_any_repo_write_into_primary_allows() {
+        // Session cwd is a plain non-git dir; the target lands in a primary on
+        // main. There is no "session repo" to match → foreign → allow.
+        let scratch = Scratch::new("cwd-no-repo");
+        let non_repo = scratch.0.join("plain");
+        std::fs::create_dir(&non_repo).unwrap();
+        let target = scratch.0.join("target-repo");
+        std::fs::create_dir(&target).unwrap();
+        init_repo(&target);
+
+        let input = edit_in(&non_repo, &target.join("f.md"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "no session repo to match → foreign → allow"
+        );
+    }
+
+    #[test]
+    fn scoping_does_not_relax_the_commit_arm_cross_repo_block() {
+        // The Edit/Write scoping is deliberately arm-local: committing into a
+        // DIFFERENT primary checkout than the session's cwd still blocks (#224),
+        // so persistence into a foreign primary is unaffected by #238.
+        let scratch = Scratch::new("scope-commit-unchanged");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let other_primary = scratch.0.join("other-repo");
+        std::fs::create_dir(&other_primary).unwrap();
+        init_repo(&other_primary);
+
+        let mut input = make_bash(&format!(
+            "git -C {} commit -m 'x'",
+            other_primary.to_string_lossy()
+        ));
+        input.cwd = Some(primary_a.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "a commit into a foreign primary still blocks — commit arm is untouched"
+        );
+    }
+
+    // --- #239: adversarial hardening ---
+
+    #[test]
+    fn new_subdir_write_in_own_primary_blocks() {
+        // F1: a Write creating a file in a not-yet-existent subdir of the
+        // session's own primary must still block. The parent dir doesn't exist
+        // yet, so the pre-fix `repo_root_for` failed open; ascending to the
+        // nearest existing ancestor (the repo root) judges it correctly.
+        let scratch = Scratch::new("new-subdir");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        // `primary/newmod` deliberately does NOT exist.
+        let input = edit_in(&primary, &primary.join("newmod/lib.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "creating a new module dir in your own primary still blocks"
+        );
+    }
+
+    #[test]
+    fn commit_with_cwd_under_claude_or_plans_in_primary_still_blocks() {
+        // F6/F7: the `.claude`/`docs/plans` carve-out is Edit-arm-only now. A
+        // commit whose target dir lexically contains those segments no longer
+        // rides through — the commit isn't scoped to those files, so a repo-wide
+        // change would otherwise slip onto main disk-free.
+        let scratch = Scratch::new("commit-carveout");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        std::fs::create_dir_all(primary.join(".claude")).unwrap();
+        std::fs::create_dir_all(primary.join("docs/plans")).unwrap();
+
+        for sub in [".claude", "docs/plans"] {
+            let mut input = make_bash(&format!(
+                "cd {} && git commit -m x",
+                primary.join(sub).to_string_lossy()
+            ));
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "commit with cwd under {sub} must block — carve-out is Edit-arm-only"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_commit_in_worktree_dedups_and_allows() {
+        // F11: repeated identical commit targets are assessed once. A worktree
+        // cwd (allow) exercises the full loop — no early block short-circuits it
+        // — so all three `git commit` segments resolve to the one worktree
+        // target and collapse to a single assessment.
+        let scratch = Scratch::new("dedup-wt");
+        let (_primary, wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("git commit -m x; git commit -m x; git commit -m x");
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "worktree commits allow; repeated targets deduped"
         );
     }
 }

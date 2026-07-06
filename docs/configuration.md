@@ -197,7 +197,7 @@ For a repo where `main` is the working branch by design, set `CADENCE_ALLOW_MAIN
 
 ## Snoozing enforce-worktree
 
-`enforce-worktree` hard-blocks mutations in a primary checkout of a branch-mode repo. For the legitimate one-off — committing an approved plan doc on the default branch, a hotfix the user explicitly wants in the primary tree — snooze it per-repo:
+`enforce-worktree` hard-blocks mutations in a primary checkout of a branch-mode repo — but only the **session's own** checkout. A file write (`Edit`/`Write`/`MultiEdit`) into a *different* repo than the session's cwd is a foreign artifact-drop (a note into an Obsidian vault, a field report into `~/Documents`, a file in a sibling repo) and is out of scope — allowed (#238). The `git commit` arm is not so scoped: committing into a foreign primary still blocks (#224), so you can drop a file into another repo but not persist it to that repo's `main` without an escape hatch. For the legitimate one-off in your own checkout — committing an approved plan doc on the default branch, a hotfix the user explicitly wants in the primary tree — snooze it per-repo:
 
 ```bash
 # Default: 30 minutes
