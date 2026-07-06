@@ -385,8 +385,12 @@ fn extract_bodies(command: &str, base_dir: &str) -> Vec<String> {
 }
 
 /// Read a `--body-file` value from disk, resolving a relative path against
-/// `base_dir`. `None` on any error (missing, non-UTF-8, `-` for stdin) so the
-/// caller fails open.
+/// `base_dir`. `None` on any error (missing, non-UTF-8, `-` for stdin,
+/// non-regular file, oversized) so the caller fails open.
+///
+/// #194: shares the #157 unbounded-read DoS shape — a symlink to an endless
+/// special file (`/dev/zero`, a FIFO) or a multi-GB file could hang or OOM the
+/// hook — so this routes through the same bounded, regular-file-only reader.
 fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
     let p = Path::new(path);
     let full = if p.is_absolute() {
@@ -394,7 +398,7 @@ fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
     } else {
         Path::new(base_dir).join(p)
     };
-    std::fs::read_to_string(full).ok()
+    cadence_hooks_core::paths::read_untrusted_config(&full)
 }
 
 /// Load `<git-root>/.claude/redaction.json`, walking up from `base_dir` to the
@@ -676,6 +680,56 @@ mod tests {
             run("gh pr create --body-file /nonexistent/path/body.md").outcome,
             Outcome::Allow
         );
+    }
+
+    // --- #194: read_body_file shares the #157 unbounded-read DoS shape ---
+
+    #[cfg(unix)]
+    #[test]
+    fn body_file_symlink_to_dev_zero_fails_open_and_does_not_hang() {
+        // The headline DoS: a `--body-file` symlinked to an endless special
+        // file. read_untrusted_config rejects it on stat (not a regular
+        // file), before any blocking read — this test must NOT hang.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("evil.md");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        let cmd = format!("gh pr create --body-file {}", link.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn body_file_fifo_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo.md");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let cmd = format!("gh pr create --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn body_file_oversized_fails_open() {
+        // One byte over the 1 MiB cap → rejected, same as read_untrusted_config.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.md");
+        std::fs::write(&path, vec![b'x'; (1024 * 1024) + 1]).unwrap();
+        let cmd = format!("gh pr create --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn body_file_normal_input_unchanged() {
+        // Ordinary body-file content still reads and still gets scanned —
+        // the bounded reader doesn't change happy-path behavior.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup mentioning cadence:polish here").unwrap();
+        let cmd = format!("gh pr create --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
     }
 
     // --- One test per universal category ---

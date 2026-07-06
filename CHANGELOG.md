@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **`read_body_file` no longer shares the #157 unbounded-read DoS shape (#194).** The `redact_external_content` reader for `gh`/`git` `--body-file`/`-F` arguments used an unbounded `fs::read_to_string`, so a body-file path resolving to a symlink to an endless special file (`/dev/zero`, a FIFO) or a multi-GB blob could hang or OOM the hook. It now routes through the same `core::paths::read_untrusted_config` #157 introduced — rejecting anything that is not a regular file and capping the read at 1 MiB — failing open (ADR-0001).
+
 ### Added
 
 - **guard-bypass provenance — every guardrail bypass now leaves a durable, privacy-safe audit line.** A new `bypasses.jsonl` metrics stream records two events: `armed` (a `dismiss-*` snooze was set) and `used` (a write rode through an active dismissal or env switch, which the denial log can't see because a bypass is an allow). Each line carries the guard, mechanism, kind (`dismissal`/`env_switch`), session, repo **basename**, a user-authored reason, and the expiry — never a command, path, or edited content (privacy-by-construction, like `denials.jsonl`). Both `dismiss-enforce-worktree` and `dismiss-main-branch-warn` gain `--reason`, **required for a dismissal longer than 1h** and nudged at or under it; the reason/session/expiry also land in a provenance sidecar beside the snooze marker (the load-bearing `{epoch}` marker is unchanged). v1 wires the two highest-value guards (`enforce-worktree`, `warn-main-branch`); the remaining guards, the global gates, and read-side surfacing are a tracked follow-up. Fully fail-open (ADR-0001) — a failed audit write never turns an allow into a block.
