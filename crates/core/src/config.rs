@@ -1,5 +1,9 @@
 //! Configuration parsing utilities for environment variables.
 
+use std::path::Path;
+
+use crate::paths::read_untrusted_config;
+
 /// Parse a space-or-comma-separated environment variable into a list of values.
 ///
 /// Accepts any combination of whitespace and commas as delimiters.
@@ -200,6 +204,44 @@ impl std::fmt::Display for AllowEntry {
         }
         Ok(())
     }
+}
+
+/// Read `env.<key>` from a repo's tracked Claude settings, honoring Claude
+/// Code's precedence: `.claude/settings.local.json` overrides
+/// `.claude/settings.json`. Returns the value of the first file where the key
+/// is *present as a scalar* (string/bool/number, coerced to string). Missing
+/// files, absent keys, malformed JSON, and non-scalar values (null/array/
+/// object) all declare nothing and fall through — a settings-read failure can
+/// only ever yield `None`, never an error, never a panic (ADR-0001).
+///
+/// Reads via [`crate::paths::read_untrusted_config`] (regular-file check + 1
+/// MiB cap, #157/#194) so a settings path that is a symlink to `/dev/zero` or
+/// a FIFO cannot hang the hook.
+///
+/// Seed primitive for the guard-family settings-resolution generalization
+/// tracked in cameronsjo/cadence-hooks#164; `src/configure.rs`'s
+/// `read_disabled_hooks` is a candidate for later consolidation onto it — NOT
+/// done here.
+pub fn repo_env_flag(repo_root: &Path, key: &str) -> Option<String> {
+    let claude_dir = repo_root.join(".claude");
+    for name in ["settings.local.json", "settings.json"] {
+        let Some(content) = read_untrusted_config(&claude_dir.join(name)) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let Some(val) = json.get("env").and_then(|env| env.get(key)) else {
+            continue;
+        };
+        match val {
+            serde_json::Value::String(s) => return Some(s.clone()),
+            serde_json::Value::Bool(b) => return Some(b.to_string()),
+            serde_json::Value::Number(n) => return Some(n.to_string()),
+            _ => continue, // null/array/object — not a declared scalar
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -636,5 +678,164 @@ mod tests {
             parse_allow_entry("gitea.internal/cameron/cadence").to_string(),
             "gitea.internal/cameron/cadence"
         );
+    }
+
+    // --- repo_env_flag ---
+
+    fn write_settings(dir: &std::path::Path, name: &str, body: &str) {
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn repo_env_flag_shared_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_local_overrides_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.local.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_local_overrides_shared_reverse() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.local.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
+        );
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("false".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_local_present_but_key_absent_falls_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(tmp.path(), "settings.local.json", r#"{"env":{}}"#);
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_malformed_local_falls_through_to_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(tmp.path(), "settings.local.json", "{not valid json");
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_neither_file_exists_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_env_absent_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(tmp.path(), "settings.json", r#"{"other":"stuff"}"#);
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_null_value_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":null}}"#,
+        );
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_null_in_local_falls_through_to_shared() {
+        // An explicit `null` in local is a non-scalar, so it declares nothing
+        // and falls through to shared — it is NOT treated as "locally cleared,
+        // stop here" (which would wrongly return None despite a truthy shared
+        // value).
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.local.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":null}}"#,
+        );
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_bool_value_coerces_to_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":true}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_directory_at_settings_path_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(claude_dir.join("settings.json")).unwrap();
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
     }
 }
