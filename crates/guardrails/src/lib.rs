@@ -31,6 +31,8 @@ pub mod inject_gh_context;
 pub mod issue_refs;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
 pub mod nudge_upgrade_after_push;
+/// Shared provenance sidecar for the `dismiss-*` snooze markers.
+pub mod snooze_meta;
 /// Warn about broken issue refs on PR create; close straggler issues on PR merge.
 pub mod verify_pr_autoclose;
 /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers.
