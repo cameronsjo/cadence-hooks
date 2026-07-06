@@ -18,7 +18,7 @@
 //! branch. That work is never the branch-worthy product change the warning targets.
 
 use crate::dismiss_main_branch_warn;
-use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
+use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -234,6 +234,23 @@ impl Check for WarnMainBranch {
 
         if result.outcome == Outcome::Nudge {
             let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+            return result;
+        }
+
+        // The nudge was suppressed. Attribute it to an active dismissal when that
+        // is *why* it went quiet — a default branch, not already warned this
+        // session, and snoozed. A permanent `CADENCE_ALLOW_MAIN` allow is the
+        // by-design config for main-mode repos (dotfiles, vaults), not a bypass
+        // worth a line per edit, so it stays a bare allow.
+        if snoozed && is_default_branch(&branch) && !already_warned {
+            let meta = dismiss_main_branch_warn::read_meta(input, Path::new(&repo_root));
+            return CheckResult::allow_bypassed(BypassProvenance {
+                kind: BypassKind::Dismissal,
+                mechanism: "dismiss-main-branch-warn".to_string(),
+                reason: meta.as_ref().and_then(|m| m.reason.clone()),
+                expires_at: meta.as_ref().and_then(|m| m.expires_at),
+                armed_by_session: meta.and_then(|m| m.session_id),
+            });
         }
 
         result
@@ -719,5 +736,159 @@ mod tests {
         // A leading `..` with no preceding component to pop leaves `docs/plans`
         // intact, so a relative plan-doc path stays exempt.
         assert!(is_plan_doc_dir(Path::new("../docs/plans")));
+    }
+
+    // --- bypass attribution via run() (real repo on main) ---
+    //
+    // The `should_warn` tests above cover the pure decision; these exercise the
+    // full `run()` path where a suppressed nudge is (or isn't) attributed to an
+    // active dismissal. A real git repo on `main` is needed because run() shells
+    // out for branch + toplevel.
+
+    /// Init a git repo checked out on `main` in a fresh tempdir; return the
+    /// tempdir plus the git-resolved (canonical) repo root.
+    fn init_repo_on_main() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let root = cadence_hooks_core::shell::git_command(
+            &tmp.path().to_string_lossy(),
+            &["rev-parse", "--show-toplevel"],
+        )
+        .expect("temp repo resolves a toplevel");
+        (tmp, root)
+    }
+
+    fn edit_input_in(repo: &Path, session: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(repo.join("src.rs").to_string_lossy().into_owned()),
+                new_string: Some("x".into()),
+                old_string: Some("y".into()),
+                ..Default::default()
+            }),
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            session_id: Some(session.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Write the session-scoped snooze marker + provenance sidecar the guard
+    /// reads, keyed on the same `(input, repo_root)` as the reader.
+    fn arm_snooze(input: &HookInput, repo_root: &str, reason: Option<&str>) {
+        let marker = cadence_hooks_core::markers::session_marker(
+            input,
+            "main-branch-snooze",
+            Some(repo_root),
+        );
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        cadence_hooks_core::markers::write_marker(&marker, &format!("{until}\n")).unwrap();
+        let sidecar = crate::snooze_meta::sidecar_for(&marker);
+        let meta = crate::snooze_meta::SnoozeMeta {
+            reason: reason.map(str::to_string),
+            session_id: input.session_id().map(str::to_string),
+            armed_at: Some(1),
+            expires_at: Some(until as i64),
+        };
+        cadence_hooks_core::markers::write_marker(&sidecar, &meta.to_json()).unwrap();
+    }
+
+    #[test]
+    fn snooze_suppressed_nudge_attributes_dismissal() {
+        let (tmp, root) = init_repo_on_main();
+        let input = edit_input_in(tmp.path(), "warn-bypass-a");
+        arm_snooze(&input, &root, Some("wrap-up edits on dotfiles"));
+
+        let r = WarnMainBranch.run(&input);
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "active snooze suppresses the nudge"
+        );
+        let prov = r.bypass.expect("suppressed nudge carries provenance");
+        assert_eq!(prov.kind, BypassKind::Dismissal);
+        assert_eq!(prov.mechanism, "dismiss-main-branch-warn");
+        assert_eq!(prov.reason.as_deref(), Some("wrap-up edits on dotfiles"));
+        assert_eq!(prov.armed_by_session.as_deref(), Some("warn-bypass-a"));
+    }
+
+    #[test]
+    fn snooze_without_sidecar_attributes_dismissal_with_none_reason() {
+        // A snooze armed before the sidecar existed still attributes a Dismissal,
+        // just with no reason/session (the guard tolerates a missing sidecar).
+        let (tmp, root) = init_repo_on_main();
+        let input = edit_input_in(tmp.path(), "warn-bypass-legacy");
+        let marker =
+            cadence_hooks_core::markers::session_marker(&input, "main-branch-snooze", Some(&root));
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        cadence_hooks_core::markers::write_marker(&marker, &format!("{until}\n")).unwrap();
+
+        let r = WarnMainBranch.run(&input);
+        assert_eq!(r.outcome, Outcome::Allow);
+        let prov = r.bypass.expect("still attributes a dismissal");
+        assert_eq!(prov.kind, BypassKind::Dismissal);
+        assert_eq!(prov.reason, None, "missing sidecar → no reason");
+        assert_eq!(prov.armed_by_session, None);
+    }
+
+    #[test]
+    fn already_warned_allow_carries_no_bypass() {
+        // Once the session has been warned, a later edit is a plain dedup allow —
+        // NOT a bypass — even if a snooze is also present. The `!already_warned`
+        // guard on attribution must hold.
+        let (tmp, root) = init_repo_on_main();
+        let input = edit_input_in(tmp.path(), "warn-bypass-warned");
+        arm_snooze(&input, &root, Some("some reason"));
+        // Pre-plant the once-per-session "warned" marker.
+        let warned =
+            cadence_hooks_core::markers::session_marker(&input, "main-branch-warned", Some(&root));
+        cadence_hooks_core::markers::write_marker(&warned, "").unwrap();
+
+        let r = WarnMainBranch.run(&input);
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(
+            r.bypass.is_none(),
+            "an already-warned dedup allow is not a bypass"
+        );
+    }
+
+    #[test]
+    fn feature_branch_edit_carries_no_bypass() {
+        // Off a default branch there's nothing to bypass — bare allow.
+        let (tmp, _root) = init_repo_on_main();
+        Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["checkout", "-q", "-b", "feat/x"])
+            .output()
+            .unwrap();
+        let input = edit_input_in(tmp.path(), "warn-bypass-feat");
+        let r = WarnMainBranch.run(&input);
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(r.bypass.is_none(), "feature-branch allow is not a bypass");
     }
 }

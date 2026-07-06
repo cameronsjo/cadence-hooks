@@ -16,10 +16,10 @@
 //! resolve the common dir via `git rev-parse --git-common-dir` rather than
 //! assuming the marker sits under the passed directory's own `.git`.
 
-use crate::dismiss_main_branch_warn::{is_snoozed_at, parse_duration};
+use crate::dismiss_main_branch_warn::{is_snoozed_at, parse_duration, session_id_from_env};
+use crate::snooze_meta::{self, DismissArmed, SnoozeMeta};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Subdirectory (relative to the git common dir) that holds the marker. The
@@ -57,6 +57,20 @@ pub fn marker_path_for(dir: &Path) -> Option<PathBuf> {
     git_common_dir(dir).map(|c| marker_path(&c))
 }
 
+/// The provenance sidecar beside the snooze marker for `dir` (resolved through
+/// the shared common dir). `None` when `dir` isn't inside a git repo.
+pub fn meta_path_for(dir: &Path) -> Option<PathBuf> {
+    marker_path_for(dir).map(|m| snooze_meta::sidecar_for(&m))
+}
+
+/// Read the provenance sidecar for `repo_root`'s active snooze — reason, arming
+/// session, expiry. `None` when the sidecar is missing/unreadable (an older
+/// marker armed before this feature, or a fail-open sidecar write): the guard
+/// then attributes the bypass with a `None` reason and still allows.
+pub fn read_meta(repo_root: &Path) -> Option<SnoozeMeta> {
+    SnoozeMeta::read(&meta_path_for(repo_root)?)
+}
+
 fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -80,18 +94,32 @@ pub fn is_snoozed_now(repo_root: &Path) -> bool {
     is_snoozed_at(&contents, now_epoch())
 }
 
-/// Entry point for the `dismiss-enforce-worktree` subcommand.
+/// The dismiss mechanism name recorded in bypass provenance.
+const MECHANISM: &str = "dismiss-enforce-worktree";
+
+/// Perform the `dismiss-enforce-worktree` action: validate, gate on `--reason`,
+/// write the epoch marker **and** its provenance sidecar under the shared git
+/// common dir. Returns [`DismissArmed`] for the binary to log + confirm.
 ///
-/// Writes the epoch-seconds expiry marker under the shared git common dir and
-/// confirms. Exits 1 on failure (missing repo, invalid duration, write error);
-/// 0 on success — this is a user-facing CLI, not a hook.
-pub fn run_dismiss(duration_str: &str) -> ! {
+/// Prints every error to stderr and returns `Err(())` (the binary exits 1) —
+/// missing repo, invalid duration, over-cap, or a missing `--reason` for a
+/// snooze longer than 1h. On success prints nothing and returns `Ok`.
+///
+/// The load-bearing marker stays exactly `{until}\n` (the guard's first-line
+/// parse is untouched); provenance rides in the sibling sidecar. The sidecar
+/// write is best-effort — a failure warns but does not fail the dismissal, so a
+/// snooze never depends on the audit trail succeeding (ADR-0001).
+///
+/// The `Err` is unit on purpose: this function prints every error to stderr
+/// itself, so the caller only needs pass/fail to pick an exit code.
+#[allow(clippy::result_unit_err)]
+pub fn perform_dismiss(duration_str: &str, reason: Option<&str>) -> Result<DismissArmed, ()> {
     let Some(duration) = parse_duration(duration_str) else {
         eprintln!(
             "cadence-hooks: invalid duration '{duration_str}'\n   \
              Expected: <number><s|m|h|d>, e.g. `30m`, `2h`, `1d`"
         );
-        process::exit(1);
+        return Err(());
     };
 
     let secs = duration.as_secs();
@@ -100,8 +128,17 @@ pub fn run_dismiss(duration_str: &str) -> ! {
             "cadence-hooks: snooze duration capped at 24h (got {duration_str})\n   \
              Re-run with a smaller window, or run again later to renew."
         );
-        process::exit(1);
+        return Err(());
     }
+
+    // Reason gate: required over 1h, nudged at or under.
+    let nudge = match snooze_meta::reason_gate(secs, reason, MECHANISM, duration_str) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return Err(());
+        }
+    };
 
     let cwd = Path::new(".");
     let Some(common) = git_common_dir(cwd) else {
@@ -109,7 +146,7 @@ pub fn run_dismiss(duration_str: &str) -> ! {
             "cadence-hooks: not inside a git repository\n   \
              dismiss-enforce-worktree must be run from within the repo you want to unblock."
         );
-        process::exit(1);
+        return Err(());
     };
 
     let path = marker_path(&common);
@@ -117,13 +154,31 @@ pub fn run_dismiss(duration_str: &str) -> ! {
         && let Err(e) = fs::create_dir_all(parent)
     {
         eprintln!("cadence-hooks: could not create {}: {e}", parent.display());
-        process::exit(1);
+        return Err(());
     }
 
-    let until = now_epoch().saturating_add(secs);
+    let armed_at = now_epoch();
+    let until = armed_at.saturating_add(secs);
     if let Err(e) = fs::write(&path, format!("{until}\n")) {
         eprintln!("cadence-hooks: could not write {}: {e}", path.display());
-        process::exit(1);
+        return Err(());
+    }
+
+    // Provenance sidecar — best-effort, must never fail the snooze.
+    let reason = snooze_meta::normalize_reason(reason);
+    let session_id = session_id_from_env();
+    let meta = SnoozeMeta {
+        reason: reason.clone(),
+        session_id: session_id.clone(),
+        armed_at: Some(armed_at as i64),
+        expires_at: Some(until as i64),
+    };
+    let sidecar = snooze_meta::sidecar_for(&path);
+    if let Err(e) = fs::write(&sidecar, meta.to_json()) {
+        eprintln!(
+            "cadence-hooks: note — snooze set, but provenance sidecar {} could not be written: {e}",
+            sidecar.display()
+        );
     }
 
     // Prefer the friendly repo toplevel for the confirmation; fall back to the
@@ -131,10 +186,24 @@ pub fn run_dismiss(duration_str: &str) -> ! {
     let where_display =
         cadence_hooks_core::shell::git_command(".", &["rev-parse", "--show-toplevel"])
             .unwrap_or_else(|| common.display().to_string());
-    println!(
+    let mut confirmation = format!(
         "enforce-worktree unblocked for {duration_str} in {where_display} (until epoch {until})"
     );
-    process::exit(0);
+    if let Some(n) = nudge {
+        confirmation.push_str("\n   ");
+        confirmation.push_str(&n);
+    }
+
+    Ok(DismissArmed {
+        guard_hook: "enforce-worktree",
+        mechanism: MECHANISM,
+        reason,
+        session_id,
+        repo_root: Some(where_display),
+        armed_at: armed_at as i64,
+        expires_at: until as i64,
+        confirmation,
+    })
 }
 
 #[cfg(test)]
@@ -268,5 +337,30 @@ mod tests {
 
         // ...and read it back from the primary checkout.
         assert!(is_snoozed_now(&primary));
+    }
+
+    // --- perform_dismiss validation (early-return paths only) ---
+    //
+    // Only the paths that reject BEFORE resolving the git common dir are safe to
+    // unit-test: the success path writes a marker into the process cwd's repo,
+    // which under `cargo test` is the real cadence-hooks checkout. The success
+    // wiring (marker + sidecar + DismissArmed + armed event) is covered
+    // end-to-end against a scratch repo instead.
+
+    #[test]
+    fn perform_dismiss_rejects_invalid_duration() {
+        assert!(perform_dismiss("bogus", None).is_err());
+    }
+
+    #[test]
+    fn perform_dismiss_rejects_over_cap() {
+        // 2d exceeds the 24h cap → Err before touching git.
+        assert!(perform_dismiss("2d", Some("why")).is_err());
+    }
+
+    #[test]
+    fn perform_dismiss_rejects_long_snooze_without_reason() {
+        // The reason gate rejects >1h without a reason, before touching git.
+        assert!(perform_dismiss("4h", None).is_err());
     }
 }

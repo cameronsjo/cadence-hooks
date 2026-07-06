@@ -50,6 +50,15 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             // can perturb the block message or the exit code that follows.
             let hook_name = hook.unwrap_or_else(|| check.name());
             cadence_hooks_metrics::log_denial(hook_name, event, &input, result.outcome);
+            // A bypass-allow rode through an active dismissal / env switch. Record
+            // *that a guard was stepped outside of* — the one event the denial log
+            // can't see (it drops Allow). Fully fail-open, same as log_denial: a
+            // failed write never perturbs the allow or its exit code (ADR-0001).
+            if let Some(prov) = &result.bypass {
+                cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::used(
+                    hook_name, &input, prov,
+                ));
+            }
             cadence_hooks_metrics::log_timing(
                 hook_name,
                 crate::registry::plugin_for(hook_name).unwrap_or("unknown"),

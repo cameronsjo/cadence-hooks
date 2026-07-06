@@ -212,6 +212,10 @@ enum GuardrailsCommands {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
         #[arg(long = "for", default_value = "30m", value_name = "DURATION")]
         for_: String,
+        /// Why the guard is being dismissed. Required for snoozes over 1h;
+        /// recorded in the bypass provenance log.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
     },
     /// Block mutations in a primary checkout of a branch-mode repo
     EnforceWorktree,
@@ -220,6 +224,10 @@ enum GuardrailsCommands {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
         #[arg(long = "for", default_value = "30m", value_name = "DURATION")]
         for_: String,
+        /// Why the guard is being dismissed. Required for snoozes over 1h;
+        /// recorded in the repo-visible bypass provenance log.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
     },
 }
 
@@ -859,11 +867,21 @@ fn main() {
                 pre,
                 canonical_hook,
             ),
-            GuardrailsCommands::DismissMainBranchWarn { for_ } => {
-                cadence_hooks_guardrails::dismiss_main_branch_warn::run_dismiss(&for_);
+            GuardrailsCommands::DismissMainBranchWarn { for_, reason } => {
+                finish_dismiss(
+                    cadence_hooks_guardrails::dismiss_main_branch_warn::perform_dismiss(
+                        &for_,
+                        reason.as_deref(),
+                    ),
+                );
             }
-            GuardrailsCommands::DismissEnforceWorktree { for_ } => {
-                cadence_hooks_guardrails::dismiss_enforce_worktree::run_dismiss(&for_);
+            GuardrailsCommands::DismissEnforceWorktree { for_, reason } => {
+                finish_dismiss(
+                    cadence_hooks_guardrails::dismiss_enforce_worktree::perform_dismiss(
+                        &for_,
+                        reason.as_deref(),
+                    ),
+                );
             }
         },
         Commands::Rules(cmd) => match cmd {
@@ -1011,6 +1029,31 @@ fn main() {
                 cadence_hooks_session::cli::run_status();
             }
         },
+    }
+}
+
+/// Finish a `dismiss-*` CLI action. On success, record the `bypass_armed` event
+/// (the binary owns the metrics writer — this keeps the guardrails crate
+/// metrics-free, mirroring the used-at-seam pattern in [`dispatch`]) and print
+/// the confirmation before exiting 0. On a handled error — already reported to
+/// stderr by `perform_dismiss` — exit 1. The armed write is fire-and-forget
+/// inside [`cadence_hooks_metrics::log_bypass`]: a failure never affects the exit.
+fn finish_dismiss(result: Result<cadence_hooks_guardrails::snooze_meta::DismissArmed, ()>) -> ! {
+    match result {
+        Ok(armed) => {
+            cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::armed(
+                armed.guard_hook,
+                armed.mechanism,
+                armed.reason.as_deref(),
+                armed.session_id.as_deref(),
+                armed.repo_root.as_deref(),
+                armed.armed_at,
+                armed.expires_at,
+            ));
+            println!("{}", armed.confirmation);
+            std::process::exit(0);
+        }
+        Err(()) => std::process::exit(1),
     }
 }
 
