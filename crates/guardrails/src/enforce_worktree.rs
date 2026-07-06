@@ -15,6 +15,13 @@
 //! Exemptions (→ allow):
 //! - `CADENCE_ALLOW_MAIN` truthy — the existing main-only-repo marker; a repo
 //!   that works on `main` by design has no worktree discipline to enforce.
+//!   Resolved two ways: process env (session-wide), or — when process env
+//!   doesn't set it — the resolved **target** repo's own tracked Claude
+//!   settings (`.claude/settings.local.json` overriding `.claude/settings.json`'s
+//!   `env` block), so a cross-repo mutation into a by-design-main repo is
+//!   exempt without that repo being the session root. Absent/unparsable/
+//!   non-scalar settings declare nothing and fall through — never a panic or
+//!   an inverted verdict (ADR-0001).
 //! - `CADENCE_NO_ENFORCE_WORKTREE` truthy — user-global kill switch for the
 //!   proving period; rollback without uninstalling.
 //! - Repo root under a temp directory (`/tmp`, `/private/tmp`, `$TMPDIR`) —
@@ -50,6 +57,7 @@ use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_
 use crate::warn_subagent_worktree::is_primary_checkout;
 use cadence_hooks_core::shell::{resolve_cd_target, split_segments_with_ops, tokenize};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -81,6 +89,30 @@ impl EnvConfig {
             kill_switch: truthy("CADENCE_NO_ENFORCE_WORKTREE"),
             tmpdir: std::env::var("TMPDIR").ok(),
         }
+    }
+}
+
+/// Per-invocation memo of the repo-declared `CADENCE_ALLOW_MAIN` exemption,
+/// keyed by resolved repo root so a command touching one repo twice reads its
+/// settings files once. Constructed fresh per hook invocation — no
+/// cross-invocation cache.
+#[derive(Default)]
+struct RepoAllowMain(HashMap<String, bool>);
+
+impl RepoAllowMain {
+    /// Does `repo_root`'s own tracked Claude settings declare
+    /// `CADENCE_ALLOW_MAIN` truthy? Memoized; a read failure caches `false`.
+    fn is_allowed(&mut self, repo_root: &str) -> bool {
+        if let Some(&cached) = self.0.get(repo_root) {
+            return cached;
+        }
+        let declared =
+            cadence_hooks_core::config::repo_env_flag(Path::new(repo_root), "CADENCE_ALLOW_MAIN")
+                .as_deref()
+                .map(|v| is_truthy(Some(v)))
+                .unwrap_or(false);
+        self.0.insert(repo_root.to_string(), declared);
+        declared
     }
 }
 
@@ -257,7 +289,8 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
          One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m` \
          (add `--reason \"<why>\"` — required over 1h; it's recorded in the repo-visible bypass log)\n\
          Repo works on main by design (dotfiles, vaults)? Set CADENCE_ALLOW_MAIN=true in \
-         .claude/settings.json's env block.\n\
+         `{repo_root}/.claude/settings.json`'s env block — the guard reads it from the target \
+         repo directly.\n\
          Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1"
     );
     if let Some(origin) = origin_repo
@@ -287,7 +320,12 @@ fn repo_root_for(dir: &Path) -> Option<String> {
 /// only to decide whether the block message needs to acknowledge a `cd`/`-C`
 /// redirect to a *different* repo (issue #224); `None` for the Edit/Write arm,
 /// where there is no such redirect to name.
-fn assess_dir(dir: &Path, cfg: &EnvConfig, origin_repo: Option<&str>) -> CheckResult {
+fn assess_dir(
+    dir: &Path,
+    cfg: &EnvConfig,
+    origin_repo: Option<&str>,
+    repo_allow: &mut RepoAllowMain,
+) -> CheckResult {
     if is_claude_managed_dir(dir) || is_plan_doc_dir(dir) {
         return CheckResult::allow();
     }
@@ -298,9 +336,11 @@ fn assess_dir(dir: &Path, cfg: &EnvConfig, origin_repo: Option<&str>) -> CheckRe
     let is_primary = is_primary_checkout(&repo_root);
     let temp_root = is_temp_root(Path::new(&repo_root), cfg.tmpdir.as_deref());
     let snoozed = dismiss_enforce_worktree::is_snoozed_now(Path::new(&repo_root));
+    let repo_declared = is_primary && !cfg.allow_main && repo_allow.is_allowed(&repo_root);
+    let allowed_main = cfg.allow_main || repo_declared;
     let blocked = should_block(
         is_primary,
-        cfg.allow_main,
+        allowed_main,
         cfg.kill_switch,
         temp_root,
         snoozed,
@@ -338,6 +378,9 @@ fn assess_dir(dir: &Path, cfg: &EnvConfig, origin_repo: Option<&str>) -> CheckRe
         if cfg.allow_main {
             return CheckResult::allow_bypassed(env_switch("CADENCE_ALLOW_MAIN"));
         }
+        if repo_declared {
+            return CheckResult::allow_bypassed(env_switch("CADENCE_ALLOW_MAIN (repo settings)"));
+        }
         if cfg.kill_switch {
             return CheckResult::allow_bypassed(env_switch("CADENCE_NO_ENFORCE_WORKTREE"));
         }
@@ -359,13 +402,14 @@ fn env_switch(var: &str) -> BypassProvenance {
 
 /// Testable core: assess the hook input under the given environment.
 fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
+    let mut repo_allow = RepoAllowMain::default();
     match input.tool_name() {
         Some("Edit") | Some("Write") | Some("MultiEdit") => {
             if input.file_path().is_none() {
                 // No target file — nothing to assess, fail open.
                 return CheckResult::allow();
             }
-            assess_dir(&git_dir_for_input(input), cfg, None)
+            assess_dir(&git_dir_for_input(input), cfg, None, &mut repo_allow)
         }
         Some("Bash") => {
             let Some(command) = input.command() else {
@@ -375,14 +419,28 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // Resolved once per invocation: the repo the shell started in,
             // used only to decide whether a redirect crossed repo boundaries.
             let cwd_repo_root = repo_root_for(Path::new(cwd));
+            // A block on any commit target wins immediately. Otherwise preserve
+            // the first *bypassed* allow's provenance: assess_dir returns an
+            // Allow-with-bypass for a snooze / env switch / repo-declared
+            // exemption on a primary checkout, and the bypass log's `used`
+            // event depends on that provenance surviving back to `run_check`.
+            // The pre-fix loop returned only non-Allow results and fell through
+            // to a bare `allow()`, silently dropping the bypass — so a `git
+            // commit` ridden through a dismissal or CADENCE_ALLOW_MAIN was never
+            // recorded (every existing provenance test drove the Edit arm, so
+            // this Bash-arm gap went unseen until the repo-settings case).
+            let mut bypassed: Option<CheckResult> = None;
             for target in git_commit_targets(command, cwd) {
                 let dir = PathBuf::from(&target);
-                let result = assess_dir(&dir, cfg, cwd_repo_root.as_deref());
+                let result = assess_dir(&dir, cfg, cwd_repo_root.as_deref(), &mut repo_allow);
                 if result.outcome != Outcome::Allow {
                     return result;
                 }
+                if result.bypass.is_some() && bypassed.is_none() {
+                    bypassed = Some(result);
+                }
             }
-            CheckResult::allow()
+            bypassed.unwrap_or_else(CheckResult::allow)
         }
         _ => CheckResult::allow(),
     }
@@ -805,6 +863,14 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "x").unwrap();
         git_in(dir, &["add", "f.txt"]);
         git_in(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Write a repo-scoped Claude settings file declaring `env` values, for
+    /// exercising `CADENCE_ALLOW_MAIN`'s target-repo-settings resolution.
+    fn write_settings(repo: &Path, name: &str, body: &str) {
+        let dir = repo.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
     }
 
     /// Primary repo + linked worktree under a non-temp scratch root.
@@ -1242,5 +1308,278 @@ mod tests {
         input.cwd = Some("/".into());
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    // --- repo-scoped CADENCE_ALLOW_MAIN (cameronsjo/cadence-hooks#232) ---
+
+    #[test]
+    fn cross_repo_commit_reads_target_repos_own_settings() {
+        // Headline repro: shell rooted in primary A, mutation targets a
+        // SEPARATE primary B that declares CADENCE_ALLOW_MAIN in its own
+        // .claude/settings.json — the exemption must travel with the target,
+        // not the shell's cwd.
+        let scratch = Scratch::new("cross-repo-allow-main");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let primary_b = scratch.0.join("declares-allow-main");
+        std::fs::create_dir(&primary_b).unwrap();
+        init_repo(&primary_b);
+        write_settings(
+            &primary_b,
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+
+        // `git -C <B> commit` with cwd=A.
+        let mut input = make_bash(&format!(
+            "git -C {} commit -m 'x'",
+            primary_b.to_string_lossy()
+        ));
+        input.cwd = Some(primary_a.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow, "-C into declaring repo B allows");
+        let prov = r.bypass.expect("repo-declared allow carries provenance");
+        assert_eq!(prov.kind, BypassKind::EnvSwitch);
+        assert_eq!(prov.mechanism, "CADENCE_ALLOW_MAIN (repo settings)");
+
+        // `cd <B> && git commit` with cwd=A.
+        let mut input = make_bash(&format!(
+            "cd {} && git commit -m 'x'",
+            primary_b.to_string_lossy()
+        ));
+        input.cwd = Some(primary_a.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow, "cd into declaring repo B allows");
+        let prov = r.bypass.expect("repo-declared allow carries provenance");
+        assert_eq!(prov.kind, BypassKind::EnvSwitch);
+        assert_eq!(prov.mechanism, "CADENCE_ALLOW_MAIN (repo settings)");
+    }
+
+    #[test]
+    fn bash_commit_bypass_provenance_survives_the_arm() {
+        // Regression: the Bash arm returned only non-Allow results and fell
+        // through to a bare allow(), dropping the bypass on an allowed commit —
+        // so a `git commit` ridden through an env switch was never recorded in
+        // bypasses.jsonl. Exercised here via CADENCE_ALLOW_MAIN (process env),
+        // independent of the repo-settings mechanism, to lock the general fix.
+        let scratch = Scratch::new("bash-bypass-prov");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash("git commit -m 'x'");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(true, false));
+        assert_eq!(r.outcome, Outcome::Allow);
+        let prov = r.bypass.expect("Bash-arm bypassed allow keeps provenance");
+        assert_eq!(prov.kind, BypassKind::EnvSwitch);
+        assert_eq!(prov.mechanism, "CADENCE_ALLOW_MAIN");
+    }
+
+    #[test]
+    fn same_repo_edit_honors_repo_declared_allow_main() {
+        let scratch = Scratch::new("same-repo-allow-main");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        write_settings(
+            &primary,
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+
+        let file = primary.join("src.rs");
+        let input = make_edit(&file.to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow);
+        let prov = r.bypass.expect("repo-declared allow carries provenance");
+        assert_eq!(prov.mechanism, "CADENCE_ALLOW_MAIN (repo settings)");
+    }
+
+    #[test]
+    fn repo_settings_precedence_and_falsy_cases() {
+        let scratch = Scratch::new("allow-main-precedence");
+
+        // local false + shared true → Block (local wins, and it's falsy).
+        let primary = scratch.0.join("local-false-shared-true");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        write_settings(
+            &primary,
+            "settings.local.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
+        );
+        write_settings(
+            &primary,
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "local falsy wins over shared truthy"
+        );
+
+        // local true alone → Allow.
+        let primary = scratch.0.join("local-true-alone");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        write_settings(
+            &primary,
+            "settings.local.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow, "local truthy alone allows");
+
+        // shared falsy only ("false") → Block.
+        let primary = scratch.0.join("shared-false");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        write_settings(
+            &primary,
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
+        );
+        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block, "shared falsy 'false' blocks");
+
+        // shared falsy only ("0") → Block.
+        let primary = scratch.0.join("shared-zero");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        write_settings(
+            &primary,
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"0"}}"#,
+        );
+        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block, "shared falsy '0' blocks");
+
+        // malformed JSON in settings.json → Block, and must not panic.
+        let primary = scratch.0.join("malformed-json");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        write_settings(&primary, "settings.json", "{not valid json");
+        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "malformed settings JSON blocks, no panic"
+        );
+    }
+
+    #[test]
+    fn process_env_allow_main_wins_over_falsy_repo_settings() {
+        // Repo settings falsy, but process env CADENCE_ALLOW_MAIN is truthy —
+        // the env override is the session-wide short-circuit and precedes the
+        // repo-settings lookup entirely, so the mechanism string stays the
+        // BARE "CADENCE_ALLOW_MAIN", not the repo-settings variant.
+        let scratch = Scratch::new("env-wins-over-repo-falsy");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        write_settings(
+            &primary,
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
+        );
+
+        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(true, false));
+        assert_eq!(r.outcome, Outcome::Allow);
+        let prov = r.bypass.expect("env override carries provenance");
+        assert_eq!(prov.mechanism, "CADENCE_ALLOW_MAIN");
+    }
+
+    #[test]
+    fn process_env_allow_main_wins_over_truthy_repo_settings() {
+        // Both process env and repo settings declare truthy — the `!cfg.allow_main`
+        // short-circuit means the repo-settings lookup never runs, so the
+        // mechanism stays the BARE "CADENCE_ALLOW_MAIN" (not the repo-settings
+        // variant). Locks that the env arm precedes the repo-declared arm.
+        let scratch = Scratch::new("env-wins-over-repo-truthy");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        write_settings(
+            &primary,
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+
+        let input = make_edit(&primary.join("src.rs").to_string_lossy(), "a", "b");
+        let r = run_enforce(&input, &cfg(true, false));
+        assert_eq!(r.outcome, Outcome::Allow);
+        let prov = r.bypass.expect("env override carries provenance");
+        assert_eq!(prov.mechanism, "CADENCE_ALLOW_MAIN");
+    }
+
+    #[test]
+    fn repo_allow_main_memo_is_deterministic_within_invocation_and_per_repo() {
+        let scratch = Scratch::new("repo-allow-memo");
+        let declaring = scratch.0.join("declares");
+        std::fs::create_dir(&declaring).unwrap();
+        init_repo(&declaring);
+        write_settings(
+            &declaring,
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        let declaring_root = repo_root_for(&declaring).unwrap();
+
+        let plain = scratch.0.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        init_repo(&plain);
+        let plain_root = repo_root_for(&plain).unwrap();
+
+        let mut memo = RepoAllowMain::default();
+        assert!(
+            memo.is_allowed(&declaring_root),
+            "declaring repo reads true"
+        );
+
+        // Delete the settings file after the first read — a re-read within
+        // the same invocation must still return the memoized value.
+        std::fs::remove_file(Path::new(&declaring_root).join(".claude/settings.json")).unwrap();
+        assert!(
+            memo.is_allowed(&declaring_root),
+            "memoized within the invocation despite the file vanishing"
+        );
+
+        assert!(
+            !memo.is_allowed(&plain_root),
+            "a distinct repo root with no settings stays independent and false"
+        );
+    }
+
+    #[test]
+    fn cross_repo_block_message_names_target_repos_settings_path() {
+        let scratch = Scratch::new("cross-repo-block-message");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let primary_b = scratch.0.join("non-declaring");
+        std::fs::create_dir(&primary_b).unwrap();
+        init_repo(&primary_b);
+
+        let mut input = make_bash(&format!(
+            "cd {} && git commit -m 'x'",
+            primary_b.to_string_lossy()
+        ));
+        input.cwd = Some(primary_a.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        let primary_b_canon = std::fs::canonicalize(&primary_b).unwrap();
+        let expected = format!(
+            "{}/.claude/settings.json",
+            primary_b_canon.to_string_lossy()
+        );
+        assert!(
+            msg.contains(&expected),
+            "message names the target repo's settings path: {msg}"
+        );
     }
 }
