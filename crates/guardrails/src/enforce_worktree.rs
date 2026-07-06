@@ -386,6 +386,19 @@ fn nearest_existing_ancestor(dir: &Path) -> PathBuf {
     }
 }
 
+/// The absolute git common dir enclosing `dir`, via
+/// `git rev-parse --path-format=absolute --git-common-dir`. Unlike the toplevel
+/// (`repo_root_for`), this is shared across every worktree of one repo (#179),
+/// so it is the right identity for "the session's own repo" in the Edit/Write
+/// scoping (#238). `None` when `dir` isn't in a git repo or git is unavailable —
+/// callers fail open (ADR-0001).
+fn git_common_dir(dir: &Path) -> Option<String> {
+    cadence_hooks_core::shell::git_command(
+        &dir.to_string_lossy(),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+}
+
 /// Evaluate one candidate directory: allow, or block with the message.
 /// `origin_repo`, when set, names the repo the command's cwd started in — used
 /// only to decide whether the block message needs to acknowledge a `cd`/`-C`
@@ -491,8 +504,8 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // in is a foreign artifact-drop — a field report into an Obsidian
             // vault, a note into `~/Documents`, a file into a sibling repo —
             // not feature work in the session's own shared tree, so it is out
-            // of scope for this guard. Enforce only when the target file's
-            // checkout is the very checkout the session's cwd is in; a
+            // of scope for this guard. Enforce only when the target file is in
+            // the session's own repo (compared by git common dir below); a
             // different repo, or a target/cwd git can't resolve to a repo,
             // falls through to allow. The Edit/Write arm is deliberately more
             // permissive than the git-commit arm: the commit arm keeps its own
@@ -517,7 +530,15 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // silently allowed (#239 F1). Existing dirs are returned unchanged.
             let target_dir = nearest_existing_ancestor(&target_dir);
             let cwd = input.cwd.as_deref().unwrap_or(".");
-            match (repo_root_for(&target_dir), repo_root_for(Path::new(cwd))) {
+            // "Same checkout" is compared by **git common dir**, not toplevel: a
+            // repo and each of its linked worktrees share one common dir (#179)
+            // but have distinct toplevels. Comparing toplevels would wrongly
+            // treat a write into the session's OWN primary tree from one of its
+            // worktrees as foreign — the exact ADR-0030 collision the guard
+            // exists to stop. Comparing common dirs keeps a cross-*repo* write
+            // foreign (a vault, a sibling repo — different common dir) while
+            // still enforcing on any tree of the session's own repo.
+            match (git_common_dir(&target_dir), git_common_dir(Path::new(cwd))) {
                 (Some(target_repo), Some(cwd_repo)) if target_repo == cwd_repo => {
                     assess_dir(&target_dir, cfg, None, &mut repo_allow)
                 }
@@ -1847,6 +1868,40 @@ mod tests {
             r.outcome,
             Outcome::Block,
             "editing your OWN primary checkout still blocks"
+        );
+    }
+
+    #[test]
+    fn edit_into_own_primary_from_a_worktree_blocks() {
+        // Scoping is by git common dir, not toplevel: a session sitting in a
+        // worktree of repo R, writing into R's OWN primary tree, is the same
+        // repo (shared common dir) — not a foreign drop — so it still blocks
+        // (the ADR-0030 collision). Comparing toplevels (distinct per worktree)
+        // would have wrongly allowed this.
+        let scratch = Scratch::new("wt-into-primary");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let input = edit_in(&wt, &primary.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "writing into your own primary from a worktree still blocks"
+        );
+    }
+
+    #[test]
+    fn edit_into_a_worktree_from_the_primary_allows() {
+        // The mirror: writing into a linked worktree from the primary session
+        // is the same repo, but the target is a worktree (not a primary), so
+        // `is_primary_checkout` lets it through.
+        let scratch = Scratch::new("primary-into-wt");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let input = edit_in(&primary, &wt.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "writing into a worktree from the primary is fine (target isn't primary)"
         );
     }
 
