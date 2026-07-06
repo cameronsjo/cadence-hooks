@@ -280,11 +280,24 @@ fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
         // Walk git's own global flags to find the subcommand, capturing a
         // `-C <path>` redirect on the way. Indices are into the quote-aware
         // token stream, so a spaced quoted `-C`/`-c` value stays one token.
+        // git globals that take a SEPARATE value token — the value must be
+        // consumed or the walk stops on it and never reaches `commit`, failing
+        // open (CodeRabbit, PR #241). `-C`/`-c` are here too (redirect / inline
+        // config); the `--work-tree`/`--git-dir` value forms are caught by the
+        // ambiguity check below and skip the whole segment.
+        const VALUE_GLOBALS: &[&str] = &[
+            "-C",
+            "-c",
+            "--namespace",
+            "--super-prefix",
+            "--config-env",
+            "--attr-source",
+        ];
         let mut redirect: Option<&str> = None;
         let mut ambiguous = false;
         let mut idx = 1;
         while idx < argv.len()
-            && (argv[idx].starts_with('-') || argv[idx - 1] == "-C" || argv[idx - 1] == "-c")
+            && (argv[idx].starts_with('-') || VALUE_GLOBALS.contains(&argv[idx - 1].as_str()))
         {
             let t = argv[idx].as_str();
             if argv[idx - 1] == "-C" {
@@ -892,6 +905,25 @@ mod tests {
         assert_eq!(
             git_commit_targets(r#"git -c user.name="A B" commit -m x"#, "/cwd"),
             vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn separate_value_git_globals_do_not_hide_commit() {
+        // CodeRabbit (PR #241): a git global taking a SEPARATE value token must
+        // be consumed, or the walk stops on the value and never sees `commit`.
+        assert_eq!(
+            git_commit_targets("git --namespace ns commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("git --attr-source HEAD commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        // …and a -C redirect still resolves when mixed with a value-global.
+        assert_eq!(
+            git_commit_targets("git --namespace ns -C /wt commit -m x", "/cwd"),
+            vec!["/wt".to_string()]
         );
     }
 
