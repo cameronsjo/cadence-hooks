@@ -228,7 +228,14 @@ pub fn repo_env_flag(repo_root: &Path, key: &str) -> Option<String> {
         let Some(content) = read_untrusted_config(&claude_dir.join(name)) else {
             continue;
         };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        // Tolerate a leading UTF-8 BOM. Editors and hand-authoring often prepend
+        // one; serde_json rejects it as an unexpected character at column 1,
+        // which would silently drop a *declared* CADENCE_ALLOW_MAIN and
+        // false-block a by-design-main repo (cadence-hooks#239 F10). We strip
+        // only the BOM — JSONC comments/trailing commas stay a strict-parse
+        // reject (no lenient-parser dependency here).
+        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
             continue;
         };
         let Some(val) = json.get("env").and_then(|env| env.get(key)) else {
@@ -824,6 +831,22 @@ mod tests {
             tmp.path(),
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":true}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_tolerates_leading_bom() {
+        // A settings.json saved with a leading UTF-8 BOM (EF BB BF) must not
+        // silently drop a declared exemption (cadence-hooks#239 F10).
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "\u{feff}{\"env\":{\"CADENCE_ALLOW_MAIN\":\"true\"}}",
         );
         assert_eq!(
             repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),

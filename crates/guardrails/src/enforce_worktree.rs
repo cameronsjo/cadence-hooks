@@ -69,7 +69,7 @@ use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_
 use crate::warn_subagent_worktree::is_primary_checkout;
 use cadence_hooks_core::shell::{resolve_cd_target, split_segments_with_ops, tokenize};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -199,12 +199,49 @@ type CommitTarget = String;
 /// The leading-word discipline mirrors `is_branch_switch` in the session
 /// crate: a `git commit` quoted in prose or a heredoc body is not this session
 /// committing.
+///
+/// Both the `cd` and `git` arms share one **quote-aware** token stream from
+/// `tokenize`. The pre-fix git arm used quote-blind `split_whitespace`, so a
+/// quoted `-C "/spaced/path"` or `-c key="a b"` value split mid-token and the
+/// `commit` subcommand was never found — a real bypass and an asymmetry with
+/// the `cd` arm (#239 F5/F9, issue #230). Each segment is also stripped of
+/// shell grouping (`(`/`{` … `)`/`}`) and transparent command prefixes
+/// (`command`/`exec`/`time`/…) so `(git commit)`, `{ git commit; }`, and
+/// `command git commit` are detected rather than slipping past the leading-word
+/// gate (#239 F4).
+fn strip_group_wrappers(segment: &str) -> &str {
+    segment
+        .trim()
+        .trim_start_matches(['(', '{', ' ', '\t'])
+        .trim_end_matches([')', '}', ';', ' ', '\t'])
+}
+
+/// Skip transparent command prefixes that run their argument as the command, so
+/// `command git commit` / `time git commit` still surface `git` as the leading
+/// word. Only skips a prefix when the following token is not an option, so a
+/// prefix's own flags are never misparsed (`nice -n 10 git commit` stays a
+/// documented miss rather than risking a wrong resolution).
+fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
+    const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup"];
+    let mut start = 0;
+    while start + 1 < tokens.len()
+        && TRANSPARENT.contains(&tokens[start].as_str())
+        && !tokens[start + 1].starts_with('-')
+    {
+        start += 1;
+    }
+    &tokens[start..]
+}
+
 fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
     let mut targets = Vec::new();
     let mut effective_dir = cwd.to_string();
 
     for (segment, _next_op) in split_segments_with_ops(command) {
-        let tokens = tokenize(&segment);
+        // Group-strip first (subshell/brace wrappers), then tokenize once —
+        // quote-aware, shared by both arms (#239 F4/F5/F9).
+        let segment = strip_group_wrappers(&segment);
+        let tokens = tokenize(segment);
         if tokens.first().map(String::as_str) == Some("cd") {
             // Always assume the cd succeeds — see the doc comment above for
             // why this path cannot reuse parse_work_dir's `|| means no-op`
@@ -234,22 +271,23 @@ fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
             continue;
         }
 
-        let ws_tokens: Vec<&str> = segment.split_whitespace().collect();
-        if ws_tokens.first() != Some(&"git") {
+        // Skip transparent prefixes (`command git commit`, …) then require a
+        // leading `git` (#239 F4).
+        let argv = skip_transparent_prefixes(&tokens);
+        if argv.first().map(String::as_str) != Some("git") {
             continue;
         }
         // Walk git's own global flags to find the subcommand, capturing a
-        // `-C <path>` redirect on the way.
+        // `-C <path>` redirect on the way. Indices are into the quote-aware
+        // token stream, so a spaced quoted `-C`/`-c` value stays one token.
         let mut redirect: Option<&str> = None;
         let mut ambiguous = false;
         let mut idx = 1;
-        while idx < ws_tokens.len()
-            && (ws_tokens[idx].starts_with('-')
-                || ws_tokens[idx - 1] == "-C"
-                || ws_tokens[idx - 1] == "-c")
+        while idx < argv.len()
+            && (argv[idx].starts_with('-') || argv[idx - 1] == "-C" || argv[idx - 1] == "-c")
         {
-            let t = ws_tokens[idx];
-            if ws_tokens[idx - 1] == "-C" {
+            let t = argv[idx].as_str();
+            if argv[idx - 1] == "-C" {
                 redirect = Some(t);
             } else if t == "--work-tree"
                 || t == "--git-dir"
@@ -263,7 +301,7 @@ fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
         if ambiguous {
             continue;
         }
-        if ws_tokens.get(idx) == Some(&"commit") {
+        if argv.get(idx).map(String::as_str) == Some("commit") {
             let target = match redirect {
                 Some(path) if Path::new(path).is_absolute() => path.to_string(),
                 Some(path) => format!("{effective_dir}/{path}"),
@@ -327,20 +365,47 @@ fn repo_root_for(dir: &Path) -> Option<String> {
     if root.is_empty() { None } else { Some(root) }
 }
 
+/// Ascend from `dir` to the nearest ancestor that exists on disk. A `Write` can
+/// name a file in a not-yet-created subtree, so the file's parent dir may not
+/// exist yet — and `git rev-parse` needs a real directory to resolve the repo,
+/// so an unresolvable parent would fail open (`repo_root_for` → `None`) and let
+/// a new-module write into the primary slip past the Edit arm (#239 F1). This
+/// walks up until it hits an existing directory. A `dir` that already exists is
+/// returned unchanged, so the common path is a single `exists()` stat and no
+/// behavior changes for edits to existing files.
+fn nearest_existing_ancestor(dir: &Path) -> PathBuf {
+    let mut cur = dir;
+    loop {
+        if cur.exists() {
+            return cur.to_path_buf();
+        }
+        match cur.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cur = parent,
+            _ => return dir.to_path_buf(),
+        }
+    }
+}
+
 /// Evaluate one candidate directory: allow, or block with the message.
 /// `origin_repo`, when set, names the repo the command's cwd started in — used
 /// only to decide whether the block message needs to acknowledge a `cd`/`-C`
 /// redirect to a *different* repo (issue #224); `None` for the Edit/Write arm,
 /// where there is no such redirect to name.
+///
+/// The `.claude/` and `docs/plans/` carve-outs are **not** applied here — they
+/// are the Edit/Write arm's concern (the *file being edited* is Claude-managed
+/// state or an approved plan doc). Applying them in this shared assessor leaked
+/// the carve-out onto the commit arm, where `dir` is a commit *target*, so
+/// `cd .claude && git commit` / `cd docs/plans && git commit` punched a
+/// disk-free hole in the block and even defeated the #224 cross-repo guard
+/// (#239 F6/F7). The sanctioned plan-doc-commit-on-`main` path is the `dismiss`
+/// snooze, so the commit arm needs no carve-out of its own.
 fn assess_dir(
     dir: &Path,
     cfg: &EnvConfig,
     origin_repo: Option<&str>,
     repo_allow: &mut RepoAllowMain,
 ) -> CheckResult {
-    if is_claude_managed_dir(dir) || is_plan_doc_dir(dir) {
-        return CheckResult::allow();
-    }
     let Some(repo_root) = repo_root_for(dir) else {
         // Not a git repo (or a bare container dir) — nothing to enforce.
         return CheckResult::allow();
@@ -437,6 +502,20 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // false block is friction — so scoping an over-broad arm is
             // aligned. `input.cwd` is always sent by Claude Code. (#238)
             let target_dir = git_dir_for_input(input);
+            // Carve-outs live HERE, on the Edit/Write arm, not in the shared
+            // `assess_dir` (which the commit arm also calls): the *file being
+            // edited* being Claude-managed state or an approved plan doc is what
+            // the carve-out is for. Checked on the lexical target path, before
+            // the ancestor ascent, so a new file under `.claude/` or
+            // `docs/plans/` is still exempt even when its dir doesn't exist yet.
+            if is_claude_managed_dir(&target_dir) || is_plan_doc_dir(&target_dir) {
+                return CheckResult::allow();
+            }
+            // A Write may name a file in a not-yet-created subtree, whose parent
+            // dir git can't resolve — ascend to the nearest existing ancestor so
+            // a new dir in the session's OWN primary is still judged rather than
+            // silently allowed (#239 F1). Existing dirs are returned unchanged.
+            let target_dir = nearest_existing_ancestor(&target_dir);
             let cwd = input.cwd.as_deref().unwrap_or(".");
             match (repo_root_for(&target_dir), repo_root_for(Path::new(cwd))) {
                 (Some(target_repo), Some(cwd_repo)) if target_repo == cwd_repo => {
@@ -464,7 +543,14 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // recorded (every existing provenance test drove the Edit arm, so
             // this Bash-arm gap went unseen until the repo-settings case).
             let mut bypassed: Option<CheckResult> = None;
+            // Dedup identical targets so a pathological command (`git commit;`
+            // ×N) can't fan out into N synchronous `git rev-parse` spawns and
+            // stall the hook — each distinct target is assessed once (#239 F11).
+            let mut seen: HashSet<String> = HashSet::new();
             for target in git_commit_targets(command, cwd) {
+                if !seen.insert(target.clone()) {
+                    continue;
+                }
                 let dir = PathBuf::from(&target);
                 let result = assess_dir(&dir, cfg, cwd_repo_root.as_deref(), &mut repo_allow);
                 if result.outcome != Outcome::Allow {
@@ -713,6 +799,78 @@ mod tests {
         assert_eq!(
             git_commit_targets("git -C /a commit -m x; git commit -m y", "/cwd"),
             vec!["/a".to_string(), "/cwd".to_string()]
+        );
+    }
+
+    // --- git_commit_targets: grouping / prefixes / quoting (#239 F4/F5/F9) ---
+
+    #[test]
+    fn subshell_and_brace_group_commit_detected() {
+        // F4: shell grouping around a commit no longer hides it.
+        assert_eq!(
+            git_commit_targets("(git commit -m x)", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("( git commit -m x )", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("{ git commit -m x; }", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn subshell_cd_then_commit_resolves_target() {
+        // F4: `(cd <dir> && git commit)` — the `(cd` no longer hides the cd, so
+        // the commit resolves to the cd target rather than the shell's cwd.
+        assert_eq!(
+            git_commit_targets("(cd /wt && git commit -m x)", "/cwd"),
+            vec!["/wt".to_string()]
+        );
+    }
+
+    #[test]
+    fn transparent_prefix_commit_detected() {
+        // F4: command/exec/time run their argument as the command.
+        for cmd in [
+            "command git commit -m x",
+            "exec git commit -m x",
+            "time git commit -m x",
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "prefix not seen through: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn transparent_prefix_with_option_is_a_miss_not_a_misparse() {
+        // `nice -n 10 git commit` — we don't parse the prefix's own flags, so
+        // this stays a documented miss (empty), never a wrong target.
+        assert!(git_commit_targets("nice -n 10 git commit -m x", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn quoted_dash_c_path_with_space_detected() {
+        // F5 / issue #230: quote-aware tokenize keeps the spaced -C path one
+        // token, so the redirect resolves and the commit is found.
+        assert_eq!(
+            git_commit_targets(r#"git -C "/path with space" commit -m x"#, "/cwd"),
+            vec!["/path with space".to_string()]
+        );
+    }
+
+    #[test]
+    fn quoted_inline_config_space_value_detected() {
+        // F9: a spaced -c value no longer splits the token stream and hides the
+        // `commit` subcommand.
+        assert_eq!(
+            git_commit_targets(r#"git -c user.name="A B" commit -m x"#, "/cwd"),
+            vec!["/cwd".to_string()]
         );
     }
 
@@ -1733,6 +1891,70 @@ mod tests {
             r.outcome,
             Outcome::Block,
             "a commit into a foreign primary still blocks — commit arm is untouched"
+        );
+    }
+
+    // --- #239: adversarial hardening ---
+
+    #[test]
+    fn new_subdir_write_in_own_primary_blocks() {
+        // F1: a Write creating a file in a not-yet-existent subdir of the
+        // session's own primary must still block. The parent dir doesn't exist
+        // yet, so the pre-fix `repo_root_for` failed open; ascending to the
+        // nearest existing ancestor (the repo root) judges it correctly.
+        let scratch = Scratch::new("new-subdir");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        // `primary/newmod` deliberately does NOT exist.
+        let input = edit_in(&primary, &primary.join("newmod/lib.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "creating a new module dir in your own primary still blocks"
+        );
+    }
+
+    #[test]
+    fn commit_with_cwd_under_claude_or_plans_in_primary_still_blocks() {
+        // F6/F7: the `.claude`/`docs/plans` carve-out is Edit-arm-only now. A
+        // commit whose target dir lexically contains those segments no longer
+        // rides through — the commit isn't scoped to those files, so a repo-wide
+        // change would otherwise slip onto main disk-free.
+        let scratch = Scratch::new("commit-carveout");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        std::fs::create_dir_all(primary.join(".claude")).unwrap();
+        std::fs::create_dir_all(primary.join("docs/plans")).unwrap();
+
+        for sub in [".claude", "docs/plans"] {
+            let mut input = make_bash(&format!(
+                "cd {} && git commit -m x",
+                primary.join(sub).to_string_lossy()
+            ));
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "commit with cwd under {sub} must block — carve-out is Edit-arm-only"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_commit_in_worktree_dedups_and_allows() {
+        // F11: repeated identical commit targets are assessed once. A worktree
+        // cwd (allow) exercises the full loop — no early block short-circuits it
+        // — so all three `git commit` segments resolve to the one worktree
+        // target and collapse to a single assessment.
+        let scratch = Scratch::new("dedup-wt");
+        let (_primary, wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("git commit -m x; git commit -m x; git commit -m x");
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "worktree commits allow; repeated targets deduped"
         );
     }
 }
