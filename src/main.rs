@@ -220,6 +220,10 @@ enum GuardrailsCommands {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
         #[arg(long = "for", default_value = "30m", value_name = "DURATION")]
         for_: String,
+        /// Repo to snooze, if not the current directory's repo — e.g. after a
+        /// `cd <other-repo> && git commit` was blocked against that repo.
+        #[arg(long, value_name = "PATH")]
+        repo: Option<String>,
     },
 }
 
@@ -862,8 +866,8 @@ fn main() {
             GuardrailsCommands::DismissMainBranchWarn { for_ } => {
                 cadence_hooks_guardrails::dismiss_main_branch_warn::run_dismiss(&for_);
             }
-            GuardrailsCommands::DismissEnforceWorktree { for_ } => {
-                cadence_hooks_guardrails::dismiss_enforce_worktree::run_dismiss(&for_);
+            GuardrailsCommands::DismissEnforceWorktree { for_, repo } => {
+                cadence_hooks_guardrails::dismiss_enforce_worktree::run_dismiss(&for_, repo);
             }
         },
         Commands::Rules(cmd) => match cmd {

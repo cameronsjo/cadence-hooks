@@ -85,7 +85,14 @@ pub fn is_snoozed_now(repo_root: &Path) -> bool {
 /// Writes the epoch-seconds expiry marker under the shared git common dir and
 /// confirms. Exits 1 on failure (missing repo, invalid duration, write error);
 /// 0 on success — this is a user-facing CLI, not a hook.
-pub fn run_dismiss(duration_str: &str) -> ! {
+///
+/// `repo`, when given, names the repo to snooze instead of the current
+/// directory's — the block reads from `--repo <path>`'s resolved git common
+/// dir. This matters because the guard itself keys its block off the
+/// **target** repo of a `cd <dir> && git commit` (or `git -C <dir> …`), which
+/// may differ from wherever the shell happens to be sitting (issue #224); a
+/// dismiss run from the shell's cwd would snooze the wrong marker.
+pub fn run_dismiss(duration_str: &str, repo: Option<String>) -> ! {
     let Some(duration) = parse_duration(duration_str) else {
         eprintln!(
             "cadence-hooks: invalid duration '{duration_str}'\n   \
@@ -103,11 +110,15 @@ pub fn run_dismiss(duration_str: &str) -> ! {
         process::exit(1);
     }
 
-    let cwd = Path::new(".");
-    let Some(common) = git_common_dir(cwd) else {
+    let target = repo
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let Some(common) = git_common_dir(&target) else {
         eprintln!(
             "cadence-hooks: not inside a git repository\n   \
-             dismiss-enforce-worktree must be run from within the repo you want to unblock."
+             dismiss-enforce-worktree must be run from within (or point --repo at) the repo you \
+             want to unblock."
         );
         process::exit(1);
     };
@@ -128,9 +139,11 @@ pub fn run_dismiss(duration_str: &str) -> ! {
 
     // Prefer the friendly repo toplevel for the confirmation; fall back to the
     // common dir if `--show-toplevel` doesn't resolve (e.g. a bare repo).
-    let where_display =
-        cadence_hooks_core::shell::git_command(".", &["rev-parse", "--show-toplevel"])
-            .unwrap_or_else(|| common.display().to_string());
+    let where_display = cadence_hooks_core::shell::git_command(
+        &target.to_string_lossy(),
+        &["rev-parse", "--show-toplevel"],
+    )
+    .unwrap_or_else(|| common.display().to_string());
     println!(
         "enforce-worktree unblocked for {duration_str} in {where_display} (until epoch {until})"
     );
