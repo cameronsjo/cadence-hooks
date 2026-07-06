@@ -228,6 +228,10 @@ enum GuardrailsCommands {
         /// recorded in the repo-visible bypass provenance log.
         #[arg(long, value_name = "TEXT")]
         reason: Option<String>,
+        /// Repo to snooze, if not the current directory's repo — e.g. after a
+        /// `cd <other-repo> && git commit` was blocked against that repo.
+        #[arg(long, value_name = "PATH")]
+        repo: Option<String>,
     },
 }
 
@@ -875,11 +879,12 @@ fn main() {
                     ),
                 );
             }
-            GuardrailsCommands::DismissEnforceWorktree { for_, reason } => {
+            GuardrailsCommands::DismissEnforceWorktree { for_, reason, repo } => {
                 finish_dismiss(
                     cadence_hooks_guardrails::dismiss_enforce_worktree::perform_dismiss(
                         &for_,
                         reason.as_deref(),
+                        repo,
                     ),
                 );
             }

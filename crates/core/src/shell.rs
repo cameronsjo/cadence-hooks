@@ -210,7 +210,7 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
 }
 
 /// Resolve a single cd target against the current effective directory.
-fn resolve_cd_target(target: &str, effective: &str) -> String {
+pub fn resolve_cd_target(target: &str, effective: &str) -> String {
     if target.starts_with('/') {
         target.to_string()
     } else if target.starts_with('~') {
@@ -227,16 +227,6 @@ fn resolve_cd_target(target: &str, effective: &str) -> String {
 
 /// Maximum recursion depth for shell-wrapper expansion in [`command_segments`].
 const MAX_WRAPPER_DEPTH: usize = 3;
-
-/// Push `current` (trimmed) onto `segments` as a new segment, dropping it if
-/// empty, then clear `current`. Helper for [`split_segments`].
-fn flush_segment(segments: &mut Vec<String>, current: &mut String) {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        segments.push(trimmed.to_string());
-    }
-    current.clear();
-}
 
 /// Strip heredoc bodies from a command so their prose never reaches the
 /// segment splitter.
@@ -400,9 +390,20 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
 /// backslash escapes (consistent with [`tokenize`]). To also see inside
 /// `sh -c '…'` wrappers and command substitutions, use [`command_segments`].
 pub fn split_segments(command: &str) -> Vec<String> {
+    split_segments_with_ops(command)
+        .into_iter()
+        .map(|(segment, _)| segment)
+        .collect()
+}
+
+/// Like [`split_segments`], but also returns the operator that follows each
+/// segment (`None` for the final segment). Lets a caller reason about control
+/// flow between segments — e.g. a `cd` immediately before `||` only takes
+/// effect on the failure path, so it must not redirect what comes after.
+pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static str>)> {
     let command = strip_heredoc_bodies(command);
     let command = command.as_str();
-    let mut segments = Vec::new();
+    let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
     let mut chars = command.chars().peekable();
@@ -422,10 +423,13 @@ pub fn split_segments(command: &str) -> Vec<String> {
             }
             '&' => {
                 // `&&` and `&` are both separators; consume the second `&`.
-                if chars.peek() == Some(&'&') {
+                let op = if chars.peek() == Some(&'&') {
                     chars.next();
-                }
-                flush_segment(&mut segments, &mut current);
+                    "&&"
+                } else {
+                    "&"
+                };
+                flush_segment_with_op(&mut segments, &mut current, op);
             }
             '|' => {
                 // `>|` is the force-clobber redirect operator, not a pipe —
@@ -434,18 +438,39 @@ pub fn split_segments(command: &str) -> Vec<String> {
                     current.push('|');
                 } else {
                     // `||` and `|` are both separators; consume the second `|`.
-                    if chars.peek() == Some(&'|') {
+                    let op = if chars.peek() == Some(&'|') {
                         chars.next();
-                    }
-                    flush_segment(&mut segments, &mut current);
+                        "||"
+                    } else {
+                        "|"
+                    };
+                    flush_segment_with_op(&mut segments, &mut current, op);
                 }
             }
-            ';' | '\n' => flush_segment(&mut segments, &mut current),
+            ';' => flush_segment_with_op(&mut segments, &mut current, ";"),
+            '\n' => flush_segment_with_op(&mut segments, &mut current, "\n"),
             _ => current.push(c),
         }
     }
-    flush_segment(&mut segments, &mut current);
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push((trimmed.to_string(), None));
+    }
     segments
+}
+
+/// Push `current` (trimmed) onto `segments` paired with the operator that
+/// follows it, dropping it if empty. Helper for [`split_segments_with_ops`].
+fn flush_segment_with_op(
+    segments: &mut Vec<(String, Option<&'static str>)>,
+    current: &mut String,
+    op: &'static str,
+) {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push((trimmed.to_string(), Some(op)));
+    }
+    current.clear();
 }
 
 /// Like [`split_segments`], but also expands what a shell would actually run:

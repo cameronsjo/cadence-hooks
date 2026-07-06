@@ -7,7 +7,7 @@
 //!
 //! Exposes:
 //! - `is_snoozed_now(repo_root)` — used by `enforce-worktree` before blocking
-//! - `run_dismiss(duration_str)` — the `dismiss-enforce-worktree` subcommand
+//! - `perform_dismiss(duration_str, reason, repo)` — the `dismiss-enforce-worktree` subcommand
 //!
 //! The marker lives under the **git common dir**
 //! (`<primary>/.git/cadence-hooks/`), which every linked worktree shares — so a
@@ -105,6 +105,13 @@ const MECHANISM: &str = "dismiss-enforce-worktree";
 /// missing repo, invalid duration, over-cap, or a missing `--reason` for a
 /// snooze longer than 1h. On success prints nothing and returns `Ok`.
 ///
+/// `repo`, when given, names the repo to snooze instead of the current
+/// directory's — the marker is written under `--repo <path>`'s resolved git
+/// common dir. This matters because the guard keys its block off the **target**
+/// repo of a `cd <dir> && git commit` (or `git -C <dir> …`), which may differ
+/// from wherever the shell happens to be sitting (issue #224); a dismiss run
+/// from the shell's cwd would snooze the wrong marker.
+///
 /// The load-bearing marker stays exactly `{until}\n` (the guard's first-line
 /// parse is untouched); provenance rides in the sibling sidecar. The sidecar
 /// write is best-effort — a failure warns but does not fail the dismissal, so a
@@ -113,7 +120,11 @@ const MECHANISM: &str = "dismiss-enforce-worktree";
 /// The `Err` is unit on purpose: this function prints every error to stderr
 /// itself, so the caller only needs pass/fail to pick an exit code.
 #[allow(clippy::result_unit_err)]
-pub fn perform_dismiss(duration_str: &str, reason: Option<&str>) -> Result<DismissArmed, ()> {
+pub fn perform_dismiss(
+    duration_str: &str,
+    reason: Option<&str>,
+    repo: Option<String>,
+) -> Result<DismissArmed, ()> {
     let Some(duration) = parse_duration(duration_str) else {
         eprintln!(
             "cadence-hooks: invalid duration '{duration_str}'\n   \
@@ -140,11 +151,15 @@ pub fn perform_dismiss(duration_str: &str, reason: Option<&str>) -> Result<Dismi
         }
     };
 
-    let cwd = Path::new(".");
-    let Some(common) = git_common_dir(cwd) else {
+    let target = repo
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let Some(common) = git_common_dir(&target) else {
         eprintln!(
             "cadence-hooks: not inside a git repository\n   \
-             dismiss-enforce-worktree must be run from within the repo you want to unblock."
+             dismiss-enforce-worktree must be run from within (or point --repo at) the repo you \
+             want to unblock."
         );
         return Err(());
     };
@@ -183,9 +198,11 @@ pub fn perform_dismiss(duration_str: &str, reason: Option<&str>) -> Result<Dismi
 
     // Prefer the friendly repo toplevel for the confirmation; fall back to the
     // common dir if `--show-toplevel` doesn't resolve (e.g. a bare repo).
-    let where_display =
-        cadence_hooks_core::shell::git_command(".", &["rev-parse", "--show-toplevel"])
-            .unwrap_or_else(|| common.display().to_string());
+    let where_display = cadence_hooks_core::shell::git_command(
+        &target.to_string_lossy(),
+        &["rev-parse", "--show-toplevel"],
+    )
+    .unwrap_or_else(|| common.display().to_string());
     let mut confirmation = format!(
         "enforce-worktree unblocked for {duration_str} in {where_display} (until epoch {until})"
     );
@@ -349,18 +366,18 @@ mod tests {
 
     #[test]
     fn perform_dismiss_rejects_invalid_duration() {
-        assert!(perform_dismiss("bogus", None).is_err());
+        assert!(perform_dismiss("bogus", None, None).is_err());
     }
 
     #[test]
     fn perform_dismiss_rejects_over_cap() {
         // 2d exceeds the 24h cap → Err before touching git.
-        assert!(perform_dismiss("2d", Some("why")).is_err());
+        assert!(perform_dismiss("2d", Some("why"), None).is_err());
     }
 
     #[test]
     fn perform_dismiss_rejects_long_snooze_without_reason() {
         // The reason gate rejects >1h without a reason, before touching git.
-        assert!(perform_dismiss("4h", None).is_err());
+        assert!(perform_dismiss("4h", None, None).is_err());
     }
 }
