@@ -16,28 +16,27 @@
 //! resolve the common dir via `git rev-parse --git-common-dir` rather than
 //! assuming the marker sits under the passed directory's own `.git`.
 
-use crate::dismiss_main_branch_warn::{is_snoozed_at, parse_duration, session_id_from_env};
+use crate::dismiss_main_branch_warn::{parse_duration, session_id_from_env};
 use crate::snooze_meta::{self, DismissArmed, SnoozeMeta};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Subdirectory (relative to the git common dir) that holds the marker. The
-/// common dir already ends in `.git`, so this is `.git/cadence-hooks/` on disk.
-const SNOOZE_DIR: &str = "cadence-hooks";
-const SNOOZE_FILE: &str = "enforce-worktree-snoozed-until";
 /// Same cap as the main-branch snooze: a lingering marker would silently
 /// disable the block long after the one-off reason for it expired.
 const MAX_SNOOZE_SECONDS: u64 = 24 * 60 * 60;
 
-/// Marker file path within a git common dir.
+/// Marker file path within a git common dir. Delegates to
+/// `cadence_hooks_core::worktree` (cadence-hooks#236), which owns the marker
+/// path/format so `enforce_worktree` and `session::start`'s posture line read
+/// the identical snooze state.
 ///
 /// `git_common_dir` is the primary checkout's `.git` directory — shared across
 /// all linked worktrees — so the marker resolves to
 /// `<primary>/.git/cadence-hooks/enforce-worktree-snoozed-until` no matter which
 /// worktree wrote it.
 pub fn marker_path(git_common_dir: &Path) -> PathBuf {
-    git_common_dir.join(SNOOZE_DIR).join(SNOOZE_FILE)
+    cadence_hooks_core::worktree::enforce_worktree_marker_path(git_common_dir)
 }
 
 /// Resolve the absolute git common dir for `dir` via
@@ -54,7 +53,7 @@ fn git_common_dir(dir: &Path) -> Option<PathBuf> {
 /// The marker path for `dir`, resolving the shared common dir first. `None` when
 /// `dir` is not inside a git repo. Used by the reader and the tests.
 pub fn marker_path_for(dir: &Path) -> Option<PathBuf> {
-    git_common_dir(dir).map(|c| marker_path(&c))
+    cadence_hooks_core::worktree::enforce_worktree_marker_path_for(dir)
 }
 
 /// The provenance sidecar beside the snooze marker for `dir` (resolved through
@@ -79,19 +78,16 @@ fn now_epoch() -> u64 {
 }
 
 /// Read the marker for the given repo and decide if the snooze is active.
+/// Delegates to `cadence_hooks_core::worktree::is_snoozed_now` — the same
+/// snooze check `session::start`'s posture line consults, so the two can
+/// never disagree about whether a dismissal is currently active.
 ///
 /// Resolves the marker through the shared git common dir, so a snooze written
 /// from a linked worktree is honoured here at the primary checkout. A missing
 /// marker, or a `repo_root` that isn't inside a git repo, yields `false`
 /// (fail-open — ADR-0001).
 pub fn is_snoozed_now(repo_root: &Path) -> bool {
-    let Some(path) = marker_path_for(repo_root) else {
-        return false;
-    };
-    let Ok(contents) = fs::read_to_string(path) else {
-        return false;
-    };
-    is_snoozed_at(&contents, now_epoch())
+    cadence_hooks_core::worktree::is_snoozed_now(repo_root)
 }
 
 /// The dismiss mechanism name recorded in bypass provenance.
