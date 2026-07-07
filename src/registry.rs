@@ -333,6 +333,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: None,
     },
     HookEntry {
+        name: "log-skill",
+        description: "Log skill invocations (PostToolUse:Skill)",
+        plugin: "metrics",
+        event: None,
+    },
+    HookEntry {
         name: "warn-stale",
         description: "Warn at SessionStart when metrics telemetry has gone stale",
         plugin: "metrics",
@@ -465,6 +471,11 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // shape; the generic logger sample carries no `questions` and would no-op.
         ("metrics", "log-ask-user-question") => Some(
             r#"{"session_id":"test","hook_event_name":"PreToolUse","model":"claude-opus-4-8","tool_input":{"questions":[{"question":"Which approach?","header":"Approach","multiSelect":false,"options":[{"label":"Option A","description":"first"},{"label":"Option B","description":"second"}]}]}}"#,
+        ),
+        // log-skill gates on tool_name == "Skill"; the generic PostToolUse
+        // logger sample carries no tool_name and would no-op.
+        ("metrics", "log-skill") => Some(
+            r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_name":"Skill","cwd":"/tmp","tool_input":{"skill":"cadence:attune","args":"execute C8"}}"#,
         ),
         // warn-branch-drift early-exits unless the command is a git commit —
         // the generic PreToolUse sample (`git status`) would never reach the
@@ -641,6 +652,7 @@ mod tests {
             "log-plan-phase",
             "log-polish-nudge",
             "log-ask-user-question",
+            "log-skill",
             "heartbeat",
             "end",
             "backstop-record",

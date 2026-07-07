@@ -151,6 +151,9 @@ pub fn utc_timestamp() -> String {
 /// Schema version stamped on every `plan-phases.jsonl` row.
 pub const PLAN_PHASE_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version stamped on every `skills.jsonl` row.
+pub const SKILL_SCHEMA_VERSION: u32 = 1;
+
 /// Crate-wide serialization lock for env-mutating tests.
 ///
 /// `CADENCE_METRICS_DIR` and its siblings are process-global, so every test that

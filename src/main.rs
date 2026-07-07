@@ -292,6 +292,8 @@ enum MetricsCommands {
     LogPolishNudge,
     /// Log AskUserQuestion stance + shape on every call (PreToolUse)
     LogAskUserQuestion,
+    /// Log skill invocations (PostToolUse:Skill)
+    LogSkill,
     /// Warn at SessionStart when metrics telemetry has gone stale (SessionStart)
     WarnStale,
 }
@@ -412,6 +414,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::LogPlanPhase { .. } => "log-plan-phase",
             MetricsCommands::LogPolishNudge => "log-polish-nudge",
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
+            MetricsCommands::LogSkill => "log-skill",
             MetricsCommands::WarnStale => "warn-stale",
         }),
         Commands::Lab(l) => Some(match l {
@@ -974,6 +977,11 @@ fn main() {
             MetricsCommands::LogAskUserQuestion => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogAskUserQuestion,
                 registry::sample_for("metrics", "log-ask-user-question"),
+                canonical_hook,
+            ),
+            MetricsCommands::LogSkill => dispatch::run_logged_logger(
+                &cadence_hooks_metrics::LogSkill,
+                registry::sample_for("metrics", "log-skill"),
                 canonical_hook,
             ),
             // warn-stale is a SessionStart *check*, not a logger — it reads the

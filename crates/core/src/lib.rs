@@ -192,6 +192,11 @@ pub struct ToolInput {
     /// means the spawn gets a fresh agent-owned worktree; absent means the
     /// subagent inherits the spawning session's working directory.
     pub isolation: Option<String>,
+    /// Skill tool: the invoked skill id (e.g. `cadence:attune`).
+    pub skill: Option<String>,
+    /// Skill tool: the skill's argument string. NEVER logged raw — only a
+    /// non-reversible hash of it is recorded (see `log_skill`).
+    pub args: Option<String>,
 }
 
 /// A single edit operation within a MultiEdit tool call.
