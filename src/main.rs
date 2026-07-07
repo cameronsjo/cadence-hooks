@@ -115,6 +115,12 @@ enum Commands {
         /// One-line summary output; exit non-zero only on errors. For SessionStart preflight.
         #[arg(long)]
         quiet: bool,
+        /// List orphaned plugin-cache version dirs that would be removed (dry-run; no deletion)
+        #[arg(long)]
+        prune: bool,
+        /// With --prune, actually remove the orphaned version dirs (default is dry-run)
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -668,8 +674,13 @@ fn main() {
             }
             configure::run(list, HOOKS);
         }
-        Commands::Doctor { root, quiet } => {
-            process::exit(doctor::run(root.as_deref(), quiet).into());
+        Commands::Doctor {
+            root,
+            quiet,
+            prune,
+            apply,
+        } => {
+            process::exit(doctor::run(root.as_deref(), quiet, prune, apply).into());
         }
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => dispatch::run_logged_check(

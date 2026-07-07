@@ -534,6 +534,180 @@ fn doctor_root_scan_ignores_stale_metrics_env() {
     );
 }
 
+// ── doctor --prune / --apply ────────────────────────────────────────────────
+
+/// Write `<root>/installed_plugins.json` (v2 schema) pinning `label` to
+/// `install_path` — the `--root`-driven manifest path `doctor --prune` reads
+/// when `root_override` is set.
+fn write_installed_plugins_manifest(
+    root: &std::path::Path,
+    label: &str,
+    install_path: &std::path::Path,
+) {
+    let manifest = format!(
+        r#"{{
+  "version": 2,
+  "plugins": {{
+    "{label}": [
+      {{ "scope": "user", "installPath": {p} }}
+    ]
+  }}
+}}"#,
+        p = serde_json::to_string(install_path.to_str().unwrap()).unwrap()
+    );
+    std::fs::write(root.join("installed_plugins.json"), manifest).unwrap();
+}
+
+#[test]
+fn doctor_prune_dry_run_lists_orphans_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "my-plugin",
+        "pinned-sha",
+        BUGGY_HOOKS_JSON,
+    );
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "my-plugin",
+        "orphan-sha",
+        BUGGY_HOOKS_JSON,
+    );
+    let pinned_path = tmp.path().join("workbench/my-plugin/pinned-sha");
+    let orphan_path = tmp.path().join("workbench/my-plugin/orphan-sha");
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned_path);
+
+    let output = cadence_hooks()
+        .args(["doctor", "--prune", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "dry-run prune exits 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("orphan-sha"),
+        "dry-run must list the orphan path: {stdout}"
+    );
+    assert!(
+        stdout.contains("--apply"),
+        "dry-run must mention how to actually remove: {stdout}"
+    );
+    assert!(orphan_path.exists(), "dry-run must not delete anything");
+    assert!(pinned_path.exists());
+}
+
+#[test]
+fn doctor_prune_apply_removes_orphans() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "my-plugin",
+        "pinned-sha",
+        BUGGY_HOOKS_JSON,
+    );
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "my-plugin",
+        "orphan-sha",
+        BUGGY_HOOKS_JSON,
+    );
+    let pinned_path = tmp.path().join("workbench/my-plugin/pinned-sha");
+    let orphan_path = tmp.path().join("workbench/my-plugin/orphan-sha");
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned_path);
+
+    let output = cadence_hooks()
+        .args(["doctor", "--prune", "--apply", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "apply prune exits 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !orphan_path.exists(),
+        "--apply must remove the orphaned version dir"
+    );
+    assert!(
+        pinned_path.exists(),
+        "--apply must never touch the pinned version dir"
+    );
+}
+
+#[test]
+fn doctor_prune_apply_never_deletes_outside_root() {
+    // A manifest `installPath` that resolves OUTSIDE the `--root` cache must
+    // never steer `--prune --apply`'s `remove_dir_all` at anything outside
+    // the root. Regression test for the cache-root containment gap.
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+
+    // A "pinned" dir and a would-be-orphan sibling, both OUTSIDE `--root`.
+    let pinned_path = outside.path().join("fake-mp/fake-plugin/pinned-sha");
+    let decoy_path = outside.path().join("fake-mp/fake-plugin/decoy-sha");
+    std::fs::create_dir_all(&pinned_path).unwrap();
+    std::fs::create_dir_all(&decoy_path).unwrap();
+    std::fs::write(decoy_path.join("keepme"), "must survive").unwrap();
+
+    write_installed_plugins_manifest(tmp.path(), "fake-plugin@fake-mp", &pinned_path);
+
+    let output = cadence_hooks()
+        .args(["doctor", "--prune", "--apply", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "apply prune with an out-of-root pin still exits 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        decoy_path.exists() && decoy_path.join("keepme").exists(),
+        "the out-of-root decoy directory must survive --prune --apply"
+    );
+    assert!(
+        pinned_path.exists(),
+        "the out-of-root pinned dir must survive too"
+    );
+}
+
+#[test]
+fn doctor_apply_without_prune_is_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let output = cadence_hooks()
+        .args(["doctor", "--apply", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--apply without --prune is a usage error.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn doctor_default_scan_falls_back_to_cache_walk_without_manifest() {
     // No installed_plugins.json — recursively walk the cache dir instead.
