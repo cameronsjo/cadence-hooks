@@ -539,35 +539,65 @@ mod tests {
         git_in(dir, &["commit", "-q", "-m", "init"]);
     }
 
-    /// Run `f` with `CADENCE_ALLOW_MAIN`/`CADENCE_NO_ENFORCE_WORKTREE`
-    /// cleared, restoring whatever the caller's own environment had
-    /// afterward. `would_block_here` reads real process env, and a caller's
-    /// environment may already carry a session-wide `CADENCE_ALLOW_MAIN=true`
-    /// — every test that asserts the posture line actually FIRES needs a
-    /// clean slate for that assertion to mean anything. Serialized via
-    /// ENV_LOCK against the other env-mutating tests in this module.
-    fn with_clean_worktree_env<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev_allow = std::env::var("CADENCE_ALLOW_MAIN").ok();
-        let prev_kill = std::env::var("CADENCE_NO_ENFORCE_WORKTREE").ok();
-        // SAFETY: serialized via ENV_LOCK.
-        unsafe {
-            std::env::remove_var("CADENCE_ALLOW_MAIN");
-            std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE");
+    /// Restores the caller's `CADENCE_ALLOW_MAIN`/`CADENCE_NO_ENFORCE_WORKTREE`
+    /// on drop — including on panic, so a failed assertion can't leak a
+    /// mutated environment into later tests in the same process.
+    struct WorktreeEnvGuard {
+        allow: Option<std::ffi::OsString>,
+        kill: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for WorktreeEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: only constructed inside `with_worktree_env`, which holds
+            // ENV_LOCK for this guard's whole lifetime (declared after the
+            // lock, so it drops before the lock releases — panic included).
+            unsafe {
+                match self.allow.take() {
+                    Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
+                    None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
+                }
+                match self.kill.take() {
+                    Some(v) => std::env::set_var("CADENCE_NO_ENFORCE_WORKTREE", v),
+                    None => std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE"),
+                }
+            }
         }
-        let result = f();
-        // SAFETY: serialized via ENV_LOCK.
+    }
+
+    /// Run `f` with `CADENCE_ALLOW_MAIN`/`CADENCE_NO_ENFORCE_WORKTREE` pinned
+    /// to exactly `allow`/`kill` (`None` = unset), restoring the caller's own
+    /// values afterward — panic-safe via `WorktreeEnvGuard`.
+    /// `would_block_here` reads real process env, and a caller's environment
+    /// may already carry a session-wide `CADENCE_ALLOW_MAIN=true` — both the
+    /// "line fires" and the "line silent because of X" assertions need the
+    /// env pinned for the assertion to mean anything (an ambient exemption
+    /// silences the line for the wrong reason). Serialized via ENV_LOCK.
+    fn with_worktree_env<T>(allow: Option<&str>, kill: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = WorktreeEnvGuard {
+            allow: std::env::var_os("CADENCE_ALLOW_MAIN"),
+            kill: std::env::var_os("CADENCE_NO_ENFORCE_WORKTREE"),
+        };
+        // SAFETY: serialized via ENV_LOCK; `_restore` puts the caller's
+        // values back on scope exit, panic included.
         unsafe {
-            match prev_allow {
+            match allow {
                 Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
                 None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
             }
-            match prev_kill {
+            match kill {
                 Some(v) => std::env::set_var("CADENCE_NO_ENFORCE_WORKTREE", v),
                 None => std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE"),
             }
         }
-        result
+        f()
+    }
+
+    /// Both worktree env vars cleared — the baseline for every posture test
+    /// whose subject is something other than the env exemptions themselves.
+    fn with_clean_worktree_env<T>(f: impl FnOnce() -> T) -> T {
+        with_worktree_env(None, None, f)
     }
 
     #[test]
@@ -591,19 +621,19 @@ mod tests {
             &scratch.0,
             &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
         );
-        assert!(worktree_posture_line(&wt.to_string_lossy()).is_none());
+        // Clean env: silence must come from the linked-worktree cwd, not an
+        // ambient CADENCE_ALLOW_MAIN exemption.
+        let line = with_clean_worktree_env(|| worktree_posture_line(&wt.to_string_lossy()));
+        assert!(line.is_none());
     }
 
     #[test]
     fn posture_line_silent_when_allow_main_env_set() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let scratch = Scratch::new("allow-main-env");
         init_repo(&scratch.0);
-        // SAFETY: serialized via ENV_LOCK against the other env-mutating
-        // posture tests in this module.
-        unsafe { std::env::set_var("CADENCE_ALLOW_MAIN", "true") };
-        let line = worktree_posture_line(&scratch.0.to_string_lossy());
-        unsafe { std::env::remove_var("CADENCE_ALLOW_MAIN") };
+        let line = with_worktree_env(Some("true"), None, || {
+            worktree_posture_line(&scratch.0.to_string_lossy())
+        });
         assert!(line.is_none(), "CADENCE_ALLOW_MAIN env silences the line");
     }
 
@@ -618,19 +648,19 @@ mod tests {
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         )
         .unwrap();
-        assert!(worktree_posture_line(&scratch.0.to_string_lossy()).is_none());
+        // Clean env: silence must come from the repo-declared flag, not an
+        // ambient env exemption.
+        let line = with_clean_worktree_env(|| worktree_posture_line(&scratch.0.to_string_lossy()));
+        assert!(line.is_none());
     }
 
     #[test]
     fn posture_line_silent_when_kill_switch_set() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let scratch = Scratch::new("kill-switch");
         init_repo(&scratch.0);
-        // SAFETY: serialized via ENV_LOCK against the other env-mutating
-        // posture tests in this module.
-        unsafe { std::env::set_var("CADENCE_NO_ENFORCE_WORKTREE", "1") };
-        let line = worktree_posture_line(&scratch.0.to_string_lossy());
-        unsafe { std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE") };
+        let line = with_worktree_env(None, Some("1"), || {
+            worktree_posture_line(&scratch.0.to_string_lossy())
+        });
         assert!(line.is_none(), "kill switch silences the line");
     }
 
@@ -647,7 +677,10 @@ mod tests {
             .as_secs()
             + 3600;
         std::fs::write(&marker, format!("{until}\n")).unwrap();
-        assert!(worktree_posture_line(&scratch.0.to_string_lossy()).is_none());
+        // Clean env: silence must come from the snooze marker, not an ambient
+        // env exemption.
+        let line = with_clean_worktree_env(|| worktree_posture_line(&scratch.0.to_string_lossy()));
+        assert!(line.is_none());
     }
 
     #[test]
@@ -706,7 +739,9 @@ mod tests {
         );
         let registry_dir = tempfile::TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-wt", "startup", &wt.to_string_lossy());
-        let r = run_start(&input, registry_dir.path(), Some("feat/y".into()), 600);
+        let r = with_clean_worktree_env(|| {
+            run_start(&input, registry_dir.path(), Some("feat/y".into()), 600)
+        });
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -716,8 +751,8 @@ mod tests {
     /// never silently drift apart.
     #[test]
     fn posture_line_matches_enforce_worktree_block_decision() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-
+        // ENV_LOCK is taken by `with_clean_worktree_env` below (non-reentrant
+        // — do not also acquire it here).
         let scratch = Scratch::new("parity");
         let primary = scratch.0.join("primary");
         std::fs::create_dir(&primary).unwrap();
@@ -741,21 +776,26 @@ mod tests {
             + 3600;
         std::fs::write(&marker, format!("{until}\n")).unwrap();
 
-        for dir in [&primary, &wt, &snoozed] {
-            let file = dir.join("src.rs");
-            let mut edit_input =
-                cadence_hooks_core::test_builders::make_edit(&file.to_string_lossy(), "a", "b");
-            edit_input.cwd = Some(dir.to_string_lossy().into_owned());
+        // Clean env for BOTH sides of the comparison: an ambient
+        // CADENCE_ALLOW_MAIN would exempt both and make the primary-checkout
+        // leg of the matrix vacuously agree on "no block".
+        with_clean_worktree_env(|| {
+            for dir in [&primary, &wt, &snoozed] {
+                let file = dir.join("src.rs");
+                let mut edit_input =
+                    cadence_hooks_core::test_builders::make_edit(&file.to_string_lossy(), "a", "b");
+                edit_input.cwd = Some(dir.to_string_lossy().into_owned());
 
-            let would_block = cadence_hooks_guardrails::enforce_worktree::EnforceWorktree
-                .run(&edit_input)
-                .outcome
-                == Outcome::Block;
-            let posture_fires = worktree_posture_line(&dir.to_string_lossy()).is_some();
-            assert_eq!(
-                posture_fires, would_block,
-                "posture line vs enforce-worktree disagree for {dir:?}"
-            );
-        }
+                let would_block = cadence_hooks_guardrails::enforce_worktree::EnforceWorktree
+                    .run(&edit_input)
+                    .outcome
+                    == Outcome::Block;
+                let posture_fires = worktree_posture_line(&dir.to_string_lossy()).is_some();
+                assert_eq!(
+                    posture_fires, would_block,
+                    "posture line vs enforce-worktree disagree for {dir:?}"
+                );
+            }
+        });
     }
 }
