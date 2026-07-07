@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-gh-write` no longer flags gh-write phrases inside quoted arguments of non-gh commands (#212).** The no-loop write scan matched `WRITE_ACTIONS` against a whole command segment, so a `git commit -m "…gh repo create…"` message describing a gh write was misread as one. The write scan now runs only on a segment that carries an *unquoted* `gh` command token (bare, a `*/gh` path, or a backslash-escaped form) — a quoted message tokenizes as a single non-`gh` token, so it is skipped, while every real gh write still surfaces a bare `gh` token, including behind an env-assignment (`GH_TOKEN=… gh …`), a transparent prefix (`sudo`/`env`/`command`/`exec` `gh …`), an argument position (`xargs gh …`, `find … -exec gh …`), or a leading redirect. The gate skips a strict subset of the prior substring scan, so it adds no false negative — a first-token-only gate would have silently dropped all of those prefixed writes.
+
 ## [0.49.0] - 2026-07-06
 
 ### Fixed
