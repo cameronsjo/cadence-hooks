@@ -5,7 +5,7 @@
 //! it and loses recoverability. This guard blocks those commands inside the
 //! vault directory and suggests `mv` to `.trash/` instead.
 
-use cadence_hooks_core::shell::{clobber_redirect_targets, split_segments, tokenize};
+use cadence_hooks_core::shell::{clobber_redirect_targets, command_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
 /// True when a normalized path is absolute — POSIX (`/foo`) or a Windows
@@ -71,11 +71,53 @@ impl FileMeta for RealFs {
     }
 }
 
-/// Resolve a redirect target against `cwd`, returning its normalized absolute
-/// path when that path falls inside `vault` (both already normalized by the
-/// caller). A relative target resolves under `cwd`, matching shell redirect
-/// semantics; an absolute target is checked directly. Returns `None` when the
-/// resolved path is outside the vault.
+/// Split an absolute path into its root prefix (`"/"` or a Windows drive
+/// prefix like `"C:/"`) and the segment body after it. Empty prefix means the
+/// path wasn't recognized as absolute (shouldn't happen for callers here,
+/// since `resolve_in_vault` always joins onto an absolute `cwd`/`vault`).
+fn split_absolute_prefix(path: &str) -> (&str, &str) {
+    if let Some(rest) = path.strip_prefix('/') {
+        return ("/", rest);
+    }
+    let b = path.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/' {
+        return (&path[..3], &path[3..]);
+    }
+    ("", path)
+}
+
+/// Lexically collapse `.`/`..` segments in an absolute path — a string
+/// operation, not a filesystem canonicalization, since a redirect target may
+/// not exist yet. `..` pops the last real segment; a `..` with nothing to pop
+/// (already at root) is dropped rather than climbing above root. This runs
+/// BEFORE the vault-prefix membership test so a climb like
+/// `cwd=/home/user, target=../../vault/note.md` resolves to `/vault/note.md`
+/// instead of string-testing a literal `/home/user/../../vault/note.md`,
+/// which would never match the `/vault/` prefix even though the shell lands
+/// inside the vault (#192 F4/F7).
+fn collapse_dots(path: &str) -> String {
+    let (prefix, body) = split_absolute_prefix(path);
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in body.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    format!("{prefix}{}", segments.join("/"))
+}
+
+/// Resolve a redirect target against `cwd`, returning its normalized,
+/// dot-collapsed absolute path when that path falls inside `vault` (both
+/// already normalized by the caller). A relative target resolves under
+/// `cwd`, matching shell redirect semantics; an absolute target is checked
+/// directly. `..`/`.` segments are lexically collapsed before the
+/// vault-prefix test (#192 F4) — otherwise a climb-back-in (`../../vault/x`)
+/// or climb-out (`../../../etc/passwd`) mis-resolves against the raw string.
+/// Returns `None` when the collapsed path is outside the vault.
 fn resolve_in_vault(target: &str, cwd: &str, vault: &str, vault_prefix: &str) -> Option<String> {
     let target = normalize_path(target);
     let resolved = if looks_absolute(&target) {
@@ -83,6 +125,7 @@ fn resolve_in_vault(target: &str, cwd: &str, vault: &str, vault_prefix: &str) ->
     } else {
         normalize_path(&format!("{cwd}/{target}"))
     };
+    let resolved = collapse_dots(&resolved);
     if resolved == vault || resolved.starts_with(vault_prefix) {
         Some(resolved)
     } else {
@@ -140,8 +183,11 @@ fn check_destructive_in_vault(
     // for writing — even when the command that follows never runs. `>>`
     // (append) and a target that doesn't exist yet (new-file creation) are
     // not destructive, so only an existing vault file behind a clobber
-    // redirect is blocked (#192).
-    for segment in split_segments(command) {
+    // redirect is blocked (#192). `command_segments` (not `split_segments`)
+    // so a redirect hidden inside a `sh -c`/`bash -c` wrapper or a `$(…)`/
+    // backtick substitution is also seen — the sibling secret-writes guard
+    // uses the same wrapper-unwrapping splitter for the same reason.
+    for segment in command_segments(command) {
         for target in clobber_redirect_targets(&segment) {
             if let Some(resolved) = resolve_in_vault(&target, &cwd, &vault, &vault_prefix)
                 && meta.exists(&resolved)
@@ -750,5 +796,60 @@ mod tests {
         let fs = FakeFs::with(&["/vault/note.md"]);
         let result = check_destructive_in_vault("echo hi > /vault/note.md", "/home", "/vault", &fs);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // --- Redirect-guard bypass hardening (security review #192 follow-up) ---
+
+    #[test]
+    fn sh_c_wrapped_redirect_into_existing_vault_file_blocked() {
+        // F1: the redirect loop must see inside a `sh -c`/`bash -c` wrapper,
+        // not just the literal top-level segment.
+        let fs = FakeFs::with(&["/vault/notes/note.md"]);
+        let result =
+            check_destructive_in_vault("sh -c 'echo x > note.md'", "/vault/notes", "/vault", &fs);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn backslash_escaped_space_target_blocked() {
+        // F2: Obsidian filenames routinely contain spaces; a backslash-escaped
+        // space must not truncate the target early.
+        let fs = FakeFs::with(&["/vault/notes/Daily Note.md"]);
+        let result =
+            check_destructive_in_vault(r"echo x > Daily\ Note.md", "/vault/notes", "/vault", &fs);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn glued_paren_subshell_truncate_blocked() {
+        // F3: a glued closing paren from subshell grouping must not survive
+        // into the resolved target and dodge the existence check.
+        let fs = FakeFs::with(&["/vault/notes/note.md"]);
+        let result = check_destructive_in_vault("(: > note.md)", "/vault/notes", "/vault", &fs);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn dotdot_climb_into_vault_from_outside_blocked() {
+        // F4: a `..` climb that lands back inside the vault must be caught
+        // even though the raw joined string never has the `/vault/` prefix.
+        let fs = FakeFs::with(&["/vault/note.md"]);
+        let result =
+            check_destructive_in_vault("echo x > ../../vault/note.md", "/home/user", "/vault", &fs);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn dotdot_out_of_vault_allowed() {
+        // F7 companion: a `..` climb that lands OUTSIDE the vault (even
+        // though the raw string mis-resolves as in-vault before collapsing)
+        // must stay Allow.
+        let result = check_destructive_in_vault(
+            "echo x > ../../../etc/passwd",
+            "/vault",
+            "/vault",
+            &FakeFs::default(),
+        );
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 }

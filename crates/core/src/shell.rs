@@ -483,7 +483,13 @@ fn flush_segment_with_op(
 /// an ordinary character before the operator. A fd-duplication form (`>&2`)
 /// has no file target: the target-collection loop below stops at `&`,
 /// yielding an empty string that is discarded. Targets may be quoted (`>
-/// "my note.md"`); the returned string has the quotes stripped.
+/// "my note.md"`); the returned string has the quotes stripped. A
+/// backslash-escaped whitespace char (`Daily\ Note.md`) stays part of the
+/// token rather than terminating it — Obsidian filenames routinely contain
+/// spaces. A trailing unmatched `)`/`}` — the artifact of a glued subshell
+/// close like `(: > note.md)` — is stripped from the collected target, since
+/// the parser doesn't track group nesting; a legitimate filename ending in
+/// those characters is the rarer case.
 pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut targets = Vec::new();
@@ -535,12 +541,24 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
                         }
                         continue;
                     }
+                    // A backslash-escaped whitespace char is part of the
+                    // filename, not a token terminator — consume the
+                    // backslash and keep the escaped char.
+                    if tc == '\\' && i + 1 < chars.len() && chars[i + 1].is_whitespace() {
+                        target.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
                     if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
                         break;
                     }
                     target.push(tc);
                     i += 1;
                 }
+                // Strip a trailing unmatched `)`/`}` — the artifact of a
+                // glued subshell/group close (`(: > note.md)`), not a real
+                // filename character in the realistic case.
+                let target = target.trim_end_matches([')', '}']).to_string();
                 if !target.is_empty() {
                     targets.push(target);
                 }
@@ -1019,6 +1037,29 @@ mod tests {
             clobber_redirect_targets(r#"echo hi > "my note.md""#),
             vec!["my note.md"]
         );
+    }
+
+    #[test]
+    fn clobber_redirect_backslash_escaped_space_target() {
+        // #192 F2: a backslash-escaped space stays part of the filename
+        // rather than terminating the token early.
+        assert_eq!(
+            clobber_redirect_targets(r"echo x > Daily\ Note.md"),
+            vec!["Daily Note.md"]
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_glued_closing_paren_stripped() {
+        // #192 F3: a subshell's glued `)` is not part of the filename.
+        assert_eq!(clobber_redirect_targets("(: > note.md)"), vec!["note.md"]);
+    }
+
+    #[test]
+    fn clobber_redirect_glued_closing_brace_stripped() {
+        // Glued directly (no separator before `}`) so it lands on the target
+        // token, unlike a `;`-separated close which is already a break char.
+        assert_eq!(clobber_redirect_targets("{ : > note.md}"), vec!["note.md"]);
     }
 
     // --- command_segments (wrapper expansion) ---
