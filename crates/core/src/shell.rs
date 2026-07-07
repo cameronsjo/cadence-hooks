@@ -184,17 +184,14 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
 
+    // Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue
+    // #229 / PR #226). bash's `||`/`&&` are equal-precedence and
+    // left-associative, so a succeeding `cd` before `||` still changes the
+    // directory for what follows (`cd x || exit; git push` pushes from `x`
+    // whenever the cd works). The earlier "cd before `||` is a no-op"
+    // heuristic misjudged that common `|| exit` idiom; both resolvers now
+    // apply every `cd` the pattern finds, in order.
     for caps in CD_PATTERN.captures_iter(command) {
-        let full_match = caps.get(0).unwrap();
-        let after = command[full_match.end()..].trim_start();
-
-        // If this cd is followed by `||`, the commands after `||` only run
-        // when the cd fails — so the cd doesn't change the effective directory
-        // for those commands.
-        if after.starts_with("||") {
-            continue;
-        }
-
         let target = caps
             .get(2)
             .or(caps.get(3))
@@ -225,8 +222,10 @@ pub fn resolve_cd_target(target: &str, effective: &str) -> String {
     }
 }
 
-/// Maximum recursion depth for shell-wrapper expansion in [`command_segments`].
-const MAX_WRAPPER_DEPTH: usize = 3;
+/// Maximum recursion depth for shell-wrapper / substitution expansion — shared
+/// by [`command_segments`] and by the guard's own scoped commit-target walk,
+/// which reuses [`child_scripts`] on the same budget.
+pub const MAX_WRAPPER_DEPTH: usize = 3;
 
 /// Strip heredoc bodies from a command so their prose never reaches the
 /// segment splitter.
@@ -473,6 +472,103 @@ fn flush_segment_with_op(
     current.clear();
 }
 
+/// Extract clobber-redirect targets from a shell command segment: the file
+/// argument following a `>` or `>|` operator. Append redirects (`>>`) do NOT
+/// truncate an existing file, so they are excluded — the operator is consumed
+/// but no target is recorded for it. Quote-aware: a `>` inside `'…'`/`"…"` is
+/// literal text, not a redirect operator, so prose like `echo "a > b" > c`
+/// yields only `c`. A stream-prefixed form (`2>`, `1>`) still names a file
+/// that gets clobbered, so its target is included — the leading digit is just
+/// an ordinary character before the operator. A fd-duplication form (`>&2`)
+/// has no file target: the target-collection loop below stops at `&`,
+/// yielding an empty string that is discarded. Targets may be quoted (`>
+/// "my note.md"`); the returned string has the quotes stripped. A
+/// backslash-escaped whitespace char (`Daily\ Note.md`) stays part of the
+/// token rather than terminating it — Obsidian filenames routinely contain
+/// spaces. A trailing unmatched `)`/`}` — the artifact of a glued subshell
+/// close like `(: > note.md)` — is stripped from the collected target, since
+/// the parser doesn't track group nesting; a legitimate filename ending in
+/// those characters is the rarer case.
+pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                i += 1;
+            }
+            '>' => {
+                i += 1;
+                // `>>` (append) does not clobber — consume the doubled
+                // operator but record no target for it.
+                if i < chars.len() && chars[i] == '>' {
+                    i += 1;
+                    continue;
+                }
+                // `>|` is the explicit force-clobber operator.
+                if i < chars.len() && chars[i] == '|' {
+                    i += 1;
+                }
+                // Skip whitespace between the operator and the filename.
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                // Collect the target token, honoring a quoted filename.
+                let mut target = String::new();
+                while i < chars.len() {
+                    let tc = chars[i];
+                    if tc == '\'' || tc == '"' {
+                        i += 1;
+                        while i < chars.len() && chars[i] != tc {
+                            target.push(chars[i]);
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            i += 1; // closing quote
+                        }
+                        continue;
+                    }
+                    // A backslash-escaped whitespace char is part of the
+                    // filename, not a token terminator — consume the
+                    // backslash and keep the escaped char.
+                    if tc == '\\' && i + 1 < chars.len() && chars[i + 1].is_whitespace() {
+                        target.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
+                        break;
+                    }
+                    target.push(tc);
+                    i += 1;
+                }
+                // Strip a trailing unmatched `)`/`}` — the artifact of a
+                // glued subshell/group close (`(: > note.md)`), not a real
+                // filename character in the realistic case.
+                let target = target.trim_end_matches([')', '}']).to_string();
+                if !target.is_empty() {
+                    targets.push(target);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    targets
+}
+
 /// Like [`split_segments`], but also expands what a shell would actually run:
 ///
 /// 1. **Wrapper expansion** — a segment whose command word is
@@ -526,6 +622,35 @@ fn expand_segments(
             }
         }
     }
+}
+
+/// Scripts a single segment will itself execute in a child shell context: a
+/// `sh`/`bash`/`zsh`/`dash` `-c <script>` wrapper's script AND any
+/// `$(…)`/backtick substitution bodies in executed context. Both can coexist —
+/// `bash -c 'true' "$(git commit)"` runs the substitution in the parent before
+/// spawning bash — so the two are unioned rather than either/or (guardrails
+/// issue cameronsjo/cadence-hooks#228, review finding 2).
+///
+/// Wrapper detection reads `argv` — the caller's transparent-prefix- and
+/// assignment-stripped token view — so a wrapper behind `exec`/`env`/`VAR=x`
+/// (`exec sh -c '…'`) is still seen (review finding 1). Substitution bodies are
+/// scanned from the raw `segment`, since a substitution in a prefix word
+/// (`env FOO=$(…) …`) also executes in the parent.
+///
+/// A child script starts in the parent's working directory *at that segment*,
+/// but runs in its own process/subshell — its `cd`s never move the parent. A
+/// caller tracking a directory across segments must therefore recurse into
+/// these with a fresh scope rather than flattening via [`command_segments`]:
+/// a flat view splices `$(cd /x)`'s `cd` into the parent stream and moves the
+/// tracked directory for segments the real shell still runs in the parent's
+/// cwd (issue #228).
+pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(inner) = shell_c_argument_tokens(argv) {
+        out.push(inner);
+    }
+    out.extend(substitution_bodies(segment));
+    out
 }
 
 /// Extract command-substitution bodies from a segment: `$(…)` (tracking nested
@@ -685,7 +810,13 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
 /// such as `-lc` (login shell + command); the script is the token following the
 /// flag that carries `c`.
 fn shell_c_argument(segment: &str) -> Option<String> {
-    let tokens = tokenize(segment);
+    shell_c_argument_tokens(&tokenize(segment))
+}
+
+/// Token-slice form of [`shell_c_argument`], so a caller that has already
+/// tokenized (and, in the guard's case, stripped transparent prefixes) can
+/// detect a wrapper without re-tokenizing.
+fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
     let first = tokens.first()?;
     let cmd = first.rsplit('/').next().unwrap_or(first);
     if !matches!(cmd, "sh" | "bash" | "zsh" | "dash") {
@@ -883,6 +1014,86 @@ mod tests {
         );
         // A real pipe still splits.
         assert_eq!(split_segments("echo x | grep y"), vec!["echo x", "grep y"]);
+    }
+
+    // --- clobber_redirect_targets ---
+
+    #[test]
+    fn clobber_redirect_plain_target() {
+        assert_eq!(clobber_redirect_targets("echo hi > f"), vec!["f"]);
+    }
+
+    #[test]
+    fn clobber_redirect_force_operator_target() {
+        assert_eq!(clobber_redirect_targets("echo hi >| f"), vec!["f"]);
+    }
+
+    #[test]
+    fn clobber_redirect_append_excluded() {
+        assert_eq!(
+            clobber_redirect_targets("echo hi >> f"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_quoted_operator_in_string_excluded() {
+        assert_eq!(
+            clobber_redirect_targets(r#"echo "use > carefully""#),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_colon_truncate_target() {
+        assert_eq!(clobber_redirect_targets(": > f"), vec!["f"]);
+    }
+
+    #[test]
+    fn clobber_redirect_stream_prefixed_target_included() {
+        assert_eq!(
+            clobber_redirect_targets("echo hi 2> err.log"),
+            vec!["err.log"]
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_fd_duplication_excluded() {
+        assert_eq!(
+            clobber_redirect_targets("echo hi >&2"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_quoted_target() {
+        assert_eq!(
+            clobber_redirect_targets(r#"echo hi > "my note.md""#),
+            vec!["my note.md"]
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_backslash_escaped_space_target() {
+        // #192 F2: a backslash-escaped space stays part of the filename
+        // rather than terminating the token early.
+        assert_eq!(
+            clobber_redirect_targets(r"echo x > Daily\ Note.md"),
+            vec!["Daily Note.md"]
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_glued_closing_paren_stripped() {
+        // #192 F3: a subshell's glued `)` is not part of the filename.
+        assert_eq!(clobber_redirect_targets("(: > note.md)"), vec!["note.md"]);
+    }
+
+    #[test]
+    fn clobber_redirect_glued_closing_brace_stripped() {
+        // Glued directly (no separator before `}`) so it lands on the target
+        // token, unlike a `;`-separated close which is already a break char.
+        assert_eq!(clobber_redirect_targets("{ : > note.md}"), vec!["note.md"]);
     }
 
     // --- command_segments (wrapper expansion) ---
@@ -1273,10 +1484,16 @@ mod tests {
     }
 
     #[test]
-    fn cd_before_or_does_not_apply() {
-        // cd before || only runs on success; git push runs on failure,
-        // so the push executes from the original cwd, not /project.
-        assert_eq!(parse_work_dir("cd /project || git push", "/home"), "/home");
+    fn cd_before_or_still_redirects_assuming_success() {
+        // Assume-success model (issue #229): a `cd` before `||` still changes
+        // the directory for what follows, since `||`/`&&` are equal-precedence
+        // left-assoc and the common `cd x || exit` idiom pushes from `x`
+        // whenever the cd works. Mirrors git_commit_targets'
+        // `cd_before_or_still_redirects_assuming_success`.
+        assert_eq!(
+            parse_work_dir("cd /project || git push", "/home"),
+            "/project"
+        );
     }
 
     #[test]
@@ -1457,7 +1674,11 @@ mod tests {
     #[test]
     fn cd_or_then_and_cd() {
         // cd /fail || cd /recover && git push
-        // cd /fail is before ||, so skipped; cd /recover is on success path
+        // Assume-success model (issue #229): every `cd` applies in order, so
+        // `cd /fail` redirects first, then `cd /recover` overrides — the last
+        // applied `cd` wins. (Same final directory as the old "skip before
+        // ||" model reached, but by applying both rather than skipping the
+        // first.)
         assert_eq!(
             parse_work_dir("cd /fail || cd /recover && git push", "/home"),
             "/recover"
