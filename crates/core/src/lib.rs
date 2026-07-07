@@ -16,6 +16,7 @@ pub mod paths;
 pub mod shell;
 pub mod time;
 pub mod transcript;
+pub mod worktree;
 
 #[cfg(feature = "test-builders")]
 pub mod test_builders;

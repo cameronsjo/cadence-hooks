@@ -9,7 +9,9 @@
 use crate::identity::{self, SessionRecord};
 use crate::registry::{self, Peer};
 use cadence_hooks_core::shell::git_command;
+use cadence_hooks_core::worktree::would_block_here;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+use std::path::Path;
 
 /// Register this session and disclose live peers.
 pub struct Start;
@@ -44,11 +46,19 @@ pub fn run_start(
     branch: Option<String>,
     stale_secs: u64,
 ) -> CheckResult {
+    // Independent of session registration: fires whenever `enforce-worktree`
+    // would actually block a mutation here, so a session with no (or an
+    // unsafe) session_id — or one whose registry write fails — still learns
+    // about the wall before hitting it. Computed via the exact predicate
+    // `enforce-worktree` uses to decide a real block, so the two can never
+    // drift apart (cadence-hooks#236).
+    let posture = input.cwd.as_deref().and_then(worktree_posture_line);
+
     let Some(sid) = input
         .session_id()
         .filter(|s| identity::is_safe_session_id(s))
     else {
-        return CheckResult::allow();
+        return finish(posture, None);
     };
 
     // Register (or re-register on resume — preserves any declared
@@ -95,7 +105,7 @@ pub fn run_start(
     };
     if registry::write_record(dir, &record).is_err() {
         // Fail open: a read-only filesystem must not break session start.
-        return CheckResult::allow();
+        return finish(posture, None);
     }
 
     // Housekeeping: presumed-dead peers leave the room before roll call. Our
@@ -104,10 +114,35 @@ pub fn run_start(
 
     // Disclose live peers, if any.
     let peers = registry::live_peers(dir, sid, stale_secs);
-    if peers.is_empty() {
-        return CheckResult::allow();
+    let peer_disclosure = (!peers.is_empty()).then(|| render_disclosure(&record, &peers));
+    finish(posture, peer_disclosure)
+}
+
+/// The worktree-posture line for `cwd`, or `None` when `enforce-worktree`
+/// would not block a mutation here (linked worktree, an exempted repo,
+/// active snooze, temp root, etc.). Delegates to
+/// [`cadence_hooks_core::worktree::would_block_here`] — the identical
+/// predicate `enforce-worktree` consults to decide a real block — so the
+/// posture line can never fire (or stay silent) out of step with the wall
+/// itself (cadence-hooks#236).
+fn worktree_posture_line(cwd: &str) -> Option<String> {
+    would_block_here(Path::new(cwd)).then(|| {
+        "Branch-mode repo, primary checkout: feature work starts in a worktree \
+         (EnterWorktree / git worktree add) — the first Edit/Write here will be blocked."
+            .to_string()
+    })
+}
+
+/// Compose the final result from the optional posture line and optional peer
+/// disclosure: `Nudge` if either is present, else `Allow`. The single point
+/// where the two independent disclosures on this surface are joined.
+fn finish(posture: Option<String>, peer_disclosure: Option<String>) -> CheckResult {
+    let parts: Vec<String> = [posture, peer_disclosure].into_iter().flatten().collect();
+    if parts.is_empty() {
+        CheckResult::allow()
+    } else {
+        CheckResult::nudge(parts.join("\n\n"))
     }
-    CheckResult::nudge(render_disclosure(&record, &peers))
 }
 
 /// Render the peer disclosure: who else is live, what they're touching, and
@@ -454,5 +489,273 @@ mod tests {
         let msg = render_disclosure(&own, &peers);
         assert!(msg.contains("quiet-loom"));
         assert!(msg.contains("amber-anvil"));
+    }
+
+    // --- worktree-posture line (cadence-hooks#236) ---
+    //
+    // Fixtures live under `target/`, NOT a tempdir — `is_temp_root`'s own
+    // exemption would otherwise mask the posture line entirely (the
+    // documented Scratch/E2E gotcha; see enforce_worktree's identical
+    // pattern). Serialized against the other env-mutating tests in this
+    // block via ENV_LOCK, since `would_block_here` reads real process env.
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/session-posture-scratch")
+                .join(format!("{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?} failed in {dir:?}");
+    }
+
+    fn init_repo(dir: &Path) {
+        git_in(dir, &["init", "-q", "-b", "main"]);
+        git_in(dir, &["config", "user.email", "t@t"]);
+        git_in(dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        git_in(dir, &["add", "f.txt"]);
+        git_in(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Run `f` with `CADENCE_ALLOW_MAIN`/`CADENCE_NO_ENFORCE_WORKTREE`
+    /// cleared, restoring whatever the caller's own environment had
+    /// afterward. `would_block_here` reads real process env, and a caller's
+    /// environment may already carry a session-wide `CADENCE_ALLOW_MAIN=true`
+    /// — every test that asserts the posture line actually FIRES needs a
+    /// clean slate for that assertion to mean anything. Serialized via
+    /// ENV_LOCK against the other env-mutating tests in this module.
+    fn with_clean_worktree_env<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_allow = std::env::var("CADENCE_ALLOW_MAIN").ok();
+        let prev_kill = std::env::var("CADENCE_NO_ENFORCE_WORKTREE").ok();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var("CADENCE_ALLOW_MAIN");
+            std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE");
+        }
+        let result = f();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prev_allow {
+                Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
+                None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
+            }
+            match prev_kill {
+                Some(v) => std::env::set_var("CADENCE_NO_ENFORCE_WORKTREE", v),
+                None => std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn posture_line_fires_in_primary_checkout() {
+        let scratch = Scratch::new("primary");
+        init_repo(&scratch.0);
+        let line = with_clean_worktree_env(|| worktree_posture_line(&scratch.0.to_string_lossy()));
+        assert!(line.is_some());
+        let msg = line.unwrap();
+        assert!(msg.contains("primary checkout"));
+        assert!(msg.contains("EnterWorktree"));
+        assert!(msg.contains("blocked"));
+    }
+
+    #[test]
+    fn posture_line_silent_in_linked_worktree() {
+        let scratch = Scratch::new("wt");
+        init_repo(&scratch.0);
+        let wt = scratch.0.join("wt");
+        git_in(
+            &scratch.0,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
+        );
+        assert!(worktree_posture_line(&wt.to_string_lossy()).is_none());
+    }
+
+    #[test]
+    fn posture_line_silent_when_allow_main_env_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let scratch = Scratch::new("allow-main-env");
+        init_repo(&scratch.0);
+        // SAFETY: serialized via ENV_LOCK against the other env-mutating
+        // posture tests in this module.
+        unsafe { std::env::set_var("CADENCE_ALLOW_MAIN", "true") };
+        let line = worktree_posture_line(&scratch.0.to_string_lossy());
+        unsafe { std::env::remove_var("CADENCE_ALLOW_MAIN") };
+        assert!(line.is_none(), "CADENCE_ALLOW_MAIN env silences the line");
+    }
+
+    #[test]
+    fn posture_line_silent_when_allow_main_repo_declared() {
+        let scratch = Scratch::new("allow-main-repo");
+        init_repo(&scratch.0);
+        let claude_dir = scratch.0.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        )
+        .unwrap();
+        assert!(worktree_posture_line(&scratch.0.to_string_lossy()).is_none());
+    }
+
+    #[test]
+    fn posture_line_silent_when_kill_switch_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let scratch = Scratch::new("kill-switch");
+        init_repo(&scratch.0);
+        // SAFETY: serialized via ENV_LOCK against the other env-mutating
+        // posture tests in this module.
+        unsafe { std::env::set_var("CADENCE_NO_ENFORCE_WORKTREE", "1") };
+        let line = worktree_posture_line(&scratch.0.to_string_lossy());
+        unsafe { std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE") };
+        assert!(line.is_none(), "kill switch silences the line");
+    }
+
+    #[test]
+    fn posture_line_silent_when_snoozed() {
+        let scratch = Scratch::new("snoozed");
+        init_repo(&scratch.0);
+        let marker =
+            cadence_hooks_core::worktree::enforce_worktree_marker_path_for(&scratch.0).unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(&marker, format!("{until}\n")).unwrap();
+        assert!(worktree_posture_line(&scratch.0.to_string_lossy()).is_none());
+    }
+
+    #[test]
+    fn run_start_nudges_on_posture_alone_with_zero_peers() {
+        // The core fix: today `run_start` returns Allow silently when there
+        // are no live peers. A primary-checkout cwd must still surface the
+        // posture line even with an empty room.
+        let scratch = Scratch::new("run-start-solo");
+        init_repo(&scratch.0);
+        let registry_dir = tempfile::TempDir::new().unwrap();
+        let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
+        let r = with_clean_worktree_env(|| {
+            run_start(&input, registry_dir.path(), Some("main".into()), 600)
+        });
+        assert_eq!(r.outcome, Outcome::Nudge, "posture alone still nudges");
+        let msg = r.message.unwrap();
+        assert!(msg.contains("primary checkout"));
+        assert!(
+            !msg.contains("Multi-session protocol"),
+            "no peers → no peer disclosure block: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_start_joins_posture_and_peer_disclosure() {
+        let scratch = Scratch::new("run-start-both");
+        init_repo(&scratch.0);
+        let registry_dir = tempfile::TempDir::new().unwrap();
+        let cwd = scratch.0.to_string_lossy().into_owned();
+
+        let peer_input = make_session_with_cwd("peer-session", "startup", &cwd);
+        run_start(&peer_input, registry_dir.path(), Some("feat/x".into()), 600);
+
+        let input = make_session_with_cwd("self-session", "startup", &cwd);
+        let r = with_clean_worktree_env(|| {
+            run_start(&input, registry_dir.path(), Some("main".into()), 600)
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("primary checkout"), "posture line present");
+        assert!(
+            msg.contains("Multi-session protocol"),
+            "peer disclosure also present: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_start_stays_silent_off_primary_checkout() {
+        // A linked worktree cwd with no peers: neither disclosure fires.
+        let scratch = Scratch::new("run-start-wt");
+        init_repo(&scratch.0);
+        let wt = scratch.0.join("wt");
+        git_in(
+            &scratch.0,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/y"],
+        );
+        let registry_dir = tempfile::TempDir::new().unwrap();
+        let input = make_session_with_cwd("solo-wt", "startup", &wt.to_string_lossy());
+        let r = run_start(&input, registry_dir.path(), Some("feat/y".into()), 600);
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    /// Parity: for a matrix of dirs, the posture line fires if and only if
+    /// `enforce-worktree` would actually block a mutation there. Drives the
+    /// REAL `EnforceWorktree` check (not a re-derivation) so the two can
+    /// never silently drift apart.
+    #[test]
+    fn posture_line_matches_enforce_worktree_block_decision() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let scratch = Scratch::new("parity");
+        let primary = scratch.0.join("primary");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        let wt = scratch.0.join("wt");
+        git_in(
+            &primary,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
+        );
+
+        let snoozed = scratch.0.join("snoozed-repo");
+        std::fs::create_dir(&snoozed).unwrap();
+        init_repo(&snoozed);
+        let marker =
+            cadence_hooks_core::worktree::enforce_worktree_marker_path_for(&snoozed).unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(&marker, format!("{until}\n")).unwrap();
+
+        for dir in [&primary, &wt, &snoozed] {
+            let file = dir.join("src.rs");
+            let mut edit_input =
+                cadence_hooks_core::test_builders::make_edit(&file.to_string_lossy(), "a", "b");
+            edit_input.cwd = Some(dir.to_string_lossy().into_owned());
+
+            let would_block = cadence_hooks_guardrails::enforce_worktree::EnforceWorktree
+                .run(&edit_input)
+                .outcome
+                == Outcome::Block;
+            let posture_fires = worktree_posture_line(&dir.to_string_lossy()).is_some();
+            assert_eq!(
+                posture_fires, would_block,
+                "posture line vs enforce-worktree disagree for {dir:?}"
+            );
+        }
     }
 }

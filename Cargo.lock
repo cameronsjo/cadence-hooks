@@ -275,6 +275,7 @@ name = "cadence-hooks-session"
 version = "0.49.0"
 dependencies = [
  "cadence-hooks-core",
+ "cadence-hooks-guardrails",
  "serde",
  "serde_json",
  "tempfile",

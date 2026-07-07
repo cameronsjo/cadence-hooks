@@ -88,14 +88,6 @@ pub fn read_meta(input: &HookInput, repo_root: &Path) -> Option<SnoozeMeta> {
     SnoozeMeta::read(&sidecar)
 }
 
-/// Pure: given the marker contents and current epoch, is the snooze active?
-/// Shared with `dismiss_enforce_worktree`, which uses the same marker format and
-/// stays repo-scoped by design (it exempts the shared primary checkout).
-pub(crate) fn is_snoozed_at(marker_contents: &str, now_epoch: u64) -> bool {
-    let parsed: Option<u64> = marker_contents.trim().parse().ok();
-    matches!(parsed, Some(until) if until > now_epoch)
-}
-
 /// Pure: is the session snooze active, with the parsed expiry **clamped** to
 /// `mtime_epoch + MAX_SNOOZE_SECONDS`? The 24h cap is thereby enforced on read,
 /// not just at write time — a marker whose body was tampered to a far-future
@@ -352,36 +344,6 @@ mod tests {
     #[test]
     fn parse_duration_trims_whitespace() {
         assert_eq!(parse_duration("  30m  "), Some(Duration::from_secs(1800)));
-    }
-
-    // --- is_snoozed_at (pure decision) ---
-
-    #[test]
-    fn snoozed_when_marker_in_future() {
-        assert!(is_snoozed_at("2000000000", 1_000_000_000));
-    }
-
-    #[test]
-    fn not_snoozed_when_marker_in_past() {
-        assert!(!is_snoozed_at("100", 1_000_000_000));
-    }
-
-    #[test]
-    fn not_snoozed_when_marker_equal_to_now() {
-        // Exactly-equal counts as expired — the snooze window is exclusive at
-        // its upper bound, otherwise a zero-duration snooze would briefly fire.
-        assert!(!is_snoozed_at("1000", 1000));
-    }
-
-    #[test]
-    fn not_snoozed_when_marker_unparseable() {
-        assert!(!is_snoozed_at("not-a-number", 1_000_000_000));
-        assert!(!is_snoozed_at("", 1_000_000_000));
-    }
-
-    #[test]
-    fn snoozed_tolerates_trailing_newline() {
-        assert!(is_snoozed_at("2000000000\n", 1_000_000_000));
     }
 
     // --- marker_path ---

@@ -71,23 +71,14 @@
 
 use crate::dismiss_enforce_worktree;
 use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
-use crate::warn_subagent_worktree::is_primary_checkout;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, child_scripts, resolve_cd_target, split_segments_with_ops, tokenize,
 };
+use cadence_hooks_core::worktree::{is_primary_checkout, is_temp_root, is_truthy, should_block};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Pure: classify a truthy env value (`1`/`true`/`yes`, trimmed,
-/// case-insensitive). Mirrors `warn_main_branch::is_main_allowed_value`.
-fn is_truthy(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes")
-    )
-}
 
 /// Environment inputs resolved once per invocation, injected into the
 /// assessment so tests can pin them without touching process env.
@@ -135,25 +126,9 @@ impl RepoAllowMain {
     }
 }
 
-/// Pure: is `repo_root` inside a temp tree? `tmpdir` is the `$TMPDIR` value,
-/// when set. Scratch/fixture repos live here; enforcing worktree discipline on
-/// them would only produce noise.
-fn is_temp_root(repo_root: &Path, tmpdir: Option<&str>) -> bool {
-    let fixed = repo_root.starts_with("/tmp") || repo_root.starts_with("/private/tmp");
-    let via_env = tmpdir
-        .map(str::trim)
-        .filter(|t| !t.is_empty() && *t != "/")
-        .is_some_and(|t| {
-            // `repo_root` comes from `git rev-parse --show-toplevel`, which
-            // canonicalizes (`/private/var/…` on macOS) while `$TMPDIR` does
-            // not (`/var/folders/…`) — compare against the canonicalized
-            // tmpdir too, or the exemption never fires on macOS.
-            repo_root.starts_with(t)
-                || std::fs::canonicalize(t)
-                    .is_ok_and(|c| c != Path::new("/") && repo_root.starts_with(&c))
-        });
-    fixed || via_env
-}
+// `is_temp_root` moved to `cadence_hooks_core::worktree` (cadence-hooks#236)
+// so the enforce-worktree block decision and `session::start`'s posture
+// line share one definition — re-imported above.
 
 /// A resolved commit target directory (absolute, or built by joining `cwd`
 /// with the accumulated `cd`s and/or a `-C` redirect — see
@@ -405,16 +380,8 @@ fn collect_commit_targets(script: &str, cwd: &str, depth: usize, targets: &mut V
     }
 }
 
-/// Pure decision, all environment resolved by the caller.
-fn should_block(
-    is_primary: bool,
-    allowed_main: bool,
-    kill_switch: bool,
-    temp_root: bool,
-    snoozed: bool,
-) -> bool {
-    is_primary && !allowed_main && !kill_switch && !temp_root && !snoozed
-}
+// `should_block` moved to `cadence_hooks_core::worktree` (cadence-hooks#236)
+// — re-imported above; this IS the same function `would_block_here` calls.
 
 /// The block message: names the checkout and every escape hatch. When
 /// `origin_repo` names a *different* repo than `repo_root` — a `cd <dir> &&

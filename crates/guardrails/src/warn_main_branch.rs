@@ -18,8 +18,9 @@
 //! branch. That work is never the branch-worthy product change the warning targets.
 
 use crate::dismiss_main_branch_warn;
+pub(crate) use cadence_hooks_core::worktree::{is_claude_managed_dir, is_plan_doc_dir};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Resolve the directory to pass to `git -C` for a given hook input.
@@ -58,68 +59,10 @@ pub(crate) fn git_dir_for_input(input: &HookInput) -> PathBuf {
         .unwrap_or(cwd)
 }
 
-/// Lexically normalize `dir`'s components — resolving `.` and `..` without
-/// touching the filesystem — returning the surviving component `OsString`s
-/// (root/prefix dropped; carve-outs match only normal segments).
-///
-/// A guard must not hit disk (ADR-0001, fail-open), so a `ParentDir` *pops*
-/// the preceding normal component rather than following a symlink. This stops
-/// a crafted `file_path` like `docs/plans/../../src/main.rs` from spoofing a
-/// carve-out: its parent `docs/plans/../../src` normalizes to `src`, so the
-/// real product file still warns (#152). Merely *removing* `..` would leave
-/// `docs/plans/src` and keep matching — the preceding-pop is what closes it.
-fn normalized_components(dir: &Path) -> Vec<std::ffi::OsString> {
-    let mut out: Vec<std::ffi::OsString> = Vec::new();
-    for c in dir.components() {
-        match c {
-            Component::Normal(s) => out.push(s.to_os_string()),
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-        }
-    }
-    out
-}
-
-/// Returns true if `dir` lives inside a `.claude/` directory.
-///
-/// These paths hold Claude Code tooling and state, never the branch-worthy
-/// product work the warning targets, so the check stays out of them:
-///
-/// - `<repo>/.claude/worktrees/<name>/...` — worktrees created by
-///   `EnterWorktree` / `cadence-forge:using-worktrees` are always on an
-///   intentional feature branch. A worktree that happens to sit on `main` is
-///   still ad-hoc work, never the load-bearing primary checkout (issue #33).
-/// - `~/.claude/...` — user config and the auto-written memory directory.
-///   `~/.claude` may itself be a git repo on `main`, but edits there aren't
-///   repo feature work (issue #35).
-///
-/// Matches on an exact `.claude` path component, so look-alikes like
-/// `.claude-old` or `myclaude` are not exempt.
-pub(crate) fn is_claude_managed_dir(dir: &Path) -> bool {
-    normalized_components(dir)
-        .iter()
-        .any(|c| c.as_os_str() == ".claude")
-}
-
-/// Returns true if `dir` is a cadence plan-document directory (`docs/plans`).
-///
-/// Approved plans are copied to `docs/plans/` on the default branch by design —
-/// cadence's plan-execution rule mandates it — so authoring a plan there is not
-/// the branch-worthy product change this warning targets. Without the carve-out
-/// the once-per-session warning is *consumed* by that first plan-doc write, so
-/// later real product edits on `main` then escape unwarned (issue #226).
-///
-/// Matches consecutive `docs` → `plans` path components anywhere in the path, so
-/// a bare `plans/`, a non-adjacent `docs/foo/plans`, or a look-alike like
-/// `mydocs/plans` is not exempt.
-pub(crate) fn is_plan_doc_dir(dir: &Path) -> bool {
-    let comps = normalized_components(dir);
-    comps
-        .windows(2)
-        .any(|w| w[0].as_os_str() == "docs" && w[1].as_os_str() == "plans")
-}
+// `is_claude_managed_dir` and `is_plan_doc_dir` moved to
+// `cadence_hooks_core::worktree` (cadence-hooks#236) so `enforce_worktree`
+// and `session::start`'s posture line share the exact same carve-out
+// predicate — re-imported above.
 
 /// Returns true if the branch name is a default branch (`main` or `master`).
 fn is_default_branch(branch: &str) -> bool {
