@@ -124,6 +124,33 @@ pub fn utc_timestamp() -> String {
     cadence_hooks_core::time::utc_timestamp()
 }
 
+// ---------------------------------------------------------------------------
+// Schema versioning (the metrics data contract)
+// ---------------------------------------------------------------------------
+//
+// A metrics stream MAY stamp an explicit integer `schemaVersion` on every row
+// so consumers branch on a declared contract version instead of probing field
+// presence. Each stream's version is a `*_SCHEMA_VERSION` constant defined here
+// — one greppable source of truth — read by that stream's logger. Keep the
+// constant and the stream's row in `plugins/cadence-metrics/docs/schema.md`
+// (cadence repo) in lockstep.
+//
+// Bump policy (Keep-a-Changelog for the data contract):
+//   - ADDITIVE change (new nullable field, new `event` enum value): DO NOT bump.
+//     Old consumers keep working; the field/value is simply absent or unseen on
+//     older rows.
+//   - BREAKING change (field renamed / removed / retyped, or a field's meaning
+//     changes): bump the stream's constant by 1 and document the cutover in a
+//     "Schema version history" note in `schema.md`.
+//
+// Streams predating this convention (`commits` / `subagents` / `denials` /
+// `sessions`) are implicitly version 0. They adopt a constant here on their
+// *next* shape change (opportunistic adoption, cadence#238) — historical
+// un-stamped lines are never backfilled.
+
+/// Schema version stamped on every `plan-phases.jsonl` row.
+pub const PLAN_PHASE_SCHEMA_VERSION: u32 = 1;
+
 /// Crate-wide serialization lock for env-mutating tests.
 ///
 /// `CADENCE_METRICS_DIR` and its siblings are process-global, so every test that

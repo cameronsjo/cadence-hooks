@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **The `schemaVersion` metrics-stream convention is now centralized with an explicit bump policy (cameronsjo/cadence#238).** `plan-phases.jsonl` piloted a per-file `SCHEMA_VERSION` constant (shipped 0.47.0); that value now lives in `crates/metrics/src/common.rs` as `PLAN_PHASE_SCHEMA_VERSION`, read from one source, alongside a documented additive-vs-breaking bump policy (Keep-a-Changelog for the data contract). No row shape changes — `plan-phases.jsonl` still emits `schemaVersion: 1`. New streams are born versioned; the four pre-existing v0 streams (`commits`/`subagents`/`denials`/`sessions`) adopt the field on their *next* shape change (opportunistic adoption), and historical un-stamped lines are never backfilled.
+
 ## [0.50.0] - 2026-07-07
 
 ### Added

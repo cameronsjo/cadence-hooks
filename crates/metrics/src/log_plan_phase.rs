@@ -9,8 +9,9 @@
 //! / `costUsd` / `model` to `null` rather than skipping the write, so a
 //! plan-phase transition is never silently dropped for lack of pricing data.
 //!
-//! Pilots the `schemaVersion` convention (stamped `1` on every row) — not yet
-//! adopted by the other metrics streams.
+//! Stamps `schemaVersion` (`common::PLAN_PHASE_SCHEMA_VERSION`) on every row.
+//! The shared per-stream version convention and its bump policy live in
+//! [`crate::common`] (schema versioning section).
 
 use crate::common;
 use crate::compute_cost::compute_cost_by_model;
@@ -19,9 +20,6 @@ use crate::scan_tokens::{ScanResult, scan_tokens};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
 use std::io::Write;
-
-/// Schema version stamped on every `plan-phases.jsonl` row.
-const SCHEMA_VERSION: u32 = 1;
 
 /// Appends a line to `plan-phases.jsonl` for each plan lifecycle event. Holds
 /// the optional price table override path supplied via `--prices`, mirroring
@@ -139,7 +137,7 @@ fn build_plan_phase_record(
     });
 
     let mut record = json!({
-        "schemaVersion": SCHEMA_VERSION,
+        "schemaVersion": common::PLAN_PHASE_SCHEMA_VERSION,
         "ts": ts,
         "event": event,
         "sessionId": input.session_id,
@@ -238,7 +236,7 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(record["schemaVersion"], 1);
+        assert_eq!(record["schemaVersion"], common::PLAN_PHASE_SCHEMA_VERSION);
         assert_eq!(record["ts"], "2026-07-05T00:00:00Z");
         assert_eq!(record["event"], "plan_exit");
         assert_eq!(record["sessionId"], "s1");
