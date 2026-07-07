@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`prevent-secret-leaks`'s Bash read path now applies the pure-loader `.envrc` content carve-out (#193).** Reading a direnv loader-only `.envrc` via a shell command (e.g. `cat .envrc`) is now allowed when the on-disk content proves it carries no secret; a secret-bearing or unreadable/absent `.envrc` still blocks. Mirrors the existing Read/Grep-arm carve-out.
+
 ## [0.49.0] - 2026-07-06
 
 ### Fixed
