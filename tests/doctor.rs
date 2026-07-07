@@ -534,6 +534,140 @@ fn doctor_root_scan_ignores_stale_metrics_env() {
     );
 }
 
+// ── doctor --prune / --apply ────────────────────────────────────────────────
+
+/// Write `<root>/installed_plugins.json` (v2 schema) pinning `label` to
+/// `install_path` — the `--root`-driven manifest path `doctor --prune` reads
+/// when `root_override` is set.
+fn write_installed_plugins_manifest(
+    root: &std::path::Path,
+    label: &str,
+    install_path: &std::path::Path,
+) {
+    let manifest = format!(
+        r#"{{
+  "version": 2,
+  "plugins": {{
+    "{label}": [
+      {{ "scope": "user", "installPath": {p} }}
+    ]
+  }}
+}}"#,
+        p = serde_json::to_string(install_path.to_str().unwrap()).unwrap()
+    );
+    std::fs::write(root.join("installed_plugins.json"), manifest).unwrap();
+}
+
+#[test]
+fn doctor_prune_dry_run_lists_orphans_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "my-plugin",
+        "pinned-sha",
+        BUGGY_HOOKS_JSON,
+    );
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "my-plugin",
+        "orphan-sha",
+        BUGGY_HOOKS_JSON,
+    );
+    let pinned_path = tmp.path().join("workbench/my-plugin/pinned-sha");
+    let orphan_path = tmp.path().join("workbench/my-plugin/orphan-sha");
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned_path);
+
+    let output = cadence_hooks()
+        .args(["doctor", "--prune", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "dry-run prune exits 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("orphan-sha"),
+        "dry-run must list the orphan path: {stdout}"
+    );
+    assert!(
+        stdout.contains("--apply"),
+        "dry-run must mention how to actually remove: {stdout}"
+    );
+    assert!(orphan_path.exists(), "dry-run must not delete anything");
+    assert!(pinned_path.exists());
+}
+
+#[test]
+fn doctor_prune_apply_removes_orphans() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "my-plugin",
+        "pinned-sha",
+        BUGGY_HOOKS_JSON,
+    );
+    write_cached_plugin(
+        tmp.path(),
+        "workbench",
+        "my-plugin",
+        "orphan-sha",
+        BUGGY_HOOKS_JSON,
+    );
+    let pinned_path = tmp.path().join("workbench/my-plugin/pinned-sha");
+    let orphan_path = tmp.path().join("workbench/my-plugin/orphan-sha");
+    write_installed_plugins_manifest(tmp.path(), "my-plugin@workbench", &pinned_path);
+
+    let output = cadence_hooks()
+        .args(["doctor", "--prune", "--apply", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "apply prune exits 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !orphan_path.exists(),
+        "--apply must remove the orphaned version dir"
+    );
+    assert!(
+        pinned_path.exists(),
+        "--apply must never touch the pinned version dir"
+    );
+}
+
+#[test]
+fn doctor_apply_without_prune_is_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let output = cadence_hooks()
+        .args(["doctor", "--apply", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--apply without --prune is a usage error.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn doctor_default_scan_falls_back_to_cache_walk_without_manifest() {
     // No installed_plugins.json — recursively walk the cache dir instead.

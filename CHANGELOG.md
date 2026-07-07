@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`doctor --prune` lists orphaned plugin-cache version dirs (dry-run default); `doctor --prune --apply` removes them; `--apply` alone is a usage error (#200).**
+
 ## [0.49.0] - 2026-07-06
 
 ### Fixed

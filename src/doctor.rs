@@ -500,6 +500,46 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// Concrete orphaned version directories across every `(label, install_path)`
+/// pair in `pinned` — siblings of each `install_path`'s parent whose basename
+/// isn't the pinned basename. Pure (no filesystem writes); reused by both
+/// [`orphan_findings`] (advisory count/bytes) and the `doctor --prune` flow
+/// (actual removal via [`prune_orphans`]), so the sibling-scan + symlink
+/// guards live in exactly one place.
+fn orphan_dirs(pinned: &[(String, PathBuf)]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    for (_label, install_path) in pinned {
+        let Some(parent) = install_path.parent() else {
+            continue;
+        };
+        let Some(pinned_name) = install_path.file_name() else {
+            continue;
+        };
+        let Ok(siblings) = std::fs::read_dir(parent) else {
+            continue;
+        };
+
+        for sibling in siblings.flatten() {
+            // `DirEntry::file_type()` does NOT follow symlinks (unlike
+            // `sibling.path().is_dir()`, which does) — a symlinked sibling
+            // must never be treated as an orphan version dir to recurse
+            // into, or a planted symlink (e.g. pointing at `$HOME` or `/`)
+            // gets summed/removed as if it were real cache content.
+            let is_real_dir = sibling.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_real_dir {
+                continue;
+            }
+            if sibling.file_name() == pinned_name {
+                continue;
+            }
+            out.push(sibling.path());
+        }
+    }
+
+    out
+}
+
 /// Findings for orphaned and missing/empty pinned plugin-cache version dirs.
 ///
 /// `pinned` is `(label, install_path)` from [`manifest_install_paths`] — the
@@ -542,49 +582,155 @@ fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool) -> Vec<Finding> {
         let Some(parent) = install_path.parent() else {
             continue;
         };
-        let Some(pinned_name) = install_path.file_name() else {
+        let single = [(label.clone(), install_path.clone())];
+        let dirs = orphan_dirs(&single);
+        if dirs.is_empty() {
             continue;
-        };
-        let Ok(siblings) = std::fs::read_dir(parent) else {
-            continue;
-        };
-
-        let mut orphan_count = 0u32;
-        let mut orphan_bytes = 0u64;
-        for sibling in siblings.flatten() {
-            // `DirEntry::file_type()` does NOT follow symlinks (unlike
-            // `sibling.path().is_dir()`, which does) — a symlinked sibling
-            // must never be treated as an orphan version dir to recurse
-            // into, or a planted symlink (e.g. pointing at `$HOME` or `/`)
-            // gets summed as if it were real cache content.
-            let is_real_dir = sibling.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if !is_real_dir {
-                continue;
-            }
-            if sibling.file_name() == pinned_name {
-                continue;
-            }
-            orphan_count += 1;
-            orphan_bytes += dir_size_bytes(&sibling.path());
         }
 
-        if orphan_count > 0 {
-            let mib = orphan_bytes as f64 / (1024.0 * 1024.0);
-            findings.push(Finding {
-                severity: Severity::Warning,
-                plugin: label.clone(),
-                file: parent.to_path_buf(),
-                line: None,
-                snippet: format!("{orphan_count} orphaned version dir(s)"),
-                diagnosis: format!(
-                    "{orphan_count} orphaned version dir(s) (~{mib:.1} MiB) left in cache"
-                ),
-                remediation: "safe to prune — not the active pinned version".to_string(),
-            });
-        }
+        let orphan_count = dirs.len();
+        let orphan_bytes: u64 = dirs.iter().map(|d| dir_size_bytes(d)).sum();
+        let mib = orphan_bytes as f64 / (1024.0 * 1024.0);
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: label.clone(),
+            file: parent.to_path_buf(),
+            line: None,
+            snippet: format!("{orphan_count} orphaned version dir(s)"),
+            diagnosis: format!(
+                "{orphan_count} orphaned version dir(s) (~{mib:.1} MiB) left in cache"
+            ),
+            remediation: "safe to prune — not the active pinned version".to_string(),
+        });
     }
 
     findings
+}
+
+/// Remove (or, when `apply` is false, merely size up) the given orphaned
+/// version directories. Returns `(removed_count, freed_bytes)` — in dry-run
+/// mode both reflect what *would* be removed, since nothing is deleted.
+///
+/// Each directory is re-verified with [`std::fs::symlink_metadata`]
+/// immediately before [`std::fs::remove_dir_all`] — narrowing the TOCTOU
+/// window between the scan that produced `dirs` and the removal itself, so a
+/// path that became a symlink (or vanished) in between is never followed or
+/// removed. Fails open per-directory: an unremovable dir is skipped with a
+/// warning to stderr, never fatal to the batch.
+fn prune_orphans(dirs: &[PathBuf], apply: bool) -> (usize, u64) {
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+
+    for dir in dirs {
+        let is_real_dir = std::fs::symlink_metadata(dir)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        if !is_real_dir {
+            continue;
+        }
+
+        let size = dir_size_bytes(dir);
+        if !apply {
+            removed += 1;
+            freed += size;
+            continue;
+        }
+
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {
+                removed += 1;
+                freed += size;
+            }
+            Err(e) => {
+                eprintln!(
+                    "cadence-hooks doctor --prune: could not remove {}: {e}",
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    (removed, freed)
+}
+
+/// `doctor --prune` entry point: list (or, with `apply`, remove) orphaned
+/// plugin-cache version dirs. Dry-run by default (decision D4) — `apply`
+/// must be paired with `prune` at the call site (`run` enforces this before
+/// dispatching here).
+///
+/// Honors `root_override` the same way the rest of `doctor` does: with
+/// `--root`, the manifest is read from `<root>/installed_plugins.json` (so
+/// integration tests can drive a fixture cache); without it, from the live
+/// `~/.claude/plugins/installed_plugins.json`. A missing manifest is not an
+/// error here — nothing to prune reports cleanly at exit 0.
+fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
+    let manifest = match root_override {
+        Some(root) => {
+            if !root.exists() {
+                eprintln!(
+                    "cadence-hooks doctor: scan root does not exist: {}",
+                    root.display()
+                );
+                return 2;
+            }
+            root.join("installed_plugins.json")
+        }
+        None => {
+            let Some(plugins) = plugins_dir() else {
+                eprintln!("cadence-hooks doctor: $HOME not set; cannot locate plugin cache");
+                return 2;
+            };
+            plugins.join("installed_plugins.json")
+        }
+    };
+
+    let Some(pinned) = manifest_install_paths(&manifest) else {
+        if !quiet {
+            println!(
+                "cadence-hooks doctor --prune: no installed-plugins manifest at {} — nothing to prune",
+                manifest.display()
+            );
+        }
+        return 0;
+    };
+
+    let dirs = orphan_dirs(&pinned);
+    if dirs.is_empty() {
+        if !quiet {
+            println!("cadence-hooks doctor --prune: no orphaned plugin-cache version dirs found");
+        }
+        return 0;
+    }
+
+    if !quiet {
+        for dir in &dirs {
+            let size = dir_size_bytes(dir);
+            let mib = size as f64 / (1024.0 * 1024.0);
+            let marker_note = if dir.join(".orphaned_at").exists() {
+                " [marked .orphaned_at]"
+            } else {
+                ""
+            };
+            println!("  {} (~{mib:.1} MiB){marker_note}", dir.display());
+        }
+    }
+
+    let (removed, freed_bytes) = prune_orphans(&dirs, apply);
+    let freed_mib = freed_bytes as f64 / (1024.0 * 1024.0);
+
+    if !quiet {
+        if apply {
+            println!(
+                "cadence-hooks doctor --prune --apply: removed {removed} orphaned version dir(s), freed ~{freed_mib:.1} MiB"
+            );
+        } else {
+            println!(
+                "cadence-hooks doctor --prune: {removed} orphaned version dir(s) (~{freed_mib:.1} MiB) would be removed — dry-run, nothing deleted. Re-run with --apply to remove them."
+            );
+        }
+    }
+
+    0
 }
 
 /// One `(marketplace, install_location, declared_repo)` from
@@ -688,7 +834,23 @@ fn canonical_remote_finding(
 /// Stream split in quiet mode is deliberate: warnings go to stdout (a caller
 /// capturing stdout gets the skew nudge to inject), errors go to stderr (a
 /// caller redirecting stderr to /dev/null still fails on the exit code).
-pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
+///
+/// `prune` switches to the orphaned-cache-dir listing/removal mode (see
+/// [`run_prune`]) instead of the hooks.json scan above — dry-run by default
+/// (decision D4); `apply` actually removes and requires `prune` (a usage
+/// error, exit 2, otherwise).
+pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) -> u8 {
+    if apply && !prune {
+        eprintln!(
+            "cadence-hooks doctor: --apply requires --prune (dry-run first with --prune, then --prune --apply)"
+        );
+        return 2;
+    }
+
+    if prune {
+        return run_prune(root_override, quiet, apply);
+    }
+
     // Resolve the install channel once — it's process-invariant, so the scan
     // below shouldn't re-probe current_exe() per hook entry.
     let channel = install_channel();
@@ -1496,7 +1658,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), false), 0);
+        assert_eq!(run(Some(root.path()), false, false, false), 0);
     }
 
     #[test]
@@ -1504,7 +1666,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence no-such-hook"#,
         ]);
-        assert_eq!(run(Some(root.path()), false), 1);
+        assert_eq!(run(Some(root.path()), false, false, false), 1);
     }
 
     #[test]
@@ -1512,7 +1674,7 @@ mod tests {
         let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), false), 2);
+        assert_eq!(run(Some(root.path()), false, false, false), 2);
     }
 
     #[test]
@@ -1521,7 +1683,7 @@ mod tests {
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' cadence no-such-hook"#,
         ]);
         // Single-quoted (Error) + unknown sub (Warning) → exit 2
-        assert_eq!(run(Some(root.path()), false), 2);
+        assert_eq!(run(Some(root.path()), false, false, false), 2);
     }
 
     #[test]
@@ -1531,7 +1693,7 @@ mod tests {
         ]);
         // Capture stdout is not trivial in unit tests; we verify exit code here.
         // The output assertion is covered by manually running the binary.
-        assert_eq!(run(Some(root.path()), true), 0);
+        assert_eq!(run(Some(root.path()), true, false, false), 0);
     }
 
     #[test]
@@ -1539,7 +1701,7 @@ mod tests {
         let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), true), 2);
+        assert_eq!(run(Some(root.path()), true, false, false), 2);
     }
 
     #[test]
@@ -1547,6 +1709,91 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), true), 0);
+        assert_eq!(run(Some(root.path()), true, false, false), 0);
+    }
+
+    // ── orphan_dirs ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn orphan_dirs_returns_stale_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        for sha in ["sha1", "sha2", "sha3"] {
+            let dir = plugin_dir.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+        let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
+
+        let mut dirs = orphan_dirs(&pinned);
+        dirs.sort();
+        assert_eq!(dirs, vec![plugin_dir.join("sha1"), plugin_dir.join("sha3")]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn orphan_dirs_skips_symlinked_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        let pinned_dir = plugin_dir.join("sha1");
+        fs::create_dir_all(&pinned_dir).unwrap();
+        fs::write(pinned_dir.join("marker"), "x").unwrap();
+
+        let escape_target = tmp.path().join("escape-target");
+        fs::create_dir_all(&escape_target).unwrap();
+
+        let symlinked_sibling = plugin_dir.join("sha-evil-link");
+        std::os::unix::fs::symlink(&escape_target, &symlinked_sibling).unwrap();
+
+        let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
+        assert!(orphan_dirs(&pinned).is_empty());
+    }
+
+    // ── prune_orphans ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn prune_orphans_dry_run_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("f"), "12345").unwrap();
+
+        let (removed, _freed) = prune_orphans(&[a.clone(), b.clone()], false);
+        assert_eq!(removed, 2);
+        assert!(a.exists(), "dry-run must not delete a");
+        assert!(b.exists(), "dry-run must not delete b");
+    }
+
+    #[test]
+    fn prune_orphans_apply_removes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("f"), "1234567890").unwrap(); // 10 bytes
+
+        let (removed, freed) = prune_orphans(std::slice::from_ref(&a), true);
+        assert_eq!(removed, 1);
+        assert!(freed > 0, "freed bytes: {freed}");
+        assert!(!a.exists(), "apply must delete the orphan dir");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_orphans_skips_symlink_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real-target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keepme"), "important").unwrap();
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (removed, freed) = prune_orphans(std::slice::from_ref(&link), true);
+        assert_eq!(removed, 0, "a symlink handed in must never be removed");
+        assert_eq!(freed, 0);
+        assert!(target.exists(), "symlink target must survive");
+        assert!(target.join("keepme").exists());
     }
 }
