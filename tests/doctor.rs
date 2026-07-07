@@ -650,6 +650,46 @@ fn doctor_prune_apply_removes_orphans() {
 }
 
 #[test]
+fn doctor_prune_apply_never_deletes_outside_root() {
+    // A manifest `installPath` that resolves OUTSIDE the `--root` cache must
+    // never steer `--prune --apply`'s `remove_dir_all` at anything outside
+    // the root. Regression test for the cache-root containment gap.
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+
+    // A "pinned" dir and a would-be-orphan sibling, both OUTSIDE `--root`.
+    let pinned_path = outside.path().join("fake-mp/fake-plugin/pinned-sha");
+    let decoy_path = outside.path().join("fake-mp/fake-plugin/decoy-sha");
+    std::fs::create_dir_all(&pinned_path).unwrap();
+    std::fs::create_dir_all(&decoy_path).unwrap();
+    std::fs::write(decoy_path.join("keepme"), "must survive").unwrap();
+
+    write_installed_plugins_manifest(tmp.path(), "fake-plugin@fake-mp", &pinned_path);
+
+    let output = cadence_hooks()
+        .args(["doctor", "--prune", "--apply", "--root"])
+        .arg(tmp.path())
+        .output()
+        .expect("failed to execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "apply prune with an out-of-root pin still exits 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        decoy_path.exists() && decoy_path.join("keepme").exists(),
+        "the out-of-root decoy directory must survive --prune --apply"
+    );
+    assert!(
+        pinned_path.exists(),
+        "the out-of-root pinned dir must survive too"
+    );
+}
+
+#[test]
 fn doctor_apply_without_prune_is_usage_error() {
     let tmp = tempfile::tempdir().unwrap();
 

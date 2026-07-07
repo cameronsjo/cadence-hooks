@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`doctor --prune` lists orphaned plugin-cache version dirs (dry-run default); `doctor --prune --apply` removes them; `--apply` alone is a usage error (#200).**
 
+### Security
+
+- **`doctor --prune`'s orphan scan is now contained to the plugin-cache root, and never treats an active pinned sibling as an orphan (#200 follow-up).** `manifest_install_paths` read each `installPath` from `installed_plugins.json` verbatim, with no check that it resolved under the plugin cache — a manifest entry pointing outside it (`/etc`, a `..`-climbing relative path) steered the sibling scan at that location instead, and `--apply` would `remove_dir_all` real directories having nothing to do with the plugin cache. Separately, `orphan_dirs` excluded only the *current* pin's own basename per parent, so two active pins sharing a parent (multi-scope installs, or two SHAs of one plugin key) each nominated the *other* as an orphan, and `--apply` deleted both live installs. `orphan_dirs` now skips any pin whose `installPath` doesn't resolve under the resolved cache root (`--root` under `--root`, else the live `~/.claude/plugins/cache`) before ever scanning its parent, and groups pinned basenames by parent so a scan excludes every active pin sharing it, not just the one being processed. `prune_orphans` adds the same containment check immediately before `remove_dir_all` as defense in depth, skipping (with a stderr warning) rather than removing anything outside the root.
+
 ## [0.49.0] - 2026-07-06
 
 ### Fixed

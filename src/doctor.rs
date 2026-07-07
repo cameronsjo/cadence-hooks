@@ -500,22 +500,68 @@ fn dir_size_bytes(dir: &Path) -> u64 {
     total
 }
 
+/// True when `path` resolves under `root` — delegates to
+/// [`cadence_hooks_core::paths::is_within`], the shared lexical containment
+/// primitive (existence-independent, rejects any `..` outright). Every pinned
+/// `installPath` and every candidate orphan sibling is checked against the
+/// plugin-cache root before it can influence a scan or a deletion, so a
+/// manifest entry pointing outside the cache (`/etc`, a `..`-climbing
+/// relative path) can never steer `remove_dir_all` anywhere but the cache.
+fn is_contained(path: &Path, root: &Path) -> bool {
+    cadence_hooks_core::paths::is_within(&path.to_string_lossy(), root)
+}
+
+/// Case-insensitive basename comparison. macOS/APFS default volumes are
+/// case-insensitive, so a manifest basename that diverges only in case from
+/// the on-disk directory name must still be recognized as the same pin —
+/// otherwise the active dir is misjudged as an orphan. Deliberately applied
+/// on every platform (not `cfg`-gated to macOS): a case-insensitive match is
+/// never wrong on a case-sensitive filesystem — basenames written by Claude
+/// Code's own installer never differ only in case — so the uniform
+/// comparison is simpler than platform-conditional logic for the same result.
+fn eq_ignore_case(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
 /// Concrete orphaned version directories across every `(label, install_path)`
-/// pair in `pinned` — siblings of each `install_path`'s parent whose basename
-/// isn't the pinned basename. Pure (no filesystem writes); reused by both
-/// [`orphan_findings`] (advisory count/bytes) and the `doctor --prune` flow
-/// (actual removal via [`prune_orphans`]), so the sibling-scan + symlink
-/// guards live in exactly one place.
-fn orphan_dirs(pinned: &[(String, PathBuf)]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// pair in `pinned` — siblings of a pinned dir's parent whose basename isn't
+/// ANY pinned basename sharing that parent. Pure (no filesystem writes);
+/// reused by both [`orphan_findings`] (advisory count/bytes) and the
+/// `doctor --prune` flow (actual removal via [`prune_orphans`]), so the
+/// sibling-scan + symlink + containment guards live in exactly one place.
+///
+/// `cache_root` bounds every pin: an `installPath` that does not resolve
+/// under it (a bogus or malicious manifest entry) is skipped entirely — its
+/// parent is never scanned, so nothing outside the plugin cache can ever be
+/// nominated as an orphan. Pins are grouped by parent directory first, so
+/// when two active pins share a parent (multi-scope installs, or two SHAs of
+/// the same plugin key), scanning that parent excludes BOTH pinned
+/// basenames — an active pin is never returned as an orphan just because a
+/// sibling pin's own scan didn't know about it.
+fn orphan_dirs(pinned: &[(String, PathBuf)], cache_root: &Path) -> Vec<PathBuf> {
+    let mut pinned_by_parent: std::collections::HashMap<PathBuf, Vec<std::ffi::OsString>> =
+        std::collections::HashMap::new();
 
     for (_label, install_path) in pinned {
+        if !is_contained(install_path, cache_root) {
+            continue;
+        }
         let Some(parent) = install_path.parent() else {
             continue;
         };
         let Some(pinned_name) = install_path.file_name() else {
             continue;
         };
+        pinned_by_parent
+            .entry(parent.to_path_buf())
+            .or_default()
+            .push(pinned_name.to_os_string());
+    }
+
+    let mut out = Vec::new();
+
+    for (parent, pinned_names) in &pinned_by_parent {
         let Ok(siblings) = std::fs::read_dir(parent) else {
             continue;
         };
@@ -530,7 +576,11 @@ fn orphan_dirs(pinned: &[(String, PathBuf)]) -> Vec<PathBuf> {
             if !is_real_dir {
                 continue;
             }
-            if sibling.file_name() == pinned_name {
+            let sibling_name = sibling.file_name();
+            if pinned_names
+                .iter()
+                .any(|name| eq_ignore_case(name, &sibling_name))
+            {
                 continue;
             }
             out.push(sibling.path());
@@ -544,15 +594,24 @@ fn orphan_dirs(pinned: &[(String, PathBuf)]) -> Vec<PathBuf> {
 ///
 /// `pinned` is `(label, install_path)` from [`manifest_install_paths`] — the
 /// version dir the manifest actually points at. Any sibling directory under
-/// `install_path`'s parent that isn't the pinned basename is an orphan: a
-/// stale SHA-pinned version left behind by an update, since the cache never
-/// garbage-collects.
+/// an `install_path`'s parent that isn't ANY pinned basename sharing that
+/// parent is an orphan: a stale SHA-pinned version left behind by an update,
+/// since the cache never garbage-collects.
 ///
 /// The missing/empty-pinned-dir warning fires in both quiet and verbose modes
 /// (it means the active plugin literally won't load). The orphan-count
 /// warning is `quiet`-suppressed — orphans are cosmetic cache bloat, not a
 /// functional break, and would otherwise nag every SessionStart forever.
-fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool) -> Vec<Finding> {
+///
+/// Orphans are computed ONCE over the full `pinned` slice (never per-pin) —
+/// calling [`orphan_dirs`] with a single-element slice per label would
+/// reintroduce the exact multi-pin bug that function's own containment
+/// guards against: when two active pins share a parent (multi-scope
+/// installs, or two SHAs of one plugin key), a single-pin view can't see the
+/// other pin's basename, so it would misreport a live install as "safe to
+/// prune". `cache_root` is forwarded to [`orphan_dirs`] — see that
+/// function's doc for the containment guarantee.
+fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool, cache_root: &Path) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     for (label, install_path) in pinned {
@@ -572,21 +631,35 @@ fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool) -> Vec<Finding> {
                               or reload via the marketplace)"
                     .to_string(),
             });
-            continue;
         }
+    }
 
-        if quiet {
-            continue;
+    if quiet {
+        return findings;
+    }
+
+    let orphans = orphan_dirs(pinned, cache_root);
+    let mut orphans_by_parent: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for dir in orphans {
+        if let Some(parent) = dir.parent() {
+            orphans_by_parent
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(dir);
         }
+    }
 
-        let Some(parent) = install_path.parent() else {
+    for (parent, dirs) in &orphans_by_parent {
+        // Attribute the finding to any label actually pinned at this parent
+        // — arbitrary-but-deterministic among labels sharing it, since the
+        // finding describes the parent directory, not a single pin.
+        let Some((label, _)) = pinned
+            .iter()
+            .find(|(_, install_path)| install_path.parent() == Some(parent.as_path()))
+        else {
             continue;
         };
-        let single = [(label.clone(), install_path.clone())];
-        let dirs = orphan_dirs(&single);
-        if dirs.is_empty() {
-            continue;
-        }
 
         let orphan_count = dirs.len();
         let orphan_bytes: u64 = dirs.iter().map(|d| dir_size_bytes(d)).sum();
@@ -594,7 +667,7 @@ fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool) -> Vec<Finding> {
         findings.push(Finding {
             severity: Severity::Warning,
             plugin: label.clone(),
-            file: parent.to_path_buf(),
+            file: parent.clone(),
             line: None,
             snippet: format!("{orphan_count} orphaned version dir(s)"),
             diagnosis: format!(
@@ -617,11 +690,26 @@ fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool) -> Vec<Finding> {
 /// path that became a symlink (or vanished) in between is never followed or
 /// removed. Fails open per-directory: an unremovable dir is skipped with a
 /// warning to stderr, never fatal to the batch.
-fn prune_orphans(dirs: &[PathBuf], apply: bool) -> (usize, u64) {
+///
+/// `cache_root` is a second, independent containment check — defense in
+/// depth alongside [`orphan_dirs`]'s own containment filtering, so a bug (or
+/// future caller) that hands this function an uncontained path still can't
+/// reach `remove_dir_all` on it; that dir is skipped with a stderr warning
+/// instead.
+fn prune_orphans(dirs: &[PathBuf], apply: bool, cache_root: &Path) -> (usize, u64) {
     let mut removed = 0usize;
     let mut freed = 0u64;
 
     for dir in dirs {
+        if !is_contained(dir, cache_root) {
+            eprintln!(
+                "cadence-hooks doctor --prune: refusing to touch {} — outside the plugin cache root {}",
+                dir.display(),
+                cache_root.display()
+            );
+            continue;
+        }
+
         let is_real_dir = std::fs::symlink_metadata(dir)
             .map(|m| m.file_type().is_dir())
             .unwrap_or(false);
@@ -663,8 +751,14 @@ fn prune_orphans(dirs: &[PathBuf], apply: bool) -> (usize, u64) {
 /// integration tests can drive a fixture cache); without it, from the live
 /// `~/.claude/plugins/installed_plugins.json`. A missing manifest is not an
 /// error here — nothing to prune reports cleanly at exit 0.
+///
+/// `cache_root` — the containment boundary passed to [`orphan_dirs`] and
+/// [`prune_orphans`] — is `root` itself under `--root` (fixtures place
+/// `<root>/<marketplace>/<plugin>/<sha>` directly, matching how the manifest
+/// path above is resolved), or the live `~/.claude/plugins/cache` otherwise —
+/// the same anchor `run`'s cache-walk fallback uses.
 fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
-    let manifest = match root_override {
+    let (manifest, cache_root) = match root_override {
         Some(root) => {
             if !root.exists() {
                 eprintln!(
@@ -673,14 +767,17 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
                 );
                 return 2;
             }
-            root.join("installed_plugins.json")
+            (root.join("installed_plugins.json"), root.to_path_buf())
         }
         None => {
             let Some(plugins) = plugins_dir() else {
                 eprintln!("cadence-hooks doctor: $HOME not set; cannot locate plugin cache");
                 return 2;
             };
-            plugins.join("installed_plugins.json")
+            (
+                plugins.join("installed_plugins.json"),
+                plugins.join("cache"),
+            )
         }
     };
 
@@ -694,7 +791,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         return 0;
     };
 
-    let dirs = orphan_dirs(&pinned);
+    let dirs = orphan_dirs(&pinned, &cache_root);
     if dirs.is_empty() {
         if !quiet {
             println!("cadence-hooks doctor --prune: no orphaned plugin-cache version dirs found");
@@ -706,6 +803,10 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         for dir in &dirs {
             let size = dir_size_bytes(dir);
             let mib = size as f64 / (1024.0 * 1024.0);
+            // `.orphaned_at` is written externally by Claude Code's own
+            // plugin loader when it retires a version dir, not by anything
+            // in this repo — surfacing it here is advisory ("this one was
+            // already flagged upstream"), not a marker this codebase creates.
             let marker_note = if dir.join(".orphaned_at").exists() {
                 " [marked .orphaned_at]"
             } else {
@@ -715,7 +816,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         }
     }
 
-    let (removed, freed_bytes) = prune_orphans(&dirs, apply);
+    let (removed, freed_bytes) = prune_orphans(&dirs, apply, &cache_root);
     let freed_mib = freed_bytes as f64 / (1024.0 * 1024.0);
 
     if !quiet {
@@ -920,7 +1021,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         && let Some(plugins) = plugins_dir()
     {
         if let Some(pinned) = manifest_install_paths(&plugins.join("installed_plugins.json")) {
-            findings.extend(orphan_findings(&pinned, quiet));
+            findings.extend(orphan_findings(&pinned, quiet, &plugins.join("cache")));
         }
 
         for (marketplace, install_dir, declared_repo) in
@@ -1276,7 +1377,7 @@ mod tests {
         }
         let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
 
-        let findings = orphan_findings(&pinned, false);
+        let findings = orphan_findings(&pinned, false, tmp.path());
         let orphan_finding = findings
             .iter()
             .find(|f| f.diagnosis.contains("orphaned"))
@@ -1294,7 +1395,7 @@ mod tests {
         let missing = tmp.path().join("mp/plugin/sha-gone");
         let pinned = vec![("plugin@mp".to_string(), missing)];
 
-        let findings = orphan_findings(&pinned, false);
+        let findings = orphan_findings(&pinned, false, tmp.path());
         assert_eq!(findings.len(), 1);
         assert!(findings[0].diagnosis.contains("missing or empty"));
     }
@@ -1308,7 +1409,7 @@ mod tests {
         fs::write(pinned_dir.join("marker"), "x").unwrap();
         let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
 
-        assert!(orphan_findings(&pinned, false).is_empty());
+        assert!(orphan_findings(&pinned, false, tmp.path()).is_empty());
     }
 
     #[test]
@@ -1327,7 +1428,7 @@ mod tests {
             ("other@mp".to_string(), missing),
         ];
 
-        let findings = orphan_findings(&pinned, true);
+        let findings = orphan_findings(&pinned, true, tmp.path());
         assert_eq!(
             findings.len(),
             1,
@@ -1358,13 +1459,58 @@ mod tests {
         std::os::unix::fs::symlink(&escape_target, &symlinked_sibling).unwrap();
 
         let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
-        let findings = orphan_findings(&pinned, false);
+        let findings = orphan_findings(&pinned, false, tmp.path());
 
         assert!(
             findings.is_empty(),
             "a symlinked sibling must not be reported as an orphan, found {} finding(s): {:?}",
             findings.len(),
             findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orphan_findings_excludes_active_pins_sharing_parent() {
+        // Two active pins (sha-A/sha-B) sharing a parent must NEVER be
+        // reported as "safe to prune" — only the genuine orphan (sha-C)
+        // should generate a finding, and exactly one (not one per label).
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("cache/mp/p");
+        for sha in ["sha-A", "sha-B", "sha-C"] {
+            let dir = parent.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+
+        let pinned = vec![
+            ("p@mp".to_string(), parent.join("sha-A")),
+            ("p@mp".to_string(), parent.join("sha-B")),
+        ];
+
+        let findings = orphan_findings(&pinned, false, tmp.path());
+        let orphan_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.diagnosis.contains("orphaned"))
+            .collect();
+
+        assert_eq!(
+            orphan_findings.len(),
+            1,
+            "exactly one orphan finding (for sha-C's parent), found: {:?}",
+            orphan_findings
+                .iter()
+                .map(|f| &f.diagnosis)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            orphan_findings[0].diagnosis.contains("1 orphaned"),
+            "only sha-C should count as an orphan (a count of 2 would mean \
+             sha-A/sha-B misjudged each other as orphans): {}",
+            orphan_findings[0].diagnosis
+        );
+        assert_eq!(
+            orphan_findings[0].file, parent,
+            "the finding is attributed to the shared parent, not a sha subdir"
         );
     }
 
@@ -1725,7 +1871,7 @@ mod tests {
         }
         let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
 
-        let mut dirs = orphan_dirs(&pinned);
+        let mut dirs = orphan_dirs(&pinned, tmp.path());
         dirs.sort();
         assert_eq!(dirs, vec![plugin_dir.join("sha1"), plugin_dir.join("sha3")]);
     }
@@ -1746,7 +1892,59 @@ mod tests {
         std::os::unix::fs::symlink(&escape_target, &symlinked_sibling).unwrap();
 
         let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
-        assert!(orphan_dirs(&pinned).is_empty());
+        assert!(orphan_dirs(&pinned, tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn orphan_dirs_skips_pin_outside_cache_root() {
+        // A manifest `installPath` that resolves outside the cache root (an
+        // absolute path elsewhere, or an `/etc`-style system dir) must be
+        // skipped entirely — its parent is never scanned, so nothing outside
+        // the root can ever be nominated as an orphan.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        // A real directory OUTSIDE the cache root, sibling to a bogus pin's
+        // parent, that must never be scanned or returned.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(outside.join("decoy")).unwrap();
+
+        let pinned = vec![("evil@mp".to_string(), outside.join("pinned-but-fake"))];
+
+        assert!(
+            orphan_dirs(&pinned, &cache_root).is_empty(),
+            "a pin outside the cache root must never be scanned"
+        );
+    }
+
+    #[test]
+    fn orphan_dirs_excludes_all_active_pins_sharing_parent() {
+        // Two active pins (e.g. two scopes/SHAs of the same plugin key) that
+        // share a parent directory must BOTH be excluded when scanning that
+        // parent — neither may be reported as an orphan just because the
+        // other pin's own scan didn't know about it. A genuine orphan
+        // sibling (sha-C) must still be returned.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("cache/mp/p");
+        for sha in ["sha-A", "sha-B", "sha-C"] {
+            let dir = parent.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+
+        let pinned = vec![
+            ("p@mp".to_string(), parent.join("sha-A")),
+            ("p@mp".to_string(), parent.join("sha-B")),
+        ];
+
+        let dirs = orphan_dirs(&pinned, tmp.path());
+        assert_eq!(
+            dirs,
+            vec![parent.join("sha-C")],
+            "only the genuine orphan (sha-C) should be returned; both active \
+             pins sharing the parent must be excluded"
+        );
     }
 
     // ── prune_orphans ─────────────────────────────────────────────────────────
@@ -1760,7 +1958,7 @@ mod tests {
         fs::create_dir_all(&b).unwrap();
         fs::write(a.join("f"), "12345").unwrap();
 
-        let (removed, _freed) = prune_orphans(&[a.clone(), b.clone()], false);
+        let (removed, _freed) = prune_orphans(&[a.clone(), b.clone()], false, tmp.path());
         assert_eq!(removed, 2);
         assert!(a.exists(), "dry-run must not delete a");
         assert!(b.exists(), "dry-run must not delete b");
@@ -1773,7 +1971,7 @@ mod tests {
         fs::create_dir_all(&a).unwrap();
         fs::write(a.join("f"), "1234567890").unwrap(); // 10 bytes
 
-        let (removed, freed) = prune_orphans(std::slice::from_ref(&a), true);
+        let (removed, freed) = prune_orphans(std::slice::from_ref(&a), true, tmp.path());
         assert_eq!(removed, 1);
         assert!(freed > 0, "freed bytes: {freed}");
         assert!(!a.exists(), "apply must delete the orphan dir");
@@ -1790,10 +1988,30 @@ mod tests {
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let (removed, freed) = prune_orphans(std::slice::from_ref(&link), true);
+        let (removed, freed) = prune_orphans(std::slice::from_ref(&link), true, tmp.path());
         assert_eq!(removed, 0, "a symlink handed in must never be removed");
         assert_eq!(freed, 0);
         assert!(target.exists(), "symlink target must survive");
         assert!(target.join("keepme").exists());
+    }
+
+    #[test]
+    fn prune_orphans_refuses_dir_outside_cache_root() {
+        // Defense in depth: even if a caller (bug, future code path) hands
+        // `prune_orphans` a path outside the resolved cache root, it must
+        // refuse to touch it rather than remove_dir_all-ing it.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let outside = tmp.path().join("outside-target");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keepme"), "important").unwrap();
+
+        let (removed, freed) = prune_orphans(std::slice::from_ref(&outside), true, &cache_root);
+        assert_eq!(removed, 0, "a dir outside cache_root must never be removed");
+        assert_eq!(freed, 0);
+        assert!(outside.exists(), "outside dir must survive");
+        assert!(outside.join("keepme").exists());
     }
 }
