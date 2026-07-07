@@ -233,6 +233,16 @@ fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
     &tokens[start..]
 }
 
+/// A shell path is absolute if git will treat it as absolute: a leading `/`
+/// (POSIX / WSL / Git-Bash shell paths — `Path::is_absolute` is false for these
+/// on Windows, no drive letter) OR a platform-absolute path (native `C:\…`).
+/// These are shell paths a command string carries, not OS paths, so the
+/// decision is made on the string first, falling back to the platform's own
+/// notion of absolute for native-Windows drive paths (issue #235).
+fn is_shell_absolute(path: &str) -> bool {
+    path.starts_with('/') || Path::new(path).is_absolute()
+}
+
 fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
     let mut targets = Vec::new();
     let mut effective_dir = cwd.to_string();
@@ -316,7 +326,7 @@ fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
         }
         if argv.get(idx).map(String::as_str) == Some("commit") {
             let target = match redirect {
-                Some(path) if Path::new(path).is_absolute() => path.to_string(),
+                Some(path) if is_shell_absolute(path) => path.to_string(),
                 Some(path) => format!("{effective_dir}/{path}"),
                 None => effective_dir.clone(),
             };
@@ -836,6 +846,19 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_drive_path_commit_targets_redirect() {
+        // A native Windows drive path is absolute via `Path::is_absolute`'s own
+        // arm of `is_shell_absolute` (no leading `/` needed) — proves the
+        // `#[cfg(unix)]`-gated fixtures above aren't the only Windows coverage
+        // for this branch (issue #235).
+        assert_eq!(
+            git_commit_targets(r"git -C C:\repo\wt commit -m x", r"C:\cwd"),
+            vec![r"C:\repo\wt".to_string()]
+        );
+    }
+
     // --- git_commit_targets: grouping / prefixes / quoting (#239 F4/F5/F9) ---
 
     #[test]
@@ -1347,6 +1370,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cd_into_other_primary_blocks_and_names_target_repo() {
         // Issue #224: the target repo of a `cd <dir> && git commit` may be a
@@ -1384,6 +1411,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cd_before_or_true_still_blocks_other_primary() {
         // Issue-review finding on the #213/#224 fix: `cd <dir> || true &&
@@ -1489,6 +1520,10 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn dismiss_repo_flag_snoozes_target_not_cwd() {
         // Mirrors what `dismiss-enforce-worktree --repo <other_primary>` writes
@@ -1570,6 +1605,10 @@ mod tests {
 
     // --- repo-scoped CADENCE_ALLOW_MAIN (cameronsjo/cadence-hooks#232) ---
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cross_repo_commit_reads_target_repos_own_settings() {
         // Headline repro: shell rooted in primary A, mutation targets a
@@ -1814,6 +1853,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cross_repo_block_message_names_target_repos_settings_path() {
         let scratch = Scratch::new("cross-repo-block-message");
@@ -2001,6 +2044,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn commit_with_cwd_under_claude_or_plans_in_primary_still_blocks() {
         // F6/F7: the `.claude`/`docs/plans` carve-out is Edit-arm-only now. A

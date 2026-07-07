@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`enforce-worktree`'s commit-target resolver no longer misjudges POSIX-shaped shell paths as relative on Windows (#235).** The `-C <path>` redirect decision used `Path::new(path).is_absolute()`, which is `false` on Windows for a leading-`/` path like `/some/worktree` (no drive letter) — so a POSIX shell path (WSL, Git-Bash) resolved as if relative to `effective_dir`, breaking `Check (windows-latest)` on `main` since #226. A new `is_shell_absolute` helper treats a leading `/` as absolute on every platform (these are shell paths a command string carries, not OS paths) before falling back to the platform's own `is_absolute` for native `C:\…` paths — no behavior change on unix. Six fixture tests that construct real Windows-shaped disk paths through `tokenize` (which is documented escape-unaware for backslashes) are `#[cfg(unix)]`-gated rather than fixed at the tokenizer level — a guard-feeding parser change is out of scope here and deferred; a new `#[cfg(windows)]` test proves a native drive-lettered path still resolves correctly through the same helper.
+
 ## [0.49.0] - 2026-07-06
 
 ### Fixed
