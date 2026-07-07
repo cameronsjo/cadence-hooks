@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.52.0] - 2026-07-07
+
+### Added
+
+- **New `metrics log-skill` subcommand + `skills.jsonl` stream — one row per `Skill` tool invocation (cameronsjo/cadence-hooks#215).** A lightweight audit log (sibling of `subagents.jsonl`), born with `schemaVersion: 1`. Records the invoked `skill` id in clear (a `plugin:directory` name, needed for the co-fire matrix) plus `argsHash` — a non-reversible `DefaultHasher` digest of the skill's argument string. The **raw args are never written**; privacy-by-construction, empirically verified against secret-shaped args, malformed payloads, and `CADENCE_METRICS_DEBUG=1` (whose `_keys` carries top-level key names only). Reads two new additive `skill`/`args` fields on the shared `ToolInput`. The plugin `Skill` matcher that drives this is a release-gated companion — it merges only once this release ships the subcommand (doctor `hooks-skew` gate).
+
 ## [0.51.0] - 2026-07-07
 
 ### Added
