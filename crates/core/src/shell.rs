@@ -184,17 +184,14 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
 
+    // Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue
+    // #229 / PR #226). bash's `||`/`&&` are equal-precedence and
+    // left-associative, so a succeeding `cd` before `||` still changes the
+    // directory for what follows (`cd x || exit; git push` pushes from `x`
+    // whenever the cd works). The earlier "cd before `||` is a no-op"
+    // heuristic misjudged that common `|| exit` idiom; both resolvers now
+    // apply every `cd` the pattern finds, in order.
     for caps in CD_PATTERN.captures_iter(command) {
-        let full_match = caps.get(0).unwrap();
-        let after = command[full_match.end()..].trim_start();
-
-        // If this cd is followed by `||`, the commands after `||` only run
-        // when the cd fails — so the cd doesn't change the effective directory
-        // for those commands.
-        if after.starts_with("||") {
-            continue;
-        }
-
         let target = caps
             .get(2)
             .or(caps.get(3))
@@ -1310,10 +1307,16 @@ mod tests {
     }
 
     #[test]
-    fn cd_before_or_does_not_apply() {
-        // cd before || only runs on success; git push runs on failure,
-        // so the push executes from the original cwd, not /project.
-        assert_eq!(parse_work_dir("cd /project || git push", "/home"), "/home");
+    fn cd_before_or_still_redirects_assuming_success() {
+        // Assume-success model (issue #229): a `cd` before `||` still changes
+        // the directory for what follows, since `||`/`&&` are equal-precedence
+        // left-assoc and the common `cd x || exit` idiom pushes from `x`
+        // whenever the cd works. Mirrors git_commit_targets'
+        // `cd_before_or_still_redirects_assuming_success`.
+        assert_eq!(
+            parse_work_dir("cd /project || git push", "/home"),
+            "/project"
+        );
     }
 
     #[test]
@@ -1494,7 +1497,11 @@ mod tests {
     #[test]
     fn cd_or_then_and_cd() {
         // cd /fail || cd /recover && git push
-        // cd /fail is before ||, so skipped; cd /recover is on success path
+        // Assume-success model (issue #229): every `cd` applies in order, so
+        // `cd /fail` redirects first, then `cd /recover` overrides — the last
+        // applied `cd` wins. (Same final directory as the old "skip before
+        // ||" model reached, but by applying both rather than skipping the
+        // first.)
         assert_eq!(
             parse_work_dir("cd /fail || cd /recover && git push", "/home"),
             "/recover"
