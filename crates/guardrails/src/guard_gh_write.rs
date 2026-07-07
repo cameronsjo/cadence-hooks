@@ -454,6 +454,66 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
     Some(String::new())
 }
 
+/// True when a command segment invokes `gh` as an actual command token — some
+/// whitespace-delimited, unquoted token resolves to `gh` (bare, a `*/gh` path,
+/// or a backslash-escaped `\gh`). Gates the write-detection scan so a gh-write
+/// phrase that appears only *inside a quoted argument* of another command —
+/// e.g. a `git commit -m "…gh repo create…"` message, where the quoted text is
+/// a single non-`gh` token — is not read as a gh write (#212).
+///
+/// Any real gh invocation still surfaces a bare `gh` token, so write coverage
+/// is unchanged from the raw-substring scan: a command-word gate on the *first*
+/// token alone would silently drop writes the shell reaches through an
+/// env-assignment (`GH_TOKEN=x gh …`), a transparent prefix (`sudo`/`env`/
+/// `command`/`exec`/`nice`/`timeout gh …`), an argument position (`xargs gh …`,
+/// `find … -exec gh …`), or a leading redirect — all of which keep `gh` as its
+/// own token. So the gate skips only a match whose phrase lives wholly within
+/// quotes — a strict subset of what the substring scan caught — which is
+/// exactly the #212 false positive and nothing else.
+///
+/// `eval "<script>"` is the one execution wrapper `command_segments` does not
+/// unwrap (unlike `sh -c`), so a gh write in eval's quoted argument would
+/// tokenize as a single non-`gh` token and read as prose. When the command
+/// word is `eval`, re-tokenize its argument so the wrapped write is still seen;
+/// a plain `git commit -m "…gh…"` message is not `eval`, so the #212 prose case
+/// stays allowed.
+fn segment_invokes_gh(segment: &str) -> bool {
+    segment_invokes_gh_depth(segment, 0)
+}
+
+/// `eval` nesting is peeled at most this deep before the argument is treated as
+/// opaque — matches `core::shell`'s `MAX_WRAPPER_DEPTH` and bounds the work on
+/// a pathological `eval eval eval …` chain (each level re-tokenizes and joins).
+const MAX_EVAL_DEPTH: usize = 3;
+
+fn segment_invokes_gh_depth(segment: &str, depth: usize) -> bool {
+    let tokens = tokenize(segment);
+    if tokens_contain_gh(&tokens) {
+        return true;
+    }
+    if depth < MAX_EVAL_DEPTH
+        && tokens
+            .first()
+            .is_some_and(|t| t.rsplit('/').next().unwrap_or(t) == "eval")
+    {
+        // tokenize already unquotes eval's argument; re-splitting it surfaces
+        // the inner command tokens. Recurse (bounded) so a nested `eval 'eval …'`
+        // peels one level at a time.
+        let inner = tokens[1..].join(" ");
+        return segment_invokes_gh_depth(&inner, depth + 1);
+    }
+    false
+}
+
+/// True when any token resolves to `gh` (bare, a `*/gh` path, or a
+/// backslash-escaped `\gh`).
+fn tokens_contain_gh(tokens: &[String]) -> bool {
+    tokens.iter().any(|tok| {
+        let unescaped = tok.strip_prefix('\\').unwrap_or(tok);
+        unescaped.rsplit('/').next().unwrap_or(unescaped) == "gh"
+    })
+}
+
 /// Extract the value of a `gh api graphql` `query=` field across the
 /// `-f`/`--field`/`-F`/`--raw-field` forms (separate-token, compact `-fquery=…`,
 /// and `=`-joined `--field=query=…`). Returns the substring after `query=`.
@@ -750,6 +810,10 @@ impl Check for GhWriteGuard {
         let work_dir = parse_work_dir(command, cwd);
 
         for segment in command_segments(command) {
+            if !segment_invokes_gh(&segment) {
+                continue;
+            }
+
             if !is_write_command(&segment) {
                 continue;
             }
@@ -1982,6 +2046,169 @@ mod tests {
                 assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
             },
         );
+    }
+
+    // --- #212: gh-write phrases inside non-gh command segments must not block ---
+
+    #[test]
+    fn git_commit_message_describing_gh_write_allowed() {
+        with_env(&owners_env_212(), || {
+            let input = input_with(
+                r#"git commit -m "feat: warn-going-public blocks gh repo create --visibility public""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn git_commit_message_gh_pr_create_allowed() {
+        with_env(&owners_env_212(), || {
+            let input = input_with(
+                r#"git commit -m "docs: explain when gh pr create is blocked""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn sh_c_gh_write_still_blocked() {
+        // Regression guard for the unwrap path: `sh -c '…'` surfaces the inner
+        // gh script as its own segment, still detected as a gh write.
+        with_env(&owners_env_212(), || {
+            let input = input_with("sh -c 'gh repo delete evil/unowned --yes'", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn bare_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with("gh repo create evil/x --public", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    // A first-token command-word gate skipped every one of these real,
+    // executable gh writes to an unowned repo; the invocation gate blocks them.
+    #[test]
+    fn env_prefixed_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with("GH_TOKEN=x gh repo create evil/x --public", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn sudo_prefixed_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with("sudo gh repo delete evil/x --yes", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn xargs_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with("xargs gh repo delete evil/x --yes", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn backslash_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with(r"\gh repo create evil/x --public", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn eval_gh_write_still_blocked() {
+        // `command_segments` does not unwrap `eval`, so its quoted gh write
+        // would read as prose without the eval-aware branch in the gate.
+        with_env(&owners_env_212(), || {
+            let input = input_with(r#"eval "gh repo delete evil/x --yes""#, "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    fn owners_env_212() -> [(&'static str, Option<&'static str>); 3] {
+        [
+            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+            ("CADENCE_ALLOWED_REPOS", None),
+            ("CADENCE_EXTRA_HOSTS", None),
+        ]
+    }
+
+    #[test]
+    fn segment_invokes_gh_bare() {
+        assert!(segment_invokes_gh("gh pr create --title test"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_absolute_path() {
+        assert!(segment_invokes_gh("/usr/bin/gh pr create --title test"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_false_for_commit_message() {
+        // The gh phrase lives wholly inside the quoted message, which tokenizes
+        // as a single non-`gh` token — the #212 false positive.
+        assert!(!segment_invokes_gh(
+            r#"git commit -m "gh repo create evil/x""#
+        ));
+    }
+
+    #[test]
+    fn segment_invokes_gh_false_for_quoted_gh_in_echo() {
+        assert!(!segment_invokes_gh(r#"echo "gh pr create""#));
+    }
+
+    // A first-token gate silently dropped every one of these real gh writes;
+    // they all keep `gh` as its own token, so the invocation gate still fires.
+    #[test]
+    fn segment_invokes_gh_true_behind_env_assignment() {
+        assert!(segment_invokes_gh(
+            "GH_TOKEN=x gh repo create evil/x --public"
+        ));
+    }
+
+    #[test]
+    fn segment_invokes_gh_true_behind_transparent_prefix() {
+        assert!(segment_invokes_gh("sudo gh repo delete evil/x --yes"));
+        assert!(segment_invokes_gh("env gh repo create evil/x --public"));
+        assert!(segment_invokes_gh("command gh repo delete evil/x --yes"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_true_as_xargs_argument() {
+        assert!(segment_invokes_gh("xargs gh repo delete --yes"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_true_backslash_escaped() {
+        assert!(segment_invokes_gh(r"\gh repo create evil/x --public"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_true_inside_eval() {
+        assert!(segment_invokes_gh(r#"eval "gh repo delete evil/x --yes""#));
+    }
+
+    #[test]
+    fn segment_invokes_gh_false_for_eval_without_gh() {
+        assert!(!segment_invokes_gh(r#"eval "echo done""#));
     }
 
     // --- #78: unverifiable gh api writes block; graphql reads exempt ---

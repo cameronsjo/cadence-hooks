@@ -48,12 +48,17 @@
 //! Known misses, accepted by design (this is a discipline guard, not a security
 //! boundary): file mutations via bash (`sed -i`, redirects) are not inspected —
 //! the `git commit` arm is the persistence backstop; `git --work-tree=…` /
-//! `--git-dir=…` commit forms and commits wrapped in `sh -c '…'` skip the check
-//! (the target tree cannot be cheaply resolved — ambiguity fails open).
-//! Env-prefixed forms (`VAR=x git commit`) are missed too — the leading word
-//! isn't `git` — and a `GIT_DIR=`/`GIT_WORK_TREE=` prefix can even invert the
-//! target (a rare false block when committing into a worktree *from* the
-//! primary via env); both accepted as exotic. A
+//! `--git-dir=…` commit forms skip the check (the target tree cannot be cheaply
+//! resolved — ambiguity fails open). Commits inside `sh -c '…'` wrappers,
+//! `$(…)`/backtick substitutions, and behind `env`/`VAR=value` prefixes ARE
+//! seen (#228) — any run of transparent-prefix or assignment words ahead of a
+//! wrapper (`env exec sh -c '…'`) is stripped before the wrapper detection
+//! runs, but a prefix's own *option flags* are never parsed, so `nice -n 10 …`
+//! / `env -i …` in front of a wrapper or commit remain misses (a flag could
+//! bind a value we'd misread).
+//! A `GIT_DIR=`/`GIT_WORK_TREE=` env prefix can invert the target (a rare false
+//! block when committing into a worktree *from* the primary via env); accepted
+//! as exotic. A
 //! `git -C <path> commit` IS resolved against `<path>`, so committing into the
 //! primary from elsewhere still blocks, and committing into a worktree from
 //! the primary does not — and so is a leading `cd <path> && git commit` (or a
@@ -67,7 +72,9 @@
 use crate::dismiss_enforce_worktree;
 use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
 use crate::warn_subagent_worktree::is_primary_checkout;
-use cadence_hooks_core::shell::{resolve_cd_target, split_segments_with_ops, tokenize};
+use cadence_hooks_core::shell::{
+    MAX_WRAPPER_DEPTH, child_scripts, resolve_cd_target, split_segments_with_ops, tokenize,
+};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -198,7 +205,10 @@ type CommitTarget = String;
 ///
 /// The leading-word discipline mirrors `is_branch_switch` in the session
 /// crate: a `git commit` quoted in prose or a heredoc body is not this session
-/// committing.
+/// committing. Wrapper scripts (`sh -c '…'`) and `$(…)`/backtick substitution
+/// bodies DO execute, though — each segment's child scripts are recursed into
+/// with the directory in effect at that segment, in their own `cd` scope (see
+/// [`collect_commit_targets`], issue #228).
 ///
 /// Both the `cd` and `git` arms share one **quote-aware** token stream from
 /// `tokenize`. The pre-fix git arm used quote-blind `split_whitespace`, so a
@@ -219,29 +229,99 @@ fn strip_group_wrappers(segment: &str) -> &str {
 /// Skip transparent command prefixes that run their argument as the command, so
 /// `command git commit` / `time git commit` still surface `git` as the leading
 /// word. Only skips a prefix when the following token is not an option, so a
-/// prefix's own flags are never misparsed (`nice -n 10 git commit` stays a
-/// documented miss rather than risking a wrong resolution).
+/// prefix's own flags are never misparsed (`nice -n 10 git commit` and
+/// `env -i git commit` stay documented misses rather than risking a wrong
+/// resolution). Leading `VAR=value` assignment words are skipped too — bash
+/// runs `VAR=value git commit` (and `env VAR=value git commit`) with the rest
+/// as the command, so an assignment word must not eat the leading-word gate
+/// (issue #228).
 fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
-    const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup"];
+    const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
     let mut start = 0;
-    while start + 1 < tokens.len()
-        && TRANSPARENT.contains(&tokens[start].as_str())
-        && !tokens[start + 1].starts_with('-')
-    {
-        start += 1;
+    while start + 1 < tokens.len() {
+        let tok = tokens[start].as_str();
+        if (TRANSPARENT.contains(&tok) && !tokens[start + 1].starts_with('-'))
+            || is_assignment_word(tok)
+        {
+            start += 1;
+        } else {
+            break;
+        }
     }
     &tokens[start..]
 }
 
+/// A leading `NAME=value` shell assignment word: a valid variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
+/// `==` comparisons — is not skipped, so this can only widen the leading-word
+/// gate past words the shell itself treats as environment prefixes.
+fn is_assignment_word(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) if !name.is_empty() => {
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// A shell path is absolute if git will treat it as absolute: a leading `/`
+/// (POSIX / WSL / Git-Bash shell paths — `Path::is_absolute` is false for these
+/// on Windows, no drive letter) OR a platform-absolute path (native `C:\…`).
+/// These are shell paths a command string carries, not OS paths, so the
+/// decision is made on the string first, falling back to the platform's own
+/// notion of absolute for native-Windows drive paths (issue #235).
+fn is_shell_absolute(path: &str) -> bool {
+    path.starts_with('/') || Path::new(path).is_absolute()
+}
+
 fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
     let mut targets = Vec::new();
+    collect_commit_targets(command, cwd, 0, &mut targets);
+    targets
+}
+
+/// Recursive worker for [`git_commit_targets`]: walks one script's segments
+/// tracking `effective_dir` across them, and recurses into each segment's
+/// child scripts — a `sh -c '<script>'` wrapper's script, `$(…)`/backtick
+/// substitution bodies — with the directory in effect *at that segment* but a
+/// fresh scope (issue #228). The scoping is load-bearing both ways: a child
+/// inherits the parent's cwd at spawn (so `cd /wt && sh -c 'git commit'`
+/// resolves to `/wt`), while a child's own `cd` never leaks back into this
+/// script's tracking (a flat `command_segments` view would splice
+/// `$(cd /x)`'s `cd` into the parent stream and misjudge — from a primary
+/// checkout, silently ALLOW — a commit the real shell still runs in the
+/// parent's cwd). Depth shares [`MAX_WRAPPER_DEPTH`] with
+/// `command_segments`'s own expansion budget.
+fn collect_commit_targets(script: &str, cwd: &str, depth: usize, targets: &mut Vec<CommitTarget>) {
     let mut effective_dir = cwd.to_string();
 
-    for (segment, _next_op) in split_segments_with_ops(command) {
+    for (segment, _next_op) in split_segments_with_ops(script) {
         // Group-strip first (subshell/brace wrappers), then tokenize once —
-        // quote-aware, shared by both arms (#239 F4/F5/F9).
+        // quote-aware, shared by every arm (#239 F4/F5/F9).
         let segment = strip_group_wrappers(&segment);
         let tokens = tokenize(segment);
+
+        // Strip transparent prefixes / assignment words up front so BOTH the
+        // child-script extraction (a wrapper behind `exec`/`env`/`VAR=x`, e.g.
+        // `env GIT_AUTHOR_NAME=x bash -c 'git commit'`) and the git
+        // leading-word gate below see the real command word — the two
+        // transparency mechanisms must compose (#228 review finding 1). The
+        // `cd` arm keeps the raw tokens: `cd` is a builtin, never run behind
+        // `env`/`exec`.
+        let argv = skip_transparent_prefixes(&tokens);
+
+        // Child scripts execute with the directory in effect HERE — a
+        // substitution is evaluated before its own segment runs, and a
+        // wrapper inherits the cwd accumulated so far — in their own scope.
+        if depth < MAX_WRAPPER_DEPTH {
+            for child in child_scripts(argv, segment) {
+                collect_commit_targets(&child, &effective_dir, depth + 1, targets);
+            }
+        }
+
         if tokens.first().map(String::as_str) == Some("cd") {
             // Always assume the cd succeeds — see the doc comment above for
             // why this path cannot reuse parse_work_dir's `|| means no-op`
@@ -271,9 +351,9 @@ fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
             continue;
         }
 
-        // Skip transparent prefixes (`command git commit`, …) then require a
-        // leading `git` (#239 F4).
-        let argv = skip_transparent_prefixes(&tokens);
+        // `argv` is the prefix-/assignment-stripped view computed above
+        // (`command`/`env`/`VAR=x git commit` → leading `git`); require it
+        // (#239 F4, #228).
         if argv.first().map(String::as_str) != Some("git") {
             continue;
         }
@@ -316,14 +396,13 @@ fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
         }
         if argv.get(idx).map(String::as_str) == Some("commit") {
             let target = match redirect {
-                Some(path) if Path::new(path).is_absolute() => path.to_string(),
+                Some(path) if is_shell_absolute(path) => path.to_string(),
                 Some(path) => format!("{effective_dir}/{path}"),
                 None => effective_dir.clone(),
             };
             targets.push(target);
         }
     }
-    targets
 }
 
 /// Pure decision, all environment resolved by the caller.
@@ -836,6 +915,19 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_drive_path_commit_targets_redirect() {
+        // A native Windows drive path is absolute via `Path::is_absolute`'s own
+        // arm of `is_shell_absolute` (no leading `/` needed) — proves the
+        // `#[cfg(unix)]`-gated fixtures above aren't the only Windows coverage
+        // for this branch (issue #235).
+        assert_eq!(
+            git_commit_targets(r"git -C C:\repo\wt commit -m x", r"C:\cwd"),
+            vec![r"C:\repo\wt".to_string()]
+        );
+    }
+
     // --- git_commit_targets: grouping / prefixes / quoting (#239 F4/F5/F9) ---
 
     #[test]
@@ -924,6 +1016,176 @@ mod tests {
         assert_eq!(
             git_commit_targets("git --namespace ns -C /wt commit -m x", "/cwd"),
             vec!["/wt".to_string()]
+        );
+    }
+
+    // --- git_commit_targets: wrapper & substitution expansion (#228, #230) ---
+
+    #[test]
+    fn shell_c_wrapper_commit_detected() {
+        // Issue #228: a `sh -c '<script>'` wrapper executes its script — the
+        // commit inside must be seen, not hidden behind the wrapper's leading
+        // word.
+        for cmd in [
+            "sh -c 'git commit -m x'",
+            r#"bash -c "git commit -m x""#,
+            "zsh -c 'git commit -m x'",
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "wrapper not seen through: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_c_wrapper_cd_redirects_inside_wrapper() {
+        // The wrapper script's own `cd` redirects commits inside that script.
+        assert_eq!(
+            git_commit_targets("sh -c 'cd /wt && git commit -m x'", "/cwd"),
+            vec!["/wt".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrapper_cd_does_not_leak_to_outer_segments() {
+        // A wrapper is a child process: its `cd` never moves the parent
+        // shell's cwd, so the outer commit still targets the original cwd. A
+        // flat expansion (command_segments-style) would splice the child's
+        // `cd /elsewhere` into the parent stream and misjudge — or, from a
+        // primary checkout, silently ALLOW — the outer commit.
+        assert_eq!(
+            git_commit_targets("sh -c 'cd /elsewhere' && git commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn outer_cd_flows_into_wrapper() {
+        // A wrapper inherits the parent's working directory at spawn.
+        assert_eq!(
+            git_commit_targets("cd /wt && sh -c 'git commit -m x'", "/cwd"),
+            vec!["/wt".to_string()]
+        );
+    }
+
+    #[test]
+    fn substitution_commit_detected() {
+        // `$(…)`/backtick bodies execute — a commit inside one is real.
+        assert_eq!(
+            git_commit_targets(r#"echo "$(git commit -m x)""#, "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("echo `git commit -m x`", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn substitution_cd_does_not_poison_outer_target() {
+        // A substitution runs in a subshell: `$(cd /elsewhere)` must not move
+        // the tracked directory for the segments that follow it — the real
+        // commit below runs in /cwd, and judging it against /elsewhere would
+        // be a silent bypass primitive from any primary checkout.
+        assert_eq!(
+            git_commit_targets(r#"echo "$(cd /elsewhere)" && git commit -m x"#, "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn single_quoted_substitution_not_expanded() {
+        // Single quotes suppress substitution — nothing executes in there.
+        assert!(git_commit_targets("echo '$(git commit -m x)'", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn nested_wrappers_bounded_still_detected() {
+        assert_eq!(
+            git_commit_targets(r#"sh -c "sh -c 'git commit -m x'""#, "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrapper_without_commit_stays_empty() {
+        assert!(git_commit_targets("sh -c 'echo not a commit'", "/cwd").is_empty());
+        assert!(git_commit_targets(r#"echo "$(git rev-parse HEAD)""#, "/cwd").is_empty());
+    }
+
+    #[test]
+    fn env_prefix_commit_detected() {
+        // Issue #228 (env facet): `env` runs its argument as the command, with
+        // or without leading VAR=value assignment words.
+        assert_eq!(
+            git_commit_targets("env git commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("env GIT_AUTHOR_NAME=x git commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn assignment_prefix_commit_detected() {
+        // bash itself allows `VAR=value cmd` — the assignment word must not
+        // eat the leading-word gate.
+        assert_eq!(
+            git_commit_targets("GIT_AUTHOR_NAME=x git commit -m x", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+    }
+
+    #[test]
+    fn env_with_option_flag_is_a_miss_not_a_misparse() {
+        // `env -i git commit` — we don't parse env's own flags; documented
+        // miss (empty), never a wrong target. Mirrors `nice -n 10`.
+        assert!(git_commit_targets("env -i git commit -m x", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn transparent_prefix_before_wrapper_composes() {
+        // #228 review finding 1: a transparent prefix or assignment word in
+        // front of a `sh -c '…'` wrapper must not reopen the boundary — the
+        // two transparency mechanisms compose. Each commits into /cwd.
+        for cmd in [
+            "exec sh -c 'git commit -m x'",
+            "command sh -c 'git commit -m x'",
+            "env sh -c 'git commit -m x'",
+            "env GIT_AUTHOR_NAME=x bash -c 'git commit -m x'",
+            "GIT_AUTHOR_NAME=x sh -c 'git commit -m x'",
+            "time bash -c 'git commit -m x'",
+            "nohup zsh -c 'git commit -m x'",
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "prefix+wrapper not composed: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefixed_wrapper_cd_still_redirects() {
+        // The composed path still tracks the wrapper script's own cd.
+        assert_eq!(
+            git_commit_targets("env exec sh -c 'cd /wt && git commit -m x'", "/cwd"),
+            vec!["/wt".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrapper_and_trailing_substitution_both_seen() {
+        // #228 review finding 2: `child_scripts` unions the wrapper script
+        // with substitution bodies, so a commit in a substitution alongside a
+        // wrapper (which the outer shell runs in the parent before spawning
+        // the wrapper) is not dropped.
+        assert_eq!(
+            git_commit_targets(r#"bash -c 'true' "$(git commit -m x)""#, "/cwd"),
+            vec!["/cwd".to_string()]
         );
     }
 
@@ -1347,6 +1609,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cd_into_other_primary_blocks_and_names_target_repo() {
         // Issue #224: the target repo of a `cd <dir> && git commit` may be a
@@ -1384,6 +1650,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cd_before_or_true_still_blocks_other_primary() {
         // Issue-review finding on the #213/#224 fix: `cd <dir> || true &&
@@ -1489,6 +1759,10 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn dismiss_repo_flag_snoozes_target_not_cwd() {
         // Mirrors what `dismiss-enforce-worktree --repo <other_primary>` writes
@@ -1570,6 +1844,10 @@ mod tests {
 
     // --- repo-scoped CADENCE_ALLOW_MAIN (cameronsjo/cadence-hooks#232) ---
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cross_repo_commit_reads_target_repos_own_settings() {
         // Headline repro: shell rooted in primary A, mutation targets a
@@ -1814,6 +2092,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cross_repo_block_message_names_target_repos_settings_path() {
         let scratch = Scratch::new("cross-repo-block-message");
@@ -2001,6 +2283,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    // unix-shaped fixture: builds POSIX command strings through an
+    // escape-unaware tokenizer; native-Windows path coverage is
+    // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn commit_with_cwd_under_claude_or_plans_in_primary_still_blocks() {
         // F6/F7: the `.claude`/`docs/plans` carve-out is Edit-arm-only now. A

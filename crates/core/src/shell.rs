@@ -184,17 +184,14 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
 
+    // Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue
+    // #229 / PR #226). bash's `||`/`&&` are equal-precedence and
+    // left-associative, so a succeeding `cd` before `||` still changes the
+    // directory for what follows (`cd x || exit; git push` pushes from `x`
+    // whenever the cd works). The earlier "cd before `||` is a no-op"
+    // heuristic misjudged that common `|| exit` idiom; both resolvers now
+    // apply every `cd` the pattern finds, in order.
     for caps in CD_PATTERN.captures_iter(command) {
-        let full_match = caps.get(0).unwrap();
-        let after = command[full_match.end()..].trim_start();
-
-        // If this cd is followed by `||`, the commands after `||` only run
-        // when the cd fails — so the cd doesn't change the effective directory
-        // for those commands.
-        if after.starts_with("||") {
-            continue;
-        }
-
         let target = caps
             .get(2)
             .or(caps.get(3))
@@ -225,8 +222,10 @@ pub fn resolve_cd_target(target: &str, effective: &str) -> String {
     }
 }
 
-/// Maximum recursion depth for shell-wrapper expansion in [`command_segments`].
-const MAX_WRAPPER_DEPTH: usize = 3;
+/// Maximum recursion depth for shell-wrapper / substitution expansion — shared
+/// by [`command_segments`] and by the guard's own scoped commit-target walk,
+/// which reuses [`child_scripts`] on the same budget.
+pub const MAX_WRAPPER_DEPTH: usize = 3;
 
 /// Strip heredoc bodies from a command so their prose never reaches the
 /// segment splitter.
@@ -528,6 +527,35 @@ fn expand_segments(
     }
 }
 
+/// Scripts a single segment will itself execute in a child shell context: a
+/// `sh`/`bash`/`zsh`/`dash` `-c <script>` wrapper's script AND any
+/// `$(…)`/backtick substitution bodies in executed context. Both can coexist —
+/// `bash -c 'true' "$(git commit)"` runs the substitution in the parent before
+/// spawning bash — so the two are unioned rather than either/or (guardrails
+/// issue cameronsjo/cadence-hooks#228, review finding 2).
+///
+/// Wrapper detection reads `argv` — the caller's transparent-prefix- and
+/// assignment-stripped token view — so a wrapper behind `exec`/`env`/`VAR=x`
+/// (`exec sh -c '…'`) is still seen (review finding 1). Substitution bodies are
+/// scanned from the raw `segment`, since a substitution in a prefix word
+/// (`env FOO=$(…) …`) also executes in the parent.
+///
+/// A child script starts in the parent's working directory *at that segment*,
+/// but runs in its own process/subshell — its `cd`s never move the parent. A
+/// caller tracking a directory across segments must therefore recurse into
+/// these with a fresh scope rather than flattening via [`command_segments`]:
+/// a flat view splices `$(cd /x)`'s `cd` into the parent stream and moves the
+/// tracked directory for segments the real shell still runs in the parent's
+/// cwd (issue #228).
+pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(inner) = shell_c_argument_tokens(argv) {
+        out.push(inner);
+    }
+    out.extend(substitution_bodies(segment));
+    out
+}
+
 /// Extract command-substitution bodies from a segment: `$(…)` (tracking nested
 /// parens) and `` `…` `` backticks, in executed context only. Single quotes
 /// suppress; double quotes do not. A backslash escapes the next char outside
@@ -685,7 +713,13 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
 /// such as `-lc` (login shell + command); the script is the token following the
 /// flag that carries `c`.
 fn shell_c_argument(segment: &str) -> Option<String> {
-    let tokens = tokenize(segment);
+    shell_c_argument_tokens(&tokenize(segment))
+}
+
+/// Token-slice form of [`shell_c_argument`], so a caller that has already
+/// tokenized (and, in the guard's case, stripped transparent prefixes) can
+/// detect a wrapper without re-tokenizing.
+fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
     let first = tokens.first()?;
     let cmd = first.rsplit('/').next().unwrap_or(first);
     if !matches!(cmd, "sh" | "bash" | "zsh" | "dash") {
@@ -1273,10 +1307,16 @@ mod tests {
     }
 
     #[test]
-    fn cd_before_or_does_not_apply() {
-        // cd before || only runs on success; git push runs on failure,
-        // so the push executes from the original cwd, not /project.
-        assert_eq!(parse_work_dir("cd /project || git push", "/home"), "/home");
+    fn cd_before_or_still_redirects_assuming_success() {
+        // Assume-success model (issue #229): a `cd` before `||` still changes
+        // the directory for what follows, since `||`/`&&` are equal-precedence
+        // left-assoc and the common `cd x || exit` idiom pushes from `x`
+        // whenever the cd works. Mirrors git_commit_targets'
+        // `cd_before_or_still_redirects_assuming_success`.
+        assert_eq!(
+            parse_work_dir("cd /project || git push", "/home"),
+            "/project"
+        );
     }
 
     #[test]
@@ -1457,7 +1497,11 @@ mod tests {
     #[test]
     fn cd_or_then_and_cd() {
         // cd /fail || cd /recover && git push
-        // cd /fail is before ||, so skipped; cd /recover is on success path
+        // Assume-success model (issue #229): every `cd` applies in order, so
+        // `cd /fail` redirects first, then `cd /recover` overrides — the last
+        // applied `cd` wins. (Same final directory as the old "skip before
+        // ||" model reached, but by applying both rather than skipping the
+        // first.)
         assert_eq!(
             parse_work_dir("cd /fail || cd /recover && git push", "/home"),
             "/recover"
