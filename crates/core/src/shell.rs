@@ -473,6 +473,85 @@ fn flush_segment_with_op(
     current.clear();
 }
 
+/// Extract clobber-redirect targets from a shell command segment: the file
+/// argument following a `>` or `>|` operator. Append redirects (`>>`) do NOT
+/// truncate an existing file, so they are excluded — the operator is consumed
+/// but no target is recorded for it. Quote-aware: a `>` inside `'…'`/`"…"` is
+/// literal text, not a redirect operator, so prose like `echo "a > b" > c`
+/// yields only `c`. A stream-prefixed form (`2>`, `1>`) still names a file
+/// that gets clobbered, so its target is included — the leading digit is just
+/// an ordinary character before the operator. A fd-duplication form (`>&2`)
+/// has no file target: the target-collection loop below stops at `&`,
+/// yielding an empty string that is discarded. Targets may be quoted (`>
+/// "my note.md"`); the returned string has the quotes stripped.
+pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                i += 1;
+            }
+            '>' => {
+                i += 1;
+                // `>>` (append) does not clobber — consume the doubled
+                // operator but record no target for it.
+                if i < chars.len() && chars[i] == '>' {
+                    i += 1;
+                    continue;
+                }
+                // `>|` is the explicit force-clobber operator.
+                if i < chars.len() && chars[i] == '|' {
+                    i += 1;
+                }
+                // Skip whitespace between the operator and the filename.
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                // Collect the target token, honoring a quoted filename.
+                let mut target = String::new();
+                while i < chars.len() {
+                    let tc = chars[i];
+                    if tc == '\'' || tc == '"' {
+                        i += 1;
+                        while i < chars.len() && chars[i] != tc {
+                            target.push(chars[i]);
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            i += 1; // closing quote
+                        }
+                        continue;
+                    }
+                    if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
+                        break;
+                    }
+                    target.push(tc);
+                    i += 1;
+                }
+                if !target.is_empty() {
+                    targets.push(target);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    targets
+}
+
 /// Like [`split_segments`], but also expands what a shell would actually run:
 ///
 /// 1. **Wrapper expansion** — a segment whose command word is
@@ -883,6 +962,63 @@ mod tests {
         );
         // A real pipe still splits.
         assert_eq!(split_segments("echo x | grep y"), vec!["echo x", "grep y"]);
+    }
+
+    // --- clobber_redirect_targets ---
+
+    #[test]
+    fn clobber_redirect_plain_target() {
+        assert_eq!(clobber_redirect_targets("echo hi > f"), vec!["f"]);
+    }
+
+    #[test]
+    fn clobber_redirect_force_operator_target() {
+        assert_eq!(clobber_redirect_targets("echo hi >| f"), vec!["f"]);
+    }
+
+    #[test]
+    fn clobber_redirect_append_excluded() {
+        assert_eq!(
+            clobber_redirect_targets("echo hi >> f"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_quoted_operator_in_string_excluded() {
+        assert_eq!(
+            clobber_redirect_targets(r#"echo "use > carefully""#),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_colon_truncate_target() {
+        assert_eq!(clobber_redirect_targets(": > f"), vec!["f"]);
+    }
+
+    #[test]
+    fn clobber_redirect_stream_prefixed_target_included() {
+        assert_eq!(
+            clobber_redirect_targets("echo hi 2> err.log"),
+            vec!["err.log"]
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_fd_duplication_excluded() {
+        assert_eq!(
+            clobber_redirect_targets("echo hi >&2"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_quoted_target() {
+        assert_eq!(
+            clobber_redirect_targets(r#"echo hi > "my note.md""#),
+            vec!["my note.md"]
+        );
     }
 
     // --- command_segments (wrapper expansion) ---

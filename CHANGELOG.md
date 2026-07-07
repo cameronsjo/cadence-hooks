@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Obsidian trash-guard now blocks clobber redirects that would truncate an existing vault file (#192).** `rm`/`unlink`/`shred`/`truncate`/`find -delete` were already caught, but a clobbering redirect into an existing vault file bypassed the guard entirely — the shell truncates the target the moment it opens the file for writing, independent of whether the command itself is destructive. A new core `clobber_redirect_targets` helper (`crates/core/src/shell.rs`) extracts only truncating-redirect targets from a command segment, excluding append redirects and file-descriptor duplication; the guard resolves each target against `cwd`/vault and, via an injected filesystem-existence seam, blocks only when the target already exists on disk. Redirecting into a new filename, or appending, remains allowed.
+
 ## [0.49.0] - 2026-07-06
 
 ### Fixed
