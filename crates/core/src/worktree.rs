@@ -484,6 +484,13 @@ mod tests {
     #[test]
     fn non_repo_dir_does_not_block() {
         let scratch = Scratch::new("would-block-non-repo");
+        // A bare scratch dir is NOT repo-less: it sits under the crate's own
+        // `target/`, so repo resolution walks up to the enclosing checkout —
+        // whose `.git` is a dir on a primary clone (CI) but a file in a
+        // linked/detached worktree (local verify). Pin the dir to "no repo
+        // resolvable" with a dead gitdir pointer so the None branch is what's
+        // tested on every platform.
+        std::fs::write(scratch.0.join(".git"), "gitdir: /nonexistent\n").unwrap();
         assert!(!would_block_here(&scratch.0));
     }
 }
