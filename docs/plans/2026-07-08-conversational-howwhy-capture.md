@@ -9,7 +9,9 @@
 
 The blind-spot pass verdict on the core thesis (*git tracks who/what/when/where; cadence captures how/why*): it **holds at the artifact tier** (ADRs, TUNING-FORK, commit messages, field reports, capture manifests, drills, memory) and **leaks at the conversational tier** — the user's answers, the reviewer's dismissals, the router's declines, the human's overrides. This cluster plugs the conversational-tier leaks that have a mechanical capture point.
 
-**Chronicle does not satisfy these asks.** The in-flight chronicle project persists raw transcripts; these four findings need *structured* rows — a Q→A ledger is queryable (`jq` over a stream) in a way a transcript grep is not, and a dismissal that lands in a PR review comment is visible to the *next reviewer*, which a dead transcript never is. Chronicle is the archaeology layer; this cluster is the evidence layer.
+**This cluster is the evidence layer; the local session store is its consumer, not a rejected alternative.** The in-flight local session-store project ingests raw transcripts for archaeology; these four findings need *structured* rows first — a Q→A ledger is queryable (`jq` over a stream) in a way a transcript grep is not, and a dismissal that lands in a PR review comment is visible to the *next reviewer*, which a dead transcript never is. This plan produces those structured source rows; the session store's ingest makes them queryable downstream. Framing corrected at Step-0 gate (Cameron, 2026-07-08) — the original draft cast the store as an alternative that failed to satisfy these asks, which had the relationship backwards.
+
+**Ingest read-path verified live (2026-07-08).** A read-only query against the local session store's Postgres table confirmed it actively tails `askuserquestion.jsonl` and `bypasses.jsonl` on its regular sync cycle, keyed by stream — row counts matched disk to within one sync-cycle's lag (its own sync agent last exited 0). The evidence-layer claim above is proven against live state, not aspirational.
 
 **Verified shipped state (probed 2026-07-08 against origin/main):**
 
