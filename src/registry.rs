@@ -180,6 +180,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "guard-rm",
+        description: "Path-aware rm triage: allow temp/managed, block home/vault/repo, ask the rest",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "guard-read-model",
         description: "Block Read/Grep by resolved session model (opt-in)",
         plugin: "guardrails",
@@ -536,6 +542,13 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("guardrails", "guard-read-model") => {
             Some(r#"{"tool_name":"Read","tool_input":{"file_path":"/tmp/x"},"cwd":"/tmp"}"#)
         }
+        // guard-rm only engages on an rm-family Bash command; the generic
+        // `git status` sample would find no delete target and no-op. Carry an
+        // absolute /tmp target so the smoke run resolves ALLOW independent of
+        // the process cwd `try` substitutes.
+        ("guardrails", "guard-rm") => Some(
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/scratch/foo"},"cwd":"/tmp"}"#,
+        ),
         _ => None,
     }
 }

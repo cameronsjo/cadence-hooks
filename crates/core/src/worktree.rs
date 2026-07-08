@@ -38,24 +38,39 @@ pub fn is_primary_checkout(repo_root: &str) -> bool {
     Path::new(repo_root).join(".git").is_dir()
 }
 
-/// Pure: is `repo_root` inside a temp tree? `tmpdir` is the `$TMPDIR` value,
-/// when set. Scratch/fixture repos live here; enforcing worktree discipline
-/// on them would only produce noise.
-pub fn is_temp_root(repo_root: &Path, tmpdir: Option<&str>) -> bool {
-    let fixed = repo_root.starts_with("/tmp") || repo_root.starts_with("/private/tmp");
+/// Pure-ish: does `path` live under a temp root? `tmpdir` is the `$TMPDIR`
+/// value, when set. True for `/tmp`, `/private/tmp`, and `$TMPDIR` (with the
+/// canonicalized form too, for macOS's `/var/folders` vs `/private/var`
+/// split). The one non-pure step is a `canonicalize` of the `$TMPDIR` value.
+///
+/// This is the generic predicate behind [`is_temp_root`]; `guardrails::guard_rm`
+/// reuses it to classify an `rm` target path (cadence-hooks#261), while
+/// `is_temp_root` keeps its repo-root-focused name for the enforce-worktree
+/// carve-out.
+pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>) -> bool {
+    let fixed = path.starts_with("/tmp") || path.starts_with("/private/tmp");
     let via_env = tmpdir
         .map(str::trim)
         .filter(|t| !t.is_empty() && *t != "/")
         .is_some_and(|t| {
-            // `repo_root` comes from `git rev-parse --show-toplevel`, which
-            // canonicalizes (`/private/var/…` on macOS) while `$TMPDIR` does
-            // not (`/var/folders/…`) — compare against the canonicalized
-            // tmpdir too, or the exemption never fires on macOS.
-            repo_root.starts_with(t)
+            // `path` (a repo root from `git rev-parse --show-toplevel`, or a
+            // resolved `rm` target) may be canonicalized (`/private/var/…` on
+            // macOS) while `$TMPDIR` is not (`/var/folders/…`) — compare
+            // against the canonicalized tmpdir too, or the match never fires
+            // on macOS.
+            path.starts_with(t)
                 || std::fs::canonicalize(t)
-                    .is_ok_and(|c| c != Path::new("/") && repo_root.starts_with(&c))
+                    .is_ok_and(|c| c != Path::new("/") && path.starts_with(&c))
         });
     fixed || via_env
+}
+
+/// Pure: is `repo_root` inside a temp tree? Scratch/fixture repos live here;
+/// enforcing worktree discipline on them would only produce noise. Delegates
+/// to [`path_under_temp_root`] — kept as a named alias for the enforce-worktree
+/// carve-out's readability.
+pub fn is_temp_root(repo_root: &Path, tmpdir: Option<&str>) -> bool {
+    path_under_temp_root(repo_root, tmpdir)
 }
 
 /// Lexically normalize `dir`'s components — resolving `.` and `..` without

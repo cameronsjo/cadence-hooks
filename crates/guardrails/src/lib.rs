@@ -25,6 +25,8 @@ pub mod guard_op_vault_scan;
 pub mod guard_push_remote;
 /// Opt-in per-model Read/Grep guard; block reads by the resolved session model.
 pub mod guard_read_model;
+/// Path-aware triage of rm-family delete commands (allow/ask/block).
+pub mod guard_rm;
 /// Inject the gh-write allowlist + `-R` rule on SessionStart.
 pub mod inject_gh_context;
 /// Shared closing-keyword detection for GitHub issue references.

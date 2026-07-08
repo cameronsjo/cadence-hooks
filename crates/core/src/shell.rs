@@ -84,6 +84,16 @@ pub fn tokenize(command: &str) -> Vec<String> {
     tokens
 }
 
+/// Last path segment of a token — `/usr/bin/rm` → `rm`, `rm` → `rm`.
+///
+/// Lets a path-qualified command word (`/bin/unlink`) match the same as a bare
+/// one. A plain filename token is its own basename, so `shredder.md` ≠ `shred`
+/// still holds. Shared flag-vs-verb primitive for the destructive-command
+/// guards (obsidian trash-guard, guardrails guard-rm).
+pub fn basename(token: &str) -> &str {
+    token.rsplit('/').next().unwrap_or(token)
+}
+
 /// Returns true if `command` contains a `gh pr create` token sequence.
 ///
 /// Whitespace-token based to avoid substring false positives — a branch named

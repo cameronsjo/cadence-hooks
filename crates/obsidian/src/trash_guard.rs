@@ -5,7 +5,7 @@
 //! it and loses recoverability. This guard blocks those commands inside the
 //! vault directory and suggests `mv` to `.trash/` instead.
 
-use cadence_hooks_core::shell::{clobber_redirect_targets, command_segments, tokenize};
+use cadence_hooks_core::shell::{basename, clobber_redirect_targets, command_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
 /// True when a normalized path is absolute — POSIX (`/foo`) or a Windows
@@ -18,14 +18,6 @@ fn looks_absolute(p: &str) -> bool {
     }
     let b = p.as_bytes();
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
-}
-
-/// Last path segment of a token — `/usr/bin/shred` → `shred`, `shred` → `shred`.
-/// Lets a path-qualified verb (`/bin/unlink`) match the same as a bare one,
-/// mirroring how the `rm` substring branch already catches `/bin/rm`. A plain
-/// filename token is its own basename, so `shredder.md` ≠ `shred` still holds.
-fn basename(token: &str) -> &str {
-    token.rsplit('/').next().unwrap_or(token)
 }
 
 /// Destructive-command gate: shapes that delete or zero a vault file,

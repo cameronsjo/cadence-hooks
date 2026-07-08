@@ -189,6 +189,8 @@ enum GuardrailsCommands {
     WarnUntracked,
     /// Block direct edits to production dotfiles (opt-in via CADENCE_GUARD_DOTFILES=1)
     GuardDotfiles,
+    /// Path-aware triage of rm-family deletes (allow temp/managed, block home/vault/repo, ask the rest)
+    GuardRm,
     /// Block Read/Grep by resolved session model (opt-in via CADENCE_READ_MODEL_GUARD_MODELS)
     GuardReadModel,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
@@ -376,6 +378,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
             GuardrailsCommands::WarnUntracked => "warn-untracked",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
+            GuardrailsCommands::GuardRm => "guard-rm",
             GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
@@ -817,6 +820,11 @@ fn main() {
             ),
             GuardrailsCommands::GuardDotfiles => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::GuardRm => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_rm::GuardRm,
                 pre,
                 canonical_hook,
             ),

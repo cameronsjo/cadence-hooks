@@ -194,7 +194,7 @@ type CommitTarget = String;
 /// (`command`/`exec`/`time`/…) so `(git commit)`, `{ git commit; }`, and
 /// `command git commit` are detected rather than slipping past the leading-word
 /// gate (#239 F4).
-fn strip_group_wrappers(segment: &str) -> &str {
+pub(crate) fn strip_group_wrappers(segment: &str) -> &str {
     segment
         .trim()
         .trim_start_matches(['(', '{', ' ', '\t'])
@@ -210,7 +210,7 @@ fn strip_group_wrappers(segment: &str) -> &str {
 /// runs `VAR=value git commit` (and `env VAR=value git commit`) with the rest
 /// as the command, so an assignment word must not eat the leading-word gate
 /// (issue #228).
-fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
+pub(crate) fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
     const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
     let mut start = 0;
     while start + 1 < tokens.len() {
