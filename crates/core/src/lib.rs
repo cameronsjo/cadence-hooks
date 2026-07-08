@@ -93,6 +93,14 @@ pub enum Outcome {
     /// PostToolUse feedback loops (e.g. validate-then-rewrite gates) where a
     /// hard `Block` (exit 2) cannot un-run the tool.
     LoopBlock,
+    /// Surface the interactive permission prompt (exit 0). Emits a PreToolUse
+    /// `permissionDecision: "ask"` envelope on stdout. Per Claude Code's
+    /// precedence (`deny` > `defer` > `ask` > `allow`, most-restrictive-wins),
+    /// an `ask` decision prompts the user *even when a settings `allow` rule
+    /// would otherwise auto-approve* — so a guard can force a confirmation on an
+    /// operation it can neither prove safe (Allow) nor prove dangerous (Block).
+    /// PreToolUse only; never emitted by a PostToolUse hook.
+    Ask,
 }
 
 impl Outcome {
@@ -101,14 +109,23 @@ impl Outcome {
             Outcome::Allow => 0,
             Outcome::Nudge => 0,
             Outcome::LoopBlock => 0,
+            Outcome::Ask => 0,
             Outcome::Block => 2,
         }
     }
 
     /// Merge two outcomes, keeping the more severe one.
+    ///
+    /// Severity, most-to-least: `Block` > `Ask` > `LoopBlock` > `Nudge` >
+    /// `Allow`. `Ask` outranks `Nudge` (a prompt is a stronger intervention
+    /// than a silent context line) but yields to `Block`. `Ask` (PreToolUse)
+    /// and `LoopBlock` (PostToolUse) are emitted on disjoint events and never
+    /// actually co-occur, so their relative order is a convention, not
+    /// observable behavior.
     pub fn merge(self, other: Outcome) -> Outcome {
         match (self, other) {
             (Outcome::Block, _) | (_, Outcome::Block) => Outcome::Block,
+            (Outcome::Ask, _) | (_, Outcome::Ask) => Outcome::Ask,
             (Outcome::LoopBlock, _) | (_, Outcome::LoopBlock) => Outcome::LoopBlock,
             (Outcome::Nudge, _) | (_, Outcome::Nudge) => Outcome::Nudge,
             _ => Outcome::Allow,
@@ -599,9 +616,9 @@ pub struct CheckResult {
     pub outcome: Outcome,
     pub message: Option<String>,
     /// Structured payload attached to hard blocks. Always `None` for
-    /// `Allow`, `Nudge`, and `LoopBlock` (their delivery shapes don't carry
-    /// it). When `Some`, `run_check` emits a `permissionDecision: "deny"`
-    /// JSON envelope alongside the legacy stderr message.
+    /// `Allow`, `Nudge`, `LoopBlock`, and `Ask` (their delivery shapes don't
+    /// carry it). When `Some`, its `fix` is folded into the block's stderr
+    /// message (exit 2 surfaces stderr only — see [`render_output`]).
     pub block_metadata: Option<BlockMetadata>,
     /// Attribution when the guard allowed *because a bypass was active* — a
     /// snooze marker or an env switch — rather than because the operation was
@@ -655,6 +672,19 @@ impl CheckResult {
     pub fn loop_block(message: impl Into<String>) -> Self {
         Self {
             outcome: Outcome::LoopBlock,
+            message: Some(message.into()),
+            block_metadata: None,
+            bypass: None,
+        }
+    }
+
+    /// Force the interactive permission prompt (exit 0). The `message` becomes
+    /// the `permissionDecisionReason` shown to the user. Use when a guard can
+    /// neither prove an operation safe (allow) nor prove it dangerous (block),
+    /// so the human decides. See [`Outcome::Ask`] for the precedence guarantee.
+    pub fn ask(message: impl Into<String>) -> Self {
+        Self {
+            outcome: Outcome::Ask,
             message: Some(message.into()),
             block_metadata: None,
             bypass: None,
@@ -804,6 +834,24 @@ fn render_output(
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
                         "additionalContext": msg,
+                    }
+                })
+                .to_string(),
+            ),
+            stderr: None,
+        },
+        Outcome::Ask => RenderedOutput {
+            // PreToolUse ask: exit 0 with a `permissionDecision: "ask"` envelope.
+            // Claude Code shows the interactive permission prompt, using `msg` as
+            // the reason — overriding a settings `allow` rule (most-restrictive
+            // precedence). The reason field is a JSON string, mirroring the
+            // additionalContext string-type contract (never an object).
+            stdout: Some(
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "permissionDecision": "ask",
+                        "permissionDecisionReason": msg,
                     }
                 })
                 .to_string(),
@@ -1324,6 +1372,91 @@ mod tests {
             render_output(Outcome::Block, None, None, HookEvent::PreToolUse, None),
             RenderedOutput::default()
         );
+    }
+
+    // --- Ask outcome: exit code, render shape, merge severity (#261) ---
+
+    #[test]
+    fn ask_exits_zero() {
+        // Ask is a prompt, not a hard block — it must exit 0 so the JSON on
+        // stdout is parsed for the permissionDecision (exit 2 would discard it).
+        assert_eq!(Outcome::Ask.code(), 0);
+    }
+
+    #[test]
+    fn render_ask_emits_permission_decision_ask_on_stdout() {
+        // THE Ask contract: a PreToolUse `permissionDecision: "ask"` envelope on
+        // stdout, no stderr. The reason must be a JSON string (mirroring the
+        // additionalContext string-type contract), never an object.
+        let rendered = render_output(
+            Outcome::Ask,
+            Some("rm target could not be proven safe — confirm?"),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert_eq!(rendered.stderr, None, "ask writes no stderr");
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered.stdout.expect("ask writes stdout")).expect("valid JSON");
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "ask");
+        assert!(
+            json["hookSpecificOutput"]["permissionDecisionReason"].is_string(),
+            "permissionDecisionReason must be a string, got {}",
+            json["hookSpecificOutput"]["permissionDecisionReason"]
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecisionReason"],
+            "rm target could not be proven safe — confirm?"
+        );
+    }
+
+    #[test]
+    fn render_ask_does_not_append_feedback_footer() {
+        // The feedback footer is a hard-block affordance; an Ask is a routine
+        // prompt, so the footer must not leak into the reason.
+        let rendered = render_output(
+            Outcome::Ask,
+            Some("confirm?"),
+            None,
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered.stdout.expect("ask writes stdout")).expect("valid JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecisionReason"], "confirm?",
+            "no footer folded into an ask reason"
+        );
+    }
+
+    #[test]
+    fn render_ask_with_none_message_emits_nothing() {
+        // A None message short-circuits before the match, like every outcome.
+        assert_eq!(
+            render_output(Outcome::Ask, None, None, HookEvent::PreToolUse, None),
+            RenderedOutput::default()
+        );
+    }
+
+    #[test]
+    fn outcome_merge_ask_below_block_above_nudge() {
+        // Block > Ask > Nudge > Allow.
+        assert_eq!(Outcome::Block.merge(Outcome::Ask), Outcome::Block);
+        assert_eq!(Outcome::Ask.merge(Outcome::Block), Outcome::Block);
+        assert_eq!(Outcome::Ask.merge(Outcome::Nudge), Outcome::Ask);
+        assert_eq!(Outcome::Nudge.merge(Outcome::Ask), Outcome::Ask);
+        assert_eq!(Outcome::Ask.merge(Outcome::Allow), Outcome::Ask);
+        assert_eq!(Outcome::Allow.merge(Outcome::Ask), Outcome::Ask);
+    }
+
+    #[test]
+    fn check_result_ask() {
+        let r = CheckResult::ask("confirm this rm");
+        assert_eq!(r.outcome, Outcome::Ask);
+        assert_eq!(r.message.as_deref(), Some("confirm this rm"));
+        assert!(r.block_metadata.is_none());
+        assert!(r.bypass.is_none());
     }
 
     #[test]

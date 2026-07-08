@@ -67,9 +67,15 @@ fn nudges_enabled() -> bool {
 /// logged. Pure — `nudges_on` is passed in so the env read stays out of the
 /// mapping and the mapping is unit-testable. `LoopBlock` (advisory, exit 0) maps
 /// to `"nudge"` alongside `Nudge`.
+///
+/// `Ask` maps to `"ask"` and is logged *unconditionally* (like `Block`), not
+/// gated on `nudges_on`: forcing an interactive prompt is a real guard
+/// intervention — it overrides a settings `allow` rule — so a proving period
+/// needs to see it, not just hard denies.
 fn decision_for(outcome: Outcome, nudges_on: bool) -> Option<&'static str> {
     match outcome {
         Outcome::Block => Some("deny"),
+        Outcome::Ask => Some("ask"),
         Outcome::Nudge | Outcome::LoopBlock => nudges_on.then_some("nudge"),
         Outcome::Allow => None,
     }
@@ -135,6 +141,14 @@ mod tests {
         assert_eq!(decision_for(Outcome::Nudge, true), Some("nudge"));
         assert_eq!(decision_for(Outcome::LoopBlock, false), None);
         assert_eq!(decision_for(Outcome::LoopBlock, true), Some("nudge"));
+    }
+
+    #[test]
+    fn ask_always_logs_ungated() {
+        // Ask is a real intervention (overrides an allow rule), so it logs
+        // regardless of CADENCE_LOG_NUDGES — the proving period needs it.
+        assert_eq!(decision_for(Outcome::Ask, false), Some("ask"));
+        assert_eq!(decision_for(Outcome::Ask, true), Some("ask"));
     }
 
     // --- build_denial_record ---
