@@ -458,6 +458,99 @@ fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option
     })
 }
 
+/// Fail-open telemetry as doctor `Finding`s — up to 3 (one per `reason`), or
+/// none when all counts are below their thresholds. `panic` and `parse` are
+/// warned on any/moderate occurrence; `version_mismatch` only counts rows
+/// tagged with the CURRENT binary's own version (see
+/// `log_failopen::recent_failopen_counts`'s doc) — an older-version row is the
+/// sanctioned release-transition case and is excluded by construction.
+fn failopen_findings(
+    dir: &Path,
+    window: Duration,
+    now: SystemTime,
+    current_version: &str,
+) -> Vec<Finding> {
+    let counts = cadence_hooks_metrics::log_failopen::recent_failopen_counts(
+        dir,
+        window,
+        now,
+        current_version,
+    );
+    let days = window.as_secs() / 86_400;
+    let mut findings = Vec::new();
+
+    if counts.panic >= 1 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("panic: {}", counts.panic),
+            diagnosis: format!(
+                "{} panic(s) in the last {days} days (failopen.jsonl)",
+                counts.panic
+            ),
+            remediation: "a panic in a check/logger is always a bug — inspect \
+                          failopen.jsonl for the namespace/subcommand and file an issue"
+                .to_string(),
+        });
+    }
+
+    if counts.parse >= 3 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("parse: {}", counts.parse),
+            diagnosis: format!(
+                "{} stdin-parse failure(s) in the last {days} days (failopen.jsonl)",
+                counts.parse
+            ),
+            remediation: "occasional malformed payloads are tolerated; 3+ suggests \
+                          a wiring problem feeding this binary bad stdin — inspect \
+                          failopen.jsonl"
+                .to_string(),
+        });
+    }
+
+    if counts.version_mismatch >= 1 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("version_mismatch: {}", counts.version_mismatch),
+            diagnosis: format!(
+                "{} version_mismatch failopen(s) on this binary's own version \
+                 ({current_version}) in the last {days} days — a hooks.json/binary \
+                 skew that hasn't resolved",
+                counts.version_mismatch
+            ),
+            remediation: "compare installed plugin hooks.json subcommand references \
+                          against 'cadence-hooks list' — this binary doesn't \
+                          recognize something a plugin expects"
+                .to_string(),
+        });
+    }
+
+    findings
+}
+
+/// Prints an informational (non-blocking, not a `Finding`) count of recent
+/// registry-file reaps when nonzero. No threshold — reaping is normal
+/// operation; this is visibility, not an alarm.
+fn print_sweep_summary(dir: &Path, window: Duration, now: SystemTime) {
+    let count = cadence_hooks_metrics::log_sweep::recent_sweep_count(dir, window, now);
+    if count == 0 {
+        return;
+    }
+    let days = window.as_secs() / 86_400;
+    println!(
+        "cadence-hooks doctor: {count} session-registry sweep(s) in the last {days} days (sweeps.jsonl)"
+    );
+}
+
 /// Sum the byte size of every regular file under `dir`, walking recursively.
 ///
 /// Symlinks are skipped (mirrors [`scan_root`]'s cycle guard) — including
@@ -1014,6 +1107,25 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         findings.push(finding);
     }
 
+    // Fail-open / sweep telemetry: same live-machine-only rationale as
+    // staleness above — under `--root` this would read the dev machine's real
+    // metrics dir, not the fixture.
+    if root_override.is_none() {
+        let metrics_dir = cadence_hooks_metrics::warn_stale::metrics_dir();
+        let now = SystemTime::now();
+        let window = Duration::from_secs(7 * 24 * 60 * 60);
+
+        findings.extend(failopen_findings(
+            &metrics_dir,
+            window,
+            now,
+            env!("CARGO_PKG_VERSION"),
+        ));
+        if !quiet {
+            print_sweep_summary(&metrics_dir, window, now);
+        }
+    }
+
     // Plugin-cache health: orphaned/missing version dirs and canonical-remote
     // drift. Same live-machine-only rationale as staleness above — under
     // `--root` this would read the dev machine's real cache, not the fixture.
@@ -1138,6 +1250,102 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert!(staleness_finding(&missing, Duration::ZERO, SystemTime::now()).is_none());
+    }
+
+    // ── failopen_findings tests ─────────────────────────────────────────────
+
+    const WEEK: Duration = Duration::from_secs(7 * 86_400);
+
+    #[test]
+    fn failopen_findings_missing_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn failopen_findings_one_panic_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let row = r#"{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","ts":"TS"}"#
+            .replace("TS", &cadence_hooks_core::time::utc_timestamp());
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].diagnosis.contains("panic"));
+    }
+
+    #[test]
+    fn failopen_findings_parse_below_threshold_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let rows: String = (0..2)
+            .map(|_| {
+                format!(
+                    r#"{{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"{ts}"}}"#
+                )
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        assert!(failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn failopen_findings_parse_at_threshold_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let rows: String = (0..3)
+            .map(|_| {
+                format!(
+                    r#"{{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"{ts}"}}"#
+                )
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].diagnosis.contains("parse"));
+    }
+
+    #[test]
+    fn failopen_findings_version_mismatch_old_version_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"version_mismatch","namespace":"future","subcommand":"hook","binaryVersion":"0.9.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        // The current binary is 1.0.0; the row is tagged 0.9.0 — a sanctioned
+        // rollout-transition row, excluded by construction.
+        assert!(failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn failopen_findings_version_mismatch_current_version_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"version_mismatch","namespace":"future","subcommand":"hook","binaryVersion":"1.0.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].diagnosis.contains("version_mismatch"));
+    }
+
+    #[test]
+    fn failopen_findings_outside_window_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let row = r#"{"reason":"panic","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"2000-01-01T00:00:00Z"}"#;
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        assert!(failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0").is_empty());
     }
 
     // ── extract_invocation table tests ──────────────────────────────────────

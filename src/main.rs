@@ -537,6 +537,19 @@ fn main() {
             "cadence-hooks: internal error (panic). This hook will not block your operation.\n\
              {payload}"
         );
+        // Best-effort argv re-read: this closure has no access to the `Check`/
+        // `Logger`/`hook` context computed elsewhere in `main` (a panic can
+        // strike anywhere), so it re-derives the attempted subcommand purely
+        // for diagnostic tagging — not validated against the registry.
+        let mut argv = std::env::args().skip(1);
+        let namespace = argv.next();
+        let subcommand = argv.next();
+        cadence_hooks_metrics::log_failopen(
+            "panic",
+            namespace.as_deref(),
+            subcommand.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        );
         process::exit(1);
     }));
 
@@ -600,6 +613,18 @@ fn main() {
                          \x20 https://github.com/cameronsjo/cadence-hooks/releases/latest\n\
                          \n\
                          Underlying error: {e}"
+                    );
+                    // Best-effort argv re-read, same as the panic hook — a
+                    // clap parse failure means `cli`/`hook_name` were never
+                    // computed, so the raw argv position is all we have.
+                    let mut argv = std::env::args().skip(1);
+                    let namespace = argv.next();
+                    let subcommand = argv.next();
+                    cadence_hooks_metrics::log_failopen(
+                        "version_mismatch",
+                        namespace.as_deref(),
+                        subcommand.as_deref(),
+                        installed,
                     );
                     process::exit(1);
                 }

@@ -7,6 +7,7 @@ description = "Multi-session coordination hooks: identity registry, disclosure, 
 
 [dependencies]
 cadence-hooks-core.workspace = true
+cadence-hooks-metrics.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 
