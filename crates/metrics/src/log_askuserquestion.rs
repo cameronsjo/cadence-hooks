@@ -175,7 +175,7 @@ fn build_answered_record(
     };
 
     let mut sorted_answers: Vec<(&String, &Value)> = answers.iter().collect();
-    sorted_answers.sort_by(|(a, _), (b, _)| a.cmp(b));
+    sorted_answers.sort_by_key(|(a, _)| *a);
 
     let answered: Vec<Value> = sorted_answers
         .into_iter()
