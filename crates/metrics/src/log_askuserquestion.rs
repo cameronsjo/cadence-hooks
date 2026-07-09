@@ -142,6 +142,30 @@ fn build_asked_record(
     record
 }
 
+/// Whether `answer_str` actually *selects* the question's recommended option —
+/// not just whether the raw string happens to contain the marker.
+///
+/// Splits `answer_str` on `", "` (multiSelect answers are comma-joined per
+/// [`cadence_hooks_core::ToolResponse::answers`]'s doc contract) and checks
+/// each selected piece against `question`'s own option labels, flagging a
+/// match only when the SELECTED label is itself marked `(Recommended)`. A
+/// plain substring check on the whole answer string would false-positive on
+/// "Other" free-text that happens to mention the phrase (e.g. "not the
+/// (Recommended) one, do X instead") and can't correctly handle a
+/// multi-select pick that includes some but not all recommended options.
+/// `false` when `question` is `None` (a payload-shape drift already noted by
+/// the `header: null` fallback) — no options to check against.
+fn answer_matches_recommended(question: Option<&AskQuestion>, answer_str: &str) -> bool {
+    let Some(options) = question.and_then(|q| q.options.as_ref()) else {
+        return false;
+    };
+    answer_str.split(", ").any(|selected| {
+        options
+            .iter()
+            .any(|o| o.label.as_deref() == Some(selected) && is_recommended_label(selected))
+    })
+}
+
 /// Build the `"answered"` phase record. Pure — no I/O.
 ///
 /// Per D1-a, `answer` is the verbatim selected-label (or "Other" free-text)
@@ -167,11 +191,10 @@ fn build_answered_record(
     answers: &HashMap<String, Value>,
     include_keys: bool,
 ) -> Value {
-    let header_for = |question_text: &str| -> Option<String> {
+    let question_for = |question_text: &str| -> Option<&AskQuestion> {
         questions
             .iter()
             .find(|q| q.question.as_deref() == Some(question_text))
-            .and_then(|q| q.header.clone())
     };
 
     let mut sorted_answers: Vec<(&String, &Value)> = answers.iter().collect();
@@ -180,9 +203,12 @@ fn build_answered_record(
     let answered: Vec<Value> = sorted_answers
         .into_iter()
         .map(|(question_text, answer)| {
-            let matched_recommended = answer.as_str().is_some_and(is_recommended_label);
+            let question = question_for(question_text);
+            let matched_recommended = answer
+                .as_str()
+                .is_some_and(|s| answer_matches_recommended(question, s));
             json!({
-                "header": header_for(question_text),
+                "header": question.and_then(|q| q.header.clone()),
                 "answer": answer,
                 "matchedRecommended": matched_recommended,
             })
@@ -270,6 +296,28 @@ mod tests {
 
     // --- run(): event/data gating (no-ops must never touch the filesystem) ---
 
+    /// Run `f` with `CADENCE_METRICS_DIR` pointed at a fresh empty tempdir, then
+    /// assert `askuserquestion.jsonl` was never created — a no-op that silently
+    /// wrote the file would otherwise pass with no assertion at all.
+    fn assert_noop(f: impl FnOnce()) {
+        let _guard = common::ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by ENV_LOCK; no other thread reads/writes
+        // CADENCE_METRICS_DIR while this guard is held.
+        unsafe {
+            std::env::set_var("CADENCE_METRICS_DIR", tmp.path());
+        }
+        f();
+        assert!(
+            !tmp.path().join("askuserquestion.jsonl").exists(),
+            "no-op run must never create askuserquestion.jsonl"
+        );
+        // SAFETY: same ENV_LOCK guard as the set above.
+        unsafe {
+            std::env::remove_var("CADENCE_METRICS_DIR");
+        }
+    }
+
     #[test]
     fn wrong_hook_event_is_noop() {
         let input = MetricsInput {
@@ -280,24 +328,28 @@ mod tests {
             }),
             ..Default::default()
         };
-        LogAskUserQuestion.run(&input);
+        assert_noop(|| LogAskUserQuestion.run(&input));
     }
 
     #[test]
     fn pre_without_questions_is_noop() {
-        LogAskUserQuestion.run(&pre_input(vec![]));
-        LogAskUserQuestion.run(&MetricsInput {
-            hook_event_name: Some("PreToolUse".into()),
-            ..Default::default()
+        assert_noop(|| {
+            LogAskUserQuestion.run(&pre_input(vec![]));
+            LogAskUserQuestion.run(&MetricsInput {
+                hook_event_name: Some("PreToolUse".into()),
+                ..Default::default()
+            });
         });
     }
 
     #[test]
     fn post_without_answers_is_noop() {
-        LogAskUserQuestion.run(&post_input(vec![], HashMap::new()));
-        LogAskUserQuestion.run(&MetricsInput {
-            hook_event_name: Some("PostToolUse".into()),
-            ..Default::default()
+        assert_noop(|| {
+            LogAskUserQuestion.run(&post_input(vec![], HashMap::new()));
+            LogAskUserQuestion.run(&MetricsInput {
+                hook_event_name: Some("PostToolUse".into()),
+                ..Default::default()
+            });
         });
     }
 
@@ -455,6 +507,56 @@ mod tests {
         let rec = build_answered_record("ts", &input_with_model(None), &qs, &answers, false);
         let answered = rec["answers"].as_array().unwrap();
         assert_eq!(answered[0]["answer"], "Neither — do X instead because Y");
+        assert_eq!(answered[0]["matchedRecommended"], false);
+    }
+
+    #[test]
+    fn answered_record_free_text_mentioning_recommended_marker_is_not_matched() {
+        // A "(Recommended)" substring inside free-text prose must NOT flag
+        // matchedRecommended — only an actual selected option label counts.
+        let qs = vec![q(
+            "Pick one",
+            "Pick",
+            &["Alpha (Recommended)", "Beta"],
+            false,
+        )];
+        let mut answers = HashMap::new();
+        answers.insert(
+            "Pick one".to_string(),
+            json!("Not the (Recommended) one, do Gamma instead"),
+        );
+        let rec = build_answered_record("ts", &input_with_model(None), &qs, &answers, false);
+        let answered = rec["answers"].as_array().unwrap();
+        assert_eq!(answered[0]["matchedRecommended"], false);
+    }
+
+    #[test]
+    fn answered_record_multiselect_matches_when_a_recommended_option_is_selected() {
+        let qs = vec![q(
+            "Pick some",
+            "Pick",
+            &["Alpha", "Beta", "Gamma (Recommended)"],
+            true,
+        )];
+        let mut answers = HashMap::new();
+        answers.insert("Pick some".to_string(), json!("Beta, Gamma (Recommended)"));
+        let rec = build_answered_record("ts", &input_with_model(None), &qs, &answers, false);
+        let answered = rec["answers"].as_array().unwrap();
+        assert_eq!(answered[0]["matchedRecommended"], true);
+    }
+
+    #[test]
+    fn answered_record_multiselect_without_recommended_pick_is_not_matched() {
+        let qs = vec![q(
+            "Pick some",
+            "Pick",
+            &["Alpha", "Beta", "Gamma (Recommended)"],
+            true,
+        )];
+        let mut answers = HashMap::new();
+        answers.insert("Pick some".to_string(), json!("Alpha, Beta"));
+        let rec = build_answered_record("ts", &input_with_model(None), &qs, &answers, false);
+        let answered = rec["answers"].as_array().unwrap();
         assert_eq!(answered[0]["matchedRecommended"], false);
     }
 
