@@ -20,6 +20,11 @@
 //! circuit breakers + retained settings `deny` rows) bounds the
 //! fail-open-plus-allow window.
 //!
+//! **v1 scope (deferred, not forgotten):** a fourth ALLOW mechanism — a per-repo
+//! declared safe-path config (`.claude/rm-exemptions.json`) — was cut from v1 as
+//! a Step-0 trim (YAGNI); it returns on a real trigger. v1 ships the three
+//! structural ALLOW/BLOCK edges above plus the ASK default.
+//!
 //! **Scope, by design (documented misses, not holes):**
 //! - The leading command word is basename-matched against `rm`/`unlink`/
 //!   `shred`/`truncate` (plus `find … -delete`), after transparent prefixes
@@ -52,6 +57,10 @@ use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome, normalize_path}
 use std::path::Path;
 
 /// Delete verbs whose leading command word marks a filesystem deletion.
+/// Deliberately duplicates `obsidian::trash_guard`'s destructive-verb set (per
+/// the plan's reuse ledger: promote when cheap, else duplicate with
+/// attribution) — the two guards judge different things (vault membership vs
+/// path class), so a shared const would couple them without real reuse.
 const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 
 /// Does `flag` (in separate-token form) consume the following token as a value
@@ -176,19 +185,61 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
         }
 
         let Some(first) = argv.first() else { continue };
-        let verb = basename(first);
+        // basename so `/bin/rm` matches; strip a leading `\` so the alias-bypass
+        // form `\rm` is still seen as `rm`. (Deliberate misses: `xargs rm` —
+        // the targets arrive on stdin, unclassifiable, and treating it as an rm
+        // with no operand would ALLOW, worse than deferring; and `RM` on a
+        // case-insensitive volume — matching case-insensitively would be wrong
+        // on Linux. Both are mitigated: a settings `allow Bash(rm:*)` rule keys
+        // on the leading word too, so they defer, never silently auto-approve.)
+        let verb = basename(first).trim_start_matches('\\');
         if DELETE_VERBS.contains(&verb) {
             for operand in delete_operands(argv, verb) {
                 out.push(resolve_target(&operand, &effective_dir));
             }
-        } else if verb == "find" && argv.iter().any(|t| t == "-delete") {
-            // `find … -delete` — only `-delete` destroys; `find` alone is
-            // read-only. (`find … -exec rm …` surfaces via the recursed rm.)
-            for root in find_roots(argv) {
-                out.push(resolve_target(&root, &effective_dir));
+        } else if verb == "find" && find_is_destructive(argv) {
+            // A `find` that deletes — via `-delete`/`-exec`/`-ok` running a
+            // delete verb — targets its search roots. When the roots can't be
+            // confidently identified (no explicit path, or an unrecognized
+            // leading option that might have dropped one), one Unresolvable
+            // target → ASK, rather than a silent cwd default.
+            match find_roots(argv) {
+                FindTargets::Paths(roots) => {
+                    for root in roots {
+                        out.push(resolve_target(&root, &effective_dir));
+                    }
+                }
+                FindTargets::Unresolvable => out.push(TargetToken::Unresolvable),
             }
         }
     }
+}
+
+/// A `find` invocation that deletes: it carries `-delete`, or an
+/// `-exec`/`-execdir`/`-ok`/`-okdir` whose command is a delete verb
+/// (`find … -exec rm …`). The command word is scanned up to its `;`/`+`
+/// terminator, so `-exec /bin/rm …`, `-exec env rm …`, and `-exec \rm …` are
+/// caught. `-exec sh -c '…'` hides the delete inside the wrapper script — a
+/// documented miss.
+fn find_is_destructive(argv: &[String]) -> bool {
+    if argv.iter().any(|t| t == "-delete") {
+        return true;
+    }
+    let mut after_exec = false;
+    for tok in argv.iter().skip(1) {
+        match tok.as_str() {
+            "-exec" | "-execdir" | "-ok" | "-okdir" => after_exec = true,
+            ";" | "\\;" | "+" => after_exec = false,
+            other
+                if after_exec
+                    && DELETE_VERBS.contains(&basename(other).trim_start_matches('\\')) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Path operands of an `rm`/`unlink`/`shred`/`truncate` invocation: non-flag
@@ -218,21 +269,62 @@ fn delete_operands(argv: &[String], verb: &str) -> Vec<String> {
     operands
 }
 
-/// Search roots of a `find` invocation: tokens after `find` up to the first
-/// expression token (`-name`, `-delete`, `(`, `!`, …). `find` with no path
-/// defaults to the current directory.
-fn find_roots(argv: &[String]) -> Vec<String> {
-    let mut roots = Vec::new();
-    for tok in argv.iter().skip(1) {
-        if tok.starts_with('-') || tok == "(" || tok == "!" {
+/// The search-root resolution of a destructive `find`.
+enum FindTargets {
+    /// Explicit path arguments to classify.
+    Paths(Vec<String>),
+    /// The roots can't be confidently identified → ASK. Two cases collapse here:
+    /// no explicit path (the target is the implicit cwd, but a leading option we
+    /// failed to recognize could equally have dropped a real root), and a
+    /// leading `-`-token that isn't a known global option.
+    Unresolvable,
+}
+
+/// Search roots of a `find` invocation: the path arguments between the global
+/// options and the first expression token (`-name`, `-delete`, `(`, `!`, …).
+///
+/// `find`'s global options precede the paths and also start with `-`, so a
+/// naive "break on the first `-`" drops the real root on `find -L <path>
+/// -delete` and silently defaults it to the cwd — from a `.claude`/`tmp` cwd
+/// that is a silent ALLOW of a protected delete. The known GNU ∪ BSD global
+/// options are skipped (`-H`/`-L`/`-P`/`-E`/`-X`/`-d`/`-s`/`-x` boolean; `-D`/
+/// `-O` valued, separate or glued). Rather than enumerate every `find` variant
+/// (fragile — a missed option re-opens the hole), anything else is treated
+/// conservatively: **no explicit path found → `Unresolvable` (ASK)**, never a
+/// silent cwd default. `-f <path>` (BSD, *adds* a search root) also routes to
+/// `Unresolvable` — its value is a real target this simple pass won't fold in.
+fn find_roots(argv: &[String]) -> FindTargets {
+    const GLOBAL_BOOL: &[&str] = &["-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x"];
+    let mut i = 1;
+    while let Some(tok) = argv.get(i) {
+        let t = tok.as_str();
+        if GLOBAL_BOOL.contains(&t) {
+            i += 1;
+        } else if t == "-D" || t == "-O" {
+            i += 2; // separate-token value
+        } else if t.starts_with("-D") || t.starts_with("-O") {
+            i += 1; // glued value (`-O2`, `-Dtree`)
+        } else {
             break;
         }
-        roots.push(tok.clone());
     }
-    if roots.is_empty() {
-        roots.push(".".to_string());
+    // At the first non-global token. A dash here means no explicit path was
+    // given (expression start) OR an unrecognized/`-f` option — either way we
+    // can't safely name the root, so ASK.
+    match argv.get(i) {
+        Some(tok) if !(tok.starts_with('-') || tok == "(" || tok == "!") => {
+            let mut roots = Vec::new();
+            while let Some(tok) = argv.get(i) {
+                if tok.starts_with('-') || tok == "(" || tok == "!" {
+                    break;
+                }
+                roots.push(tok.clone());
+                i += 1;
+            }
+            FindTargets::Paths(roots)
+        }
+        _ => FindTargets::Unresolvable,
     }
-    roots
 }
 
 /// Resolve one operand against the effective cwd, or mark it unresolvable.
@@ -265,6 +357,12 @@ fn resolve_target(operand: &str, effective_dir: &str) -> TargetToken {
 /// The literal directory prefix of a (possibly globbed) operand: everything up
 /// to the last `/` before the first glob metachar. A glob in the first segment
 /// yields `""` (the cwd); a leading-`/` glob (`/*`) yields `/` (the root).
+///
+/// `[` is treated as a glob metachar unconditionally, though it is also a legal
+/// filename character — so a literal `~/Documents/file[1].txt` reduces to
+/// `~/Documents` and classifies as the exact home child (Block) rather than the
+/// deeper ambiguous path (Ask). The error direction is always *more* restrictive
+/// (Block/Ask, never a silent Allow), so it is safe, if occasionally strict.
 fn glob_literal_prefix(operand: &str) -> &str {
     let Some(pos) = operand.find(['*', '?', '[']) else {
         return operand;
@@ -281,6 +379,28 @@ fn has_parent_segment(path: &str) -> bool {
     path.split('/').any(|seg| seg == "..")
 }
 
+/// Drop bare `.` segments from an already-`normalize_path`'d string, so a
+/// non-canonical form like `~/./Documents` still matches the exact classifiers
+/// (`HomeChild`, `Vault`, `has_git_component`) rather than slipping to the
+/// ambiguous default. `..` never reaches here — `resolve_target` routes it to
+/// `Unresolvable` upstream.
+fn drop_dot_segments(path: &str) -> String {
+    if !path.split('/').any(|s| s == ".") {
+        return path.to_string();
+    }
+    let leading = path.starts_with('/');
+    let joined = path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    if leading {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
 /// Classify a resolved target path. `is_git_root` is injected (the wrapper
 /// stats `<target>/.git`; tests stub it) so this stays pure.
 ///
@@ -288,7 +408,7 @@ fn has_parent_segment(path: &str) -> bool {
 /// target under a protected ancestor — a git worktree under `.claude`, a repo
 /// checked out in `/tmp` — is ALLOW, not blocked as a git repo.
 fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool) -> TargetClass {
-    let norm = normalize_path(path);
+    let norm = drop_dot_segments(&normalize_path(path));
 
     // ALLOW rules first.
     if path_under_temp_root(Path::new(&norm), ctx.tmpdir) {
@@ -370,6 +490,10 @@ fn judge_rm(
             TargetToken::Path(p) => classify_path(p, ctx, is_git_root),
         };
         let outcome = class.outcome();
+        // Remember the FIRST block-classified target only for message wording.
+        // The choice is arbitrary, not an ordering — every BLOCK `TargetClass`
+        // shares one `Outcome::Block`, so which one names the message doesn't
+        // change the verdict.
         if outcome == Outcome::Block && block_class.is_none() {
             block_class = Some(class);
         }
@@ -777,10 +901,136 @@ mod tests {
     }
 
     #[test]
-    fn find_delete_no_path_uses_cwd() {
-        // No path before the expression → defaults to cwd, here a home child.
-        let cwd = format!("{}/Documents", home());
-        assert_eq!(judge("find -name '*.md' -delete", &cwd), Outcome::Block);
+    fn find_delete_no_explicit_path_asks() {
+        // No explicit path before the expression: the target is the implicit
+        // cwd, but a leading option we failed to recognize could equally have
+        // dropped a real root — can't tell safely, so ASK (never a silent cwd
+        // default that a `.claude`/`tmp` cwd would turn into ALLOW).
+        assert_eq!(judge("find -name '*.md' -delete", "/home"), Outcome::Ask);
+        assert_eq!(judge("find -delete", "/home"), Outcome::Ask);
+    }
+
+    #[test]
+    fn find_bsd_global_options_keep_the_root() {
+        // macOS ships BSD find: -x/-s/-E/-d/-X are global options too.
+        assert_eq!(
+            judge("find -x ~/Documents -delete", "/home"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("find -s ~/Documents -delete", "/home"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("find -E ~/Documents -delete", "/home"),
+            Outcome::Block
+        );
+    }
+
+    #[test]
+    fn find_unknown_leading_option_asks() {
+        // An option outside the known GNU∪BSD global set might have dropped the
+        // real root → ASK, not a silent cwd default.
+        assert_eq!(
+            judge("find -zzz ~/Documents -delete", "/home"),
+            Outcome::Ask
+        );
+        // `-f <path>` (BSD, adds a search root) also routes to ASK.
+        assert_eq!(judge("find -f ~/Documents -delete", "/home"), Outcome::Ask);
+    }
+
+    #[test]
+    fn find_ok_and_backslash_exec_detected() {
+        // `-ok`/`-okdir` are interactive `-exec`; a `\rm` behind -exec is still rm.
+        assert_eq!(
+            judge("find ~/Documents -ok rm {} +", "/home"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("find ~/Documents -exec \\rm -rf {} +", "/home"),
+            Outcome::Block
+        );
+    }
+
+    // --- security-review fixes: find global options, -exec, \rm, dots ---
+
+    #[test]
+    fn find_leading_global_option_keeps_the_root() {
+        // Sec #1: a leading -L/-H/-P (or -D/-O) must not drop the real root and
+        // default to cwd. `find -L ~/Documents -delete` blocks, not allows.
+        assert_eq!(
+            judge("find -L ~/Documents -name '*.md' -delete", "/home"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("find -P ~/Documents -delete", "/home"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("find -O2 ~/Documents -delete", "/home"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("find -D tree ~/Documents -delete", "/home"),
+            Outcome::Block
+        );
+    }
+
+    #[test]
+    fn find_exec_delete_targets_the_root() {
+        // Sec #2: `find … -exec rm …` deletes, so the search roots are targets.
+        assert_eq!(
+            judge("find ~/Documents -name '*.md' -exec rm -rf {} +", "/home"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("find ~/Documents -execdir /bin/rm {} ;", "/home"),
+            Outcome::Block
+        );
+        assert_eq!(judge("find /tmp/x -exec rm {} +", "/home"), Outcome::Allow);
+    }
+
+    #[test]
+    fn find_without_exec_delete_still_read_only() {
+        // A find whose -exec runs a non-delete command is read-only → Allow.
+        assert_eq!(
+            judge("find ~/Documents -exec cat {} +", "/home"),
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn backslash_rm_alias_bypass_detected() {
+        // Sec #3: `\rm` (bypasses a shell alias) is still `rm`.
+        assert_eq!(judge("\\rm -rf /", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn dot_segments_do_not_downgrade_block() {
+        // Sec #4: a `.` segment must not slip a home child past the exact match.
+        assert_eq!(judge("rm -rf ~/./Documents", "/home"), Outcome::Block);
+        assert_eq!(judge("rm -rf /vaults/./main/x", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn more_value_flags_not_misread() {
+        // Cover the rest of the takes_value table + glued / =-joined forms.
+        assert_eq!(
+            judge("shred --iterations 3 /tmp/x", "/home"),
+            Outcome::Allow
+        );
+        assert_eq!(
+            judge("shred --random-source /dev/urandom /tmp/x", "/home"),
+            Outcome::Allow
+        );
+        assert_eq!(
+            judge("truncate -r /tmp/ref /tmp/x", "/home"),
+            Outcome::Allow
+        );
+        // Glued (`-s0`) and =-joined (`--size=0`) carry their own value — the
+        // only operand is /tmp/x.
+        assert_eq!(judge("truncate -s0 /tmp/x", "/home"), Outcome::Allow);
+        assert_eq!(judge("truncate --size=0 /tmp/x", "/home"), Outcome::Allow);
     }
 
     // --- message content ---
