@@ -76,11 +76,16 @@ fn has_recommended(questions: &[AskQuestion]) -> bool {
     questions
         .iter()
         .flat_map(|q| q.options.iter().flatten())
-        .any(|o| {
-            o.label
-                .as_deref()
-                .is_some_and(|l| l.contains(RECOMMENDED_MARKER))
-        })
+        .any(|o| o.label.as_deref().is_some_and(is_recommended_label))
+}
+
+/// True when a single option label carries the `(Recommended)` marker.
+/// Exposes [`RECOMMENDED_MARKER`] as a predicate for consumers outside this
+/// module (e.g. the `log-ask-user-question` metrics logger classifying a
+/// selected answer) that need to test one label rather than a whole
+/// `[AskQuestion]` slice, without duplicating the marker literal.
+pub fn is_recommended_label(label: &str) -> bool {
+    label.contains(RECOMMENDED_MARKER)
 }
 
 /// True when any question text declares no clear recommendation.
@@ -397,6 +402,12 @@ mod tests {
         // The bare prose "recommend" must not count, nor a near-miss phrase.
         assert!(!contains_no_rec_marker("I recommend option A clearly"));
         assert!(!contains_no_rec_marker("no recommendation given"));
+    }
+
+    #[test]
+    fn is_recommended_label_matches_marker() {
+        assert!(is_recommended_label("Option A (Recommended)"));
+        assert!(!is_recommended_label("Option B"));
     }
 
     #[test]

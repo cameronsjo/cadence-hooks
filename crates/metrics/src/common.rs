@@ -154,6 +154,10 @@ pub const PLAN_PHASE_SCHEMA_VERSION: u32 = 1;
 /// Schema version stamped on every `skills.jsonl` row.
 pub const SKILL_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version stamped on every `askuserquestion.jsonl` row (both
+/// `asked` and `answered` phases).
+pub const ASKUSERQUESTION_SCHEMA_VERSION: u32 = 1;
+
 /// Crate-wide serialization lock for env-mutating tests.
 ///
 /// `CADENCE_METRICS_DIR` and its siblings are process-global, so every test that

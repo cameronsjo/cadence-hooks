@@ -495,6 +495,11 @@ pub struct MetricsInput {
     /// absent. Powers event-derivation loggers like `log-plan-phase` that key
     /// off which tool ran rather than a fixed `hook_event_name`.
     pub tool_name: Option<String>,
+    /// The tool response, available in PostToolUse payloads. Mirrors
+    /// [`HookInput::tool_response`]; deserializes to `None` on PreToolUse and
+    /// other events that carry no response. Additive — every existing logger
+    /// ignores it.
+    pub tool_response: Option<ToolResponse>,
     /// Top-level keys present in the raw payload. Populated by [`Self::from_json`],
     /// not deserialized — powers the `CADENCE_METRICS_DEBUG` `_keys` field that
     /// surfaces schema additions across Claude Code releases.

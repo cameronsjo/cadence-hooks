@@ -292,7 +292,7 @@ enum MetricsCommands {
     },
     /// Log polish-nudge skips: `gh pr create` + whether /polish ran (PostToolUse)
     LogPolishNudge,
-    /// Log AskUserQuestion stance + shape on every call (PreToolUse)
+    /// Log AskUserQuestion: asked (PreToolUse) + answered (PostToolUse)
     LogAskUserQuestion,
     /// Log skill invocations (PostToolUse:Skill)
     LogSkill,
