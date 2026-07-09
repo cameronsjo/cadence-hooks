@@ -110,7 +110,7 @@ pub fn run_start(
 
     // Housekeeping: presumed-dead peers leave the room before roll call. Our
     // own (just-refreshed) file is excluded by sid as defense-in-depth.
-    registry::sweep_stale(dir, stale_secs, sid);
+    registry::sweep_stale(dir, stale_secs, sid, "start");
 
     // Disclose live peers, if any.
     let peers = registry::live_peers(dir, sid, stale_secs);
@@ -341,8 +341,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
         // stale_secs = 0: any measurable age (whole seconds) counts as stale.
+        // Reaping fires log_sweep (#259) — scratch-dir-scoped so this doesn't
+        // race the sweep-telemetry tests in `registry` over the
+        // process-global CADENCE_METRICS_DIR.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), None, 0);
+        let r = registry::test_metrics_env::with_scratch_metrics_dir(|| {
+            run_start(&input, tmp.path(), None, 0)
+        });
         assert_eq!(r.outcome, Outcome::Allow, "stale peers are ignored");
         assert!(
             registry::read_own(tmp.path(), "peer-session").is_none(),
