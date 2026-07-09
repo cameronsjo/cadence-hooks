@@ -49,8 +49,8 @@
 
 use crate::enforce_worktree::{skip_transparent_prefixes, strip_group_wrappers};
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, basename, child_scripts, resolve_cd_target, split_segments_with_ops,
-    tokenize,
+    MAX_WRAPPER_DEPTH, basename, child_scripts, looks_absolute, resolve_cd_target,
+    split_segments_with_ops, tokenize,
 };
 use cadence_hooks_core::worktree::path_under_temp_root;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome, normalize_path};
@@ -344,6 +344,11 @@ fn resolve_target(operand: &str, effective_dir: &str) -> TargetToken {
     // effective directory itself.
     let resolved = if literal.is_empty() || literal == "." {
         effective_dir.to_string()
+    } else if looks_absolute(literal) {
+        // Absolute — POSIX `/…` or a Windows drive path `C:/…`. Use as-is;
+        // `resolve_cd_target` only recognizes leading `/` (and `~`), so a drive
+        // path would otherwise be joined onto the cwd and misclassified.
+        literal.to_string()
     } else {
         resolve_cd_target(literal, effective_dir)
     };
@@ -1010,6 +1015,23 @@ mod tests {
         // Sec #4: a `.` segment must not slip a home child past the exact match.
         assert_eq!(judge("rm -rf ~/./Documents", "/home"), Outcome::Block);
         assert_eq!(judge("rm -rf /vaults/./main/x", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn drive_absolute_path_treated_as_absolute() {
+        // A Windows drive path (`C:/…`) is absolute — it must NOT be joined onto
+        // the cwd, which would miss the exact classifiers. With the fix it
+        // matches the (drive-path) vault → Block; without it, the joined
+        // `/home/C:/vault/notes` would miss → Ask. (Regression for the Windows
+        // `rm -rf C:/Users/<me>` home-delete case.)
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some("C:/vault"),
+            tmpdir: None,
+        };
+        let out = judge_rm("rm -rf C:/vault/notes", "/home", &ctx, &|_| false).outcome;
+        assert_eq!(out, Outcome::Block);
     }
 
     #[test]

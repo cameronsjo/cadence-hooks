@@ -94,6 +94,19 @@ pub fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
+/// True when a (forward-slash-normalized) path is absolute — POSIX (`/foo`) or a
+/// Windows drive-absolute path (`C:/foo`, after `\`→`/` normalization). Lets a
+/// guard distinguish an explicit path argument from a flag (`-rf`) or a bare
+/// relative name, and recognize a drive path as absolute (which a leading-`/`
+/// test alone would miss). Shared by the destructive-command guards.
+pub fn looks_absolute(p: &str) -> bool {
+    if p.starts_with('/') {
+        return true;
+    }
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
+}
+
 /// Returns true if `command` contains a `gh pr create` token sequence.
 ///
 /// Whitespace-token based to avoid substring false positives — a branch named

@@ -5,20 +5,10 @@
 //! it and loses recoverability. This guard blocks those commands inside the
 //! vault directory and suggests `mv` to `.trash/` instead.
 
-use cadence_hooks_core::shell::{basename, clobber_redirect_targets, command_segments, tokenize};
+use cadence_hooks_core::shell::{
+    basename, clobber_redirect_targets, command_segments, looks_absolute, tokenize,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
-
-/// True when a normalized path is absolute — POSIX (`/foo`) or a Windows
-/// drive-absolute path (`C:/foo`, after `normalize_path` turns `\` into `/`).
-/// Used to distinguish an explicit path argument from a flag (`-rf`) or a
-/// bare relative name.
-fn looks_absolute(p: &str) -> bool {
-    if p.starts_with('/') {
-        return true;
-    }
-    let b = p.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
-}
 
 /// Destructive-command gate: shapes that delete or zero a vault file,
 /// bypassing Obsidian's `.trash/`. `rm` keeps its original loose substring
