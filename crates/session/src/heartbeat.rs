@@ -84,7 +84,7 @@ pub fn run_heartbeat(
     // exclusion in `sweep_stale` is then defense-in-depth — our file is fresh
     // regardless.
     let _ = registry::touch_own(dir, session_id, branch, is_self_switch);
-    registry::sweep_stale(dir, stale_secs, session_id);
+    registry::sweep_stale(dir, stale_secs, session_id, "heartbeat");
 }
 
 #[cfg(test)]
@@ -319,8 +319,12 @@ mod tests {
         registry::write_record(dir, &live).unwrap();
 
         // Our heartbeat fires with a zero-second staleness threshold: any
-        // measurable age (whole seconds) is stale.
-        run_heartbeat(dir, "self-session", Some("main".into()), None, 0);
+        // measurable age (whole seconds) is stale. Reaping fires log_sweep
+        // (#259) — scratch-dir-scoped so this doesn't race the sweep-telemetry
+        // tests in `registry` over the process-global CADENCE_METRICS_DIR.
+        registry::test_metrics_env::with_scratch_metrics_dir(|| {
+            run_heartbeat(dir, "self-session", Some("main".into()), None, 0);
+        });
 
         assert!(
             registry::find_own(dir, "dead-sess").is_none(),
@@ -355,7 +359,11 @@ mod tests {
         }
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        run_heartbeat(dir, "self-session", Some("main".into()), None, 0);
+        // Reaping fires log_sweep (#259) — scratch-dir-scoped, see the
+        // sibling test above.
+        registry::test_metrics_env::with_scratch_metrics_dir(|| {
+            run_heartbeat(dir, "self-session", Some("main".into()), None, 0);
+        });
 
         assert!(
             registry::find_own(dir, "sess-a").is_none(),

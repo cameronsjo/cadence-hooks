@@ -293,7 +293,15 @@ pub fn touch_own(
 /// (`session start` and the PostToolUse heartbeat) refresh their own mtime
 /// first, so the exclusion is defense-in-depth against a self-sweep. Pass
 /// `""` to sweep everything (CLI/tests with no own session).
-pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
+///
+/// `trigger` names the call site (`"heartbeat"` | `"start"`) and is threaded
+/// through to [`cadence_hooks_metrics::log_sweep`] for every reaped file, so
+/// cross-machine/cross-session liveness sweeps become observable (#259). Each
+/// reaped file is best-effort re-parsed as a [`SessionRecord`] to recover its
+/// `name`/`session_id` for the log row — this parse is ONLY for telemetry and
+/// never gates or blocks the delete; an unparsable file still logs (with
+/// `None`/`None`) and still gets reaped.
+pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str, trigger: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -315,6 +323,15 @@ pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
         if let Some(age) = mtime_age_secs(&path)
             && age > stale_secs
         {
+            let record = fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<SessionRecord>(&t).ok());
+            cadence_hooks_metrics::log_sweep(
+                trigger,
+                record.as_ref().map(|r| r.session_id.as_str()),
+                record.as_ref().map(|r| r.name.as_str()),
+                age,
+            );
             let _ = fs::remove_file(&path);
         }
     }
@@ -380,6 +397,48 @@ fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+/// Shared test support for `CADENCE_METRICS_DIR`, the process-global env var
+/// [`cadence_hooks_metrics::log_sweep`] reads. `sweep_stale` now fires that
+/// logger on every real reap (#259), so ANY test in this crate that ages a
+/// file past its staleness threshold — not just the sweep-telemetry tests
+/// below — touches this var and must serialize against every other one, or
+/// race and either pollute the real `~/.claude/metrics` dir or write into a
+/// sibling test's tempdir. `pub(crate)` so `heartbeat` and `start`'s test
+/// modules (separate files) can reuse the same lock instance — a second,
+/// unrelated `Mutex` would not actually serialize anything.
+#[cfg(test)]
+pub(crate) mod test_metrics_env {
+    use std::sync::Mutex;
+
+    pub(crate) static METRICS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with `CADENCE_METRICS_DIR` pinned to `dir` for its duration.
+    pub(crate) fn with_metrics_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = METRICS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized against every other env-mutating test via
+        // METRICS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CADENCE_METRICS_DIR", dir);
+        }
+        let result = f();
+        // SAFETY: serialized against every other env-mutating test via
+        // METRICS_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("CADENCE_METRICS_DIR");
+        }
+        result
+    }
+
+    /// Convenience for a test that doesn't inspect `sweeps.jsonl` itself but
+    /// still reaps a real file (and so fires `log_sweep`) — a throwaway
+    /// tempdir keeps the write off the real metrics dir and off the lock
+    /// window without the caller needing to build its own `TempDir`.
+    pub(crate) fn with_scratch_metrics_dir<T>(f: impl FnOnce() -> T) -> T {
+        let tmp = tempfile::TempDir::new().unwrap();
+        with_metrics_dir(tmp.path(), f)
+    }
 }
 
 #[cfg(test)]
@@ -693,7 +752,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         write_record(&dir, &record("fresh-face", "new-session")).unwrap();
         // stale_secs = 0: the old file (age ≥ 1s) is stale, the fresh one (age 0) is not.
-        sweep_stale(&dir, 0, "");
+        // Reaping fires log_sweep (#259) — scratch-dir-scoped so this doesn't
+        // race the sweep-telemetry tests below over CADENCE_METRICS_DIR.
+        test_metrics_env::with_scratch_metrics_dir(|| sweep_stale(&dir, 0, "", "test"));
         assert!(find_own(&dir, "old-session").is_none(), "stale swept");
         assert!(find_own(&dir, "new-session").is_some(), "fresh kept");
     }
@@ -708,7 +769,7 @@ mod tests {
         write_record(&dir, &record("the-peer", "peer-session")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // stale_secs = 0: both files have aged ≥ 1s, but own is excluded by sid.
-        sweep_stale(&dir, 0, "own-session");
+        test_metrics_env::with_scratch_metrics_dir(|| sweep_stale(&dir, 0, "own-session", "test"));
         assert!(
             find_own(&dir, "own-session").is_some(),
             "own aged file is NOT swept"
@@ -732,7 +793,7 @@ mod tests {
         let peer_file = dir.join("beta-anvil.session-.json");
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // stale_secs = 0: both files have aged ≥ 1s; own is spared by session_id.
-        sweep_stale(&dir, 0, "session-1");
+        test_metrics_env::with_scratch_metrics_dir(|| sweep_stale(&dir, 0, "session-1", "test"));
         assert!(
             own_file.exists(),
             "own file kept (spared by exact session_id)"
@@ -745,7 +806,95 @@ mod tests {
 
     #[test]
     fn sweep_missing_directory_is_noop() {
-        sweep_stale(Path::new("/nonexistent/sessions"), 0, "");
+        sweep_stale(Path::new("/nonexistent/sessions"), 0, "", "test");
+    }
+
+    // --- sweep telemetry (#259) ---
+    //
+    // `CADENCE_METRICS_DIR` is process-global. These tests use the shared
+    // `test_metrics_env::with_metrics_dir` (rather than a module-local lock)
+    // because it's the SAME lock every other test in this crate that reaps a
+    // real file serializes against — a second, independent `Mutex` here would
+    // not actually prevent a concurrent unrelated reap from racing these
+    // assertions (see `test_metrics_env`'s doc comment).
+
+    use test_metrics_env::with_metrics_dir;
+
+    fn read_sweep_lines(metrics_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = metrics_dir.join("sweeps.jsonl");
+        match fs::read_to_string(&path) {
+            Ok(contents) => contents
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+                .collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    #[test]
+    fn sweep_logs_reaped_file_identity_and_trigger() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        write_record(&dir, &record("old-timer", "old-session")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let metrics_dir = tmp.path().join("metrics");
+        with_metrics_dir(&metrics_dir, || {
+            sweep_stale(&dir, 0, "", "heartbeat");
+        });
+
+        assert!(find_own(&dir, "old-session").is_none(), "stale file reaped");
+        let rows = read_sweep_lines(&metrics_dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["trigger"], "heartbeat");
+        assert_eq!(rows[0]["sessionId"], "old-session");
+        assert_eq!(rows[0]["name"], "old-timer");
+    }
+
+    #[test]
+    fn sweep_reaps_file_even_when_metrics_dir_uncreatable() {
+        // A pre-existing FILE at the metrics-dir path makes `create_dir_all`
+        // fail inside `log_sweep`. The reap itself must be entirely unaffected
+        // by that failure — log_sweep's fail-open contract (ADR-0001).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        write_record(&dir, &record("old-timer", "old-session")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let blocked_metrics_path = tmp.path().join("metrics-blocked");
+        fs::write(&blocked_metrics_path, b"not a directory").unwrap();
+
+        with_metrics_dir(&blocked_metrics_path, || {
+            sweep_stale(&dir, 0, "", "heartbeat");
+        });
+
+        assert!(
+            find_own(&dir, "old-session").is_none(),
+            "stale file reaped even though the metrics dir write failed"
+        );
+    }
+
+    #[test]
+    fn sweep_reaps_and_logs_null_identity_for_unparsable_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let garbage_path = dir.join("garbage.deadbeef.json");
+        fs::write(&garbage_path, "not json {{").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let metrics_dir = tmp.path().join("metrics");
+        with_metrics_dir(&metrics_dir, || {
+            sweep_stale(&dir, 0, "", "start");
+        });
+
+        assert!(!garbage_path.exists(), "unparsable file still reaped");
+        let rows = read_sweep_lines(&metrics_dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["trigger"], "start");
+        assert!(rows[0]["sessionId"].is_null());
+        assert!(rows[0]["name"].is_null());
     }
 
     // --- deregister (remove_own, #97) ---

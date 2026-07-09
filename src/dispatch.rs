@@ -35,10 +35,19 @@ use std::time::Instant;
 pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>) -> ! {
     let started = Instant::now();
     guard_interactive_terminal(check.name(), Some(event), None);
+    // Hoisted above the stdin parse so both the parse-failure arm and the
+    // decided-result arm below can record against the same canonical name.
+    let hook_name = hook.unwrap_or_else(|| check.name());
     let input = match HookInput::from_stdin() {
         Ok(input) => input,
         Err(e) => {
             eprintln!("cadence-hooks: {e}");
+            cadence_hooks_metrics::log_failopen(
+                "parse",
+                crate::registry::plugin_for(hook_name),
+                Some(hook_name),
+                env!("CARGO_PKG_VERSION"),
+            );
             process::exit(0); // Fail open on parse errors (ADR-0001)
         }
     };
@@ -48,7 +57,6 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
         Some(result) => {
             // Record before emitting. Both writes are fully fail-open, so neither
             // can perturb the block message or the exit code that follows.
-            let hook_name = hook.unwrap_or_else(|| check.name());
             cadence_hooks_metrics::log_denial(hook_name, event, &input, result.outcome);
             // A bypass-allow rode through an active dismissal / env switch. Record
             // *that a guard was stepped outside of* — the one event the denial log
@@ -91,21 +99,40 @@ pub fn run_logged_logger(
 ) -> ! {
     let started = Instant::now();
     guard_interactive_terminal(logger.name(), None, sample_override);
+    let namespace = crate::registry::plugin_for(hook.unwrap_or(""));
     // Capture the session id (when the payload carries one) for the timing row;
     // a parse failure leaves it `None`, matching core's fail-open-to-exit-0 path.
     let mut session_id: Option<String> = None;
-    if let Ok(input) = MetricsInput::from_stdin() {
-        session_id = input.session_id.clone();
-        // A panicking logger must not skip the timing write or the exit-0 below.
-        // Catch the unwind so the contract holds even on a buggy implementation.
-        // `AssertUnwindSafe` is required because `&dyn Logger` is not
-        // `UnwindSafe`; we exit immediately afterward, so there is no post-panic
-        // state to corrupt.
-        let _ = catch_unwind(AssertUnwindSafe(|| logger.run(&input)));
+    match MetricsInput::from_stdin() {
+        Ok(input) => {
+            session_id = input.session_id.clone();
+            // A panicking logger must not skip the timing write or the exit-0
+            // below. Catch the unwind so the contract holds even on a buggy
+            // implementation. `AssertUnwindSafe` is required because
+            // `&dyn Logger` is not `UnwindSafe`; we exit immediately
+            // afterward, so there is no post-panic state to corrupt.
+            let result = catch_unwind(AssertUnwindSafe(|| logger.run(&input)));
+            if result.is_err() {
+                cadence_hooks_metrics::log_failopen(
+                    "panic",
+                    namespace,
+                    hook,
+                    env!("CARGO_PKG_VERSION"),
+                );
+            }
+        }
+        Err(_) => {
+            cadence_hooks_metrics::log_failopen(
+                "parse",
+                namespace,
+                hook,
+                env!("CARGO_PKG_VERSION"),
+            );
+        }
     }
     cadence_hooks_metrics::log_timing(
         hook.unwrap_or("unknown"),
-        crate::registry::plugin_for(hook.unwrap_or("")).unwrap_or("metrics"),
+        namespace.unwrap_or("metrics"),
         "logger",
         started.elapsed().as_millis(),
         session_id.as_deref(),

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`sweep_stale` (the session-registry reaper behind the PostToolUse heartbeat and `session start`) now logs every reap to `sweeps.jsonl` (cameronsjo/cadence-hooks#259).** Cross-machine/cross-session liveness sweeps were previously invisible. Each row carries the reaping `trigger` (`"heartbeat"` | `"start"`), the reaped file's `sessionId`/`name` when it still parsed, and its age at reap time — a best-effort identity parse that never gates the delete it's recording.
+- **The binary's three fail-open paths — a caught panic, a stdin-parse failure, and clap version-skew — now log to `failopen.jsonl` (cameronsjo/cadence-hooks#259).** Every row carries `reason` (`"panic"|"parse"|"version_mismatch"`), the attempted `namespace`/`subcommand` when known, and the running `binaryVersion`. Both new streams ride the existing JSONL rail on `<metrics_dir>/`, consistent with `denials.jsonl`/`hooks.jsonl`/`bypasses.jsonl` — wiring them into a fuller OTLP-based observability stack is a named follow-up, not this change.
+- **`cadence-hooks doctor` now surfaces both new streams.** An informational (non-blocking) line reports recent session-registry sweep counts. Fail-open counts warn on ≥1 panic, ≥3 parse failures, or ≥1 `version_mismatch` in the last 7 days — the `version_mismatch` check counts only rows tagged with the *currently installed* binary's own version, so a sanctioned new-hooks.json/old-binary release transition doesn't alarm; a recurrence on the current version means the skew didn't resolve.
+
 ## [0.52.0] - 2026-07-07
 
 ### Added

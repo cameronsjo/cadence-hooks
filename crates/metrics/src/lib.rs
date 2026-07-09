@@ -18,6 +18,8 @@ pub mod log_bypass;
 pub mod log_commit;
 /// Append guard-denial audit records to `denials.jsonl`.
 pub mod log_denial;
+/// Append fail-open telemetry (panic / parse / version-skew) to `failopen.jsonl`.
+pub mod log_failopen;
 /// Append plan-lifecycle records (EnterPlanMode/ExitPlanMode) to `plan-phases.jsonl`.
 pub mod log_plan_phase;
 /// Append polish-nudge (`gh pr create`) records to `polish_nudges.jsonl`.
@@ -30,6 +32,8 @@ pub mod log_session_start;
 pub mod log_skill;
 /// Append subagent lifecycle records to `subagents.jsonl`.
 pub mod log_subagent;
+/// Append sweep-reap records to `sweeps.jsonl`.
+pub mod log_sweep;
 /// Append threshold-gated hook self-timing records to `hooks.jsonl`.
 pub mod log_timing;
 /// Shared per-model breakdown builders for `byModel[]` / `unpricedModels[]`.
@@ -47,12 +51,14 @@ pub use log_askuserquestion::LogAskUserQuestion;
 pub use log_bypass::{BypassEvent, log_bypass};
 pub use log_commit::LogCommit;
 pub use log_denial::log_denial;
+pub use log_failopen::log_failopen;
 pub use log_plan_phase::LogPlanPhase;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_session::LogSession;
 pub use log_session_start::LogSessionStart;
 pub use log_skill::LogSkill;
 pub use log_subagent::LogSubagent;
+pub use log_sweep::log_sweep;
 pub use log_timing::log_timing;
 pub use snapshot::Snapshot;
 pub use warn_stale::WarnStale;
