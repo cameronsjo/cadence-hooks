@@ -334,7 +334,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "log-ask-user-question",
-        description: "Log AskUserQuestion stance + shape on every call (PreToolUse)",
+        description: "Log AskUserQuestion asked (PreToolUse) + answered (PostToolUse) events",
         plugin: "metrics",
         event: None,
     },

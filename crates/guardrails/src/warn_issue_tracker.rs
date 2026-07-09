@@ -155,11 +155,9 @@ pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
         (dh.clone(), repo)
     } else {
         let wd = work_dir.to_str().unwrap_or(".");
-        match git_command(wd, &["remote", "get-url", "origin"]) {
-            Some(origin_url) => match host_and_repo_from_url(&origin_url) {
-                Some((h, r)) => (h, r.to_lowercase()),
-                None => return None,
-            },
+        let origin_url = git_command(wd, &["remote", "get-url", "origin"])?;
+        match host_and_repo_from_url(&origin_url) {
+            Some((h, r)) => (h, r.to_lowercase()),
             None => return None,
         }
     };

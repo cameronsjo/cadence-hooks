@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`metrics log-ask-user-question` now widens to a dual `asked`/`answered` event, closing UU-6 of the 2026-07-08 methodology-coverage blind-spot pass (plan PR cameronsjo/cadence-hooks#260).** Previously the logger only reacted to `PreToolUse`, so a user's selected answer — and any "Other" free-text — died with the transcript the moment the conversation scrolled past. It now also accepts `PostToolUse`, following `log_plan_phase.rs`'s dual-event precedent: one subcommand, one stream (`askuserquestion.jsonl`), a `phase: "asked"|"answered"` discriminator, born `schemaVersion: 1`. Per Decision D1-a (Cameron, plan review), the `answered` record logs each question's selected label or free-text answer **verbatim, unredacted** — this stream's whole value is the user's why, and it lives in the same trust domain (`~/.claude/metrics/`) as the transcript itself — plus `matchedRecommended`, reusing the shared `(Recommended)`-marker predicate so it never drifts from the `warn-recommended-option` nudge's own stance classifier. The plugin-side `PostToolUse:AskUserQuestion` matcher (`plugins/cadence-metrics/hooks/hooks.json`, cadence monorepo) is a release-gated companion — it merges only after this release ships, so the release-gate ordering (binary first) matters for more than doctor's `hooks-skew` gate: a negative-control run confirmed the **pre**-widening logger never gated on `hook_event_name` at all, only on `tool_input.questions` presence — and a real `PostToolUse` payload still carries `tool_input.questions` (mirrored back), so an out-of-order rollout wouldn't have no-op'd, it would have double-logged the same call under the old schema-v0 shape (fail-open, exit 0 — never an error, just a duplicate row). This widening closes that gap on both sides by branching explicitly on `hook_event_name`.
+
 ## [0.53.0] - 2026-07-08
 
 ### Added
