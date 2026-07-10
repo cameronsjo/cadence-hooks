@@ -238,6 +238,10 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
                 let stdout = drain
                     .and_then(|handle| handle.join().ok())
                     .unwrap_or_default();
+                // A completed spawn (any exit code) feeds the induced-exhaustion
+                // discriminator: many fast completions before a later timeout
+                // means volume, not host slowness (#271 security follow-up).
+                crate::deadline::note_completed_spawn();
                 return GitSpawn::Completed(std::process::Output {
                     status,
                     stdout,
@@ -248,6 +252,12 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Reaping the child closed the pipe's write end, so the
+                    // drain thread's read_to_end has hit EOF; join it so the
+                    // handle isn't detached with a swallowed result.
+                    if let Some(handle) = drain {
+                        let _ = handle.join();
+                    }
                     crate::deadline::note_hit();
                     return GitSpawn::TimedOut;
                 }
@@ -256,6 +266,9 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Some(handle) = drain {
+                    let _ = handle.join();
+                }
                 return GitSpawn::SpawnFailed;
             }
         }
@@ -1059,6 +1072,18 @@ mod tests {
             run_bounded_with(&mut cmd, std::time::Duration::from_secs(1)),
             GitSpawn::SpawnFailed
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_completed_spawn_increments_the_induced_counter() {
+        // The counter is process-global; assert the one-way increment on a
+        // completed spawn, not an absolute value (peer tests may also bump it).
+        let before = crate::deadline::completed_spawns_for_test();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+        let _ = run_bounded_with(&mut cmd, std::time::Duration::from_secs(5));
+        assert!(crate::deadline::completed_spawns_for_test() > before);
     }
 
     #[test]

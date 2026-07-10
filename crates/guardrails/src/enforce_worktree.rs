@@ -505,7 +505,10 @@ fn assess_dir(
     probe: &mut GitProbe,
 ) -> CheckResult {
     let Some(repo_root) = probe.repo_root(dir) else {
-        // Not a git repo (or a bare container dir) — nothing to enforce.
+        // Not a git repo (or a bare container dir), or the probe timed out
+        // (#271) — both fail open, deliberately: enforce-worktree is a
+        // workflow-discipline guard, and a missed nudge is cheaper than a
+        // false block (ADR-0001).
         return CheckResult::allow();
     };
     // The snooze marker lives under the shared git common dir; resolve it

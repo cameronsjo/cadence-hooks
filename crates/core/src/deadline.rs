@@ -18,13 +18,14 @@
 //!
 //! `CADENCE_HOOK_DEADLINE_MS` tunes the budget. It is security-relevant:
 //! guards treat a timed-out probe as fail-open, so a tiny value would be a
-//! guard-softening primitive (injectable via a repo `.envrc` or CI env).
-//! Positive values below [`MIN_BUDGET_MS`] therefore clamp up to the floor.
-//! `0` disables the deadline entirely — the *safe* direction: spawns revert
-//! to unbounded and fail-closed arms stay fail-closed.
+//! guard-softening primitive and a huge value would let the deadline never
+//! fire (both injectable via a repo `.envrc` or CI env). Positive values
+//! therefore clamp into [`MIN_BUDGET_MS`, `MAX_BUDGET_MS`]. `0` disables the
+//! deadline entirely — the *safe* direction: spawns revert to unbounded and
+//! fail-closed arms stay fail-closed.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Default shared budget. Bounds only in-process git time — the wrapper /
@@ -37,10 +38,31 @@ const DEFAULT_BUDGET_MS: u64 = 3000;
 /// fail-open (see module doc).
 const MIN_BUDGET_MS: u64 = 1000;
 
+/// Ceiling for positive overrides. A value at or above the tightest 5s
+/// external hooks.json timeout would let the internal deadline never fire —
+/// reverting to the pre-#271 silent external-kill this module exists to
+/// prevent. A caller who genuinely wants no bound uses `0` (disabled), not a
+/// huge value; a repo-injected huge value clamps here instead of neutralizing
+/// the mitigation.
+const MAX_BUDGET_MS: u64 = 4500;
+
+/// Above this many successfully-completed git spawns in one process, a
+/// subsequent timeout is treated as *induced* budget exhaustion (attacker
+/// volume, not host slowness): fail-closed arms that can be driven to spawn a
+/// variable, command-controlled number of probes (guard-push-remote's
+/// per-remote loop) then BLOCK rather than degrade to allow. The discriminator
+/// is completion count, not wall time — a genuinely slow host times out on its
+/// *first* probe (few completed spawns), while only a crafted flood of fast
+/// probes completes many before starving a later, ownership-deciding one.
+/// Sits far above any legitimate guard's spawn count (enforce-worktree ≤3, a
+/// push guard ~5, a several-mirror push loop ~a dozen).
+const INDUCED_EXHAUSTION_SPAWNS: u64 = 24;
+
 static HOOK_START: OnceLock<Instant> = OnceLock::new();
 static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
 static DEADLINE_HIT: AtomicBool = AtomicBool::new(false);
 static SUPPRESSED_BLOCK: AtomicBool = AtomicBool::new(false);
+static COMPLETED_SPAWNS: AtomicU64 = AtomicU64::new(0);
 
 /// What a spawn site should do with its next subprocess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,13 +90,17 @@ fn budget() -> Option<Duration> {
 /// Parse a raw `CADENCE_HOOK_DEADLINE_MS` value. Pure for unit tests.
 ///
 /// Unset/empty/garbage → default; `0` → disabled (`None`); positive values
-/// clamp up to [`MIN_BUDGET_MS`].
+/// clamp into [`MIN_BUDGET_MS`, `MAX_BUDGET_MS`].
 fn budget_from(raw: Option<&str>) -> Option<Duration> {
     match raw.map(str::trim) {
         None | Some("") => Some(Duration::from_millis(DEFAULT_BUDGET_MS)),
         Some(s) => match s.parse::<u64>() {
             Ok(0) => None,
-            Ok(ms) => Some(Duration::from_millis(ms.max(MIN_BUDGET_MS))),
+            // Clamp both ends: a tiny value is a guard-softening primitive, a
+            // huge value neutralizes the mitigation (see the const docs).
+            Ok(ms) => Some(Duration::from_millis(
+                ms.clamp(MIN_BUDGET_MS, MAX_BUDGET_MS),
+            )),
             Err(_) => Some(Duration::from_millis(DEFAULT_BUDGET_MS)),
         },
     }
@@ -122,6 +148,31 @@ pub fn suppressed_block() -> bool {
     SUPPRESSED_BLOCK.load(Ordering::Relaxed)
 }
 
+/// Record one successfully-completed (not timed-out) bounded git spawn. The
+/// running total feeds [`timeout_is_induced`]. Called by the bounded runner,
+/// not by guards directly.
+pub fn note_completed_spawn() {
+    COMPLETED_SPAWNS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Test-only read of the completed-spawn counter (the counter is otherwise
+/// write-only from outside this module).
+#[cfg(test)]
+pub fn completed_spawns_for_test() -> u64 {
+    COMPLETED_SPAWNS.load(Ordering::Relaxed)
+}
+
+/// Has this process completed enough git spawns that a *subsequent* timeout is
+/// better explained by attacker-induced volume than by host slowness? A guard
+/// that can be driven to a command-controlled number of probes should treat a
+/// timeout past this point as fail-*closed* (block), since the fail-open
+/// justification — "the guard's own infrastructure is failing" — no longer
+/// holds when the guard already ran two dozen probes to completion. See
+/// [`INDUCED_EXHAUSTION_SPAWNS`].
+pub fn timeout_is_induced() -> bool {
+    COMPLETED_SPAWNS.load(Ordering::Relaxed) >= INDUCED_EXHAUSTION_SPAWNS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,8 +213,18 @@ mod tests {
     }
 
     #[test]
-    fn budget_honors_values_above_floor() {
+    fn budget_honors_values_in_range() {
         assert_eq!(budget_from(Some("4200")), Some(Duration::from_millis(4200)));
+    }
+
+    #[test]
+    fn budget_clamps_large_values_to_ceiling() {
+        // A huge value would let the internal deadline never fire — clamp so a
+        // repo-injected value can't neutralize the mitigation. Use 0 to disable.
+        assert_eq!(
+            budget_from(Some("600000")),
+            Some(Duration::from_millis(MAX_BUDGET_MS))
+        );
     }
 
     #[test]

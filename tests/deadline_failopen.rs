@@ -172,6 +172,65 @@ fn hanging_branch_resolution_never_blocks_bare_head_force_push() {
 }
 
 #[test]
+fn push_loop_padding_flood_blocks_instead_of_failing_open() {
+    // The #271 security regression gate. A push loop that resolves a flood of
+    // bogus remotes drains the shared deadline; without the induced-exhaustion
+    // discriminator the trailing unowned-remote push would time out and fail
+    // OPEN (execute the unowned push). A fast fake git makes every padding
+    // resolution complete quickly — so the budget is drained by *volume*, and
+    // the guard must recognize that and BLOCK, not allow.
+    let shim = tempfile::tempdir().unwrap();
+    // Fast fake git: every remote resolution fails quickly (nonexistent
+    // remote), completing a spawn and burning ~one poll interval of budget.
+    std::fs::write(shim.path().join("git"), "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(
+        &shim.path().join("git"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let metrics = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+
+    // ~200 padding pushes reliably exceed the 1000ms floor budget at the ~10ms
+    // poll interval, then one push to an (also unresolvable, but that's not the
+    // point) trailing remote whose resolution is pre-exhausted → TimedOut.
+    let mut body = String::new();
+    for i in 0..200 {
+        body.push_str(&format!("git push r{i}; "));
+    }
+    body.push_str("git push evilremote main");
+    let command = format!("for x in 1; do {body}; done");
+
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "cwd": work.path().to_string_lossy(),
+    })
+    .to_string();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["guardrails", "guard-push-remote"]);
+    cmd.env("PATH", shim.path());
+    cmd.env("CADENCE_HOOK_DEADLINE_MS", "1000");
+    cmd.env("CADENCE_METRICS_DIR", metrics.path());
+    cmd.env("CADENCE_ALLOWED_OWNERS", "cameronsjo");
+    cmd.env_remove("CADENCE_DISABLE");
+    let out = run_with_payload(&mut cmd, &payload);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "induced budget exhaustion must BLOCK, not fail open: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("budget"),
+        "block message names the exhaustion: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn enforce_worktree_edit_arm_stays_within_spawn_budget() {
     // Regression gate (#271 prevention): the Edit/Write arm's git spawn count
     // grew unnoticed from ~1 to 4-5 across releases; this pins it. The count
