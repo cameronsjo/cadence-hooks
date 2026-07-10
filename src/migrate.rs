@@ -89,7 +89,23 @@ fn migrate_claude_dir(claude_dir: &Path) -> Result<MigrateReport, String> {
                 ));
             }
         },
-        None => serde_json::Map::new(),
+        None => {
+            // `read_untrusted_config` returns `None` for FOUR states: truly
+            // absent, non-regular (symlink/FIFO/dir), oversized (>1 MiB), or
+            // non-UTF-8. Only a truly-absent file may start a fresh map — a
+            // present-but-unreadable file must NOT be silently overwritten by
+            // the merged sections (same "don't destroy content" stance as the
+            // non-object refusal above). `symlink_metadata` (no follow) tells
+            // the two apart: `Ok` means something is there.
+            if std::fs::symlink_metadata(&cadence_path).is_ok() {
+                return Err(format!(
+                    "{} exists but could not be read (not a regular file, larger \
+                     than 1 MiB, or not UTF-8) — fix or remove it before migrating",
+                    cadence_path.display()
+                ));
+            }
+            serde_json::Map::new()
+        }
     };
 
     let mut report = MigrateReport::default();
@@ -127,12 +143,32 @@ fn migrate_claude_dir(claude_dir: &Path) -> Result<MigrateReport, String> {
     }
 
     // Stamp the version envelope so a freshly-created file carries it and an
-    // older hand-authored one gains it. `serde_json` preserves insertion order
-    // for the Map, but the two sections were inserted above; put version first
-    // by rebuilding only when it's absent.
+    // older hand-authored one gains it. `serde_json`'s `Map` here is a
+    // `BTreeMap` (no `preserve_order` feature), so keys always serialize sorted
+    // — `version` lands after the sections regardless of insertion order; this
+    // only ensures the key is present, never absent.
     root_obj
         .entry("version".to_string())
         .or_insert(serde_json::Value::from(1));
+
+    // Refuse to write *through* a symlink at cadence.json. `std::fs::write` is a
+    // plain `open(O_CREAT|O_TRUNC)` that follows symlinks, so an attacker-planted
+    // `.claude/cadence.json -> ~/.claude/settings.json` (untrusted repo content)
+    // would land the merged JSON at the link target, outside `.claude/` —
+    // creating a file at a dangling target, or truncating a real config file.
+    // `read_untrusted_config` guards the READ side only; this is the first write
+    // path, so it needs its own check. A regular file (idempotent re-write) or an
+    // absent path is fine; `symlink_metadata` does not follow, so it judges the
+    // path itself.
+    if std::fs::symlink_metadata(&cadence_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "{} is a symlink — refusing to write through it (remove or replace the link, then re-run)",
+            cadence_path.display()
+        ));
+    }
 
     let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(root_obj))
         .map_err(|e| format!("failed to serialize {}: {e}", cadence_path.display()))?;
@@ -140,7 +176,13 @@ fn migrate_claude_dir(claude_dir: &Path) -> Result<MigrateReport, String> {
         .map_err(|e| format!("failed to write {}: {e}", cadence_path.display()))?;
 
     // Rename consumed legacy files only after the write succeeds, so a failed
-    // write never strands the source.
+    // write never strands the source. If a rename fails mid-loop (disk full,
+    // permission denied) after cadence.json is already written, that section is
+    // now `AlreadyPresent`, so a re-run non-destructively skips it but never
+    // retries the rename — the orphaned legacy file lingers and `doctor` keeps
+    // warning until it's removed by hand. Low-probability (same-filesystem
+    // rename after a successful write), and non-destructive, so it's surfaced
+    // rather than transactionally rolled back.
     for legacy_path in to_rename {
         let migrated = migrated_path(&legacy_path);
         std::fs::rename(&legacy_path, &migrated)
@@ -453,6 +495,60 @@ mod tests {
         assert!(err.contains("not a JSON object"), "{err}");
         // Nothing renamed.
         assert!(dir.path().join(".claude/redaction.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_write_through_dangling_symlinked_cadence_json() {
+        // An attacker-planted cadence.json symlink to a NONEXISTENT target must
+        // not let the write create a file there. The read gate rejects the
+        // unreadable symlink first (present-but-unreadable → refuse), so the
+        // target is never created.
+        let dir = seed(&[("redaction.json", r#"{"allowlist":["x"]}"#)], None);
+        let claude = dir.path().join(".claude");
+        let target = dir.path().join("outside.json");
+        std::os::unix::fs::symlink(&target, claude.join("cadence.json")).unwrap();
+
+        assert!(migrate_claude_dir(&claude).is_err());
+        assert!(!target.exists(), "must not write through the symlink");
+        // Legacy file left in place (refused before the rename).
+        assert!(claude.join("redaction.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_cadence_json_pointing_at_existing_object() {
+        // A symlink to an existing JSON *object* (e.g. a real settings file):
+        // the read follows and parses it, but the pre-write symlink guard still
+        // refuses, so the target is never truncated.
+        let dir = seed(&[("redaction.json", r#"{"allowlist":["x"]}"#)], None);
+        let claude = dir.path().join(".claude");
+        let target = dir.path().join("real-settings.json");
+        std::fs::write(&target, r#"{"keep":"me"}"#).unwrap();
+        std::os::unix::fs::symlink(&target, claude.join("cadence.json")).unwrap();
+
+        let err = migrate_claude_dir(&claude).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+        // Target untouched.
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            r#"{"keep":"me"}"#
+        );
+    }
+
+    #[test]
+    fn refuses_present_but_unreadable_cadence_json() {
+        // A cadence.json that exists but the read gate rejects (here: a
+        // directory at the path — non-regular) must NOT be treated as absent and
+        // silently overwritten by the merged sections.
+        let dir = seed(&[("redaction.json", r#"{"allowlist":["x"]}"#)], None);
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir(claude.join("cadence.json")).unwrap();
+
+        let err = migrate_claude_dir(&claude).unwrap_err();
+        assert!(err.contains("could not be read"), "{err}");
+        // Legacy file left in place (refused before any rename).
+        assert!(claude.join("redaction.json").exists());
     }
 
     #[test]
