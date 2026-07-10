@@ -22,24 +22,21 @@
 //! for user-global). For repos where dispatching subagents from main is the
 //! intended workflow.
 
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
 use std::path::{Path, PathBuf};
-
-/// Returns true if `repo_root` is a **primary checkout** — its `.git` is a
-/// directory. A linked worktree's `.git` is a *file* pointing into the primary
-/// repo's `.git/worktrees/`, so a `false` here means the session is already
-/// inside a worktree (and its subagents inherit that worktree). Mirrors the
-/// `.git`-dir primitive in `cadence_hooks_session::registry::ensure_git_excluded`.
-pub(crate) fn is_primary_checkout(repo_root: &str) -> bool {
-    Path::new(repo_root).join(".git").is_dir()
-}
 
 /// Count the worktrees in `git worktree list --porcelain` output.
 ///
 /// Each worktree is introduced by a line starting with `worktree `. The primary
 /// checkout is always one entry, so `> 1` means at least one *sibling* worktree.
-fn count_worktrees(porcelain: &str) -> usize {
+///
+/// `pub(crate)` so sibling guards can share this one porcelain parse rather than
+/// re-deriving it (cadence-hooks#164) — `GitState` resolves per-path facts but
+/// deliberately does not enumerate a repo's sibling worktrees, so the count
+/// stays a separate, shared primitive.
+pub(crate) fn count_worktrees(porcelain: &str) -> usize {
     porcelain
         .lines()
         .filter(|l| l.starts_with("worktree "))
@@ -135,12 +132,19 @@ impl Check for WarnSubagentWorktree {
         // cwd of the spawning session — the directory its subagents inherit.
         let cwd = input.cwd.as_deref().unwrap_or(".");
 
-        // Not in a git repo → nothing to isolate. Fail open (ADR-0001).
-        let Some(repo_root) = git_command(cwd, &["rev-parse", "--show-toplevel"]) else {
+        // Repo root + primary-vs-worktree come from the shared `GitState` — a
+        // pure filesystem walk, replacing the `git rev-parse --show-toplevel`
+        // spawn and the guard-local `.git`-is-dir check with the one tested
+        // resolution (cadence-hooks#164). Not in a git repo → nothing to
+        // isolate; fail open (ADR-0001).
+        let Some(state) = GitState::resolve(Path::new(cwd)) else {
             return CheckResult::allow();
         };
+        let repo_root = state.repo_root.to_string_lossy().into_owned();
 
-        let in_main = is_primary_checkout(&repo_root);
+        let in_main = state.is_primary();
+        // Sibling-worktree existence is not a per-path fact `GitState` carries,
+        // so the porcelain enumeration stays a git spawn.
         let worktree_exists = git_command(cwd, &["worktree", "list", "--porcelain"])
             .map(|out| count_worktrees(&out) > 1)
             .unwrap_or(false);
@@ -257,32 +261,10 @@ mod tests {
         assert_eq!(count_worktrees(porcelain), 1);
     }
 
-    // --- is_primary_checkout (.git dir vs file) ---
-
-    #[test]
-    fn primary_checkout_when_git_is_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".git")).unwrap();
-        assert!(is_primary_checkout(dir.path().to_str().unwrap()));
-    }
-
-    #[test]
-    fn not_primary_checkout_when_git_is_file() {
-        // A linked worktree's .git is a file ("gitdir: ...").
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".git"),
-            "gitdir: /repo/.git/worktrees/feat\n",
-        )
-        .unwrap();
-        assert!(!is_primary_checkout(dir.path().to_str().unwrap()));
-    }
-
-    #[test]
-    fn not_primary_checkout_when_git_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!is_primary_checkout(dir.path().to_str().unwrap()));
-    }
+    // Primary-vs-linked detection is now `core::gitstate::GitState`'s fact,
+    // characterized there (`resolves_primary_checkout`,
+    // `resolves_linked_worktree_branch_and_kind`); the guard consumes
+    // `state.is_primary()` and no longer carries its own `.git`-dir check.
 
     // --- run() early exits ---
 
@@ -296,11 +278,91 @@ mod tests {
 
     #[test]
     fn agent_outside_git_repo_allows() {
-        // A temp dir that is not a git repo → rev-parse fails → fail-open allow.
+        // A temp dir that is not a git repo → GitState::resolve is None →
+        // fail-open allow.
         let dir = tempfile::tempdir().unwrap();
         let input = make_agent(Some("general-purpose"), None, dir.path().to_str().unwrap());
         let result = WarnSubagentWorktree.run(&input);
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    // --- run() through GitState: real repo + sibling worktree (#164 PR2) ---
+    //
+    // The migration's seam is `GitState::resolve` feeding `is_primary` into the
+    // (unchanged) `assess_spawn` decision. These prove the primary-vs-linked
+    // fact survives the swap end to end: a dispatch from the primary checkout
+    // nudges, and one from inside the sibling worktree does not.
+
+    /// Serialize the env-reading dispatch tests: `assess_spawn`'s `allowed` arm
+    /// reads `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` from real process env, which an
+    /// ambient session value could otherwise flip to a false allow.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn dispatch_from_primary_with_sibling_worktree_nudges() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN").ok();
+        // SAFETY: serialized via ENV_LOCK; restored below.
+        unsafe {
+            std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path();
+        git(primary, &["init", "-q", "-b", "main"]);
+        git(primary, &["config", "user.email", "t@t"]);
+        git(primary, &["config", "user.name", "t"]);
+        git(primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = primary.join("wt");
+        git(
+            primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &wt.to_string_lossy(),
+                "-b",
+                "feat/x",
+            ],
+        );
+
+        // From the primary checkout: primary + a sibling worktree exists → nudge.
+        let from_primary = make_agent(Some("general-purpose"), None, primary.to_str().unwrap());
+        let r = WarnSubagentWorktree.run(&from_primary);
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "primary + sibling worktree should nudge"
+        );
+
+        // From inside the linked worktree: `.git` is a file → not primary → allow.
+        let from_wt = make_agent(Some("general-purpose"), None, wt.to_str().unwrap());
+        let r = WarnSubagentWorktree.run(&from_wt);
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "dispatch from inside a worktree already inherits its isolation"
+        );
+
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN", v),
+                None => std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN"),
+            }
+        }
     }
 
     // --- isolation() round-trips via make_agent ---
