@@ -70,6 +70,13 @@ pub fn read_meta(repo_root: &Path) -> Option<SnoozeMeta> {
     SnoozeMeta::read(&meta_path_for(repo_root)?)
 }
 
+/// [`read_meta`] for a caller that already resolved the git common dir — pure
+/// filesystem, no git subprocess (the #271 spawn-reduction path).
+pub fn read_meta_in(git_common_dir: &Path) -> Option<SnoozeMeta> {
+    let marker = cadence_hooks_core::worktree::enforce_worktree_marker_path(git_common_dir);
+    SnoozeMeta::read(&snooze_meta::sidecar_for(&marker))
+}
+
 fn now_epoch() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

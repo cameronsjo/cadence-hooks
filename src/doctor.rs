@@ -458,9 +458,12 @@ fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option
     })
 }
 
-/// Fail-open telemetry as doctor `Finding`s — up to 3 (one per `reason`), or
+/// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
 /// none when all counts are below their thresholds. `panic` and `parse` are
-/// warned on any/moderate occurrence; `version_mismatch` only counts rows
+/// warned on any/moderate occurrence; the #271 deadline pair is load-correlated
+/// (`deadline` warns at 3+) except the suppressed-block row, which warns at 1
+/// because each one is an enforcement block that did not fire;
+/// `version_mismatch` only counts rows
 /// tagged with the CURRENT binary's own version (see
 /// `log_failopen::recent_failopen_counts`'s doc) — an older-version row is the
 /// sanctioned release-transition case and is excluded by construction.
@@ -530,6 +533,51 @@ fn failopen_findings(
             remediation: "compare installed plugin hooks.json subcommand references \
                           against 'cadence-hooks list' — this binary doesn't \
                           recognize something a plugin expects"
+                .to_string(),
+        });
+    }
+
+    if counts.deadline >= 3 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("deadline: {}", counts.deadline),
+            diagnosis: format!(
+                "{} git-probe deadline hit(s) in the last {days} days (failopen.jsonl) \
+                 — git-backed checks are degrading to fail-open under slow subprocess I/O",
+                counts.deadline
+            ),
+            remediation: "git is stalling under this environment: check for a \
+                          cloud-synced working directory (OneDrive/iCloud/Dropbox), \
+                          endpoint-protection scanning, or heavy concurrent session \
+                          load; CADENCE_HOOK_DEADLINE_MS tunes the budget (#271)"
+                .to_string(),
+        });
+    }
+
+    // Threshold 1, not 3: each row is an enforcement block that did not fire.
+    if counts.deadline_block_suppressed >= 1 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!(
+                "deadline_block_suppressed: {}",
+                counts.deadline_block_suppressed
+            ),
+            diagnosis: format!(
+                "{} fail-closed block(s) suppressed by the git-probe deadline in the \
+                 last {days} days (failopen.jsonl) — ownership/branch enforcement was \
+                 bypassed, not just slowed",
+                counts.deadline_block_suppressed
+            ),
+            remediation: "inspect failopen.jsonl for the affected guards; until git \
+                          latency is addressed, pass explicit targets (-R owner/repo, \
+                          explicit push remotes) so those guards don't need git probes \
+                          (#271)"
                 .to_string(),
         });
     }

@@ -1533,18 +1533,38 @@ mod tests {
     fn bare_head_force_push_on_protected_branch_blocked_unit() {
         // Injected resolution: current branch is protected → block.
         let args = ["--force", "origin", "head"];
+        let branch = BranchResolution::Branch("main".to_string());
         assert!(
             GitSafetyGuard
-                .check_push_blocked(&args, Some("main"))
+                .check_push_blocked(&args, Some(&branch))
                 .is_some()
         );
     }
 
     #[test]
     fn bare_head_force_push_unresolvable_blocked_unit() {
-        // Injected resolution: branch unknown → fail safe, block.
+        // Injected resolution: git answered, branch unknown → fail safe, block.
         let args = ["--force", "origin", "head"];
-        assert!(GitSafetyGuard.check_push_blocked(&args, None).is_some());
+        assert!(
+            GitSafetyGuard
+                .check_push_blocked(&args, Some(&BranchResolution::Unresolvable))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bare_head_force_push_timed_out_resolution_never_blocks_unit() {
+        // The probe hit the #271 deadline: the guard's own infrastructure
+        // failure never blocks — degrades to the routine force nudge.
+        let args = ["--force", "origin", "head"];
+        assert!(
+            GitSafetyGuard
+                .check_push_blocked(&args, Some(&BranchResolution::TimedOut))
+                .is_none()
+        );
+        // The suppressed fail-closed block is recorded for the loud
+        // fail-open telemetry at the dispatch layer.
+        assert!(cadence_hooks_core::deadline::suppressed_block());
     }
 
     #[test]
@@ -1552,9 +1572,10 @@ mod tests {
         // Routine rebase workflow: force-push of HEAD on a feature branch is
         // never statically blocked — it falls through to the force nudge.
         let args = ["--force", "origin", "head"];
+        let branch = BranchResolution::Branch("my-feature".to_string());
         assert!(
             GitSafetyGuard
-                .check_push_blocked(&args, Some("my-feature"))
+                .check_push_blocked(&args, Some(&branch))
                 .is_none()
         );
     }
