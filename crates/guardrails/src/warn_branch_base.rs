@@ -121,11 +121,13 @@ fn current_branch(cwd: Option<&str>) -> Option<String> {
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    cmd.output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
+        cadence_hooks_core::shell::GitSpawn::Completed(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (!s.is_empty()).then_some(s)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
