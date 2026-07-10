@@ -4,8 +4,9 @@
 //! whether the current branch is `main` or `master`. Nudges to switch
 //! to main first to avoid stacking branches.
 
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use std::process::Command;
+use std::path::Path;
 
 /// Warns when creating a new branch from a non-main base.
 pub struct WarnBranchBase;
@@ -115,19 +116,13 @@ fn is_main_branch(name: &str) -> bool {
     MAIN_BRANCH_REFS.contains(&name)
 }
 
+/// The current branch of the repo enclosing `cwd`, or `None` for a detached
+/// HEAD / not-a-repo. Resolves via the shared [`GitState`] — a pure-filesystem
+/// read of `HEAD` — instead of a `git branch --show-current` spawn
+/// (cadence-hooks#164). `GitState.branch` is `None` on a detached HEAD, matching
+/// the old empty-string→`None` normalization exactly.
 fn current_branch(cwd: Option<&str>) -> Option<String> {
-    let mut cmd = Command::new("git");
-    cmd.args(["branch", "--show-current"]);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
-        cadence_hooks_core::shell::GitSpawn::Completed(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            (!s.is_empty()).then_some(s)
-        }
-        _ => None,
-    }
+    GitState::resolve(Path::new(cwd.unwrap_or("."))).and_then(|s| s.branch)
 }
 
 #[cfg(test)]
