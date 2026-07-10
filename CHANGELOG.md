@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **One per-repo guard config: `.claude/cadence.json` (#153).** The two independently-grown per-guard files (`.claude/redaction.json`, `.claude/terminology.json`) unify into a single namespaced file, each guard reading its own top-level section (`redaction`, `terminology`) via a new fail-open generic `core::config::load_cadence_section<T>` — each guard keeps its existing `*Config` struct, no types move across crates. The read routes through the hardened `read_untrusted_config` (1 MiB cap, regular-file-only), so a missing file, unreadable/oversized/special file, non-UTF-8, malformed JSON, absent section, or shape mismatch all yield the guard's default config (ADR-0001). A `version: 1` envelope plus permissive handling of unknown top-level keys makes future sections additive — a repo may hand-author the reserved `nudges` block (#216) early without breaking. Decision and the frozen #216 schema recorded in `docs/adr/0002-unified-cadence-config.md`.
+- **`cadence-hooks migrate-config` (#153).** Converts a repo's legacy config in one step: merges each legacy file into its `cadence.json` section, then renames the consumed file to `*.json.migrated` (reversible breadcrumb) rather than deleting. Never clobbers a section already present (leaves that legacy file in place to reconcile); idempotent; preserves unknown top-level keys; refuses to proceed on a non-object `cadence.json` rather than destroy content; renames only after the write succeeds. Scannable TTY-aware summary (payload to stdout, diagnostics to stderr, honors `NO_COLOR`), non-zero exit on any error.
+- **`cadence-hooks doctor` warns on orphaned legacy config and a malformed `cadence.json` (#153)** — the hard cut's non-silent net. In default mode, doctor resolves the current repo's git root and warns (never errors) when a legacy `redaction.json`/`terminology.json` is present (no longer read → points at `migrate-config`) or when `cadence.json` is present but not valid JSON (runtime fails open to default config, so the repo's softening silently stops applying). Repo-scoped, so it is skipped under `--root`, matching the live-machine-only gating of the existing checks.
+
+### Changed
+
+- **The `terminology` and `redact-external-content` guards now read from `.claude/cadence.json` — a hard cut (#153).** The legacy `.claude/terminology.json` / `.claude/redaction.json` are no longer read; both guards' `*Config` structs and all downstream behavior are byte-for-byte identical, only the file read changed. Run `cadence-hooks migrate-config` to convert a repo (or hand-author `cadence.json`); doctor warns on an orphaned legacy file. **Migration:** write `cadence.json` before upgrading the binary, then upgrade, then rename the legacy file — a zero-gap order (the old binary ignores the unknown `cadence.json` and still reads the legacy file; the new binary reads `cadence.json`).
+
 ## [0.55.0] - 2026-07-10
 
 ### Fixed
