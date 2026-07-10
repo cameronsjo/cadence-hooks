@@ -18,8 +18,45 @@
 //! guard). Both call the same primitives below, so the *primitives* — not the
 //! composition — are the single source of truth.
 
+use crate::HookInput;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+
+/// Resolve the directory a git query should target for a hook input.
+///
+/// For an Edit/Write, returns the parent directory of the edited file, so
+/// `git -C <dir>` (or a `GitState::resolve` walk) picks the file's *enclosing*
+/// repo even when the session's cwd belongs to an outer parent repo (the
+/// nested-repo case). Relative `file_path` values join against `input.cwd` — the
+/// hook event's cwd, not the hook process's. For inputs with no file path (Bash),
+/// falls back to `input.cwd`, then `.`.
+///
+/// Shared by `warn-main-branch` and `enforce-worktree` so neither guard borrows
+/// the other's copy (cadence-hooks#164).
+pub fn git_dir_for_input(input: &HookInput) -> PathBuf {
+    let cwd = input
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let Some(file_path) = input.file_path() else {
+        return cwd;
+    };
+
+    let path = Path::new(&file_path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    resolved
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or(cwd)
+}
 
 /// Pure: classify a truthy env value (`1`/`true`/`yes`, trimmed,
 /// case-insensitive). Mirrors `warn_main_branch::is_main_allowed_value` and
