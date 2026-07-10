@@ -238,10 +238,6 @@ pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitS
                 let stdout = drain
                     .and_then(|handle| handle.join().ok())
                     .unwrap_or_default();
-                // A completed spawn (any exit code) feeds the induced-exhaustion
-                // discriminator: many fast completions before a later timeout
-                // means volume, not host slowness (#271 security follow-up).
-                crate::deadline::note_completed_spawn();
                 return GitSpawn::Completed(std::process::Output {
                     status,
                     stdout,
@@ -1072,18 +1068,6 @@ mod tests {
             run_bounded_with(&mut cmd, std::time::Duration::from_secs(1)),
             GitSpawn::SpawnFailed
         ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_completed_spawn_increments_the_induced_counter() {
-        // The counter is process-global; assert the one-way increment on a
-        // completed spawn, not an absolute value (peer tests may also bump it).
-        let before = crate::deadline::completed_spawns_for_test();
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "exit 0"]);
-        let _ = run_bounded_with(&mut cmd, std::time::Duration::from_secs(5));
-        assert!(crate::deadline::completed_spawns_for_test() > before);
     }
 
     #[test]

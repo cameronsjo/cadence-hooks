@@ -258,13 +258,19 @@ impl Check for PushRemoteGuard {
             let work_dir_loop = parse_work_dir(command, cwd_loop);
 
             // This loop is the one guard path that spawns a *command-controlled*
-            // number of git probes (one per looped push), so it is the vector
-            // for induced budget exhaustion (#271 security follow-up): a flood
-            // of bogus-remote pushes drains the shared deadline, then the real
-            // ownership-deciding probe times out and would fail open. Guard it
-            // with the induced-exhaustion discriminator — a timeout arriving
-            // after two dozen completed probes is volume, not host slowness, so
-            // block rather than allow the unvalidated push through.
+            // number of git probes (one per looped push), so it is the induced-
+            // budget-exhaustion vector (#271 security follow-up): a flood of
+            // bogus-remote pushes drains the shared deadline, then the real
+            // ownership-deciding probe times out. A push loop is rare and
+            // batchable, so the safe answer to *any* resolution timeout here is
+            // to fail CLOSED — "run pushes individually so each remote is
+            // validated" (a single push has budget for its one resolution). This
+            // is deliberately stricter than the single-command arm below (which
+            // fails open on a slow host, the common path that must not
+            // false-block): failing open in the loop would let an unvalidated,
+            // possibly-unowned push through, and no timing/count heuristic can
+            // separate that flood from a slow host — a slow host inflates each
+            // probe, keeping any completion-count discriminator under its bar.
             for cmd in cmds {
                 let Some(remote) = &cmd.explicit_repo else {
                     continue;
@@ -281,22 +287,17 @@ impl Check for PushRemoteGuard {
                         }
                     }
                     PushUrlResolution::TimedOut => {
-                        if cadence_hooks_core::deadline::timeout_is_induced() {
-                            return CheckResult::block(
-                                "🚫 git-guardrails: Push-loop ownership check exhausted the \
-                                 git-probe budget\n   \
-                                 A loop resolving many push remotes drained the deadline before \
-                                 an ownership check could complete — a possible evasion.\n   \
-                                 Fix: run pushes individually so each remote is validated.",
-                            );
-                        }
-                        // Genuine slow-host timeout on this one remote: record
-                        // the suppressed fail-closed block and skip, as an
-                        // unresolved remote was fail-open pre-#271.
-                        cadence_hooks_core::deadline::note_suppressed_block();
+                        return CheckResult::block(
+                            "🚫 git-guardrails: Push-loop ownership check timed out\n   \
+                             The git-probe deadline expired before a looped push's remote \
+                             could be ownership-validated — failing closed so an unowned \
+                             remote can't slip through.\n   \
+                             Fix: run pushes individually so each remote is validated.",
+                        );
                     }
                     // Failed (git answered, remote unresolvable): unchanged
-                    // fail-open skip.
+                    // fail-open skip — an unresolvable remote was fail-open
+                    // pre-#271, and the trailing single-command arm still runs.
                     PushUrlResolution::Failed => {}
                 }
             }
@@ -311,22 +312,18 @@ impl Check for PushRemoteGuard {
         let work_dir = parse_work_dir(command, cwd);
 
         // Not a git repo — let git fail naturally. A timed-out repo gate (#271)
-        // skips the entire ownership check below, so record it as a suppressed
-        // fail-closed block (the sharp telemetry reason), not the soft
-        // `deadline` one the runner records on its own.
+        // on this single-command path is the accepted common-path degradation:
+        // a normal `git push` on a slow host must not false-block (ADR-0001), so
+        // fail open and record the suppressed fail-closed block (the sharp
+        // telemetry reason) rather than the soft `deadline` the runner logs on
+        // its own. (Unlike the loop arm above, there is no command-controlled
+        // spawn count here to inflate — the probe count is fixed.)
         match cadence_hooks_core::shell::git_command_detailed(
             &work_dir,
             &["rev-parse", "--git-dir"],
         ) {
             cadence_hooks_core::shell::GitQuery::Value(_) => {}
             cadence_hooks_core::shell::GitQuery::TimedOut => {
-                if cadence_hooks_core::deadline::timeout_is_induced() {
-                    return CheckResult::block(
-                        "🚫 git-guardrails: git-probe budget exhausted before the push \
-                         target could be resolved\n   \
-                         Fix: run this push on its own so its remote can be validated.",
-                    );
-                }
                 cadence_hooks_core::deadline::note_suppressed_block();
                 return CheckResult::allow();
             }
@@ -353,14 +350,6 @@ impl Check for PushRemoteGuard {
                 // the suppressed fail-closed block so telemetry can distinguish
                 // "slow git" from "an ownership block was bypassed".
                 PushUrlResolution::TimedOut => {
-                    if cadence_hooks_core::deadline::timeout_is_induced() {
-                        return CheckResult::block(
-                            "🚫 git-guardrails: git-probe budget exhausted before the push \
-                             target could be resolved\n   \
-                             Fix: run this push on its own so its remote can be validated."
-                                .to_string(),
-                        );
-                    }
                     cadence_hooks_core::deadline::note_suppressed_block();
                     return CheckResult::allow();
                 }

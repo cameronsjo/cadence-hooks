@@ -37,6 +37,10 @@ const SLOW_MS: u64 = 1000;
 /// machine with a deep project history.
 const MAX_FILES: usize = 50;
 
+/// Skip a session log larger than this rather than read it whole into memory.
+/// Well above a normal log; a runaway file is not worth an unbounded read.
+const MAX_LOG_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Per-subcommand latency tally over the scanned window.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HookLatency {
@@ -61,10 +65,31 @@ fn cadence_subcommand(command: &str) -> Option<String> {
     let mut tokens = tail.split_whitespace();
     let ns = tokens.next()?;
     let sub = tokens.next()?;
-    if ns.is_empty() || sub.is_empty() {
+    // Both tokens must be a real namespace/subcommand id (kebab-case), so a
+    // non-hook `command` that merely contains the marker string can't surface
+    // an arbitrary path fragment or option into doctor output. The namespace
+    // is checked against the known set; the subcommand against its charset.
+    const NAMESPACES: [&str; 7] = [
+        "cadence",
+        "guardrails",
+        "rules",
+        "obsidian",
+        "metrics",
+        "lab",
+        "session",
+    ];
+    if !NAMESPACES.contains(&ns) || !is_kebab_id(sub) {
         return None;
     }
     Some(format!("{ns} {sub}"))
+}
+
+/// A hook subcommand id: lowercase letters/digits with internal dashes, no
+/// path/option characters.
+fn is_kebab_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Fold one hook-execution record into the tally. Ignores non-cadence hooks and
@@ -192,6 +217,12 @@ fn recent_logs(projects: &Path, window: Duration, now: SystemTime) -> Vec<PathBu
 pub fn scan_recent(projects: &Path, window: Duration, now: SystemTime) -> Vec<HookLatency> {
     let mut tallies: Vec<HookLatency> = Vec::new();
     for log in recent_logs(projects, window, now) {
+        // Skip a pathologically large log rather than read it whole into memory
+        // (doctor-only and the user's own logs, so this is hardening, not a
+        // security boundary).
+        if std::fs::metadata(&log).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+            continue;
+        }
         let Ok(contents) = std::fs::read_to_string(&log) else {
             continue;
         };
@@ -280,6 +311,27 @@ mod tests {
     fn cadence_subcommand_ignores_non_cadence() {
         assert_eq!(cadence_subcommand("cmux hooks claude stop"), None);
         assert_eq!(cadence_subcommand("run-cadence-hooks.sh cadence"), None); // no sub
+    }
+
+    #[test]
+    fn cadence_subcommand_rejects_unknown_ns_and_non_id_tokens() {
+        // A non-hook command that merely contains the marker string must not
+        // surface arbitrary trailing tokens (path fragments, options) as a
+        // "subcommand" in doctor output.
+        assert_eq!(
+            cadence_subcommand("echo run-cadence-hooks.sh /etc/passwd --foo"),
+            None,
+            "unknown namespace token rejected"
+        );
+        assert_eq!(
+            cadence_subcommand("x/run-cadence-hooks.sh cadence ../../secret"),
+            None,
+            "non-kebab subcommand rejected"
+        );
+        assert_eq!(
+            cadence_subcommand("x/run-cadence-hooks.sh cadence prevent-secret-writes"),
+            Some("cadence prevent-secret-writes".to_string())
+        );
     }
 
     #[test]

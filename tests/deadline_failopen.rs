@@ -174,11 +174,11 @@ fn hanging_branch_resolution_never_blocks_bare_head_force_push() {
 #[test]
 fn push_loop_padding_flood_blocks_instead_of_failing_open() {
     // The #271 security regression gate. A push loop that resolves a flood of
-    // bogus remotes drains the shared deadline; without the induced-exhaustion
-    // discriminator the trailing unowned-remote push would time out and fail
-    // OPEN (execute the unowned push). A fast fake git makes every padding
-    // resolution complete quickly — so the budget is drained by *volume*, and
-    // the guard must recognize that and BLOCK, not allow.
+    // remotes drains the shared deadline; if the trailing push's ownership
+    // probe times out and the loop arm fails OPEN, an unowned push executes.
+    // The loop arm therefore fails CLOSED on ANY resolution timeout — this is
+    // robust to a slow host inflating each probe (which defeats a completion-
+    // count discriminator), because it doesn't depend on how the budget drained.
     let shim = tempfile::tempdir().unwrap();
     // Fast fake git: every remote resolution fails quickly (nonexistent
     // remote), completing a spawn and burning ~one poll interval of budget.
@@ -189,8 +189,7 @@ fn push_loop_padding_flood_blocks_instead_of_failing_open() {
     let work = tempfile::tempdir().unwrap();
 
     // ~200 padding pushes reliably exceed the 1000ms floor budget at the ~10ms
-    // poll interval, then one push to an (also unresolvable, but that's not the
-    // point) trailing remote whose resolution is pre-exhausted → TimedOut.
+    // poll interval, then one push whose resolution is pre-exhausted → TimedOut.
     let mut body = String::new();
     for i in 0..200 {
         body.push_str(&format!("git push r{i}; "));
@@ -217,12 +216,12 @@ fn push_loop_padding_flood_blocks_instead_of_failing_open() {
     assert_eq!(
         out.status.code(),
         Some(2),
-        "induced budget exhaustion must BLOCK, not fail open: {}",
+        "a loop-arm resolution timeout must BLOCK, not fail open: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("budget"),
-        "block message names the exhaustion: {}",
+        String::from_utf8_lossy(&out.stderr).contains("timed out"),
+        "block message names the timeout: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     // The guard ENFORCED (blocked), so nothing degraded to fail-open — the

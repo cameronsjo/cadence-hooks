@@ -25,7 +25,7 @@
 //! fail-closed arms stay fail-closed.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Default shared budget. Bounds only in-process git time — the wrapper /
@@ -46,23 +46,10 @@ const MIN_BUDGET_MS: u64 = 1000;
 /// the mitigation.
 const MAX_BUDGET_MS: u64 = 4500;
 
-/// Above this many successfully-completed git spawns in one process, a
-/// subsequent timeout is treated as *induced* budget exhaustion (attacker
-/// volume, not host slowness): fail-closed arms that can be driven to spawn a
-/// variable, command-controlled number of probes (guard-push-remote's
-/// per-remote loop) then BLOCK rather than degrade to allow. The discriminator
-/// is completion count, not wall time — a genuinely slow host times out on its
-/// *first* probe (few completed spawns), while only a crafted flood of fast
-/// probes completes many before starving a later, ownership-deciding one.
-/// Sits far above any legitimate guard's spawn count (enforce-worktree ≤3, a
-/// push guard ~5, a several-mirror push loop ~a dozen).
-const INDUCED_EXHAUSTION_SPAWNS: u64 = 24;
-
 static HOOK_START: OnceLock<Instant> = OnceLock::new();
 static BUDGET: OnceLock<Option<Duration>> = OnceLock::new();
 static DEADLINE_HIT: AtomicBool = AtomicBool::new(false);
 static SUPPRESSED_BLOCK: AtomicBool = AtomicBool::new(false);
-static COMPLETED_SPAWNS: AtomicU64 = AtomicU64::new(0);
 
 /// What a spawn site should do with its next subprocess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,31 +133,6 @@ pub fn note_suppressed_block() {
 /// [`note_suppressed_block`]).
 pub fn suppressed_block() -> bool {
     SUPPRESSED_BLOCK.load(Ordering::Relaxed)
-}
-
-/// Record one successfully-completed (not timed-out) bounded git spawn. The
-/// running total feeds [`timeout_is_induced`]. Called by the bounded runner,
-/// not by guards directly.
-pub fn note_completed_spawn() {
-    COMPLETED_SPAWNS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Test-only read of the completed-spawn counter (the counter is otherwise
-/// write-only from outside this module).
-#[cfg(test)]
-pub fn completed_spawns_for_test() -> u64 {
-    COMPLETED_SPAWNS.load(Ordering::Relaxed)
-}
-
-/// Has this process completed enough git spawns that a *subsequent* timeout is
-/// better explained by attacker-induced volume than by host slowness? A guard
-/// that can be driven to a command-controlled number of probes should treat a
-/// timeout past this point as fail-*closed* (block), since the fail-open
-/// justification — "the guard's own infrastructure is failing" — no longer
-/// holds when the guard already ran two dozen probes to completion. See
-/// [`INDUCED_EXHAUSTION_SPAWNS`].
-pub fn timeout_is_induced() -> bool {
-    COMPLETED_SPAWNS.load(Ordering::Relaxed) >= INDUCED_EXHAUSTION_SPAWNS
 }
 
 #[cfg(test)]
