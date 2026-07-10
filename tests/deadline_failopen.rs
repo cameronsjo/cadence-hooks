@@ -182,12 +182,9 @@ fn push_loop_padding_flood_blocks_instead_of_failing_open() {
     let shim = tempfile::tempdir().unwrap();
     // Fast fake git: every remote resolution fails quickly (nonexistent
     // remote), completing a spawn and burning ~one poll interval of budget.
-    std::fs::write(shim.path().join("git"), "#!/bin/sh\nexit 1\n").unwrap();
-    std::fs::set_permissions(
-        &shim.path().join("git"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    let git_path = shim.path().join("git");
+    std::fs::write(&git_path, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&git_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let metrics = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
 

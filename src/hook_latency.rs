@@ -182,7 +182,7 @@ fn recent_logs(projects: &Path, window: Duration, now: SystemTime) -> Vec<PathBu
             files.push((modified, path));
         }
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
     files.truncate(MAX_FILES);
     files.into_iter().map(|(_, p)| p).collect()
 }
