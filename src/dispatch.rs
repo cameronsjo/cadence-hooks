@@ -161,17 +161,23 @@ pub fn run_logged_logger(
 /// means enforcement was actually bypassed; a plain `deadline` means git-backed
 /// checks degraded to their ordinary fail-open arms.
 ///
-/// `enforced` is true when the guard's final outcome still *blocked* — e.g. a
-/// `guard-push-remote` induced-exhaustion block, where a probe timed out
-/// (setting `deadline::hit()`) yet the guard blocked rather than failed open.
-/// In that case the plain `deadline` row is suppressed: nothing degraded to
-/// fail-open, so the "degraded to fail-open" breadcrumb would be a lie. The
-/// `deadline_block_suppressed` tier is unaffected — those paths return allow.
+/// **Both tiers require `!enforced`.** `enforced` is true when the guard's
+/// final outcome was `Block` or `Ask` — the operation was stopped (exit 2) or
+/// gated on the user (who then sees the prompt), so nothing silently proceeded.
+/// A *silent* bypass — the only thing worth a loud row — happens exactly when
+/// the tool runs anyway (Allow/Nudge). A fail-closed arm can set the sticky
+/// `suppressed_block` flag on one segment's timed-out probe while a *later*,
+/// purely-static check legitimately blocks the whole command (e.g.
+/// `git push --force origin HEAD; git push --force origin main` — segment 1's
+/// branch probe times out, segment 2 blocks with no spawn). Reporting
+/// `deadline_block_suppressed` there is a false positive on the very signal
+/// Phase 1.5 reads as "an ownership block was bypassed", so both tiers gate on
+/// the final outcome, not just the sticky flag.
 ///
 /// Both writes are fully fail-open and never perturb the verdict or exit code.
 fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, enforced: bool) {
     use cadence_hooks_core::deadline;
-    if deadline::suppressed_block() {
+    if deadline::suppressed_block() && !enforced {
         cadence_hooks_metrics::log_failopen(
             "deadline_block_suppressed",
             namespace,

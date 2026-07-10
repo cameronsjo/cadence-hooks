@@ -128,9 +128,18 @@ fn record_hook(tallies: &mut Vec<HookLatency>, obj: &serde_json::Map<String, Val
     }
 }
 
+/// Depth cap for [`walk`]. serde_json already rejects lines nested deeper than
+/// its own 128-limit at parse time, so a value reaching `walk` can't exceed
+/// that — this makes the "never recurses without bound" property explicit and
+/// local rather than relying on the parser's cap.
+const MAX_WALK_DEPTH: u32 = 128;
+
 /// Walk a parsed session-log line for hook-execution objects (they appear both
 /// at the top level and nested inside `stop_hook_summary.hookInfos`).
-fn walk(value: &Value, tallies: &mut Vec<HookLatency>) {
+fn walk(value: &Value, tallies: &mut Vec<HookLatency>, depth: u32) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     match value {
         Value::Object(obj) => {
             // A hook-execution record has a `command`; the stop-summary form
@@ -139,12 +148,12 @@ fn walk(value: &Value, tallies: &mut Vec<HookLatency>) {
                 record_hook(tallies, obj);
             }
             for v in obj.values() {
-                walk(v, tallies);
+                walk(v, tallies, depth + 1);
             }
         }
         Value::Array(items) => {
             for v in items {
-                walk(v, tallies);
+                walk(v, tallies, depth + 1);
             }
         }
         _ => {}
@@ -163,7 +172,7 @@ pub fn scan_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<HookLatency> 
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        walk(&value, &mut tallies);
+        walk(&value, &mut tallies, 0);
     }
     tallies.sort_by(|a, b| {
         b.slow

@@ -172,6 +172,54 @@ fn hanging_branch_resolution_never_blocks_bare_head_force_push() {
 }
 
 #[test]
+fn suppressed_block_not_logged_when_a_later_static_check_blocks() {
+    // A multi-segment command where segment 1's git probe times out (setting
+    // the sticky suppressed-block flag) but segment 2 statically blocks with no
+    // spawn. The operation is ENFORCED (exit 2), so nothing was bypassed — the
+    // sharp `deadline_block_suppressed` row must NOT fire (it would be a false
+    // positive on the exact signal Phase 1.5 reads as an active bypass).
+    let shim = tempfile::tempdir().unwrap();
+    write_hanging_git(shim.path());
+    let metrics = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        // seg 1: bare-HEAD force push → branch resolution hangs → suppressed flag.
+        // seg 2: force push to protected `main` → pure token match → hard block.
+        "tool_input": { "command": "git push --force origin HEAD; git push --force origin main" },
+        "cwd": work.path().to_string_lossy(),
+    })
+    .to_string();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["cadence", "git-safety"]);
+    cmd.env("PATH", shim.path());
+    cmd.env("CADENCE_HOOK_DEADLINE_MS", "1000");
+    cmd.env("CADENCE_METRICS_DIR", metrics.path());
+    cmd.env_remove("CADENCE_DISABLE");
+    let out = run_with_payload(&mut cmd, &payload);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the protected-branch force push must block: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = failopen_rows(metrics.path());
+    assert!(
+        rows.iter()
+            .all(|r| r["reason"] != "deadline_block_suppressed"),
+        "an enforced block must not log a bypassed-enforcement row: {rows:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("degraded to allow"),
+        "no bypass breadcrumb on an enforced block: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn push_loop_padding_flood_blocks_instead_of_failing_open() {
     // The #271 security regression gate. A push loop that resolves a flood of
     // remotes drains the shared deadline; if the trailing push's ownership
