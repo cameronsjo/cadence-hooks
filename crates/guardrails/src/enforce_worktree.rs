@@ -2954,7 +2954,14 @@ mod tests {
         std::fs::create_dir(&foreign).unwrap();
         init_repo(&foreign);
 
-        let mut input = make_bash(&format!("cd {} && uv add serde", foreign.to_string_lossy()));
+        // Relative `cd` (not the absolute fixture path): a Windows fixture path
+        // interpolated here is `C:\…\foreign-repo`, whose backslashes bash
+        // treats as escapes, so the `cd` silently fails on Git Bash and the
+        // mutation resolves back in the session's own repo → false nudge on
+        // windows-latest. `../foreign-repo` is separator-agnostic and resolves
+        // against the effective cwd (`primary_a` == `<scratch>/repo`) → the
+        // sibling `<scratch>/foreign-repo` on every platform.
+        let mut input = make_bash("cd ../foreign-repo && uv add serde");
         input.cwd = Some(primary_a.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(
