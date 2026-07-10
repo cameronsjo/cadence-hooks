@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **`warn-branch-base` folds in an early worktree-first nudge (Refs #276).** `git checkout -b`/`git switch -c` in a **primary checkout** under worktree discipline — the same state `enforce-worktree` would gate a mutation in, via the shared `would_block_here` primitive — now nudges toward creating a worktree instead, regardless of which base is named. This replaces the guard's old "switch to main first" advice for that case, which wrongly presumed branching in place was fine as long as the base was main; in a primary checkout, branching in place at all is the anti-pattern `enforce-worktree` exists to prevent. A linked worktree, an exempted repo (`CADENCE_ALLOW_MAIN`, `CADENCE_NO_ENFORCE_WORKTREE`, temp root), or an unresolvable cwd falls through to the original base-branch check, unchanged.
+
 ## [0.55.0] - 2026-07-10
 
 ### Fixed
