@@ -585,6 +585,35 @@ fn failopen_findings(
     findings
 }
 
+/// Cadence hook latency from Claude Code session logs as a doctor `Finding`
+/// (cadence-hooks#271 prevention P2). The binary can't self-report an external
+/// timeout kill — a killed process logs nothing — but Claude Code records every
+/// hook's `durationMs`, so a scan of recent session logs surfaces guards that
+/// are degrading (incl. pure-CPU guards the deadline telemetry never sees). A
+/// `Warning`, never an `Error`: slow hooks are an environment problem to
+/// diagnose, not a shell bug.
+fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> Vec<Finding> {
+    let tallies = crate::hook_latency::scan_recent(projects, window, now);
+    let days = window.as_secs() / 86_400;
+    match crate::hook_latency::summary(&tallies, days) {
+        None => Vec::new(),
+        Some(diagnosis) => vec![Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-hooks".to_string(),
+            file: projects.to_path_buf(),
+            line: None,
+            snippet: "Claude Code session logs".to_string(),
+            diagnosis,
+            remediation: "git-backed guards are bounded by the internal deadline \
+                          (CADENCE_HOOK_DEADLINE_MS); a pure-CPU guard that's still \
+                          slow points at fork/exec contention — check for a \
+                          cloud-synced working dir, endpoint-protection scanning, or \
+                          heavy concurrent-session load (#271)"
+                .to_string(),
+        }],
+    }
+}
+
 /// Prints an informational (non-blocking, not a `Finding`) count of recent
 /// registry-file reaps when nonzero. No threshold — reaping is normal
 /// operation; this is visibility, not an alarm.
@@ -1168,6 +1197,11 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             window,
             now,
             env!("CARGO_PKG_VERSION"),
+        ));
+        findings.extend(hook_latency_findings(
+            &crate::hook_latency::projects_dir(),
+            window,
+            now,
         ));
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);

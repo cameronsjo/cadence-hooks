@@ -20,6 +20,7 @@ fn under_claude_code() -> bool {
 mod configure;
 mod dispatch;
 mod doctor;
+mod hook_latency;
 mod registry;
 mod try_hook;
 use registry::{HOOKS, HookEntry};
