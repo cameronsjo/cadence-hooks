@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **P0 #271 mitigation: every git subprocess is now wall-clock bounded under a shared per-process deadline, so guards degrade to *observable* fail-open instead of being silently killed by the external hooks.json timeout.** On a host with slow subprocess I/O (cloud-synced `.git`, endpoint-protection scanning, heavy concurrent-session load), unbounded `git` probes rode hook processes past their 5s budget; Claude Code kills a timed-out hook from outside and fails open, so the guard suite added ~5s of latency per tool call while silently not enforcing — and a killed process can't log its own death. The new `core::deadline` budget (`CADENCE_HOOK_DEADLINE_MS`, default 3000ms; `0` disables; positive values clamp up to a 1000ms floor because a tiny value injected via a repo `.envrc` would be a guard-softening primitive) is armed at hook dispatch and shared across a process's spawns — a pre-exhausted budget skips the spawn entirely. The bounded runner (`core::shell::run_git_bounded`) kills and reaps the child at the deadline, drains stdout on a thread (no 64KB pipe-buffer deadlock), sets `GIT_OPTIONAL_LOCKS=0` on every spawn, and returns a tri-state so callers distinguish "git answered badly" from "git never answered". The deadline bounds in-process git time only — the wrapper/fork-exec slice before `main` is outside its reach (that residual belongs to the process-fan-out follow-up).
+- **Three fail-closed guard arms no longer convert a timed-out git probe into a false block** — each gates on its *own* resolution's timeout, never a process-global flag: `cadence git-safety`'s bare-`HEAD` force-push arm (a routine `git push --force origin HEAD` on the slow host would have been blocked as "unresolvable current branch"), `guardrails guard-push-remote`'s unresolvable-push-target arm, and `guardrails guard-gh-write`'s unresolvable-repo arm (single commands and relaxed no-`cd` loops). A genuine resolution failure — git answered, target truly ambiguous — still blocks exactly as before. In `guard-gh-write`, the ownership-deciding `origin` probe now runs before the optional `upstream` fork refinement so the refinement can't starve it under a shared budget, and a timed-out `upstream` never degrades to origin-only judgment (in a fork clone that would be a wrong-target allow).
+
+### Added
+
+- **Two new `failopen.jsonl` reasons (additive; schemaVersion stays 1) make the degradation loud:** `deadline` — git probes were abandoned at the budget and guards took their ordinary fail-open arms; `deadline_block_suppressed` — a fail-closed arm downgraded an actual block, i.e. enforcement was bypassed, not just slowed. Both come with a stderr breadcrumb, and `cadence-hooks doctor` warns at ≥3 `deadline` rows in the window (load-correlated, like `parse`) and at ≥1 suppressed block (each one is an enforcement block that did not fire). Session `heartbeat`/`end`/`backstop-record` migrate to the logged dispatcher so their deadline hits have an emission path (they gain `hooks.jsonl` timing rows as a side effect).
+- **A spawn-budget regression test pins `enforce-worktree`'s Edit/Write arm at ≤3 git spawns** (a counting fake-`git` shim), so the next accidental per-edit probe is a red CI run instead of a field P0 — the count had grown from ~1 to 4-5 across v0.48–0.49 unnoticed.
+
+### Changed
+
+- **`enforce-worktree` drops from 4-5 git spawns to 3 per Edit/Write** via a per-invocation `GitProbe` memo (common-dir and repo-root asked of git once per directory), with the snooze marker and its provenance sidecar now read through the already-resolved common dir — pure filesystem, no extra spawns, and writer/reader marker anchors provably match. A resolved repo whose common-dir probe times out now allows (snooze state unreadable — the guard's own infrastructure failure never blocks, ADR-0001) instead of risking a false block through an active dismissal.
+
 ## [0.54.0] - 2026-07-09
 
 ### Added

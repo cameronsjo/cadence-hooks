@@ -1002,6 +1002,65 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 mod tests {
     use super::*;
 
+    // --- run_bounded_with (the #271 bounded subprocess runner) ---
+    // Driven with the explicit-timeout entry point so the process-global
+    // deadline state never confounds these; plain `sh`/`sleep` stand in for
+    // git — the runner is command-agnostic.
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_fast_command_completes_with_stdout() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo bounded-ok"]);
+        match run_bounded_with(&mut cmd, std::time::Duration::from_secs(10)) {
+            GitSpawn::Completed(out) => {
+                assert!(out.status.success());
+                assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bounded-ok");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_slow_command_is_killed_and_reaped_at_timeout() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let result = run_bounded_with(&mut cmd, std::time::Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert!(matches!(result, GitSpawn::TimedOut), "got {result:?}");
+        // Kill happened at ~100ms, not at the child's 30s — proves the kill
+        // path; the clean return (no panic, no hang) proves the reap.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "kill at timeout, took {elapsed:?}"
+        );
+        assert!(crate::deadline::hit(), "timeout marks the shared flag");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_large_output_does_not_deadlock() {
+        // 200KB > the ~64KB pipe buffer: without the drain thread this hangs
+        // (child blocked writing, parent blocked in try_wait poll).
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 200000 /dev/zero"]);
+        match run_bounded_with(&mut cmd, std::time::Duration::from_secs(10)) {
+            GitSpawn::Completed(out) => assert_eq!(out.stdout.len(), 200_000),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_missing_program_is_spawn_failed() {
+        let mut cmd = Command::new("definitely-not-a-real-program-271");
+        assert!(matches!(
+            run_bounded_with(&mut cmd, std::time::Duration::from_secs(1)),
+            GitSpawn::SpawnFailed
+        ));
+    }
+
     #[test]
     fn is_gh_pr_create_matches_the_command() {
         assert!(is_gh_pr_create("gh pr create --title test"));
