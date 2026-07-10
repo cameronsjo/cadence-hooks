@@ -48,11 +48,11 @@
 //! the single source of truth.
 
 use crate::enforce_worktree::{skip_transparent_prefixes, strip_group_wrappers};
+use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, child_scripts, looks_absolute, resolve_cd_target,
     split_segments_with_ops, tokenize,
 };
-use cadence_hooks_core::worktree::path_under_temp_root;
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome, normalize_path};
 use std::path::Path;
 
@@ -384,91 +384,61 @@ fn has_parent_segment(path: &str) -> bool {
     path.split('/').any(|seg| seg == "..")
 }
 
-/// Drop bare `.` segments from an already-`normalize_path`'d string, so a
-/// non-canonical form like `~/./Documents` still matches the exact classifiers
-/// (`HomeChild`, `Vault`, `has_git_component`) rather than slipping to the
-/// ambiguous default. `..` never reaches here — `resolve_target` routes it to
-/// `Unresolvable` upstream.
-fn drop_dot_segments(path: &str) -> String {
-    if !path.split('/').any(|s| s == ".") {
-        return path.to_string();
-    }
-    let leading = path.starts_with('/');
-    let joined = path
-        .split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect::<Vec<_>>()
-        .join("/");
-    if leading {
-        format!("/{joined}")
-    } else {
-        joined
-    }
-}
-
-/// Classify a resolved target path. `is_git_root` is injected (the wrapper
-/// stats `<target>/.git`; tests stub it) so this stays pure.
+/// Classify a resolved target path into guard-rm's [`TargetClass`].
+///
+/// Delegates the shared path facts to [`pathclass::classify`] — temp,
+/// `.claude`-managed, git-root, and home-child — and layers guard-rm's own
+/// root / home / vault policy on top. Those three stay guard-local: they have
+/// only this one consumer today, so promoting them to the shared classifier
+/// would couple without real reuse (cadence-hooks#164 D5). `is_git_root` is
+/// injected (the wrapper stats `<target>/.git`; tests stub it) so this stays
+/// pure.
 ///
 /// Order is load-bearing: ALLOW rules run **before** BLOCK rules, so a scratch
 /// target under a protected ancestor — a git worktree under `.claude`, a repo
-/// checked out in `/tmp` — is ALLOW, not blocked as a git repo.
+/// checked out in `/tmp` — is ALLOW, not blocked as a git repo. guard-rm's
+/// root/home checks sit ahead of the shared home-child, and vault ahead of the
+/// shared git-root, preserving the prototype's exact precedence (and thus its
+/// BLOCK-message wording). A `pathclass` `DocsPlans`/`Source` fact (no guard-rm
+/// consumer) falls through to the ambiguous [`TargetClass::Unknown`] default.
 fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool) -> TargetClass {
-    let norm = drop_dot_segments(&normalize_path(path));
+    let norm = pathclass::normalize(path);
+    let pc_ctx = PathClassContext {
+        home: ctx.home,
+        tmpdir: ctx.tmpdir,
+    };
+    let shared = pathclass::classify(&norm, &pc_ctx, is_git_root);
 
-    // ALLOW rules first.
-    if path_under_temp_root(Path::new(&norm), ctx.tmpdir) {
-        return TargetClass::Temp;
-    }
-    if is_under_claude_managed(&norm) {
-        return TargetClass::ClaudeManaged;
+    // ALLOW rules first — the shared classifier owns Temp and ClaudeManaged.
+    match shared {
+        PathClass::Temp => return TargetClass::Temp,
+        PathClass::ClaudeManaged => return TargetClass::ClaudeManaged,
+        _ => {}
     }
 
     // BLOCK rules. `normalize_path("/")` == "" (trailing slash trimmed), so an
-    // empty norm IS the root.
+    // empty norm IS the root — guard-rm's root/home outrank the shared home-child.
     if norm.is_empty() || norm == "/" {
         return TargetClass::Root;
     }
     if norm == ctx.home {
         return TargetClass::Home;
     }
-    if is_first_level_home_child(&norm, ctx.home) {
+    if shared == PathClass::HomeChild {
         return TargetClass::HomeChild;
     }
+    // Vault is guard-rm-local (deferred from pathclass v1); checked ahead of the
+    // shared git-root so a vault that is also a repo reports the vault.
     if let Some(vault) = ctx.vault
         && (norm == vault || norm.starts_with(&format!("{vault}/")))
     {
         return TargetClass::Vault;
     }
-    if has_git_component(&norm) || is_git_root(&norm) {
+    if shared == PathClass::GitRoot {
         return TargetClass::GitRepo;
     }
 
     TargetClass::Unknown
-}
-
-/// `.claude` appears as a path component AND is not the final one — the target
-/// lives *under* a `.claude` dir, rather than being it.
-fn is_under_claude_managed(path: &str) -> bool {
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    match segs.iter().position(|s| *s == ".claude") {
-        Some(pos) => pos + 1 < segs.len(),
-        None => false,
-    }
-}
-
-/// `path` is a first-level entry directly under `home` (one component below).
-fn is_first_level_home_child(path: &str, home: &str) -> bool {
-    if home.is_empty() {
-        return false;
-    }
-    let prefix = format!("{home}/");
-    path.strip_prefix(&prefix)
-        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
-}
-
-/// Any `/`-separated segment of `path` is exactly `.git`.
-fn has_git_component(path: &str) -> bool {
-    path.split('/').any(|seg| seg == ".git")
 }
 
 /// The decision core: collect targets, classify each, and keep the most severe

@@ -4,7 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.55.0] - 2026-07-10
+## [Unreleased]
+
+### Added
+
+- **Two pure `core` modules give the git/branch guard family one tested notion of "what kind of path / repo / branch is this?" (cadence-hooks#164, PR1 of the umbrella).** `core::pathclass` generalizes `guard-rm`'s shipped `classify_path`/`TargetClass` prototype into a shared `path → PathClass` map — `Temp`, `ClaudeManaged`, `DocsPlans`, `HomeChild`, `GitRoot`, `Source` — preserving the load-bearing ALLOW-before-BLOCK precedence and folding in #152's lexical `..` normalization so no carve-out ever matches an uncanonicalized path. `core::gitstate::GitState::resolve` exposes `repo_root`, `git_common_dir`, `branch`, `worktree_kind` (primary/linked), and `default_branch` as a pure filesystem walk (no `git` spawn), built on the existing `paths::find_git_root` + `resolve_git_common_dir`. Both expose **facts, not policy** — no `is_main`/block/allow verdict — so a shared classifier feeding a BLOCK guard can never drift one guard's decision (or fail-direction) into another's. `guard-rm` is refactored as `pathclass`'s first consumer with **byte-identical verdicts** (all 53 existing tests unchanged); the incident history (#152/#33/#35) is captured as a seed-corpus regression suite. Additive — no other guard consumes the modules yet, so this PR changes structure, never a decision. `memory`/`vault` classes deferred to land with their second consumer (D5).
 
 ### Fixed
 

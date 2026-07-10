@@ -174,7 +174,10 @@ pub fn resolve_git_common_dir(repo_root: &Path) -> Option<PathBuf> {
 
 /// Parse a `.git` *file*'s `gitdir: <path>` line into the worktree admin dir,
 /// joining a relative target against the `.git` file's parent (`repo_root`).
-fn read_gitdir_file(dot_git_file: &Path, repo_root: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)` so [`crate::gitstate`] can resolve a linked worktree's admin
+/// dir (which holds that worktree's own `HEAD`) without re-deriving the parse.
+pub(crate) fn read_gitdir_file(dot_git_file: &Path, repo_root: &Path) -> Option<PathBuf> {
     let contents = std::fs::read_to_string(dot_git_file).ok()?;
     let target = contents
         .lines()
