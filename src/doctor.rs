@@ -1083,6 +1083,71 @@ fn canonical_remote_finding(
     })
 }
 
+/// Legacy per-guard config files the unified loader no longer reads
+/// (cadence-hooks#153). Presence is a `Warning`, not an `Error`: the repo's
+/// softening is silently inert until migrated — the hard cut's non-silent net.
+const LEGACY_CONFIG_FILES: &[&str] = &["redaction.json", "terminology.json"];
+
+/// One `Warning` per orphaned legacy config file under `<root>/.claude/`, empty
+/// when none is present. Detects any entry at the path (regular file or
+/// symlink) via `symlink_metadata` — no read — so a leftover file is surfaced
+/// regardless of what it is. Pure; the caller resolves the repo root.
+fn legacy_config_findings(root: &Path) -> Vec<Finding> {
+    let claude = root.join(".claude");
+    LEGACY_CONFIG_FILES
+        .iter()
+        .filter_map(|name| {
+            let path = claude.join(name);
+            if std::fs::symlink_metadata(&path).is_err() {
+                return None;
+            }
+            Some(Finding {
+                severity: Severity::Warning,
+                plugin: "cadence-hooks".to_string(),
+                file: path.clone(),
+                line: None,
+                snippet: (*name).to_string(),
+                diagnosis: format!(
+                    "legacy guard config '{name}' present but no longer read — \
+                     unified into .claude/cadence.json (#153)"
+                ),
+                remediation: "run 'cadence-hooks migrate-config' to merge it into \
+                              .claude/cadence.json (renames the legacy file to \
+                              *.json.migrated)"
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A `Warning` when `<root>/.claude/cadence.json` is present but not valid JSON,
+/// or `None` when it is absent, unreadable/special (fail-open), or parses.
+///
+/// Runtime is fail-open — a malformed `cadence.json` silently yields every
+/// guard's default config, so its per-repo softening quietly stops applying.
+/// This makes that non-silent, without ever failing the run (advisory only).
+fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
+    let path = root.join(cadence_hooks_core::config::CADENCE_CONFIG_REL);
+    let content = cadence_hooks_core::paths::read_untrusted_config(&path)?;
+    if serde_json::from_str::<serde_json::Value>(&content).is_ok() {
+        return None;
+    }
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: "cadence-hooks".to_string(),
+        file: path,
+        line: None,
+        snippet: "cadence.json".to_string(),
+        diagnosis: "`.claude/cadence.json` is present but not valid JSON — guards \
+                    fall open to default config, so their per-repo softening is \
+                    silently inert"
+            .to_string(),
+        remediation: "fix the JSON syntax; 'cadence-hooks migrate-config' writes a \
+                      valid file from any legacy config"
+            .to_string(),
+    })
+}
+
 /// Entry point for the `doctor` subcommand. Returns the process exit code.
 ///
 /// Exit codes:
@@ -1236,6 +1301,20 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             ) {
                 findings.push(finding);
             }
+        }
+    }
+
+    // Repo-local guard-config health: orphaned legacy files (ignored under the
+    // #153 hard cut) and a malformed cadence.json. Repo-scoped, so default mode
+    // only — under `--root` (the CI/fixture path) there is no "current repo" to
+    // inspect, same live-machine-only rationale as the checks above.
+    if root_override.is_none()
+        && let Ok(cwd) = std::env::current_dir()
+        && let Some(repo_root) = cadence_hooks_core::paths::find_git_root(&cwd.to_string_lossy())
+    {
+        findings.extend(legacy_config_findings(&repo_root));
+        if let Some(finding) = cadence_config_parse_finding(&repo_root) {
+            findings.push(finding);
         }
     }
 
@@ -2303,5 +2382,73 @@ mod tests {
         assert_eq!(freed, 0);
         assert!(outside.exists(), "outside dir must survive");
         assert!(outside.join("keepme").exists());
+    }
+
+    // ── legacy_config_findings / cadence_config_parse_finding (#153) ─────────
+
+    fn seed_claude(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        for (name, body) in files {
+            fs::write(claude.join(name), body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn legacy_config_findings_flags_present_files() {
+        let dir = seed_claude(&[("redaction.json", "{}"), ("terminology.json", "{}")]);
+        let findings = legacy_config_findings(dir.path());
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| f.severity == Severity::Warning));
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.remediation.contains("migrate-config")),
+            "each remediation points at migrate-config"
+        );
+        let snippets: Vec<&str> = findings.iter().map(|f| f.snippet.as_str()).collect();
+        assert!(snippets.contains(&"redaction.json"));
+        assert!(snippets.contains(&"terminology.json"));
+    }
+
+    #[test]
+    fn legacy_config_findings_clean_repo_is_empty() {
+        // Only the unified file present → nothing to warn about.
+        let dir = seed_claude(&[("cadence.json", r#"{"version":1}"#)]);
+        assert!(legacy_config_findings(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn legacy_config_findings_partial_flags_only_present() {
+        let dir = seed_claude(&[("redaction.json", "{}")]);
+        let findings = legacy_config_findings(dir.path());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].snippet, "redaction.json");
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_malformed_warns() {
+        let dir = seed_claude(&[("cadence.json", "{not valid json")]);
+        let finding =
+            cadence_config_parse_finding(dir.path()).expect("a malformed cadence.json must warn");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(finding.diagnosis.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_valid_is_none() {
+        let dir = seed_claude(&[(
+            "cadence.json",
+            r#"{"version":1,"terminology":{"exemptions":[]}}"#,
+        )]);
+        assert!(cadence_config_parse_finding(dir.path()).is_none());
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_absent_is_none() {
+        let dir = seed_claude(&[]);
+        assert!(cadence_config_parse_finding(dir.path()).is_none());
     }
 }
