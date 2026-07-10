@@ -73,7 +73,13 @@
 //! - **`$VAR`/`$(…)`-pathed targets** — `cat > "$OUT"`, `> "$(…)"`: the scoped
 //!   walk carries no assignment expansion (that lives only on the flat
 //!   `command_segments` view, the #228 bypass class this predicate MUST NOT
-//!   use), so the target stays unexpanded → resolves to no repo → miss.
+//!   use), so the target stays the literal token (`<cwd>/$OUT`). This is
+//!   imprecise both ways: the *intended* file is never resolved (a true target
+//!   is missed), and the literal token's own nearest-existing-ancestor is
+//!   usually the cwd — so if the cwd is in-primary the nudge **over-fires** on
+//!   the wrong path rather than silently missing. Advisory-only, so an
+//!   imprecise nudge is acceptable; widening to the flat expansion view is
+//!   rejected (it is the #228 bypass primitive).
 //! - **Prefix-flag wrappers** — `nice -n 10 <mutator>`, `env -i sh -c '…'`,
 //!   `sudo <mutator>`: the transparent-prefix stripper stops at a prefix whose
 //!   next token is a flag (and `sudo` isn't a transparent prefix here), so the
@@ -205,12 +211,23 @@ impl GitProbe {
 type CommitTarget = String;
 
 /// A resolved subprocess-mutation location surfaced by the same scoped walk
-/// (see [`collect_targets`]). For a package-manager verb (`uv add`, …) it is the
-/// segment's effective cwd; for a direct file mutator (`sed -i`, `tee`) or a
-/// redirect it is the resolved target path. Assessed for a **nudge** (never a
-/// block) only when it lands in the session's own primary checkout — see
-/// [`mutation_nudge`].
-type MutationTarget = String;
+/// (see [`collect_targets`]). The variant records whether the path is a
+/// **directory** (a package-manager verb's effective cwd) or a **file** (a
+/// `sed -i`/`tee`/redirect target) — the distinction is load-bearing in
+/// [`mutation_nudge`], which must resolve a *file* to its parent directory
+/// before any `git` probe (a `git -C <file> rev-parse` errors "Not a
+/// directory", which silently dropped the nudge for the already-existing
+/// tracked file the feature targets — security-review FIX 1). Assessed for a
+/// **nudge** (never a block) only when it lands in the session's own primary
+/// checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MutationTarget {
+    /// A package-manager verb runs in this directory (already a directory).
+    Dir(String),
+    /// A file mutator (`sed -i`, `tee`) or redirect writes this file path;
+    /// resolve to its parent directory before probing git.
+    File(String),
+}
 
 /// Pure: walk `command` segment by segment (heredoc bodies stripped, quotes
 /// respected — see [`split_segments_with_ops`]), tracking the effective
@@ -446,13 +463,19 @@ fn detect_mutations(
     mutations: &mut Vec<MutationTarget>,
 ) {
     if is_package_mutation(argv) {
-        mutations.push(effective_dir.to_string());
+        mutations.push(MutationTarget::Dir(effective_dir.to_string()));
     }
     for target in file_mutation_targets(argv) {
-        mutations.push(resolve_mutation_target(&target, effective_dir));
+        mutations.push(MutationTarget::File(resolve_mutation_target(
+            &target,
+            effective_dir,
+        )));
     }
     for target in redirect_targets(segment) {
-        mutations.push(resolve_mutation_target(&target, effective_dir));
+        mutations.push(MutationTarget::File(resolve_mutation_target(
+            &target,
+            effective_dir,
+        )));
     }
 }
 
@@ -801,18 +824,38 @@ fn mutation_nudge(
     let cwd_common = probe.common_dir(Path::new(cwd))?;
     let mut seen: HashSet<String> = HashSet::new();
     for target in mutation_targets {
-        if !seen.insert(target.clone()) {
+        // Resolve to the directory to assess. A `File` target is resolved to
+        // its PARENT directory first — exactly as the Edit/Write arm does via
+        // `git_dir_for_input`'s `.parent()` — because a `git -C <file>
+        // rev-parse` errors "Not a directory" and `nearest_existing_ancestor`
+        // returns an existing file unchanged (its own `exists()` short-circuits
+        // the ascent), so probing the raw file path silently dropped the nudge
+        // for an already-existing tracked file (security-review FIX 1). A `Dir`
+        // target (a package-manager verb's cwd) is already a directory — taking
+        // its parent would wrongly hop to the enclosing dir, so it is used as-is.
+        let assess_path: PathBuf = match target {
+            MutationTarget::Dir(d) => PathBuf::from(d),
+            MutationTarget::File(f) => Path::new(f)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(f)),
+        };
+        if !seen.insert(assess_path.to_string_lossy().into_owned()) {
             continue;
         }
-        let target_path = Path::new(target);
         // Same `.claude/`/`docs/plans/` carve-outs as the Edit/Write arm — a
         // mutation into Claude-managed state or an approved plan doc is exempt.
-        if is_claude_managed_dir(target_path) || is_plan_doc_dir(target_path) {
+        // Checked on the containing dir, matching the Edit arm (which checks the
+        // file's `git_dir_for_input` parent), so a `.claude/`-component path is
+        // still caught.
+        if is_claude_managed_dir(&assess_path) || is_plan_doc_dir(&assess_path) {
             continue;
         }
-        // A redirect/verb target may name a not-yet-created file; ascend to the
-        // nearest existing dir so repo resolution works (mirrors the Edit arm).
-        let dir = nearest_existing_ancestor(target_path);
+        // A redirect/verb target may name a file in a not-yet-created subtree;
+        // ascend to the nearest existing dir so repo resolution works (mirrors
+        // the Edit arm, which runs `nearest_existing_ancestor` after `.parent()`).
+        let dir = nearest_existing_ancestor(&assess_path);
         // Same repo as the session? (git common dir equality, #238/#179.) A
         // mutation into a foreign repo or a temp dir git can't resolve is out
         // of scope, exactly like a foreign Edit/Write drop.
@@ -2634,7 +2677,7 @@ mod tests {
         // representative mutation location is the effective cwd.
         assert_eq!(
             mutation_targets("uv add serde", "/cwd"),
-            vec!["/cwd".to_string()]
+            vec![MutationTarget::Dir("/cwd".to_string())]
         );
         for cmd in [
             "cargo add serde",
@@ -2651,7 +2694,7 @@ mod tests {
         ] {
             assert_eq!(
                 mutation_targets(cmd, "/cwd"),
-                vec!["/cwd".to_string()],
+                vec![MutationTarget::Dir("/cwd".to_string())],
                 "package mutator not detected: {cmd}"
             );
         }
@@ -2680,17 +2723,17 @@ mod tests {
     fn sed_in_place_targets_the_file() {
         assert_eq!(
             mutation_targets("sed -i s/a/b/ src/foo.rs", "/cwd"),
-            vec!["/cwd/src/foo.rs".to_string()]
+            vec![MutationTarget::File("/cwd/src/foo.rs".to_string())]
         );
         // `-i.bak` (suffix form) still counts as in-place.
         assert_eq!(
             mutation_targets("sed -i.bak 's/a/b/' src/foo.rs", "/cwd"),
-            vec!["/cwd/src/foo.rs".to_string()]
+            vec![MutationTarget::File("/cwd/src/foo.rs".to_string())]
         );
         // An absolute target stands alone.
         assert_eq!(
             mutation_targets("sed -i s/a/b/ /abs/foo.rs", "/cwd"),
-            vec!["/abs/foo.rs".to_string()]
+            vec![MutationTarget::File("/abs/foo.rs".to_string())]
         );
     }
 
@@ -2704,12 +2747,12 @@ mod tests {
     fn tee_targets_every_operand() {
         assert_eq!(
             mutation_targets("tee out.txt", "/cwd"),
-            vec!["/cwd/out.txt".to_string()]
+            vec![MutationTarget::File("/cwd/out.txt".to_string())]
         );
         // `-a` (append) still mutates; flags are skipped.
         assert_eq!(
             mutation_targets("tee -a out.txt", "/cwd"),
-            vec!["/cwd/out.txt".to_string()]
+            vec![MutationTarget::File("/cwd/out.txt".to_string())]
         );
     }
 
@@ -2719,11 +2762,11 @@ mod tests {
         // shared core `redirect_targets`, not the clobber-only parser).
         assert_eq!(
             mutation_targets("echo x > src/tracked.txt", "/cwd"),
-            vec!["/cwd/src/tracked.txt".to_string()]
+            vec![MutationTarget::File("/cwd/src/tracked.txt".to_string())]
         );
         assert_eq!(
             mutation_targets("echo x >> src/tracked.txt", "/cwd"),
-            vec!["/cwd/src/tracked.txt".to_string()]
+            vec![MutationTarget::File("/cwd/src/tracked.txt".to_string())]
         );
     }
 
@@ -2742,11 +2785,11 @@ mod tests {
         // for a commit — reusing the same scoped walk.
         assert_eq!(
             mutation_targets("cd /wt && uv add serde", "/cwd"),
-            vec!["/wt".to_string()]
+            vec![MutationTarget::Dir("/wt".to_string())]
         );
         assert_eq!(
             mutation_targets("cd /wt && echo x > f", "/cwd"),
-            vec!["/wt/f".to_string()]
+            vec![MutationTarget::File("/wt/f".to_string())]
         );
     }
 
@@ -2757,7 +2800,7 @@ mod tests {
         // the mutation channel inherits the commit channel's cd isolation.
         assert_eq!(
             mutation_targets("sh -c 'cd /elsewhere' && echo x > f", "/cwd"),
-            vec!["/cwd/f".to_string()]
+            vec![MutationTarget::File("/cwd/f".to_string())]
         );
     }
 
@@ -2767,11 +2810,11 @@ mod tests {
         // recursion surfaces it, scoped to the wrapper's inherited cwd.
         assert_eq!(
             mutation_targets("sh -c 'uv add serde'", "/cwd"),
-            vec!["/cwd".to_string()]
+            vec![MutationTarget::Dir("/cwd".to_string())]
         );
         assert_eq!(
             mutation_targets("cd /wt && sh -c 'echo x > f'", "/cwd"),
-            vec!["/wt/f".to_string()]
+            vec![MutationTarget::File("/wt/f".to_string())]
         );
     }
 
@@ -2814,6 +2857,39 @@ mod tests {
         input.cwd = Some(primary.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Nudge, "sed -i in the primary nudges");
+    }
+
+    #[test]
+    fn existing_tracked_file_mutations_in_primary_nudge() {
+        // Security-review FIX 1: the headline case — a mutator into a file that
+        // ALREADY EXISTS (the tracked file the feature is FOR). Pre-fix, feeding
+        // the raw file path to `nearest_existing_ancestor` returned the FILE
+        // (its own exists() short-circuits the ascent), then `git -C <file>
+        // rev-parse` failed "Not a directory" → common_dir None → silent Allow.
+        // The fix takes the file's `.parent()` first, mirroring `git_dir_for_input`.
+        let scratch = Scratch::new("mut-existing");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        // `f.txt` is committed by init_repo; add a committed nested file too.
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        std::fs::write(primary.join("src/foo.rs"), "fn main() {}\n").unwrap();
+        git_in(&primary, &["add", "src/foo.rs"]);
+        git_in(&primary, &["commit", "-q", "-m", "add src/foo.rs"]);
+
+        for cmd in [
+            "sed -i s/a/b/ src/foo.rs", // existing nested file
+            "echo x > src/foo.rs",      // clobber an existing file
+            "echo x >> f.txt",          // append to an existing root file
+            "tee f.txt",                // tee onto an existing file
+        ] {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Nudge,
+                "mutating an EXISTING tracked file must nudge: {cmd}"
+            );
+        }
     }
 
     #[test]
