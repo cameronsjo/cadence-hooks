@@ -458,9 +458,12 @@ fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option
     })
 }
 
-/// Fail-open telemetry as doctor `Finding`s — up to 3 (one per `reason`), or
+/// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
 /// none when all counts are below their thresholds. `panic` and `parse` are
-/// warned on any/moderate occurrence; `version_mismatch` only counts rows
+/// warned on any/moderate occurrence; the #271 deadline pair is load-correlated
+/// (`deadline` warns at 3+) except the suppressed-block row, which warns at 1
+/// because each one is an enforcement block that did not fire;
+/// `version_mismatch` only counts rows
 /// tagged with the CURRENT binary's own version (see
 /// `log_failopen::recent_failopen_counts`'s doc) — an older-version row is the
 /// sanctioned release-transition case and is excluded by construction.
@@ -534,7 +537,81 @@ fn failopen_findings(
         });
     }
 
+    if counts.deadline >= 3 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("deadline: {}", counts.deadline),
+            diagnosis: format!(
+                "{} git-probe deadline hit(s) in the last {days} days (failopen.jsonl) \
+                 — git-backed checks are degrading to fail-open under slow subprocess I/O",
+                counts.deadline
+            ),
+            remediation: "git is stalling under this environment: check for a \
+                          cloud-synced working directory (OneDrive/iCloud/Dropbox), \
+                          endpoint-protection scanning, or heavy concurrent session \
+                          load; CADENCE_HOOK_DEADLINE_MS tunes the budget (#271)"
+                .to_string(),
+        });
+    }
+
+    // Threshold 1, not 3: each row is an enforcement block that did not fire.
+    if counts.deadline_block_suppressed >= 1 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!(
+                "deadline_block_suppressed: {}",
+                counts.deadline_block_suppressed
+            ),
+            diagnosis: format!(
+                "{} fail-closed block(s) suppressed by the git-probe deadline in the \
+                 last {days} days (failopen.jsonl) — ownership/branch enforcement was \
+                 bypassed, not just slowed",
+                counts.deadline_block_suppressed
+            ),
+            remediation: "inspect failopen.jsonl for the affected guards; until git \
+                          latency is addressed, pass explicit targets (-R owner/repo, \
+                          explicit push remotes) so those guards don't need git probes \
+                          (#271)"
+                .to_string(),
+        });
+    }
+
     findings
+}
+
+/// Cadence hook latency from Claude Code session logs as a doctor `Finding`
+/// (cadence-hooks#271 prevention P2). The binary can't self-report an external
+/// timeout kill — a killed process logs nothing — but Claude Code records every
+/// hook's `durationMs`, so a scan of recent session logs surfaces guards that
+/// are degrading (incl. pure-CPU guards the deadline telemetry never sees). A
+/// `Warning`, never an `Error`: slow hooks are an environment problem to
+/// diagnose, not a shell bug.
+fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> Vec<Finding> {
+    let tallies = crate::hook_latency::scan_recent(projects, window, now);
+    let days = window.as_secs() / 86_400;
+    match crate::hook_latency::summary(&tallies, days) {
+        None => Vec::new(),
+        Some(diagnosis) => vec![Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-hooks".to_string(),
+            file: projects.to_path_buf(),
+            line: None,
+            snippet: "Claude Code session logs".to_string(),
+            diagnosis,
+            remediation: "git-backed guards are bounded by the internal deadline \
+                          (CADENCE_HOOK_DEADLINE_MS); a pure-CPU guard that's still \
+                          slow points at fork/exec contention — check for a \
+                          cloud-synced working dir, endpoint-protection scanning, or \
+                          heavy concurrent-session load (#271)"
+                .to_string(),
+        }],
+    }
 }
 
 /// Prints an informational (non-blocking, not a `Finding`) count of recent
@@ -1120,6 +1197,11 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             window,
             now,
             env!("CARGO_PKG_VERSION"),
+        ));
+        findings.extend(hook_latency_findings(
+            &crate::hook_latency::projects_dir(),
+            window,
+            now,
         ));
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);

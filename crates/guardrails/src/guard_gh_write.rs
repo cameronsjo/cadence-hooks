@@ -9,8 +9,7 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, command_segments, git_command, host_and_repo_from_url, parse_work_dir,
-    strip_quotes, tokenize,
+    LOOP_PATTERN, command_segments, host_and_repo_from_url, parse_work_dir, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -122,6 +121,11 @@ enum RepoResolution {
     },
     /// Cannot determine target
     Unresolvable,
+    /// Resolution abandoned at the #271 subprocess deadline. Distinct from
+    /// `Unresolvable` (git answered; genuinely ambiguous — fail-closed block
+    /// stands): a timeout is the guard's own infrastructure failing, which
+    /// degrades to a loud fail-open, never a false block (ADR-0001).
+    TimedOut,
 }
 
 fn resolve_target_repo(
@@ -184,9 +188,29 @@ fn resolve_target_repo(
 /// the command) and the deterministic-loop policy (where command-string
 /// flags are absent by definition).
 fn resolve_from_git_remotes(work_dir: &str) -> RepoResolution {
-    if let Some(upstream_url) = git_command(work_dir, &["remote", "get-url", "upstream"]) {
-        let origin_url =
-            git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
+    use cadence_hooks_core::shell::{GitQuery, git_command_detailed};
+
+    // The ownership-deciding `origin` probe runs FIRST: probes share one
+    // subprocess budget (#271), and the optional fork refinement must not
+    // starve the resolution the verdict actually hangs on.
+    let origin_url = match git_command_detailed(work_dir, &["remote", "get-url", "origin"]) {
+        GitQuery::Value(url) => Some(url),
+        GitQuery::Failed => None,
+        GitQuery::TimedOut => return RepoResolution::TimedOut,
+    };
+
+    // A timed-out upstream probe cannot degrade to origin-only judgment: in a
+    // fork clone, a bare gh write can land on upstream, so judging the fork's
+    // owned origin alone would be a wrong-target allow. Timeout anywhere in
+    // resolution → TimedOut (loud fail-open at the verdict layer).
+    let upstream_url = match git_command_detailed(work_dir, &["remote", "get-url", "upstream"]) {
+        GitQuery::Value(url) => Some(url),
+        GitQuery::Failed => None,
+        GitQuery::TimedOut => return RepoResolution::TimedOut,
+    };
+
+    if let Some(upstream_url) = upstream_url {
+        let origin_url = origin_url.unwrap_or_default();
         let (origin_host, origin) = host_and_repo_from_url(&origin_url).unwrap_or_default();
         let (upstream_host, upstream) = host_and_repo_from_url(&upstream_url).unwrap_or_default();
         return RepoResolution::Fork {
@@ -197,7 +221,7 @@ fn resolve_from_git_remotes(work_dir: &str) -> RepoResolution {
         };
     }
 
-    if let Some(origin_url) = git_command(work_dir, &["remote", "get-url", "origin"]) {
+    if let Some(origin_url) = origin_url {
         match host_and_repo_from_url(&origin_url) {
             Some((host, repo)) => return RepoResolution::Resolved { host, repo },
             None => return RepoResolution::Unresolvable,
@@ -313,8 +337,18 @@ fn judge_loop_write(
     // iteration's gh resolves to the suggested repo — same trust as a
     // single command. Anything else (strict mode, cd in body, parse
     // failure, fork, unowned/unresolvable cwd) blocks.
-    if !strict && body_mutates_cwd == Some(false) && suggestion.is_some() {
-        return LoopWriteDecision::Allow;
+    if !strict && body_mutates_cwd == Some(false) {
+        if suggestion.is_some() {
+            return LoopWriteDecision::Allow;
+        }
+        // Resolution hit the #271 subprocess deadline — mirror the
+        // single-command TimedOut arm: infrastructure failure fails open
+        // (loudly), never a false block. Strict mode still blocks above
+        // regardless of resolution, so this converts no strict verdict.
+        if matches!(cwd_resolution, RepoResolution::TimedOut) {
+            cadence_hooks_core::deadline::note_suppressed_block();
+            return LoopWriteDecision::Allow;
+        }
     }
 
     LoopWriteDecision::Block { suggestion }
@@ -633,6 +667,14 @@ fn judge_write_segment(
                      Use -R {upstream} to target upstream (if intended)"
                 )))
             }
+        }
+        // The resolution probes hit the #271 subprocess deadline: the guard's
+        // own infrastructure failed, which never blocks (ADR-0001). The
+        // suppressed fail-closed block is recorded so telemetry distinguishes
+        // "slow git" from "an ownership block was bypassed".
+        RepoResolution::TimedOut => {
+            cadence_hooks_core::deadline::note_suppressed_block();
+            None
         }
         RepoResolution::Unresolvable => {
             // Suggest the first allowed owner so the fix is concrete even when no

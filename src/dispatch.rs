@@ -34,6 +34,11 @@ use std::time::Instant;
 /// (e.g. a subcommand with no registry mapping) it falls back to `check.name()`.
 pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>) -> ! {
     let started = Instant::now();
+    // Arm the shared subprocess deadline before any guard logic can spawn git
+    // (cadence-hooks#271): probes abandon at the internal budget so the guard
+    // decides and self-reports instead of being killed by the external
+    // hooks.json timeout, which is unloggable.
+    cadence_hooks_core::deadline::arm();
     guard_interactive_terminal(check.name(), Some(event), None);
     // Hoisted above the stdin parse so both the parse-failure arm and the
     // decided-result arm below can record against the same canonical name.
@@ -67,6 +72,11 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                     hook_name, &input, prov,
                 ));
             }
+            // A Block/Ask outcome stopped the operation, so a timed-out probe
+            // did not degrade to fail-open — don't emit the plain deadline row
+            // (Allow/Nudge let the tool proceed, so those still do).
+            let enforced = matches!(result.outcome, Outcome::Block | Outcome::Ask);
+            log_deadline_degradation(hook_name, crate::registry::plugin_for(hook_name), enforced);
             cadence_hooks_metrics::log_timing(
                 hook_name,
                 crate::registry::plugin_for(hook_name).unwrap_or("unknown"),
@@ -98,6 +108,9 @@ pub fn run_logged_logger(
     hook: Option<&str>,
 ) -> ! {
     let started = Instant::now();
+    // Same arming as run_logged_check: loggers spawn git too (heartbeat,
+    // backstop) and must decide inside the external hooks.json budget.
+    cadence_hooks_core::deadline::arm();
     guard_interactive_terminal(logger.name(), None, sample_override);
     let namespace = crate::registry::plugin_for(hook.unwrap_or(""));
     // Capture the session id (when the payload carries one) for the timing row;
@@ -130,6 +143,8 @@ pub fn run_logged_logger(
             );
         }
     }
+    // Loggers never block, so a deadline hit here is always a fail-open degradation.
+    log_deadline_degradation(hook.unwrap_or("unknown"), namespace, false);
     cadence_hooks_metrics::log_timing(
         hook.unwrap_or("unknown"),
         namespace.unwrap_or("metrics"),
@@ -138,4 +153,49 @@ pub fn run_logged_logger(
         session_id.as_deref(),
     );
     process::exit(0);
+}
+
+/// Emit the loud fail-open row + stderr breadcrumb when this process's git
+/// probes hit the internal deadline (cadence-hooks#271). Two tiers, sharper
+/// one wins: a suppressed fail-closed block (`deadline_block_suppressed`)
+/// means enforcement was actually bypassed; a plain `deadline` means git-backed
+/// checks degraded to their ordinary fail-open arms.
+///
+/// **Both tiers require `!enforced`.** `enforced` is true when the guard's
+/// final outcome was `Block` or `Ask` — the operation was stopped (exit 2) or
+/// gated on the user (who then sees the prompt), so nothing silently proceeded.
+/// A *silent* bypass — the only thing worth a loud row — happens exactly when
+/// the tool runs anyway (Allow/Nudge). A fail-closed arm can set the sticky
+/// `suppressed_block` flag on one segment's timed-out probe while a *later*,
+/// purely-static check legitimately blocks the whole command (e.g.
+/// `git push --force origin HEAD; git push --force origin main` — segment 1's
+/// branch probe times out, segment 2 blocks with no spawn). Reporting
+/// `deadline_block_suppressed` there is a false positive on the very signal
+/// Phase 1.5 reads as "an ownership block was bypassed", so both tiers gate on
+/// the final outcome, not just the sticky flag.
+///
+/// Both writes are fully fail-open and never perturb the verdict or exit code.
+fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, enforced: bool) {
+    use cadence_hooks_core::deadline;
+    if deadline::suppressed_block() && !enforced {
+        cadence_hooks_metrics::log_failopen(
+            "deadline_block_suppressed",
+            namespace,
+            Some(hook_name),
+            env!("CARGO_PKG_VERSION"),
+        );
+        eprintln!(
+            "cadence-hooks: {hook_name}: git probe deadline exceeded; a fail-closed block was degraded to allow (see failopen.jsonl)"
+        );
+    } else if deadline::hit() && !enforced {
+        cadence_hooks_metrics::log_failopen(
+            "deadline",
+            namespace,
+            Some(hook_name),
+            env!("CARGO_PKG_VERSION"),
+        );
+        eprintln!(
+            "cadence-hooks: {hook_name}: git probe deadline exceeded; git-backed checks degraded to fail-open"
+        );
+    }
 }

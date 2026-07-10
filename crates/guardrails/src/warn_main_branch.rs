@@ -146,11 +146,10 @@ impl Check for WarnMainBranch {
         // `git -C` walks upward to find `.git`, picking the nearest enclosing
         // repository — which is what we want when editing inside a nested
         // checkout from a session whose CWD is the outer parent.
-        let branch = match Command::new("git")
-            .args(["-C", &dir_arg, "symbolic-ref", "--short", "HEAD"])
-            .output()
-        {
-            Ok(out) if out.status.success() => {
+        let mut branch_cmd = Command::new("git");
+        branch_cmd.args(["-C", &dir_arg, "symbolic-ref", "--short", "HEAD"]);
+        let branch = match cadence_hooks_core::shell::run_git_bounded(&mut branch_cmd) {
+            cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             }
             _ => return CheckResult::allow(),
@@ -158,11 +157,10 @@ impl Check for WarnMainBranch {
 
         // Repo root for marker — same source as the branch query so the
         // once-per-session suppression actually keys off the same repo.
-        let repo_root = match Command::new("git")
-            .args(["-C", &dir_arg, "rev-parse", "--show-toplevel"])
-            .output()
-        {
-            Ok(out) if out.status.success() => {
+        let mut root_cmd = Command::new("git");
+        root_cmd.args(["-C", &dir_arg, "rev-parse", "--show-toplevel"]);
+        let repo_root = match cadence_hooks_core::shell::run_git_bounded(&mut root_cmd) {
+            cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             }
             _ => return CheckResult::allow(),

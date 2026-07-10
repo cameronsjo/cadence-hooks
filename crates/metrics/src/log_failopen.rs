@@ -81,6 +81,12 @@ pub struct FailopenCounts {
     pub panic: u64,
     pub parse: u64,
     pub version_mismatch: u64,
+    /// Git probes hit the #271 in-process deadline; guards degraded to their
+    /// ordinary fail-open arms. Load-correlated, like `parse`.
+    pub deadline: u64,
+    /// A fail-closed guard arm downgraded its block to allow because its probe
+    /// timed out — enforcement was actually bypassed, the sharpest row here.
+    pub deadline_block_suppressed: u64,
 }
 
 /// Count `failopen.jsonl` rows within `window` of `now`, filtered by `reason`
@@ -145,6 +151,15 @@ pub fn recent_failopen_counts(
             &cutoff,
             "version_mismatch",
             Some(current_version),
+        ),
+        // Deadline rows are environment-correlated (slow disk, load), not
+        // version-correlated — count across versions, like panic/parse.
+        deadline: count_recent(&contents, &cutoff, "deadline", None),
+        deadline_block_suppressed: count_recent(
+            &contents,
+            &cutoff,
+            "deadline_block_suppressed",
+            None,
         ),
     }
 }
@@ -340,6 +355,8 @@ mod tests {
                 panic: 1,
                 parse: 1,
                 version_mismatch: 1,
+                deadline: 0,
+                deadline_block_suppressed: 0,
             }
         );
     }

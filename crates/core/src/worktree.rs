@@ -151,9 +151,19 @@ fn now_epoch() -> u64 {
 /// missing marker, or a `repo_root` that isn't inside a git repo, yields
 /// `false` (fail-open — ADR-0001).
 pub fn is_snoozed_now(repo_root: &Path) -> bool {
-    let Some(path) = enforce_worktree_marker_path_for(repo_root) else {
-        return false;
-    };
+    match git_common_dir(repo_root) {
+        Some(common) => is_snoozed_in_common_dir(&common),
+        None => false,
+    }
+}
+
+/// Snooze check for a caller that has already resolved the git common dir —
+/// pure filesystem, no git subprocess. The dismiss writer anchors the marker
+/// under the same `--path-format=absolute --git-common-dir` resolution, so a
+/// pre-resolved common dir from that command form reads the same marker the
+/// writer armed.
+pub fn is_snoozed_in_common_dir(git_common_dir: &Path) -> bool {
+    let path = enforce_worktree_marker_path(git_common_dir);
     let Ok(contents) = std::fs::read_to_string(path) else {
         return false;
     };

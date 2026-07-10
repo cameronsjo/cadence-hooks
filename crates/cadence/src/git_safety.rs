@@ -11,7 +11,7 @@
 //! subcommand is the first non-flag token, so an unlisted global flag
 //! (`-p`, `--literal-pathspecs`) cannot hide the subcommand (#72).
 
-use cadence_hooks_core::shell::{command_segments, git_command, parse_work_dir, tokenize};
+use cadence_hooks_core::shell::{command_segments, parse_work_dir, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Protected branch names that trigger blocks instead of warnings.
@@ -167,16 +167,39 @@ fn force_pushes_bare_head(tokens: &[&str]) -> bool {
     args.iter().any(|a| is_force_flag(a)) && args.contains(&"head")
 }
 
+/// Current-branch resolution for bare-`HEAD` force pushes.
+///
+/// `Unresolvable` (git answered, no branch — e.g. not a repo) stays a block:
+/// that fail-safe is deliberate. `TimedOut` (the probe hit the #271 subprocess
+/// deadline) must NOT block — a slow host is the guard's own infrastructure
+/// failing, and converting that into a false block on routine
+/// feature-branch force pushes is the regression this distinction prevents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BranchResolution {
+    Branch(String),
+    Unresolvable,
+    TimedOut,
+}
+
 /// Resolve the current branch in the command's effective directory,
-/// lowercased to match normalized tokens. `None` when not in a git repo.
-fn resolve_current_branch(input: &HookInput, command: &str) -> Option<String> {
+/// lowercased to match normalized tokens.
+fn resolve_current_branch(input: &HookInput, command: &str) -> BranchResolution {
     let cwd_fallback = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| ".".to_string());
     let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
     let work_dir = parse_work_dir(command, cwd);
-    git_command(&work_dir, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|b| b.to_lowercase())
+    match cadence_hooks_core::shell::git_command_detailed(
+        &work_dir,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+    ) {
+        cadence_hooks_core::shell::GitQuery::Value(branch) => {
+            BranchResolution::Branch(branch.to_lowercase())
+        }
+        cadence_hooks_core::shell::GitQuery::Failed => BranchResolution::Unresolvable,
+        cadence_hooks_core::shell::GitQuery::TimedOut => BranchResolution::TimedOut,
+    }
 }
 
 /// Return true if a token is a refspec targeting a protected branch.
@@ -216,12 +239,13 @@ impl GitSafetyGuard {
     /// Returns `Some(reason)` if blocked, `None` if not.
     ///
     /// `current_branch` is the resolved branch for bare-`HEAD` force pushes;
-    /// the caller resolves it lazily (only when such a segment appears).
+    /// the caller resolves it lazily (`None` = no such segment, so no
+    /// resolution was attempted).
     fn check_blocked(
         &self,
         normalized: &str,
         tokens: &[&str],
-        current_branch: Option<&str>,
+        current_branch: Option<&BranchResolution>,
     ) -> Option<String> {
         // Find the git subcommand position
         let git_pos = tokens.iter().position(|t| is_git_word(t))?;
@@ -252,7 +276,11 @@ impl GitSafetyGuard {
         }
     }
 
-    fn check_push_blocked(&self, args: &[&str], current_branch: Option<&str>) -> Option<String> {
+    fn check_push_blocked(
+        &self,
+        args: &[&str],
+        current_branch: Option<&BranchResolution>,
+    ) -> Option<String> {
         // `--mirror` overwrites EVERY remote ref and deletes remote refs absent
         // locally — protected branches included, no per-branch targeting (#84).
         if args.contains(&"--mirror") {
@@ -273,18 +301,25 @@ impl GitSafetyGuard {
             }
 
             // A bare `HEAD` target pushes the current branch (#71). Block when
-            // it resolves to a protected branch, and when it cannot be
-            // resolved at all (fail safe — a push from a non-repo dir fails
-            // anyway). A resolved feature branch falls through to the routine
-            // force-push nudge: `git push --force origin HEAD` on a feature
-            // branch is normal rebase workflow and is never statically blocked.
+            // it resolves to a protected branch, and when git answers but the
+            // branch cannot be determined (fail safe — a push from a non-repo
+            // dir fails anyway). A resolution that hit the #271 subprocess
+            // deadline is the guard's OWN failure — never a block (ADR-0001);
+            // it degrades to the fall-through and is recorded loudly as a
+            // suppressed fail-closed block. A resolved feature branch falls
+            // through to the routine force-push nudge: `git push --force
+            // origin HEAD` on a feature branch is normal rebase workflow and
+            // is never statically blocked.
             if args.contains(&"head") {
                 match current_branch {
-                    Some(branch) if is_protected_branch(branch) => {
+                    Some(BranchResolution::Branch(branch)) if is_protected_branch(branch) => {
                         return Some("Force push of HEAD while on protected branch".into());
                     }
-                    Some(_) => {}
-                    None => {
+                    Some(BranchResolution::Branch(_)) => {}
+                    Some(BranchResolution::TimedOut) => {
+                        cadence_hooks_core::deadline::note_suppressed_block();
+                    }
+                    Some(BranchResolution::Unresolvable) | None => {
                         return Some("Force push of HEAD with unresolvable current branch".into());
                     }
                 }
@@ -568,7 +603,7 @@ impl Check for GitSafetyGuard {
         let mut should_warn = false;
         // Current-branch resolution for bare-HEAD force pushes (#71): lazy
         // (only when such a segment appears) and memoized across segments.
-        let mut resolved_branch: Option<Option<String>> = None;
+        let mut resolved_branch: Option<BranchResolution> = None;
         for segment in command_segments(command) {
             // Per-segment alias check: a `git config alias.x …` segment is
             // exempt, but a destructive sibling in the same chain is not.
@@ -583,9 +618,9 @@ impl Check for GitSafetyGuard {
             let normalized = tokens.join(" ");
 
             let current_branch = if force_pushes_bare_head(&tokens) {
-                resolved_branch
-                    .get_or_insert_with(|| resolve_current_branch(input, command))
-                    .as_deref()
+                Some(
+                    &*resolved_branch.get_or_insert_with(|| resolve_current_branch(input, command)),
+                )
             } else {
                 None
             };
@@ -1498,18 +1533,38 @@ mod tests {
     fn bare_head_force_push_on_protected_branch_blocked_unit() {
         // Injected resolution: current branch is protected → block.
         let args = ["--force", "origin", "head"];
+        let branch = BranchResolution::Branch("main".to_string());
         assert!(
             GitSafetyGuard
-                .check_push_blocked(&args, Some("main"))
+                .check_push_blocked(&args, Some(&branch))
                 .is_some()
         );
     }
 
     #[test]
     fn bare_head_force_push_unresolvable_blocked_unit() {
-        // Injected resolution: branch unknown → fail safe, block.
+        // Injected resolution: git answered, branch unknown → fail safe, block.
         let args = ["--force", "origin", "head"];
-        assert!(GitSafetyGuard.check_push_blocked(&args, None).is_some());
+        assert!(
+            GitSafetyGuard
+                .check_push_blocked(&args, Some(&BranchResolution::Unresolvable))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn bare_head_force_push_timed_out_resolution_never_blocks_unit() {
+        // The probe hit the #271 deadline: the guard's own infrastructure
+        // failure never blocks — degrades to the routine force nudge.
+        let args = ["--force", "origin", "head"];
+        assert!(
+            GitSafetyGuard
+                .check_push_blocked(&args, Some(&BranchResolution::TimedOut))
+                .is_none()
+        );
+        // The suppressed fail-closed block is recorded for the loud
+        // fail-open telemetry at the dispatch layer.
+        assert!(cadence_hooks_core::deadline::suppressed_block());
     }
 
     #[test]
@@ -1517,9 +1572,10 @@ mod tests {
         // Routine rebase workflow: force-push of HEAD on a feature branch is
         // never statically blocked — it falls through to the force nudge.
         let args = ["--force", "origin", "head"];
+        let branch = BranchResolution::Branch("my-feature".to_string());
         assert!(
             GitSafetyGuard
-                .check_push_blocked(&args, Some("my-feature"))
+                .check_push_blocked(&args, Some(&branch))
                 .is_none()
         );
     }

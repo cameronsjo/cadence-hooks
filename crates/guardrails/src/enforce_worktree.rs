@@ -78,7 +78,6 @@ use cadence_hooks_core::worktree::{is_primary_checkout, is_temp_root, is_truthy,
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Environment inputs resolved once per invocation, injected into the
 /// assessment so tests can pin them without touching process env.
@@ -129,6 +128,35 @@ impl RepoAllowMain {
 // `is_temp_root` moved to `cadence_hooks_core::worktree` (cadence-hooks#236)
 // so the enforce-worktree block decision and `session::start`'s posture
 // line share one definition — re-imported above.
+
+/// Per-invocation memo of the two git probes this guard repeats — common dir
+/// and repo root — keyed by directory, so one invocation never asks git the
+/// same question twice (#271: each probe is a subprocess against a possibly
+/// slow `.git`). Constructed fresh per hook invocation — no cross-invocation
+/// cache (mirrors [`RepoAllowMain`]).
+#[derive(Default)]
+struct GitProbe {
+    common_dirs: HashMap<PathBuf, Option<String>>,
+    roots: HashMap<PathBuf, Option<String>>,
+}
+
+impl GitProbe {
+    /// Memoized [`git_common_dir`].
+    fn common_dir(&mut self, dir: &Path) -> Option<String> {
+        self.common_dirs
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| git_common_dir(dir))
+            .clone()
+    }
+
+    /// Memoized [`repo_root_for`].
+    fn repo_root(&mut self, dir: &Path) -> Option<String> {
+        self.roots
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| repo_root_for(dir))
+            .clone()
+    }
+}
 
 /// A resolved commit target directory (absolute, or built by joining `cwd`
 /// with the accumulated `cd`s and/or a `-C` redirect — see
@@ -415,13 +443,10 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
 
 /// Resolve the repo root enclosing `dir`, if any.
 fn repo_root_for(dir: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
-    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if root.is_empty() { None } else { Some(root) }
+    cadence_hooks_core::shell::git_command(
+        &dir.to_string_lossy(),
+        &["rev-parse", "--show-toplevel"],
+    )
 }
 
 /// Ascend from `dir` to the nearest ancestor that exists on disk. A `Write` can
@@ -477,14 +502,31 @@ fn assess_dir(
     cfg: &EnvConfig,
     origin_repo: Option<&str>,
     repo_allow: &mut RepoAllowMain,
+    probe: &mut GitProbe,
 ) -> CheckResult {
-    let Some(repo_root) = repo_root_for(dir) else {
-        // Not a git repo (or a bare container dir) — nothing to enforce.
+    let Some(repo_root) = probe.repo_root(dir) else {
+        // Not a git repo (or a bare container dir), or the probe timed out
+        // (#271) — both fail open, deliberately: enforce-worktree is a
+        // workflow-discipline guard, and a missed nudge is cheaper than a
+        // false block (ADR-0001).
         return CheckResult::allow();
     };
+    // The snooze marker lives under the shared git common dir; resolve it
+    // through the probe (the Edit/Write arm already asked this exact question
+    // for its same-repo scoping, so that path is a memo hit) and hand the
+    // resolved dir to the marker reads below — pure filesystem from here,
+    // no further git spawns (#271: Edit/Write 4-5 spawns → 3).
+    let Some(common_dir) = probe.common_dir(dir) else {
+        // The root resolved but the common dir didn't — in practice the probe
+        // hit the #271 deadline. Snooze state is unreadable, and blocking
+        // could false-block through an active dismissal: the guard's own
+        // infrastructure failure never blocks (ADR-0001).
+        return CheckResult::allow();
+    };
+    let common_dir = PathBuf::from(common_dir);
     let is_primary = is_primary_checkout(&repo_root);
     let temp_root = is_temp_root(Path::new(&repo_root), cfg.tmpdir.as_deref());
-    let snoozed = dismiss_enforce_worktree::is_snoozed_now(Path::new(&repo_root));
+    let snoozed = cadence_hooks_core::worktree::is_snoozed_in_common_dir(&common_dir);
     let repo_declared = is_primary && !cfg.allow_main && repo_allow.is_allowed(&repo_root);
     let allowed_main = cfg.allow_main || repo_declared;
     let blocked = should_block(
@@ -515,7 +557,7 @@ fn assess_dir(
     // aggregates the repetition.
     if is_primary && !temp_root {
         if snoozed {
-            let meta = dismiss_enforce_worktree::read_meta(Path::new(&repo_root));
+            let meta = dismiss_enforce_worktree::read_meta_in(&common_dir);
             return CheckResult::allow_bypassed(BypassProvenance {
                 kind: BypassKind::Dismissal,
                 mechanism: "dismiss-enforce-worktree".to_string(),
@@ -552,6 +594,7 @@ fn env_switch(var: &str) -> BypassProvenance {
 /// Testable core: assess the hook input under the given environment.
 fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
     let mut repo_allow = RepoAllowMain::default();
+    let mut probe = GitProbe::default();
     match input.tool_name() {
         Some("Edit") | Some("Write") | Some("MultiEdit") => {
             if input.file_path().is_none() {
@@ -597,9 +640,12 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // exists to stop. Comparing common dirs keeps a cross-*repo* write
             // foreign (a vault, a sibling repo — different common dir) while
             // still enforcing on any tree of the session's own repo.
-            match (git_common_dir(&target_dir), git_common_dir(Path::new(cwd))) {
+            match (
+                probe.common_dir(&target_dir),
+                probe.common_dir(Path::new(cwd)),
+            ) {
                 (Some(target_repo), Some(cwd_repo)) if target_repo == cwd_repo => {
-                    assess_dir(&target_dir, cfg, None, &mut repo_allow)
+                    assess_dir(&target_dir, cfg, None, &mut repo_allow, &mut probe)
                 }
                 _ => CheckResult::allow(),
             }
@@ -611,7 +657,7 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             let cwd = input.cwd.as_deref().unwrap_or(".");
             // Resolved once per invocation: the repo the shell started in,
             // used only to decide whether a redirect crossed repo boundaries.
-            let cwd_repo_root = repo_root_for(Path::new(cwd));
+            let cwd_repo_root = probe.repo_root(Path::new(cwd));
             // A block on any commit target wins immediately. Otherwise preserve
             // the first *bypassed* allow's provenance: assess_dir returns an
             // Allow-with-bypass for a snooze / env switch / repo-declared
@@ -632,7 +678,13 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                     continue;
                 }
                 let dir = PathBuf::from(&target);
-                let result = assess_dir(&dir, cfg, cwd_repo_root.as_deref(), &mut repo_allow);
+                let result = assess_dir(
+                    &dir,
+                    cfg,
+                    cwd_repo_root.as_deref(),
+                    &mut repo_allow,
+                    &mut probe,
+                );
                 if result.outcome != Outcome::Allow {
                     return result;
                 }
@@ -1334,7 +1386,7 @@ mod tests {
     }
 
     fn git_in(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
+        let ok = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .output()

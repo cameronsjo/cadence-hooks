@@ -78,10 +78,12 @@ fn git_in(cwd: Option<&str>) -> Command {
 /// Run a git command and return its trimmed stdout, or `None` on failure or
 /// empty output.
 fn git_output(cwd: Option<&str>, args: &[&str]) -> Option<String> {
-    let output = git_in(cwd).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let mut cmd = git_in(cwd);
+    cmd.args(args);
+    let output = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
+        cadence_hooks_core::shell::GitSpawn::Completed(output) if output.status.success() => output,
+        _ => return None,
+    };
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if text.is_empty() { None } else { Some(text) }
 }

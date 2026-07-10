@@ -59,9 +59,9 @@ impl Check for WarnUntrackedFiles {
         {
             cmd.current_dir(dir);
         }
-        let output = match cmd.output() {
-            Ok(out) => out,
-            Err(_) => return CheckResult::allow(),
+        let output = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
+            cadence_hooks_core::shell::GitSpawn::Completed(out) => out,
+            _ => return CheckResult::allow(),
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);

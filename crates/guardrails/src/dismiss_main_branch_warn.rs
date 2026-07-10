@@ -125,11 +125,12 @@ pub(crate) fn session_id_from_env() -> Option<String> {
 /// Locate the current repo root via `git rev-parse --show-toplevel`.
 /// Returns None if not in a git repo or git is unavailable.
 fn repo_root() -> Option<PathBuf> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--show-toplevel"]);
+    let out = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
+        cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => out,
+        _ => return None,
+    };
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if path.is_empty() {
         None

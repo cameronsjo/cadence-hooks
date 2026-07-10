@@ -173,19 +173,161 @@ pub fn repo_from_url(url: &str) -> Option<String> {
     host_and_repo_from_url(url).map(|(_, repo)| repo)
 }
 
+/// Outcome of a wall-clock-bounded subprocess run.
+///
+/// The tri-state exists so fail-closed guard arms can tell "git answered
+/// badly" (a genuine resolution failure they should still block on) apart
+/// from "git never answered" (the guard's own infrastructure failing —
+/// ADR-0001 fail-open territory). Collapsing both into one failure value is
+/// how a slow host turns into false blocks.
+#[derive(Debug)]
+pub enum GitSpawn {
+    /// The process ran to completion (any exit code); stderr is not captured.
+    Completed(std::process::Output),
+    /// The process could not be spawned (e.g. no `git` on PATH).
+    SpawnFailed,
+    /// The process was killed at the deadline, or the shared budget was
+    /// already exhausted before the spawn.
+    TimedOut,
+}
+
+/// Tri-state result of [`git_command_detailed`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum GitQuery {
+    /// git exited 0 with non-empty trimmed stdout.
+    Value(String),
+    /// git ran (or failed to spawn) and produced no usable answer.
+    Failed,
+    /// The deadline expired before git answered — fail-open territory only.
+    TimedOut,
+}
+
+/// Run a prepared command with a hard wall-clock bound.
+///
+/// stdin null; stdout piped and drained on a thread (a stalled parent read is
+/// how a >64KB pipe buffer deadlocks); stderr null. `GIT_OPTIONAL_LOCKS=0` is
+/// set so git skips optional index writes — cloud-sync clients hold locks on
+/// exactly those files. On expiry the child is killed *and reaped* (no
+/// zombie), the shared deadline is marked hit, and `TimedOut` is returned.
+pub fn run_bounded_with(cmd: &mut Command, timeout: std::time::Duration) -> GitSpawn {
+    use std::process::Stdio;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("GIT_OPTIONAL_LOCKS", "0");
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return GitSpawn::SpawnFailed,
+    };
+
+    let drain = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = drain
+                    .and_then(|handle| handle.join().ok())
+                    .unwrap_or_default();
+                return GitSpawn::Completed(std::process::Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Reaping the child closed the pipe's write end, so the
+                    // drain thread's read_to_end has hit EOF; join it so the
+                    // handle isn't detached with a swallowed result.
+                    if let Some(handle) = drain {
+                        let _ = handle.join();
+                    }
+                    crate::deadline::note_hit();
+                    return GitSpawn::TimedOut;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(handle) = drain {
+                    let _ = handle.join();
+                }
+                return GitSpawn::SpawnFailed;
+            }
+        }
+    }
+}
+
+/// Run a prepared git command bounded by the process deadline
+/// ([`crate::deadline`]): armed hook paths share one budget across spawns
+/// (a pre-exhausted budget skips the spawn entirely), unarmed CLI paths cap
+/// each spawn individually, and a disabled deadline runs unbounded.
+pub fn run_git_bounded(cmd: &mut Command) -> GitSpawn {
+    use crate::deadline::{self, BudgetState};
+
+    let timeout = match deadline::state() {
+        BudgetState::Disabled => {
+            // Escape hatch (CADENCE_HOOK_DEADLINE_MS=0): legacy unbounded run.
+            return match cmd.output() {
+                Ok(output) => GitSpawn::Completed(output),
+                Err(_) => GitSpawn::SpawnFailed,
+            };
+        }
+        BudgetState::Armed(remaining) => {
+            if remaining.is_zero() {
+                deadline::note_hit();
+                return GitSpawn::TimedOut;
+            }
+            remaining
+        }
+        BudgetState::Unarmed(cap) => cap,
+    };
+    run_bounded_with(cmd, timeout)
+}
+
+/// Run a git command in a specific working directory, with the tri-state
+/// outcome fail-closed guard arms need.
+pub fn git_command_detailed(work_dir: &str, args: &[&str]) -> GitQuery {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(work_dir).args(args);
+    match run_git_bounded(&mut cmd) {
+        GitSpawn::Completed(output) if output.status.success() => {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if value.is_empty() {
+                GitQuery::Failed
+            } else {
+                GitQuery::Value(value)
+            }
+        }
+        GitSpawn::Completed(_) | GitSpawn::SpawnFailed => GitQuery::Failed,
+        GitSpawn::TimedOut => GitQuery::TimedOut,
+    }
+}
+
 /// Run a git command in a specific working directory.
 ///
 /// Returns trimmed stdout on success, `None` on failure or empty output.
+/// A deadline timeout also yields `None` — every caller of this signature
+/// treats `None` as its fail-open arm; callers that fail *closed* on `None`
+/// must use [`git_command_detailed`] instead.
 pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
-    Command::new("git")
-        .arg("-C")
-        .arg(work_dir)
-        .args(args)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    match git_command_detailed(work_dir, args) {
+        GitQuery::Value(value) => Some(value),
+        GitQuery::Failed | GitQuery::TimedOut => None,
+    }
 }
 
 static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
@@ -868,6 +1010,65 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- run_bounded_with (the #271 bounded subprocess runner) ---
+    // Driven with the explicit-timeout entry point so the process-global
+    // deadline state never confounds these; plain `sh`/`sleep` stand in for
+    // git — the runner is command-agnostic.
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_fast_command_completes_with_stdout() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo bounded-ok"]);
+        match run_bounded_with(&mut cmd, std::time::Duration::from_secs(10)) {
+            GitSpawn::Completed(out) => {
+                assert!(out.status.success());
+                assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bounded-ok");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_slow_command_is_killed_and_reaped_at_timeout() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let started = std::time::Instant::now();
+        let result = run_bounded_with(&mut cmd, std::time::Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        assert!(matches!(result, GitSpawn::TimedOut), "got {result:?}");
+        // Kill happened at ~100ms, not at the child's 30s — proves the kill
+        // path; the clean return (no panic, no hang) proves the reap.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "kill at timeout, took {elapsed:?}"
+        );
+        assert!(crate::deadline::hit(), "timeout marks the shared flag");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_large_output_does_not_deadlock() {
+        // 200KB > the ~64KB pipe buffer: without the drain thread this hangs
+        // (child blocked writing, parent blocked in try_wait poll).
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 200000 /dev/zero"]);
+        match run_bounded_with(&mut cmd, std::time::Duration::from_secs(10)) {
+            GitSpawn::Completed(out) => assert_eq!(out.stdout.len(), 200_000),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_missing_program_is_spawn_failed() {
+        let mut cmd = Command::new("definitely-not-a-real-program-271");
+        assert!(matches!(
+            run_bounded_with(&mut cmd, std::time::Duration::from_secs(1)),
+            GitSpawn::SpawnFailed
+        ));
+    }
 
     #[test]
     fn is_gh_pr_create_matches_the_command() {
