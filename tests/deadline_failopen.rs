@@ -225,6 +225,19 @@ fn push_loop_padding_flood_blocks_instead_of_failing_open() {
         "block message names the exhaustion: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The guard ENFORCED (blocked), so nothing degraded to fail-open — the
+    // timed-out probe must NOT emit a plain `deadline` row or the misleading
+    // "degraded to fail-open" breadcrumb (CodeRabbit finding on #273).
+    let rows = failopen_rows(metrics.path());
+    assert!(
+        rows.iter().all(|r| r["reason"] != "deadline"),
+        "a block must not log a fail-open deadline row: {rows:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("degraded to fail-open"),
+        "no fail-open breadcrumb on an enforced block: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

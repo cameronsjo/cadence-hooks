@@ -72,7 +72,11 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                     hook_name, &input, prov,
                 ));
             }
-            log_deadline_degradation(hook_name, crate::registry::plugin_for(hook_name));
+            // A Block/Ask outcome stopped the operation, so a timed-out probe
+            // did not degrade to fail-open — don't emit the plain deadline row
+            // (Allow/Nudge let the tool proceed, so those still do).
+            let enforced = matches!(result.outcome, Outcome::Block | Outcome::Ask);
+            log_deadline_degradation(hook_name, crate::registry::plugin_for(hook_name), enforced);
             cadence_hooks_metrics::log_timing(
                 hook_name,
                 crate::registry::plugin_for(hook_name).unwrap_or("unknown"),
@@ -139,7 +143,8 @@ pub fn run_logged_logger(
             );
         }
     }
-    log_deadline_degradation(hook.unwrap_or("unknown"), namespace);
+    // Loggers never block, so a deadline hit here is always a fail-open degradation.
+    log_deadline_degradation(hook.unwrap_or("unknown"), namespace, false);
     cadence_hooks_metrics::log_timing(
         hook.unwrap_or("unknown"),
         namespace.unwrap_or("metrics"),
@@ -154,9 +159,17 @@ pub fn run_logged_logger(
 /// probes hit the internal deadline (cadence-hooks#271). Two tiers, sharper
 /// one wins: a suppressed fail-closed block (`deadline_block_suppressed`)
 /// means enforcement was actually bypassed; a plain `deadline` means git-backed
-/// checks degraded to their ordinary fail-open arms. Both writes are fully
-/// fail-open and never perturb the verdict or exit code that follows.
-fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>) {
+/// checks degraded to their ordinary fail-open arms.
+///
+/// `enforced` is true when the guard's final outcome still *blocked* — e.g. a
+/// `guard-push-remote` induced-exhaustion block, where a probe timed out
+/// (setting `deadline::hit()`) yet the guard blocked rather than failed open.
+/// In that case the plain `deadline` row is suppressed: nothing degraded to
+/// fail-open, so the "degraded to fail-open" breadcrumb would be a lie. The
+/// `deadline_block_suppressed` tier is unaffected — those paths return allow.
+///
+/// Both writes are fully fail-open and never perturb the verdict or exit code.
+fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, enforced: bool) {
     use cadence_hooks_core::deadline;
     if deadline::suppressed_block() {
         cadence_hooks_metrics::log_failopen(
@@ -168,7 +181,7 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>) {
         eprintln!(
             "cadence-hooks: {hook_name}: git probe deadline exceeded; a fail-closed block was degraded to allow (see failopen.jsonl)"
         );
-    } else if deadline::hit() {
+    } else if deadline::hit() && !enforced {
         cadence_hooks_metrics::log_failopen(
             "deadline",
             namespace,
