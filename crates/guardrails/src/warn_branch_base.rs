@@ -576,6 +576,14 @@ mod tests {
         });
     }
 
+    // Unix-only: core's temp-root detection (`path_under_temp_root`) keys off
+    // `/tmp`/`/private/tmp` and `$TMPDIR`, with no Windows `TEMP`/`TMP`
+    // handling — so `std::env::temp_dir()` (a `C:\…\Temp` path on Windows) is
+    // not seen as a temp root and this suppression can't be exercised there.
+    // No D3 coverage is lost: the `would_block_here`-false fall-through this
+    // asserts is also covered cross-platform by the `allow_main` and
+    // `kill_switch` suppression tests above.
+    #[cfg(unix)]
     #[test]
     fn checkout_b_temp_root_suppresses_worktree_first_nudge() {
         with_clean_worktree_env(|| {
