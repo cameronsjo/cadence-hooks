@@ -191,12 +191,13 @@ fn subtract_existing(
         .collect()
 }
 
-/// Per-repo terminology exemptions, read from `<git-root>/.claude/terminology.json`.
+/// Per-repo terminology exemptions, read from the `terminology` section of
+/// `<git-root>/.claude/cadence.json` (cadence-hooks#153).
 ///
 /// Softens the hard block for named files/terms — it can only ever *remove* or
-/// *demote* a violation, never add one. Missing, unreadable, or invalid JSON all
-/// deserialize to the default (empty) config; the guard never errors on it
-/// (fail-open, ADR-0001). Mirrors the `.claude/redaction.json` precedent.
+/// *demote* a violation, never add one. Missing file, unreadable, invalid JSON,
+/// or an absent section all deserialize to the default (empty) config; the
+/// guard never errors on it (fail-open, ADR-0001).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TerminologyConfig {
@@ -282,17 +283,17 @@ fn glob_match(pattern: &str, rel_path: &str, basename: &str) -> bool {
     }
 }
 
-/// Load `<root>/.claude/terminology.json`. Missing, unreadable, or invalid JSON
-/// all yield the default (empty) config (fail-open, ADR-0001).
+/// Load this guard's `terminology` section from the unified
+/// `<root>/.claude/cadence.json` (cadence-hooks#153). Missing file, unreadable,
+/// invalid JSON, or an absent section all yield the default (empty) config
+/// (fail-open, ADR-0001). The legacy `.claude/terminology.json` is no longer
+/// read — a hard cut; `cadence-hooks migrate-config` converts a repo and
+/// `cadence-hooks doctor` warns on an orphaned legacy file.
 fn load_terminology_config(root: &Path) -> TerminologyConfig {
-    let path = root.join(".claude/terminology.json");
-    let Some(content) = cadence_hooks_core::paths::read_untrusted_config(&path) else {
-        return TerminologyConfig::default();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
+    cadence_hooks_core::config::load_cadence_section(root, "terminology")
 }
 
-/// Apply per-repo `.claude/terminology.json` softening to the accumulated
+/// Apply per-repo `.claude/cadence.json` `terminology` softening to the accumulated
 /// violations, in place. `allow`-mode exemptions drop a block; `nudge`-mode
 /// exemptions demote a block to a nudge; any matching exemption drops a
 /// pre-existing nudge (already advisory). The git root is found by walking up
@@ -399,7 +400,7 @@ impl Check for TerminologyGuard {
             }
         }
 
-        // Per-repo `.claude/terminology.json` softening — only when there's a
+        // Per-repo `.claude/cadence.json` `terminology` softening — only when there's a
         // violation to soften and we know the file path (so a clean edit never
         // touches disk). The hardcoded is_excluded_path() baseline above still
         // applies; this only ever removes or demotes a violation, never adds one.
@@ -1135,26 +1136,36 @@ mod tests {
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
-    // --- Per-repo .claude/terminology.json exemptions ---
+    // --- Per-repo .claude/cadence.json `terminology` exemptions ---
     //
-    // The loader reads `<git-root>/.claude/terminology.json` from disk, so these
-    // tests build a real temp git root and address the written file by an
-    // absolute path inside it. Flagged terms are taken from BLOCK_VIOLATIONS
-    // (never spelled as literals) so the config JSON carries no hardcoded term.
+    // The loader reads the `terminology` section of `<git-root>/.claude/cadence.json`
+    // from disk (cadence-hooks#153), so these tests build a real temp git root and
+    // address the written file by an absolute path inside it. Flagged terms are
+    // taken from BLOCK_VIOLATIONS (never spelled as literals) so the config JSON
+    // carries no hardcoded term.
 
     use cadence_hooks_core::Outcome;
     use std::path::PathBuf;
 
-    /// A temp git root containing `.claude/terminology.json` with `json`.
-    fn temp_repo(json: &str) -> tempfile::TempDir {
+    /// A temp git root whose `.claude/cadence.json` carries `section_json` as its
+    /// `terminology` section. `section_json` is the same object the legacy
+    /// `terminology.json` held (e.g. `{"exemptions":[…]}`); it is nested under
+    /// the `terminology` key of the unified file. A malformed `section_json`
+    /// stays malformed once wrapped, so fail-open cases still exercise a broken
+    /// document.
+    fn temp_repo(section_json: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(dir.path().join(".claude/terminology.json"), json).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/cadence.json"),
+            format!(r#"{{"version":1,"terminology":{section_json}}}"#),
+        )
+        .unwrap();
         dir
     }
 
-    /// A temp git root with NO terminology.json (config-absent baseline).
+    /// A temp git root with NO cadence.json (config-absent baseline).
     fn temp_repo_no_config() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -1367,15 +1378,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn special_file_config_fails_open_and_does_not_hang() {
-        // #157: a `.claude/terminology.json` that is a symlink to an endless
+        // #157: a `.claude/cadence.json` that is a symlink to an endless
         // special file (`/dev/zero`) must be rejected on stat — the guard falls
         // open to the default (empty) config and a flagged term still blocks,
         // without an unbounded read hanging the hook.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::os::unix::fs::symlink("/dev/zero", dir.path().join(".claude/terminology.json"))
-            .unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join(".claude/cadence.json")).unwrap();
         let input = write_at(dir.path(), "src/main.rs", BLOCK_VIOLATIONS[0].0);
         assert_eq!(outcome(&input), Outcome::Block);
     }
