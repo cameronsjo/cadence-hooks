@@ -12,6 +12,20 @@
 //! branch-mode repo. A linked worktree's `.git` is a file, so worktrees pass
 //! untouched — that is the point.
 //!
+//! **Nudges** (exit 0, #234) — the one advisory tier — when a Bash command runs
+//! a *subprocess tree-mutation* in the session's own primary checkout without a
+//! `git commit`: a package-manager manifest mutator (`uv add`, `cargo add`,
+//! `pip/npm/pnpm/poetry/yarn install|add`, …), a direct file mutator (`sed -i`,
+//! `tee`), or a `>`/`>>` redirect into a tracked file. These writes accumulate
+//! in the shared tree and aren't caught until the eventual `git commit`/`Write`
+//! tripwire, so the nudge raises coverage of that class from silent-allow →
+//! advisory. It never blocks (cannot weaken an existing block), is scoped to the
+//! session's OWN checkout like the Edit/Write arm, honors every exemption below,
+//! and — per the composition contract — is evaluated **only after** the commit
+//! (block) channel finds no block, so `uv add && git commit` into the primary
+//! still BLOCKS rather than double-firing a nudge. It reuses the
+//! `dismiss-enforce-worktree` snooze (no separate dismiss key — D2).
+//!
 //! The two arms differ in *scope* by design (#238). The **Edit/Write arm** only
 //! enforces on the session's **own** checkout — the target file's repo must be
 //! the same repo the session's cwd is in. A write into any *other* repo (a note
@@ -46,8 +60,34 @@
 //! - Not a git repo, or git unavailable — fail open (ADR-0001).
 //!
 //! Known misses, accepted by design (this is a discipline guard, not a security
-//! boundary): file mutations via bash (`sed -i`, redirects) are not inspected —
-//! the `git commit` arm is the persistence backstop; `git --work-tree=…` /
+//! boundary). Subprocess manifest/redirect mutations now **nudge** (#234) — they
+//! are no longer a silent miss — but the nudge's own coverage is a curated
+//! floor, not a fence. Named v1 misses of the mutation-nudge channel, each
+//! degrading to the pre-#234 silent-allow (never a weakened block):
+//! - **Non-enumerated mutator verbs** — `cp`/`mv`/`install` into a tracked path,
+//!   `dd of=…`, `truncate`, `patch`, `ed`/`ex`, `perl -i`, `awk -i inplace`,
+//!   `python -c 'open(p,"w")'`, and the git tree-mutators `git apply|restore|
+//!   rm|mv|stash pop` (not commit boundaries, so the commit flag-walk never
+//!   matches them). The package-manager/`sed`/`tee`/redirect list is a floor;
+//!   widening it is follow-up.
+//! - **`$VAR`/`$(…)`-pathed targets** — `cat > "$OUT"`, `> "$(…)"`: the scoped
+//!   walk carries no assignment expansion (that lives only on the flat
+//!   `command_segments` view, the #228 bypass class this predicate MUST NOT
+//!   use), so the target stays unexpanded → resolves to no repo → miss.
+//! - **Prefix-flag wrappers** — `nice -n 10 <mutator>`, `env -i sh -c '…'`,
+//!   `sudo <mutator>`: the transparent-prefix stripper stops at a prefix whose
+//!   next token is a flag (and `sudo` isn't a transparent prefix here), so the
+//!   mutator is never reached — inherits the commit arm's prefix-flag miss.
+//! - **Depth past the wrapper budget** — a mutator in a 4th `sh -c`/`$(…)` level
+//!   is not reached (shares [`MAX_WRAPPER_DEPTH`]).
+//! - **`sed -i` with multiple files / no file** — only the trailing operand is
+//!   taken as the target; a bare `sed -i 's/…/…/'` (no file) is degenerate.
+//! - **A mutation nudge is suppressed when the same command also carries a
+//!   bypassed `git commit` allow** (a snooze/env exemption on any commit target
+//!   in the command) — the bypass-log record takes precedence, and the same
+//!   exemption suppresses the mutation in that repo anyway.
+//!
+//! Commit-channel (block) misses, unchanged: `git --work-tree=…` /
 //! `--git-dir=…` commit forms skip the check (the target tree cannot be cheaply
 //! resolved — ambiguity fails open). Commits inside `sh -c '…'` wrappers,
 //! `$(…)`/backtick substitutions, and behind `env`/`VAR=value` prefixes ARE
@@ -72,7 +112,8 @@
 use crate::dismiss_enforce_worktree;
 use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, child_scripts, resolve_cd_target, split_segments_with_ops, tokenize,
+    MAX_WRAPPER_DEPTH, basename, child_scripts, redirect_targets, resolve_cd_target,
+    split_segments_with_ops, tokenize,
 };
 use cadence_hooks_core::worktree::{is_primary_checkout, is_temp_root, is_truthy, should_block};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
@@ -163,6 +204,14 @@ impl GitProbe {
 /// [`git_commit_targets`]).
 type CommitTarget = String;
 
+/// A resolved subprocess-mutation location surfaced by the same scoped walk
+/// (see [`collect_targets`]). For a package-manager verb (`uv add`, …) it is the
+/// segment's effective cwd; for a direct file mutator (`sed -i`, `tee`) or a
+/// redirect it is the resolved target path. Assessed for a **nudge** (never a
+/// block) only when it lands in the session's own primary checkout — see
+/// [`mutation_nudge`].
+type MutationTarget = String;
+
 /// Pure: walk `command` segment by segment (heredoc bodies stripped, quotes
 /// respected — see [`split_segments_with_ops`]), tracking the effective
 /// working directory through any `cd` prefix, and for each segment whose
@@ -211,7 +260,7 @@ type CommitTarget = String;
 /// committing. Wrapper scripts (`sh -c '…'`) and `$(…)`/backtick substitution
 /// bodies DO execute, though — each segment's child scripts are recursed into
 /// with the directory in effect at that segment, in their own `cd` scope (see
-/// [`collect_commit_targets`], issue #228).
+/// [`collect_targets`], issue #228).
 ///
 /// Both the `cd` and `git` arms share one **quote-aware** token stream from
 /// `tokenize`. The pre-fix git arm used quote-blind `split_whitespace`, so a
@@ -280,25 +329,156 @@ fn is_shell_absolute(path: &str) -> bool {
     path.starts_with('/') || Path::new(path).is_absolute()
 }
 
-fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
-    let mut targets = Vec::new();
-    collect_commit_targets(command, cwd, 0, &mut targets);
-    targets
+/// Walk `command` once, returning both output channels: the `git commit`
+/// targets (block channel) and the subprocess-mutation locations (nudge
+/// channel). One walk, two channels — the block channel is evaluated first in
+/// [`run_enforce`] so a `uv add && git commit` into the primary blocks (commit
+/// wins) and never *also* nudges.
+fn scan_targets(command: &str, cwd: &str) -> (Vec<CommitTarget>, Vec<MutationTarget>) {
+    let mut commits = Vec::new();
+    let mut mutations = Vec::new();
+    collect_targets(command, cwd, 0, &mut commits, &mut mutations);
+    (commits, mutations)
 }
 
-/// Recursive worker for [`git_commit_targets`]: walks one script's segments
-/// tracking `effective_dir` across them, and recurses into each segment's
-/// child scripts — a `sh -c '<script>'` wrapper's script, `$(…)`/backtick
-/// substitution bodies — with the directory in effect *at that segment* but a
-/// fresh scope (issue #228). The scoping is load-bearing both ways: a child
-/// inherits the parent's cwd at spawn (so `cd /wt && sh -c 'git commit'`
-/// resolves to `/wt`), while a child's own `cd` never leaks back into this
-/// script's tracking (a flat `command_segments` view would splice
+/// Test-only view of the commit channel (production reads both channels via
+/// [`scan_targets`]); the many commit-parsing tests exercise it directly.
+#[cfg(test)]
+fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
+    scan_targets(command, cwd).0
+}
+
+/// Test-only view of the mutation channel (production reads both channels via
+/// [`scan_targets`]).
+#[cfg(test)]
+fn mutation_targets(command: &str, cwd: &str) -> Vec<MutationTarget> {
+    scan_targets(command, cwd).1
+}
+
+/// A package-manager subcommand that mutates a manifest/lockfile in its cwd:
+/// `uv add|remove|sync`, `cargo add|rm`, `pip install`, `npm install|i|add`,
+/// `pnpm add|install`, `poetry add`, `yarn add`. Coarse v1 taxonomy — the cwd
+/// being the primary checkout is the sole trigger, no path resolution (a
+/// package manager writes its manifest relative to cwd). `python -m pip …`,
+/// `sudo`-wrapped forms, and unlisted managers are named accepted misses.
+fn is_package_mutation(argv: &[String]) -> bool {
+    let Some(cmd) = argv.first() else {
+        return false;
+    };
+    let sub = argv.get(1).map(String::as_str);
+    matches!(
+        (basename(cmd), sub),
+        ("uv", Some("add" | "remove" | "sync"))
+            | ("cargo", Some("add" | "rm"))
+            | ("pip" | "pip3", Some("install"))
+            | ("npm", Some("install" | "i" | "add"))
+            | ("pnpm", Some("add" | "install"))
+            | ("poetry", Some("add"))
+            | ("yarn", Some("add"))
+    )
+}
+
+/// Target files of a direct in-place mutator verb with a resolvable target:
+/// `sed -i <file>` (requires an in-place flag; the file is the trailing
+/// operand — multiple files catch only the last) and `tee <file>` (every
+/// non-flag operand). Other tree mutators (`cp`/`mv`/`dd`/`patch`/`perl -i`/
+/// `git apply|restore|rm|mv`/…) are named accepted misses — not enumerated.
+fn file_mutation_targets(argv: &[String]) -> Vec<String> {
+    let Some(cmd) = argv.first() else {
+        return Vec::new();
+    };
+    match basename(cmd) {
+        "sed" => {
+            let in_place = argv.iter().any(|t| {
+                t == "-i"
+                    || t.starts_with("-i")
+                    || t == "--in-place"
+                    || t.starts_with("--in-place=")
+            });
+            if !in_place {
+                return Vec::new();
+            }
+            // The file operand is the trailing non-flag token
+            // (`sed -i 's/a/b/' file`). The script is an earlier operand; a
+            // bare `sed -i 's/a/b/'` (no file) is a degenerate miss.
+            argv.iter()
+                .skip(1)
+                .rfind(|t| !t.starts_with('-'))
+                .cloned()
+                .into_iter()
+                .collect()
+        }
+        "tee" => argv
+            .iter()
+            .skip(1)
+            .filter(|t| !t.starts_with('-'))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve a mutator's target path against the segment's effective dir, the
+/// same way the commit arm resolves a `-C` redirect: an absolute path (POSIX or
+/// Windows-drive via [`is_shell_absolute`]) or a `~`-path stands alone; a
+/// relative path joins onto the effective dir. A `$VAR`/`$(…)`-pathed target
+/// stays unexpanded → resolves to no repo downstream (fail-open miss).
+fn resolve_mutation_target(path: &str, effective_dir: &str) -> String {
+    if path.starts_with('~') {
+        resolve_cd_target(path, effective_dir)
+    } else if is_shell_absolute(path) {
+        path.to_string()
+    } else {
+        format!("{effective_dir}/{path}")
+    }
+}
+
+/// Per-segment mutation detection (#234) — the nudge channel of the scoped
+/// walk. Runs on every non-`cd` segment: package-manager manifest mutators
+/// (keyed on the effective cwd), direct file mutators (`sed -i`/`tee`), and
+/// redirect targets (`>`, `>>`, `>|`, `2>`, … via the shared core parser). All
+/// targets are advisory — the primary-checkout scoping, suppression, and
+/// block-first ordering live in [`run_enforce`]/[`mutation_nudge`].
+fn detect_mutations(
+    argv: &[String],
+    segment: &str,
+    effective_dir: &str,
+    mutations: &mut Vec<MutationTarget>,
+) {
+    if is_package_mutation(argv) {
+        mutations.push(effective_dir.to_string());
+    }
+    for target in file_mutation_targets(argv) {
+        mutations.push(resolve_mutation_target(&target, effective_dir));
+    }
+    for target in redirect_targets(segment) {
+        mutations.push(resolve_mutation_target(&target, effective_dir));
+    }
+}
+
+/// Recursive worker for [`scan_targets`]: walks one script's segments tracking
+/// `effective_dir` across them, filling **both** output channels per segment —
+/// `targets` (the `git commit` block channel) and `mutations` (the #234
+/// subprocess-mutation nudge channel, via [`detect_mutations`]) — and recurses
+/// into each segment's child scripts (a `sh -c '<script>'` wrapper's script,
+/// `$(…)`/backtick substitution bodies) with the directory in effect *at that
+/// segment* but a fresh scope (issue #228). The scoping is load-bearing both
+/// ways: a child inherits the parent's cwd at spawn (so `cd /wt && sh -c 'git
+/// commit'` resolves to `/wt`), while a child's own `cd` never leaks back into
+/// this script's tracking (a flat `command_segments` view would splice
 /// `$(cd /x)`'s `cd` into the parent stream and misjudge — from a primary
 /// checkout, silently ALLOW — a commit the real shell still runs in the
-/// parent's cwd). Depth shares [`MAX_WRAPPER_DEPTH`] with
-/// `command_segments`'s own expansion budget.
-fn collect_commit_targets(script: &str, cwd: &str, depth: usize, targets: &mut Vec<CommitTarget>) {
+/// parent's cwd). Both channels ride the *same* scoped walk, so the mutation
+/// nudge inherits the #228-safe cd-scoping rather than reintroducing the flat
+/// primitive. Depth shares [`MAX_WRAPPER_DEPTH`] with `command_segments`'s own
+/// expansion budget.
+fn collect_targets(
+    script: &str,
+    cwd: &str,
+    depth: usize,
+    targets: &mut Vec<CommitTarget>,
+    mutations: &mut Vec<MutationTarget>,
+) {
     let mut effective_dir = cwd.to_string();
 
     for (segment, _next_op) in split_segments_with_ops(script) {
@@ -321,7 +501,7 @@ fn collect_commit_targets(script: &str, cwd: &str, depth: usize, targets: &mut V
         // wrapper inherits the cwd accumulated so far — in their own scope.
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, segment) {
-                collect_commit_targets(&child, &effective_dir, depth + 1, targets);
+                collect_targets(&child, &effective_dir, depth + 1, targets, mutations);
             }
         }
 
@@ -353,6 +533,13 @@ fn collect_commit_targets(script: &str, cwd: &str, depth: usize, targets: &mut V
             }
             continue;
         }
+
+        // Subprocess-mutation detection (#234) — the SECOND output channel,
+        // filled alongside commit targets. Runs on every non-`cd` segment
+        // (the `cd` arm `continue`d above), git segments included: a redirect
+        // can ride any command, and `is_package_mutation`/`file_mutation_targets`
+        // key on the verb so a `git commit` never registers as a mutator.
+        detect_mutations(argv, segment, &effective_dir, mutations);
 
         // `argv` is the prefix-/assignment-stripped view computed above
         // (`command`/`env`/`VAR=x git commit` → leading `git`); require it
@@ -591,6 +778,77 @@ fn env_switch(var: &str) -> BypassProvenance {
     }
 }
 
+/// The subprocess-mutation nudge (#234) — enforce-worktree's first nudge
+/// branch. For each mutation location surfaced by the walk, fire ONLY when it
+/// lands in the session's OWN primary checkout: reuse the Edit/Write arm's
+/// git-common-dir equality scoping (#238) and the `.claude/`/`docs/plans/`
+/// carve-outs, and gate on [`assess_dir`] returning a Block there. Routing
+/// through `assess_dir` folds every existing suppression for free (process/repo
+/// `CADENCE_ALLOW_MAIN`, the `CADENCE_NO_ENFORCE_WORKTREE` kill switch,
+/// temp-root, and the active `dismiss-enforce-worktree` snooze) — an Allow
+/// (exempt, or the target isn't a primary checkout) yields no nudge. Advisory
+/// (exit 0): it never blocks, so it cannot weaken any existing block, and it
+/// reuses the enforce-worktree snooze rather than adding a dismiss key (D2).
+fn mutation_nudge(
+    mutation_targets: &[MutationTarget],
+    cwd: &str,
+    cfg: &EnvConfig,
+    repo_allow: &mut RepoAllowMain,
+    probe: &mut GitProbe,
+) -> Option<CheckResult> {
+    // Scope to the session's own repo (like #238): resolve the cwd's common dir
+    // once. A session not in any repo has no own checkout to protect → no nudge.
+    let cwd_common = probe.common_dir(Path::new(cwd))?;
+    let mut seen: HashSet<String> = HashSet::new();
+    for target in mutation_targets {
+        if !seen.insert(target.clone()) {
+            continue;
+        }
+        let target_path = Path::new(target);
+        // Same `.claude/`/`docs/plans/` carve-outs as the Edit/Write arm — a
+        // mutation into Claude-managed state or an approved plan doc is exempt.
+        if is_claude_managed_dir(target_path) || is_plan_doc_dir(target_path) {
+            continue;
+        }
+        // A redirect/verb target may name a not-yet-created file; ascend to the
+        // nearest existing dir so repo resolution works (mirrors the Edit arm).
+        let dir = nearest_existing_ancestor(target_path);
+        // Same repo as the session? (git common dir equality, #238/#179.) A
+        // mutation into a foreign repo or a temp dir git can't resolve is out
+        // of scope, exactly like a foreign Edit/Write drop.
+        match probe.common_dir(&dir) {
+            Some(target_common) if target_common == cwd_common => {}
+            _ => continue,
+        }
+        // Would a mutation here BLOCK? assess_dir folds every suppression; a
+        // Block means an un-exempted primary checkout → nudge. `origin_repo` is
+        // None — there is no cross-repo redirect to attribute in the message.
+        if assess_dir(&dir, cfg, None, repo_allow, probe).outcome == Outcome::Block {
+            let repo = probe
+                .repo_root(&dir)
+                .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            return Some(CheckResult::nudge(mutation_nudge_message(&repo)));
+        }
+    }
+    None
+}
+
+/// The nudge message: names the checkout, the accumulate-before-tripwire
+/// rationale, the worktree fix, and the shared-snooze escape (the nudge reuses
+/// the enforce-worktree snooze — no separate dismiss key, per D2).
+fn mutation_nudge_message(repo_root: &str) -> String {
+    format!(
+        "enforce-worktree: this command mutates tracked files in the primary checkout \
+         `{repo_root}` via a subprocess (package install, `sed -i`, or a redirect).\n\
+         These writes accumulate in the shared primary tree and aren't caught until the eventual \
+         `git commit` — by which point unwinding them is costly.\n\
+         Prefer a worktree: `git worktree add .claude/worktrees/<slug> -b feat/<slug>` \
+         (or EnterWorktree), then run it there.\n\
+         Silence subprocess-mutation nudges for a bit: \
+         `cadence-hooks guardrails dismiss-enforce-worktree --for 30m`."
+    )
+}
+
 /// Testable core: assess the hook input under the given environment.
 fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
     let mut repo_allow = RepoAllowMain::default();
@@ -669,11 +927,17 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // recorded (every existing provenance test drove the Edit arm, so
             // this Bash-arm gap went unseen until the repo-settings case).
             let mut bypassed: Option<CheckResult> = None;
+            // One walk, two channels (#234): commit targets (block) and
+            // subprocess-mutation locations (nudge). The commit channel is
+            // evaluated FIRST — the composition contract is block-first: a
+            // `uv add && git commit` into the primary must BLOCK (commit wins),
+            // never double-fire a nudge.
+            let (commit_targets, mutation_targets) = scan_targets(command, cwd);
             // Dedup identical targets so a pathological command (`git commit;`
             // ×N) can't fan out into N synchronous `git rev-parse` spawns and
             // stall the hook — each distinct target is assessed once (#239 F11).
             let mut seen: HashSet<String> = HashSet::new();
-            for target in git_commit_targets(command, cwd) {
+            for target in commit_targets {
                 if !seen.insert(target.clone()) {
                     continue;
                 }
@@ -691,6 +955,18 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 if result.bypass.is_some() && bypassed.is_none() {
                     bypassed = Some(result);
                 }
+            }
+            // No commit blocked. The mutation nudge fires ONLY IF no commit
+            // rode a bypass either — a snooze/env exemption on any commit in the
+            // command also suppresses the mutation in the same repo, so a
+            // bypassed-commit allow implies a suppressed nudge; deferring to it
+            // preserves the bypass-log record (a Nudge carries no provenance).
+            // enforce-worktree's first nudge branch.
+            if bypassed.is_none()
+                && let Some(nudge) =
+                    mutation_nudge(&mutation_targets, cwd, cfg, &mut repo_allow, &mut probe)
+            {
+                return nudge;
             }
             bypassed.unwrap_or_else(CheckResult::allow)
         }
@@ -2347,6 +2623,313 @@ mod tests {
             r.outcome,
             Outcome::Allow,
             "worktree commits allow; repeated targets deduped"
+        );
+    }
+
+    // --- #234: subprocess-mutation detection (pure parsing) ---
+
+    #[test]
+    fn package_manager_mutation_targets_cwd() {
+        // A package-manager manifest mutator: cwd is the sole trigger, so the
+        // representative mutation location is the effective cwd.
+        assert_eq!(
+            mutation_targets("uv add serde", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        for cmd in [
+            "cargo add serde",
+            "cargo rm serde",
+            "pip install requests",
+            "npm install",
+            "npm i lodash",
+            "npm add lodash",
+            "pnpm add react",
+            "poetry add httpx",
+            "yarn add left-pad",
+            "uv sync",
+            "uv remove serde",
+        ] {
+            assert_eq!(
+                mutation_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "package mutator not detected: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_manager_read_only_subcommands_are_not_mutations() {
+        // Read-only / non-mutating package-manager verbs must stay silent.
+        for cmd in [
+            "cargo build",
+            "cargo test",
+            "npm run build",
+            "npm ls",
+            "pip list",
+            "uv pip list",
+            "yarn install", // yarn install (no add) is not in the v1 list
+        ] {
+            assert!(
+                mutation_targets(cmd, "/cwd").is_empty(),
+                "false mutation on read-only verb: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn sed_in_place_targets_the_file() {
+        assert_eq!(
+            mutation_targets("sed -i s/a/b/ src/foo.rs", "/cwd"),
+            vec!["/cwd/src/foo.rs".to_string()]
+        );
+        // `-i.bak` (suffix form) still counts as in-place.
+        assert_eq!(
+            mutation_targets("sed -i.bak 's/a/b/' src/foo.rs", "/cwd"),
+            vec!["/cwd/src/foo.rs".to_string()]
+        );
+        // An absolute target stands alone.
+        assert_eq!(
+            mutation_targets("sed -i s/a/b/ /abs/foo.rs", "/cwd"),
+            vec!["/abs/foo.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn sed_without_in_place_is_not_a_mutation() {
+        // No `-i` → sed writes to stdout, not the file.
+        assert!(mutation_targets("sed s/a/b/ src/foo.rs", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn tee_targets_every_operand() {
+        assert_eq!(
+            mutation_targets("tee out.txt", "/cwd"),
+            vec!["/cwd/out.txt".to_string()]
+        );
+        // `-a` (append) still mutates; flags are skipped.
+        assert_eq!(
+            mutation_targets("tee -a out.txt", "/cwd"),
+            vec!["/cwd/out.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn redirect_clobber_and_append_both_detected() {
+        // Both `>` and `>>` are covered in v1 (proves append coverage via the
+        // shared core `redirect_targets`, not the clobber-only parser).
+        assert_eq!(
+            mutation_targets("echo x > src/tracked.txt", "/cwd"),
+            vec!["/cwd/src/tracked.txt".to_string()]
+        );
+        assert_eq!(
+            mutation_targets("echo x >> src/tracked.txt", "/cwd"),
+            vec!["/cwd/src/tracked.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn read_only_and_commit_segments_yield_no_mutation() {
+        // A plain read, and a `git commit` (the block channel, not a mutation),
+        // contribute nothing to the mutation channel.
+        assert!(mutation_targets("cat src/foo.rs", "/cwd").is_empty());
+        assert!(mutation_targets("git status", "/cwd").is_empty());
+        assert!(mutation_targets("git commit -m x", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn cd_scopes_mutation_target_like_commit() {
+        // A leading `cd` moves the effective dir for the mutation, exactly as
+        // for a commit — reusing the same scoped walk.
+        assert_eq!(
+            mutation_targets("cd /wt && uv add serde", "/cwd"),
+            vec!["/wt".to_string()]
+        );
+        assert_eq!(
+            mutation_targets("cd /wt && echo x > f", "/cwd"),
+            vec!["/wt/f".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrapper_cd_does_not_leak_to_outer_mutation() {
+        // #228-safe scoping: a child `sh -c 'cd /elsewhere'` never moves the
+        // parent's effective dir, so the outer redirect still targets cwd —
+        // the mutation channel inherits the commit channel's cd isolation.
+        assert_eq!(
+            mutation_targets("sh -c 'cd /elsewhere' && echo x > f", "/cwd"),
+            vec!["/cwd/f".to_string()]
+        );
+    }
+
+    #[test]
+    fn mutation_inside_sh_c_wrapper_detected() {
+        // A mutation inside a `sh -c '…'` wrapper executes — the child-script
+        // recursion surfaces it, scoped to the wrapper's inherited cwd.
+        assert_eq!(
+            mutation_targets("sh -c 'uv add serde'", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
+        assert_eq!(
+            mutation_targets("cd /wt && sh -c 'echo x > f'", "/cwd"),
+            vec!["/wt/f".to_string()]
+        );
+    }
+
+    // --- #234: subprocess-mutation nudge (end-to-end against real repos) ---
+
+    #[test]
+    fn package_mutation_in_primary_nudges_and_in_worktree_is_silent() {
+        let scratch = Scratch::new("mut-uv");
+        let (primary, wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash("uv add serde");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "uv add in the primary checkout nudges"
+        );
+        assert!(
+            r.message.unwrap().contains("worktree"),
+            "nudge names the worktree fix"
+        );
+
+        // The same in a linked worktree is not a primary checkout → silent.
+        let mut input = make_bash("uv add serde");
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "uv add in a worktree is fine — not a primary checkout"
+        );
+    }
+
+    #[test]
+    fn sed_in_place_in_primary_nudges() {
+        let scratch = Scratch::new("mut-sed");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("sed -i s/a/b/ src/foo.rs");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Nudge, "sed -i in the primary nudges");
+    }
+
+    #[test]
+    fn redirect_into_primary_nudges_clobber_and_append() {
+        let scratch = Scratch::new("mut-redirect");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash("echo x > src/tracked.txt");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Nudge, "clobber redirect nudges");
+
+        let mut input = make_bash("echo x >> src/tracked.txt");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "append redirect nudges too (>> covered in v1)"
+        );
+    }
+
+    #[test]
+    fn redirect_into_temp_is_silent() {
+        // A redirect whose target is outside the session's repo (a `/tmp`
+        // scratch file) is out of scope — no nudge.
+        let scratch = Scratch::new("mut-redirect-temp");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("echo x > /tmp/scratch-234-probe");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a redirect into /tmp is a foreign target → silent"
+        );
+    }
+
+    #[test]
+    fn mutation_then_commit_in_primary_still_blocks_no_double_fire() {
+        // Composition contract: block-first. `uv add && git commit` into the
+        // primary BLOCKS on the commit — the mutation nudge never fires.
+        let scratch = Scratch::new("mut-and-commit");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("uv add serde && git commit -m x");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "commit wins — block-first, no nudge double-fire"
+        );
+    }
+
+    #[test]
+    fn foreign_repo_mutation_is_silent() {
+        // A mutation whose effective cwd resolves into a DIFFERENT repo than the
+        // session's own is a foreign drop → silent, mirroring the Edit/Write arm.
+        let scratch = Scratch::new("mut-foreign");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let foreign = scratch.0.join("foreign-repo");
+        std::fs::create_dir(&foreign).unwrap();
+        init_repo(&foreign);
+
+        let mut input = make_bash(&format!("cd {} && uv add serde", foreign.to_string_lossy()));
+        input.cwd = Some(primary_a.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a mutation in a foreign repo is out of scope → silent"
+        );
+    }
+
+    #[test]
+    fn mutation_suppressions_silence_the_nudge() {
+        let scratch = Scratch::new("mut-suppress");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let bash_uv = |dir: &Path| {
+            let mut input = make_bash("uv add serde");
+            input.cwd = Some(dir.to_string_lossy().into_owned());
+            input
+        };
+
+        // CADENCE_ALLOW_MAIN → silent.
+        let r = run_enforce(&bash_uv(&primary), &cfg(true, false));
+        assert_eq!(r.outcome, Outcome::Allow, "CADENCE_ALLOW_MAIN silences");
+
+        // CADENCE_NO_ENFORCE_WORKTREE kill switch → silent.
+        let r = run_enforce(&bash_uv(&primary), &cfg(false, true));
+        assert_eq!(r.outcome, Outcome::Allow, "kill switch silences");
+
+        // Active snooze → silent.
+        let marker = dismiss_enforce_worktree::marker_path_for(&primary).unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(&marker, format!("{until}\n")).unwrap();
+        let r = run_enforce(&bash_uv(&primary), &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow, "active snooze silences");
+    }
+
+    #[test]
+    fn read_only_command_in_primary_is_silent() {
+        let scratch = Scratch::new("mut-readonly");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("cat src/foo.rs && git status");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a read-only command never nudges"
         );
     }
 }
