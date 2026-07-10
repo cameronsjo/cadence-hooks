@@ -10,6 +10,7 @@
 //! read that would never see EOF.
 
 pub mod config;
+pub mod deadline;
 pub mod loop_analysis;
 pub mod markers;
 pub mod paths;

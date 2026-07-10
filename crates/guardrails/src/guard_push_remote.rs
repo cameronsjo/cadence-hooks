@@ -34,17 +34,49 @@ fn check_owner(
     )
 }
 
+/// Push-URL resolution outcome. `Failed` (git answered; no remote/branch to
+/// resolve) keeps the fail-closed block downstream — that guard against real
+/// ambiguity is deliberate. `TimedOut` (a probe hit the #271 subprocess
+/// deadline) is the guard's own infrastructure failing and must degrade to
+/// fail-open, never a false block on a slow host.
+enum PushUrlResolution {
+    Url(String),
+    Failed,
+    TimedOut,
+}
+
 /// Resolve the push URL for a git repo.
-fn resolve_push_url(work_dir: &str, explicit_remote: Option<&str>) -> Option<String> {
+fn resolve_push_url(work_dir: &str, explicit_remote: Option<&str>) -> PushUrlResolution {
+    use cadence_hooks_core::shell::{GitQuery, git_command_detailed};
+
+    let get_url = |remote: &str| match git_command_detailed(
+        work_dir,
+        &["remote", "get-url", "--push", remote],
+    ) {
+        GitQuery::Value(url) => PushUrlResolution::Url(url),
+        GitQuery::Failed => PushUrlResolution::Failed,
+        GitQuery::TimedOut => PushUrlResolution::TimedOut,
+    };
+
     if let Some(remote) = explicit_remote {
-        return git_command(work_dir, &["remote", "get-url", "--push", remote]);
+        return get_url(remote);
     }
 
     // No explicit remote — find where bare push would go
-    let branch = git_command(work_dir, &["branch", "--show-current"])?;
-    let tracking = git_command(work_dir, &["config", &format!("branch.{branch}.remote")])
-        .unwrap_or_else(|| "origin".to_string());
-    git_command(work_dir, &["remote", "get-url", "--push", &tracking])
+    let branch = match git_command_detailed(work_dir, &["branch", "--show-current"]) {
+        GitQuery::Value(branch) => branch,
+        GitQuery::Failed => return PushUrlResolution::Failed,
+        GitQuery::TimedOut => return PushUrlResolution::TimedOut,
+    };
+    let tracking =
+        match git_command_detailed(work_dir, &["config", &format!("branch.{branch}.remote")]) {
+            GitQuery::Value(tracking) => tracking,
+            // No per-branch remote configured is a normal git state — same
+            // "origin" fallback as before.
+            GitQuery::Failed => "origin".to_string(),
+            GitQuery::TimedOut => return PushUrlResolution::TimedOut,
+        };
+    get_url(&tracking)
 }
 
 /// Classification of the explicit push target in `git push [flags] <target>`.
@@ -216,8 +248,12 @@ impl Check for PushRemoteGuard {
             let work_dir_loop = parse_work_dir(command, cwd_loop);
 
             for cmd in cmds {
+                // Failed and TimedOut both skip: this arm blocks only on a
+                // *resolved* unowned URL, so an unresolved one was already
+                // fail-open before the #271 deadline existed.
                 if let Some(remote) = &cmd.explicit_repo
-                    && let Some(url) = resolve_push_url(&work_dir_loop, Some(remote))
+                    && let PushUrlResolution::Url(url) =
+                        resolve_push_url(&work_dir_loop, Some(remote))
                     && !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts)
                 {
                     return CheckResult::block(format!(
@@ -255,14 +291,24 @@ impl Check for PushRemoteGuard {
             } else {
                 None
             };
-            let Some(url) = resolve_push_url(&work_dir, explicit) else {
-                return CheckResult::block(format!(
-                    "⚠️  git-guardrails: Cannot resolve push target\n   \
-                     Directory: {work_dir}\n   \
-                     Push explicitly: git push origin main"
-                ));
-            };
-            url
+            match resolve_push_url(&work_dir, explicit) {
+                PushUrlResolution::Url(url) => url,
+                // The probe hit the #271 subprocess deadline: the guard's own
+                // infrastructure failed, which never blocks (ADR-0001). Record
+                // the suppressed fail-closed block so telemetry can distinguish
+                // "slow git" from "an ownership block was bypassed".
+                PushUrlResolution::TimedOut => {
+                    cadence_hooks_core::deadline::note_suppressed_block();
+                    return CheckResult::allow();
+                }
+                PushUrlResolution::Failed => {
+                    return CheckResult::block(format!(
+                        "⚠️  git-guardrails: Cannot resolve push target\n   \
+                         Directory: {work_dir}\n   \
+                         Push explicitly: git push origin main"
+                    ));
+                }
+            }
         };
 
         if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {

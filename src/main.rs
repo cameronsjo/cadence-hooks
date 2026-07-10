@@ -5,7 +5,7 @@
 //! with 0 (allow), 1 (warn), or 2 (block). The CLI commands (`list`, `doctor`,
 //! `configure`, `try`, `session declare`/`status`) take no stdin.
 
-use cadence_hooks_core::{HookEvent, run_logger_from_stdin};
+use cadence_hooks_core::HookEvent;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::process;
 
@@ -1043,9 +1043,14 @@ fn main() {
                 session,
                 canonical_hook,
             ),
-            SessionCommands::Heartbeat => run_logger_from_stdin(
+            // Heartbeat/End/BackstopRecord run through the logged dispatcher so
+            // the #271 subprocess deadline is armed (they spawn git) and its
+            // degradation rows have an emission path — core cannot reach the
+            // metrics crate to report a deadline hit itself.
+            SessionCommands::Heartbeat => dispatch::run_logged_logger(
                 &cadence_hooks_session::heartbeat::Heartbeat,
                 registry::sample_for("session", "heartbeat"),
+                canonical_hook,
             ),
             SessionCommands::Guard => dispatch::run_logged_check(
                 &cadence_hooks_session::guard::Guard,
@@ -1062,13 +1067,15 @@ fn main() {
                 pre,
                 canonical_hook,
             ),
-            SessionCommands::End => run_logger_from_stdin(
+            SessionCommands::End => dispatch::run_logged_logger(
                 &cadence_hooks_session::end::End,
                 registry::sample_for("session", "end"),
+                canonical_hook,
             ),
-            SessionCommands::BackstopRecord => run_logger_from_stdin(
+            SessionCommands::BackstopRecord => dispatch::run_logged_logger(
                 &cadence_hooks_session::backstop::BackstopRecord,
                 registry::sample_for("session", "backstop-record"),
+                canonical_hook,
             ),
             SessionCommands::BackstopWarn => dispatch::run_logged_check(
                 &cadence_hooks_session::backstop::BackstopWarn,
