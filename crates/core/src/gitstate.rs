@@ -56,15 +56,29 @@ impl GitState {
     /// Resolve the git facts enclosing `start`, or `None` when `start` is not
     /// inside a git repository (or the `.git` is not a real git dir — a `HEAD`
     /// is required, matching [`resolve_git_common_dir`]).
+    ///
+    /// `repo_root` and `git_common_dir` are **canonicalized** (`..` and symlinks
+    /// resolved) so they are directly comparable and match git's own
+    /// `--path-format=absolute` output. This is load-bearing for consumers that
+    /// test repo identity by comparing these paths: `resolve_git_common_dir`
+    /// returns an un-normalized `…/.git/worktrees/<wt>/../..` for a linked
+    /// worktree, and `find_git_root` preserves whatever symlinked form the start
+    /// path carried (macOS `/var` vs git's `/private/var`) — so two checkouts of
+    /// the *same* repo would otherwise compare unequal by string, and a BLOCK
+    /// guard scoping "same repo" that way would silently loosen. `git_dir` stays
+    /// raw — it is only used here to read `HEAD`, never compared.
     pub fn resolve(start: &Path) -> Option<GitState> {
         let repo_root = find_git_root(&start.to_string_lossy())?;
+        // Derive the worktree admin dir and common dir from the *raw* root — the
+        // filesystem walk needs the real on-disk path — before canonicalizing
+        // the outward-facing identity paths.
         let (worktree_kind, git_dir) = worktree_git_dir(&repo_root)?;
         let git_common_dir = resolve_git_common_dir(&repo_root)?;
         let branch = head_branch(&git_dir);
         let default_branch = default_branch_from(&git_common_dir);
         Some(GitState {
-            repo_root,
-            git_common_dir,
+            repo_root: canonicalize_or(&repo_root),
+            git_common_dir: canonicalize_or(&git_common_dir),
             branch,
             worktree_kind,
             default_branch,
@@ -118,6 +132,15 @@ fn default_branch_from(common_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Canonicalize `p` (resolve `..` and symlinks), falling back to the path
+/// unchanged if the syscall fails — a rare race where the dir was removed
+/// between the walk and here. Failing open to the raw path keeps a whole
+/// `GitState` from collapsing to `None` over a transient race (ADR-0001); the
+/// raw path is still a usable, if non-canonical, identity.
+fn canonicalize_or(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,13 +161,20 @@ mod tests {
         }
     }
 
+    /// Canonicalize `p` for comparison against `GitState`'s canonicalized fields
+    /// — the tempdir root is itself a symlinked form on macOS (`/var` →
+    /// `/private/var`), so a raw `tmp.path()` would not match.
+    fn canon(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap()
+    }
+
     #[test]
     fn resolves_primary_checkout() {
         let tmp = tempfile::tempdir().unwrap();
         init_primary(tmp.path(), "feat/x", Some("main"));
         let state = GitState::resolve(tmp.path()).expect("resolves");
-        assert_eq!(state.repo_root, tmp.path());
-        assert_eq!(state.git_common_dir, tmp.path().join(".git"));
+        assert_eq!(state.repo_root, canon(tmp.path()));
+        assert_eq!(state.git_common_dir, canon(&tmp.path().join(".git")));
         assert_eq!(state.branch.as_deref(), Some("feat/x"));
         assert_eq!(state.worktree_kind, WorktreeKind::Primary);
         assert!(state.is_primary());
@@ -159,7 +189,7 @@ mod tests {
         let sub = tmp.path().join("crates").join("core");
         std::fs::create_dir_all(&sub).unwrap();
         let state = GitState::resolve(&sub).expect("walks up to the repo root");
-        assert_eq!(state.repo_root, tmp.path());
+        assert_eq!(state.repo_root, canon(tmp.path()));
         assert_eq!(state.branch.as_deref(), Some("main"));
         assert_eq!(state.default_branch, None, "no origin/HEAD → no default");
     }
@@ -211,6 +241,62 @@ mod tests {
         );
         // The common dir resolves back to the primary's .git (holds the HEAD).
         assert!(state.git_common_dir.join("HEAD").exists());
+    }
+
+    #[test]
+    fn primary_and_linked_worktree_share_one_canonical_common_dir() {
+        // The load-bearing identity property (cadence-hooks#164): a primary
+        // checkout and a REAL linked worktree of the same repo must resolve to
+        // the *same* `git_common_dir`, so a consumer that scopes "same repo" by
+        // comparing common dirs (the enforce-worktree Edit/Write arm) cannot be
+        // fooled into treating them as different repos. Without canonicalization
+        // they diverge two ways — the worktree's raw common dir is
+        // `…/.git/worktrees/wt/../..` AND carries git's `/private/var` form while
+        // the primary keeps the tempdir's `/var` symlink form — so this asserts
+        // the exact string equality that string-comparison consumers rely on.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&primary, &["init", "-q", "-b", "main"]);
+        git(&primary, &["config", "user.email", "t@t"]);
+        git(&primary, &["config", "user.name", "t"]);
+        git(&primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = tmp.path().join("wt");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &wt.to_string_lossy(),
+                "-b",
+                "feat/x",
+            ],
+        );
+
+        let sp = GitState::resolve(&primary).expect("primary resolves");
+        let sw = GitState::resolve(&wt).expect("worktree resolves");
+        assert_eq!(
+            sp.git_common_dir, sw.git_common_dir,
+            "primary and its linked worktree must share one canonical common dir"
+        );
+        // …and the repo roots stay distinct (they are different checkouts).
+        assert_ne!(sp.repo_root, sw.repo_root);
+        assert!(sp.is_primary());
+        assert!(sw.is_linked());
     }
 
     #[test]
