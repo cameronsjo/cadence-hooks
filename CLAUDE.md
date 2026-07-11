@@ -27,6 +27,7 @@ Manual tagging or formula edits race the automation. Post-release: `brew update 
 
 ## Gotchas
 
+- **Bare `cargo test` at the workspace root runs ONLY the root package (~100 tests) and looks green while the member crates' ~2,800 tests never run** — a false-complete suite. `cargo test --workspace` is the real gate (same for `clippy --workspace`); a compile error in a member crate is invisible to the root-only run. (Bit the goal-primitive build, 2026-07-10.)
 - **Ignore `make bump`'s "next steps" output** — it suggests `git tag` + `git push --tags`, which predates and races the auto-tag automation. Just commit and push; `auto-tag.yml` owns tagging.
 - **hooks.json `if:` globs cannot match a pipe character** — `|` is the alternation separator. For checks that fire on pipelines (e.g. `warn-alias-parsing`), enumerate tool names in the filter and let the binary's pipe check do the precision work.
 - **The git-safety hook (this repo's own product) blocks `git rebase` in Claude sessions.** To rebase a stacked PR branch onto main: cherry-pick its own commits onto a fresh branch from main, then `git push origin <tmp-branch>:<pr-branch> --force-with-lease`.
