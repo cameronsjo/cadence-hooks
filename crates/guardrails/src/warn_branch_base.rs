@@ -436,11 +436,12 @@ mod tests {
     // `would_block_here` reads real process env (`CADENCE_ALLOW_MAIN`,
     // `CADENCE_NO_ENFORCE_WORKTREE`), unlike `enforce_worktree`'s own tests
     // (which inject an `EnvConfig`) — so these tests pin real env, serialized
-    // via ENV_LOCK and restored on drop, panic included. Mirrors
-    // `session::start`'s `with_worktree_env`/`WorktreeEnvGuard` pattern —
-    // that helper is private to its own crate, so this is a local copy, not
-    // a shared abstraction.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // via the shared `crate::CADENCE_ALLOW_MAIN_TEST_LOCK` and restored on drop,
+    // panic included. The lock is crate-wide, not module-local, because
+    // `warn_main_branch`'s tests mutate `CADENCE_ALLOW_MAIN` too — two separate
+    // module locks would not exclude each other under cargo's parallel runner
+    // (cadence-hooks#298). Mirrors `session::start`'s
+    // `with_worktree_env`/`WorktreeEnvGuard` pattern.
 
     struct WorktreeEnvGuard {
         allow: Option<std::ffi::OsString>,
@@ -450,9 +451,9 @@ mod tests {
     impl Drop for WorktreeEnvGuard {
         fn drop(&mut self) {
             // SAFETY: only constructed inside `with_worktree_env`, which
-            // holds ENV_LOCK for this guard's whole lifetime (declared after
-            // the lock, so it drops before the lock releases — panic
-            // included).
+            // holds `CADENCE_ALLOW_MAIN_TEST_LOCK` for this guard's whole
+            // lifetime (declared after the lock, so it drops before the lock
+            // releases — panic included).
             unsafe {
                 match self.allow.take() {
                     Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
@@ -467,7 +468,9 @@ mod tests {
     }
 
     fn with_worktree_env<T>(allow: Option<&str>, kill: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let _restore = WorktreeEnvGuard {
             allow: std::env::var_os("CADENCE_ALLOW_MAIN"),
             kill: std::env::var_os("CADENCE_NO_ENFORCE_WORKTREE"),
