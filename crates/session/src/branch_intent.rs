@@ -12,8 +12,8 @@
 //! the bias is hard toward silence:
 //!
 //! 1. **Mutation** — the tool is `Edit`/`Write`/`NotebookEdit` (new work).
-//! 2. **Real feature branch** — live `git branch --show-current` is non-empty
-//!    and not `main`/`master`.
+//! 2. **Real feature branch** — the current branch (from `GitState`'s `HEAD`
+//!    read) is present and not `main`/`master`. A detached HEAD is `None`.
 //! 3. **Intent declared** — the session's record carries a non-blank `intent`.
 //!    Absent/blank → allow *and do not write the marker*, so a session that
 //!    declares intent later still gets its one evaluation.
@@ -35,6 +35,7 @@
 
 use crate::identity;
 use crate::registry;
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::{Path, PathBuf};
@@ -107,9 +108,14 @@ impl Check for WarnBranchIntent {
             return CheckResult::allow();
         }
 
-        // Full evaluation: resolve git state (bounded to ~3 shell-outs), assess,
-        // then write the marker so this never re-fires this session.
-        let branch = git_command(cwd, &["branch", "--show-current"]);
+        // Full evaluation: resolve git state, assess, then write the marker so
+        // this never re-fires this session. The current branch comes from the
+        // shared `GitState` (a pure-filesystem `HEAD` read, not a
+        // `git branch --show-current` spawn; cadence-hooks#164) — `None` on a
+        // detached HEAD, which gate 2 treats identically to the old
+        // empty-string result. The staleness probes below stay `git_command`
+        // (rev-list count, tip date) — facts `GitState` does not carry.
+        let branch = GitState::resolve(Path::new(cwd)).and_then(|s| s.branch);
         let ahead = resolve_default_branch(cwd)
             .as_deref()
             .and_then(|d| ahead_count(cwd, d));
