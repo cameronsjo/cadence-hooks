@@ -114,12 +114,28 @@ pub fn looks_absolute(p: &str) -> bool {
 /// `log-polish-nudge` metrics Logger so the logged denominator equals the
 /// nudge-fire set.
 ///
-/// Built on [`tokenize`] (not `split_whitespace`) so a quoted `gh pr create`
-/// inside a `-m`/`--body` arg collapses to one token and cannot line up in the
-/// 3-window — a branch named `gh-pr-create-experiments`, or that phrase inside a
-/// commit message, must never match.
+/// Evaluated **per shell segment** ([`split_segments`]) so the draft-flag check
+/// is scoped to the `gh pr create` invocation's OWN args — a bare `-d` from an
+/// unrelated sibling command on a compound line (`curl -d x && gh pr create`,
+/// `docker run -d img ; gh pr create`) must not misclassify a real ship as a
+/// draft. Each segment is tokenized with [`tokenize`] (not `split_whitespace`)
+/// so a quoted `gh pr create` inside a `-m`/`--body` arg collapses to one token
+/// and cannot line up in the 3-window — a branch named
+/// `gh-pr-create-experiments`, or that phrase inside a commit message, must
+/// never match.
 pub fn is_polish_ship_anchor(command: &str) -> bool {
-    let tokens = tokenize(command);
+    split_segments(command)
+        .iter()
+        .any(|segment| segment_is_ship_anchor(segment))
+}
+
+/// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
+/// create` carrying no `--draft`/`-d` flag *in that same segment*. Scoping the
+/// draft-flag scan to one segment is what keeps an unrelated sibling command's
+/// `-d` from suppressing a real ship (the reason [`is_polish_ship_anchor`]
+/// splits first rather than scanning the whole token stream).
+fn segment_is_ship_anchor(segment: &str) -> bool {
+    let tokens = tokenize(segment);
     let is_gh_pr = |sub: &str| {
         tokens
             .windows(3)
@@ -1181,6 +1197,28 @@ mod tests {
         assert!(!is_polish_ship_anchor("gh pr create --draft"));
         assert!(!is_polish_ship_anchor("gh pr create --draft --title x"));
         assert!(!is_polish_ship_anchor("gh pr create -d --fill"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_draft_flag_scoped_to_create_segment() {
+        // A bare `-d`/`--draft` in an UNRELATED sibling command on a compound
+        // line must not misclassify a real non-draft create as a draft. The
+        // draft-flag scan is scoped to the create's own shell segment.
+        assert!(is_polish_ship_anchor(
+            "curl -d 'x=y' https://example.com && gh pr create --title z"
+        ));
+        assert!(is_polish_ship_anchor(
+            "docker run -d img ; gh pr create --title z"
+        ));
+        // Sibling `-d` AFTER the create, on the other side of an operator.
+        assert!(is_polish_ship_anchor(
+            "gh pr create --title z && curl -d payload https://x"
+        ));
+        // A genuine draft in its own segment still skips — the fix must not
+        // over-correct into treating every create as non-draft.
+        assert!(!is_polish_ship_anchor("echo hi && gh pr create --draft"));
+        // `gh pr ready` after a sibling with `-d` still anchors.
+        assert!(is_polish_ship_anchor("docker run -d img ; gh pr ready 12"));
     }
 
     #[test]
