@@ -74,7 +74,15 @@ fn failopen_rows(metrics_dir: &std::path::Path) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn hanging_git_on_edit_fails_open_fast_with_deadline_row() {
+fn enforce_worktree_edit_is_immune_to_a_hanging_git() {
+    // Since cadence-hooks#164, enforce-worktree resolves repo/worktree identity
+    // through `core::gitstate::GitState` — a pure filesystem walk — and spawns
+    // NO `git`. So even with only a hanging `git` on PATH it decides instantly
+    // from the on-disk `.git`, never invokes the shim, and therefore records no
+    // `deadline` degradation: the guard graduated past the #271 exposure rather
+    // than merely surviving it. (A plain tempdir isn't a git repo, so the
+    // verdict is a fail-open allow — the point here is the *absence* of a spawn,
+    // not the verdict.)
     let shim = tempfile::tempdir().unwrap();
     write_hanging_git(shim.path());
     let metrics = tempfile::tempdir().unwrap();
@@ -103,24 +111,22 @@ fn hanging_git_on_edit_fails_open_fast_with_deadline_row() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "a timed-out probe fails open, never blocks: {}",
+        "not a repo → fail-open allow: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // The whole point: decide well inside the 5s external hooks.json budget
-    // instead of being killed by it. Generous bound for slow CI.
+    // Nowhere near the hanging git's 30s sleep — it was never spawned.
     assert!(
         elapsed < Duration::from_secs(4),
-        "guard must abandon the probe at its ~1s budget, took {elapsed:?}"
+        "enforce resolves via the filesystem, never awaiting the hanging git; took {elapsed:?}"
     );
     let rows = failopen_rows(metrics.path());
-    assert_eq!(rows.len(), 1, "exactly one failopen row: {rows:?}");
-    assert_eq!(rows[0]["reason"], "deadline");
-    assert_eq!(rows[0]["namespace"], "guardrails");
-    assert_eq!(rows[0]["subcommand"], "enforce-worktree");
-    assert_eq!(rows[0]["binaryVersion"], env!("CARGO_PKG_VERSION"));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("deadline exceeded"),
-        "stderr breadcrumb expected: {}",
+        rows.is_empty(),
+        "no git spawn → no deadline degradation to record: {rows:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("deadline exceeded"),
+        "no deadline breadcrumb when no probe ran: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -288,12 +294,14 @@ fn push_loop_padding_flood_blocks_instead_of_failing_open() {
 }
 
 #[test]
-fn enforce_worktree_edit_arm_stays_within_spawn_budget() {
-    // Regression gate (#271 prevention): the Edit/Write arm's git spawn count
-    // grew unnoticed from ~1 to 4-5 across releases; this pins it. The count
-    // is location-independent — the arm's probes (target common dir, cwd
-    // common dir, repo root) all run BEFORE any temp-root carve-out is
-    // consulted, and the snooze/meta reads are pure filesystem now.
+fn enforce_worktree_edit_arm_spawns_no_git() {
+    // Regression gate, sharpened by cadence-hooks#164: the Edit/Write arm's git
+    // spawn count grew unnoticed from ~1 to 4-5 across releases, then #271
+    // pinned it at ≤3. Routing identity through `GitState` (a filesystem walk)
+    // drops it to ZERO — enforce-worktree no longer spawns `git` at all. This
+    // pins that floor: any future per-edit `git` probe creeping back in is a red
+    // run. (Formerly asserted `spawns > 0`; that "harness broken" guard is now
+    // the *expected* state, so the assertion inverts.)
     let real_git = String::from_utf8(
         Command::new("sh")
             .args(["-c", "command -v git"])
@@ -356,10 +364,9 @@ fn enforce_worktree_edit_arm_stays_within_spawn_budget() {
     let spawns = std::fs::read_to_string(&count_file)
         .map(|s| s.lines().count())
         .unwrap_or(0);
-    assert!(
-        spawns <= 3,
-        "enforce-worktree Edit arm spawn budget is 3 (target common dir, cwd \
-         common dir, repo root); got {spawns} — a new per-edit git probe crept in"
+    assert_eq!(
+        spawns, 0,
+        "enforce-worktree Edit arm must spawn zero git (resolution is a GitState \
+         filesystem walk); got {spawns} — a git probe crept back in"
     );
-    assert!(spawns > 0, "counting shim never ran — harness broken");
 }

@@ -117,6 +117,7 @@
 
 use crate::dismiss_enforce_worktree;
 use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, child_scripts, redirect_targets, resolve_cd_target,
     split_segments_with_ops, tokenize,
@@ -176,32 +177,45 @@ impl RepoAllowMain {
 // so the enforce-worktree block decision and `session::start`'s posture
 // line share one definition — re-imported above.
 
-/// Per-invocation memo of the two git probes this guard repeats — common dir
-/// and repo root — keyed by directory, so one invocation never asks git the
-/// same question twice (#271: each probe is a subprocess against a possibly
-/// slow `.git`). Constructed fresh per hook invocation — no cross-invocation
-/// cache (mirrors [`RepoAllowMain`]).
+/// Per-invocation memo of the [`GitState`] resolution this guard repeats, keyed
+/// by directory, so one invocation never re-walks the same tree. Constructed
+/// fresh per hook invocation — no cross-invocation cache (mirrors
+/// [`RepoAllowMain`]).
+///
+/// `GitState` replaces the prior `git rev-parse --show-toplevel` /
+/// `--git-common-dir` subprocess probes entirely (cadence-hooks#164): repo
+/// root, shared common dir, and primary-vs-worktree now come from a filesystem
+/// walk, so `enforce-worktree` spawns **zero** `git` for identity and is immune
+/// to a slow/hanging `.git` (the residual #271 exposure). The `common_dir` /
+/// `repo_root` accessors keep their string return types — `GitState`
+/// canonicalizes both to the same `--path-format=absolute` form the old probes
+/// returned, so every call site (same-repo scoping, snooze marker, block
+/// message) is byte-for-byte unchanged. A nonexistent `dir` resolves to `None`,
+/// matching git's `-C` failure (cadence-hooks#299).
 #[derive(Default)]
 struct GitProbe {
-    common_dirs: HashMap<PathBuf, Option<String>>,
-    roots: HashMap<PathBuf, Option<String>>,
+    states: HashMap<PathBuf, Option<GitState>>,
 }
 
 impl GitProbe {
-    /// Memoized [`git_common_dir`].
-    fn common_dir(&mut self, dir: &Path) -> Option<String> {
-        self.common_dirs
+    /// Memoized [`GitState::resolve`].
+    fn state(&mut self, dir: &Path) -> Option<GitState> {
+        self.states
             .entry(dir.to_path_buf())
-            .or_insert_with(|| git_common_dir(dir))
+            .or_insert_with(|| GitState::resolve(dir))
             .clone()
     }
 
-    /// Memoized [`repo_root_for`].
+    /// The shared git common dir (canonical), or `None` when `dir` isn't a repo.
+    fn common_dir(&mut self, dir: &Path) -> Option<String> {
+        self.state(dir)
+            .map(|s| s.git_common_dir.to_string_lossy().into_owned())
+    }
+
+    /// The repo root (canonical), or `None` when `dir` isn't a repo.
     fn repo_root(&mut self, dir: &Path) -> Option<String> {
-        self.roots
-            .entry(dir.to_path_buf())
-            .or_insert_with(|| repo_root_for(dir))
-            .clone()
+        self.state(dir)
+            .map(|s| s.repo_root.to_string_lossy().into_owned())
     }
 }
 
@@ -659,19 +673,11 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
     msg
 }
 
-/// Resolve the repo root enclosing `dir`, if any.
-fn repo_root_for(dir: &Path) -> Option<String> {
-    cadence_hooks_core::shell::git_command(
-        &dir.to_string_lossy(),
-        &["rev-parse", "--show-toplevel"],
-    )
-}
-
 /// Ascend from `dir` to the nearest ancestor that exists on disk. A `Write` can
 /// name a file in a not-yet-created subtree, so the file's parent dir may not
-/// exist yet — and `git rev-parse` needs a real directory to resolve the repo,
-/// so an unresolvable parent would fail open (`repo_root_for` → `None`) and let
-/// a new-module write into the primary slip past the Edit arm (#239 F1). This
+/// exist yet — and [`GitState::resolve`] returns `None` for a nonexistent path
+/// (cadence-hooks#299), so an unresolved parent would fail open and let a
+/// new-module write into the primary slip past the Edit arm (#239 F1). This
 /// walks up until it hits an existing directory. A `dir` that already exists is
 /// returned unchanged, so the common path is a single `exists()` stat and no
 /// behavior changes for edits to existing files.
@@ -686,19 +692,6 @@ fn nearest_existing_ancestor(dir: &Path) -> PathBuf {
             _ => return dir.to_path_buf(),
         }
     }
-}
-
-/// The absolute git common dir enclosing `dir`, via
-/// `git rev-parse --path-format=absolute --git-common-dir`. Unlike the toplevel
-/// (`repo_root_for`), this is shared across every worktree of one repo (#179),
-/// so it is the right identity for "the session's own repo" in the Edit/Write
-/// scoping (#238). `None` when `dir` isn't in a git repo or git is unavailable —
-/// callers fail open (ADR-0001).
-fn git_common_dir(dir: &Path) -> Option<String> {
-    cadence_hooks_core::shell::git_command(
-        &dir.to_string_lossy(),
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
 }
 
 /// Evaluate one candidate directory: allow, or block with the message.
@@ -2150,9 +2143,9 @@ mod tests {
 
     #[test]
     fn missing_dir_fails_open() {
-        // A directory git cannot resolve (nonexistent path) → no repo root →
-        // allow. ADR-0001: the guard's own failure never blocks.
-        assert!(repo_root_for(Path::new("/nonexistent-enforce-worktree")).is_none());
+        // A nonexistent path → GitState resolves no repo → allow. ADR-0001:
+        // the guard's own failure never blocks.
+        assert!(GitState::resolve(Path::new("/nonexistent-enforce-worktree")).is_none());
         let input = make_edit("/nonexistent-enforce-worktree/f.rs", "a", "b");
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
@@ -2411,12 +2404,20 @@ mod tests {
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         );
-        let declaring_root = repo_root_for(&declaring).unwrap();
+        let declaring_root = GitState::resolve(&declaring)
+            .unwrap()
+            .repo_root
+            .to_string_lossy()
+            .into_owned();
 
         let plain = scratch.0.join("plain");
         std::fs::create_dir(&plain).unwrap();
         init_repo(&plain);
-        let plain_root = repo_root_for(&plain).unwrap();
+        let plain_root = GitState::resolve(&plain)
+            .unwrap()
+            .repo_root
+            .to_string_lossy()
+            .into_owned();
 
         let mut memo = RepoAllowMain::default();
         assert!(
