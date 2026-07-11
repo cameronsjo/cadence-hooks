@@ -811,9 +811,10 @@ mod tests {
     // `is_main_allowed` reads real process env, which a caller's own
     // environment may already set (CLAUDE.md: Claude sessions can ambiently
     // carry `CADENCE_ALLOW_MAIN=true`) — clear it for the test that must prove
-    // the *repo-declared* source is what allows, serialized against any other
-    // env-mutating test here.
-    static ALLOW_MAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // the *repo-declared* source is what allows, serialized against every other
+    // `CADENCE_ALLOW_MAIN`-mutating test *across the crate* (not just this
+    // module) via the shared `crate::CADENCE_ALLOW_MAIN_TEST_LOCK`
+    // (cadence-hooks#298 — `warn_branch_base` mutates the same var).
 
     #[test]
     fn repo_declared_allow_main_suppresses_nudge() {
@@ -822,11 +823,11 @@ mod tests {
         // by-design-main repo that opted out in settings is no longer nudged on
         // `main`. This is the intended behavior change; everything else is
         // verdict-locked.
-        let _guard = ALLOW_MAIN_ENV_LOCK
+        let _guard = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("CADENCE_ALLOW_MAIN").ok();
-        // SAFETY: serialized via ALLOW_MAIN_ENV_LOCK; restored below. With
+        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK; restored below. With
         // process env cleared, the only allow source is the settings file.
         unsafe {
             std::env::remove_var("CADENCE_ALLOW_MAIN");
