@@ -734,6 +734,83 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
     targets
 }
 
+/// Extract **every** redirect target in a command segment — the filename after
+/// each `>`, `>>`, `>|`, `2>`, `&>`, etc. Unlike [`clobber_redirect_targets`]
+/// (which deliberately EXCLUDES `>>` append, since an append does not truncate
+/// an existing file), this returns the target of *any* redirect that writes a
+/// file, append included — the right set for a caller that cares whether a file
+/// is *mutated* at all, not just clobbered.
+///
+/// Quote-aware: a `>` inside `'…'`/`"…"` is literal text, not a redirect (so
+/// `echo "a > b" > c` targets only `c`). Catches stderr (`2>`), clobber (`>|`),
+/// glued (`>file`), and multiple redirects in one segment.
+///
+/// Shared parser: consumed by `prevent-secret-writes` (append to a `.env` is a
+/// secret write) and by `enforce-worktree`'s subprocess-mutation nudge (append
+/// into a tracked file in the primary checkout is a tree mutation). Keeping one
+/// implementation means one parser for the security review to scrutinize.
+pub fn redirect_targets(segment: &str) -> Vec<String> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                i += 1;
+            }
+            '>' => {
+                i += 1;
+                // Consume a doubled `>>` (append) or `>|` (clobber).
+                if i < chars.len() && (chars[i] == '>' || chars[i] == '|') {
+                    i += 1;
+                }
+                // Skip whitespace between the operator and the filename.
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                // Collect the target token, honoring a quoted filename.
+                let mut target = String::new();
+                while i < chars.len() {
+                    let tc = chars[i];
+                    if tc == '\'' || tc == '"' {
+                        i += 1;
+                        while i < chars.len() && chars[i] != tc {
+                            target.push(chars[i]);
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            i += 1; // closing quote
+                        }
+                        continue;
+                    }
+                    if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
+                        break;
+                    }
+                    target.push(tc);
+                    i += 1;
+                }
+                if !target.is_empty() {
+                    targets.push(target);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    targets
+}
+
 /// Like [`split_segments`], but also expands what a shell would actually run:
 ///
 /// 1. **Wrapper expansion** — a segment whose command word is
@@ -1318,6 +1395,37 @@ mod tests {
         // Glued directly (no separator before `}`) so it lands on the target
         // token, unlike a `;`-separated close which is already a break char.
         assert_eq!(clobber_redirect_targets("{ : > note.md}"), vec!["note.md"]);
+    }
+
+    // --- redirect_targets (all redirects, append INCLUDED) ---
+
+    #[test]
+    fn redirect_targets_plain_and_append_both_included() {
+        // The append `>>` distinction from clobber_redirect_targets: this
+        // parser records the target of BOTH.
+        assert_eq!(redirect_targets("echo hi > f"), vec!["f"]);
+        assert_eq!(redirect_targets("echo hi >> f"), vec!["f"]);
+        assert_eq!(redirect_targets("echo hi >| f"), vec!["f"]);
+    }
+
+    #[test]
+    fn redirect_targets_append_diverges_from_clobber() {
+        // Same input, opposite verdict — the reason both functions exist.
+        assert_eq!(redirect_targets("echo hi >> f"), vec!["f"]);
+        assert_eq!(
+            clobber_redirect_targets("echo hi >> f"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn redirect_targets_quote_aware_and_multiple() {
+        // A `>` inside quotes is prose; only the real redirect counts, and
+        // every redirect in the segment is captured.
+        assert_eq!(
+            redirect_targets(r#"echo "a > b" > c 2>> err.log"#),
+            vec!["c", "err.log"]
+        );
     }
 
     // --- command_segments (wrapper expansion) ---
