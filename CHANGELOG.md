@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **`enforce-worktree` resolves repo/worktree identity entirely through `core::gitstate::GitState` — a pure filesystem walk — and spawns zero `git` (cadence-hooks#164, the final umbrella PR; the only BLOCK guard).** The per-invocation `GitProbe` memo swaps its `git rev-parse --show-toplevel` / `--path-format=absolute --git-common-dir` subprocess probes for one memoized `GitState::resolve` per directory; the `common_dir`/`repo_root` accessors keep their string return types because `GitState` canonicalizes both to the same `--path-format=absolute` form the old probes returned, so every call site — the Edit/Write same-repo scoping, the `git commit` cross-repo guard, #234's subprocess-mutation-nudge channel, the snooze marker, and the block message — is byte-for-byte unchanged (all 130 enforce unit tests pass; verified end-to-end that a primary-checkout edit blocks, a worktree edit allows, a worktree-session edit into its own primary still blocks, and a `sed -i` mutation in a primary still nudges). The **#271 upshot:** enforce-worktree no longer spawns `git` at all, so it is now *immune* to a slow or hanging `.git` rather than merely bounded against it — its two `deadline_failopen` cases flip from "times out and records a deadline row" to "resolves instantly, records nothing."
+- **`GitState::resolve` returns `None` for a nonexistent `start` path, matching git's `-C` failure (cadence-hooks#299).** Previously the underlying `find_git_root` walked lexical ancestors past a not-yet-created leaf directory up into the enclosing repo and reported *that* repo's state — so `cd <nonexistent> && git push` / `git commit` could resolve the parent repo's branch for a command the shell never runs (a spurious nudge, or — for the BLOCK-guard migration above — a would-be false block). The `enforce-worktree` Edit/Write arm ascends to the nearest existing ancestor before resolving, so new-file writes are unaffected.
+
 ## [0.57.0] - 2026-07-11
 
 ### Changed

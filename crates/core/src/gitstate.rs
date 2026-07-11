@@ -68,6 +68,17 @@ impl GitState {
     /// guard scoping "same repo" that way would silently loosen. `git_dir` stays
     /// raw — it is only used here to read `HEAD`, never compared.
     pub fn resolve(start: &Path) -> Option<GitState> {
+        // git's `-C <dir>` fails on a path that does not exist; mirror that so a
+        // nonexistent `start` (a `cd <not-yet-created> && …` target) resolves to
+        // `None` rather than letting `find_git_root`'s lexical ancestor walk
+        // climb up into the *enclosing* repo and report that repo's state
+        // (cadence-hooks#299). A BLOCK guard consuming this must not resolve a
+        // commit/edit target the shell never reaches. The `enforce-worktree`
+        // Edit/Write arm ascends to the nearest existing ancestor before calling
+        // here, so new-file writes are unaffected.
+        if !start.exists() {
+            return None;
+        }
         let repo_root = find_git_root(&start.to_string_lossy())?;
         // Derive the worktree admin dir and common dir from the *raw* root — the
         // filesystem walk needs the real on-disk path — before canonicalizing
@@ -312,5 +323,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         assert_eq!(GitState::resolve(tmp.path()), None);
+    }
+
+    #[test]
+    fn nonexistent_start_under_a_repo_is_none() {
+        // #299: a nonexistent path must resolve to None, NOT climb up into the
+        // enclosing repo. A real repo with a not-yet-created subdir — the
+        // lexical walk would otherwise report the repo's branch for a `cd
+        // <subdir> && …` the shell never reaches (a BLOCK-guard bypass class).
+        let tmp = tempfile::tempdir().unwrap();
+        let git = tmp.path().join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        // The repo itself resolves…
+        assert!(GitState::resolve(tmp.path()).is_some());
+        // …but a nonexistent child of it does not.
+        assert_eq!(GitState::resolve(&tmp.path().join("not-created-yet")), None);
     }
 }
