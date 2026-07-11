@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.57.1] - 2026-07-11
+
+### Fixed
+
+- **`is_polish_ship_anchor` scopes its `--draft`/`-d` check to the `gh pr create`'s own shell segment (cadence-hooks#297).** The 0.57.0 predicate located the `create` position with a 3-token window but scanned the *whole* token stream for the draft flag, so a bare `-d` from an unrelated sibling command on a compound line (`curl -d x && gh pr create`, `docker run -d img ; gh pr create`) misclassified a genuine non-draft ship as a draft and silently suppressed both the nudge and the `log-polish-nudge` metrics denominator. `-d` is a common short flag, so this false negative inverted #297's intent for exactly the scripted multi-command shape the codebase anticipates. The anchor is now evaluated per shell segment (`split_segments`) so the draft-flag scan sees only the create's own args — mirroring the repo's "find the subcommand position, then scan its scope" pattern. A genuine draft in its own segment still skips, and `gh pr ready` after a sibling `-d` still anchors. Caught by the `cadence:code-reviewer` gate on #297 after the initial ship.
+
 ## [0.57.0] - 2026-07-11
 
 ### Changed
