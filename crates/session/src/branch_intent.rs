@@ -678,4 +678,57 @@ mod tests {
             "an existing marker short-circuits to allow (once per session)"
         );
     }
+
+    /// A real repo on `main`, then a feature branch one commit ahead, both
+    /// commits dated before `STARTED` so the tip is genuinely stale. Exercises
+    /// the live git the `run()` path makes — branch via `GitState`,
+    /// `resolve_default_branch`, `ahead_count`, `tip_epoch`.
+    fn init_stale_feature_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_COMMITTER_DATE", format!("@{TIP_OLD}"))
+                .env("GIT_AUTHOR_DATE", format!("@{TIP_OLD}"))
+                .status()
+                .expect("git");
+            assert!(ok.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&["checkout", "-q", "-b", "feat/unrelated-diagram"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "diagram work"]);
+        dir
+    }
+
+    #[test]
+    fn run_nudges_on_real_stale_unrelated_branch_via_gitstate() {
+        // End-to-end coverage of the #164 migration: `run()` resolves the live
+        // current branch through `GitState` (the `run_intent`/`assess` seams
+        // inject a branch and bypass it). A real repo whose HEAD is a stale
+        // feature branch — one commit ahead of `main`, old tip — plus a declared
+        // intent sharing no token with the branch name drives the full path to a
+        // nudge, proving the GitState-resolved branch flows into the
+        // staleness/relatedness gates correctly.
+        let repo = init_stale_feature_repo();
+        let cwd = repo.path().to_string_lossy().to_string();
+        let dir = registry::sessions_dir(&cwd).expect("sessions dir");
+        seed_record(
+            &dir,
+            "run-stale",
+            "feat/unrelated-diagram",
+            Some("docs/kanban-migration cadence-hooks#243"),
+            STARTED,
+        );
+
+        let input = edit_input("run-stale", &cwd);
+        assert_eq!(
+            WarnBranchIntent.run(&input).outcome,
+            Outcome::Nudge,
+            "a stale, unrelated feature branch resolved via GitState nudges"
+        );
+    }
 }
