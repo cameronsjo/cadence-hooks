@@ -75,8 +75,27 @@ impl Logger for End {
 /// resume is a tombstone / soft-delete, deliberately deferred (P3) until the loss
 /// proves to matter in practice. (Compaction uses the separate `PreCompact` hook,
 /// not SessionEnd, so a live session never self-deregisters mid-work.)
+///
+/// **Goal exception.** A record carrying an ACTIVE goal (`goal declare`) is
+/// *orphaned* — kept on disk with `goal.orphaned_epoch` stamped — instead of
+/// removed. `/clear` mints a NEW session id for the successor (re-verified live
+/// 2026-07-10), so deleting the record here would destroy the goal the
+/// successor is entitled to adopt via `goal reinject` (`source == "clear"`).
+/// The orphan is not a phantom peer ([`registry::read_peers`] skips
+/// orphaned-goal records), is consumed by the adopting SessionStart, and is
+/// otherwise reaped by the normal mtime sweep — no second store, no second
+/// sweep rule. This is precisely the tombstone/soft-delete deferred above,
+/// scoped to the one field whose loss proved to matter.
 pub fn run_end(hook_event_name: Option<&str>, dir: &std::path::Path, session_id: &str) {
     if hook_event_name != Some("SessionEnd") {
+        return;
+    }
+    if let Some(mut record) = registry::read_own(dir, session_id)
+        && let Some(goal) = record.goal.as_mut()
+        && goal.is_active()
+    {
+        goal.orphaned_epoch = Some(identity::now_epoch());
+        let _ = registry::write_record(dir, &record);
         return;
     }
     let _ = registry::remove_own(dir, session_id);
@@ -85,7 +104,7 @@ pub fn run_end(hook_event_name: Option<&str>, dir: &std::path::Path, session_id:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::SessionRecord;
+    use crate::identity::{GoalState, SessionRecord};
     use tempfile::TempDir;
 
     fn record(name: &str, session_id: &str) -> SessionRecord {
@@ -106,6 +125,46 @@ mod tests {
         assert!(
             registry::find_own(tmp.path(), "self-session").is_none(),
             "SessionEnd deregisters the session's lane"
+        );
+    }
+
+    #[test]
+    fn run_end_orphans_goal_bearing_record_instead_of_removing() {
+        // The /clear handoff: the successor session arrives under a NEW id, so
+        // the goal-bearing record must survive SessionEnd — marked orphaned,
+        // not deleted — for `goal reinject` to adopt.
+        let tmp = TempDir::new().unwrap();
+        let mut rec = record("quiet-loom", "self-session");
+        rec.goal = Some(GoalState {
+            text: "ship the goal primitive".into(),
+            ..Default::default()
+        });
+        registry::write_record(tmp.path(), &rec).unwrap();
+        run_end(Some("SessionEnd"), tmp.path(), "self-session");
+        let back = registry::read_own(tmp.path(), "self-session")
+            .expect("goal-bearing record survives SessionEnd");
+        assert!(
+            back.goal.unwrap().orphaned_epoch.is_some(),
+            "record is marked orphaned for the successor to adopt"
+        );
+    }
+
+    #[test]
+    fn run_end_removes_record_with_superseded_goal() {
+        // Only an ACTIVE goal earns the orphan handoff — a superseded goal is
+        // dead weight and the record deregisters normally.
+        let tmp = TempDir::new().unwrap();
+        let mut rec = record("quiet-loom", "self-session");
+        rec.goal = Some(GoalState {
+            text: "old goal".into(),
+            superseded: true,
+            ..Default::default()
+        });
+        registry::write_record(tmp.path(), &rec).unwrap();
+        run_end(Some("SessionEnd"), tmp.path(), "self-session");
+        assert!(
+            registry::find_own(tmp.path(), "self-session").is_none(),
+            "superseded goal does not exempt the record from deregistration"
         );
     }
 

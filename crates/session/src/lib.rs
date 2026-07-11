@@ -29,6 +29,9 @@
 //! | `end`               | SessionEnd   | [`end`]         |
 //! | `backstop-record`   | SessionEnd   | [`backstop`]    |
 //! | `backstop-warn`     | SessionStart | [`backstop`]    |
+//! | `goal reinject`     | SessionStart | [`goal`]        |
+//! | `goal guard`        | PreToolUse   | [`goal`]        |
+//! | `goal declare/status/clear` | CLI actions | [`goal`] |
 
 /// Outro "no loose ends" backstop: SessionEnd records loose ends, SessionStart warns (#123).
 pub mod backstop;
@@ -40,6 +43,9 @@ pub mod branch_intent;
 pub mod cli;
 /// SessionEnd logger: deregister this session's registry file (#97).
 pub mod end;
+/// The session's declared `main()`: goal CLI verbs, SessionStart re-injection
+/// (survives `/clear` by orphan adoption), and the PreToolUse scope guard.
+pub mod goal;
 /// PreToolUse lane warnings — never blocks.
 pub mod guard;
 /// PostToolUse heartbeat — touches the session's own registry file.

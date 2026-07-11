@@ -36,6 +36,48 @@ pub struct SessionRecord {
     /// Unix epoch seconds of registration — for age math.
     #[serde(default)]
     pub started_epoch: u64,
+    /// The session's declared objective (`goal declare`), when one is set.
+    /// Omitted entirely for goal-less sessions, so a record written by a
+    /// session that never declares a goal serializes byte-identically to the
+    /// pre-goal schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<GoalState>,
+}
+
+/// A declared session objective — the session's `main()`.
+///
+/// Lives inside [`SessionRecord`] (one store, one sweep rule): the goal shares
+/// the record's heartbeat liveness and dies with the session. `goal reinject`
+/// re-primes the model with it at SessionStart; `goal guard` nudges on
+/// mutations outside `scope`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalState {
+    /// The objective, verbatim as declared.
+    pub text: String,
+    /// Repo-relative path prefixes the goal's work is expected to stay inside
+    /// (plain prefix match, no globs). Empty = no mechanical scope guard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
+    /// Unix epoch seconds when the goal was declared.
+    #[serde(default)]
+    pub declared_epoch: u64,
+    /// True when a later goal replaced this one — excluded from re-injection
+    /// and adoption.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
+    /// Set by `session end` when the declaring session ended: the record is
+    /// kept (not deregistered) as an orphan so the `/clear` successor — which
+    /// arrives under a NEW session id — can adopt the goal. Reaped by the
+    /// normal mtime sweep if never adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphaned_epoch: Option<u64>,
+}
+
+impl GoalState {
+    /// True when this goal is live for re-injection/adoption: not superseded.
+    pub fn is_active(&self) -> bool {
+        !self.superseded
+    }
 }
 
 /// Workshop tools and instruments — the Artificer's bench.
@@ -337,6 +379,7 @@ mod tests {
             touching: vec!["crates/guardrails/".into()],
             started: "2026-06-02T01:26:05Z".into(),
             started_epoch: 1_780_000_000,
+            goal: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let back: SessionRecord = serde_json::from_str(&json).unwrap();
@@ -354,6 +397,54 @@ mod tests {
         assert!(!json.contains("branch"), "absent branch omitted: {json}");
         assert!(!json.contains("intent"), "absent intent omitted: {json}");
         assert!(!json.contains("touching"), "empty touching omitted: {json}");
+    }
+
+    #[test]
+    fn goalless_record_serializes_byte_identically_to_pre_goal_schema() {
+        // The plan's compatibility contract: a session that never declares a
+        // goal writes a record with NO goal key — byte-identical to the schema
+        // before GoalState existed.
+        let record = SessionRecord {
+            name: "quiet-loom".into(),
+            session_id: "e4739a12".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("goal"), "no goal key emitted: {json}");
+    }
+
+    #[test]
+    fn goal_record_round_trips_json() {
+        let record = SessionRecord {
+            name: "quiet-loom".into(),
+            session_id: "e4739a12".into(),
+            goal: Some(GoalState {
+                text: "ship the goal primitive".into(),
+                scope: vec!["crates/session/".into()],
+                declared_epoch: 1_780_000_000,
+                superseded: false,
+                orphaned_epoch: None,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, back);
+        assert!(
+            !json.contains("superseded") && !json.contains("orphaned_epoch"),
+            "false/None goal sub-fields omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn goal_state_active_unless_superseded() {
+        let mut goal = GoalState {
+            text: "x".into(),
+            ..Default::default()
+        };
+        assert!(goal.is_active());
+        goal.superseded = true;
+        assert!(!goal.is_active());
     }
 
     #[test]

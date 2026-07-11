@@ -252,27 +252,37 @@ pub fn is_blanket_add(command: &str) -> bool {
     false
 }
 
+/// The path-intersection predicate shared by the peer-lane guard (a `Vec<Peer>`
+/// of `touching` lanes) and the goal scope guard (a `Vec<String>` of `--scope`
+/// prefixes): true when `path` falls inside `prefix`.
+///
+/// `prefix` is a repo-relative path prefix (plain prefix, no globs); `path` may
+/// be absolute or repo-relative. Containment uses a path-boundary check on both
+/// sides, so `crates/guard` never matches `crates/guardrails/`. A blank prefix
+/// matches nothing.
+pub fn path_within(path: &str, prefix: &str) -> bool {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let needle = format!("/{trimmed}/");
+    path.contains(&needle)
+        || path.starts_with(&format!("{trimmed}/"))
+        || path == trimmed
+        || path.ends_with(&format!("/{trimmed}"))
+}
+
 /// If `path` falls inside any live peer's declared `touching` paths, return
 /// the peer's name and the matching lane prefix.
 ///
 /// Lane entries per peer are capped at [`crate::identity::MAX_LANES`] so a
 /// crafted registry file with thousands of entries cannot force unbounded
-/// matching work on every Edit/Write.
+/// matching work on every Edit/Write. Containment itself is [`path_within`] —
+/// the one predicate both this caller and the goal scope guard share.
 pub fn path_in_peer_lane<'a>(path: &str, peers: &'a [Peer]) -> Option<(&'a str, &'a str)> {
     for peer in peers {
         for lane in peer.record.touching.iter().take(crate::identity::MAX_LANES) {
-            let lane_trimmed = lane.trim_end_matches('/');
-            if lane_trimmed.is_empty() {
-                continue;
-            }
-            // `touching` entries are repo-relative; the edited path may be
-            // absolute. Containment with a path-boundary check on both sides.
-            let needle = format!("/{lane_trimmed}/");
-            if path.contains(&needle)
-                || path.starts_with(&format!("{lane_trimmed}/"))
-                || path == lane_trimmed
-                || path.ends_with(&format!("/{lane_trimmed}"))
-            {
+            if path_within(path, lane) {
                 return Some((peer.record.name.as_str(), lane.as_str()));
             }
         }
@@ -591,6 +601,28 @@ mod tests {
         // Path-scoped `-u <pathspec>` only touches matching tracked files.
         assert!(!is_blanket_add("git add -u src/"));
         assert!(!is_blanket_add("git add --update crates/session/"));
+    }
+
+    #[test]
+    fn path_within_boundaries() {
+        // The shared predicate (peer lanes + goal scope): path-boundary
+        // containment, absolute or repo-relative, no substring bleed.
+        assert!(path_within("/repo/src/main.rs", "src/"));
+        assert!(path_within("src/main.rs", "src/"));
+        assert!(path_within("src", "src/"));
+        assert!(path_within("/repo/src", "src"));
+        assert!(!path_within("/repo/srclike/main.rs", "src/"));
+        assert!(!path_within("/repo/other/file.rs", "src/"));
+        assert!(!path_within("/repo/x.rs", ""));
+        assert!(!path_within("/repo/x.rs", "/"));
+        assert!(path_within(
+            "/repo/crates/session/src/goal.rs",
+            "crates/session/"
+        ));
+        assert!(!path_within(
+            "/repo/crates/guardrails/src/lib.rs",
+            "crates/guard"
+        ));
     }
 
     #[test]

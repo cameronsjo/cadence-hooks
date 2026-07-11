@@ -87,6 +87,16 @@ pub fn read_peers(dir: &Path, own_session_id: &str, stale_secs: u64) -> Vec<Peer
         if record.session_id == own_session_id {
             continue;
         }
+        // An orphaned-goal record is a DEAD session's goal awaiting adoption by
+        // its /clear successor (`session end` keeps it instead of deregistering).
+        // It is not a live peer — surfacing it would disclose a phantom.
+        if record
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.orphaned_epoch.is_some())
+        {
+            continue;
+        }
         let idle_secs = mtime_age_secs(&path).unwrap_or(0);
         let age_secs = now.saturating_sub(record.started_epoch);
         peers.push(Peer {
@@ -807,6 +817,80 @@ mod tests {
     #[test]
     fn sweep_missing_directory_is_noop() {
         sweep_stale(Path::new("/nonexistent/sessions"), 0, "", "test");
+    }
+
+    // --- goal records: one store, one sweep rule ---
+
+    fn goal_record(name: &str, session_id: &str, orphaned: bool) -> SessionRecord {
+        let mut rec = record(name, session_id);
+        rec.goal = Some(identity::GoalState {
+            text: "ship the goal primitive".into(),
+            declared_epoch: identity::now_epoch(),
+            orphaned_epoch: orphaned.then(identity::now_epoch),
+            ..Default::default()
+        });
+        rec
+    }
+
+    #[test]
+    fn sweep_keeps_live_goal_record_reaps_dead_one() {
+        // The goal shares the record's mtime liveness — no second sweep rule.
+        // A heartbeat-live goal-bearing record survives; a dead-past-grace one
+        // is reaped exactly like any other record.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &goal_record("old-goal", "dead-session", true)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_record(&dir, &goal_record("live-goal", "live-session", false)).unwrap();
+        test_metrics_env::with_scratch_metrics_dir(|| sweep_stale(&dir, 0, "", "test"));
+        assert!(
+            find_own(&dir, "live-session").is_some(),
+            "heartbeat-live goal record survives the sweep"
+        );
+        assert!(
+            find_own(&dir, "dead-session").is_none(),
+            "dead-past-grace goal record is reaped — the goal dies with the session"
+        );
+    }
+
+    #[test]
+    fn read_peers_skips_orphaned_goal_record() {
+        // An orphaned-goal record is a dead session's handoff, not a live peer —
+        // it must not surface as a phantom in the SessionStart disclosure.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &goal_record("the-orphan", "ended-session", true)).unwrap();
+        write_record(&dir, &record("forge-anvil", "peer-session")).unwrap();
+        let peers = read_peers(&dir, "self", 600);
+        assert_eq!(peers.len(), 1, "orphan skipped, real peer surfaced");
+        assert_eq!(peers[0].record.name, "forge-anvil");
+    }
+
+    #[test]
+    fn read_peers_surfaces_live_goal_bearing_peer() {
+        // A LIVE session with a declared goal is still a normal peer — only the
+        // orphaned marker hides a record from discovery.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &goal_record("goal-holder", "peer-session", false)).unwrap();
+        let peers = read_peers(&dir, "self", 600);
+        assert_eq!(peers.len(), 1, "goal-bearing live peer is disclosed");
+    }
+
+    #[test]
+    fn touch_own_preserves_goal() {
+        // The PostToolUse heartbeat rewrites the record every tool call — it
+        // must never shed a declared goal.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &goal_record("goal-holder", "self-session", false)).unwrap();
+        touch_own(&dir, "self-session", Some("feat/x".into()), false).unwrap();
+        let back = read_own(&dir, "self-session").unwrap();
+        assert_eq!(
+            back.goal.unwrap().text,
+            "ship the goal primitive",
+            "heartbeat preserves the goal"
+        );
     }
 
     // --- sweep telemetry (#259) ---

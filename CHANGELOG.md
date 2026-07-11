@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`goal` — the session's explicit `main()`: a declared objective that survives `/clear` and mechanically nudges scope drift (cameronsjo/cadence#380, PR 1 of 2).** `SessionRecord` gains an optional `GoalState` (`text`, `scope` path prefixes, `declared_epoch`, `superseded`, `orphaned_epoch`); a goal-less record serializes byte-identically to the pre-goal schema. New CLI verbs `goal declare --goal <TEXT> [--scope <PREFIX>]...` / `goal status` / `goal clear` (CLI actions: exempt from hooks.json wiring, `CADENCE_DISABLE`, and `CADENCE_BYPASS`, like `session declare`/`status`). Two new hooks: **`goal reinject`** (SessionStart) re-states the active goal + on-ramp as `additionalContext`, and **`goal guard`** (PreToolUse) nudges — never blocks (ADR-0001) — when an `Edit`/`MultiEdit`/`Write`/`NotebookEdit` targets a path outside the declared scope (plain prefix match via the same path predicate as the peer-lane guard; Bash is deliberately model-policed, and with no `--scope` the guard is inert). `/clear` mints a NEW session id and fires SessionEnd for the old one (re-verified live 2026-07-10), so survival works by **orphan adoption**: `session end` keeps a goal-bearing record (stamped `orphaned_epoch`) instead of deregistering it, `read_peers` hides the orphan from peer disclosure, and the successor's SessionStart (`source == "clear"`/`"compact"`) adopts the freshest orphan within a 5-minute TTL, one-shot — one store, one sweep rule (an unadopted orphan is reaped by the normal mtime sweep). A cold `--resume` under the same id un-orphans its own record, so goals now survive resume too. Kill switches: `CADENCE_GOAL_ENFORCE=off` (global) and `goal clear` (per-session).
+- **`HookInput::file_path()` now resolves NotebookEdit's `notebook_path`** — path-scoped guards see notebook edits like any other file mutation (previously they were invisible to every path guard).
+
+### Changed
+
+- **`session declare`/`goal declare` resolve the session id from `CLAUDE_CODE_SESSION_ID` first** (the variable Claude Code actually exports into Bash tool invocations; the legacy bare `CLAUDE_SESSION_ID` remains as a fallback), so `--session-id` is no longer strictly required inside a session.
+
 ## [0.56.0] - 2026-07-10
 
 ### Added

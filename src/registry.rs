@@ -9,7 +9,7 @@ use cadence_hooks_core::HookEvent;
 pub struct HookEntry {
     pub name: &'static str,
     pub description: &'static str,
-    /// CLI namespace: cadence | guardrails | rules | obsidian | metrics | lab | session
+    /// CLI namespace: cadence | guardrails | rules | obsidian | metrics | lab | session | goal
     pub plugin: &'static str,
     /// Hook event this command serves — drives `try`'s sample-payload shape.
     /// `None` for fire-and-forget loggers, which react to `hook_event_name`
@@ -412,6 +412,19 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: Some(HookEvent::SessionStart),
     },
+    // goal (cadence-canon)
+    HookEntry {
+        name: "reinject",
+        description: "Re-inject the active session goal as context at session start",
+        plugin: "goal",
+        event: Some(HookEvent::SessionStart),
+    },
+    HookEntry {
+        name: "guard",
+        description: "Nudge when an edit lands outside the session goal's declared scope",
+        plugin: "goal",
+        event: Some(HookEvent::PreToolUse),
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
@@ -519,6 +532,15 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "backstop-warn") => {
             Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#)
         }
+        // goal reinject is a SessionStart check; carry a cwd so `try` resolves
+        // a sessions dir instead of the cwd-less event sample.
+        ("goal", "reinject") => Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#),
+        // goal guard only engages on a file mutation; the generic Bash sample
+        // would no-op before the record read. Fail-opens cleanly (no goal
+        // declared for the sample session).
+        ("goal", "guard") => Some(
+            r#"{"session_id":"test","tool_name":"Edit","cwd":"/tmp","tool_input":{"file_path":"/tmp/x.rs"}}"#,
+        ),
         // warn-subagent-worktree only engages on an Agent/Task spawn; the generic
         // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a
         // directory to resolve against.

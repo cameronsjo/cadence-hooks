@@ -8,10 +8,15 @@
 use crate::identity;
 use crate::registry;
 
-/// Resolve this session's id: explicit flag first, then `CLAUDE_SESSION_ID`
-/// (exported by Claude Code into every Bash invocation).
-fn resolve_session_id(flag: Option<String>) -> Option<String> {
-    flag.or_else(|| std::env::var("CLAUDE_SESSION_ID").ok())
+/// Resolve this session's id: explicit flag first, then
+/// `CLAUDE_CODE_SESSION_ID` (the variable Claude Code actually exports into
+/// Bash tool invocations — verified live 2026-07-10), then the legacy
+/// `CLAUDE_SESSION_ID` as a compatibility fallback.
+///
+/// `pub(crate)` so the `goal` CLI verbs resolve identity the same way.
+pub(crate) fn resolve_session_id(flag: Option<String>) -> Option<String> {
+    flag.or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+        .or_else(|| std::env::var("CLAUDE_SESSION_ID").ok())
         .filter(|s| identity::is_safe_session_id(s))
 }
 
@@ -49,7 +54,7 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
     let Some(sid) = resolve_session_id(session_id) else {
         println!(
             "session declare: no session id. Pass --session-id or run inside Claude Code \
-             (CLAUDE_SESSION_ID)."
+             (CLAUDE_CODE_SESSION_ID)."
         );
         return;
     };

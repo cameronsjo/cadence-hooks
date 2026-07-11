@@ -210,6 +210,10 @@ pub struct ToolInput {
     /// means the spawn gets a fresh agent-owned worktree; absent means the
     /// subagent inherits the spawning session's working directory.
     pub isolation: Option<String>,
+    /// NotebookEdit tool: the target `.ipynb` path (NotebookEdit carries
+    /// `notebook_path`, not `file_path`). Resolved by [`HookInput::file_path`]
+    /// so path-scoped guards see notebook edits like any other file mutation.
+    pub notebook_path: Option<String>,
     /// Skill tool: the invoked skill id (e.g. `cadence:attune`).
     pub skill: Option<String>,
     /// Skill tool: the skill's argument string. NEVER logged raw — only a
@@ -276,12 +280,18 @@ impl HookInput {
         serde_json::from_str(&buf).map_err(|e| format!("Failed to parse hook JSON: {e}"))
     }
 
-    /// Resolved file path — checks file_path first, then path.
+    /// Resolved file path — checks file_path first, then path, then
+    /// notebook_path (NotebookEdit's spelling).
     /// Returns a normalized path (trimmed, slashes normalized, null bytes removed).
     pub fn file_path(&self) -> Option<String> {
         self.tool_input
             .as_ref()
-            .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()))
+            .and_then(|ti| {
+                ti.file_path
+                    .as_deref()
+                    .or(ti.path.as_deref())
+                    .or(ti.notebook_path.as_deref())
+            })
             .map(normalize_path)
     }
 

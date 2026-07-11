@@ -84,9 +84,14 @@ enum Commands {
     #[command(subcommand)]
     Session(SessionCommands),
 
+    /// Session goal — declare, inspect, re-inject, and scope-guard the
+    /// session's objective (cadence-canon)
+    #[command(subcommand)]
+    Goal(GoalCommands),
+
     /// Run a hook against a generated sample payload (manual testing)
     Try {
-        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, lab, session)
+        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, lab, session, goal)
         namespace: String,
         /// Hook name (see `cadence-hooks list`)
         subcommand: String,
@@ -343,6 +348,40 @@ enum SessionCommands {
     Status,
 }
 
+#[derive(Subcommand)]
+enum GoalCommands {
+    /// Declare (or replace) this session's goal — its explicit main() (CLI action)
+    Declare {
+        /// The objective, sharp enough to evaluate work against
+        #[arg(long, value_name = "TEXT")]
+        goal: String,
+        /// Repo-relative path prefixes the work should stay inside (repeatable;
+        /// plain prefix match, no globs). Without it the scope guard is inert.
+        #[arg(long, value_name = "PREFIX")]
+        scope: Vec<String>,
+        /// Session id override (defaults to $CLAUDE_CODE_SESSION_ID)
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+    },
+    /// Show this session's goal and scope (CLI action)
+    Status {
+        /// Session id override (defaults to $CLAUDE_CODE_SESSION_ID)
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+    },
+    /// Clear this session's goal — goal complete, or the per-session off switch (CLI action)
+    Clear {
+        /// Session id override (defaults to $CLAUDE_CODE_SESSION_ID)
+        #[arg(long, value_name = "ID")]
+        session_id: Option<String>,
+    },
+    /// Re-inject the active goal as context at session start; adopts the
+    /// predecessor's goal after /clear (SessionStart)
+    Reinject,
+    /// Nudge — never block — when an edit lands outside the goal's declared scope (PreToolUse)
+    Guard,
+}
+
 /// Returns the kebab-case hook name for the resolved subcommand.
 /// These match the CLI names that clap derives from the enum variants.
 fn hook_name(cmd: &Commands) -> Option<&'static str> {
@@ -439,6 +478,20 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             // dismiss-main-branch-warn).
             SessionCommands::Declare { .. } | SessionCommands::Status => return None,
         }),
+        Commands::Goal(g) => Some(match g {
+            // The registry names are "reinject"/"guard" under namespace "goal"
+            // (matching the CLI form doctor cross-references). Note
+            // CADENCE_DISABLE=guard therefore names BOTH `session guard` and
+            // `goal guard` — accepted: both are advisory nudges, and diverging
+            // the disable key from the registry name would be worse.
+            GoalCommands::Reinject => "reinject",
+            GoalCommands::Guard => "guard",
+            // declare/status/clear are CLI actions (same treatment as
+            // session declare/status).
+            GoalCommands::Declare { .. }
+            | GoalCommands::Status { .. }
+            | GoalCommands::Clear { .. } => return None,
+        }),
         Commands::Try { .. }
         | Commands::List
         | Commands::Configure { .. }
@@ -504,11 +557,13 @@ fn print_hook_list() {
 fn main() {
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
-    // Note: `list`, `configure`, `doctor`, `try`, and the session CLI actions
-    // (`declare`, `status`) are exempt — they're CLI/diagnostic commands, not
-    // enforcement paths, and must work always. A bypassed doctor would report
-    // false-clean in CI; a bypassed `session status` would hide live peers
-    // exactly when someone is debugging coordination.
+    // Note: `list`, `configure`, `doctor`, `try`, and the session/goal CLI
+    // actions (`declare`, `status`, `clear`) are exempt — they're
+    // CLI/diagnostic commands, not enforcement paths, and must work always. A
+    // bypassed doctor would report false-clean in CI; a bypassed `session
+    // status` would hide live peers exactly when someone is debugging
+    // coordination; a bypassed `goal declare` would silently drop the goal a
+    // skill just told the user it locked.
     let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
     // Match on subcommand *position* (argv[1], or argv[1]+argv[2] for session
     // CLI actions) — not any argv token, which would let a hook argument that
@@ -518,6 +573,7 @@ fn main() {
         (positional.next().as_deref(), positional.next().as_deref()),
         (Some("list" | "configure" | "doctor" | "try"), _)
             | (Some("session"), Some("declare" | "status"))
+            | (Some("goal"), Some("declare" | "status" | "clear"))
     );
     if bypassed && !bypass_exempt {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
@@ -1094,6 +1150,31 @@ fn main() {
                 cadence_hooks_session::cli::run_status();
             }
         },
+        Commands::Goal(cmd) => match cmd {
+            GoalCommands::Reinject => dispatch::run_logged_check(
+                &cadence_hooks_session::goal::Reinject,
+                session,
+                canonical_hook,
+            ),
+            GoalCommands::Guard => dispatch::run_logged_check(
+                &cadence_hooks_session::goal::ScopeGuard,
+                pre,
+                canonical_hook,
+            ),
+            GoalCommands::Declare {
+                goal,
+                scope,
+                session_id,
+            } => {
+                cadence_hooks_session::goal::run_declare(goal, scope, session_id);
+            }
+            GoalCommands::Status { session_id } => {
+                cadence_hooks_session::goal::run_status(session_id);
+            }
+            GoalCommands::Clear { session_id } => {
+                cadence_hooks_session::goal::run_clear(session_id);
+            }
+        },
     }
 }
 
@@ -1143,6 +1224,7 @@ mod tests {
             "metrics",
             "lab",
             "session",
+            "goal",
         ];
         // clap subcommands that are CLI actions, not hooks (no hooks.json wiring).
         let non_hooks = [
@@ -1150,6 +1232,7 @@ mod tests {
             "dismiss-enforce-worktree",
             "declare",
             "status",
+            "clear",
             "record-polish",
         ];
 
