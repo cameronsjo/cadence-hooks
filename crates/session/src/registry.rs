@@ -238,9 +238,21 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 /// Write (or overwrite) a record's file in the registry. Creates the
 /// directory if needed. Writing refreshes mtime — this *is* the heartbeat.
+///
+/// **Path hardening:** `record.name` becomes a filename component, and on the
+/// read→modify→write paths (heartbeat `touch_own`, SessionEnd orphaning, goal
+/// adoption) it was read from a peer-writable file — a crafted `name` with a
+/// path separator could otherwise steer the write outside the registry dir.
+/// A name that fails the same charset check session ids get is re-derived
+/// deterministically from the session id instead of trusted.
 pub fn write_record(dir: &Path, record: &SessionRecord) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
-    let path = dir.join(identity::filename(&record.name, &record.session_id));
+    let name = if identity::is_safe_session_id(&record.name) {
+        record.name.clone()
+    } else {
+        identity::generate_name(&record.session_id)
+    };
+    let path = dir.join(identity::filename(&name, &record.session_id));
     let json = serde_json::to_string_pretty(record).unwrap_or_else(|_| "{}".to_string());
     atomic_write(&path, (json + "\n").as_bytes())
 }
@@ -567,6 +579,30 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["quiet-loom.e4739a12.json".to_string()]);
+    }
+
+    #[test]
+    fn write_record_rejects_traversal_name() {
+        // A crafted record `name` with a path separator (read back from a
+        // peer-writable file on the read→modify→write paths) must not steer
+        // the write outside the registry dir — the unsafe name is re-derived
+        // from the session id instead.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let rec = SessionRecord {
+            name: "../escape".into(),
+            session_id: "victim-session".into(),
+            ..Default::default()
+        };
+        write_record(&dir, &rec).unwrap();
+        assert!(
+            !tmp.path().join("escape.victim-s.json").exists(),
+            "traversal name must not write outside the registry dir"
+        );
+        assert!(
+            read_own(&dir, "victim-session").is_some(),
+            "record still lands inside the registry under a derived name"
+        );
     }
 
     #[test]

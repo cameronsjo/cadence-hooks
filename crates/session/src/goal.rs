@@ -122,12 +122,13 @@ pub fn run_declare(goal: String, scope: Vec<String>, session_id: Option<String>)
                 render_scope_clause(goal)
             );
             println!(
-                "Re-injected at session start (survives /clear); off-scope edits get a /defer \
-                 nudge{}. `goal clear` when done.",
+                "{} `goal clear` when done.",
                 if goal.scope.is_empty() {
-                    " once a --scope is declared"
+                    "Re-injected at session start (survives /clear); no --scope declared, so the \
+                     off-scope nudge stays inert."
                 } else {
-                    ""
+                    "Re-injected at session start (survives /clear); off-scope edits get a \
+                     /defer nudge."
                 }
             );
         }
@@ -253,17 +254,20 @@ pub fn run_reinject(dir: &Path, sid: &str, source: Option<&str>) -> CheckResult 
 
     if matches!(source, Some("clear") | Some("compact"))
         && let Some((orphan_path, orphan)) = freshest_orphan(dir, sid)
+        // Claim-by-delete: concurrent /clear successors in one checkout race
+        // for the same orphan, and exactly one remove_file succeeds — the
+        // loser backs off (fail open, no adoption) instead of double-adopting,
+        // preserving one-goal-one-owner. Deleting before the write trades a
+        // rare goal loss on a failed record write (the nudge below still
+        // re-primes THIS session either way) for that invariant.
+        && std::fs::remove_file(&orphan_path).is_ok()
     {
         let mut goal = orphan.goal.clone().expect("orphan filter requires goal");
         goal.orphaned_epoch = None;
         let mut own = registry::read_own(dir, sid).unwrap_or_else(|| minimal_record(sid));
-        own.goal = Some(goal);
-        if registry::write_record(dir, &own).is_ok() {
-            // One-shot consume: the goal now lives in the successor's record.
-            let _ = std::fs::remove_file(&orphan_path);
-            let goal = own.goal.as_ref().expect("just set");
-            return CheckResult::nudge(render_reinject(goal));
-        }
+        own.goal = Some(goal.clone());
+        let _ = registry::write_record(dir, &own);
+        return CheckResult::nudge(render_reinject(&goal));
     }
 
     CheckResult::allow()
@@ -399,6 +403,9 @@ pub fn run_scope_guard(input: &HookInput, record: Option<&SessionRecord>) -> Che
     {
         return CheckResult::allow();
     }
+    // `path` is normalize_path-cleaned already; sanitize_field keeps the
+    // interpolation discipline uniform with every other rendered field.
+    let path = identity::sanitize_field(&path, GOAL_DISPLAY_MAX);
     CheckResult::nudge(format!(
         "This edits `{path}`, outside your goal scope (**{}**). Off-goal? Capture it with \
          `/defer` and return to your next step — or say `override`.",
@@ -712,6 +719,48 @@ mod tests {
                 "{tool} out of scope nudges"
             );
         }
+    }
+
+    #[test]
+    fn notebook_edit_real_payload_shape_is_guarded() {
+        // NotebookEdit carries `notebook_path`, not `file_path` — the real
+        // payload shape must reach the scope predicate via the core
+        // file_path() fallback, or notebook edits are invisible to the guard.
+        let rec = guarded_record(&["docs/"]);
+        let input = HookInput {
+            tool_name: Some("NotebookEdit".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                notebook_path: Some("/repo/notebooks/scratch.ipynb".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = run_scope_guard(&input, Some(&rec));
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "out-of-scope NotebookEdit (notebook_path payload) nudges"
+        );
+        assert!(r.message.unwrap().contains("scratch.ipynb"));
+    }
+
+    #[test]
+    fn concurrent_clear_successors_adopt_at_most_once() {
+        // Claim-by-delete: after one successor adopts, the orphan is gone —
+        // a second successor racing on the same orphan backs off cleanly.
+        let tmp = TempDir::new().unwrap();
+        let rec = record_with_goal("quiet-loom", "old-session", "one owner", &[]);
+        registry::write_record(tmp.path(), &rec).unwrap();
+        crate::end::run_end(Some("SessionEnd"), tmp.path(), "old-session");
+
+        let first = run_reinject(tmp.path(), "successor-1", Some("clear"));
+        assert_eq!(first.outcome, Outcome::Nudge, "first successor adopts");
+        let second = run_reinject(tmp.path(), "successor-2", Some("clear"));
+        assert_eq!(
+            second.outcome,
+            Outcome::Allow,
+            "second successor finds no orphan — one goal, one owner"
+        );
     }
 
     #[test]
