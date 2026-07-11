@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`session warn-branch-intent` resolves the current branch through the shared `core::gitstate::GitState` (cadence-hooks#164).** Its gate-2 `git branch --show-current` spawn becomes a pure-filesystem `HEAD` read — the fifth and last family branch resolver (the umbrella's "4" undercounted; this one lives in the `session` crate). A detached HEAD resolves to `None`, which gate 2 already treats identically to the old empty-string result, so verdicts are unchanged. The staleness probes (rev-list ahead-count, tip date) stay `git_command` — facts `GitState` does not carry.
 - **`warn-subagent-worktree` resolves the spawning session's repo and primary-vs-worktree state through the shared `core::gitstate::GitState` (cadence-hooks#164, PR2).** The guard's `git rev-parse --show-toplevel` spawn and its guard-local `.git`-is-dir check collapse onto one pure-filesystem resolution (a git spawn removed, aligning with #271's spawn-reduction); the sibling-worktree count stays a `git worktree list` spawn since it is not a per-path fact (`count_worktrees` lifted to `pub(crate)` for future sharing). The `assess_spawn` decision is untouched — verdicts are characterization-locked, now with a real-repo seam test proving a dispatch from the primary nudges while one from inside a linked worktree does not.
 
 ### Added
