@@ -1,9 +1,17 @@
-//! Gate `/polish` before creating a pull request.
+//! Gate `/polish` before branch work ships for review.
 //!
-//! Fires on `gh pr create`. Polish is mandatory before a PR, so this check reads
-//! a **branch-scoped marker** the polish skill records when it completes
-//! (`cadence-hooks cadence record-polish`), keyed on `(repo_root, branch)`. It
-//! routes a 2-way, fail-open outcome:
+//! Fires on the **ship moment** — `gh pr ready` (leaving draft) or a **non-draft**
+//! `gh pr create` (the legacy direct flow). A `--draft` create is deliberately
+//! NOT an anchor: entry posture (cadence#278) opens a draft PR at worktree entry,
+//! at zero diff, where polish is meaningless — nudging there fires once per branch
+//! with nothing to polish, then never again (#297). `gh pr merge` is also excluded
+//! (an orchestrator often runs it from `main`/another cwd, so the branch
+//! mis-resolves and false-nudges).
+//!
+//! Polish is mandatory before a PR ships, so this check reads a **branch-scoped
+//! marker** the polish skill records when it completes (`cadence-hooks cadence
+//! record-polish`), keyed on `(repo_root, branch)`. It routes a 2-way, fail-open
+//! outcome:
 //!
 //! - a polish marker exists for the PR's branch → **allow** (silent — no nag
 //!   after a real polish run);
@@ -14,7 +22,9 @@
 //! `/polish` slash-command (no `Skill` `tool_use` block to find, #154) and was
 //! branch-blind — a polish on branch A satisfied a PR on branch B (#146). The
 //! marker is invocation-agnostic (Skill call, slash-command, or a delegated
-//! subagent all end by recording it) and branch-scoped by key construction.
+//! subagent all end by recording it) and branch-scoped by key construction — so
+//! whoever runs the ship command on the branch resolves the same marker a
+//! completed `/polish` wrote, session-independently.
 //!
 //! `/polish` runs a branch-scoped pass over the changes vs `origin/main` —
 //! simplify, logging, tests, docs, security, and code review. Skill, agent,
@@ -28,7 +38,7 @@
 //! write has propagated.
 
 use cadence_hooks_core::markers::polish_marker_present;
-use cadence_hooks_core::shell::is_gh_pr_create;
+use cadence_hooks_core::shell::is_polish_ship_anchor;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Gates `/polish` (cadence-forge:polish) before opening a PR — conditional on a
@@ -44,10 +54,11 @@ impl Check for NudgePolishBeforePr {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
-        // Only a `gh pr create` pays the git-resolution cost; every other
-        // command short-circuits to allow inside `decide`.
+        // Only a ship anchor (`gh pr ready` / non-draft `gh pr create`) pays the
+        // git-resolution cost; every other command short-circuits to allow
+        // inside `decide`.
         let marker_present =
-            is_gh_pr_create(command) && polish_marker_present(command, input.cwd.as_deref());
+            is_polish_ship_anchor(command) && polish_marker_present(command, input.cwd.as_deref());
         decide(command, marker_present)
     }
 }
@@ -55,12 +66,12 @@ impl Check for NudgePolishBeforePr {
 /// The pure 2-way conditional — no I/O, so the gate logic is unit-tested without
 /// the filesystem. `run()` resolves the marker and hands the boolean in.
 ///
-/// - non-`gh pr create` → allow.
-/// - `gh pr create` + a branch-scoped polish marker present → allow (silent).
-/// - `gh pr create` + no marker (or unresolved repo/branch/cwd) → nudge
+/// - non-ship-anchor (incl. a `--draft` create and `gh pr merge`) → allow.
+/// - ship anchor + a branch-scoped polish marker present → allow (silent).
+/// - ship anchor + no marker (or unresolved repo/branch/cwd) → nudge
 ///   (fail-open floor, ADR-0001 — CP1 never blocks).
 fn decide(command: &str, marker_present: bool) -> CheckResult {
-    if !is_gh_pr_create(command) {
+    if !is_polish_ship_anchor(command) {
         return CheckResult::allow();
     }
     if marker_present {
@@ -84,7 +95,7 @@ const SCOPE_CLAUSES: &str = "Skill / agent / command / rule markdown and \
 /// Allow + warn; the model proceeds (CP1 fail-open floor, ADR-0001).
 fn nudge_message() -> String {
     format!(
-        "Before opening this PR, consider `/polish` (cadence-forge:polish) — no \
+        "Before this PR ships for review, consider `/polish` (cadence-forge:polish) — no \
          polish has been recorded for this branch this session (`/polish` records \
          a marker when it completes). It's a branch-scoped pass vs `origin/main`: \
          simplify, logging, tests, docs, security, code review. {SCOPE_CLAUSES} \
@@ -157,11 +168,39 @@ mod tests {
     }
 
     #[test]
-    fn decide_non_pr_create_allows_regardless_of_marker() {
+    fn decide_non_ship_anchor_allows_regardless_of_marker() {
         // The matcher only scopes the process spawn; decide() still guards
-        // against a non-create gh command slipping through.
+        // against a non-anchor gh command slipping through.
         assert_eq!(decide("gh pr list", false).outcome, Outcome::Allow);
         assert_eq!(decide("git commit -m x", true).outcome, Outcome::Allow);
+        // `gh pr merge` is excluded — it must not nudge even without a marker.
+        assert_eq!(decide("gh pr merge 12", false).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn decide_draft_create_allows_regardless_of_marker() {
+        // A `--draft` create is not the ship moment (#297) — an entry-posture
+        // draft opens at zero diff, so it must allow even with no marker.
+        assert_eq!(
+            decide("gh pr create --draft", false).outcome,
+            Outcome::Allow
+        );
+        assert_eq!(
+            decide("gh pr create -d --title x", false).outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn decide_pr_ready_routes_like_create() {
+        // `gh pr ready` (leaves draft) is the ship anchor: no marker → nudge,
+        // marker present → silent allow.
+        let nudge = decide("gh pr ready 12", false);
+        assert_eq!(nudge.outcome, Outcome::Nudge);
+        nudge_msg_has_loophole_clauses(&nudge.message.unwrap_or_default());
+        let allow = decide("gh pr ready 12", true);
+        assert_eq!(allow.outcome, Outcome::Allow);
+        assert!(allow.message.is_none());
     }
 
     // --- integration through run() with a real temp git repo (#146 fixture) ---
@@ -230,6 +269,42 @@ mod tests {
     }
 
     #[test]
+    fn run_pr_ready_same_branch_marker_allows_silently() {
+        // The ship anchor end-to-end: `gh pr ready` on a branch whose marker
+        // exists → silent allow, resolved the same way a create would be.
+        let (tmp, root) = init_repo_on_branch("feat/ready");
+        write_marker(&polish_marker(&root, "feat/ready"), "{}").unwrap();
+
+        let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
+        let result = NudgePolishBeforePr.run(&input);
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(
+            result.message.is_none(),
+            "a recorded polish allows silently"
+        );
+    }
+
+    #[test]
+    fn run_pr_ready_no_marker_nudges() {
+        // `gh pr ready` with no marker for the branch → fail-open nudge.
+        let (tmp, _root) = init_repo_on_branch("feat/ready-unmarked");
+        let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
+        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn run_draft_create_allows_even_without_marker() {
+        // A `--draft` create in a resolvable repo with no marker still allows —
+        // the anchor skips drafts before any marker resolution (#297).
+        let (tmp, _root) = init_repo_on_branch("feat/draft");
+        let input = make_bash_with_cwd(
+            "gh pr create --draft --title x",
+            tmp.path().to_str().unwrap(),
+        );
+        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
     fn run_unresolved_cwd_nudges_never_blocks() {
         // No cwd at all → marker unresolved → fail-open nudge (never Block).
         let input = HookInput {
@@ -243,7 +318,7 @@ mod tests {
         assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
     }
 
-    // --- preserved matcher tests (is_gh_pr_create unchanged) ---
+    // --- preserved matcher tests (is_polish_ship_anchor) ---
 
     #[test]
     fn gh_pr_create_with_heredoc_body_nudges() {

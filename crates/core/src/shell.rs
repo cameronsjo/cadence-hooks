@@ -107,18 +107,31 @@ pub fn looks_absolute(p: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
 }
 
-/// Returns true if `command` contains a `gh pr create` token sequence.
+/// True when `command` is about to expose branch work for review: `gh pr ready`
+/// (leaves draft) or a NON-draft `gh pr create`. A `--draft`/`-d` create is NOT
+/// an anchor — an entry-posture draft opens at zero diff, where polish is
+/// meaningless (#297). Shared by the `nudge-polish-before-pr` Check and the
+/// `log-polish-nudge` metrics Logger so the logged denominator equals the
+/// nudge-fire set.
 ///
-/// Whitespace-token based to avoid substring false positives — a branch named
-/// `gh-pr-create-experiments`, or the literal text inside a quoted arg, must not
-/// match. Shared by the `nudge-polish-before-pr` Check (the nudge) and the
-/// `log-polish-nudge` metrics Logger, so the logged denominator is exactly the
-/// set of PRs that fired the nudge.
-pub fn is_gh_pr_create(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    tokens
-        .windows(3)
-        .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == "create")
+/// Built on [`tokenize`] (not `split_whitespace`) so a quoted `gh pr create`
+/// inside a `-m`/`--body` arg collapses to one token and cannot line up in the
+/// 3-window — a branch named `gh-pr-create-experiments`, or that phrase inside a
+/// commit message, must never match.
+pub fn is_polish_ship_anchor(command: &str) -> bool {
+    let tokens = tokenize(command);
+    let is_gh_pr = |sub: &str| {
+        tokens
+            .windows(3)
+            .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == sub)
+    };
+    if is_gh_pr("ready") {
+        return true;
+    }
+    if is_gh_pr("create") {
+        return !tokens.iter().any(|t| t == "--draft" || t == "-d");
+    }
+    false
 }
 
 /// Extract `(host, "owner/repo")` from any git remote URL format.
@@ -1148,20 +1161,46 @@ mod tests {
     }
 
     #[test]
-    fn is_gh_pr_create_matches_the_command() {
-        assert!(is_gh_pr_create("gh pr create --title test"));
-        assert!(is_gh_pr_create("cd repo && gh pr create --fill"));
+    fn is_polish_ship_anchor_matches_non_draft_create() {
+        assert!(is_polish_ship_anchor("gh pr create --title test"));
+        assert!(is_polish_ship_anchor("cd repo && gh pr create --fill"));
+        // `--title x` (non-draft) is an anchor.
+        assert!(is_polish_ship_anchor("gh pr create --title x"));
     }
 
     #[test]
-    fn is_gh_pr_create_rejects_other_gh_and_substrings() {
-        assert!(!is_gh_pr_create("gh pr list"));
-        assert!(!is_gh_pr_create("gh pr view 123"));
-        assert!(!is_gh_pr_create("gh issue create --title x"));
+    fn is_polish_ship_anchor_matches_ready() {
+        // `gh pr ready` leaves draft → the ship moment.
+        assert!(is_polish_ship_anchor("gh pr ready 12"));
+        assert!(is_polish_ship_anchor("cd repo && gh pr ready"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_skips_draft_create() {
+        // An entry-posture draft opens at zero diff — polish is meaningless.
+        assert!(!is_polish_ship_anchor("gh pr create --draft"));
+        assert!(!is_polish_ship_anchor("gh pr create --draft --title x"));
+        assert!(!is_polish_ship_anchor("gh pr create -d --fill"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_rejects_other_gh_and_substrings() {
+        assert!(!is_polish_ship_anchor("gh pr list"));
+        assert!(!is_polish_ship_anchor("gh pr view 123"));
+        // `gh pr merge` is deliberately excluded — often run from main/another
+        // cwd by an orchestrator, so the branch mis-resolves and false-nudges.
+        assert!(!is_polish_ship_anchor("gh pr merge 12"));
+        assert!(!is_polish_ship_anchor("gh issue create --title x"));
         // A branch name containing the literal substring must not match.
-        assert!(!is_gh_pr_create("git checkout gh-pr-create-experiments"));
+        assert!(!is_polish_ship_anchor(
+            "git checkout gh-pr-create-experiments"
+        ));
         // Quoted as a single commit-message arg → tokens don't line up.
-        assert!(!is_gh_pr_create("git commit -m 'gh pr create'"));
+        assert!(!is_polish_ship_anchor("git commit -m 'gh pr create'"));
+        // A quoted `gh pr ready` inside a body arg must not line up either.
+        assert!(!is_polish_ship_anchor(
+            "gh pr comment -b 'run gh pr ready next'"
+        ));
     }
 
     // --- strip_quotes ---
