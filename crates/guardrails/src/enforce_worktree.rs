@@ -415,15 +415,23 @@ fn file_mutation_targets(argv: &[String]) -> Vec<String> {
             if !in_place {
                 return Vec::new();
             }
-            // The file operand is the trailing non-flag token
-            // (`sed -i 's/a/b/' file`). The script is an earlier operand; a
-            // bare `sed -i 's/a/b/'` (no file) is a degenerate miss.
-            argv.iter()
+            // sed's non-flag operands are `[script, file...]`, so a file target
+            // exists only when there are >= 2 of them (script + at least one
+            // file). A bare `sed -i 's/a/b/'` has a single non-flag operand —
+            // the SCRIPT, which is not a file — so it is a true no-file
+            // degenerate miss (edits nothing), not a target. With >= 2, the
+            // file is the trailing operand (multiple files: only the last is
+            // taken — a named accepted miss).
+            let operands: Vec<&String> = argv
+                .iter()
                 .skip(1)
-                .rfind(|t| !t.starts_with('-'))
-                .cloned()
-                .into_iter()
-                .collect()
+                .filter(|t| !t.starts_with('-'))
+                .collect();
+            if operands.len() >= 2 {
+                operands.last().map(|s| (*s).clone()).into_iter().collect()
+            } else {
+                Vec::new()
+            }
         }
         "tee" => argv
             .iter()
@@ -2744,6 +2752,21 @@ mod tests {
     }
 
     #[test]
+    fn sed_in_place_without_file_operand_is_not_a_mutation() {
+        // Code-review finding: a bare `sed -i 's/a/b/'` with NO file operand
+        // edits nothing — its sole non-flag operand is the SCRIPT, not a file.
+        // A file target exists only with >= 2 non-flag operands (script + file).
+        assert!(mutation_targets("sed -i s/a/b/", "/cwd").is_empty());
+        assert!(mutation_targets("sed -i 's/a/b/'", "/cwd").is_empty());
+        assert!(mutation_targets("sed -i.bak 's/a/b/'", "/cwd").is_empty());
+        // …but the script + file form still yields the file (unchanged).
+        assert_eq!(
+            mutation_targets("sed -i s/a/b/ foo.rs", "/cwd"),
+            vec![MutationTarget::File("/cwd/foo.rs".to_string())]
+        );
+    }
+
+    #[test]
     fn tee_targets_every_operand() {
         assert_eq!(
             mutation_targets("tee out.txt", "/cwd"),
@@ -2857,6 +2880,22 @@ mod tests {
         input.cwd = Some(primary.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Nudge, "sed -i in the primary nudges");
+    }
+
+    #[test]
+    fn sed_in_place_without_file_in_primary_is_silent() {
+        // Code-review finding: `sed -i 's/a/b/'` with no file operand mutates
+        // nothing, so it must not nudge even in the primary checkout.
+        let scratch = Scratch::new("mut-sed-nofile");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("sed -i s/a/b/");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "bare sed -i (no file operand) mutates nothing → silent"
+        );
     }
 
     #[test]
