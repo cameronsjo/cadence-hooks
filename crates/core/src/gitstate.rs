@@ -68,17 +68,26 @@ impl GitState {
     /// guard scoping "same repo" that way would silently loosen. `git_dir` stays
     /// raw — it is only used here to read `HEAD`, never compared.
     pub fn resolve(start: &Path) -> Option<GitState> {
-        // git's `-C <dir>` fails on a path that does not exist; mirror that so a
-        // nonexistent `start` (a `cd <not-yet-created> && …` target) resolves to
-        // `None` rather than letting `find_git_root`'s lexical ancestor walk
-        // climb up into the *enclosing* repo and report that repo's state
-        // (cadence-hooks#299). A BLOCK guard consuming this must not resolve a
-        // commit/edit target the shell never reaches. The `enforce-worktree`
-        // Edit/Write arm ascends to the nearest existing ancestor before calling
-        // here, so new-file writes are unaffected.
-        if !start.exists() {
-            return None;
-        }
+        // Canonicalize `start` (resolving symlinks) BEFORE the lexical
+        // `find_git_root` walk, so the walk climbs the **physical** ancestor
+        // chain `git rev-parse` itself would follow. Two facts this closes:
+        //
+        // 1. **Symlinks (security).** `find_git_root` pops path components
+        //    lexically; a symlinked component (`outer/link` → `repo/src`, where
+        //    `outer` is a linked worktree whose `.git` is a *file*) would let the
+        //    lexical ancestor's worktree `.git` win over the physical primary,
+        //    so a commit/edit that lands in the primary would resolve to the
+        //    worktree and ALLOW — a silent loosening of this BLOCK guard. git,
+        //    which follows the symlink physically, resolves the primary and
+        //    BLOCKs. Canonicalizing first makes the walk agree with git.
+        // 2. **Nonexistent start (cadence-hooks#299).** `canonicalize` fails on a
+        //    path that does not exist, so a `cd <not-yet-created> && …` target
+        //    resolves to `None` (matching git's `-C` failure) instead of the
+        //    lexical walk climbing into the enclosing repo — a target the shell
+        //    never reaches. The `enforce-worktree` Edit/Write arm ascends to the
+        //    nearest existing ancestor before calling here, so new-file writes
+        //    are unaffected.
+        let start = std::fs::canonicalize(start).ok()?;
         let repo_root = find_git_root(&start.to_string_lossy())?;
         // Derive the worktree admin dir and common dir from the *raw* root — the
         // filesystem walk needs the real on-disk path — before canonicalizing
@@ -308,6 +317,67 @@ mod tests {
         assert_ne!(sp.repo_root, sw.repo_root);
         assert!(sp.is_primary());
         assert!(sw.is_linked());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_into_primary_resolves_to_primary_not_the_linking_worktree() {
+        // Security regression (enforce-worktree BLOCK-guard loosening found in
+        // the #164 security review): a symlink that sits lexically inside a
+        // linked worktree but points into the PRIMARY tree must resolve to the
+        // primary — matching git's physical walk — not the worktree the symlink
+        // lexically lives under. Before canonicalizing `start`, `find_git_root`'s
+        // lexical pop would stop at the worktree's `.git` FILE (→ is_primary
+        // false), so `cd <symlink> && git commit` into the primary would ALLOW
+        // where git BLOCKs. The `canonicalize(start)` first fixes it.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("repo");
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&primary, &["init", "-q", "-b", "main"]);
+        git(&primary, &["config", "user.email", "t@t"]);
+        git(&primary, &["config", "user.name", "t"]);
+        git(&primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        // A linked worktree (`outer`) whose `.git` is a FILE.
+        let outer = tmp.path().join("outer");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &outer.to_string_lossy(),
+                "-b",
+                "feat/x",
+            ],
+        );
+        // A symlink inside the worktree pointing into the PRIMARY's tree.
+        let link = outer.join("link");
+        std::os::unix::fs::symlink(primary.join("src"), &link).unwrap();
+
+        let state = GitState::resolve(&link).expect("symlink into primary resolves");
+        assert!(
+            state.is_primary(),
+            "a symlink into the primary must resolve to the primary checkout, \
+             not the worktree it lexically sits under"
+        );
+        assert_eq!(
+            state.repo_root,
+            std::fs::canonicalize(&primary).unwrap(),
+            "repo_root is the physical primary, matching git rev-parse"
+        );
     }
 
     #[test]
