@@ -40,10 +40,13 @@ use std::path::Path;
 ///
 /// [`classify`] returns exactly one class per path, resolved by a load-bearing
 /// precedence (see the module docs): the allow-granting carve-outs
-/// ([`Temp`](PathClass::Temp), [`ClaudeManaged`](PathClass::ClaudeManaged),
-/// [`DocsPlans`](PathClass::DocsPlans)) resolve before the block-ish structural
+/// ([`Temp`](PathClass::Temp), [`ClaudeManaged`](PathClass::ClaudeManaged)) —
+/// the two with a live ALLOW consumer — resolve first, then the structural
 /// classes ([`HomeChild`](PathClass::HomeChild), [`GitRoot`](PathClass::GitRoot)),
-/// which resolve before the residual [`Source`](PathClass::Source).
+/// then [`DocsPlans`](PathClass::DocsPlans), then the residual
+/// [`Source`](PathClass::Source). `DocsPlans` sits *below* `GitRoot` on purpose:
+/// it has no ALLOW consumer yet, so a `docs/plans` path that is also a git root
+/// must report the git-root fact (or guard_rm would downgrade a BLOCK to ASK).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathClass {
     /// Under a temp root (`/tmp`, `/private/tmp`, `$TMPDIR`).
@@ -118,16 +121,17 @@ pub fn classify(
 ) -> PathClass {
     let norm = normalize(path);
 
-    // Allow-granting carve-outs first — an allow-class must resolve before an
-    // escalating structural class can match (the prototype's load-bearing order).
+    // Allow-granting carve-outs first — `Temp` and `ClaudeManaged` are the only
+    // classes with a live ALLOW consumer (guard_rm), so they must out-rank the
+    // escalating structural classes: a scratch target under a protected
+    // ancestor (a worktree under `.claude`, a repo in `/tmp`) resolves to its
+    // allow-class before git-root can match. This ordering is load-bearing and
+    // locked by `claude_managed_wins_over_git_root_probe`.
     if path_under_temp_root(Path::new(&norm), ctx.tmpdir) {
         return PathClass::Temp;
     }
     if under_claude_dir(&norm) {
         return PathClass::ClaudeManaged;
-    }
-    if under_docs_plans(&norm) {
-        return PathClass::DocsPlans;
     }
 
     // Structural classes. HomeChild resolves before GitRoot so a home-child that
@@ -136,8 +140,19 @@ pub fn classify(
     if is_first_level_home_child(&norm, ctx.home) {
         return PathClass::HomeChild;
     }
+    // GitRoot resolves BEFORE DocsPlans, unlike the allow-classes above.
+    // `DocsPlans` has no live ALLOW consumer yet (guard_rm treats it as the
+    // ambiguous middle, exactly like `Source`), so a path that is *both* under
+    // `docs/plans/` and a git root must report the git-root fact — otherwise
+    // guard_rm, which has no `DocsPlans` arm, would downgrade a real
+    // `.git`-bearing delete target from BLOCK to ASK, breaking the
+    // byte-identical contract (a docs/plans path that is also a git repo).
+    // Locked by `git_root_under_docs_plans_reports_git_root`.
     if has_git_component(&norm) || is_git_root(&norm) {
         return PathClass::GitRoot;
+    }
+    if under_docs_plans(&norm) {
+        return PathClass::DocsPlans;
     }
 
     PathClass::Source
@@ -290,6 +305,25 @@ mod tests {
         assert_eq!(
             class("/Users/x/repo/docs/plans/2026/q2", "/Users/x"),
             PathClass::DocsPlans
+        );
+    }
+
+    #[test]
+    fn git_root_under_docs_plans_reports_git_root() {
+        // Precedence lock (code-review finding): `DocsPlans` has no ALLOW
+        // consumer, so a path that is BOTH under `docs/plans/` and a git root
+        // must report GitRoot — otherwise guard_rm (no DocsPlans arm) would
+        // downgrade a `.git`-bearing delete target from BLOCK to ASK, breaking
+        // the byte-identical contract. Both the literal `.git` component and the
+        // injected probe must resolve to GitRoot, not DocsPlans.
+        assert_eq!(
+            class("/Users/x/repo/docs/plans/.git", "/Users/x"),
+            PathClass::GitRoot
+        );
+        let probe = |p: &str| p == "/Users/x/repo/docs/plans";
+        assert_eq!(
+            classify("/Users/x/repo/docs/plans", &ctx("/Users/x"), &probe),
+            PathClass::GitRoot
         );
     }
 
