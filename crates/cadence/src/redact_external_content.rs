@@ -14,8 +14,8 @@
 //! terms in an external post — documenting the harness itself, an issue *about*
 //! `cadence:writing-skills`, a commit that renames `tool_input`. The condition
 //! is detectable but the policy is advisory, so this is a nudge. The per-repo
-//! `.claude/redaction.json` `allowlist` is the escape hatch for the recurring
-//! legitimate case.
+//! `.claude/cadence.json` `redaction.allowlist` is the escape hatch for the
+//! recurring legitimate case.
 //!
 //! ## Body extraction (not segment-based)
 //!
@@ -176,9 +176,10 @@ static HARNESS_NOUN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("harness-noun pattern should compile")
 });
 
-/// Per-repo override file, read from `<git-root>/.claude/redaction.json`.
-/// Missing, unreadable, or invalid JSON all deserialize to the default (empty)
-/// config — the check never errors on it (fail-open, ADR-0001).
+/// Per-repo override, read from the `redaction` section of
+/// `<git-root>/.claude/cadence.json` (cadence-hooks#153). Missing file,
+/// unreadable, invalid JSON, or an absent section all deserialize to the
+/// default (empty) config — the check never errors on it (fail-open, ADR-0001).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RedactionConfig {
@@ -298,7 +299,7 @@ impl Check for RedactExternalContent {
     }
 }
 
-/// Resolve the directory to read `.claude/redaction.json` from and to resolve a
+/// Resolve the directory to read `.claude/cadence.json` from and to resolve a
 /// relative `--body-file` path against: the hook's `cwd`, falling back to the
 /// process working directory, then `.`.
 fn resolve_base_dir(input: &HookInput) -> String {
@@ -401,19 +402,18 @@ fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
     cadence_hooks_core::paths::read_untrusted_config(&full)
 }
 
-/// Load `<git-root>/.claude/redaction.json`, walking up from `base_dir` to the
-/// first ancestor containing a `.git` entry (dir or worktree file). Any failure
-/// — no git root, missing/unreadable file, invalid JSON — yields the default
-/// (empty) config.
+/// Load this guard's `redaction` section from `<git-root>/.claude/cadence.json`
+/// (cadence-hooks#153), walking up from `base_dir` to the first ancestor
+/// containing a `.git` entry (dir or worktree file). Any failure — no git root,
+/// missing/unreadable file, invalid JSON, or an absent section — yields the
+/// default (empty) config. The legacy `.claude/redaction.json` is no longer
+/// read (hard cut); `cadence-hooks migrate-config` converts a repo and
+/// `cadence-hooks doctor` warns on an orphaned legacy file.
 fn load_redaction_config(base_dir: &str) -> RedactionConfig {
     let Some(root) = cadence_hooks_core::paths::find_git_root(base_dir) else {
         return RedactionConfig::default();
     };
-    let path = root.join(".claude/redaction.json");
-    let Some(content) = cadence_hooks_core::paths::read_untrusted_config(&path) else {
-        return RedactionConfig::default();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
+    cadence_hooks_core::config::load_cadence_section(&root, "redaction")
 }
 
 /// Resolve the destination-tier ordinal (PURE — env passed as an argument, never
@@ -817,14 +817,23 @@ mod tests {
         );
     }
 
-    // --- Per-repo .claude/redaction.json ---
+    // --- Per-repo .claude/cadence.json `redaction` section ---
 
-    /// Build a temp git root with a `.claude/redaction.json`, returning the root.
-    fn temp_repo_with_config(json: &str) -> tempfile::TempDir {
+    /// Build a temp git root whose `.claude/cadence.json` carries `section_json`
+    /// as its `redaction` section (cadence-hooks#153). `section_json` is the same
+    /// object the legacy `redaction.json` held; it is nested under the
+    /// `redaction` key of the unified file. A malformed `section_json` stays
+    /// malformed once wrapped, so fail-open cases still exercise a broken
+    /// document.
+    fn temp_repo_with_config(section_json: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(dir.path().join(".claude/redaction.json"), json).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/cadence.json"),
+            format!(r#"{{"version":1,"redaction":{section_json}}}"#),
+        )
+        .unwrap();
         dir
     }
 
@@ -907,7 +916,7 @@ mod tests {
 
     #[test]
     fn missing_config_is_fail_open() {
-        // A git root with no redaction.json → no custom patterns, universal
+        // A git root with no cadence.json → no custom patterns, universal
         // categories still apply.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -928,14 +937,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn special_file_config_fails_open_and_does_not_hang() {
-        // #157: a `.claude/redaction.json` symlinked to an endless special file
+        // #157: a `.claude/cadence.json` symlinked to an endless special file
         // (`/dev/zero`) is rejected on stat — the loader falls open to the
         // default config and the universal scan still nudges a skill id, without
         // an unbounded read hanging the hook.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::os::unix::fs::symlink("/dev/zero", dir.path().join(".claude/redaction.json")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join(".claude/cadence.json")).unwrap();
         let cmd = "gh pr create --body \"see cadence:attune\"";
         let input = make_bash_with_cwd(cmd, dir.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
@@ -958,7 +967,7 @@ mod tests {
     // shared JSON/TSV fixture) — the fixture would add setup scope with no
     // parity win here, since Rust and the bash port are separately validated. ---
 
-    /// Parse a `.claude/redaction.json` body into a [`RedactionConfig`].
+    /// Parse a `redaction`-section body into a [`RedactionConfig`].
     fn cfg(json: &str) -> RedactionConfig {
         serde_json::from_str(json).expect("test config should deserialize")
     }

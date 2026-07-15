@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use serde::de::DeserializeOwned;
+
 use crate::paths::read_untrusted_config;
 
 /// Parse a space-or-comma-separated environment variable into a list of values.
@@ -249,6 +251,45 @@ pub fn repo_env_flag(repo_root: &Path, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The single per-repo guard config file, relative to the git root.
+///
+/// One namespaced `.claude/cadence.json` replaces the family of per-guard
+/// `.claude/*.json` files (cadence-hooks#153). Each guard reads its own
+/// top-level section via [`load_cadence_section`]; unknown sections are
+/// ignored (permissive, fail-open), so a `version` envelope plus reserved
+/// keys (`nudges`, #216) can be hand-authored ahead of the loader that reads
+/// them.
+pub const CADENCE_CONFIG_REL: &str = ".claude/cadence.json";
+
+/// Load one guard's section from `<root>/.claude/cadence.json`, deserialized
+/// into the guard's own `T` (each guard keeps its existing `*Config` struct —
+/// no type moves across crates).
+///
+/// Fail-open at every step, mirroring the per-guard loaders it replaces: a
+/// missing file, an unreadable/oversized/special file (via
+/// [`read_untrusted_config`]'s 1 MiB cap + regular-file check), non-UTF-8, a
+/// top-level JSON parse failure, an absent `section`, or a section that does
+/// not shape-match `T` all yield `T::default()` (ADR-0001 — a guard's own
+/// config-read failure must never block the user).
+///
+/// The file is read and parsed once per call. Each guard invokes this with its
+/// own `section` name (`"terminology"`, `"redaction"`), so a repo that reads N
+/// sections re-reads the file N times per tool event — acceptable at N≈2 with a
+/// 1 MiB cap, and it keeps each guard's read independent and fail-open.
+pub fn load_cadence_section<T: Default + DeserializeOwned>(root: &Path, section: &str) -> T {
+    let path = root.join(CADENCE_CONFIG_REL);
+    let Some(content) = read_untrusted_config(&path) else {
+        return T::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return T::default();
+    };
+    value
+        .get(section)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -860,5 +901,121 @@ mod tests {
         let claude_dir = tmp.path().join(".claude");
         std::fs::create_dir_all(claude_dir.join("settings.json")).unwrap();
         assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    // --- load_cadence_section ---
+
+    #[derive(Debug, Default, PartialEq, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SampleSection {
+        #[serde(default)]
+        exemptions: Vec<String>,
+        #[serde(default)]
+        origin_audience: Option<String>,
+    }
+
+    /// Write `body` to `<root>/.claude/cadence.json`.
+    fn write_cadence_config(dir: &std::path::Path, body: &str) {
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("cadence.json"), body).unwrap();
+    }
+
+    #[test]
+    fn load_cadence_section_missing_file_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_reads_present_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            r#"{"version":1,"terminology":{"exemptions":["a.yml","b.yml"]}}"#,
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got.exemptions, vec!["a.yml", "b.yml"]);
+    }
+
+    #[test]
+    fn load_cadence_section_reads_only_its_own_section() {
+        // Two guards share the file; each reads only its slice.
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            r#"{"terminology":{"exemptions":["t.yml"]},"redaction":{"originAudience":"public"}}"#,
+        );
+        let term: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        let redact: SampleSection = load_cadence_section(tmp.path(), "redaction");
+        assert_eq!(term.exemptions, vec!["t.yml"]);
+        assert!(term.origin_audience.is_none());
+        assert_eq!(redact.origin_audience.as_deref(), Some("public"));
+        assert!(redact.exemptions.is_empty());
+    }
+
+    #[test]
+    fn load_cadence_section_absent_section_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(tmp.path(), r#"{"version":1,"redaction":{}}"#);
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_unknown_top_level_keys_ignored() {
+        // The reserved #216 `nudges` key may be hand-authored early; a guard
+        // reading its own section must tolerate keys it doesn't understand.
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            r#"{"version":1,"nudges":{"backstop-warn":{"suppress":true}},"terminology":{"exemptions":["x.yml"]}}"#,
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got.exemptions, vec!["x.yml"]);
+    }
+
+    #[test]
+    fn load_cadence_section_malformed_json_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(tmp.path(), "{not valid json");
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_wrong_shape_is_default() {
+        // The section is present but not the shape `T` expects — fail-open to
+        // default rather than propagating a deserialize error.
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            r#"{"terminology":{"exemptions":"not-an-array"}}"#,
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_directory_at_config_path_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(claude_dir.join("cadence.json")).unwrap();
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_cadence_section_special_file_is_default() {
+        // A cadence.json symlinked to an endless special file is rejected on
+        // stat by read_untrusted_config — no unbounded read, fail-open.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", claude_dir.join("cadence.json")).unwrap();
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
     }
 }

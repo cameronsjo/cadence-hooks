@@ -28,32 +28,49 @@ Each hook is a subcommand; `cadence-hooks list` shows every hook with its event
 and disable status, and `cadence-hooks <namespace> --help` lists a namespace's
 subcommands.
 
-## Per-repo terminology exemptions
+## Per-repo guard config: `.claude/cadence.json`
+
+Per-repo guard softening lives in a single `<git-root>/.claude/cadence.json`,
+each guard reading its own top-level section (`terminology`, `redaction`) under a
+`version: 1` envelope. Unknown top-level keys are ignored, so the file tolerates
+sections a newer binary hasn't shipped yet.
+
+> **Migrating from the pre-unification files.** Earlier versions read separate
+> `.claude/terminology.json` and `.claude/redaction.json` files. Those are **no
+> longer read** — run `cadence-hooks migrate-config` in the repo to merge them
+> into `cadence.json` (it renames each consumed file to `*.json.migrated`), or
+> hand-author `cadence.json`. `cadence-hooks doctor` warns when an orphaned
+> legacy file is still present or when `cadence.json` fails to parse.
+
+### `terminology` — soften the inclusive-terminology block
 
 The `terminology` guard hard-**blocks** a small set of dated terms on every
 `Write`/`Edit` (`whitelist`, `blacklist`, `master branch`/`master node`,
 `slave`, `sanity check`, `dummy value`; `grandfathered` is a softer nudge). That
 block is the right default everywhere. But some files legitimately carry these
 words — a vendor ACL format named `whitelist`, an existing API field, a config
-schema whose key *is* the dated term. A per-repo `<git-root>/.claude/terminology.json`
-softens the block for named files and terms.
+schema whose key *is* the dated term. The `terminology` section softens the
+block for named files and terms.
 
 It can only ever **remove or demote** a violation — never add one. It cannot
 introduce new blocked terms, and it cannot turn the block on for a path the
 built-in baseline already exempts (this repo's own source, `CLAUDE.md`,
-`.claude/hooks`/`rules`). Missing, unreadable, or invalid JSON is ignored and the
-block stands (fail-open, ADR-0001).
+`.claude/hooks`/`rules`). A missing file, unreadable/oversized/special file, or
+invalid JSON is ignored and the block stands (fail-open, ADR-0001).
 
 ```jsonc
 {
-  "exemptions": [
-    {
-      "paths": ["config/acl.yml", "**/firewall-*.yaml", "vendor-list.yml"],
-      "terms": ["whitelist", "blacklist"],
-      "mode": "allow"
-    },
-    { "paths": ["vendor/**"] }
-  ]
+  "version": 1,
+  "terminology": {
+    "exemptions": [
+      {
+        "paths": ["config/acl.yml", "**/firewall-*.yaml", "vendor-list.yml"],
+        "terms": ["whitelist", "blacklist"],
+        "mode": "allow"
+      },
+      { "paths": ["vendor/**"] }
+    ]
+  }
 }
 ```
 
