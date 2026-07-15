@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`enforce-worktree` exempts a commitless (unborn-HEAD) primary checkout, so the first commit of a brand-new repo is no longer blocked with a mechanically-impossible remedy (cadence-hooks#309).** The block turns on `is_primary_checkout` alone, so the very first commit of any fresh `git init`'d repo blocked — yet the remedy the block prints (`git worktree add -b <branch>`) needs a commit to branch from, an unborn HEAD has none, so the bootstrap commit *must* land in the primary checkout. `assess_dir` — the single chokepoint every arm routes through — now exempts a repo with **zero commits reachable from any ref** (`git rev-list --count -n1 --all == 0`, probed lazily on the would-block path only, memoized on `GitProbe`). The predicate keys on "any commit anywhere", **not** the current HEAD: a `git checkout --orphan` / `git update-ref -d HEAD` established repo still has commits (a worktree is still possible off the surviving refs) and still blocks — closing the bypass a naive current-HEAD-unborn test would open. Fails closed via `git_command_detailed`'s tri-state — only an affirmative `Value("0")` exempts; a probe error or deadline timeout keeps the block. Covers all three arms (Edit/Write, the Bash `git commit` channel, and the mutation-nudge channel) with one carve-out; the exemption evaporates at the first commit.
+
 ## [0.58.0] - 2026-07-11
 
 ### Changed

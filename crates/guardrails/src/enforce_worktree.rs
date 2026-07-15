@@ -57,6 +57,14 @@
 //! - Active snooze via `cadence-hooks guardrails dismiss-enforce-worktree
 //!   --for <duration>` — the one-off escape (e.g. committing a plan doc on the
 //!   default branch).
+//! - **Commitless (unborn-HEAD) primary checkout** — a repo with zero commits
+//!   reachable from any ref (a fresh `git init`, before its first commit)
+//!   cannot be worktree'd (`git worktree add -b` needs a commit to branch
+//!   from), so the block's own remedy is impossible and the bootstrap commit
+//!   MUST land here (#309). Keyed on "any commit anywhere" (`rev-list --all`),
+//!   NOT the current HEAD — a `git checkout --orphan` / `git update-ref -d
+//!   HEAD` established repo still has commits and still blocks. The exemption
+//!   evaporates at the first commit.
 //! - Not a git repo, or git unavailable — fail open (ADR-0001).
 //!
 //! Known misses, accepted by design (this is a discipline guard, not a security
@@ -195,6 +203,10 @@ impl RepoAllowMain {
 #[derive(Default)]
 struct GitProbe {
     states: HashMap<PathBuf, Option<GitState>>,
+    /// Memo of the "repo has zero commits anywhere" probe, keyed by the dir
+    /// passed in. `true` = commitless (unborn-HEAD bootstrap). Populated lazily
+    /// on the would-block path only (see [`GitProbe::is_commitless`]).
+    commitless: HashMap<PathBuf, bool>,
 }
 
 impl GitProbe {
@@ -216,6 +228,46 @@ impl GitProbe {
     fn repo_root(&mut self, dir: &Path) -> Option<String> {
         self.state(dir)
             .map(|s| s.repo_root.to_string_lossy().into_owned())
+    }
+
+    /// Does the repo at `dir` have **zero commits reachable from any ref**?
+    /// Memoized (mirrors [`common_dir`]/[`repo_root`]). This is the bootstrap
+    /// exemption's predicate (#309): a genuinely commitless repo can't be
+    /// worktree'd — `git worktree add -b <b>` needs a commit to branch from —
+    /// so the guard's own remedy is impossible and its first commit MUST land
+    /// in the primary checkout.
+    ///
+    /// The predicate keys on "any commit anywhere" (`rev-list --all`), **not**
+    /// the current HEAD: a `git checkout --orphan` / `git update-ref -d HEAD`
+    /// established repo has an unborn *current* HEAD but its commits survive on
+    /// other refs, so a worktree IS still possible there — exempting it would
+    /// reopen the ADR-0030 collision the guard exists to stop. `--count -n1`
+    /// caps the walk at one commit, so this is O(1), not a full-graph count
+    /// (#271 latency discipline).
+    ///
+    /// **Fails closed.** Only an affirmative `Value("0")` is the exempt signal.
+    /// [`git_command_detailed`](cadence_hooks_core::shell::git_command_detailed)
+    /// collapses success-with-empty-output into `Failed`, so a non-empty
+    /// `Value` is the sole outcome distinguishable from a probe error; a commits
+    /// -exist `Value(non-"0")`, a spawn failure / nonzero exit (`Failed`), and a
+    /// deadline `TimedOut` all return `false` → the block stands. (Using the
+    /// plain `git_command` `Option` wrapper would fold a slow-`.git` `TimedOut`
+    /// into the same `None` as unborn and flip an established-repo block to an
+    /// allow — this is the third git spawn under the shared #271 deadline, the
+    /// most likely to be starved.)
+    fn is_commitless(&mut self, dir: &Path) -> bool {
+        if let Some(&cached) = self.commitless.get(dir) {
+            return cached;
+        }
+        let commitless = matches!(
+            cadence_hooks_core::shell::git_command_detailed(
+                &dir.to_string_lossy(),
+                &["rev-list", "--count", "-n1", "--all"],
+            ),
+            cadence_hooks_core::shell::GitQuery::Value(ref v) if v == "0"
+        );
+        self.commitless.insert(dir.to_path_buf(), commitless);
+        commitless
     }
 }
 
@@ -748,6 +800,26 @@ fn assess_dir(
         snoozed,
     );
     if blocked {
+        // Bootstrap exemption (#309): a repo with zero commits *anywhere*
+        // cannot be worktree'd — `git worktree add -b <b>` needs a commit to
+        // branch from — so the block's own remedy is mechanically impossible
+        // and the first/bootstrap commit MUST land in this primary checkout.
+        // The exemption evaporates the moment the repo has its first commit.
+        //
+        // Probed lazily, only on this would-block path (no extra git spawn in
+        // the common worktree/temp/snoozed case — #271), and keyed on "any
+        // commit exists" (`rev-list --all`), NOT the current HEAD: an
+        // orphan-HEAD / HEAD-deleted established repo still has commits and
+        // still blocks. Fails closed — only an affirmative `Value("0")`
+        // exempts; a probe error/timeout keeps the block (see
+        // [`GitProbe::is_commitless`]).
+        //
+        // Plain `allow()` (not `allow_bypassed`): like the temp-root carve-out,
+        // the guard's *premise* doesn't hold here — this is not a user-armed
+        // bypass, so it writes no bypass-log entry.
+        if probe.is_commitless(Path::new(&repo_root)) {
+            return CheckResult::allow();
+        }
         return CheckResult::block(block_message(&repo_root, origin_repo));
     }
 
@@ -3053,6 +3125,209 @@ mod tests {
             r.outcome,
             Outcome::Allow,
             "a read-only command never nudges"
+        );
+    }
+
+    // --- #309: bootstrap-commit exemption (unborn HEAD) ---
+
+    /// A fresh `git init`'d repo on a feature branch with **no commit yet** —
+    /// the bootstrap / unborn-HEAD state. `.git` is a directory so
+    /// `is_primary_checkout` is true, but `rev-list --all` counts zero, so the
+    /// block's own remedy (`git worktree add -b <b>`) is impossible.
+    fn init_commitless_repo(dir: &Path) {
+        git_in(dir, &["init", "-q", "-b", "feat/x"]);
+        git_in(dir, &["config", "user.email", "t@t"]);
+        git_in(dir, &["config", "user.name", "t"]);
+    }
+
+    #[test]
+    fn commitless_primary_exempts_edit_commit_and_mutation_arms() {
+        // The fix: a commitless (unborn-HEAD) primary is exempt on ALL THREE
+        // arms — one carve-out in `assess_dir` covers Edit/Write, the Bash
+        // commit channel, and the mutation-nudge channel.
+        let scratch = Scratch::new("bootstrap-exempt");
+        let repo = scratch.0.join("fresh");
+        std::fs::create_dir(&repo).unwrap();
+        init_commitless_repo(&repo);
+
+        // (a) Edit arm — editing the first file in the bootstrap checkout.
+        let input = edit_in(&repo, &repo.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "Edit in a commitless primary is exempt"
+        );
+        assert!(
+            r.bypass.is_none(),
+            "the bootstrap exemption is a plain allow, not a bypass-log entry"
+        );
+
+        // (b) Bash commit arm — the bootstrap `git commit` MUST land here.
+        let mut input = make_bash("git add -A && git commit -m init");
+        input.cwd = Some(repo.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "the bootstrap commit in a commitless primary is exempt"
+        );
+        assert!(r.bypass.is_none(), "commit-arm exemption is a plain allow");
+
+        // (c) Mutation-nudge arm — a subprocess mutation in a commitless
+        //     primary produces NO nudge (a fresh repo also can't worktree a
+        //     pre-commit `sed -i`/redirect/`uv add`).
+        for cmd in [
+            "uv add serde",
+            "sed -i s/a/b/ src/foo.rs",
+            "echo x > src/tracked.txt",
+        ] {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(repo.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "mutation nudge is suppressed in a commitless primary: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_commit_ends_the_bootstrap_exemption() {
+        // Narrowness control: the exemption is specific to commitless, not a
+        // blanket allow — the very first commit re-arms the block.
+        let scratch = Scratch::new("bootstrap-narrow");
+        let repo = scratch.0.join("fresh");
+        std::fs::create_dir(&repo).unwrap();
+        init_commitless_repo(&repo);
+
+        let input = edit_in(&repo, &repo.join("src.rs"));
+        assert_eq!(
+            run_enforce(&input, &cfg(false, false)).outcome,
+            Outcome::Allow,
+            "commitless → exempt"
+        );
+
+        // Land the first commit; the exemption must evaporate.
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        git_in(&repo, &["add", "f.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "the first commit re-arms the block — exemption is commitless-only"
+        );
+    }
+
+    #[test]
+    fn orphan_head_established_repo_still_blocks() {
+        // Security regression (the load-bearing case): a repo WITH commits
+        // forced to unborn-HEAD via `git checkout --orphan` still has its
+        // commits reachable from the original branch, so a worktree IS still
+        // possible — the block MUST stand. The predicate keys on "any commit
+        // anywhere", not the current HEAD.
+        let scratch = Scratch::new("bootstrap-orphan");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        git_in(&primary, &["checkout", "-q", "--orphan", "tmp-orphan"]);
+
+        // Bash commit arm.
+        let mut input = make_bash("git commit -m x");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "orphan-HEAD with reachable commits still blocks (commit arm)"
+        );
+
+        // Edit arm.
+        let input = edit_in(&primary, &primary.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "orphan-HEAD with reachable commits still blocks (edit arm)"
+        );
+    }
+
+    #[test]
+    fn head_deleted_established_repo_still_blocks() {
+        // The `git update-ref -d HEAD` sibling of the orphan case: HEAD's own
+        // ref is deleted (current HEAD unborn) but a surviving `other` ref
+        // still holds the commit → a worktree is possible off `other` → the
+        // block MUST stand.
+        let scratch = Scratch::new("bootstrap-updateref");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        git_in(&primary, &["branch", "other"]); // second ref keeps the commit
+        git_in(&primary, &["update-ref", "-d", "HEAD"]); // delete HEAD's branch → unborn HEAD
+
+        let mut input = make_bash("git commit -m x");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "HEAD-deleted repo with a surviving ref still blocks"
+        );
+    }
+
+    #[test]
+    fn detached_head_primary_still_blocks() {
+        // Detached-HEAD control: commits exist and HEAD resolves to a sha
+        // (`Value(<sha>)`), so the repo is NOT commitless — proves the
+        // exemption keys on *zero commits*, not on any HEAD-resolution quirk.
+        let scratch = Scratch::new("bootstrap-detached");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        git_in(&primary, &["checkout", "-q", "--detach", "HEAD"]);
+
+        let input = edit_in(&primary, &primary.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "detached-HEAD primary (commits exist) still blocks"
+        );
+    }
+
+    #[test]
+    fn is_commitless_probe_true_only_for_zero_commits() {
+        // Probe unit: true for a fresh `git init`; false after a commit; false
+        // on an established repo forced to orphan-HEAD (commits still exist).
+        // Each fixture uses a fresh `GitProbe` so the memo never masks the
+        // per-repo answer.
+        let scratch = Scratch::new("bootstrap-probe");
+
+        let fresh = scratch.0.join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        init_commitless_repo(&fresh);
+        assert!(
+            GitProbe::default().is_commitless(&fresh),
+            "a fresh git init is commitless"
+        );
+
+        let committed = scratch.0.join("committed");
+        std::fs::create_dir(&committed).unwrap();
+        init_repo(&committed);
+        assert!(
+            !GitProbe::default().is_commitless(&committed),
+            "a committed repo is not commitless"
+        );
+
+        let orphan = scratch.0.join("orphan");
+        std::fs::create_dir(&orphan).unwrap();
+        init_repo(&orphan);
+        git_in(&orphan, &["checkout", "-q", "--orphan", "tmp-orphan"]);
+        assert!(
+            !GitProbe::default().is_commitless(&orphan),
+            "orphan-HEAD established repo is NOT commitless (commits survive on other refs)"
         );
     }
 }
