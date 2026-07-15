@@ -1129,21 +1129,35 @@ fn legacy_config_findings(root: &Path) -> Vec<Finding> {
 fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
     let path = root.join(cadence_hooks_core::config::CADENCE_CONFIG_REL);
     let content = cadence_hooks_core::paths::read_untrusted_config(&path)?;
-    if serde_json::from_str::<serde_json::Value>(&content).is_ok() {
-        return None;
-    }
+    // Two distinct failures both leave every guard on its default config: a
+    // syntax error, and a syntactically-valid but non-object top level. The
+    // latter is silent — `load_cadence_section` reads each section via
+    // `value.get(section)`, which yields nothing for an array/number/string,
+    // so the section lookup falls through to the default with no error.
+    let diagnosis = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(value) if value.is_object() => return None,
+        Ok(_) => {
+            "`.claude/cadence.json` is present but its top level is not a JSON \
+                  object — guards read their section via `value.get(section)`, which \
+                  yields nothing for a non-object, so they fall open to default \
+                  config and their per-repo softening is silently inert"
+        }
+        Err(_) => {
+            "`.claude/cadence.json` is present but not valid JSON — guards \
+                   fall open to default config, so their per-repo softening is \
+                   silently inert"
+        }
+    };
     Some(Finding {
         severity: Severity::Warning,
         plugin: "cadence-hooks".to_string(),
         file: path,
         line: None,
         snippet: "cadence.json".to_string(),
-        diagnosis: "`.claude/cadence.json` is present but not valid JSON — guards \
-                    fall open to default config, so their per-repo softening is \
-                    silently inert"
-            .to_string(),
-        remediation: "fix the JSON syntax; 'cadence-hooks migrate-config' writes a \
-                      valid file from any legacy config"
+        diagnosis: diagnosis.to_string(),
+        remediation: "make `.claude/cadence.json` a valid JSON object; \
+                      'cadence-hooks migrate-config' writes a valid file from any \
+                      legacy config"
             .to_string(),
     })
 }
@@ -2444,6 +2458,20 @@ mod tests {
             r#"{"version":1,"terminology":{"exemptions":[]}}"#,
         )]);
         assert!(cadence_config_parse_finding(dir.path()).is_none());
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_non_object_warns() {
+        // Syntactically-valid JSON whose top level is not an object: every
+        // guard's `value.get(section)` yields nothing, so they silently fall
+        // open to defaults. Doctor must still warn, and distinguish this from
+        // the malformed-JSON case.
+        let dir = seed_claude(&[("cadence.json", "[]")]);
+        let finding =
+            cadence_config_parse_finding(dir.path()).expect("a non-object cadence.json must warn");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(finding.diagnosis.contains("not a JSON object"));
+        assert!(!finding.diagnosis.contains("not valid JSON"));
     }
 
     #[test]
