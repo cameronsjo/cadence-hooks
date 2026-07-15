@@ -12,6 +12,20 @@
 //! branch-mode repo. A linked worktree's `.git` is a file, so worktrees pass
 //! untouched — that is the point.
 //!
+//! **Nudges** (exit 0, #234) — the one advisory tier — when a Bash command runs
+//! a *subprocess tree-mutation* in the session's own primary checkout without a
+//! `git commit`: a package-manager manifest mutator (`uv add`, `cargo add`,
+//! `pip/npm/pnpm/poetry/yarn install|add`, …), a direct file mutator (`sed -i`,
+//! `tee`), or a `>`/`>>` redirect into a tracked file. These writes accumulate
+//! in the shared tree and aren't caught until the eventual `git commit`/`Write`
+//! tripwire, so the nudge raises coverage of that class from silent-allow →
+//! advisory. It never blocks (cannot weaken an existing block), is scoped to the
+//! session's OWN checkout like the Edit/Write arm, honors every exemption below,
+//! and — per the composition contract — is evaluated **only after** the commit
+//! (block) channel finds no block, so `uv add && git commit` into the primary
+//! still BLOCKS rather than double-firing a nudge. It reuses the
+//! `dismiss-enforce-worktree` snooze (no separate dismiss key — D2).
+//!
 //! The two arms differ in *scope* by design (#238). The **Edit/Write arm** only
 //! enforces on the session's **own** checkout — the target file's repo must be
 //! the same repo the session's cwd is in. A write into any *other* repo (a note
@@ -43,11 +57,51 @@
 //! - Active snooze via `cadence-hooks guardrails dismiss-enforce-worktree
 //!   --for <duration>` — the one-off escape (e.g. committing a plan doc on the
 //!   default branch).
+//! - **Commitless (unborn-HEAD) primary checkout** — a repo with zero commits
+//!   reachable from any ref (a fresh `git init`, before its first commit)
+//!   cannot be worktree'd (`git worktree add -b` needs a commit to branch
+//!   from), so the block's own remedy is impossible and the bootstrap commit
+//!   MUST land here (#309). Keyed on "any commit anywhere" (`rev-list --all`),
+//!   NOT the current HEAD — a `git checkout --orphan` / `git update-ref -d
+//!   HEAD` established repo still has commits and still blocks. The exemption
+//!   evaporates at the first commit.
 //! - Not a git repo, or git unavailable — fail open (ADR-0001).
 //!
 //! Known misses, accepted by design (this is a discipline guard, not a security
-//! boundary): file mutations via bash (`sed -i`, redirects) are not inspected —
-//! the `git commit` arm is the persistence backstop; `git --work-tree=…` /
+//! boundary). Subprocess manifest/redirect mutations now **nudge** (#234) — they
+//! are no longer a silent miss — but the nudge's own coverage is a curated
+//! floor, not a fence. Named v1 misses of the mutation-nudge channel, each
+//! degrading to the pre-#234 silent-allow (never a weakened block):
+//! - **Non-enumerated mutator verbs** — `cp`/`mv`/`install` into a tracked path,
+//!   `dd of=…`, `truncate`, `patch`, `ed`/`ex`, `perl -i`, `awk -i inplace`,
+//!   `python -c 'open(p,"w")'`, and the git tree-mutators `git apply|restore|
+//!   rm|mv|stash pop` (not commit boundaries, so the commit flag-walk never
+//!   matches them). The package-manager/`sed`/`tee`/redirect list is a floor;
+//!   widening it is follow-up.
+//! - **`$VAR`/`$(…)`-pathed targets** — `cat > "$OUT"`, `> "$(…)"`: the scoped
+//!   walk carries no assignment expansion (that lives only on the flat
+//!   `command_segments` view, the #228 bypass class this predicate MUST NOT
+//!   use), so the target stays the literal token (`<cwd>/$OUT`). This is
+//!   imprecise both ways: the *intended* file is never resolved (a true target
+//!   is missed), and the literal token's own nearest-existing-ancestor is
+//!   usually the cwd — so if the cwd is in-primary the nudge **over-fires** on
+//!   the wrong path rather than silently missing. Advisory-only, so an
+//!   imprecise nudge is acceptable; widening to the flat expansion view is
+//!   rejected (it is the #228 bypass primitive).
+//! - **Prefix-flag wrappers** — `nice -n 10 <mutator>`, `env -i sh -c '…'`,
+//!   `sudo <mutator>`: the transparent-prefix stripper stops at a prefix whose
+//!   next token is a flag (and `sudo` isn't a transparent prefix here), so the
+//!   mutator is never reached — inherits the commit arm's prefix-flag miss.
+//! - **Depth past the wrapper budget** — a mutator in a 4th `sh -c`/`$(…)` level
+//!   is not reached (shares [`MAX_WRAPPER_DEPTH`]).
+//! - **`sed -i` with multiple files / no file** — only the trailing operand is
+//!   taken as the target; a bare `sed -i 's/…/…/'` (no file) is degenerate.
+//! - **A mutation nudge is suppressed when the same command also carries a
+//!   bypassed `git commit` allow** (a snooze/env exemption on any commit target
+//!   in the command) — the bypass-log record takes precedence, and the same
+//!   exemption suppresses the mutation in that repo anyway.
+//!
+//! Commit-channel (block) misses, unchanged: `git --work-tree=…` /
 //! `--git-dir=…` commit forms skip the check (the target tree cannot be cheaply
 //! resolved — ambiguity fails open). Commits inside `sh -c '…'` wrappers,
 //! `$(…)`/backtick substitutions, and behind `env`/`VAR=value` prefixes ARE
@@ -71,8 +125,10 @@
 
 use crate::dismiss_enforce_worktree;
 use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, child_scripts, resolve_cd_target, split_segments_with_ops, tokenize,
+    MAX_WRAPPER_DEPTH, basename, child_scripts, redirect_targets, resolve_cd_target,
+    split_segments_with_ops, tokenize,
 };
 use cadence_hooks_core::worktree::{is_primary_checkout, is_temp_root, is_truthy, should_block};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
@@ -129,32 +185,89 @@ impl RepoAllowMain {
 // so the enforce-worktree block decision and `session::start`'s posture
 // line share one definition — re-imported above.
 
-/// Per-invocation memo of the two git probes this guard repeats — common dir
-/// and repo root — keyed by directory, so one invocation never asks git the
-/// same question twice (#271: each probe is a subprocess against a possibly
-/// slow `.git`). Constructed fresh per hook invocation — no cross-invocation
-/// cache (mirrors [`RepoAllowMain`]).
+/// Per-invocation memo of the [`GitState`] resolution this guard repeats, keyed
+/// by directory, so one invocation never re-walks the same tree. Constructed
+/// fresh per hook invocation — no cross-invocation cache (mirrors
+/// [`RepoAllowMain`]).
+///
+/// `GitState` replaces the prior `git rev-parse --show-toplevel` /
+/// `--git-common-dir` subprocess probes entirely (cadence-hooks#164): repo
+/// root, shared common dir, and primary-vs-worktree now come from a filesystem
+/// walk, so `enforce-worktree` spawns **zero** `git` for identity and is immune
+/// to a slow/hanging `.git` (the residual #271 exposure). The `common_dir` /
+/// `repo_root` accessors keep their string return types — `GitState`
+/// canonicalizes both to the same `--path-format=absolute` form the old probes
+/// returned, so every call site (same-repo scoping, snooze marker, block
+/// message) is byte-for-byte unchanged. A nonexistent `dir` resolves to `None`,
+/// matching git's `-C` failure (cadence-hooks#299).
 #[derive(Default)]
 struct GitProbe {
-    common_dirs: HashMap<PathBuf, Option<String>>,
-    roots: HashMap<PathBuf, Option<String>>,
+    states: HashMap<PathBuf, Option<GitState>>,
+    /// Memo of the "repo has zero commits anywhere" probe, keyed by the dir
+    /// passed in. `true` = commitless (unborn-HEAD bootstrap). Populated lazily
+    /// on the would-block path only (see [`GitProbe::is_commitless`]).
+    commitless: HashMap<PathBuf, bool>,
 }
 
 impl GitProbe {
-    /// Memoized [`git_common_dir`].
-    fn common_dir(&mut self, dir: &Path) -> Option<String> {
-        self.common_dirs
+    /// Memoized [`GitState::resolve`].
+    fn state(&mut self, dir: &Path) -> Option<GitState> {
+        self.states
             .entry(dir.to_path_buf())
-            .or_insert_with(|| git_common_dir(dir))
+            .or_insert_with(|| GitState::resolve(dir))
             .clone()
     }
 
-    /// Memoized [`repo_root_for`].
+    /// The shared git common dir (canonical), or `None` when `dir` isn't a repo.
+    fn common_dir(&mut self, dir: &Path) -> Option<String> {
+        self.state(dir)
+            .map(|s| s.git_common_dir.to_string_lossy().into_owned())
+    }
+
+    /// The repo root (canonical), or `None` when `dir` isn't a repo.
     fn repo_root(&mut self, dir: &Path) -> Option<String> {
-        self.roots
-            .entry(dir.to_path_buf())
-            .or_insert_with(|| repo_root_for(dir))
-            .clone()
+        self.state(dir)
+            .map(|s| s.repo_root.to_string_lossy().into_owned())
+    }
+
+    /// Does the repo at `dir` have **zero commits reachable from any ref**?
+    /// Memoized (mirrors [`common_dir`]/[`repo_root`]). This is the bootstrap
+    /// exemption's predicate (#309): a genuinely commitless repo can't be
+    /// worktree'd — `git worktree add -b <b>` needs a commit to branch from —
+    /// so the guard's own remedy is impossible and its first commit MUST land
+    /// in the primary checkout.
+    ///
+    /// The predicate keys on "any commit anywhere" (`rev-list --all`), **not**
+    /// the current HEAD: a `git checkout --orphan` / `git update-ref -d HEAD`
+    /// established repo has an unborn *current* HEAD but its commits survive on
+    /// other refs, so a worktree IS still possible there — exempting it would
+    /// reopen the ADR-0030 collision the guard exists to stop. `--count -n1`
+    /// caps the walk at one commit, so this is O(1), not a full-graph count
+    /// (#271 latency discipline).
+    ///
+    /// **Fails closed.** Only an affirmative `Value("0")` is the exempt signal.
+    /// [`git_command_detailed`](cadence_hooks_core::shell::git_command_detailed)
+    /// collapses success-with-empty-output into `Failed`, so a non-empty
+    /// `Value` is the sole outcome distinguishable from a probe error; a commits
+    /// -exist `Value(non-"0")`, a spawn failure / nonzero exit (`Failed`), and a
+    /// deadline `TimedOut` all return `false` → the block stands. (Using the
+    /// plain `git_command` `Option` wrapper would fold a slow-`.git` `TimedOut`
+    /// into the same `None` as unborn and flip an established-repo block to an
+    /// allow — this is the third git spawn under the shared #271 deadline, the
+    /// most likely to be starved.)
+    fn is_commitless(&mut self, dir: &Path) -> bool {
+        if let Some(&cached) = self.commitless.get(dir) {
+            return cached;
+        }
+        let commitless = matches!(
+            cadence_hooks_core::shell::git_command_detailed(
+                &dir.to_string_lossy(),
+                &["rev-list", "--count", "-n1", "--all"],
+            ),
+            cadence_hooks_core::shell::GitQuery::Value(ref v) if v == "0"
+        );
+        self.commitless.insert(dir.to_path_buf(), commitless);
+        commitless
     }
 }
 
@@ -162,6 +275,25 @@ impl GitProbe {
 /// with the accumulated `cd`s and/or a `-C` redirect — see
 /// [`git_commit_targets`]).
 type CommitTarget = String;
+
+/// A resolved subprocess-mutation location surfaced by the same scoped walk
+/// (see [`collect_targets`]). The variant records whether the path is a
+/// **directory** (a package-manager verb's effective cwd) or a **file** (a
+/// `sed -i`/`tee`/redirect target) — the distinction is load-bearing in
+/// [`mutation_nudge`], which must resolve a *file* to its parent directory
+/// before any `git` probe (a `git -C <file> rev-parse` errors "Not a
+/// directory", which silently dropped the nudge for the already-existing
+/// tracked file the feature targets — security-review FIX 1). Assessed for a
+/// **nudge** (never a block) only when it lands in the session's own primary
+/// checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MutationTarget {
+    /// A package-manager verb runs in this directory (already a directory).
+    Dir(String),
+    /// A file mutator (`sed -i`, `tee`) or redirect writes this file path;
+    /// resolve to its parent directory before probing git.
+    File(String),
+}
 
 /// Pure: walk `command` segment by segment (heredoc bodies stripped, quotes
 /// respected — see [`split_segments_with_ops`]), tracking the effective
@@ -211,7 +343,7 @@ type CommitTarget = String;
 /// committing. Wrapper scripts (`sh -c '…'`) and `$(…)`/backtick substitution
 /// bodies DO execute, though — each segment's child scripts are recursed into
 /// with the directory in effect at that segment, in their own `cd` scope (see
-/// [`collect_commit_targets`], issue #228).
+/// [`collect_targets`], issue #228).
 ///
 /// Both the `cd` and `git` arms share one **quote-aware** token stream from
 /// `tokenize`. The pre-fix git arm used quote-blind `split_whitespace`, so a
@@ -280,25 +412,170 @@ fn is_shell_absolute(path: &str) -> bool {
     path.starts_with('/') || Path::new(path).is_absolute()
 }
 
-fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
-    let mut targets = Vec::new();
-    collect_commit_targets(command, cwd, 0, &mut targets);
-    targets
+/// Walk `command` once, returning both output channels: the `git commit`
+/// targets (block channel) and the subprocess-mutation locations (nudge
+/// channel). One walk, two channels — the block channel is evaluated first in
+/// [`run_enforce`] so a `uv add && git commit` into the primary blocks (commit
+/// wins) and never *also* nudges.
+fn scan_targets(command: &str, cwd: &str) -> (Vec<CommitTarget>, Vec<MutationTarget>) {
+    let mut commits = Vec::new();
+    let mut mutations = Vec::new();
+    collect_targets(command, cwd, 0, &mut commits, &mut mutations);
+    (commits, mutations)
 }
 
-/// Recursive worker for [`git_commit_targets`]: walks one script's segments
-/// tracking `effective_dir` across them, and recurses into each segment's
-/// child scripts — a `sh -c '<script>'` wrapper's script, `$(…)`/backtick
-/// substitution bodies — with the directory in effect *at that segment* but a
-/// fresh scope (issue #228). The scoping is load-bearing both ways: a child
-/// inherits the parent's cwd at spawn (so `cd /wt && sh -c 'git commit'`
-/// resolves to `/wt`), while a child's own `cd` never leaks back into this
-/// script's tracking (a flat `command_segments` view would splice
+/// Test-only view of the commit channel (production reads both channels via
+/// [`scan_targets`]); the many commit-parsing tests exercise it directly.
+#[cfg(test)]
+fn git_commit_targets(command: &str, cwd: &str) -> Vec<CommitTarget> {
+    scan_targets(command, cwd).0
+}
+
+/// Test-only view of the mutation channel (production reads both channels via
+/// [`scan_targets`]).
+#[cfg(test)]
+fn mutation_targets(command: &str, cwd: &str) -> Vec<MutationTarget> {
+    scan_targets(command, cwd).1
+}
+
+/// A package-manager subcommand that mutates a manifest/lockfile in its cwd:
+/// `uv add|remove|sync`, `cargo add|rm`, `pip install`, `npm install|i|add`,
+/// `pnpm add|install`, `poetry add`, `yarn add`. Coarse v1 taxonomy — the cwd
+/// being the primary checkout is the sole trigger, no path resolution (a
+/// package manager writes its manifest relative to cwd). `python -m pip …`,
+/// `sudo`-wrapped forms, and unlisted managers are named accepted misses.
+fn is_package_mutation(argv: &[String]) -> bool {
+    let Some(cmd) = argv.first() else {
+        return false;
+    };
+    let sub = argv.get(1).map(String::as_str);
+    matches!(
+        (basename(cmd), sub),
+        ("uv", Some("add" | "remove" | "sync"))
+            | ("cargo", Some("add" | "rm"))
+            | ("pip" | "pip3", Some("install"))
+            | ("npm", Some("install" | "i" | "add"))
+            | ("pnpm", Some("add" | "install"))
+            | ("poetry", Some("add"))
+            | ("yarn", Some("add"))
+    )
+}
+
+/// Target files of a direct in-place mutator verb with a resolvable target:
+/// `sed -i <file>` (requires an in-place flag; the file is the trailing
+/// operand — multiple files catch only the last) and `tee <file>` (every
+/// non-flag operand). Other tree mutators (`cp`/`mv`/`dd`/`patch`/`perl -i`/
+/// `git apply|restore|rm|mv`/…) are named accepted misses — not enumerated.
+fn file_mutation_targets(argv: &[String]) -> Vec<String> {
+    let Some(cmd) = argv.first() else {
+        return Vec::new();
+    };
+    match basename(cmd) {
+        "sed" => {
+            let in_place = argv.iter().any(|t| {
+                t == "-i"
+                    || t.starts_with("-i")
+                    || t == "--in-place"
+                    || t.starts_with("--in-place=")
+            });
+            if !in_place {
+                return Vec::new();
+            }
+            // sed's non-flag operands are `[script, file...]`, so a file target
+            // exists only when there are >= 2 of them (script + at least one
+            // file). A bare `sed -i 's/a/b/'` has a single non-flag operand —
+            // the SCRIPT, which is not a file — so it is a true no-file
+            // degenerate miss (edits nothing), not a target. With >= 2, the
+            // file is the trailing operand (multiple files: only the last is
+            // taken — a named accepted miss).
+            let operands: Vec<&String> = argv
+                .iter()
+                .skip(1)
+                .filter(|t| !t.starts_with('-'))
+                .collect();
+            if operands.len() >= 2 {
+                operands.last().map(|s| (*s).clone()).into_iter().collect()
+            } else {
+                Vec::new()
+            }
+        }
+        "tee" => argv
+            .iter()
+            .skip(1)
+            .filter(|t| !t.starts_with('-'))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve a mutator's target path against the segment's effective dir, the
+/// same way the commit arm resolves a `-C` redirect: an absolute path (POSIX or
+/// Windows-drive via [`is_shell_absolute`]) or a `~`-path stands alone; a
+/// relative path joins onto the effective dir. A `$VAR`/`$(…)`-pathed target
+/// stays unexpanded → resolves to no repo downstream (fail-open miss).
+fn resolve_mutation_target(path: &str, effective_dir: &str) -> String {
+    if path.starts_with('~') {
+        resolve_cd_target(path, effective_dir)
+    } else if is_shell_absolute(path) {
+        path.to_string()
+    } else {
+        format!("{effective_dir}/{path}")
+    }
+}
+
+/// Per-segment mutation detection (#234) — the nudge channel of the scoped
+/// walk. Runs on every non-`cd` segment: package-manager manifest mutators
+/// (keyed on the effective cwd), direct file mutators (`sed -i`/`tee`), and
+/// redirect targets (`>`, `>>`, `>|`, `2>`, … via the shared core parser). All
+/// targets are advisory — the primary-checkout scoping, suppression, and
+/// block-first ordering live in [`run_enforce`]/[`mutation_nudge`].
+fn detect_mutations(
+    argv: &[String],
+    segment: &str,
+    effective_dir: &str,
+    mutations: &mut Vec<MutationTarget>,
+) {
+    if is_package_mutation(argv) {
+        mutations.push(MutationTarget::Dir(effective_dir.to_string()));
+    }
+    for target in file_mutation_targets(argv) {
+        mutations.push(MutationTarget::File(resolve_mutation_target(
+            &target,
+            effective_dir,
+        )));
+    }
+    for target in redirect_targets(segment) {
+        mutations.push(MutationTarget::File(resolve_mutation_target(
+            &target,
+            effective_dir,
+        )));
+    }
+}
+
+/// Recursive worker for [`scan_targets`]: walks one script's segments tracking
+/// `effective_dir` across them, filling **both** output channels per segment —
+/// `targets` (the `git commit` block channel) and `mutations` (the #234
+/// subprocess-mutation nudge channel, via [`detect_mutations`]) — and recurses
+/// into each segment's child scripts (a `sh -c '<script>'` wrapper's script,
+/// `$(…)`/backtick substitution bodies) with the directory in effect *at that
+/// segment* but a fresh scope (issue #228). The scoping is load-bearing both
+/// ways: a child inherits the parent's cwd at spawn (so `cd /wt && sh -c 'git
+/// commit'` resolves to `/wt`), while a child's own `cd` never leaks back into
+/// this script's tracking (a flat `command_segments` view would splice
 /// `$(cd /x)`'s `cd` into the parent stream and misjudge — from a primary
 /// checkout, silently ALLOW — a commit the real shell still runs in the
-/// parent's cwd). Depth shares [`MAX_WRAPPER_DEPTH`] with
-/// `command_segments`'s own expansion budget.
-fn collect_commit_targets(script: &str, cwd: &str, depth: usize, targets: &mut Vec<CommitTarget>) {
+/// parent's cwd). Both channels ride the *same* scoped walk, so the mutation
+/// nudge inherits the #228-safe cd-scoping rather than reintroducing the flat
+/// primitive. Depth shares [`MAX_WRAPPER_DEPTH`] with `command_segments`'s own
+/// expansion budget.
+fn collect_targets(
+    script: &str,
+    cwd: &str,
+    depth: usize,
+    targets: &mut Vec<CommitTarget>,
+    mutations: &mut Vec<MutationTarget>,
+) {
     let mut effective_dir = cwd.to_string();
 
     for (segment, _next_op) in split_segments_with_ops(script) {
@@ -321,7 +598,7 @@ fn collect_commit_targets(script: &str, cwd: &str, depth: usize, targets: &mut V
         // wrapper inherits the cwd accumulated so far — in their own scope.
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, segment) {
-                collect_commit_targets(&child, &effective_dir, depth + 1, targets);
+                collect_targets(&child, &effective_dir, depth + 1, targets, mutations);
             }
         }
 
@@ -353,6 +630,13 @@ fn collect_commit_targets(script: &str, cwd: &str, depth: usize, targets: &mut V
             }
             continue;
         }
+
+        // Subprocess-mutation detection (#234) — the SECOND output channel,
+        // filled alongside commit targets. Runs on every non-`cd` segment
+        // (the `cd` arm `continue`d above), git segments included: a redirect
+        // can ride any command, and `is_package_mutation`/`file_mutation_targets`
+        // key on the verb so a `git commit` never registers as a mutator.
+        detect_mutations(argv, segment, &effective_dir, mutations);
 
         // `argv` is the prefix-/assignment-stripped view computed above
         // (`command`/`env`/`VAR=x git commit` → leading `git`); require it
@@ -441,19 +725,11 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
     msg
 }
 
-/// Resolve the repo root enclosing `dir`, if any.
-fn repo_root_for(dir: &Path) -> Option<String> {
-    cadence_hooks_core::shell::git_command(
-        &dir.to_string_lossy(),
-        &["rev-parse", "--show-toplevel"],
-    )
-}
-
 /// Ascend from `dir` to the nearest ancestor that exists on disk. A `Write` can
 /// name a file in a not-yet-created subtree, so the file's parent dir may not
-/// exist yet — and `git rev-parse` needs a real directory to resolve the repo,
-/// so an unresolvable parent would fail open (`repo_root_for` → `None`) and let
-/// a new-module write into the primary slip past the Edit arm (#239 F1). This
+/// exist yet — and [`GitState::resolve`] returns `None` for a nonexistent path
+/// (cadence-hooks#299), so an unresolved parent would fail open and let a
+/// new-module write into the primary slip past the Edit arm (#239 F1). This
 /// walks up until it hits an existing directory. A `dir` that already exists is
 /// returned unchanged, so the common path is a single `exists()` stat and no
 /// behavior changes for edits to existing files.
@@ -468,19 +744,6 @@ fn nearest_existing_ancestor(dir: &Path) -> PathBuf {
             _ => return dir.to_path_buf(),
         }
     }
-}
-
-/// The absolute git common dir enclosing `dir`, via
-/// `git rev-parse --path-format=absolute --git-common-dir`. Unlike the toplevel
-/// (`repo_root_for`), this is shared across every worktree of one repo (#179),
-/// so it is the right identity for "the session's own repo" in the Edit/Write
-/// scoping (#238). `None` when `dir` isn't in a git repo or git is unavailable —
-/// callers fail open (ADR-0001).
-fn git_common_dir(dir: &Path) -> Option<String> {
-    cadence_hooks_core::shell::git_command(
-        &dir.to_string_lossy(),
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
 }
 
 /// Evaluate one candidate directory: allow, or block with the message.
@@ -537,6 +800,26 @@ fn assess_dir(
         snoozed,
     );
     if blocked {
+        // Bootstrap exemption (#309): a repo with zero commits *anywhere*
+        // cannot be worktree'd — `git worktree add -b <b>` needs a commit to
+        // branch from — so the block's own remedy is mechanically impossible
+        // and the first/bootstrap commit MUST land in this primary checkout.
+        // The exemption evaporates the moment the repo has its first commit.
+        //
+        // Probed lazily, only on this would-block path (no extra git spawn in
+        // the common worktree/temp/snoozed case — #271), and keyed on "any
+        // commit exists" (`rev-list --all`), NOT the current HEAD: an
+        // orphan-HEAD / HEAD-deleted established repo still has commits and
+        // still blocks. Fails closed — only an affirmative `Value("0")`
+        // exempts; a probe error/timeout keeps the block (see
+        // [`GitProbe::is_commitless`]).
+        //
+        // Plain `allow()` (not `allow_bypassed`): like the temp-root carve-out,
+        // the guard's *premise* doesn't hold here — this is not a user-armed
+        // bypass, so it writes no bypass-log entry.
+        if probe.is_commitless(Path::new(&repo_root)) {
+            return CheckResult::allow();
+        }
         return CheckResult::block(block_message(&repo_root, origin_repo));
     }
 
@@ -589,6 +872,97 @@ fn env_switch(var: &str) -> BypassProvenance {
         expires_at: None,
         armed_by_session: None,
     }
+}
+
+/// The subprocess-mutation nudge (#234) — enforce-worktree's first nudge
+/// branch. For each mutation location surfaced by the walk, fire ONLY when it
+/// lands in the session's OWN primary checkout: reuse the Edit/Write arm's
+/// git-common-dir equality scoping (#238) and the `.claude/`/`docs/plans/`
+/// carve-outs, and gate on [`assess_dir`] returning a Block there. Routing
+/// through `assess_dir` folds every existing suppression for free (process/repo
+/// `CADENCE_ALLOW_MAIN`, the `CADENCE_NO_ENFORCE_WORKTREE` kill switch,
+/// temp-root, and the active `dismiss-enforce-worktree` snooze) — an Allow
+/// (exempt, or the target isn't a primary checkout) yields no nudge. Advisory
+/// (exit 0): it never blocks, so it cannot weaken any existing block, and it
+/// reuses the enforce-worktree snooze rather than adding a dismiss key (D2).
+fn mutation_nudge(
+    mutation_targets: &[MutationTarget],
+    cwd: &str,
+    cfg: &EnvConfig,
+    repo_allow: &mut RepoAllowMain,
+    probe: &mut GitProbe,
+) -> Option<CheckResult> {
+    // Scope to the session's own repo (like #238): resolve the cwd's common dir
+    // once. A session not in any repo has no own checkout to protect → no nudge.
+    let cwd_common = probe.common_dir(Path::new(cwd))?;
+    let mut seen: HashSet<String> = HashSet::new();
+    for target in mutation_targets {
+        // Resolve to the directory to assess. A `File` target is resolved to
+        // its PARENT directory first — exactly as the Edit/Write arm does via
+        // `git_dir_for_input`'s `.parent()` — because a `git -C <file>
+        // rev-parse` errors "Not a directory" and `nearest_existing_ancestor`
+        // returns an existing file unchanged (its own `exists()` short-circuits
+        // the ascent), so probing the raw file path silently dropped the nudge
+        // for an already-existing tracked file (security-review FIX 1). A `Dir`
+        // target (a package-manager verb's cwd) is already a directory — taking
+        // its parent would wrongly hop to the enclosing dir, so it is used as-is.
+        let assess_path: PathBuf = match target {
+            MutationTarget::Dir(d) => PathBuf::from(d),
+            MutationTarget::File(f) => Path::new(f)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(f)),
+        };
+        if !seen.insert(assess_path.to_string_lossy().into_owned()) {
+            continue;
+        }
+        // Same `.claude/`/`docs/plans/` carve-outs as the Edit/Write arm — a
+        // mutation into Claude-managed state or an approved plan doc is exempt.
+        // Checked on the containing dir, matching the Edit arm (which checks the
+        // file's `git_dir_for_input` parent), so a `.claude/`-component path is
+        // still caught.
+        if is_claude_managed_dir(&assess_path) || is_plan_doc_dir(&assess_path) {
+            continue;
+        }
+        // A redirect/verb target may name a file in a not-yet-created subtree;
+        // ascend to the nearest existing dir so repo resolution works (mirrors
+        // the Edit arm, which runs `nearest_existing_ancestor` after `.parent()`).
+        let dir = nearest_existing_ancestor(&assess_path);
+        // Same repo as the session? (git common dir equality, #238/#179.) A
+        // mutation into a foreign repo or a temp dir git can't resolve is out
+        // of scope, exactly like a foreign Edit/Write drop.
+        match probe.common_dir(&dir) {
+            Some(target_common) if target_common == cwd_common => {}
+            _ => continue,
+        }
+        // Would a mutation here BLOCK? assess_dir folds every suppression; a
+        // Block means an un-exempted primary checkout → nudge. `origin_repo` is
+        // None — there is no cross-repo redirect to attribute in the message.
+        if assess_dir(&dir, cfg, None, repo_allow, probe).outcome == Outcome::Block {
+            let repo = probe
+                .repo_root(&dir)
+                .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            return Some(CheckResult::nudge(mutation_nudge_message(&repo)));
+        }
+    }
+    None
+}
+
+/// The nudge message: names the checkout, the accumulate-before-tripwire
+/// rationale, the worktree fix, and the shared-snooze escape (the nudge reuses
+/// the enforce-worktree snooze — no separate dismiss key, per D2).
+fn mutation_nudge_message(repo_root: &str) -> String {
+    format!(
+        "enforce-worktree: this command mutates tracked files in the primary checkout \
+         `{repo_root}` via a subprocess (package install, `sed -i`, or a redirect).\n\
+         These writes accumulate in the shared primary tree and aren't caught until the eventual \
+         `git commit` — by which point unwinding them is costly.\n\
+         Prefer a worktree: `git worktree add .claude/worktrees/<slug> -b feat/<slug>` \
+         (or EnterWorktree), then run it there.\n\
+         Silence subprocess-mutation nudges for a bit: \
+         `cadence-hooks guardrails dismiss-enforce-worktree --for 30m`."
+    )
 }
 
 /// Testable core: assess the hook input under the given environment.
@@ -669,11 +1043,17 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // recorded (every existing provenance test drove the Edit arm, so
             // this Bash-arm gap went unseen until the repo-settings case).
             let mut bypassed: Option<CheckResult> = None;
+            // One walk, two channels (#234): commit targets (block) and
+            // subprocess-mutation locations (nudge). The commit channel is
+            // evaluated FIRST — the composition contract is block-first: a
+            // `uv add && git commit` into the primary must BLOCK (commit wins),
+            // never double-fire a nudge.
+            let (commit_targets, mutation_targets) = scan_targets(command, cwd);
             // Dedup identical targets so a pathological command (`git commit;`
             // ×N) can't fan out into N synchronous `git rev-parse` spawns and
             // stall the hook — each distinct target is assessed once (#239 F11).
             let mut seen: HashSet<String> = HashSet::new();
-            for target in git_commit_targets(command, cwd) {
+            for target in commit_targets {
                 if !seen.insert(target.clone()) {
                     continue;
                 }
@@ -691,6 +1071,18 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                 if result.bypass.is_some() && bypassed.is_none() {
                     bypassed = Some(result);
                 }
+            }
+            // No commit blocked. The mutation nudge fires ONLY IF no commit
+            // rode a bypass either — a snooze/env exemption on any commit in the
+            // command also suppresses the mutation in the same repo, so a
+            // bypassed-commit allow implies a suppressed nudge; deferring to it
+            // preserves the bypass-log record (a Nudge carries no provenance).
+            // enforce-worktree's first nudge branch.
+            if bypassed.is_none()
+                && let Some(nudge) =
+                    mutation_nudge(&mutation_targets, cwd, cfg, &mut repo_allow, &mut probe)
+            {
+                return nudge;
             }
             bypassed.unwrap_or_else(CheckResult::allow)
         }
@@ -1823,9 +2215,9 @@ mod tests {
 
     #[test]
     fn missing_dir_fails_open() {
-        // A directory git cannot resolve (nonexistent path) → no repo root →
-        // allow. ADR-0001: the guard's own failure never blocks.
-        assert!(repo_root_for(Path::new("/nonexistent-enforce-worktree")).is_none());
+        // A nonexistent path → GitState resolves no repo → allow. ADR-0001:
+        // the guard's own failure never blocks.
+        assert!(GitState::resolve(Path::new("/nonexistent-enforce-worktree")).is_none());
         let input = make_edit("/nonexistent-enforce-worktree/f.rs", "a", "b");
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(r.outcome, Outcome::Allow);
@@ -2084,12 +2476,20 @@ mod tests {
             "settings.json",
             r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
         );
-        let declaring_root = repo_root_for(&declaring).unwrap();
+        let declaring_root = GitState::resolve(&declaring)
+            .unwrap()
+            .repo_root
+            .to_string_lossy()
+            .into_owned();
 
         let plain = scratch.0.join("plain");
         std::fs::create_dir(&plain).unwrap();
         init_repo(&plain);
-        let plain_root = repo_root_for(&plain).unwrap();
+        let plain_root = GitState::resolve(&plain)
+            .unwrap()
+            .repo_root
+            .to_string_lossy()
+            .into_owned();
 
         let mut memo = RepoAllowMain::default();
         assert!(
@@ -2347,6 +2747,587 @@ mod tests {
             r.outcome,
             Outcome::Allow,
             "worktree commits allow; repeated targets deduped"
+        );
+    }
+
+    // --- #234: subprocess-mutation detection (pure parsing) ---
+
+    #[test]
+    fn package_manager_mutation_targets_cwd() {
+        // A package-manager manifest mutator: cwd is the sole trigger, so the
+        // representative mutation location is the effective cwd.
+        assert_eq!(
+            mutation_targets("uv add serde", "/cwd"),
+            vec![MutationTarget::Dir("/cwd".to_string())]
+        );
+        for cmd in [
+            "cargo add serde",
+            "cargo rm serde",
+            "pip install requests",
+            "npm install",
+            "npm i lodash",
+            "npm add lodash",
+            "pnpm add react",
+            "poetry add httpx",
+            "yarn add left-pad",
+            "uv sync",
+            "uv remove serde",
+        ] {
+            assert_eq!(
+                mutation_targets(cmd, "/cwd"),
+                vec![MutationTarget::Dir("/cwd".to_string())],
+                "package mutator not detected: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_manager_read_only_subcommands_are_not_mutations() {
+        // Read-only / non-mutating package-manager verbs must stay silent.
+        for cmd in [
+            "cargo build",
+            "cargo test",
+            "npm run build",
+            "npm ls",
+            "pip list",
+            "uv pip list",
+            "yarn install", // yarn install (no add) is not in the v1 list
+        ] {
+            assert!(
+                mutation_targets(cmd, "/cwd").is_empty(),
+                "false mutation on read-only verb: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn sed_in_place_targets_the_file() {
+        assert_eq!(
+            mutation_targets("sed -i s/a/b/ src/foo.rs", "/cwd"),
+            vec![MutationTarget::File("/cwd/src/foo.rs".to_string())]
+        );
+        // `-i.bak` (suffix form) still counts as in-place.
+        assert_eq!(
+            mutation_targets("sed -i.bak 's/a/b/' src/foo.rs", "/cwd"),
+            vec![MutationTarget::File("/cwd/src/foo.rs".to_string())]
+        );
+        // An absolute target stands alone.
+        assert_eq!(
+            mutation_targets("sed -i s/a/b/ /abs/foo.rs", "/cwd"),
+            vec![MutationTarget::File("/abs/foo.rs".to_string())]
+        );
+    }
+
+    #[test]
+    fn sed_without_in_place_is_not_a_mutation() {
+        // No `-i` → sed writes to stdout, not the file.
+        assert!(mutation_targets("sed s/a/b/ src/foo.rs", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn sed_in_place_without_file_operand_is_not_a_mutation() {
+        // Code-review finding: a bare `sed -i 's/a/b/'` with NO file operand
+        // edits nothing — its sole non-flag operand is the SCRIPT, not a file.
+        // A file target exists only with >= 2 non-flag operands (script + file).
+        assert!(mutation_targets("sed -i s/a/b/", "/cwd").is_empty());
+        assert!(mutation_targets("sed -i 's/a/b/'", "/cwd").is_empty());
+        assert!(mutation_targets("sed -i.bak 's/a/b/'", "/cwd").is_empty());
+        // …but the script + file form still yields the file (unchanged).
+        assert_eq!(
+            mutation_targets("sed -i s/a/b/ foo.rs", "/cwd"),
+            vec![MutationTarget::File("/cwd/foo.rs".to_string())]
+        );
+    }
+
+    #[test]
+    fn tee_targets_every_operand() {
+        assert_eq!(
+            mutation_targets("tee out.txt", "/cwd"),
+            vec![MutationTarget::File("/cwd/out.txt".to_string())]
+        );
+        // `-a` (append) still mutates; flags are skipped.
+        assert_eq!(
+            mutation_targets("tee -a out.txt", "/cwd"),
+            vec![MutationTarget::File("/cwd/out.txt".to_string())]
+        );
+    }
+
+    #[test]
+    fn redirect_clobber_and_append_both_detected() {
+        // Both `>` and `>>` are covered in v1 (proves append coverage via the
+        // shared core `redirect_targets`, not the clobber-only parser).
+        assert_eq!(
+            mutation_targets("echo x > src/tracked.txt", "/cwd"),
+            vec![MutationTarget::File("/cwd/src/tracked.txt".to_string())]
+        );
+        assert_eq!(
+            mutation_targets("echo x >> src/tracked.txt", "/cwd"),
+            vec![MutationTarget::File("/cwd/src/tracked.txt".to_string())]
+        );
+    }
+
+    #[test]
+    fn read_only_and_commit_segments_yield_no_mutation() {
+        // A plain read, and a `git commit` (the block channel, not a mutation),
+        // contribute nothing to the mutation channel.
+        assert!(mutation_targets("cat src/foo.rs", "/cwd").is_empty());
+        assert!(mutation_targets("git status", "/cwd").is_empty());
+        assert!(mutation_targets("git commit -m x", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn cd_scopes_mutation_target_like_commit() {
+        // A leading `cd` moves the effective dir for the mutation, exactly as
+        // for a commit — reusing the same scoped walk.
+        assert_eq!(
+            mutation_targets("cd /wt && uv add serde", "/cwd"),
+            vec![MutationTarget::Dir("/wt".to_string())]
+        );
+        assert_eq!(
+            mutation_targets("cd /wt && echo x > f", "/cwd"),
+            vec![MutationTarget::File("/wt/f".to_string())]
+        );
+    }
+
+    #[test]
+    fn wrapper_cd_does_not_leak_to_outer_mutation() {
+        // #228-safe scoping: a child `sh -c 'cd /elsewhere'` never moves the
+        // parent's effective dir, so the outer redirect still targets cwd —
+        // the mutation channel inherits the commit channel's cd isolation.
+        assert_eq!(
+            mutation_targets("sh -c 'cd /elsewhere' && echo x > f", "/cwd"),
+            vec![MutationTarget::File("/cwd/f".to_string())]
+        );
+    }
+
+    #[test]
+    fn mutation_inside_sh_c_wrapper_detected() {
+        // A mutation inside a `sh -c '…'` wrapper executes — the child-script
+        // recursion surfaces it, scoped to the wrapper's inherited cwd.
+        assert_eq!(
+            mutation_targets("sh -c 'uv add serde'", "/cwd"),
+            vec![MutationTarget::Dir("/cwd".to_string())]
+        );
+        assert_eq!(
+            mutation_targets("cd /wt && sh -c 'echo x > f'", "/cwd"),
+            vec![MutationTarget::File("/wt/f".to_string())]
+        );
+    }
+
+    // --- #234: subprocess-mutation nudge (end-to-end against real repos) ---
+
+    #[test]
+    fn package_mutation_in_primary_nudges_and_in_worktree_is_silent() {
+        let scratch = Scratch::new("mut-uv");
+        let (primary, wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash("uv add serde");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "uv add in the primary checkout nudges"
+        );
+        assert!(
+            r.message.unwrap().contains("worktree"),
+            "nudge names the worktree fix"
+        );
+
+        // The same in a linked worktree is not a primary checkout → silent.
+        let mut input = make_bash("uv add serde");
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "uv add in a worktree is fine — not a primary checkout"
+        );
+    }
+
+    #[test]
+    fn sed_in_place_in_primary_nudges() {
+        let scratch = Scratch::new("mut-sed");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("sed -i s/a/b/ src/foo.rs");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Nudge, "sed -i in the primary nudges");
+    }
+
+    #[test]
+    fn sed_in_place_without_file_in_primary_is_silent() {
+        // Code-review finding: `sed -i 's/a/b/'` with no file operand mutates
+        // nothing, so it must not nudge even in the primary checkout.
+        let scratch = Scratch::new("mut-sed-nofile");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("sed -i s/a/b/");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "bare sed -i (no file operand) mutates nothing → silent"
+        );
+    }
+
+    #[test]
+    fn existing_tracked_file_mutations_in_primary_nudge() {
+        // Security-review FIX 1: the headline case — a mutator into a file that
+        // ALREADY EXISTS (the tracked file the feature is FOR). Pre-fix, feeding
+        // the raw file path to `nearest_existing_ancestor` returned the FILE
+        // (its own exists() short-circuits the ascent), then `git -C <file>
+        // rev-parse` failed "Not a directory" → common_dir None → silent Allow.
+        // The fix takes the file's `.parent()` first, mirroring `git_dir_for_input`.
+        let scratch = Scratch::new("mut-existing");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        // `f.txt` is committed by init_repo; add a committed nested file too.
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        std::fs::write(primary.join("src/foo.rs"), "fn main() {}\n").unwrap();
+        git_in(&primary, &["add", "src/foo.rs"]);
+        git_in(&primary, &["commit", "-q", "-m", "add src/foo.rs"]);
+
+        for cmd in [
+            "sed -i s/a/b/ src/foo.rs", // existing nested file
+            "echo x > src/foo.rs",      // clobber an existing file
+            "echo x >> f.txt",          // append to an existing root file
+            "tee f.txt",                // tee onto an existing file
+        ] {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Nudge,
+                "mutating an EXISTING tracked file must nudge: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_into_primary_nudges_clobber_and_append() {
+        let scratch = Scratch::new("mut-redirect");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash("echo x > src/tracked.txt");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Nudge, "clobber redirect nudges");
+
+        let mut input = make_bash("echo x >> src/tracked.txt");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "append redirect nudges too (>> covered in v1)"
+        );
+    }
+
+    #[test]
+    fn redirect_into_temp_is_silent() {
+        // A redirect whose target is outside the session's repo (a `/tmp`
+        // scratch file) is out of scope — no nudge.
+        let scratch = Scratch::new("mut-redirect-temp");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("echo x > /tmp/scratch-234-probe");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a redirect into /tmp is a foreign target → silent"
+        );
+    }
+
+    #[test]
+    fn mutation_then_commit_in_primary_still_blocks_no_double_fire() {
+        // Composition contract: block-first. `uv add && git commit` into the
+        // primary BLOCKS on the commit — the mutation nudge never fires.
+        let scratch = Scratch::new("mut-and-commit");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("uv add serde && git commit -m x");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "commit wins — block-first, no nudge double-fire"
+        );
+    }
+
+    #[test]
+    fn foreign_repo_mutation_is_silent() {
+        // A mutation whose effective cwd resolves into a DIFFERENT repo than the
+        // session's own is a foreign drop → silent, mirroring the Edit/Write arm.
+        let scratch = Scratch::new("mut-foreign");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let foreign = scratch.0.join("foreign-repo");
+        std::fs::create_dir(&foreign).unwrap();
+        init_repo(&foreign);
+
+        // Relative `cd` (not the absolute fixture path): a Windows fixture path
+        // interpolated here is `C:\…\foreign-repo`, whose backslashes bash
+        // treats as escapes, so the `cd` silently fails on Git Bash and the
+        // mutation resolves back in the session's own repo → false nudge on
+        // windows-latest. `../foreign-repo` is separator-agnostic and resolves
+        // against the effective cwd (`primary_a` == `<scratch>/repo`) → the
+        // sibling `<scratch>/foreign-repo` on every platform.
+        let mut input = make_bash("cd ../foreign-repo && uv add serde");
+        input.cwd = Some(primary_a.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a mutation in a foreign repo is out of scope → silent"
+        );
+    }
+
+    #[test]
+    fn mutation_suppressions_silence_the_nudge() {
+        let scratch = Scratch::new("mut-suppress");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let bash_uv = |dir: &Path| {
+            let mut input = make_bash("uv add serde");
+            input.cwd = Some(dir.to_string_lossy().into_owned());
+            input
+        };
+
+        // CADENCE_ALLOW_MAIN → silent.
+        let r = run_enforce(&bash_uv(&primary), &cfg(true, false));
+        assert_eq!(r.outcome, Outcome::Allow, "CADENCE_ALLOW_MAIN silences");
+
+        // CADENCE_NO_ENFORCE_WORKTREE kill switch → silent.
+        let r = run_enforce(&bash_uv(&primary), &cfg(false, true));
+        assert_eq!(r.outcome, Outcome::Allow, "kill switch silences");
+
+        // Active snooze → silent.
+        let marker = dismiss_enforce_worktree::marker_path_for(&primary).unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        std::fs::write(&marker, format!("{until}\n")).unwrap();
+        let r = run_enforce(&bash_uv(&primary), &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow, "active snooze silences");
+    }
+
+    #[test]
+    fn read_only_command_in_primary_is_silent() {
+        let scratch = Scratch::new("mut-readonly");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("cat src/foo.rs && git status");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a read-only command never nudges"
+        );
+    }
+
+    // --- #309: bootstrap-commit exemption (unborn HEAD) ---
+
+    /// A fresh `git init`'d repo on a feature branch with **no commit yet** —
+    /// the bootstrap / unborn-HEAD state. `.git` is a directory so
+    /// `is_primary_checkout` is true, but `rev-list --all` counts zero, so the
+    /// block's own remedy (`git worktree add -b <b>`) is impossible.
+    fn init_commitless_repo(dir: &Path) {
+        git_in(dir, &["init", "-q", "-b", "feat/x"]);
+        git_in(dir, &["config", "user.email", "t@t"]);
+        git_in(dir, &["config", "user.name", "t"]);
+    }
+
+    #[test]
+    fn commitless_primary_exempts_edit_commit_and_mutation_arms() {
+        // The fix: a commitless (unborn-HEAD) primary is exempt on ALL THREE
+        // arms — one carve-out in `assess_dir` covers Edit/Write, the Bash
+        // commit channel, and the mutation-nudge channel.
+        let scratch = Scratch::new("bootstrap-exempt");
+        let repo = scratch.0.join("fresh");
+        std::fs::create_dir(&repo).unwrap();
+        init_commitless_repo(&repo);
+
+        // (a) Edit arm — editing the first file in the bootstrap checkout.
+        let input = edit_in(&repo, &repo.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "Edit in a commitless primary is exempt"
+        );
+        assert!(
+            r.bypass.is_none(),
+            "the bootstrap exemption is a plain allow, not a bypass-log entry"
+        );
+
+        // (b) Bash commit arm — the bootstrap `git commit` MUST land here.
+        let mut input = make_bash("git add -A && git commit -m init");
+        input.cwd = Some(repo.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "the bootstrap commit in a commitless primary is exempt"
+        );
+        assert!(r.bypass.is_none(), "commit-arm exemption is a plain allow");
+
+        // (c) Mutation-nudge arm — a subprocess mutation in a commitless
+        //     primary produces NO nudge (a fresh repo also can't worktree a
+        //     pre-commit `sed -i`/redirect/`uv add`).
+        for cmd in [
+            "uv add serde",
+            "sed -i s/a/b/ src/foo.rs",
+            "echo x > src/tracked.txt",
+        ] {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(repo.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "mutation nudge is suppressed in a commitless primary: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_commit_ends_the_bootstrap_exemption() {
+        // Narrowness control: the exemption is specific to commitless, not a
+        // blanket allow — the very first commit re-arms the block.
+        let scratch = Scratch::new("bootstrap-narrow");
+        let repo = scratch.0.join("fresh");
+        std::fs::create_dir(&repo).unwrap();
+        init_commitless_repo(&repo);
+
+        let input = edit_in(&repo, &repo.join("src.rs"));
+        assert_eq!(
+            run_enforce(&input, &cfg(false, false)).outcome,
+            Outcome::Allow,
+            "commitless → exempt"
+        );
+
+        // Land the first commit; the exemption must evaporate.
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        git_in(&repo, &["add", "f.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "the first commit re-arms the block — exemption is commitless-only"
+        );
+    }
+
+    #[test]
+    fn orphan_head_established_repo_still_blocks() {
+        // Security regression (the load-bearing case): a repo WITH commits
+        // forced to unborn-HEAD via `git checkout --orphan` still has its
+        // commits reachable from the original branch, so a worktree IS still
+        // possible — the block MUST stand. The predicate keys on "any commit
+        // anywhere", not the current HEAD.
+        let scratch = Scratch::new("bootstrap-orphan");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        git_in(&primary, &["checkout", "-q", "--orphan", "tmp-orphan"]);
+
+        // Bash commit arm.
+        let mut input = make_bash("git commit -m x");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "orphan-HEAD with reachable commits still blocks (commit arm)"
+        );
+
+        // Edit arm.
+        let input = edit_in(&primary, &primary.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "orphan-HEAD with reachable commits still blocks (edit arm)"
+        );
+    }
+
+    #[test]
+    fn head_deleted_established_repo_still_blocks() {
+        // The `git update-ref -d HEAD` sibling of the orphan case: HEAD's own
+        // ref is deleted (current HEAD unborn) but a surviving `other` ref
+        // still holds the commit → a worktree is possible off `other` → the
+        // block MUST stand.
+        let scratch = Scratch::new("bootstrap-updateref");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        git_in(&primary, &["branch", "other"]); // second ref keeps the commit
+        git_in(&primary, &["update-ref", "-d", "HEAD"]); // delete HEAD's branch → unborn HEAD
+
+        let mut input = make_bash("git commit -m x");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "HEAD-deleted repo with a surviving ref still blocks"
+        );
+    }
+
+    #[test]
+    fn detached_head_primary_still_blocks() {
+        // Detached-HEAD control: commits exist and HEAD resolves to a sha
+        // (`Value(<sha>)`), so the repo is NOT commitless — proves the
+        // exemption keys on *zero commits*, not on any HEAD-resolution quirk.
+        let scratch = Scratch::new("bootstrap-detached");
+        let primary = scratch.0.join("repo");
+        std::fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        git_in(&primary, &["checkout", "-q", "--detach", "HEAD"]);
+
+        let input = edit_in(&primary, &primary.join("src.rs"));
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "detached-HEAD primary (commits exist) still blocks"
+        );
+    }
+
+    #[test]
+    fn is_commitless_probe_true_only_for_zero_commits() {
+        // Probe unit: true for a fresh `git init`; false after a commit; false
+        // on an established repo forced to orphan-HEAD (commits still exist).
+        // Each fixture uses a fresh `GitProbe` so the memo never masks the
+        // per-repo answer.
+        let scratch = Scratch::new("bootstrap-probe");
+
+        let fresh = scratch.0.join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        init_commitless_repo(&fresh);
+        assert!(
+            GitProbe::default().is_commitless(&fresh),
+            "a fresh git init is commitless"
+        );
+
+        let committed = scratch.0.join("committed");
+        std::fs::create_dir(&committed).unwrap();
+        init_repo(&committed);
+        assert!(
+            !GitProbe::default().is_commitless(&committed),
+            "a committed repo is not commitless"
+        );
+
+        let orphan = scratch.0.join("orphan");
+        std::fs::create_dir(&orphan).unwrap();
+        init_repo(&orphan);
+        git_in(&orphan, &["checkout", "-q", "--orphan", "tmp-orphan"]);
+        assert!(
+            !GitProbe::default().is_commitless(&orphan),
+            "orphan-HEAD established repo is NOT commitless (commits survive on other refs)"
         );
     }
 }

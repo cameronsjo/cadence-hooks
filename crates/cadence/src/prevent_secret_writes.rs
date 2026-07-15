@@ -9,79 +9,17 @@ use crate::secret_patterns::{
     command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token, is_safe_template, is_secret_scan_exempt, scan_secret_values,
 };
-use cadence_hooks_core::shell::{command_segments, tokenize};
+use cadence_hooks_core::shell::{command_segments, redirect_targets, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Wrapper words that pass their argv through to the real command —
 /// `sudo rm .env` must classify as `rm`, not `sudo`.
 const COMMAND_WRAPPERS: &[&str] = &["sudo", "command", "nohup", "time", "xargs"];
 
-/// Extract every redirect target in a command segment — the filename after each
-/// `>`, `>>`, `>|`, `2>`, `&>`, etc. Quote-aware: a `>` inside `'…'`/`"…"` is
-/// literal text, not a redirect (so `echo "a > b" > c` targets only `c`). This
-/// catches stderr, clobber, glued (`>file`), and multiple redirects in one
-/// segment — the old single-`>` scan saw only the first.
-fn redirect_targets(segment: &str) -> Vec<String> {
-    let chars: Vec<char> = segment.chars().collect();
-    let mut targets = Vec::new();
-    let mut i = 0;
-    let mut quote: Option<char> = None;
-
-    while i < chars.len() {
-        let c = chars[i];
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            '\'' | '"' => {
-                quote = Some(c);
-                i += 1;
-            }
-            '>' => {
-                i += 1;
-                // Consume a doubled `>>` (append) or `>|` (clobber).
-                if i < chars.len() && (chars[i] == '>' || chars[i] == '|') {
-                    i += 1;
-                }
-                // Skip whitespace between the operator and the filename.
-                while i < chars.len() && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                // Collect the target token, honoring a quoted filename.
-                let mut target = String::new();
-                while i < chars.len() {
-                    let tc = chars[i];
-                    if tc == '\'' || tc == '"' {
-                        i += 1;
-                        while i < chars.len() && chars[i] != tc {
-                            target.push(chars[i]);
-                            i += 1;
-                        }
-                        if i < chars.len() {
-                            i += 1; // closing quote
-                        }
-                        continue;
-                    }
-                    if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
-                        break;
-                    }
-                    target.push(tc);
-                    i += 1;
-                }
-                if !target.is_empty() {
-                    targets.push(target);
-                }
-            }
-            _ => i += 1,
-        }
-    }
-
-    targets
-}
+// `redirect_targets` (the all-redirects, append-included parser) moved to
+// `cadence_hooks_core::shell` so `enforce-worktree`'s subprocess-mutation nudge
+// shares this exact parser rather than hand-rolling a second one (#234) — the
+// one guard-feeding redirect parser the security review has to scrutinize.
 
 /// Extract write targets created by writer verbs in a segment (#76):
 /// `tee` and `rm` — every non-flag token; `cp`/`mv`/`install` — the last

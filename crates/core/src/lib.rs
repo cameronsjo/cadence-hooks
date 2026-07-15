@@ -11,8 +11,10 @@
 
 pub mod config;
 pub mod deadline;
+pub mod gitstate;
 pub mod loop_analysis;
 pub mod markers;
+pub mod pathclass;
 pub mod paths;
 pub mod shell;
 pub mod time;

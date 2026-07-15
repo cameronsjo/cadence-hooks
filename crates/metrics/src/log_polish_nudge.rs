@@ -1,11 +1,13 @@
-//! `PostToolUse:Bash` — when `gh pr create` runs, append one line to
+//! `PostToolUse:Bash` — when a polish **ship anchor** runs (`gh pr ready`, or a
+//! non-draft `gh pr create`), append one line to
 //! `<metrics_dir>/polish_nudges.jsonl` recording the nudge-fire and whether
 //! `/polish` ran earlier this session.
 //!
 //! This is the deterministic denominator for the polish-nudge efficacy
-//! measurement (claude-configurations#151): every `gh pr create` *is* a nudged
-//! PR (it fires `nudge-polish-before-pr`), so the same [`is_gh_pr_create`]
-//! predicate gates both. `polished` is a best-effort transcript scan for a
+//! measurement (claude-configurations#151): every ship anchor *is* a nudged PR
+//! (it fires `nudge-polish-before-pr`), so the same [`is_polish_ship_anchor`]
+//! predicate gates both — a draft create nudges nowhere, so it is logged
+//! nowhere either (#297). `polished` is a best-effort transcript scan for a
 //! `cadence-forge:polish` Skill invocation earlier in the session — a row with
 //! `polished: false` is a deterministic *skip candidate*. Distinguishing a
 //! rationalized skip from a legitimate one stays a transcript/prose judgment;
@@ -15,7 +17,7 @@
 
 use crate::common;
 use cadence_hooks_core::markers::polish_marker_present;
-use cadence_hooks_core::shell::is_gh_pr_create;
+use cadence_hooks_core::shell::is_polish_ship_anchor;
 use cadence_hooks_core::transcript::{
     subagent_transcripts_have_polish_run, transcript_has_polish_run,
 };
@@ -37,7 +39,7 @@ impl Logger for LogPolishNudge {
         };
         // The denominator is defined as "every PR that fired the nudge", so the
         // gate MUST be the same predicate the nudge uses.
-        if !is_gh_pr_create(command) {
+        if !is_polish_ship_anchor(command) {
             return;
         }
         // Skip malformed payloads (mirrors the other loggers); session_id is
