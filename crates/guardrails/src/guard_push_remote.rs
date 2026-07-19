@@ -242,10 +242,7 @@ impl Check for PushRemoteGuard {
         let extra_hosts = env_extra_hosts();
 
         if allowed_owners.is_empty() {
-            return CheckResult::block(
-                "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
-                 CADENCE_ALLOWED_OWNERS is not set.",
-            );
+            return CheckResult::block(crate::messages::NOT_CONFIGURED_MSG);
         }
 
         // Validate ownership of explicit remotes in loops

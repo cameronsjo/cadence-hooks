@@ -67,12 +67,10 @@ fn is_allowed_value(value: Option<&str>) -> bool {
 /// The nudge message: names the behavior (cwd inheritance → main, not the
 /// worktree) and both fixes, plus the silence env var.
 fn warn_message() -> String {
-    "You're dispatching a subagent from the main checkout while a sibling git worktree exists. \
-     Subagents inherit the spawning session's working directory, so this work will land in the \
-     main checkout — not the worktree.\n\
-     To isolate it: dispatch from a session already inside the worktree, or pass \
-     isolation: \"worktree\" to give the spawn a fresh agent-owned worktree.\n\
-     To silence for this repo: set CADENCE_ALLOW_SUBAGENT_FROM_MAIN=true in .claude/settings.json"
+    "Subagent dispatched from the main checkout while a sibling worktree exists — subagents \
+     inherit this session's cwd, so the work lands in main, not the worktree. To isolate: \
+     dispatch from inside the worktree, or pass isolation: \"worktree\". Silence for this repo: \
+     CADENCE_ALLOW_SUBAGENT_FROM_MAIN=true in .claude/settings.json"
         .to_string()
 }
 

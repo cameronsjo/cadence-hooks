@@ -131,17 +131,11 @@ fn is_retro_path(path: &str) -> bool {
 }
 
 fn nudge_text() -> String {
-    "Before this commit/push/PR/issue ships, audit the about-to-ship content \
-     (commit message, PR/issue body, changed files) for overshare:\n\n  \
-     - disabilities, neurodivergence, health\n  \
-     - relationships, family, personal life\n  \
-     - non-technical biographical detail\n\n\
-     Keep the technical why/when/how. If anything is ambiguous, surface it \
-     to the user before continuing.\n\n\
-     If personal context is needed, route it to the Obsidian vault \
-     ($OBSIDIAN_VAULT) instead of a public repo.\n\n\
-     Exempt from audit: retros (docs/blog/*retrospective*) and vault paths.\n\n\
-     Silence for this session: CADENCE_SKIP_OVERSHARE_AUDIT=1"
+    "Pre-ship audit: scan the outgoing content (commit message, PR/issue body, changed files) \
+     for personal overshare — health/neurodivergence, relationships/family, non-technical \
+     biography. Keep the technical why/how; anything ambiguous, surface to the user first. \
+     Personal context routes to the Obsidian vault ($OBSIDIAN_VAULT), never a public repo. \
+     Exempt: retros and vault paths. Silence for this session: CADENCE_SKIP_OVERSHARE_AUDIT=1"
         .to_string()
 }
 

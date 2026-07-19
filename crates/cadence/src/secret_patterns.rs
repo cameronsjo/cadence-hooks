@@ -66,6 +66,16 @@ pub const BLOCKED_PATH_FRAGMENTS: &[&str] = &[
 /// Ambiguous patterns (warn, not block).
 pub const WARN_EXTENSIONS: &[&str] = &["pem", "p8"];
 
+/// The ambiguous-file nudge shared verbatim by `prevent_secret_writes` and
+/// `prevent_secret_leaks`'s Read arm — the latter passes `"(Read) "` as
+/// `prefix` to name the tool; the former passes `""`.
+pub fn ambiguous_key_material_message(prefix: &str, filename: &str) -> String {
+    format!(
+        "⚠️  {prefix}'{filename}' may contain private key material. \
+         Approve only if you know this is a public cert."
+    )
+}
+
 /// Check if a filename is a safe template (e.g., `.env.example`).
 pub fn is_safe_template(filename: &str) -> bool {
     let lower = filename.to_lowercase();
