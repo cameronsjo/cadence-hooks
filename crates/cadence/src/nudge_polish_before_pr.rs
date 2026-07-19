@@ -106,8 +106,8 @@ fn nudge_message() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_hooks_core::gitstate::GitState;
     use cadence_hooks_core::markers::{polish_marker, write_marker};
-    use cadence_hooks_core::shell::git_command;
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
     use cadence_hooks_core::{Outcome, ToolInput};
     use std::process::Command;
@@ -205,10 +205,12 @@ mod tests {
     // --- integration through run() with a real temp git repo (#146 fixture) ---
 
     /// Init a git repo in a fresh tempdir, checked out on `branch` (no commit
-    /// needed — `branch --show-current` reports an unborn branch, and the gate
-    /// only reads `--show-toplevel` + `--show-current`). Returns the tempdir and
-    /// the git-resolved repo root (canonicalized, so it matches what `run()`
-    /// resolves — critical on macOS where `/tmp` → `/private/tmp`).
+    /// needed — an unborn HEAD still resolves a branch name via [`GitState`],
+    /// and the gate only reads the common dir + current branch). Returns the
+    /// tempdir and the git-resolved `git_common_dir` (canonicalized, so it
+    /// matches what `run()` resolves — critical on macOS where `/tmp` →
+    /// `/private/tmp` — and the same key `polish_marker_present` now uses,
+    /// cadence-hooks#324).
     fn init_repo_on_branch(branch: &str) -> (tempfile::TempDir, String) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_str().unwrap().to_string();
@@ -225,8 +227,8 @@ mod tests {
         };
         git(&["init", "-q"]);
         git(&["checkout", "-q", "-b", branch]);
-        let root = git_command(&dir, &["rev-parse", "--show-toplevel"])
-            .expect("temp repo resolves a toplevel");
+        let state = GitState::resolve(tmp.path()).expect("temp repo resolves git state");
+        let root = state.git_common_dir.to_string_lossy().into_owned();
         (tmp, root)
     }
 
@@ -315,6 +317,148 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+    }
+
+    // --- worktree-stable keying (cadence-hooks#324) ---
+
+    /// `git -C primary <args>`, asserting success. Shared by the worktree
+    /// fixtures below.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    /// A primary checkout with one commit — `git worktree add` refuses an
+    /// unborn branch, unlike [`init_repo_on_branch`]'s marker-only fixtures.
+    fn init_primary_with_commit(primary: &std::path::Path) {
+        std::fs::create_dir_all(primary).unwrap();
+        git_in(primary, &["init", "-q", "-b", "main"]);
+        git_in(primary, &["config", "user.email", "t@t"]);
+        git_in(primary, &["config", "user.name", "t"]);
+        git_in(primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    #[test]
+    fn run_worktree_marker_satisfies_primary_ship_command() {
+        // #324: a marker recorded from a linked worktree must satisfy the ship
+        // command run from the primary checkout, once the primary is on the
+        // same branch — the common-dir key is shared across both checkouts.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feat/thing",
+            ],
+        );
+
+        let wt_state = GitState::resolve(&wt).expect("worktree resolves");
+        write_marker(
+            &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/thing"),
+            "{}",
+        )
+        .unwrap();
+
+        git_in(
+            &primary,
+            &["worktree", "remove", "--force", wt.to_str().unwrap()],
+        );
+        git_in(&primary, &["checkout", "-q", "feat/thing"]);
+
+        let input = make_bash_with_cwd("gh pr create --title x", primary.to_str().unwrap());
+        let result = NudgePolishBeforePr.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Allow,
+            "a worktree-recorded marker must satisfy the primary checkout on the same branch"
+        );
+    }
+
+    #[test]
+    fn run_primary_marker_satisfies_worktree_ship_command() {
+        // #324 inverse: a marker recorded from the PRIMARY checkout must
+        // satisfy a ship command run from a linked WORKTREE on the same branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        git_in(&primary, &["checkout", "-q", "-b", "feat/y"]);
+
+        let primary_state = GitState::resolve(&primary).expect("primary resolves");
+        write_marker(
+            &polish_marker(&primary_state.git_common_dir.to_string_lossy(), "feat/y"),
+            "{}",
+        )
+        .unwrap();
+
+        // Free `feat/y` from the primary so a worktree can check it out.
+        git_in(&primary, &["checkout", "-q", "main"]);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "feat/y"],
+        );
+
+        let input = make_bash_with_cwd("gh pr create --title x", wt.to_str().unwrap());
+        let result = NudgePolishBeforePr.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Allow,
+            "a primary-recorded marker must satisfy a linked worktree on the same branch"
+        );
+    }
+
+    #[test]
+    fn run_worktree_marker_does_not_satisfy_different_branch() {
+        // The common-dir re-key must not loosen branch scoping: a marker
+        // recorded from a worktree on branch A must still miss when the ship
+        // command runs on a different branch, even in the same repo.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feat/a",
+            ],
+        );
+
+        let wt_state = GitState::resolve(&wt).expect("worktree resolves");
+        write_marker(
+            &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/a"),
+            "{}",
+        )
+        .unwrap();
+
+        // Primary stays on `main` — a different branch from the marker.
+        let input = make_bash_with_cwd("gh pr create --title x", primary.to_str().unwrap());
+        let result = NudgePolishBeforePr.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Nudge,
+            "a marker for a different branch must not satisfy the ship command"
+        );
     }
 
     // --- preserved matcher tests (is_polish_ship_anchor) ---

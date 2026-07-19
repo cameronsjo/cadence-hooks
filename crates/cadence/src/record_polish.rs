@@ -6,24 +6,35 @@
 //! gate ([`crate::nudge_polish_before_pr`]) then reads that marker instead of
 //! scanning the session transcript.
 //!
-//! The marker key is `(repo_root, branch)` (see [`markers::polish_marker`]), so
-//! detection is invocation-agnostic (Skill call, `/polish` slash-command, or a
-//! delegated subagent all end by running this) and branch-scoped (a marker for
-//! branch A cannot satisfy a PR on branch B).
+//! The marker key is `(repo_root, branch)` (see [`markers::polish_marker`]),
+//! where `repo_root` is the canonicalized `git rev-parse --git-common-dir`
+//! (cadence-hooks#324) — stable across every worktree of a repo, not
+//! `--show-toplevel` (a linked worktree's own path). Detection is therefore
+//! invocation-agnostic (Skill call, `/polish` slash-command, or a delegated
+//! subagent all end by running this), worktree-agnostic (recording from a
+//! worktree satisfies a ship command run from the primary checkout, and vice
+//! versa), and branch-scoped (a marker for branch A cannot satisfy a PR on
+//! branch B).
 //!
 //! Advisory, always — this must never fail the user's polish pass. Every error
 //! path (not a repo, detached HEAD, unwritable marker dir) prints one stderr
 //! line and exits 0 (ADR-0001).
 
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::markers::{polish_marker, write_marker};
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::time::utc_timestamp;
 use serde_json::json;
 
-/// Resolve `repo_root`, `branch`, and `head_sha` from `dir` via git, letting
-/// explicit overrides bypass the shell-out so tests need no real repository.
+/// Resolve `repo_root`, `branch`, and `head_sha` from `dir`, letting explicit
+/// overrides bypass resolution so tests need no real repository.
 ///
-/// `head_sha` is best-effort: a repo with no commits yet has no `HEAD`, so it
+/// `repo_root` and `branch` come from [`GitState::resolve`] — a pure
+/// filesystem walk keyed on the canonicalized `git_common_dir`, matching the
+/// read side ([`cadence_hooks_core::markers::polish_marker_present`]) so a
+/// worktree and its primary checkout key to the same marker. `head_sha` is
+/// still resolved via a `git` shell-out: it's provenance metadata, not part of
+/// the key, and best-effort — a repo with no commits yet has no `HEAD`, so it
 /// resolves to `None` and the field is recorded as an empty string rather than
 /// failing the record. `repo_root` and `branch` are the load-bearing key; when
 /// either can't be resolved the caller degrades to a no-op (exit 0).
@@ -32,8 +43,10 @@ fn resolve(
     repo_root: Option<String>,
     branch: Option<String>,
 ) -> Option<(String, String, String)> {
-    let repo_root = repo_root.or_else(|| git_command(dir, &["rev-parse", "--show-toplevel"]))?;
-    let branch = branch.or_else(|| git_command(dir, &["branch", "--show-current"]))?;
+    let git_state = || GitState::resolve(std::path::Path::new(dir));
+    let repo_root = repo_root
+        .or_else(|| git_state().map(|state| state.git_common_dir.to_string_lossy().into_owned()))?;
+    let branch = branch.or_else(|| git_state().and_then(|state| state.branch))?;
     // Polish does not commit (SKILL.md), so this is the pre-polish base SHA — a
     // provenance breadcrumb for CP2, never an exact-match key. Empty when the
     // repo has no HEAD yet.
@@ -141,5 +154,85 @@ mod tests {
         // marker. Asserts the call simply returns (fail-open) without unwinding;
         // a bad marker dir would likewise exit via the write_marker arm.
         run_record(None, None, Some("full".into()));
+    }
+
+    // --- worktree-stable keying (cadence-hooks#324) ---
+
+    /// Init a primary checkout with one commit (a real commit is required —
+    /// `git worktree add` refuses an unborn branch), plus a `git` closure bound
+    /// to that checkout.
+    fn init_primary_with_commit(primary: &std::path::Path) {
+        std::fs::create_dir_all(primary).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(primary)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    #[test]
+    fn worktree_record_satisfies_primary_check_same_branch() {
+        // RED (#324): a polish recorded from a LINKED WORKTREE must satisfy a
+        // ship command run from the PRIMARY checkout on the same branch — the
+        // marker key must be common-dir-based, not `--show-toplevel`-based
+        // (a worktree's toplevel is its own path, not the shared repo).
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+
+        let wt = tmp.path().join("wt");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&primary)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "feat/thing",
+        ]);
+
+        // Record from the WORKTREE path — the record side's own resolution.
+        let wt_str = wt.to_str().unwrap().to_string();
+        let (repo_root, branch, head_sha) =
+            resolve(&wt_str, None, None).expect("worktree resolves repo/branch");
+        assert_eq!(branch, "feat/thing");
+        let content = marker_content(&branch, &head_sha, "full");
+        write_marker(&polish_marker(&repo_root, &branch), &content).unwrap();
+
+        // Free the branch from the worktree and check it out on the primary —
+        // the realistic sequel to "finished the worktree, shipping from primary".
+        git(&["worktree", "remove", "--force", wt.to_str().unwrap()]);
+        git(&["checkout", "-q", "feat/thing"]);
+
+        assert!(
+            cadence_hooks_core::markers::polish_marker_present(
+                "gh pr create --title x",
+                Some(primary.to_str().unwrap()),
+            ),
+            "a polish marker recorded from a linked worktree must satisfy a ship \
+             command run from the primary checkout on the same branch"
+        );
     }
 }
