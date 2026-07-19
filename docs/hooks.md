@@ -28,7 +28,7 @@ For how hooks communicate with Claude Code (stdin/stdout/exit codes), see
 
 `warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
-judgment to the model. It exempts retro paths and writes under `$OBSIDIAN_VAULT`
+judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 (the safe home for personal context), and is silenced session-wide with
 `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 
