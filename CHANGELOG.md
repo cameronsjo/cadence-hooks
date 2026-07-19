@@ -16,6 +16,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **The `terminology` and `redact-external-content` guards now read from `.claude/cadence.json` — a hard cut (#153).** The legacy `.claude/terminology.json` / `.claude/redaction.json` are no longer read; both guards' `*Config` structs and all downstream behavior are byte-for-byte identical, only the file read changed. Run `cadence-hooks migrate-config` to convert a repo (or hand-author `cadence.json`); doctor warns on an orphaned legacy file. **Migration:** write `cadence.json` before upgrading the binary, then upgrade, then rename the legacy file — a zero-gap order (the old binary ignores the unknown `cadence.json` and still reads the legacy file; the new binary reads `cadence.json`).
 
+- **Ten chattiest hook messages tightened ~25%, duplicated strings consolidated (#327, PR #328).** Each message now carries verdict + the one fix + one pointer instead of its full pedagogy per fire; literal-duplicate strings (worktree recipe, not-configured, repo-delete template, key-material clause) moved to shared constants so a wording change lands once. `inject-gh-context` renders owner and repo allowlist entries as one combined list.
+- **`warn-overshare` no longer exempts retro paths (#329, PR #330).** `cadence:retro` relocated its output out of the repo (vault primary, gitignored fallback — cameronsjo/cadence#499), so `docs/blog/*retro*` paths have no sanctioned personal content and now get the normal audit; the exemption is vault-paths-only.
+
+### Fixed
+
+- **Polish marker is worktree-stable (#324, PR #326).** The marker key now uses the canonicalized `git-common-dir` instead of `--show-toplevel` on both the record and read sides — a polish recorded from a linked worktree satisfies a ship command run from the primary checkout on the same branch, and vice versa. Old-key markers age out; no compat shim.
+
 ## [0.59.0] - 2026-07-15
 
 ### Fixed
