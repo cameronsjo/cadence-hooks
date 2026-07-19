@@ -19,8 +19,9 @@
 //! that can't be written just means the nudge may re-fire, never a block.
 
 use crate::HookInput;
+use crate::gitstate::GitState;
 use crate::paths;
-use crate::shell::{git_command, parse_work_dir};
+use crate::shell::parse_work_dir;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -146,20 +147,22 @@ pub fn polish_marker(repo_root: &str, branch: &str) -> PathBuf {
 /// record for this PR's branch" — the pre-PR gate acts on it and the
 /// polish-nudge metric records it, so the two cannot disagree (#177).
 ///
-/// Resolves `repo_root` (`git rev-parse --show-toplevel`) and `branch`
-/// (`git branch --show-current`) from `cwd`, honoring a `cd`-prefixed command
-/// via [`parse_work_dir`] — mirrors the record side. Any missing piece (no cwd,
-/// not a repo, detached HEAD) yields `false` (fail-open, ADR-0001).
+/// Resolves the repo identity via [`crate::gitstate::GitState`] — keyed on the
+/// canonicalized `git rev-parse --git-common-dir`, not `--show-toplevel`
+/// (cadence-hooks#324) — so a linked worktree and its primary checkout key to
+/// the same marker; `branch` comes from `cwd` too, honoring a `cd`-prefixed
+/// command via [`parse_work_dir`] — mirrors the record side. Any missing piece
+/// (no cwd, not a repo, detached HEAD) yields `false` (fail-open, ADR-0001).
 pub fn polish_marker_present(command: &str, cwd: Option<&str>) -> bool {
     let Some(cwd) = cwd else { return false };
     let dir = parse_work_dir(command, cwd);
-    let Some(repo_root) = git_command(&dir, &["rev-parse", "--show-toplevel"]) else {
+    let Some(state) = GitState::resolve(Path::new(&dir)) else {
         return false;
     };
-    let Some(branch) = git_command(&dir, &["branch", "--show-current"]) else {
+    let Some(branch) = state.branch else {
         return false;
     };
-    polish_marker(&repo_root, &branch).is_file()
+    polish_marker(&state.git_common_dir.to_string_lossy(), &branch).is_file()
 }
 
 /// Write `contents` to a marker path symlink-safely.
@@ -375,8 +378,9 @@ mod tests {
     // --- polish_marker_present (shared gate/metric helper, #177) ---
 
     /// Init a git repo in a fresh tempdir, checked out on `branch`, and return
-    /// the tempdir plus the git-resolved (canonicalized) repo root — mirrors the
-    /// gate's own `init_repo_on_branch` so both sides key markers identically.
+    /// the tempdir plus the git-resolved (canonicalized) `git_common_dir` — the
+    /// same key `polish_marker_present` now resolves via [`GitState`], so both
+    /// sides key markers identically (no hand-rolled second resolution).
     fn init_repo_on_branch(branch: &str) -> (tempfile::TempDir, String) {
         use std::process::Command;
         let tmp = tempfile::tempdir().unwrap();
@@ -394,8 +398,8 @@ mod tests {
         };
         git(&["init", "-q"]);
         git(&["checkout", "-q", "-b", branch]);
-        let root = crate::shell::git_command(&dir, &["rev-parse", "--show-toplevel"])
-            .expect("temp repo resolves a toplevel");
+        let state = GitState::resolve(tmp.path()).expect("temp repo resolves git state");
+        let root = state.git_common_dir.to_string_lossy().into_owned();
         (tmp, root)
     }
 
@@ -433,5 +437,16 @@ mod tests {
     fn polish_marker_present_false_when_cwd_none() {
         // No cwd → unresolved → false (fail-open, ADR-0001).
         assert!(!polish_marker_present("gh pr create --title x", None));
+    }
+
+    #[test]
+    fn polish_marker_present_false_for_non_repo_cwd() {
+        // A real directory that is not a git repo → GitState::resolve is None
+        // → false (fail-open, ADR-0001) — still holds after the #324 re-key.
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!polish_marker_present(
+            "gh pr create --title x",
+            Some(tmp.path().to_str().unwrap())
+        ));
     }
 }
