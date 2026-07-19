@@ -88,19 +88,18 @@ fn decide(command: &str, marker_present: bool) -> CheckResult {
 /// and "TDD/attune already covered it" skips can't survive it.
 const SCOPE_CLAUSES: &str = "Skill / agent / command / rule markdown and \
     CLAUDE.md are behavior, not documentation — IN scope; only *literal* docs \
-    (prose about the system) route to `/polish docs`. Planning, TDD, attune, or \
-    a code-review precede polish — they don't replace it.";
+    route to `/polish docs`. Planning, TDD, attune, or a code-review precede \
+    polish — they don't replace it.";
 
 /// The soft nudge — fires when no polish marker exists for the PR's branch.
 /// Allow + warn; the model proceeds (CP1 fail-open floor, ADR-0001).
 fn nudge_message() -> String {
     format!(
-        "Before this PR ships for review, consider `/polish` (cadence-forge:polish) — no \
-         polish has been recorded for this branch this session (`/polish` records \
-         a marker when it completes). It's a branch-scoped pass vs `origin/main`: \
-         simplify, logging, tests, docs, security, code review. {SCOPE_CLAUSES} \
-         Skip ONLY if it's a trivial one-liner or already went through `/polish`. \
-         If you skip, say so and why — don't skip silently."
+        "No polish recorded for this branch — run `/polish` (cadence-forge:polish) \
+         before this PR ships: a branch-scoped quality pass vs `origin/main`; it \
+         records the marker when it completes. {SCOPE_CLAUSES} Skip ONLY for a \
+         trivial one-liner or an already-polished branch — say so and why, don't \
+         skip silently."
     )
 }
 

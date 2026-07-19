@@ -35,13 +35,10 @@ use std::path::PathBuf;
 const CHROME_TOOL_PREFIX: &str = "mcp__claude-in-chrome__";
 
 /// The re-clarify message emitted on the first (blocked) call.
-const BLOCK_MESSAGE: &str = "BLOCKED: guard-browser-device\n\
-Found: First Claude-in-Chrome action this session — target device unconfirmed.\n\
-       Multiple Chrome browsers may be paired to this account.\n\
-Fix:   1) list_connected_browsers  2) AskUserQuestion listing every connected\n\
-       browser (label = display name, deviceId in parens)  3) select_browser with\n\
-       the chosen deviceId (or switch_browser to pair interactively).\n\
-       Then re-run this tool — it will proceed for the rest of the session.";
+const BLOCK_MESSAGE: &str = "BLOCKED: first Claude-in-Chrome action this session — target \
+device unconfirmed (multiple browsers may be paired). Fix: list_connected_browsers, then \
+AskUserQuestion listing each browser (display name, deviceId in parens), then select_browser \
+with the chosen deviceId. Re-run the tool after — confirmed for the rest of the session.";
 
 /// Block the first Claude-in-Chrome tool call per session until the target
 /// device is confirmed.
@@ -127,7 +124,7 @@ mod tests {
                 .message
                 .as_deref()
                 .expect("block should carry a message")
-                .contains("guard-browser-device")
+                .contains("target device unconfirmed")
         );
         assert!(marker.exists(), "first call must write the session marker");
 

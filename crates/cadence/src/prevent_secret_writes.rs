@@ -241,10 +241,9 @@ impl Check for SecretWritesGuard {
                 }
 
                 if is_ambiguous(filename) {
-                    return CheckResult::nudge(format!(
-                        "⚠️  '{filename}' may contain private key material. \
-                         Approve only if you know this is a public cert."
-                    ));
+                    return CheckResult::nudge(
+                        crate::secret_patterns::ambiguous_key_material_message("", filename),
+                    );
                 }
 
                 CheckResult::allow()

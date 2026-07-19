@@ -124,6 +124,7 @@
 //! #224).
 
 use crate::dismiss_enforce_worktree;
+use crate::messages::WORKTREE_CREATE_RECIPE;
 use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
@@ -703,23 +704,19 @@ fn collect_targets(
 /// the policy to the repo the shell happened to start in (issue #224).
 fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
     let mut msg = format!(
-        "Blocked: `{repo_root}` is a primary checkout — feature work belongs in a worktree, \
-         not the shared primary tree.\n\
-         Create one: `git worktree add .claude/worktrees/<slug> -b feat/<slug>` \
-         (or EnterWorktree / `/worktree create feat <slug>`), then work there.\n\
-         One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m` \
-         (add `--reason \"<why>\"` — required over 1h; it's recorded in the repo-visible bypass log)\n\
-         Repo works on main by design (dotfiles, vaults)? Set CADENCE_ALLOW_MAIN=true in \
-         `{repo_root}/.claude/settings.json`'s env block — the guard reads it from the target \
-         repo directly.\n\
-         Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1"
+        "Blocked: `{repo_root}` is a primary checkout — feature work belongs in a worktree.\n\
+         Create one: {WORKTREE_CREATE_RECIPE}, then work there.\n\
+         One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m \
+         --reason \"<why>\"` (reason required over 1h; logged in the repo-visible bypass log).\n\
+         Main-by-design repo? Set CADENCE_ALLOW_MAIN=true in the target repo's \
+         .claude/settings.json env block. Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1."
     );
     if let Some(origin) = origin_repo
         && origin != repo_root
     {
         msg.push_str(&format!(
-            "\nThis command targets `{repo_root}` (via `cd`/`-C`), judged against that repo — \
-             not `{origin}`, where the shell started."
+            "\nJudged against `{repo_root}` (the repo this command targets via cd/-C), \
+             not `{origin}`."
         ));
     }
     msg
@@ -955,13 +952,9 @@ fn mutation_nudge(
 fn mutation_nudge_message(repo_root: &str) -> String {
     format!(
         "enforce-worktree: this command mutates tracked files in the primary checkout \
-         `{repo_root}` via a subprocess (package install, `sed -i`, or a redirect).\n\
-         These writes accumulate in the shared primary tree and aren't caught until the eventual \
-         `git commit` — by which point unwinding them is costly.\n\
-         Prefer a worktree: `git worktree add .claude/worktrees/<slug> -b feat/<slug>` \
-         (or EnterWorktree), then run it there.\n\
-         Silence subprocess-mutation nudges for a bit: \
-         `cadence-hooks guardrails dismiss-enforce-worktree --for 30m`."
+         `{repo_root}` via a subprocess (package install, `sed -i`, or a redirect) — writes \
+         accumulate unseen until commit. Prefer a worktree: {WORKTREE_CREATE_RECIPE}. \
+         Silence for 30m: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m`"
     )
 }
 
@@ -1742,15 +1735,15 @@ mod tests {
     #[test]
     fn message_omits_redirect_note_when_same_repo() {
         let msg = block_message("/Users/dev/repo", Some("/Users/dev/repo"));
-        assert!(!msg.contains("where the shell started"));
+        assert!(!msg.contains("Judged against"));
     }
 
     #[test]
     fn message_names_redirect_when_origin_differs() {
         let msg = block_message("/Users/dev/mono", Some("/Users/dev/meta"));
-        assert!(msg.contains("targets `/Users/dev/mono`"));
+        assert!(msg.contains("Judged against `/Users/dev/mono`"));
         assert!(msg.contains("/Users/dev/meta"));
-        assert!(msg.contains("where the shell started"));
+        assert!(msg.contains("not `/Users/dev/meta`"));
     }
 
     // --- end-to-end against real repos ---
@@ -2056,7 +2049,7 @@ mod tests {
             "message names the target repo: {msg}"
         );
         assert!(
-            msg.contains("where the shell started"),
+            msg.contains("Judged against"),
             "message acknowledges the cd redirect: {msg}"
         );
     }
@@ -2532,13 +2525,13 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Block);
         let msg = r.message.unwrap();
         let primary_b_canon = std::fs::canonicalize(&primary_b).unwrap();
-        let expected = format!(
-            "{}/.claude/settings.json",
-            primary_b_canon.to_string_lossy()
+        assert!(
+            msg.contains(&primary_b_canon.to_string_lossy().to_string()),
+            "message names the target repo: {msg}"
         );
         assert!(
-            msg.contains(&expected),
-            "message names the target repo's settings path: {msg}"
+            msg.contains("the target repo's .claude/settings.json"),
+            "message points the CADENCE_ALLOW_MAIN fix at the target repo, not the origin: {msg}"
         );
     }
 

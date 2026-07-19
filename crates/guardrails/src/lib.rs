@@ -39,6 +39,8 @@ pub mod guard_rm;
 pub mod inject_gh_context;
 /// Shared closing-keyword detection for GitHub issue references.
 pub mod issue_refs;
+/// Shared message text duplicated across guardrails call sites (cadence-hooks#327).
+pub mod messages;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
 pub mod nudge_upgrade_after_push;
 /// Shared provenance sidecar for the `dismiss-*` snooze markers.

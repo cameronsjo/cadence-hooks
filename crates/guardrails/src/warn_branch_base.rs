@@ -13,6 +13,7 @@
 //! an explicit base argument) is `main`/`master`, nudging to switch to main
 //! first to avoid stacking branches.
 
+use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::worktree::would_block_here;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -82,11 +83,11 @@ impl Check for WarnBranchBase {
 /// discipline: names the anti-pattern (branching in place) rather than
 /// the base branch, and points at the worktree-entry playbook.
 fn worktree_first_message() -> String {
-    "⚠️  Branching in a primary checkout is the pattern `enforce-worktree` prevents.\n   \
-     Create a worktree instead: `git worktree add .claude/worktrees/<slug> -b <branch>` \
-     (or EnterWorktree), then create the branch there.\n   \
-     See cadence-forge:using-worktrees § Session Entry Posture."
-        .to_string()
+    format!(
+        "⚠️  Branching in a primary checkout is the pattern `enforce-worktree` prevents.\n   \
+         Create a worktree instead: {WORKTREE_CREATE_RECIPE}, then create the branch there.\n   \
+         See cadence-forge:using-worktrees § Session Entry Posture."
+    )
 }
 
 /// Check if command creates a new branch.
