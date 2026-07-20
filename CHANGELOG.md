@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.61.0] - 2026-07-20
+
+### Added
+
+- **`cadence-hooks session persist-plan` — deterministic plan persistence on UserPromptSubmit (#348, cameronsjo/cadence#505).** Intercepts the harness-injected `Implement the following plan:` prompt (the approve-and-clear UI path, where the conversational save rule can never fire) and persists the plan body to `<repo>/docs/plans/<local-date>-<slug>.md` with a provenance block (exact body-hash parent resolution against sibling transcripts — `unknown` over fuzzy), body-hash idempotency over an O_EXCL suffix ladder (never overwrites), a `plan-links.jsonl` linkage row (schemaVersion 1), and a context line naming the persisted path. Strips both pinned harness suffix paragraphs before hashing; bounded transcript scan (≤48 h, ≤20 files, ≤32 MiB each, streamed); narrow panic guard; every failure path exits 0. Enabling core changes: `HookEvent::UserPromptSubmit`, `HookInput.prompt`, `time::local_date()`; new deps `gethostname`, `sha2`. Wiring ships in the cadence plugin (cameronsjo/cadence#507).
+
+### Changed
+
+- **`guard-gh-write` unblocks read-only and curated review-thread GraphQL, keeps arbitrary mutations closed (#262, #263, #300, #317; PR #342).**
+
+### Fixed
+
+- **`guard-rm` allows file-scoped artifact/temp deletes and corrects the bypass hint (#322, #316, #311; PR #341).**
+- **`prevent-secret-leaks` scopes the echo/printf nudge to expanded secret-shaped vars (#332, #333, #334, #321; PR #340).**
+
 ## [0.60.0] - 2026-07-19
 
 ### Added
