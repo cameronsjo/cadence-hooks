@@ -709,7 +709,10 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
          One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m \
          --reason \"<why>\"` (reason required over 1h; logged in the repo-visible bypass log).\n\
          Main-by-design repo? Set CADENCE_ALLOW_MAIN=true in the target repo's \
-         .claude/settings.json env block. Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1."
+         .claude/settings.json env block. Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1.\n\
+         If the change must stay on this checkout's current branch (peer-coordinated work on a \
+         shared branch), a worktree cannot duplicate it — the dismiss above is the sanctioned \
+         path, not a workaround."
     );
     if let Some(origin) = origin_repo
         && origin != repo_root
@@ -1730,6 +1733,10 @@ mod tests {
         assert!(msg.contains("dismiss-enforce-worktree"));
         assert!(msg.contains("CADENCE_ALLOW_MAIN"));
         assert!(msg.contains("CADENCE_NO_ENFORCE_WORKTREE"));
+        // The can't-worktree coordination case names the dismiss as sanctioned
+        // (#313) — not a workaround.
+        assert!(msg.contains("peer-coordinated work on a shared branch"));
+        assert!(msg.contains("the dismiss above is the sanctioned path"));
     }
 
     #[test]
