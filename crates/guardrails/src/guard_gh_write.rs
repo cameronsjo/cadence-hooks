@@ -637,6 +637,23 @@ fn strip_graphql_literals(query: &str) -> String {
                 // Consume until the closing `"""` (or end — unterminated blanks
                 // the remainder, which fails the extractor closed).
                 while i < chars.len() {
+                    // GraphQL's ONLY block-string escape is `\"""` (a literal
+                    // triple-quote). It does NOT close the string — consume all
+                    // four chars and stay inside. Missing this let a smuggled
+                    // root field ride through: an early close turned the real
+                    // `}` chars living inside the string into structural braces,
+                    // so the extractor closed the selection set early and never
+                    // saw the trailing mutation field (#262).
+                    if chars[i] == '\\'
+                        && i + 3 < chars.len()
+                        && chars[i + 1] == '"'
+                        && chars[i + 2] == '"'
+                        && chars[i + 3] == '"'
+                    {
+                        out.push_str("    ");
+                        i += 4;
+                        continue;
+                    }
                     if chars[i] == '"'
                         && i + 2 < chars.len()
                         && chars[i + 1] == '"'
@@ -2905,6 +2922,59 @@ mod tests {
             );
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_escaped_triple_quote_rider_blocks() {
+        // SECURITY REGRESSION (#262): a `\"""` escaped triple-quote keeps the
+        // block string open past the `}` chars smuggled inside it. Without
+        // honoring the escape the stripper closed early, the real `}`s read as
+        // structure, the extractor closed the selection set before the trailing
+        // field, and `deleteRepository` rode through as a safe
+        // `resolveReviewThread`. Must BLOCK.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""X\"""} } } """}) {clientMutationId} deleteRepository(input:{repositoryId:"NODE_ID"}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(
+                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                "smuggled deleteRepository must not ride through as a safe mutation"
+            );
+            assert_eq!(
+                result.block_metadata.expect("structured block").rule_id,
+                "gh-write-api-unverifiable"
+            );
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_escaped_triple_quote_legit_allows() {
+        // A genuine `\"""` inside a string value, with no smuggled field, must
+        // still ALLOW — the escape is honored in both directions, not blanket-blocked.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""has \""" a literal triple-quote"""}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_bare_brace_no_escape_allows() {
+        // A normal block string containing a bare `}` (no escape) with a single
+        // safe root field must still ALLOW — the escape fix didn't over-tighten.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""note } with brace"""}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
     }
 
