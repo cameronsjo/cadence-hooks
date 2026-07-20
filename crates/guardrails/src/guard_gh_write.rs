@@ -58,10 +58,26 @@ static REPO_SUBCOMMAND: LazyLock<Regex> = LazyLock::new(|| {
 static API_REPOS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
 
-/// Word-boundary, case-insensitive match for the GraphQL `mutation` keyword —
-/// the signal that a `gh api graphql` query writes rather than reads.
-static MUTATION_WORD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bmutation\b").expect("pattern should compile"));
+/// Word-boundary match for the lowercase GraphQL `mutation` operation keyword —
+/// the signal that a `gh api graphql` query writes rather than reads. Matched
+/// case-SENSITIVELY: the operation keyword is lowercase, whereas the *type* name
+/// `Mutation` (e.g. an introspection read `__type(name: "Mutation")`) is
+/// capitalized and must not be mistaken for a write (#263).
+static MUTATION_KEYWORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bmutation\b").expect("pattern should compile"));
+
+/// GraphQL mutation root fields safe to auto-allow: pure boolean thread metadata
+/// on a PR review that carries no attacker-controllable payload.
+/// `resolveReviewThread`/`unresolveReviewThread` only toggle a review thread's
+/// resolved flag, so they're allowed like reads (#262, #300, #317).
+///
+/// Deliberately EXCLUDED: `addPullRequestReviewThreadReply` posts
+/// attacker-controllable text as the user (its REST equivalent goes through
+/// owner-verified `repos/<owner>/<repo>` paths, so it stays checkable there).
+/// It's a future maintainer's-call candidate, not an oversight. `addComment` and
+/// `addPullRequestReview` are likewise out — any field that writes content stays
+/// blocked.
+static SAFE_GRAPHQL_MUTATIONS: [&str; 2] = ["resolveReviewThread", "unresolveReviewThread"];
 
 static GIST_COMMAND: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+gist\s").expect("pattern should compile"));
@@ -586,7 +602,248 @@ fn graphql_mutation_status(segment: &str) -> Option<bool> {
     if query.starts_with('@') {
         return None;
     }
-    Some(MUTATION_WORD.is_match(&query))
+    // Classify on the string-stripped body so a `mutation` keyword smuggled
+    // inside a string literal (or a `Mutation` type name in an introspection
+    // read) can't flip the verdict (#263).
+    let stripped = strip_graphql_literals(&query);
+    Some(MUTATION_KEYWORD.is_match(&stripped))
+}
+
+/// Replace GraphQL string literals — both `"…"` and block `"""…"""`, honoring
+/// `\"` escapes — and `#`-to-end-of-line comments with spaces. Neutralizes
+/// braces, identifiers, and keywords hiding inside string arguments so the
+/// mutation classifier and the root-field extractor see only real query
+/// structure (#263). Length is preserved (each consumed char becomes a space)
+/// so byte offsets stay aligned for the extractor.
+fn strip_graphql_literals(query: &str) -> String {
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = String::with_capacity(query.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '#' {
+            // Comment: blank through end of line (the newline itself is kept).
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '"' {
+            let is_block = i + 2 < chars.len() && chars[i + 1] == '"' && chars[i + 2] == '"';
+            if is_block {
+                out.push_str("   ");
+                i += 3;
+                // Consume until the closing `"""` (or end — unterminated blanks
+                // the remainder, which fails the extractor closed).
+                while i < chars.len() {
+                    // GraphQL's ONLY block-string escape is `\"""` (a literal
+                    // triple-quote). It does NOT close the string — consume all
+                    // four chars and stay inside. Missing this let a smuggled
+                    // root field ride through: an early close turned the real
+                    // `}` chars living inside the string into structural braces,
+                    // so the extractor closed the selection set early and never
+                    // saw the trailing mutation field (#262).
+                    if chars[i] == '\\'
+                        && i + 3 < chars.len()
+                        && chars[i + 1] == '"'
+                        && chars[i + 2] == '"'
+                        && chars[i + 3] == '"'
+                    {
+                        out.push_str("    ");
+                        i += 4;
+                        continue;
+                    }
+                    if chars[i] == '"'
+                        && i + 2 < chars.len()
+                        && chars[i + 1] == '"'
+                        && chars[i + 2] == '"'
+                    {
+                        out.push_str("   ");
+                        i += 3;
+                        break;
+                    }
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            // Regular string, honoring `\"` (and `\\`) escapes.
+            out.push(' ');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    out.push(' ');
+                    i += 1;
+                    if i < chars.len() {
+                        out.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+                if chars[i] == '"' {
+                    out.push(' ');
+                    i += 1;
+                    break;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn is_graphql_name_start(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphabetic()
+}
+
+fn is_graphql_name_cont(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
+/// Extract the root (top-level) field names of a GraphQL mutation from an
+/// already string-stripped query. Returns `None` on ANY structural ambiguity so
+/// the caller fails closed:
+/// - not exactly one `mutation` operation keyword (a second op could hide a
+///   dangerous field),
+/// - no selection set, an unbalanced brace/paren, a truncated body, or
+/// - an unexpected token at field-head position (fragment `...`, directive `@`,
+///   variable `$`, …).
+///
+/// Aliases resolve to the underlying field (`x: deleteRepository` → `deleteRepository`).
+/// Only identifiers at brace-depth 1 / paren-depth 0 are field heads, so argument
+/// values and sub-selections never leak into the result.
+fn graphql_root_mutation_fields(stripped_query: &str) -> Option<Vec<String>> {
+    let mut kw_matches = MUTATION_KEYWORD.find_iter(stripped_query);
+    let kw = kw_matches.next()?;
+    if kw_matches.next().is_some() {
+        return None; // multiple operations — ambiguous, fail closed
+    }
+    let bytes = stripped_query.as_bytes();
+
+    // Locate the selection-set `{`: the first `{` at paren-depth 0 after the
+    // keyword, skipping an optional operation name and `(varDefs)`.
+    let mut i = kw.end();
+    let mut paren_depth: i32 = 0;
+    let mut brace_start: Option<usize> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => paren_depth += 1,
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return None;
+                }
+            }
+            b'{' if paren_depth == 0 => {
+                brace_start = Some(i);
+                break;
+            }
+            b'}' if paren_depth == 0 => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut i = brace_start?;
+
+    // Walk the selection set, collecting field heads at brace-depth 1 / paren-depth 0.
+    let mut fields: Vec<String> = Vec::new();
+    let mut brace_depth: i32 = 0;
+    let mut paren_depth: i32 = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'{' => {
+                brace_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    return Some(fields); // closed the mutation selection set
+                }
+                if brace_depth < 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            _ if brace_depth != 1 || paren_depth != 0 => {
+                // Inside an argument list or a sub-selection — not a field head.
+                i += 1;
+            }
+            _ if c.is_ascii_whitespace() || c == b',' => {
+                i += 1;
+            }
+            b':' => {
+                // Alias separator; the real field name follows.
+                i += 1;
+            }
+            _ if is_graphql_name_start(c) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_graphql_name_cont(bytes[i]) {
+                    i += 1;
+                }
+                let ident = &stripped_query[start..i];
+                // Look past whitespace/commas: a following `:` makes this an alias,
+                // so the true field name is the next identifier — skip it here.
+                let mut j = i;
+                while j < bytes.len() && (bytes[j].is_ascii_whitespace() || bytes[j] == b',') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b':' {
+                    continue;
+                }
+                fields.push(ident.to_string());
+            }
+            _ => return None, // fragment/directive/variable/etc. — ambiguous
+        }
+    }
+    None // ran off the end without closing the selection set
+}
+
+/// True when `segment` is a `gh api graphql` mutation whose root fields are ALL
+/// in [`SAFE_GRAPHQL_MUTATIONS`]. Inlines the query (a non-inline `@file` query
+/// is never safe), strips string/comment literals, requires the `mutation`
+/// keyword, and demands the extractor return a non-empty, fully-safe field set.
+/// The membership test is a subset check (`all`), never `contains`, so a single
+/// unsafe field in a composite mutation blocks the whole segment.
+fn graphql_is_safe_mutation(segment: &str) -> bool {
+    let tokens = tokenize(segment);
+    let Some(query) = graphql_query_value(&tokens) else {
+        return false;
+    };
+    if query.starts_with('@') {
+        return false;
+    }
+    let stripped = strip_graphql_literals(&query);
+    if !MUTATION_KEYWORD.is_match(&stripped) {
+        return false;
+    }
+    match graphql_root_mutation_fields(&stripped) {
+        Some(fields) => {
+            !fields.is_empty()
+                && fields
+                    .iter()
+                    .all(|f| SAFE_GRAPHQL_MUTATIONS.contains(&f.as_str()))
+        }
+        None => false,
+    }
 }
 
 /// Build the block message for a `gh api` write whose target owner can't be
@@ -594,16 +851,27 @@ fn graphql_mutation_status(segment: &str) -> Option<bool> {
 /// `repos/<owner>/<repo>`). When `undeterminable_query` is set, the GraphQL
 /// query was loaded from a file, so its mutation status couldn't be confirmed.
 fn api_unverifiable_message(segment: &str, undeterminable_query: bool) -> String {
+    let is_graphql = gh_api_endpoint(segment).as_deref() == Some("graphql");
     let note = if undeterminable_query {
         "\n   Note: the GraphQL query is loaded from a file (`-F query=@…`), so its \
          mutation status can't be verified — treated as a write."
     } else {
         ""
     };
+    // graphql has no `-R`/`repos/<owner>/<repo>` form, so the generic
+    // "use gh api repos/…" fix is unsatisfiable there — state the reality (#317).
+    let fix = if is_graphql {
+        "Fix: `gh api graphql` has no `-R` or `repos/<owner>/<repo>` form to make ownership \
+         checkable. `resolveReviewThread`/`unresolveReviewThread` mutations are auto-allowed; \
+         any other mutation must be run by the user directly (a command they execute \
+         themselves), not by the agent."
+    } else {
+        "Fix: use `gh api repos/<owner>/<repo>/…` so ownership is checkable, or ask the user"
+    };
     format!(
         "🚫 git-guardrails: gh api write to an unverifiable target — ownership can't be checked\n   \
          Command: {segment}\n   \
-         Fix: use `gh api repos/<owner>/<repo>/…` so ownership is checkable, or ask the user{note}"
+         {fix}{note}"
     )
 }
 
@@ -616,12 +884,18 @@ fn api_unverifiable_block(
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> CheckResult {
+    // graphql has no -R/repos form, so its structured fix states the reality
+    // rather than the unsatisfiable "use gh api repos/…" (#317).
+    let fix = if gh_api_endpoint(segment).as_deref() == Some("graphql") {
+        "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly".to_string()
+    } else {
+        "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user".to_string()
+    };
     CheckResult::block_structured(
         api_unverifiable_message(segment, undeterminable_query),
         BlockMetadata {
             rule_id: "gh-write-api-unverifiable".to_string(),
-            fix: "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user"
-                .to_string(),
+            fix,
             allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
             severity: "error",
         },
@@ -878,6 +1152,9 @@ impl Check for GhWriteGuard {
                     match graphql_mutation_status(&segment) {
                         // Inline read query — no ownership to check, allow.
                         Some(false) => continue,
+                        // Bounded, content-free thread-metadata mutation
+                        // (resolve/unresolveReviewThread) — allow like a read.
+                        _ if graphql_is_safe_mutation(&segment) => continue,
                         // Mutation (`Some(true)`) or non-inline/undeterminable
                         // (`None`) — both block; the message names the latter.
                         status => {
@@ -2288,9 +2565,11 @@ mod tests {
             let result = GhWriteGuard.run(&input);
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+            // graphql fix states the reality (no -R/repos form) rather than the
+            // unsatisfiable generic remediation (#317).
             assert_eq!(
                 meta.fix,
-                "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user"
+                "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly"
             );
             assert_eq!(meta.severity, "error");
         });
@@ -2494,5 +2773,366 @@ mod tests {
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
+    }
+
+    // --- #262/#263/#300/#317: graphql safe-mutation allowlist + string-stripped classifier ---
+
+    #[test]
+    fn graphql_resolve_review_thread_allows() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_unresolve_review_thread_allows() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { unresolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_resolve_review_thread_multiline_allows() {
+        // Whitespace/newlines between the keyword, selection set, and fields
+        // must not defeat the extractor.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "gh api graphql -f query='mutation {\n  resolveReviewThread(input: {threadId: \"T\"}) {\n    thread { id }\n  }\n}'",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_aliased_safe_field_allows() {
+        // `alias: field` resolves to the underlying safe field.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { foo: resolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_introspection_mutation_typename_read_allows() {
+        // #263 regression: a read whose string arg is the `Mutation` type name
+        // must not be misread as a write. Case-sensitive keyword + literal
+        // stripping both defend this.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='query { __type(name: "Mutation") { fields { name } } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_dangerous_mutations_block() {
+        // Security regression: destructive/content-writing mutations stay blocked.
+        with_env(&owners_env(), || {
+            for q in [
+                "mutation { deleteRepository(input: {repositoryId: \"R\"}) { clientMutationId } }",
+                "mutation { createRepository(input: {name: \"x\"}) { repository { id } } }",
+                "mutation { mergePullRequest(input: {pullRequestId: \"P\"}) { pullRequest { merged } } }",
+                "mutation { createRelease(input: {repositoryId: \"R\", tagName: \"v1\"}) { release { id } } }",
+                "mutation { createRef(input: {repositoryId: \"R\", name: \"refs/heads/x\", oid: \"o\"}) { ref { id } } }",
+                // Deliberately excluded from the allowlist — posts user text.
+                "mutation { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: \"T\", body: \"hi\"}) { comment { id } } }",
+            ] {
+                let cmd = format!("gh api graphql -f query='{q}'");
+                let input = input_with(&cmd, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "must block: {q}"
+                );
+                assert_eq!(
+                    result.block_metadata.expect("structured block").rule_id,
+                    "gh-write-api-unverifiable"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn graphql_composite_safe_plus_dangerous_blocks() {
+        // Subset check, not `contains`: one unsafe root field blocks the whole
+        // segment even alongside a safe one.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "T"}) { thread { id } } deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_alias_disguised_dangerous_blocks() {
+        // An alias must not launder a dangerous field past the allowlist.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { x: deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_string_injected_dangerous_blocks() {
+        // A dangerous field hidden inside a string argument is neutralized by
+        // literal stripping; the real root field (`addComment`) is unsafe → block.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { addComment(input: {body: "}} deleteRepository(input:{"}) { clientMutationId } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_chained_read_then_dangerous_mutation_blocks() {
+        // Per-segment: a benign first read can't shield a dangerous mutation.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh pr list && gh api graphql -f query='mutation { deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_escaped_triple_quote_rider_blocks() {
+        // SECURITY REGRESSION (#262): a `\"""` escaped triple-quote keeps the
+        // block string open past the `}` chars smuggled inside it. Without
+        // honoring the escape the stripper closed early, the real `}`s read as
+        // structure, the extractor closed the selection set before the trailing
+        // field, and `deleteRepository` rode through as a safe
+        // `resolveReviewThread`. Must BLOCK.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""X\"""} } } """}) {clientMutationId} deleteRepository(input:{repositoryId:"NODE_ID"}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(
+                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                "smuggled deleteRepository must not ride through as a safe mutation"
+            );
+            assert_eq!(
+                result.block_metadata.expect("structured block").rule_id,
+                "gh-write-api-unverifiable"
+            );
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_escaped_triple_quote_legit_allows() {
+        // A genuine `\"""` inside a string value, with no smuggled field, must
+        // still ALLOW — the escape is honored in both directions, not blanket-blocked.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""has \""" a literal triple-quote"""}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_bare_brace_no_escape_allows() {
+        // A normal block string containing a bare `}` (no escape) with a single
+        // safe root field must still ALLOW — the escape fix didn't over-tighten.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""note } with brace"""}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_file_query_names_file_reason() {
+        // `-F query=@file` is undeterminable → block, and the message names the
+        // @file reason (the safe-mutation path can't rescue a non-inline query).
+        with_env(&owners_env(), || {
+            let input = input_with("gh api graphql -F query=@bulk.graphql", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+            let msg = result.message.expect("block message");
+            assert!(
+                msg.contains('@') && msg.to_lowercase().contains("file"),
+                "message must name the @file reason: {msg}"
+            );
+        });
+    }
+
+    // --- unit: strip_graphql_literals ---
+
+    #[test]
+    fn strip_blanks_string_content_including_braces() {
+        let out = strip_graphql_literals(r#"mutation { addComment(input: {body: "}} evil"}) }"#);
+        assert!(
+            !out.contains("evil"),
+            "string content must be blanked: {out}"
+        );
+        assert!(out.contains("mutation") && out.contains("addComment"));
+    }
+
+    #[test]
+    fn strip_blanks_block_string_content() {
+        let out = strip_graphql_literals(r#"f(note: """danger }} deleteRepository""")"#);
+        assert!(!out.contains("deleteRepository"));
+        assert!(!out.contains("danger"));
+        assert!(out.contains("note"));
+    }
+
+    #[test]
+    fn strip_blanks_comment_to_eol() {
+        let out = strip_graphql_literals("mutation { # deleteRepository\n resolveReviewThread }");
+        assert!(!out.contains("deleteRepository"));
+        assert!(out.contains("resolveReviewThread"));
+    }
+
+    #[test]
+    fn strip_honors_escaped_quote() {
+        // The escaped `\"` does not close the string, so the `}` stays inside and
+        // is blanked — it must not leak to the top level.
+        let out = strip_graphql_literals(r#"a "x \" }" b"#);
+        assert!(
+            !out.contains('}'),
+            "escaped quote must not close the string early: {out}"
+        );
+    }
+
+    // --- unit: graphql_root_mutation_fields ---
+
+    #[test]
+    fn root_fields_single_safe() {
+        assert_eq!(
+            graphql_root_mutation_fields(
+                "mutation { resolveReviewThread(input: {}) { thread { id } } }"
+            ),
+            Some(vec!["resolveReviewThread".to_string()])
+        );
+    }
+
+    #[test]
+    fn root_fields_alias_resolves_to_field() {
+        assert_eq!(
+            graphql_root_mutation_fields(
+                "mutation { x: deleteRepository(input: {}) { clientMutationId } }"
+            ),
+            Some(vec!["deleteRepository".to_string()])
+        );
+    }
+
+    #[test]
+    fn root_fields_composite_collects_all() {
+        assert_eq!(
+            graphql_root_mutation_fields(
+                "mutation { resolveReviewThread(input: {}) { thread { id } } deleteRepository(input: {}) { clientMutationId } }"
+            ),
+            Some(vec![
+                "resolveReviewThread".to_string(),
+                "deleteRepository".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn root_fields_skips_nested_and_args() {
+        // Argument identifiers and sub-selection fields must not appear as roots.
+        assert_eq!(
+            graphql_root_mutation_fields(
+                "mutation { resolveReviewThread(input: {threadId: 1}) { thread { id } } }"
+            ),
+            Some(vec!["resolveReviewThread".to_string()])
+        );
+    }
+
+    #[test]
+    fn root_fields_none_on_truncated() {
+        assert_eq!(
+            graphql_root_mutation_fields("mutation { resolveReviewThread(input: {"),
+            None
+        );
+    }
+
+    #[test]
+    fn root_fields_none_on_multiple_operations() {
+        assert_eq!(
+            graphql_root_mutation_fields("mutation A { x } mutation B { y }"),
+            None
+        );
+    }
+
+    #[test]
+    fn root_fields_none_on_no_selection_set() {
+        assert_eq!(graphql_root_mutation_fields("mutation"), None);
+    }
+
+    #[test]
+    fn root_fields_none_on_fragment_spread() {
+        // A fragment spread at field-head is a structure we don't model — fail closed.
+        assert_eq!(graphql_root_mutation_fields("mutation { ...Frag }"), None);
+    }
+
+    // --- unit: graphql_is_safe_mutation ---
+
+    #[test]
+    fn is_safe_mutation_true_for_resolve() {
+        assert!(graphql_is_safe_mutation(
+            r#"gh api graphql -f query='mutation { resolveReviewThread(input: {}) { thread { id } } }'"#
+        ));
+    }
+
+    #[test]
+    fn is_safe_mutation_false_for_file_query() {
+        assert!(!graphql_is_safe_mutation(
+            "gh api graphql -F query=@big.graphql"
+        ));
+    }
+
+    #[test]
+    fn is_safe_mutation_false_for_read() {
+        assert!(!graphql_is_safe_mutation(
+            r#"gh api graphql -f query='query { viewer { login } }'"#
+        ));
+    }
+
+    #[test]
+    fn is_safe_mutation_false_for_composite() {
+        assert!(!graphql_is_safe_mutation(
+            r#"gh api graphql -f query='mutation { resolveReviewThread(input: {}) { thread { id } } deleteRepository(input: {}) { clientMutationId } }'"#
+        ));
     }
 }
