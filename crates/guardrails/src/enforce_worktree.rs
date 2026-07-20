@@ -2591,6 +2591,40 @@ mod tests {
         }
     }
 
+    // --- #304: nested-repo commit-target attribution ---
+
+    #[test]
+    fn nested_primary_commit_attributes_to_nested_repo_not_parent() {
+        // Regression lock: a `git commit` with cwd inside a NESTED independent
+        // primary repo (its own `.git`, initialized inside another repo's tree)
+        // must resolve to the nested repo — the block names it, not the
+        // enclosing parent.
+        let scratch = Scratch::new("nested-attribution");
+        let parent = scratch.0.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        init_repo(&parent);
+        let child = parent.join("child");
+        std::fs::create_dir(&child).unwrap();
+        init_repo(&child);
+
+        let mut input = make_bash("git commit -m x");
+        input.cwd = Some(child.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block, "the nested primary blocks");
+        let msg = r.message.unwrap();
+        // The blocked repo is the nested `child`, not the enclosing `parent`.
+        // `child`'s path is `…/parent/child`, so a "parent` is a primary"
+        // phrasing can only appear if the block misattributes to the parent.
+        assert!(
+            msg.contains("child` is a primary checkout"),
+            "block names the nested repo: {msg}"
+        );
+        assert!(
+            !msg.contains("parent` is a primary checkout"),
+            "block must not misattribute to the enclosing parent: {msg}"
+        );
+    }
+
     #[test]
     fn same_repo_edit_honors_repo_declared_allow_main() {
         let scratch = Scratch::new("same-repo-allow-main");
