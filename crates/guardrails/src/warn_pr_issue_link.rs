@@ -184,6 +184,32 @@ mod tests {
         assert!(judge_pr_create("gh pr create -t x -F body.md", &contents).is_none());
     }
 
+    // Regression for #270: a cross-repo `Closes owner/repo#N` in a body file
+    // must be recognized as a closing keyword — allow (no nudge).
+    #[test]
+    fn body_file_cross_repo_closes_allowed() {
+        let contents = BodyFile::Contents("Closes cameronsjo/cadence#308".into());
+        assert!(
+            judge_pr_create(
+                "gh pr create -R cameronsjo/cadence --draft --title x --body-file /tmp/pr-body-entry.md",
+                &contents
+            )
+            .is_none()
+        );
+    }
+
+    // Cross-repo `Closes owner/repo#N` in an inline body — allow (no nudge).
+    #[test]
+    fn inline_body_cross_repo_closes_allowed() {
+        assert!(
+            judge_pr_create(
+                r#"gh pr create --body "Closes owner/repo#5""#,
+                &BodyFile::Absent
+            )
+            .is_none()
+        );
+    }
+
     // Test case 6b: --body-file flag present but file unreadable — stay silent (ADR-0001).
     // An unreadable file is the check's own verification failure (write/hook race,
     // permissions, path resolution) — never bother the user about it.
