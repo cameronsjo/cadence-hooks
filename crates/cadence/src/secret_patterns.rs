@@ -280,6 +280,19 @@ pub fn command_may_reference_secret(lower_command: &str) -> bool {
             .any(|frag| lower_command.contains(frag))
 }
 
+/// Substrings that mark a variable NAME as secret-shaped (`API_KEY`,
+/// `DB_PASSWORD`, `GH_TOKEN`). Matched case-insensitively against the name.
+const SECRET_VAR_NAME_KEYWORDS: &[&str] =
+    &["key", "secret", "token", "password", "credential", "auth"];
+
+/// Does this variable name look like it holds a secret? True iff its lowercased
+/// form contains any [`SECRET_VAR_NAME_KEYWORDS`] substring — the predicate the
+/// echo/printf leak nudge uses to judge an expanded var by name alone.
+pub fn is_secret_shaped_var_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SECRET_VAR_NAME_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
 /// High-confidence secret-*value* patterns: `(human name, regex)`.
 ///
 /// Each is deliberately provider-prefixed and length-bounded so a match means
