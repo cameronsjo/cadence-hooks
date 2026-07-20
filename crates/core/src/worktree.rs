@@ -31,11 +31,43 @@ pub fn is_truthy(value: Option<&str>) -> bool {
     )
 }
 
-/// Returns true if `repo_root` is a **primary checkout** — its `.git` is a
-/// directory. A linked worktree's `.git` is a *file* pointing into the
-/// primary repo's `.git/worktrees/`.
+/// Returns true if `repo_root` is a **primary checkout** — classified by
+/// resolved git identity, not by the surface form of `.git`. A conventional
+/// primary has a `.git` *directory* (the fast path). But a
+/// `--separate-git-dir` primary *also* has a `.git` *file* (like a linked
+/// worktree does), so the file-vs-dir surface form alone can't tell them apart
+/// (cadence-hooks#255): a separate-git-dir primary's `.git` file resolves to a
+/// git-dir that IS the shared common dir, whereas a linked worktree's `.git`
+/// file resolves to a git-dir under `.git/worktrees/<name>`, distinct from the
+/// common dir. So the rule is: **primary iff the canonical git-dir equals the
+/// canonical git-common-dir**, resolved the same spawn-free way
+/// [`crate::gitstate::GitState::resolve`] does.
+///
+/// Any resolution failure returns `false` (fail-open per ADR-0001 — a broken
+/// `.git` must never *newly* block).
 pub fn is_primary_checkout(repo_root: &str) -> bool {
-    Path::new(repo_root).join(".git").is_dir()
+    let root = Path::new(repo_root);
+    let dot_git = root.join(".git");
+    // Fast path: a real `.git` directory is always a primary checkout.
+    if dot_git.is_dir() {
+        return true;
+    }
+    // `.git` is a file (or absent): resolve the worktree admin dir (git-dir)
+    // and the shared common dir, then compare canonical identities. Reuses
+    // `crate::paths` exactly as `GitState::resolve` does — no git subprocess.
+    let Some(git_dir) = crate::paths::read_gitdir_file(&dot_git, root) else {
+        return false;
+    };
+    let Some(common_dir) = crate::paths::resolve_git_common_dir(root) else {
+        return false;
+    };
+    match (
+        std::fs::canonicalize(&git_dir),
+        std::fs::canonicalize(&common_dir),
+    ) {
+        (Ok(g), Ok(c)) => g == c,
+        _ => false,
+    }
 }
 
 /// Pure-ish: does `path` live under a temp root? `tmpdir` is the `$TMPDIR`
@@ -92,6 +124,15 @@ fn normalized_components(dir: &Path) -> Vec<OsString> {
 
 /// Returns true if `dir` lives inside a `.claude/` directory — Claude Code
 /// tooling/state, never the branch-worthy product work these guards target.
+///
+/// Layer B: this lexical `.claude`-anywhere match is a coarse stand-in for "is
+/// Claude-managed state", not a precise repo classification. One consequence
+/// worth stating plainly — a *primary checkout* that itself lives under a
+/// `.claude/` path is intentionally exempt from enforce-worktree. That coarse
+/// exemption is exactly why the `#312` `Scratch` fixtures assert their roots
+/// stay OUT of `.claude/` (and out of any temp root): a fixture under a
+/// carve-out would silently exempt every case and make the block paths
+/// untestable.
 pub fn is_claude_managed_dir(dir: &Path) -> bool {
     normalized_components(dir)
         .iter()
@@ -254,10 +295,75 @@ mod tests {
 
     #[test]
     fn not_primary_checkout_when_git_is_file() {
+        // A real linked worktree: its `.git` file resolves to a git-dir under
+        // `.git/worktrees/<name>`, distinct from the shared common dir — so the
+        // resolved-identity check classifies it as NOT primary.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("repo");
+        std::fs::create_dir_all(&primary).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&primary, &["init", "-q"]);
+        git(&primary, &["config", "user.email", "t@t"]);
+        git(&primary, &["config", "user.name", "t"]);
+        git(&primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = tmp.path().join("wt");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &wt.to_string_lossy(),
+                "-b",
+                "feat/x",
+            ],
+        );
+        assert!(!is_primary_checkout(wt.to_str().unwrap()));
+        // Control: the primary checkout itself IS primary (`.git` is a dir).
+        assert!(is_primary_checkout(primary.to_str().unwrap()));
+    }
+
+    #[test]
+    fn separate_git_dir_primary_is_primary() {
+        // `git init --separate-git-dir` produces a `.git` *file* on a genuine
+        // primary checkout — its git-dir equals the common dir, so it must be
+        // classified primary despite the file surface form (cadence-hooks#255).
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let gitdir = tmp.path().join("gitdir");
+        std::fs::create_dir_all(&work).unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(format!("--separate-git-dir={}", gitdir.display()))
+            .arg(&work)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git init --separate-git-dir failed");
+        assert!(work.join(".git").is_file(), "sanity: .git is a file");
+        assert!(is_primary_checkout(work.to_str().unwrap()));
+    }
+
+    #[test]
+    fn separate_git_dir_resolution_failure_fails_open() {
+        // A dangling gitdir pointer (target does not exist) resolves to no real
+        // git dir — fail open to NOT primary rather than newly blocking.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".git"),
-            "gitdir: /repo/.git/worktrees/feat\n",
+            "gitdir: /nonexistent/dangling.git\n",
         )
         .unwrap();
         assert!(!is_primary_checkout(dir.path().to_str().unwrap()));
@@ -400,6 +506,16 @@ mod tests {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/core-worktree-scratch")
                 .join(format!("{tag}-{}", std::process::id()));
+            // #312: a `.claude/` component or a temp prefix on the fixture root
+            // would silently exempt every case (the guard's own carve-outs) and
+            // make the block paths pass vacuously. Fail loudly instead.
+            assert!(
+                !is_claude_managed_dir(&root)
+                    && !path_under_temp_root(&root, std::env::var("TMPDIR").ok().as_deref()),
+                "fixture root sits under a carve-out (.claude/ or temp) — run the suite \
+                 from a carve-out-free checkout: {}",
+                root.display()
+            );
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             Self(root)

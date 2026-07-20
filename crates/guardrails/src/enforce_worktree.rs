@@ -640,57 +640,175 @@ fn collect_targets(
         detect_mutations(argv, segment, &effective_dir, mutations);
 
         // `argv` is the prefix-/assignment-stripped view computed above
-        // (`command`/`env`/`VAR=x git commit` → leading `git`); require it
-        // (#239 F4, #228).
-        if argv.first().map(String::as_str) != Some("git") {
-            continue;
-        }
-        // Walk git's own global flags to find the subcommand, capturing a
-        // `-C <path>` redirect on the way. Indices are into the quote-aware
-        // token stream, so a spaced quoted `-C`/`-c` value stays one token.
-        // git globals that take a SEPARATE value token — the value must be
-        // consumed or the walk stops on it and never reaches `commit`, failing
-        // open (CodeRabbit, PR #241). `-C`/`-c` are here too (redirect / inline
-        // config); the `--work-tree`/`--git-dir` value forms are caught by the
-        // ambiguity check below and skip the whole segment.
-        const VALUE_GLOBALS: &[&str] = &[
-            "-C",
-            "-c",
-            "--namespace",
-            "--super-prefix",
-            "--config-env",
-            "--attr-source",
-        ];
-        let mut redirect: Option<&str> = None;
-        let mut ambiguous = false;
-        let mut idx = 1;
-        while idx < argv.len()
-            && (argv[idx].starts_with('-') || VALUE_GLOBALS.contains(&argv[idx - 1].as_str()))
-        {
-            let t = argv[idx].as_str();
-            if argv[idx - 1] == "-C" {
-                redirect = Some(t);
-            } else if t == "--work-tree"
-                || t == "--git-dir"
-                || t.starts_with("--work-tree=")
-                || t.starts_with("--git-dir=")
-            {
-                ambiguous = true;
-            }
-            idx += 1;
-        }
-        if ambiguous {
-            continue;
-        }
-        if argv.get(idx).map(String::as_str) == Some("commit") {
-            let target = match redirect {
-                Some(path) if is_shell_absolute(path) => path.to_string(),
-                Some(path) => format!("{effective_dir}/{path}"),
-                None => effective_dir.clone(),
-            };
+        // (`command`/`env`/`VAR=x git commit` → leading `git`); the commit
+        // detection (leading-word gate, git-global walk, `-C` redirect,
+        // ambiguity skip) lives in [`commit_target_of`] so the #323 in-chain
+        // scan resolves a commit target identically (#239 F4, #228).
+        if let Some(target) = commit_target_of(argv, &effective_dir) {
             targets.push(target);
         }
     }
+}
+
+/// If `argv` (already prefix-/assignment-stripped) is a `git … commit …`
+/// invocation, return the directory the commit lands in — the `effective_dir`,
+/// or a `-C <path>` redirect resolved against it. `None` when the segment is
+/// not a git-commit, or its target tree is ambiguous (`--work-tree`/`--git-dir`,
+/// which fails open).
+///
+/// Walks git's own global flags to find the subcommand, capturing a `-C <path>`
+/// redirect on the way. Indices are into the quote-aware token stream, so a
+/// spaced quoted `-C`/`-c` value stays one token. git globals that take a
+/// SEPARATE value token must be consumed or the walk stops on the value and
+/// never reaches `commit`, failing open (CodeRabbit, PR #241).
+fn commit_target_of(argv: &[String], effective_dir: &str) -> Option<CommitTarget> {
+    if argv.first().map(String::as_str) != Some("git") {
+        return None;
+    }
+    const VALUE_GLOBALS: &[&str] = &[
+        "-C",
+        "-c",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--attr-source",
+    ];
+    let mut redirect: Option<&str> = None;
+    let mut ambiguous = false;
+    let mut idx = 1;
+    while idx < argv.len()
+        && (argv[idx].starts_with('-') || VALUE_GLOBALS.contains(&argv[idx - 1].as_str()))
+    {
+        let t = argv[idx].as_str();
+        if argv[idx - 1] == "-C" {
+            redirect = Some(t);
+        } else if t == "--work-tree"
+            || t == "--git-dir"
+            || t.starts_with("--work-tree=")
+            || t.starts_with("--git-dir=")
+        {
+            ambiguous = true;
+        }
+        idx += 1;
+    }
+    if ambiguous {
+        return None;
+    }
+    if argv.get(idx).map(String::as_str) == Some("commit") {
+        Some(match redirect {
+            Some(path) if is_shell_absolute(path) => path.to_string(),
+            Some(path) => format!("{effective_dir}/{path}"),
+            None => effective_dir.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Scan `command`'s **top-level** segments for a leading in-chain
+/// `dismiss-enforce-worktree` that licenses a same-repo `git commit` ordered
+/// after it — the #323 loosening. Returns a map from resolved commit-target dir
+/// to the dismiss's parsed `--reason` (for the synthesized bypass provenance).
+///
+/// Two guardrails keep this strict:
+///
+/// - **Top-level only.** A dismiss is honored only when it is the segment's own
+///   command (leading token is the `cadence-hooks` binary) — a dismiss buried
+///   in a `$(…)` substitution or `sh -c '…'` wrapper is NOT honored, because
+///   that dismiss does not actually run before this same command's commit. This
+///   walk therefore never recurses into child scripts (unlike
+///   [`collect_targets`]).
+/// - **`&&` chain only (GATE RIDER).** The dismiss's snooze only exists at the
+///   commit's runtime if every connector between them is `&&`. A `;`/`||` (or
+///   `|`/`&`/newline) breaks the chain — the dismiss might fail and the commit
+///   still run — so the active dismiss set is cleared on any non-`&&` connector,
+///   and such a commit still BLOCKS (fail closed).
+fn inchain_dismissed_commits(command: &str, cwd: &str) -> HashMap<CommitTarget, Option<String>> {
+    let mut dismissed: HashMap<CommitTarget, Option<String>> = HashMap::new();
+    // Repos with an active leading dismiss in the CURRENT unbroken `&&` chain:
+    // target dir → parsed `--reason`. Cleared whenever a non-`&&` connector
+    // breaks the chain.
+    let mut active: HashMap<CommitTarget, Option<String>> = HashMap::new();
+    let mut effective_dir = cwd.to_string();
+
+    for (segment, next_op) in split_segments_with_ops(command) {
+        let segment = strip_group_wrappers(&segment);
+        let tokens = tokenize(segment);
+        let argv = skip_transparent_prefixes(&tokens);
+
+        if tokens.first().map(String::as_str) == Some("cd") {
+            // `cd` accumulation, tracked exactly as [`collect_targets`] does
+            // (bare `cd`, flag-only, `-`, or `$VAR` targets left unresolved).
+            let mut idx = 1;
+            while tokens
+                .get(idx)
+                .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
+            {
+                idx += 1;
+            }
+            if let Some(target) = tokens.get(idx)
+                && target != "-"
+                && !target.starts_with('$')
+            {
+                effective_dir = resolve_cd_target(target, &effective_dir);
+            }
+        } else if is_dismiss_enforce_segment(argv) {
+            active.insert(
+                dismiss_target_dir(argv, &effective_dir),
+                crate::snooze_meta::normalize_reason(flag_value(argv, "--reason").as_deref()),
+            );
+        } else if let Some(target) = commit_target_of(argv, &effective_dir)
+            && let Some(reason) = active.get(&target)
+        {
+            dismissed.entry(target).or_insert_with(|| reason.clone());
+        }
+
+        // GATE RIDER: only an `&&` connector preserves the active dismiss set
+        // into the next segment.
+        if next_op != Some("&&") {
+            active.clear();
+        }
+    }
+    dismissed
+}
+
+/// True when `argv` (prefix-stripped) is a `cadence-hooks guardrails
+/// dismiss-enforce-worktree …` invocation whose leading token IS the
+/// `cadence-hooks` binary (by basename) — so a dismiss wrapped in `$(…)` or
+/// `sh -c '…'`, where the binary word is not the segment's own command, is not
+/// matched (top-level only, #323).
+fn is_dismiss_enforce_segment(argv: &[String]) -> bool {
+    argv.first().map(|c| basename(c)) == Some("cadence-hooks")
+        && argv
+            .windows(2)
+            .any(|w| w[0] == "guardrails" && w[1] == "dismiss-enforce-worktree")
+}
+
+/// The repo dir a `dismiss-enforce-worktree` segment targets: its `--repo`
+/// value resolved against `effective_dir` when present (mirroring
+/// [`commit_target_of`]'s `-C` resolution so the two produce matching target
+/// strings for the same repo), else `effective_dir` itself.
+fn dismiss_target_dir(argv: &[String], effective_dir: &str) -> CommitTarget {
+    match flag_value(argv, "--repo") {
+        Some(repo) if is_shell_absolute(&repo) => repo,
+        Some(repo) => format!("{effective_dir}/{repo}"),
+        None => effective_dir.to_string(),
+    }
+}
+
+/// Value of a `--flag <value>` or `--flag=<value>` option in `argv`, if present.
+fn flag_value(argv: &[String], flag: &str) -> Option<String> {
+    let eq_prefix = format!("{flag}=");
+    let mut it = argv.iter();
+    while let Some(tok) = it.next() {
+        if tok == flag {
+            return it.next().cloned();
+        }
+        if let Some(v) = tok.strip_prefix(&eq_prefix) {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 // `should_block` moved to `cadence_hooks_core::worktree` (cadence-hooks#236)
@@ -709,7 +827,10 @@ fn block_message(repo_root: &str, origin_repo: Option<&str>) -> String {
          One-off exception: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m \
          --reason \"<why>\"` (reason required over 1h; logged in the repo-visible bypass log).\n\
          Main-by-design repo? Set CADENCE_ALLOW_MAIN=true in the target repo's \
-         .claude/settings.json env block. Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1."
+         .claude/settings.json env block. Disable everywhere: CADENCE_NO_ENFORCE_WORKTREE=1.\n\
+         If the change must stay on this checkout's current branch (peer-coordinated work on a \
+         shared branch), a worktree cannot duplicate it — the dismiss above is the sanctioned \
+         path, not a workaround."
     );
     if let Some(origin) = origin_repo
         && origin != repo_root
@@ -1042,6 +1163,14 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
             // `uv add && git commit` into the primary must BLOCK (commit wins),
             // never double-fire a nudge.
             let (commit_targets, mutation_targets) = scan_targets(command, cwd);
+            // A leading `&&`-chained `dismiss-enforce-worktree` for the SAME
+            // repo licenses a commit ordered after it (#323): the dismiss will
+            // have armed the snooze before the commit runs, so honoring it here
+            // keeps the hook's decision consistent with what the shell will
+            // actually do. Top-level only, `&&`-chain only (see
+            // [`inchain_dismissed_commits`]); the map is keyed by the same
+            // resolved target strings the commit channel produces.
+            let dismissed = inchain_dismissed_commits(command, cwd);
             // Dedup identical targets so a pathological command (`git commit;`
             // ×N) can't fan out into N synchronous `git rev-parse` spawns and
             // stall the hook — each distinct target is assessed once (#239 F11).
@@ -1059,6 +1188,21 @@ fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
                     &mut probe,
                 );
                 if result.outcome != Outcome::Allow {
+                    // A leading in-chain dismiss for this same repo converts the
+                    // block into a recorded bypass — never a bare allow, so the
+                    // bypass-log `used` event fires (#323).
+                    if let Some(reason) = dismissed.get(&target) {
+                        if bypassed.is_none() {
+                            bypassed = Some(CheckResult::allow_bypassed(BypassProvenance {
+                                kind: BypassKind::Dismissal,
+                                mechanism: "dismiss-enforce-worktree (in-chain)".to_string(),
+                                reason: reason.clone(),
+                                expires_at: None,
+                                armed_by_session: None,
+                            }));
+                        }
+                        continue;
+                    }
                     return result;
                 }
                 if result.bypass.is_some() && bypassed.is_none() {
@@ -1730,6 +1874,10 @@ mod tests {
         assert!(msg.contains("dismiss-enforce-worktree"));
         assert!(msg.contains("CADENCE_ALLOW_MAIN"));
         assert!(msg.contains("CADENCE_NO_ENFORCE_WORKTREE"));
+        // The can't-worktree coordination case names the dismiss as sanctioned
+        // (#313) — not a workaround.
+        assert!(msg.contains("peer-coordinated work on a shared branch"));
+        assert!(msg.contains("the dismiss above is the sanctioned path"));
     }
 
     #[test]
@@ -1758,6 +1906,20 @@ mod tests {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/enforce-worktree-scratch")
                 .join(format!("{tag}-{}", std::process::id()));
+            // #312: the whole point of a `target/`-rooted fixture is to sit
+            // OUTSIDE the guard's own carve-outs — a `.claude/` component or a
+            // temp prefix would silently exempt every fixture and make the block
+            // paths pass vacuously. Fail loudly rather than test nothing.
+            assert!(
+                !is_claude_managed_dir(&root)
+                    && !cadence_hooks_core::worktree::path_under_temp_root(
+                        &root,
+                        std::env::var("TMPDIR").ok().as_deref(),
+                    ),
+                "fixture root sits under a carve-out (.claude/ or temp) — run the suite \
+                 from a carve-out-free checkout: {}",
+                root.display()
+            );
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             Self(root)
@@ -2311,6 +2473,156 @@ mod tests {
         let prov = r.bypass.expect("Bash-arm bypassed allow keeps provenance");
         assert_eq!(prov.kind, BypassKind::EnvSwitch);
         assert_eq!(prov.mechanism, "CADENCE_ALLOW_MAIN");
+    }
+
+    // --- #323: leading in-chain dismiss ---
+
+    #[test]
+    fn leading_inchain_dismiss_same_repo_allows_commit() {
+        // `dismiss && git commit` in the same primary: the dismiss arms the
+        // snooze before the commit runs, so the commit is allowed — and recorded
+        // as an in-chain Dismissal bypass, never a bare allow.
+        let scratch = Scratch::new("inchain-same");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash(
+            "cadence-hooks guardrails dismiss-enforce-worktree --for 30m \
+             --reason \"peer coordination\" && git commit -m x",
+        );
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "leading &&-chained in-chain dismiss allows the same-repo commit"
+        );
+        let prov = r.bypass.expect("in-chain dismiss records a bypass");
+        assert_eq!(prov.kind, BypassKind::Dismissal);
+        assert_eq!(prov.mechanism, "dismiss-enforce-worktree (in-chain)");
+        assert_eq!(prov.reason.as_deref(), Some("peer coordination"));
+    }
+
+    #[test]
+    fn inchain_dismiss_semicolon_connector_still_blocks() {
+        // GATE RIDER: a `;` between the dismiss and the commit means the dismiss
+        // might have failed at runtime with the commit still running — so the
+        // snooze is not guaranteed to exist. Fail closed: still BLOCK.
+        let scratch = Scratch::new("inchain-semicolon");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash(
+            "cadence-hooks guardrails dismiss-enforce-worktree --for 30m --reason x ; \
+             git commit -m y",
+        );
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "a `;` connector breaks the chain — commit still blocks"
+        );
+    }
+
+    #[test]
+    fn inchain_dismiss_different_repo_still_blocks() {
+        // A dismiss `--repo B` does not license a commit landing in A.
+        let scratch = Scratch::new("inchain-diff-repo");
+        let (primary_a, _wt) = primary_and_worktree(&scratch);
+        let primary_b = scratch.0.join("other");
+        std::fs::create_dir(&primary_b).unwrap();
+        init_repo(&primary_b);
+
+        let mut input = make_bash(&format!(
+            "cadence-hooks guardrails dismiss-enforce-worktree --for 30m --reason x --repo {} \
+             && git commit -m y",
+            primary_b.to_string_lossy()
+        ));
+        input.cwd = Some(primary_a.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "dismiss for repo B does not license a commit into repo A"
+        );
+    }
+
+    #[test]
+    fn dismiss_after_commit_still_blocks() {
+        // Order matters: a dismiss AFTER the commit cannot have armed the snooze
+        // in time — the commit still blocks.
+        let scratch = Scratch::new("inchain-after");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+
+        let mut input = make_bash(
+            "git commit -m y && cadence-hooks guardrails dismiss-enforce-worktree \
+             --for 30m --reason x",
+        );
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "a dismiss ordered after the commit does not license it"
+        );
+    }
+
+    #[test]
+    fn dismiss_in_subshell_still_blocks() {
+        // Top-level only: a dismiss buried in a `sh -c '…'` wrapper or a `$(…)`
+        // substitution is not the segment's own command and does not license a
+        // top-level commit.
+        let scratch = Scratch::new("inchain-subshell");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+
+        for cmd in [
+            "sh -c 'cadence-hooks guardrails dismiss-enforce-worktree --for 30m --reason x' \
+             && git commit -m y",
+            "$(cadence-hooks guardrails dismiss-enforce-worktree --for 30m --reason x) \
+             && git commit -m y",
+        ] {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a dismiss in a subshell does not license the commit: {cmd}"
+            );
+        }
+    }
+
+    // --- #304: nested-repo commit-target attribution ---
+
+    #[test]
+    fn nested_primary_commit_attributes_to_nested_repo_not_parent() {
+        // Regression lock: a `git commit` with cwd inside a NESTED independent
+        // primary repo (its own `.git`, initialized inside another repo's tree)
+        // must resolve to the nested repo — the block names it, not the
+        // enclosing parent.
+        let scratch = Scratch::new("nested-attribution");
+        let parent = scratch.0.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        init_repo(&parent);
+        let child = parent.join("child");
+        std::fs::create_dir(&child).unwrap();
+        init_repo(&child);
+
+        let mut input = make_bash("git commit -m x");
+        input.cwd = Some(child.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block, "the nested primary blocks");
+        let msg = r.message.unwrap();
+        // The blocked repo is the nested `child`, not the enclosing `parent`.
+        // `child`'s path is `…/parent/child`, so a "parent` is a primary"
+        // phrasing can only appear if the block misattributes to the parent.
+        assert!(
+            msg.contains("child` is a primary checkout"),
+            "block names the nested repo: {msg}"
+        );
+        assert!(
+            !msg.contains("parent` is a primary checkout"),
+            "block must not misattribute to the enclosing parent: {msg}"
+        );
     }
 
     #[test]
