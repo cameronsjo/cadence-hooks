@@ -17,6 +17,8 @@ clap = { version = "4", features = ["derive"] }
 brush-parser = "0.3"
 dialoguer = "0.11"
 jiff = "0.2"
+gethostname = "0.5"
+sha2 = "0.10"
 
 cadence-hooks-core = { path = "crates/core" }
 cadence-hooks-cadence = { path = "crates/cadence" }
