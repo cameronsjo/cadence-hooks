@@ -11,11 +11,13 @@ use std::sync::LazyLock;
 /// Regex for issue-closing keywords followed by a `#<number>` ref.
 ///
 /// Matches: closes, closed, close, fixes, fixed, fix, resolves, resolved, resolve.
-/// Case-insensitive; captures the digit string after `#`.
+/// Case-insensitive. Captures the digit string after `#` as `num`, and an
+/// optional cross-repo `owner/repo` prefix as `repo`. Cross-repo
+/// `owner/repo#N` is recognized (URL form and `GH-N` remain out of scope).
 static CLOSING_KW_RE: LazyLock<Regex> = LazyLock::new(|| {
     // Word boundaries keep substring hits ("discloses", "prefixes") from
     // counting as closing keywords.
-    Regex::new(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s+#([0-9]+)\b")
+    Regex::new(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s+(?P<repo>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#(?P<num>[0-9]+)\b")
         .expect("pattern should compile")
 });
 
@@ -31,7 +33,10 @@ pub fn has_closing_keyword(text: &str) -> bool {
 pub fn extract_refs(text: &str) -> Vec<u64> {
     let mut nums: Vec<u64> = CLOSING_KW_RE
         .captures_iter(text)
-        .filter_map(|cap| cap.get(1)?.as_str().parse::<u64>().ok())
+        // Same-repo only: a cross-repo `owner/repo#N` number would be closed
+        // against the PR's own repo, closing the wrong repo's issue.
+        .filter(|cap| cap.name("repo").is_none())
+        .filter_map(|cap| cap.name("num")?.as_str().parse::<u64>().ok())
         .collect();
     nums.sort_unstable();
     nums.dedup();
@@ -72,6 +77,19 @@ mod tests {
         assert!(!has_closing_keyword("this discloses #2 publicly"));
         assert!(!has_closing_keyword("prefixes #3 with a dash"));
         assert!(extract_refs("discloses #2 and prefixes #3").is_empty());
+    }
+
+    #[test]
+    fn has_closing_keyword_matches_cross_repo() {
+        assert!(has_closing_keyword("Closes cameronsjo/cadence#308"));
+        assert!(has_closing_keyword("Fixes owner/repo#5"));
+        assert!(has_closing_keyword("resolves a-b/c.d_e#7"));
+    }
+
+    #[test]
+    fn extract_refs_skips_cross_repo() {
+        assert!(extract_refs("Closes owner/repo#5").is_empty());
+        assert_eq!(extract_refs("Closes #3 and closes owner/repo#5"), vec![3]);
     }
 
     #[test]
