@@ -89,6 +89,10 @@ enum TargetClass {
     /// is NOT here — deleting it whole is not the transient-scratch case this
     /// ALLOW exists for, so it falls through to the block/ask rules.
     ClaudeManaged,
+    /// A transient scratch/editor-swap file directly under home whose name ends
+    /// in a recognized ephemeral suffix (`.tmp`/`.swp`/`.swo`). ALLOW — deleting
+    /// these is routine cleanup, not the destructive home-child case.
+    Scratch,
     /// The filesystem root `/`. BLOCK.
     Root,
     /// The user's home directory itself. BLOCK.
@@ -110,7 +114,7 @@ enum TargetClass {
 impl TargetClass {
     fn outcome(self) -> Outcome {
         match self {
-            TargetClass::Temp | TargetClass::ClaudeManaged => Outcome::Allow,
+            TargetClass::Temp | TargetClass::ClaudeManaged | TargetClass::Scratch => Outcome::Allow,
             TargetClass::Root
             | TargetClass::Home
             | TargetClass::HomeChild
@@ -384,6 +388,15 @@ fn has_parent_segment(path: &str) -> bool {
     path.split('/').any(|seg| seg == "..")
 }
 
+/// True when `norm`'s final path segment ends in a recognized transient suffix
+/// (`.tmp`, `.swp`, `.swo`) — an editor swap file or a temp-write artifact.
+/// `.bak`/`.orig`/`.old` are deliberately excluded: those can be intentional
+/// backups a user means to keep, so they stay BLOCK under home.
+fn is_transient_scratch(norm: &str) -> bool {
+    let last = norm.rsplit('/').next().unwrap_or(norm);
+    last.ends_with(".tmp") || last.ends_with(".swp") || last.ends_with(".swo")
+}
+
 /// Classify a resolved target path into guard-rm's [`TargetClass`].
 ///
 /// Delegates the shared path facts to [`pathclass::classify`] — temp,
@@ -425,6 +438,11 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
         return TargetClass::Home;
     }
     if shared == PathClass::HomeChild {
+        // A transient scratch/swap file under home (`~/.claude.json.tmp`,
+        // `~/.foo.swp`) is routine cleanup, not the destructive home-child case.
+        if is_transient_scratch(&norm) {
+            return TargetClass::Scratch;
+        }
         return TargetClass::HomeChild;
     }
     // Vault is guard-rm-local (deferred from pathclass v1); checked ahead of the
@@ -679,6 +697,23 @@ mod tests {
     fn deep_home_path_is_not_child() {
         // Only first-level home entries block; deeper paths fall to the middle.
         assert_eq!(judge("rm -rf ~/Documents/notes", "/home"), Outcome::Ask);
+    }
+
+    // --- ALLOW: transient-suffix scratch files directly under home (#316) ---
+
+    #[test]
+    fn transient_scratch_under_home_allows() {
+        // Editor swaps and temp-write artifacts under home are routine cleanup.
+        assert_eq!(judge("rm -f ~/.claude.json.tmp", "/home"), Outcome::Allow);
+        assert_eq!(judge("rm -f ~/.foo.swp", "/home"), Outcome::Allow);
+    }
+
+    #[test]
+    fn non_transient_home_child_still_blocks() {
+        assert_eq!(judge("rm -rf ~/.zshrc", "/home"), Outcome::Block);
+        assert_eq!(judge("rm -rf ~/Documents", "/home"), Outcome::Block);
+        // `.bak` is a deliberate exclusion — it can be an intentional backup.
+        assert_eq!(judge("rm -rf ~/Documents.bak", "/home"), Outcome::Block);
     }
 
     // --- BLOCK: vault ---
