@@ -86,8 +86,9 @@ pub fn render_context(
     if !non_default_hosts.is_empty() {
         let hosts = non_default_hosts.into_iter().collect::<Vec<_>>().join(", ");
         msg.push_str(&format!(
-            " gh only reaches {default_host}; for {hosts} use that forge's own CLI/API \
-             tooling instead."
+            " Hosts other than {default_host} ({hosts}): gh reaches them only if they run \
+             GitHub — pass `-R host/owner/repo`; otherwise use that forge's own CLI/API \
+             tooling."
         ));
     }
 
@@ -173,30 +174,30 @@ mod tests {
     fn routes_away_from_gh_for_host_qualified_owner_entry() {
         let owners = parse_allow_entries("git.sjo.lol/cameron");
         let msg = render_context(&owners, &[], &[], "github.com");
-        assert!(msg.contains("gh only reaches github.com"));
-        assert!(msg.contains("git.sjo.lol"));
+        assert!(msg.contains("Hosts other than github.com (git.sjo.lol)"));
+        assert!(msg.contains("`-R host/owner/repo`"));
     }
 
     #[test]
     fn routes_away_from_gh_for_extra_host() {
         let extras = vec!["git.sjo.lol".to_string()];
         let msg = render_context(&[], &[], &extras, "github.com");
-        assert!(msg.contains("gh only reaches github.com"));
-        assert!(msg.contains("git.sjo.lol"));
+        assert!(msg.contains("Hosts other than github.com (git.sjo.lol)"));
+        assert!(msg.contains("forge's own CLI/API tooling"));
     }
 
     #[test]
     fn omits_routing_sentence_when_no_non_default_hosts() {
         let owners = parse_allow_entries("cameronsjo cameron");
         let msg = render_context(&owners, &[], &[], "github.com");
-        assert!(!msg.contains("gh only reaches"));
+        assert!(!msg.contains("Hosts other than"));
     }
 
     #[test]
     fn omits_routing_sentence_when_host_qualified_entry_matches_default() {
         let owners = parse_allow_entries("github.com/cameron");
         let msg = render_context(&owners, &[], &[], "github.com");
-        assert!(!msg.contains("gh only reaches"));
+        assert!(!msg.contains("Hosts other than"));
     }
 
     #[test]
@@ -205,7 +206,9 @@ mod tests {
         let msg = render_context(&[], &[], &extras, "github.com");
         assert!(msg.contains("Extra hosts: git.sjo.lol."));
         assert!(msg.contains(
-            "gh only reaches github.com; for git.sjo.lol use that forge's own CLI/API tooling instead."
+            "Hosts other than github.com (git.sjo.lol): gh reaches them only if they run \
+             GitHub — pass `-R host/owner/repo`; otherwise use that forge's own CLI/API \
+             tooling."
         ));
     }
 
