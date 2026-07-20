@@ -25,6 +25,7 @@ use cadence_hooks_core::markers::{polish_marker, write_marker};
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::time::utc_timestamp;
 use serde_json::json;
+use std::path::Path;
 
 /// Resolve `repo_root`, `branch`, and `head_sha` from `dir`, letting explicit
 /// overrides bypass resolution so tests need no real repository.
@@ -66,6 +67,15 @@ fn marker_content(branch: &str, head_sha: &str, scope: &str) -> String {
     .to_string()
 }
 
+/// One-line success verdict: the marker path (the payload a caller probes to
+/// confirm the pre-PR gate is satisfied) plus the (repo@branch, scope) key.
+fn record_verdict(repo_root: &str, branch: &str, scope: &str, path: &Path) -> String {
+    format!(
+        "recorded polish marker: {} ({repo_root}@{branch} scope={scope})",
+        path.display()
+    )
+}
+
 /// Write the branch-scoped polish marker, resolving repo/branch/HEAD from the
 /// current directory unless overridden. Fail-open: any missing context or write
 /// error prints one stderr line and returns without error — a CLI action must
@@ -87,10 +97,11 @@ pub fn run_record(repo_root: Option<String>, branch: Option<String>, scope: Opti
     let scope = scope.unwrap_or_else(|| "full".to_string());
     let content = marker_content(&branch, &head_sha, &scope);
     let path = polish_marker(&repo_root, &branch);
-    if let Err(e) = write_marker(&path, &content) {
-        eprintln!(
+    match write_marker(&path, &content) {
+        Ok(()) => println!("{}", record_verdict(&repo_root, &branch, &scope, &path)),
+        Err(e) => eprintln!(
             "cadence-hooks record-polish: marker write failed ({e}) — pre-PR gate may re-nudge."
-        );
+        ),
     }
 }
 
@@ -109,6 +120,15 @@ mod tests {
         // recorded_at is an ISO-8601 UTC instant (jiff `utc_timestamp`).
         let ts = v["recorded_at"].as_str().unwrap();
         assert!(ts.ends_with('Z'), "recorded_at should be UTC: {ts}");
+    }
+
+    #[test]
+    fn record_verdict_names_path_repo_branch_and_scope() {
+        let path = polish_marker("/tmp/repo", "feat/x");
+        let verdict = record_verdict("/tmp/repo", "feat/x", "full", &path);
+        assert!(verdict.contains(&path.display().to_string()));
+        assert!(verdict.contains("/tmp/repo@feat/x"));
+        assert!(verdict.contains("scope=full"));
     }
 
     #[test]
