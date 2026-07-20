@@ -412,6 +412,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: Some(HookEvent::SessionStart),
     },
+    HookEntry {
+        name: "persist-plan",
+        description: "Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)",
+        plugin: "session",
+        event: Some(HookEvent::UserPromptSubmit),
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
@@ -519,6 +525,14 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "backstop-warn") => {
             Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#)
         }
+        // persist-plan gates on an exact "Implement the following plan:"
+        // prefix; the generic UserPromptSubmit sample carries no cwd/session_id
+        // so `try` would fail open before the write path. Carries the full
+        // shape (prompt + cwd + session_id + transcript_path) so `try` from a
+        // real checkout exercises the actual extraction and write.
+        ("session", "persist-plan") => Some(
+            r#"{"session_id":"test","prompt":"Implement the following plan:\n\n# Try Sample\n\nbody text","cwd":"/tmp","transcript_path":"/tmp/test.jsonl"}"#,
+        ),
         // warn-subagent-worktree only engages on an Agent/Task spawn; the generic
         // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a
         // directory to resolve against.
