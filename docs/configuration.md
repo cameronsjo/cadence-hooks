@@ -109,6 +109,7 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_METRICS_DEBUG` | `log-subagent` | Set to `1` to append a `_keys` array of the raw payload's top-level keys to subagent records — surfaces schema additions across Claude Code releases |
 | `CADENCE_METRICS_STALE_DAYS` | `warn-stale` | Days of metrics-write silence before the SessionStart alarm fires and `doctor` reports staleness (default 4); zero or unparseable falls back to the default |
 | `CADENCE_SESSION_STALE_MINUTES` | `session` hooks | Minutes of heartbeat silence before a session is presumed dead (default 10) |
+| `CADENCE_DOCTOR_PRUNE_FORCE` | `doctor --prune` | Set to `1` or `true` to bypass the live-session gate and let `doctor --prune --apply` delete orphaned plugin-cache version dirs even while peer sessions are running. The gate's refusal message names this override; otherwise run `/reload-plugins` in the live session first to release the retired dirs |
 | `GH_AUTOCLOSE_WAIT_SECONDS` | `verify-pr-autoclose` | Seconds to wait after `gh pr merge` before checking for straggler issues (default 10) |
 | `OBSIDIAN_VAULT` | `trash-guard`, `warn-overshare` | Absolute path to Obsidian vault — the trash guard scopes `rm` blocking to it, and the overshare audit treats it as the safe destination for personal context |
 
