@@ -139,18 +139,29 @@ pub fn run_persist_plan(
     }
     let stem = format!("{local_date}-{slug}");
 
-    let parent_session_id = input
+    let parent = input
         .transcript_path()
-        .and_then(|tp| find_parent_session_id(Path::new(tp), &body_hash, SystemTime::now()));
-    let parent_name = parent_session_id.as_deref().map(identity::generate_name);
+        .and_then(|tp| find_parent(Path::new(tp), &body_hash, SystemTime::now()));
+    let parent_session_id = parent.as_ref().map(|p| p.session_id.as_str());
+    let parent_name = parent_session_id.map(identity::generate_name);
     let own_name = identity::generate_name(session_id);
+    let machine_digest = crate::provenance::machine_digest(host);
+
+    let approving_parent = parent
+        .as_ref()
+        .zip(parent_name.as_deref())
+        .map(|(p, name)| ApprovingParent {
+            name,
+            session_id: p.session_id.as_str(),
+            model: p.model.as_deref(),
+            harness_version: p.harness_version.as_deref(),
+        });
 
     let provenance = provenance_block(
-        parent_name.as_deref(),
-        parent_session_id.as_deref(),
+        approving_parent,
         &own_name,
         session_id,
-        host,
+        &machine_digest,
         utc_now,
         &body_hash,
     );
@@ -174,7 +185,7 @@ pub fn run_persist_plan(
     );
     append_plan_links_row(&plan_links_row(
         utc_now,
-        parent_session_id.as_deref(),
+        parent_session_id,
         session_id,
         host,
         &repo_root.to_string_lossy(),
@@ -383,13 +394,34 @@ fn claim_target(
 // Provenance: parent resolution (Approach step 4)
 // ---------------------------------------------------------------------------
 
-/// A transcript line's `ExitPlanMode` tool_use plan text, if this line is an
-/// assistant message carrying one. Mirrors
+/// The parent transcript's approving turn, resolved by [`find_parent`]: the
+/// matched sibling's session id plus the fields the `Approved in:` line's
+/// bracket segment needs. `model`/`harness_version` are `None` when the
+/// matched line doesn't carry them — the bracket segment is then omitted
+/// entirely (see [`provenance_block`]) rather than rendered empty.
+#[derive(Debug, PartialEq, Eq)]
+struct ParentTuple {
+    session_id: String,
+    model: Option<String>,
+    harness_version: Option<String>,
+}
+
+/// One transcript line's `ExitPlanMode` tool_use match: the plan text plus
+/// the approving turn's model (`message.model`) and harness version
+/// (top-level `version`), when this line is an assistant message carrying an
+/// `ExitPlanMode` call. Mirrors
 /// `cadence_hooks_core::transcript::line_is_polish_skill_use`'s traversal.
-fn exit_plan_mode_text(line: &str) -> Option<String> {
+struct ExitPlanModeMatch {
+    plan_text: String,
+    model: Option<String>,
+    harness_version: Option<String>,
+}
+
+fn exit_plan_mode_match(line: &str) -> Option<ExitPlanModeMatch> {
     let value: Value = serde_json::from_str(line).ok()?;
-    let content = value.get("message")?.get("content")?.as_array()?;
-    content.iter().find_map(|block| {
+    let message = value.get("message")?;
+    let content = message.get("content")?.as_array()?;
+    let plan_text = content.iter().find_map(|block| {
         if block.get("type").and_then(Value::as_str) != Some("tool_use") {
             return None;
         }
@@ -401,6 +433,19 @@ fn exit_plan_mode_text(line: &str) -> Option<String> {
             .get("plan")?
             .as_str()
             .map(str::to_string)
+    })?;
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let harness_version = value
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(ExitPlanModeMatch {
+        plan_text,
+        model,
+        harness_version,
     })
 }
 
@@ -412,16 +457,12 @@ fn exit_plan_mode_text(line: &str) -> Option<String> {
 /// streamed line-by-line (never loading a whole sibling into memory) with a
 /// substring pre-filter on each line before any JSON parse. `now` is the
 /// caller's `SystemTime::now()`, threaded through for testability without a
-/// frozen clock. Returns the session id (the sibling's file stem) on the
-/// first exact match — never a fuzzy guess — and only when that stem passes
+/// frozen clock. Returns a [`ParentTuple`] on the first exact match — never a
+/// fuzzy guess — and only when the sibling's file stem passes
 /// [`identity::is_safe_session_id`]; a match against a hostile-named sibling
 /// is treated as no-match (`unknown`), since the returned id flows raw into
 /// the provenance text and the linkage row.
-fn find_parent_session_id(
-    transcript_path: &Path,
-    target_hash: &str,
-    now: SystemTime,
-) -> Option<String> {
+fn find_parent(transcript_path: &Path, target_hash: &str, now: SystemTime) -> Option<ParentTuple> {
     let dir = transcript_path.parent()?;
     let mut candidates: Vec<(SystemTime, PathBuf)> = fs::read_dir(dir)
         .ok()?
@@ -460,35 +501,80 @@ fn find_parent_session_id(
             if !line.contains("ExitPlanMode") {
                 continue;
             }
-            let Some(plan_text) = exit_plan_mode_text(&line) else {
+            let Some(exit_plan) = exit_plan_mode_match(&line) else {
                 continue;
             };
-            let normalized = strip_trailing_suffix_lines_and_trim(&plan_text);
+            let normalized = strip_trailing_suffix_lines_and_trim(&exit_plan.plan_text);
             if sha256_hex(normalized.as_bytes()) == target_hash {
                 let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-                return stem.filter(|s| identity::is_safe_session_id(s));
+                return stem
+                    .filter(|s| identity::is_safe_session_id(s))
+                    .map(|session_id| ParentTuple {
+                        session_id,
+                        model: exit_plan.model,
+                        harness_version: exit_plan.harness_version,
+                    });
             }
         }
     }
     None
 }
 
+/// The `Approved in:`/model+harness bracket segment, e.g. `" [claude-fable-5,
+/// claude-code 2.1.214]"` — rendered with its own leading space so the
+/// caller can splice it directly after the `(id)` segment. `None` when
+/// neither field is present, so the caller omits the bracket entirely rather
+/// than printing an empty or dangling one; when only one field is present,
+/// the bracket carries just that field (still never empty).
+fn model_harness_bracket(model: Option<&str>, harness_version: Option<&str>) -> Option<String> {
+    match (model, harness_version) {
+        (Some(m), Some(v)) => Some(format!(" [{m}, claude-code {v}]")),
+        (Some(m), None) => Some(format!(" [{m}]")),
+        (None, Some(v)) => Some(format!(" [claude-code {v}]")),
+        (None, None) => None,
+    }
+}
+
+/// The approving parent's rendered fields for [`provenance_block`]'s
+/// `Approved in:` line — bundled to keep the render function's arity under
+/// clippy's `too_many_arguments` threshold. `name` is the parent's generated
+/// display name (`identity::generate_name`), computed by the caller since
+/// [`find_parent`] only resolves the raw [`ParentTuple`].
+struct ApprovingParent<'a> {
+    name: &'a str,
+    session_id: &'a str,
+    model: Option<&'a str>,
+    harness_version: Option<&'a str>,
+}
+
 /// Render the provenance block appended to every persisted plan.
+///
+/// `machine_digest` is the salted, truncated digest from
+/// [`crate::provenance::machine_digest`] — never the raw hostname (cadence#248
+/// fixes the doctrine violation of a bare hostname in a committed artifact).
+/// It appears on both lines: transcripts are machine-local, so a resolved
+/// parent is same-machine by construction. The executing-session line never
+/// carries model/harness — on a same-session wipe it would be identical to
+/// the parent's, and on a fresh pickup it's simply unknown.
 fn provenance_block(
-    parent_name: Option<&str>,
-    parent_session_id: Option<&str>,
+    parent: Option<ApprovingParent>,
     own_name: &str,
     own_session_id: &str,
-    host: &str,
+    machine_digest: &str,
     utc_now: &str,
     body_hash: &str,
 ) -> String {
-    let approved_in = match (parent_name, parent_session_id) {
-        (Some(name), Some(sid)) => format!("Approved in: {name} ({sid}) @ {host}"),
-        _ => "Approved in: unknown".to_string(),
+    let approved_in = match parent {
+        Some(p) => {
+            let bracket = model_harness_bracket(p.model, p.harness_version).unwrap_or_default();
+            let name = p.name;
+            let sid = p.session_id;
+            format!("Approved in: {name} ({sid}){bracket} @ {machine_digest}")
+        }
+        None => "Approved in: unknown".to_string(),
     };
     format!(
-        "{approved_in}\nExecuting session: {own_name} ({own_session_id}) @ {host}\n\
+        "{approved_in}\nExecuting session: {own_name} ({own_session_id}) @ {machine_digest}\n\
          Persisted: {utc_now}\nPlan-body-SHA256: {body_hash}\n"
     )
 }
@@ -909,14 +995,26 @@ mod tests {
 
     // --- provenance: parent resolution ---
 
-    fn exit_plan_mode_line(plan: &str) -> String {
-        serde_json::json!({
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": plan}}]
-            }
-        })
-        .to_string()
+    /// `model`/`harness_version` model the assistant line's `message.model`
+    /// and top-level `version` — both `None` reproduces the older transcript
+    /// shape that carries neither.
+    fn exit_plan_mode_line(
+        plan: &str,
+        model: Option<&str>,
+        harness_version: Option<&str>,
+    ) -> String {
+        let mut message = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": plan}}]
+        });
+        if let Some(m) = model {
+            message["model"] = serde_json::json!(m);
+        }
+        let mut line = serde_json::json!({ "message": message });
+        if let Some(v) = harness_version {
+            line["version"] = serde_json::json!(v);
+        }
+        line.to_string()
     }
 
     #[test]
@@ -925,13 +1023,67 @@ mod tests {
         let plan_text = "# Title\n\nbody text";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
 
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
-        let found = find_parent_session_id(&own, &hash, SystemTime::now());
-        assert_eq!(found.as_deref(), Some("parent-session-id"));
+        let found = find_parent(&own, &hash, SystemTime::now());
+        assert_eq!(
+            found,
+            Some(ParentTuple {
+                session_id: "parent-session-id".to_string(),
+                model: None,
+                harness_version: None,
+            })
+        );
+    }
+
+    #[test]
+    fn find_parent_extracts_model_and_harness_version_from_matched_line() {
+        // Real transcripts stamp the approving assistant line with both
+        // `message.model` and a top-level `version` — verified live against
+        // an actual ExitPlanMode transcript line (2026-07-20). A fixture
+        // carrying neither would pass this assertion vacuously, so both
+        // fields must be populated here.
+        let tmp = TempDir::new().unwrap();
+        let plan_text = "# Title\n\nbody text";
+        let hash = sha256_hex(plan_text.as_bytes());
+        let sibling = tmp.path().join("parent-session-id.jsonl");
+        fs::write(
+            &sibling,
+            exit_plan_mode_line(plan_text, Some("claude-fable-5"), Some("2.1.214")),
+        )
+        .unwrap();
+        let own = tmp.path().join("own-session-id.jsonl");
+        fs::write(&own, "{}").unwrap();
+
+        let found = find_parent(&own, &hash, SystemTime::now());
+        assert_eq!(
+            found,
+            Some(ParentTuple {
+                session_id: "parent-session-id".to_string(),
+                model: Some("claude-fable-5".to_string()),
+                harness_version: Some("2.1.214".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn find_parent_missing_model_and_harness_version_is_gracefully_none() {
+        // Older transcript lines (or a stripped-down fixture) may carry
+        // neither field — the tuple must still resolve, with both absent.
+        let tmp = TempDir::new().unwrap();
+        let plan_text = "# Title\n\nbody text";
+        let hash = sha256_hex(plan_text.as_bytes());
+        let sibling = tmp.path().join("parent-session-id.jsonl");
+        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
+        let own = tmp.path().join("own-session-id.jsonl");
+        fs::write(&own, "{}").unwrap();
+
+        let found = find_parent(&own, &hash, SystemTime::now()).expect("parent must be found");
+        assert_eq!(found.model, None);
+        assert_eq!(found.harness_version, None);
     }
 
     #[test]
@@ -940,11 +1092,11 @@ mod tests {
         let plan_text = "# Title\n\nbody text";
         let hash = sha256_hex(plan_text.as_bytes());
         let own = tmp.path().join("own-session-id.jsonl");
-        fs::write(&own, exit_plan_mode_line(plan_text)).unwrap();
+        fs::write(&own, exit_plan_mode_line(plan_text, None, None)).unwrap();
 
-        let found = find_parent_session_id(&own, &hash, SystemTime::now());
+        let found = find_parent(&own, &hash, SystemTime::now());
         assert_eq!(
-            found.as_deref(),
+            found.map(|p| p.session_id).as_deref(),
             Some("own-session-id"),
             "same-file wipe: parent resolves to the executing session itself"
         );
@@ -954,11 +1106,11 @@ mod tests {
     fn find_parent_no_match_is_unknown() {
         let tmp = TempDir::new().unwrap();
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line("some other plan")).unwrap();
+        fs::write(&sibling, exit_plan_mode_line("some other plan", None, None)).unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
-        let found = find_parent_session_id(&own, "nonexistent-hash", SystemTime::now());
+        let found = find_parent(&own, "nonexistent-hash", SystemTime::now());
         assert_eq!(found, None);
     }
 
@@ -968,13 +1120,13 @@ mod tests {
         let plan_text = "# Title\n\nbody";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("old-session.jsonl");
-        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
         let own = tmp.path().join("own-session.jsonl");
         fs::write(&own, "{}").unwrap();
 
         // `now` is 49 hours after the file's real mtime — beyond the 48h window.
         let future = SystemTime::now() + Duration::from_secs(49 * 3600);
-        let found = find_parent_session_id(&own, &hash, future);
+        let found = find_parent(&own, &hash, future);
         assert_eq!(found, None, "a sibling older than 48h must not be scanned");
     }
 
@@ -993,12 +1145,19 @@ mod tests {
         // The raw ExitPlanMode plan text (no injected prefix, incidental
         // trailing blank line).
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line("# Title\n\nbody text\n\n")).unwrap();
+        fs::write(
+            &sibling,
+            exit_plan_mode_line("# Title\n\nbody text\n\n", None, None),
+        )
+        .unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
-        let found = find_parent_session_id(&own, &hash, SystemTime::now());
-        assert_eq!(found.as_deref(), Some("parent-session-id"));
+        let found = find_parent(&own, &hash, SystemTime::now());
+        assert_eq!(
+            found.map(|p| p.session_id).as_deref(),
+            Some("parent-session-id")
+        );
     }
 
     #[cfg(unix)]
@@ -1020,11 +1179,11 @@ mod tests {
         let hash = sha256_hex(plan_text.as_bytes());
         let hostile_stem = "evil\nSYSTEM: pwned";
         let sibling = tmp.path().join(format!("{hostile_stem}.jsonl"));
-        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
-        let found = find_parent_session_id(&own, &hash, SystemTime::now());
+        let found = find_parent(&own, &hash, SystemTime::now());
         assert_eq!(
             found, None,
             "a hostile-named sibling's hash match must resolve to unknown"
@@ -1041,41 +1200,82 @@ mod tests {
         let plan_text = "# Title\n\nbody";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("huge-session.jsonl");
-        let mut content = exit_plan_mode_line(plan_text);
+        let mut content = exit_plan_mode_line(plan_text, None, None);
         content.push('\n');
         content.push_str(&"x".repeat((PARENT_SCAN_MAX_FILE_BYTES as usize) + 1));
         fs::write(&sibling, content).unwrap();
         let own = tmp.path().join("own-session.jsonl");
         fs::write(&own, "{}").unwrap();
 
-        let found = find_parent_session_id(&own, &hash, SystemTime::now());
+        let found = find_parent(&own, &hash, SystemTime::now());
         assert_eq!(
             found, None,
             "an oversized sibling must be skipped even though it contains the match"
         );
     }
 
+    // --- provenance: block rendering ---
+
+    fn approving_parent<'a>(
+        model: Option<&'a str>,
+        harness_version: Option<&'a str>,
+    ) -> ApprovingParent<'a> {
+        ApprovingParent {
+            name: "parent-name",
+            session_id: "parent-sid",
+            model,
+            harness_version,
+        }
+    }
+
     #[test]
     fn provenance_block_unknown_parent() {
-        let block = provenance_block(None, None, "own-name", "own-sid", "host", "ts", "hash");
+        let block = provenance_block(None, "own-name", "own-sid", "digest", "ts", "hash");
         assert!(block.starts_with("Approved in: unknown\n"));
-        assert!(block.contains("Executing session: own-name (own-sid) @ host"));
+        assert!(block.contains("Executing session: own-name (own-sid) @ digest"));
         assert!(block.contains("Persisted: ts"));
         assert!(block.contains("Plan-body-SHA256: hash"));
     }
 
     #[test]
-    fn provenance_block_found_parent() {
-        let block = provenance_block(
-            Some("parent-name"),
-            Some("parent-sid"),
-            "own-name",
-            "own-sid",
-            "host",
-            "ts",
-            "hash",
+    fn provenance_block_found_parent_with_model_and_harness() {
+        let parent = approving_parent(Some("claude-fable-5"), Some("2.1.214"));
+        let block = provenance_block(Some(parent), "own-name", "own-sid", "digest", "ts", "hash");
+        assert!(block.starts_with(
+            "Approved in: parent-name (parent-sid) [claude-fable-5, claude-code 2.1.214] @ digest\n"
+        ));
+        // The executing-session line never carries model/harness — only name + id.
+        assert!(block.contains("Executing session: own-name (own-sid) @ digest"));
+    }
+
+    #[test]
+    fn provenance_block_found_parent_without_model_or_harness_omits_bracket() {
+        // Neither field resolved (e.g. an older transcript format) — the
+        // bracket segment must be omitted entirely, never rendered empty.
+        let parent = approving_parent(None, None);
+        let block = provenance_block(Some(parent), "own-name", "own-sid", "digest", "ts", "hash");
+        assert!(block.starts_with("Approved in: parent-name (parent-sid) @ digest\n"));
+        assert!(!block.contains('['), "no dangling/empty bracket: {block}");
+    }
+
+    #[test]
+    fn provenance_block_found_parent_with_model_only() {
+        let parent = approving_parent(Some("claude-fable-5"), None);
+        let block = provenance_block(Some(parent), "own-name", "own-sid", "digest", "ts", "hash");
+        assert!(
+            block.starts_with("Approved in: parent-name (parent-sid) [claude-fable-5] @ digest\n")
         );
-        assert!(block.starts_with("Approved in: parent-name (parent-sid) @ host\n"));
+    }
+
+    #[test]
+    fn provenance_block_found_parent_with_harness_only() {
+        let parent = approving_parent(None, Some("2.1.214"));
+        let block = provenance_block(Some(parent), "own-name", "own-sid", "digest", "ts", "hash");
+        assert!(
+            block.starts_with(
+                "Approved in: parent-name (parent-sid) [claude-code 2.1.214] @ digest\n"
+            )
+        );
     }
 
     // --- linkage row schema ---
@@ -1167,6 +1367,13 @@ mod tests {
         assert!(!written.contains("If this plan can be broken down"));
         assert!(written.contains("Executing session:"));
         assert!(written.contains("Plan-body-SHA256:"));
+        // Doctrine fix (cadence#248): the committed block carries the salted
+        // digest, never the raw hostname.
+        assert!(
+            !written.contains("test-host"),
+            "the raw hostname must never reach the committed provenance block"
+        );
+        assert!(written.contains(&crate::provenance::machine_digest("test-host")));
 
         let links = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
         assert!(links.contains("\"child_session_id\":\"child-session-id\""));
@@ -1174,6 +1381,9 @@ mod tests {
         // plan_path is forward-slash-normalized regardless of platform — a
         // stable schema value for consumers, not the native separator.
         assert!(links.contains("\"plan_path\":\"docs/plans/2026-07-20-fix-the-widget.md\""));
+        // Local-only metrics KEEP the bare hostname — only the committed doc
+        // block is salted (cadence#248).
+        assert!(links.contains("\"host\":\"test-host\""));
     }
 
     #[test]

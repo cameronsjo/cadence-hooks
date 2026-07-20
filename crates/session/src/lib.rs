@@ -49,6 +49,9 @@ pub mod identity;
 /// UserPromptSubmit hook: persist an approved plan whose post-approval turn
 /// was wiped (approve-and-clear), so it survives on disk (cadence#505).
 pub mod persist_plan;
+/// Salted machine digest for committed provenance blocks (cadence#248) —
+/// shared with a future commit-message provenance check.
+pub mod provenance;
 /// Registry I/O: the `.claude/sessions/` directory and peer discovery.
 pub mod registry;
 /// SessionStart hook: register self, sweep stale, disclose live peers.
