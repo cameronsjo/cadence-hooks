@@ -212,6 +212,26 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
     }
 }
 
+/// Build the one-line quiet SessionStart warning summary. Names an actor
+/// (Claude) and an action (run doctor, triage, surface to the user) instead of
+/// the old passive "run for details". The version-skew upgrade hint is appended
+/// only when a skew warning is present — stale-telemetry-only warnings carry no
+/// upgrade to suggest.
+fn quiet_warning_summary(
+    version: &str,
+    n_warn: usize,
+    has_skew: bool,
+    channel: InstallChannel,
+) -> String {
+    let mut summary = format!(
+        "cadence-hooks {version}: {n_warn} plugin warning(s). Claude: run 'cadence-hooks doctor', triage, and surface anything actionable to the user in one line."
+    );
+    if has_skew {
+        summary.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
+    }
+    summary
+}
+
 /// Judge an invocation against the registry.
 /// Returns `None` when the pair is known-good.
 /// Returns `Some(SkewDiagnosis)` for a namespace mismatch or unknown subcommand.
@@ -1420,10 +1440,12 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         // telemetry, so the summary stays generic and defers the specifics to a
         // full `cadence-hooks doctor` run.
         let version = env!("CARGO_PKG_VERSION");
+        let has_skew = warnings
+            .iter()
+            .any(|w| w.diagnosis.contains("not present in this binary"));
         println!(
-            "cadence-hooks {version}: {} plugin warning(s) — run 'cadence-hooks doctor' for details ({})",
-            warnings.len(),
-            upgrade_hint_short(channel)
+            "{}",
+            quiet_warning_summary(version, warnings.len(), has_skew, channel)
         );
         return 0;
     }
@@ -2206,6 +2228,35 @@ mod tests {
         let h = upgrade_hint_short(InstallChannel::Cargo);
         assert!(h.contains("doctor"), "{h}");
         assert!(!h.contains("brew"), "{h}");
+    }
+
+    // ── quiet_warning_summary (#306) ────────────────────────────────────────
+
+    #[test]
+    fn quiet_summary_names_actor_and_action() {
+        let s = quiet_warning_summary("0.60.0", 2, false, InstallChannel::Unknown);
+        assert!(s.contains("Claude:"), "must name the actor: {s}");
+        assert!(
+            s.contains("run 'cadence-hooks doctor'"),
+            "must name the action: {s}"
+        );
+    }
+
+    #[test]
+    fn quiet_summary_no_skew_omits_upgrade_hint() {
+        let s = quiet_warning_summary("0.60.0", 1, false, InstallChannel::Homebrew);
+        assert!(!s.contains("brew upgrade"), "no upgrade hint expected: {s}");
+        assert!(!s.contains("Version skew"), "no skew clause expected: {s}");
+    }
+
+    #[test]
+    fn quiet_summary_skew_includes_upgrade_hint() {
+        let s = quiet_warning_summary("0.60.0", 1, true, InstallChannel::Homebrew);
+        assert!(s.contains("Version skew"), "skew clause expected: {s}");
+        assert!(
+            s.contains("brew upgrade cadence-hooks"),
+            "Homebrew skew hint expected: {s}"
+        );
     }
 
     // ── integration tests via run(Some(tmpdir), ...) ─────────────────────────
