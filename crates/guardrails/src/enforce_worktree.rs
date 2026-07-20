@@ -1906,6 +1906,20 @@ mod tests {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/enforce-worktree-scratch")
                 .join(format!("{tag}-{}", std::process::id()));
+            // #312: the whole point of a `target/`-rooted fixture is to sit
+            // OUTSIDE the guard's own carve-outs — a `.claude/` component or a
+            // temp prefix would silently exempt every fixture and make the block
+            // paths pass vacuously. Fail loudly rather than test nothing.
+            assert!(
+                !is_claude_managed_dir(&root)
+                    && !cadence_hooks_core::worktree::path_under_temp_root(
+                        &root,
+                        std::env::var("TMPDIR").ok().as_deref(),
+                    ),
+                "fixture root sits under a carve-out (.claude/ or temp) — run the suite \
+                 from a carve-out-free checkout: {}",
+                root.display()
+            );
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             Self(root)

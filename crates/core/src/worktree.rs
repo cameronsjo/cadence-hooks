@@ -124,6 +124,15 @@ fn normalized_components(dir: &Path) -> Vec<OsString> {
 
 /// Returns true if `dir` lives inside a `.claude/` directory — Claude Code
 /// tooling/state, never the branch-worthy product work these guards target.
+///
+/// Layer B: this lexical `.claude`-anywhere match is a coarse stand-in for "is
+/// Claude-managed state", not a precise repo classification. One consequence
+/// worth stating plainly — a *primary checkout* that itself lives under a
+/// `.claude/` path is intentionally exempt from enforce-worktree. That coarse
+/// exemption is exactly why the `#312` `Scratch` fixtures assert their roots
+/// stay OUT of `.claude/` (and out of any temp root): a fixture under a
+/// carve-out would silently exempt every case and make the block paths
+/// untestable.
 pub fn is_claude_managed_dir(dir: &Path) -> bool {
     normalized_components(dir)
         .iter()
@@ -497,6 +506,16 @@ mod tests {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/core-worktree-scratch")
                 .join(format!("{tag}-{}", std::process::id()));
+            // #312: a `.claude/` component or a temp prefix on the fixture root
+            // would silently exempt every case (the guard's own carve-outs) and
+            // make the block paths pass vacuously. Fail loudly instead.
+            assert!(
+                !is_claude_managed_dir(&root)
+                    && !path_under_temp_root(&root, std::env::var("TMPDIR").ok().as_deref()),
+                "fixture root sits under a carve-out (.claude/ or temp) — run the suite \
+                 from a carve-out-free checkout: {}",
+                root.display()
+            );
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             Self(root)
