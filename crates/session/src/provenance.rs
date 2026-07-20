@@ -2,8 +2,8 @@
 //!
 //! A raw hostname is machine-identifying but not something that belongs in a
 //! git-committed artifact — it leaks environment topology to anyone who reads
-//! the repo's history. Every COMMITTED provenance block (persisted plans
-//! today; a future commit-message check per the same convention) uses
+//! the repo's history. Every COMMITTED provenance block (persisted plans,
+//! and the `warn-commit-provenance` nudge's computed trailer) uses
 //! [`machine_digest`] instead. Local-only telemetry (e.g. `plan-links.jsonl`)
 //! is unaffected and keeps the bare hostname — this module exists only for
 //! the committed-artifact path.

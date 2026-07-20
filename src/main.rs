@@ -326,6 +326,8 @@ enum SessionCommands {
     WarnBranchDrift,
     /// Nudge when new work starts on a stale, unrelated feature branch (PreToolUse)
     WarnBranchIntent,
+    /// Nudge toward a `Session-Id:` trailer on a Claude-composed commit message (PreToolUse)
+    WarnCommitProvenance,
     /// Deregister this session's registry file when it ends (SessionEnd logger)
     End,
     /// Record loose ends when the session ends, for the next start to surface (SessionEnd logger)
@@ -438,6 +440,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::Guard => "guard",
             SessionCommands::WarnBranchDrift => "warn-branch-drift",
             SessionCommands::WarnBranchIntent => "warn-branch-intent",
+            SessionCommands::WarnCommitProvenance => "warn-commit-provenance",
             SessionCommands::End => "end",
             SessionCommands::BackstopRecord => "backstop-record",
             SessionCommands::BackstopWarn => "backstop-warn",
@@ -1081,6 +1084,11 @@ fn main() {
             ),
             SessionCommands::WarnBranchIntent => dispatch::run_logged_check(
                 &cadence_hooks_session::branch_intent::WarnBranchIntent,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::WarnCommitProvenance => dispatch::run_logged_check(
+                &cadence_hooks_session::warn_commit_provenance::WarnCommitProvenance,
                 pre,
                 canonical_hook,
             ),

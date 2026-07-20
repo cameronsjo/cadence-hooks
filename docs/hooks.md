@@ -143,6 +143,7 @@ give sessions *identity* within a repo via a registry at `<repo>/.claude/session
 | `heartbeat` | PostToolUse | Touch this session's registry file; refresh the recorded branch so peers see branch drift |
 | `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths |
 | `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time |
+| `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one |
 
 Liveness is mtime-based: a session that crashes or closes simply stops heartbeating
 and is presumed dead after 10 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
