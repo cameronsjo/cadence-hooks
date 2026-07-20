@@ -332,6 +332,8 @@ enum SessionCommands {
     BackstopRecord,
     /// Warn at session start when the last session in this repo left loose ends (SessionStart)
     BackstopWarn,
+    /// Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)
+    PersistPlan,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -439,6 +441,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::End => "end",
             SessionCommands::BackstopRecord => "backstop-record",
             SessionCommands::BackstopWarn => "backstop-warn",
+            SessionCommands::PersistPlan => "persist-plan",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -680,6 +683,7 @@ fn main() {
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
     let session = HookEvent::SessionStart;
+    let user_prompt_submit = HookEvent::UserPromptSubmit;
 
     match cli.command {
         Commands::Try {
@@ -1093,6 +1097,11 @@ fn main() {
             SessionCommands::BackstopWarn => dispatch::run_logged_check(
                 &cadence_hooks_session::backstop::BackstopWarn,
                 session,
+                canonical_hook,
+            ),
+            SessionCommands::PersistPlan => dispatch::run_logged_check(
+                &cadence_hooks_session::persist_plan::PersistPlan,
+                user_prompt_submit,
                 canonical_hook,
             ),
             SessionCommands::Declare {
