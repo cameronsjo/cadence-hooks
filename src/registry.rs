@@ -395,6 +395,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-commit-provenance",
+        description: "Nudge toward a Session-Id: trailer on a Claude-composed commit message",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "end",
         description: "Deregister this session's registry file when it ends (SessionEnd)",
         plugin: "session",
@@ -501,6 +507,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // and fail-opens cleanly (cwd not a registered session).
         ("session", "warn-branch-intent") => Some(
             r#"{"session_id":"test","tool_name":"Edit","cwd":"/tmp","tool_input":{"file_path":"/tmp/x.rs"}}"#,
+        ),
+        // warn-commit-provenance early-exits unless the command is a git
+        // commit carrying an extractable message — the generic PreToolUse
+        // sample (`git status`) would never reach the Session-Id: check.
+        ("session", "warn-commit-provenance") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}"#,
         ),
         // end gates on hook_event_name == "SessionEnd"; the generic logger
         // sample carries a different event and would no-op before the gate.
