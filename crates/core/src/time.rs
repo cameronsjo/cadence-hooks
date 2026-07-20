@@ -23,6 +23,18 @@ pub fn utc_timestamp() -> String {
     Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// Current LOCAL calendar date, `%Y-%m-%d` (e.g. `2026-07-20`).
+///
+/// Distinct from [`utc_timestamp`]: filenames that carry a date (e.g. the
+/// `docs/plans/YYYY-MM-DD-<slug>.md` convention `session persist-plan` writes
+/// into) use the author's local calendar day, matching every hand-authored
+/// plan file — a UTC-derived date would occasionally be a day off from what
+/// the session experienced. `Zoned::now()` resolves the system time zone,
+/// falling back to UTC if the platform cannot report one (never panicking).
+pub fn local_date() -> String {
+    jiff::Zoned::now().strftime("%Y-%m-%d").to_string()
+}
+
 /// Human-facing current-datetime context for the cron-scheduling nudge.
 ///
 /// CronCreate pins to exact calendar dates in the user's **local** time, so the
@@ -70,6 +82,14 @@ mod tests {
     fn utc_timestamp_is_never_empty() {
         // Unlike the `date` shell-out it replaces, jiff cannot fail here.
         assert!(!utc_timestamp().is_empty());
+    }
+
+    #[test]
+    fn local_date_has_iso_date_shape() {
+        let d = local_date();
+        // e.g. 2026-07-20 — 10 chars, two dashes.
+        assert_eq!(d.len(), 10, "ISO calendar date is 10 chars: {d}");
+        assert_eq!(d.matches('-').count(), 2, "two dashes: {d}");
     }
 
     #[test]
