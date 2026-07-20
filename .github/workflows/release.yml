@@ -102,6 +102,7 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: ${{ env.ARCHIVE }}
+          retention-days: 1
 
   release:
     name: Create Release
