@@ -230,14 +230,13 @@ pub fn repo_env_flag(repo_root: &Path, key: &str) -> Option<String> {
         let Some(content) = read_untrusted_config(&claude_dir.join(name)) else {
             continue;
         };
-        // Tolerate a leading UTF-8 BOM. Editors and hand-authoring often prepend
-        // one; serde_json rejects it as an unexpected character at column 1,
-        // which would silently drop a *declared* CADENCE_ALLOW_MAIN and
-        // false-block a by-design-main repo (cadence-hooks#239 F10). We strip
-        // only the BOM — JSONC comments/trailing commas stay a strict-parse
-        // reject (no lenient-parser dependency here).
-        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
+        // Tolerate a leading UTF-8 BOM and JSONC (comments, trailing commas).
+        // Editors and hand-authoring often prepend a BOM or leave `//` comments;
+        // strict serde_json rejects both, which would silently drop a *declared*
+        // CADENCE_ALLOW_MAIN and false-block a by-design-main repo
+        // (cadence-hooks#239 F10, #246). parse_jsonc strips them before parsing;
+        // still-malformed input yields None and falls through.
+        let Some(json) = parse_jsonc(&content) else {
             continue;
         };
         let Some(val) = json.get("env").and_then(|env| env.get(key)) else {
@@ -251,6 +250,120 @@ pub fn repo_env_flag(repo_root: &Path, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Parse settings/config content as JSONC: tolerate a leading UTF-8 BOM plus
+/// `//`/`/* */` comments and trailing commas before strict JSON parsing.
+///
+/// Editors and hand-authoring routinely produce these, and strict serde_json
+/// rejects them outright — which for a fail-open guard means a *declared*
+/// setting silently vanishes (cadence-hooks#246). Stripping favors clarity over
+/// cleverness: two string-aware passes rather than one dense one, and no new
+/// parser dependency. Genuinely malformed input still returns `None`, so every
+/// caller keeps its existing fail-open fall-through.
+fn parse_jsonc(content: &str) -> Option<serde_json::Value> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let cleaned = strip_jsonc(content);
+    serde_json::from_str(&cleaned).ok()
+}
+
+/// Strip JSONC comments and trailing commas via two string-aware passes.
+fn strip_jsonc(content: &str) -> String {
+    strip_trailing_commas(&strip_comments(content))
+}
+
+/// Pass 1: remove `//` line comments and `/* */` block comments while leaving
+/// string literals untouched. A `//` inside `"http://example"` or a `/*` inside
+/// a value must survive verbatim, so we track string state and `\`-escapes.
+fn strip_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next(); // consume the second '/'
+                while let Some(&next) = chars.peek() {
+                    if next == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next(); // consume the '*'
+                let mut prev_star = false;
+                for next in chars.by_ref() {
+                    if prev_star && next == '/' {
+                        break;
+                    }
+                    prev_star = next == '*';
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Pass 2: drop a comma whose next non-whitespace character is `}` or `]`,
+/// again skipping string interiors so a comma inside `"a,]"` is preserved.
+fn strip_trailing_commas(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                i += 1; // drop the trailing comma
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// The single per-repo guard config file, relative to the git root.
@@ -283,7 +396,7 @@ pub fn load_cadence_section<T: Default + DeserializeOwned>(root: &Path, section:
     let Some(content) = read_untrusted_config(&path) else {
         return T::default();
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Some(value) = parse_jsonc(&content) else {
         return T::default();
     };
     value
@@ -903,6 +1016,234 @@ mod tests {
         assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
     }
 
+    #[test]
+    fn repo_env_flag_tolerates_line_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  // exempt this repo\n  \"env\": {\n    \"CADENCE_ALLOW_MAIN\": \"true\" // trailing note\n  }\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_tolerates_block_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  /* why this repo is exempt\n     spans lines */\n  \"env\": { \"CADENCE_ALLOW_MAIN\": \"true\" }\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_tolerates_trailing_comma() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  \"env\": {\n    \"CADENCE_ALLOW_MAIN\": \"true\",\n  },\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_jsonc_and_bom_combined() {
+        // A BOM-prefixed file that also carries comments and a trailing comma —
+        // all tolerations must compose.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "\u{feff}{\n  // exemption\n  \"env\": { \"CADENCE_ALLOW_MAIN\": \"true\", },\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_slashes_inside_string_value_preserved() {
+        // A `//` inside a string value must never be mistaken for a comment.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"http://example"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("http://example".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_comma_and_braces_inside_string_preserved() {
+        // A comma-then-brace sequence inside a string is not a trailing comma.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"a,] b,} c"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("a,] b,} c".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_escaped_quote_in_string() {
+        // An escaped quote must not prematurely end the string, or the stripper
+        // would treat the value interior as structural JSON.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"a\"//b"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("a\"//b".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_adjacent_block_comments() {
+        // Two non-overlapping block comments back to back must both strip
+        // cleanly, without the second being mistaken for a continuation of
+        // the first.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{ /* first */ /* second */ \"env\": {\"CADENCE_ALLOW_MAIN\":\"true\"} }",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_line_comment_no_trailing_newline_at_eof() {
+        // A `//` comment that runs to end-of-file with no trailing newline
+        // must not hang or panic — chars.peek() returning None ends the scan.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\"env\":{\"CADENCE_ALLOW_MAIN\":\"true\"}} // trailing note",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_unterminated_block_comment_falls_through() {
+        // An unterminated `/*` swallows the rest of the file, including the
+        // closing braces — the result is malformed JSON, so this must
+        // fail-open to None (no panic, no hang) rather than propagate an
+        // error.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\"env\":{\"CADENCE_ALLOW_MAIN\":\"true\" /* unterminated",
+        );
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_comment_token_inside_block_comment() {
+        // A `//` sequence inside an open `/* */` block is just comment text,
+        // not a nested line-comment start.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  /* this looks like // a line comment inside a block */\n  \"env\": {\"CADENCE_ALLOW_MAIN\":\"true\"}\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_crlf_line_comments() {
+        // CRLF line endings (common on Windows-authored files) must not
+        // defeat `//` comment stripping — the scan breaks on '\n', so a
+        // preceding '\r' is consumed as part of the comment.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\r\n  // note\r\n  \"env\": {\"CADENCE_ALLOW_MAIN\": \"true\"}\r\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_entirely_comment_file_is_none() {
+        // A file that is nothing but a comment strips down to an empty
+        // string, which strict serde_json rejects — falls open to None
+        // rather than panicking on an empty parse.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(tmp.path(), "settings.json", "// just a comment, no JSON");
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_trailing_comma_then_comment_then_brace() {
+        // Comments are stripped in pass 1, trailing commas in pass 2 — a
+        // comma followed by a comment followed by the closing brace must
+        // still be recognized as trailing once the comment is gone.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\"env\":{\"CADENCE_ALLOW_MAIN\":\"true\", // trailing note\n}}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_nested_block_comment_not_supported_falls_through() {
+        // JSONC block comments don't nest (matches the VS Code / JS spec):
+        // the first `*/` closes the comment, leaving the inner comment's own
+        // trailing text as stray JSON tokens. This documents the resulting
+        // fail-open None rather than a fixable bug — nesting was never a
+        // stated requirement.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  /* outer /* inner */ still comment */\n  \"env\": {\"CADENCE_ALLOW_MAIN\":\"true\"}\n}",
+        );
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
     // --- load_cadence_section ---
 
     #[derive(Debug, Default, PartialEq, serde::Deserialize)]
@@ -1017,5 +1358,29 @@ mod tests {
         std::os::unix::fs::symlink("/dev/zero", claude_dir.join("cadence.json")).unwrap();
         let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
         assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_tolerates_jsonc() {
+        // Comments and a trailing comma must not defeat a hand-authored section.
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            "{\n  // guard config\n  \"terminology\": {\n    \"exemptions\": [\"a.yml\", \"b.yml\",],\n  },\n}",
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got.exemptions, vec!["a.yml", "b.yml"]);
+    }
+
+    #[test]
+    fn load_cadence_section_tolerates_leading_bom() {
+        // A BOM-prefixed cadence.json must still parse (mirrors repo_env_flag).
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            "\u{feff}{\"terminology\":{\"exemptions\":[\"x.yml\"]}}",
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got.exemptions, vec!["x.yml"]);
     }
 }
