@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.62.0] - 2026-07-20
+
+### Added
+
+- **`cadence-hooks session warn-commit-provenance` — warn-tier nudge toward producer-tuple commit trailers (cameronsjo/cadence#473; PR #360).** PreToolUse Bash check on git-commit commands: when the composed message lacks `Session-Id:`, warns with a fully-computed, copy-ready trailer block — Session-Name (canon `identity::generate_name`), Session-Id (payload), Model (`transcript::last_assistant_model`), Harness (the transcript's top-level `version` via the new `transcript::last_assistant_harness_version`, `AI_AGENT` env fallback), Machine (`provenance::machine_digest`). Message extraction covers inline `-m`/`--message` (repeated flags concatenated with git's paragraph semantics), heredoc-in-command-string (bash-faithful `<<`/`<<-` terminator semantics), and `-F`/`--file` (cwd-relative, 64 KiB metadata-checked cap, scan-only — file content never reaches any output). Untrusted transcript/env-derived fields are sanitized (`identity::sanitize_field`) before interpolation; `catch_unwind` self-guard; any unresolvable tuple field is omitted, never guessed; every failure path allows (ADR-0001). Adversarial security review (guard-feeding parser lens) + code-review seat before merge. Plugin wiring (cadence-canon, `if: Bash(*git commit*)`) is a release-gated companion.
+
+### Changed
+
+- **`session persist-plan`'s provenance block is unified with the producer tuple (cameronsjo/cadence#248; PR #359).** The parent-transcript scan now returns the approving session's tuple — id, model, harness version — read from the same matched ExitPlanMode assistant line, and `Approved in:` renders `<name> (<id>) [<model>, claude-code <version>] @ <machine>`; the executing line carries name and id. Missing fields degrade gracefully (single-field bracket, or none — never empty brackets); no parent found stays the literal `Approved in: unknown`. The committed block's machine field is now a salted hostname digest — new `provenance::machine_digest`, `sha256(hostname + "cadence-prov-v1")` hex-truncated to 12, pinned by a known-vector test — never the raw hostname; `plan-links.jsonl` (local metrics) keeps the bare host.
+
 ## [0.61.0] - 2026-07-20
 
 ### Added
