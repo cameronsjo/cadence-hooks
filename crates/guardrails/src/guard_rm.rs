@@ -83,7 +83,8 @@ fn takes_value(verb: &str, flag: &str) -> bool {
 /// Does this invocation recurse? `rm` only — recursion is meaningless for
 /// `unlink`/`shred`/`truncate`, which never descend into directories. True when
 /// a short-flag cluster carries `r`/`R` (`-rf`, `-fr`) or a `--recursive` long
-/// flag appears before a `--` operand terminator.
+/// flag (or any unambiguous abbreviation of it) appears before a `--` operand
+/// terminator.
 fn rm_is_recursive(argv: &[String], verb: &str) -> bool {
     if verb != "rm" {
         return false;
@@ -92,14 +93,20 @@ fn rm_is_recursive(argv: &[String], verb: &str) -> bool {
         if tok == "--" {
             break; // operands only after this
         }
-        if tok == "--recursive" {
-            return true;
+        // GNU coreutils rm accepts unambiguous long-option abbreviations, and
+        // `--recursive` is the only rm long option starting with `--r` — so
+        // `--r`/`--rec`/`--recu`/… all expand to it. Treat any `--<p>` where p is
+        // a non-empty prefix of "recursive" as recursive; `--recursivex` (not a
+        // prefix) does not match, and a bare `--` (empty p) is the terminator
+        // already handled above.
+        if let Some(rest) = tok.strip_prefix("--") {
+            if !rest.is_empty() && "recursive".starts_with(rest) {
+                return true;
+            }
+            continue; // a long flag that isn't a --recursive abbreviation
         }
-        // A short-flag cluster (`-rf`); long flags like `--force` are skipped.
-        if tok.starts_with('-')
-            && !tok.starts_with("--")
-            && (tok.contains('r') || tok.contains('R'))
-        {
+        // A short-flag cluster (`-rf`); the leading `-` is not a `--` long flag.
+        if tok.starts_with('-') && (tok.contains('r') || tok.contains('R')) {
             return true;
         }
     }
@@ -936,6 +943,33 @@ mod tests {
         // A recursive sweep could dredge tracked directories → Ask, not Allow.
         assert_eq!(
             judge_with("rm -rf project-*", "/srv/repo", &["/srv/repo"]),
+            Outcome::Ask
+        );
+    }
+
+    #[test]
+    fn recursive_long_flag_abbreviations_detected() {
+        // GNU rm expands any unambiguous `--r…` prefix to `--recursive`.
+        let rm = |arg: &str| rm_is_recursive(&["rm".into(), arg.into(), "x".into()], "rm");
+        assert!(rm("--recursive"));
+        assert!(rm("--recu"));
+        assert!(rm("--rec"));
+        assert!(rm("--r"));
+        // A bare `--` operand terminator is not a recursive flag.
+        assert!(!rm("--"));
+        // `--recursivex` is not a prefix of "recursive" → not matched.
+        assert!(!rm("--recursivex"));
+        // An unrelated long flag is not recursive.
+        assert!(!rm("--force"));
+    }
+
+    #[test]
+    fn abbreviated_recursive_file_glob_in_git_repo_asks() {
+        // Security regression (#322): `--recu` IS a recursive delete, so a
+        // file-scoped glob sweep in a git repo must not ride through to Allow on
+        // a false non-recursive belief — it Asks, like `-rf` does.
+        assert_eq!(
+            judge_with("rm --recu project-*", "/srv/repo", &["/srv/repo"]),
             Outcome::Ask
         );
     }
