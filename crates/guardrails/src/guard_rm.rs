@@ -502,7 +502,14 @@ fn block_message(class: TargetClass) -> String {
     };
     format!(
         "🚫 guard-rm: this deletes {what}, which is almost never intended.\n   \
-         If you're certain, run it in a terminal yourself, or:\n   \
+         To keep the file but get it out of the way, move it to the trash — \
+         guard-rm never fires on `mv`:\n   \
+         • mv <target> ~/.Trash\n   \
+         If you truly mean to delete, opt out via Claude Code's own environment. \
+         A command-line prefix (`CADENCE_DISABLE=guard-rm rm …`) has NO effect: \
+         the hook reads its own environment, never the command string. Set one of \
+         these in the `env` block of .claude/settings.json, or export it before \
+         launching Claude Code:\n   \
          • CADENCE_DISABLE=guard-rm — opt this guard out (persists in settings)\n   \
          • CADENCE_BYPASS=1 — bypass all cadence enforcement for one session"
     )
@@ -1040,6 +1047,24 @@ mod tests {
         assert!(msg.contains("filesystem root"));
         assert!(msg.contains("CADENCE_DISABLE=guard-rm"));
         assert!(msg.contains("CADENCE_BYPASS=1"));
+    }
+
+    #[test]
+    fn block_message_bypass_hint_is_actionable() {
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some(VAULT),
+            tmpdir: None,
+        };
+        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| false);
+        let msg = r.message.expect("block carries a message");
+        // The recoverable alternative that never trips guard-rm.
+        assert!(msg.contains("~/.Trash"));
+        // The hatches live in Claude Code's environment, not the command line.
+        assert!(msg.contains("settings.json") || msg.contains("environment"));
+        // A command-line prefix is inert — the caveat must be spelled out.
+        assert!(msg.contains("NO effect"));
     }
 
     #[test]
