@@ -35,6 +35,17 @@ const PLAN_PREFIX: &str = "Implement the following plan:";
 /// covered by matching on the prefix rather than the full line.
 const SUFFIX_LINE_PREFIX: &str = "If this plan can be broken down";
 
+/// Prefix of a second trailing paragraph the harness may inject BETWEEN the
+/// plan body and [`SUFFIX_LINE_PREFIX`] — a pointer back at the transcript
+/// ("...before exiting plan mode..."). Live-verified 2026-07-20 (see the plan
+/// doc's execution addendum): without stripping this too, the persisted body
+/// glues harness text onto every plan AND the parent-transcript hash match
+/// (Approach step 4) systematically misses, since `ExitPlanMode`'s raw
+/// `input.plan` never carries either paragraph. Stripped by the same
+/// trailing-line-prefix mechanism as `SUFFIX_LINE_PREFIX` — a line matching
+/// EITHER prefix pops.
+const POINTER_PARAGRAPH_PREFIX: &str = "If you need specific details from before exiting plan mode";
+
 /// Cap on the generated slug's length (before the date prefix).
 const MAX_SLUG_LEN: usize = 60;
 
@@ -167,11 +178,14 @@ pub fn run_persist_plan(
 // Extraction: prefix gate, suffix strip, trim (Approach step 1)
 // ---------------------------------------------------------------------------
 
-/// Strip trailing lines whose trimmed text starts with [`SUFFIX_LINE_PREFIX`],
-/// interleaved with trailing blank lines (either can follow the other), then
+/// Strip trailing lines whose trimmed text starts with [`SUFFIX_LINE_PREFIX`]
+/// or [`POINTER_PARAGRAPH_PREFIX`], interleaved with trailing blank lines
+/// (either prefix, or a blank line, can follow either in any order), then
 /// trim leading blank lines. A single unified pass so trailing whitespace
-/// around the suffix line never leaves a stray blank line or an unstripped
-/// suffix behind.
+/// around either paragraph never leaves a stray blank line or an unstripped
+/// paragraph behind. Only a TRAILING line is ever popped — a line matching
+/// either prefix mid-body (the plan text legitimately discussing these
+/// strings) is never touched, since the loop only ever inspects `lines.last()`.
 fn strip_trailing_suffix_lines_and_trim(text: &str) -> String {
     let mut lines: Vec<&str> = text.lines().collect();
     loop {
@@ -179,7 +193,10 @@ fn strip_trailing_suffix_lines_and_trim(text: &str) -> String {
             Some(last) if last.trim().is_empty() => {
                 lines.pop();
             }
-            Some(last) if last.trim_start().starts_with(SUFFIX_LINE_PREFIX) => {
+            Some(last)
+                if last.trim_start().starts_with(SUFFIX_LINE_PREFIX)
+                    || last.trim_start().starts_with(POINTER_PARAGRAPH_PREFIX) =>
+            {
                 lines.pop();
             }
             _ => break,
@@ -558,6 +575,53 @@ mod tests {
             "# Title\n\nbody\n\nIf this plan can be broken down further.\n\n",
         );
         assert_eq!(body, "# Title\n\nbody");
+    }
+
+    #[test]
+    fn suffix_strip_strips_both_paragraphs_in_template_order() {
+        // Real harness template order: plan body, blank, the transcript-pointer
+        // paragraph, blank, the breakdown-line suffix.
+        let body = strip_trailing_suffix_lines_and_trim(
+            "\n\n# Title\n\nbody text\n\n\
+             If you need specific details from before exiting plan mode, review the \
+             transcript.\n\n\
+             If this plan can be broken down into discrete units of work, consider using the \
+             Agent tool to dispatch them.",
+        );
+        assert_eq!(
+            body, "# Title\n\nbody text",
+            "both trailing paragraphs strip down to the bare plan body"
+        );
+    }
+
+    #[test]
+    fn suffix_strip_pointer_paragraph_alone() {
+        // The pointer paragraph can appear without the breakdown-line suffix.
+        let body = strip_trailing_suffix_lines_and_trim(
+            "\n\n# Title\n\nbody text\n\n\
+             If you need specific details from before exiting plan mode, review the \
+             transcript.",
+        );
+        assert_eq!(body, "# Title\n\nbody text");
+    }
+
+    #[test]
+    fn suffix_strip_mid_body_occurrence_of_either_prefix_survives() {
+        // Plan text that legitimately discusses these exact strings mid-body
+        // (not as the trailing line) must NOT be stripped — only a genuinely
+        // trailing line pops.
+        let body = strip_trailing_suffix_lines_and_trim(
+            "\n\n# Title\n\nIf this plan can be broken down, do X first.\n\n\
+             If you need specific details from before exiting plan mode, ask.\n\n\
+             final body line",
+        );
+        assert_eq!(
+            body,
+            "# Title\n\nIf this plan can be broken down, do X first.\n\n\
+             If you need specific details from before exiting plan mode, ask.\n\n\
+             final body line",
+            "mid-body lines matching either prefix are not trailing — never stripped"
+        );
     }
 
     // --- slug ---
