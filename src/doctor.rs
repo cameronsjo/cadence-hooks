@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::registry;
+// The session crate's `registry` (peer-session liveness) — aliased because the
+// bare name is already taken by the binary's hook-catalog `registry` above.
+use cadence_hooks_session::registry as session_registry;
 
 /// Severity of a finding: errors block (shell bugs), warnings advise (version skew).
 #[derive(Debug, PartialEq)]
@@ -911,6 +914,42 @@ fn prune_orphans(dirs: &[PathBuf], apply: bool, cache_root: &Path) -> (usize, u6
     (removed, freed)
 }
 
+/// Whether `doctor --prune --apply` may proceed, or is blocked because live peer
+/// sessions are still running and may be pinned to plugin-cache version dirs
+/// that pruning would pull out from under them.
+enum PruneGate {
+    Proceed,
+    Blocked(Vec<String>),
+}
+
+/// Decide whether `--prune --apply` may run. Pure over its inputs so it is
+/// testable without a live registry.
+///
+/// `force` overrides everything (the `CADENCE_DOCTOR_PRUNE_FORCE` escape hatch).
+/// A `None` sessions dir means there is nothing to protect (not inside a repo),
+/// so it proceeds. Otherwise it blocks when any non-stale peer is registered,
+/// naming them. `own_session_id` is `""` so the invoking session itself counts
+/// as a live peer — a prune must not delete dirs the caller is pinned to —
+/// matching how `run_status` enumerates peers.
+///
+/// Limitation: the session registry is repo-scoped (`<repo>/.claude/sessions`),
+/// so sessions running in other checkouts against the same global plugin cache
+/// are invisible here — the gate is under-protective across repos, never
+/// over-destructive.
+fn prune_liveness_gate(sessions_dir: Option<&Path>, stale_secs: u64, force: bool) -> PruneGate {
+    if force {
+        return PruneGate::Proceed;
+    }
+    let Some(dir) = sessions_dir else {
+        return PruneGate::Proceed;
+    };
+    let live = session_registry::live_peers(dir, "", stale_secs);
+    if live.is_empty() {
+        return PruneGate::Proceed;
+    }
+    PruneGate::Blocked(live.into_iter().map(|p| p.record.name).collect())
+}
+
 /// `doctor --prune` entry point: list (or, with `apply`, remove) orphaned
 /// plugin-cache version dirs. Dry-run by default (decision D4) — `apply`
 /// must be paired with `prune` at the call site (`run` enforces this before
@@ -986,6 +1025,33 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         }
     }
 
+    // Refuse to delete while live peer sessions may be pinned to these dirs.
+    // Only under default mode (not `--root`), mirroring the legacy-config gating
+    // below — `--root` fixtures must stay hermetic and never read live sessions.
+    // Dry-run deletes nothing, so the gate only guards the destructive `apply`.
+    if root_override.is_none() && apply {
+        let stale_secs = session_registry::stale_minutes() * 60;
+        let force = matches!(
+            std::env::var("CADENCE_DOCTOR_PRUNE_FORCE").as_deref(),
+            Ok("1") | Ok("true")
+        );
+        let sessions_dir = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| session_registry::sessions_dir(&cwd.to_string_lossy()));
+        if let PruneGate::Blocked(names) =
+            prune_liveness_gate(sessions_dir.as_deref(), stale_secs, force)
+        {
+            eprintln!(
+                "cadence-hooks doctor --prune --apply: refusing to prune — {} live session(s) may be pinned to these version dirs: {}. \
+                 Run /reload-plugins in any live session first to release the retired dirs, then re-run. \
+                 Or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway.",
+                names.len(),
+                names.join(", ")
+            );
+            return 0;
+        }
+    }
+
     let (removed, freed_bytes) = prune_orphans(&dirs, apply, &cache_root);
     let freed_mib = freed_bytes as f64 / (1024.0 * 1024.0);
 
@@ -993,6 +1059,9 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         if apply {
             println!(
                 "cadence-hooks doctor --prune --apply: removed {removed} orphaned version dir(s), freed ~{freed_mib:.1} MiB"
+            );
+            println!(
+                "  If any Claude Code session is currently running, run /reload-plugins in it now."
             );
         } else {
             println!(
@@ -2396,6 +2465,79 @@ mod tests {
         assert_eq!(freed, 0);
         assert!(outside.exists(), "outside dir must survive");
         assert!(outside.join("keepme").exists());
+    }
+
+    // ── prune_liveness_gate (#305) ──────────────────────────────────────────
+
+    /// Write a fresh peer record and return its sessions dir.
+    fn seed_session(name: &str, session_id: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude").join("sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: name.into(),
+            session_id: session_id.into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        session_registry::write_record(&dir, &rec).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn prune_liveness_gate_forces_through() {
+        // force wins even with a live session pinned.
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        assert!(matches!(
+            prune_liveness_gate(Some(&dir), 600, true),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_none_dir_proceeds() {
+        assert!(matches!(
+            prune_liveness_gate(None, 600, false),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_empty_dir_proceeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            prune_liveness_gate(Some(tmp.path()), 600, false),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_live_session_blocks_and_names() {
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        // Large stale window so the just-written record counts as live.
+        match prune_liveness_gate(Some(&dir), 600, false) {
+            PruneGate::Blocked(names) => {
+                assert!(
+                    names.contains(&"forge-anvil".to_string()),
+                    "block must name the live session: {names:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a live session must block the prune"),
+        }
+    }
+
+    #[test]
+    fn prune_liveness_gate_only_stale_proceeds() {
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        // stale_secs = 0: any measurable mtime age makes the peer stale.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(matches!(
+            prune_liveness_gate(Some(&dir), 0, false),
+            PruneGate::Proceed
+        ));
     }
 
     // ── legacy_config_findings / cadence_config_parse_finding (#153) ─────────
