@@ -107,18 +107,47 @@ pub fn looks_absolute(p: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
 }
 
-/// Returns true if `command` contains a `gh pr create` token sequence.
+/// True when `command` is about to expose branch work for review: `gh pr ready`
+/// (leaves draft) or a NON-draft `gh pr create`. A `--draft`/`-d` create is NOT
+/// an anchor — an entry-posture draft opens at zero diff, where polish is
+/// meaningless (#297). Shared by the `nudge-polish-before-pr` Check and the
+/// `log-polish-nudge` metrics Logger so the logged denominator equals the
+/// nudge-fire set.
 ///
-/// Whitespace-token based to avoid substring false positives — a branch named
-/// `gh-pr-create-experiments`, or the literal text inside a quoted arg, must not
-/// match. Shared by the `nudge-polish-before-pr` Check (the nudge) and the
-/// `log-polish-nudge` metrics Logger, so the logged denominator is exactly the
-/// set of PRs that fired the nudge.
-pub fn is_gh_pr_create(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    tokens
-        .windows(3)
-        .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == "create")
+/// Evaluated **per shell segment** ([`split_segments`]) so the draft-flag check
+/// is scoped to the `gh pr create` invocation's OWN args — a bare `-d` from an
+/// unrelated sibling command on a compound line (`curl -d x && gh pr create`,
+/// `docker run -d img ; gh pr create`) must not misclassify a real ship as a
+/// draft. Each segment is tokenized with [`tokenize`] (not `split_whitespace`)
+/// so a quoted `gh pr create` inside a `-m`/`--body` arg collapses to one token
+/// and cannot line up in the 3-window — a branch named
+/// `gh-pr-create-experiments`, or that phrase inside a commit message, must
+/// never match.
+pub fn is_polish_ship_anchor(command: &str) -> bool {
+    split_segments(command)
+        .iter()
+        .any(|segment| segment_is_ship_anchor(segment))
+}
+
+/// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
+/// create` carrying no `--draft`/`-d` flag *in that same segment*. Scoping the
+/// draft-flag scan to one segment is what keeps an unrelated sibling command's
+/// `-d` from suppressing a real ship (the reason [`is_polish_ship_anchor`]
+/// splits first rather than scanning the whole token stream).
+fn segment_is_ship_anchor(segment: &str) -> bool {
+    let tokens = tokenize(segment);
+    let is_gh_pr = |sub: &str| {
+        tokens
+            .windows(3)
+            .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == sub)
+    };
+    if is_gh_pr("ready") {
+        return true;
+    }
+    if is_gh_pr("create") {
+        return !tokens.iter().any(|t| t == "--draft" || t == "-d");
+    }
+    false
 }
 
 /// Extract `(host, "owner/repo")` from any git remote URL format.
@@ -734,6 +763,83 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
     targets
 }
 
+/// Extract **every** redirect target in a command segment — the filename after
+/// each `>`, `>>`, `>|`, `2>`, `&>`, etc. Unlike [`clobber_redirect_targets`]
+/// (which deliberately EXCLUDES `>>` append, since an append does not truncate
+/// an existing file), this returns the target of *any* redirect that writes a
+/// file, append included — the right set for a caller that cares whether a file
+/// is *mutated* at all, not just clobbered.
+///
+/// Quote-aware: a `>` inside `'…'`/`"…"` is literal text, not a redirect (so
+/// `echo "a > b" > c` targets only `c`). Catches stderr (`2>`), clobber (`>|`),
+/// glued (`>file`), and multiple redirects in one segment.
+///
+/// Shared parser: consumed by `prevent-secret-writes` (append to a `.env` is a
+/// secret write) and by `enforce-worktree`'s subprocess-mutation nudge (append
+/// into a tracked file in the primary checkout is a tree mutation). Keeping one
+/// implementation means one parser for the security review to scrutinize.
+pub fn redirect_targets(segment: &str) -> Vec<String> {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                i += 1;
+            }
+            '>' => {
+                i += 1;
+                // Consume a doubled `>>` (append) or `>|` (clobber).
+                if i < chars.len() && (chars[i] == '>' || chars[i] == '|') {
+                    i += 1;
+                }
+                // Skip whitespace between the operator and the filename.
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                // Collect the target token, honoring a quoted filename.
+                let mut target = String::new();
+                while i < chars.len() {
+                    let tc = chars[i];
+                    if tc == '\'' || tc == '"' {
+                        i += 1;
+                        while i < chars.len() && chars[i] != tc {
+                            target.push(chars[i]);
+                            i += 1;
+                        }
+                        if i < chars.len() {
+                            i += 1; // closing quote
+                        }
+                        continue;
+                    }
+                    if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
+                        break;
+                    }
+                    target.push(tc);
+                    i += 1;
+                }
+                if !target.is_empty() {
+                    targets.push(target);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    targets
+}
+
 /// Like [`split_segments`], but also expands what a shell would actually run:
 ///
 /// 1. **Wrapper expansion** — a segment whose command word is
@@ -1071,20 +1177,68 @@ mod tests {
     }
 
     #[test]
-    fn is_gh_pr_create_matches_the_command() {
-        assert!(is_gh_pr_create("gh pr create --title test"));
-        assert!(is_gh_pr_create("cd repo && gh pr create --fill"));
+    fn is_polish_ship_anchor_matches_non_draft_create() {
+        assert!(is_polish_ship_anchor("gh pr create --title test"));
+        assert!(is_polish_ship_anchor("cd repo && gh pr create --fill"));
+        // `--title x` (non-draft) is an anchor.
+        assert!(is_polish_ship_anchor("gh pr create --title x"));
     }
 
     #[test]
-    fn is_gh_pr_create_rejects_other_gh_and_substrings() {
-        assert!(!is_gh_pr_create("gh pr list"));
-        assert!(!is_gh_pr_create("gh pr view 123"));
-        assert!(!is_gh_pr_create("gh issue create --title x"));
+    fn is_polish_ship_anchor_matches_ready() {
+        // `gh pr ready` leaves draft → the ship moment.
+        assert!(is_polish_ship_anchor("gh pr ready 12"));
+        assert!(is_polish_ship_anchor("cd repo && gh pr ready"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_skips_draft_create() {
+        // An entry-posture draft opens at zero diff — polish is meaningless.
+        assert!(!is_polish_ship_anchor("gh pr create --draft"));
+        assert!(!is_polish_ship_anchor("gh pr create --draft --title x"));
+        assert!(!is_polish_ship_anchor("gh pr create -d --fill"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_draft_flag_scoped_to_create_segment() {
+        // A bare `-d`/`--draft` in an UNRELATED sibling command on a compound
+        // line must not misclassify a real non-draft create as a draft. The
+        // draft-flag scan is scoped to the create's own shell segment.
+        assert!(is_polish_ship_anchor(
+            "curl -d 'x=y' https://example.com && gh pr create --title z"
+        ));
+        assert!(is_polish_ship_anchor(
+            "docker run -d img ; gh pr create --title z"
+        ));
+        // Sibling `-d` AFTER the create, on the other side of an operator.
+        assert!(is_polish_ship_anchor(
+            "gh pr create --title z && curl -d payload https://x"
+        ));
+        // A genuine draft in its own segment still skips — the fix must not
+        // over-correct into treating every create as non-draft.
+        assert!(!is_polish_ship_anchor("echo hi && gh pr create --draft"));
+        // `gh pr ready` after a sibling with `-d` still anchors.
+        assert!(is_polish_ship_anchor("docker run -d img ; gh pr ready 12"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_rejects_other_gh_and_substrings() {
+        assert!(!is_polish_ship_anchor("gh pr list"));
+        assert!(!is_polish_ship_anchor("gh pr view 123"));
+        // `gh pr merge` is deliberately excluded — often run from main/another
+        // cwd by an orchestrator, so the branch mis-resolves and false-nudges.
+        assert!(!is_polish_ship_anchor("gh pr merge 12"));
+        assert!(!is_polish_ship_anchor("gh issue create --title x"));
         // A branch name containing the literal substring must not match.
-        assert!(!is_gh_pr_create("git checkout gh-pr-create-experiments"));
+        assert!(!is_polish_ship_anchor(
+            "git checkout gh-pr-create-experiments"
+        ));
         // Quoted as a single commit-message arg → tokens don't line up.
-        assert!(!is_gh_pr_create("git commit -m 'gh pr create'"));
+        assert!(!is_polish_ship_anchor("git commit -m 'gh pr create'"));
+        // A quoted `gh pr ready` inside a body arg must not line up either.
+        assert!(!is_polish_ship_anchor(
+            "gh pr comment -b 'run gh pr ready next'"
+        ));
     }
 
     // --- strip_quotes ---
@@ -1318,6 +1472,37 @@ mod tests {
         // Glued directly (no separator before `}`) so it lands on the target
         // token, unlike a `;`-separated close which is already a break char.
         assert_eq!(clobber_redirect_targets("{ : > note.md}"), vec!["note.md"]);
+    }
+
+    // --- redirect_targets (all redirects, append INCLUDED) ---
+
+    #[test]
+    fn redirect_targets_plain_and_append_both_included() {
+        // The append `>>` distinction from clobber_redirect_targets: this
+        // parser records the target of BOTH.
+        assert_eq!(redirect_targets("echo hi > f"), vec!["f"]);
+        assert_eq!(redirect_targets("echo hi >> f"), vec!["f"]);
+        assert_eq!(redirect_targets("echo hi >| f"), vec!["f"]);
+    }
+
+    #[test]
+    fn redirect_targets_append_diverges_from_clobber() {
+        // Same input, opposite verdict — the reason both functions exist.
+        assert_eq!(redirect_targets("echo hi >> f"), vec!["f"]);
+        assert_eq!(
+            clobber_redirect_targets("echo hi >> f"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn redirect_targets_quote_aware_and_multiple() {
+        // A `>` inside quotes is prose; only the real redirect counts, and
+        // every redirect in the segment is captured.
+        assert_eq!(
+            redirect_targets(r#"echo "a > b" > c 2>> err.log"#),
+            vec!["c", "err.log"]
+        );
     }
 
     // --- command_segments (wrapper expansion) ---

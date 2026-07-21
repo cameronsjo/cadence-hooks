@@ -1,9 +1,17 @@
-//! Gate `/polish` before creating a pull request.
+//! Gate `/polish` before branch work ships for review.
 //!
-//! Fires on `gh pr create`. Polish is mandatory before a PR, so this check reads
-//! a **branch-scoped marker** the polish skill records when it completes
-//! (`cadence-hooks cadence record-polish`), keyed on `(repo_root, branch)`. It
-//! routes a 2-way, fail-open outcome:
+//! Fires on the **ship moment** — `gh pr ready` (leaving draft) or a **non-draft**
+//! `gh pr create` (the legacy direct flow). A `--draft` create is deliberately
+//! NOT an anchor: entry posture (cadence#278) opens a draft PR at worktree entry,
+//! at zero diff, where polish is meaningless — nudging there fires once per branch
+//! with nothing to polish, then never again (#297). `gh pr merge` is also excluded
+//! (an orchestrator often runs it from `main`/another cwd, so the branch
+//! mis-resolves and false-nudges).
+//!
+//! Polish is mandatory before a PR ships, so this check reads a **branch-scoped
+//! marker** the polish skill records when it completes (`cadence-hooks cadence
+//! record-polish`), keyed on `(repo_root, branch)`. It routes a 2-way, fail-open
+//! outcome:
 //!
 //! - a polish marker exists for the PR's branch → **allow** (silent — no nag
 //!   after a real polish run);
@@ -14,7 +22,9 @@
 //! `/polish` slash-command (no `Skill` `tool_use` block to find, #154) and was
 //! branch-blind — a polish on branch A satisfied a PR on branch B (#146). The
 //! marker is invocation-agnostic (Skill call, slash-command, or a delegated
-//! subagent all end by recording it) and branch-scoped by key construction.
+//! subagent all end by recording it) and branch-scoped by key construction — so
+//! whoever runs the ship command on the branch resolves the same marker a
+//! completed `/polish` wrote, session-independently.
 //!
 //! `/polish` runs a branch-scoped pass over the changes vs `origin/main` —
 //! simplify, logging, tests, docs, security, and code review. Skill, agent,
@@ -28,7 +38,7 @@
 //! write has propagated.
 
 use cadence_hooks_core::markers::polish_marker_present;
-use cadence_hooks_core::shell::is_gh_pr_create;
+use cadence_hooks_core::shell::is_polish_ship_anchor;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Gates `/polish` (cadence-forge:polish) before opening a PR — conditional on a
@@ -44,10 +54,11 @@ impl Check for NudgePolishBeforePr {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
-        // Only a `gh pr create` pays the git-resolution cost; every other
-        // command short-circuits to allow inside `decide`.
+        // Only a ship anchor (`gh pr ready` / non-draft `gh pr create`) pays the
+        // git-resolution cost; every other command short-circuits to allow
+        // inside `decide`.
         let marker_present =
-            is_gh_pr_create(command) && polish_marker_present(command, input.cwd.as_deref());
+            is_polish_ship_anchor(command) && polish_marker_present(command, input.cwd.as_deref());
         decide(command, marker_present)
     }
 }
@@ -55,12 +66,12 @@ impl Check for NudgePolishBeforePr {
 /// The pure 2-way conditional — no I/O, so the gate logic is unit-tested without
 /// the filesystem. `run()` resolves the marker and hands the boolean in.
 ///
-/// - non-`gh pr create` → allow.
-/// - `gh pr create` + a branch-scoped polish marker present → allow (silent).
-/// - `gh pr create` + no marker (or unresolved repo/branch/cwd) → nudge
+/// - non-ship-anchor (incl. a `--draft` create and `gh pr merge`) → allow.
+/// - ship anchor + a branch-scoped polish marker present → allow (silent).
+/// - ship anchor + no marker (or unresolved repo/branch/cwd) → nudge
 ///   (fail-open floor, ADR-0001 — CP1 never blocks).
 fn decide(command: &str, marker_present: bool) -> CheckResult {
-    if !is_gh_pr_create(command) {
+    if !is_polish_ship_anchor(command) {
         return CheckResult::allow();
     }
     if marker_present {
@@ -77,27 +88,26 @@ fn decide(command: &str, marker_present: bool) -> CheckResult {
 /// and "TDD/attune already covered it" skips can't survive it.
 const SCOPE_CLAUSES: &str = "Skill / agent / command / rule markdown and \
     CLAUDE.md are behavior, not documentation — IN scope; only *literal* docs \
-    (prose about the system) route to `/polish docs`. Planning, TDD, attune, or \
-    a code-review precede polish — they don't replace it.";
+    route to `/polish docs`. Planning, TDD, attune, or a code-review precede \
+    polish — they don't replace it.";
 
 /// The soft nudge — fires when no polish marker exists for the PR's branch.
 /// Allow + warn; the model proceeds (CP1 fail-open floor, ADR-0001).
 fn nudge_message() -> String {
     format!(
-        "Before opening this PR, consider `/polish` (cadence-forge:polish) — no \
-         polish has been recorded for this branch this session (`/polish` records \
-         a marker when it completes). It's a branch-scoped pass vs `origin/main`: \
-         simplify, logging, tests, docs, security, code review. {SCOPE_CLAUSES} \
-         Skip ONLY if it's a trivial one-liner or already went through `/polish`. \
-         If you skip, say so and why — don't skip silently."
+        "No polish recorded for this branch — run `/polish` (cadence-forge:polish) \
+         before this PR ships: a branch-scoped quality pass vs `origin/main`; it \
+         records the marker when it completes. {SCOPE_CLAUSES} Skip ONLY for a \
+         trivial one-liner or an already-polished branch — say so and why, don't \
+         skip silently."
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_hooks_core::gitstate::GitState;
     use cadence_hooks_core::markers::{polish_marker, write_marker};
-    use cadence_hooks_core::shell::git_command;
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
     use cadence_hooks_core::{Outcome, ToolInput};
     use std::process::Command;
@@ -157,20 +167,50 @@ mod tests {
     }
 
     #[test]
-    fn decide_non_pr_create_allows_regardless_of_marker() {
+    fn decide_non_ship_anchor_allows_regardless_of_marker() {
         // The matcher only scopes the process spawn; decide() still guards
-        // against a non-create gh command slipping through.
+        // against a non-anchor gh command slipping through.
         assert_eq!(decide("gh pr list", false).outcome, Outcome::Allow);
         assert_eq!(decide("git commit -m x", true).outcome, Outcome::Allow);
+        // `gh pr merge` is excluded — it must not nudge even without a marker.
+        assert_eq!(decide("gh pr merge 12", false).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn decide_draft_create_allows_regardless_of_marker() {
+        // A `--draft` create is not the ship moment (#297) — an entry-posture
+        // draft opens at zero diff, so it must allow even with no marker.
+        assert_eq!(
+            decide("gh pr create --draft", false).outcome,
+            Outcome::Allow
+        );
+        assert_eq!(
+            decide("gh pr create -d --title x", false).outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn decide_pr_ready_routes_like_create() {
+        // `gh pr ready` (leaves draft) is the ship anchor: no marker → nudge,
+        // marker present → silent allow.
+        let nudge = decide("gh pr ready 12", false);
+        assert_eq!(nudge.outcome, Outcome::Nudge);
+        nudge_msg_has_loophole_clauses(&nudge.message.unwrap_or_default());
+        let allow = decide("gh pr ready 12", true);
+        assert_eq!(allow.outcome, Outcome::Allow);
+        assert!(allow.message.is_none());
     }
 
     // --- integration through run() with a real temp git repo (#146 fixture) ---
 
     /// Init a git repo in a fresh tempdir, checked out on `branch` (no commit
-    /// needed — `branch --show-current` reports an unborn branch, and the gate
-    /// only reads `--show-toplevel` + `--show-current`). Returns the tempdir and
-    /// the git-resolved repo root (canonicalized, so it matches what `run()`
-    /// resolves — critical on macOS where `/tmp` → `/private/tmp`).
+    /// needed — an unborn HEAD still resolves a branch name via [`GitState`],
+    /// and the gate only reads the common dir + current branch). Returns the
+    /// tempdir and the git-resolved `git_common_dir` (canonicalized, so it
+    /// matches what `run()` resolves — critical on macOS where `/tmp` →
+    /// `/private/tmp` — and the same key `polish_marker_present` now uses,
+    /// cadence-hooks#324).
     fn init_repo_on_branch(branch: &str) -> (tempfile::TempDir, String) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_str().unwrap().to_string();
@@ -187,8 +227,8 @@ mod tests {
         };
         git(&["init", "-q"]);
         git(&["checkout", "-q", "-b", branch]);
-        let root = git_command(&dir, &["rev-parse", "--show-toplevel"])
-            .expect("temp repo resolves a toplevel");
+        let state = GitState::resolve(tmp.path()).expect("temp repo resolves git state");
+        let root = state.git_common_dir.to_string_lossy().into_owned();
         (tmp, root)
     }
 
@@ -230,6 +270,42 @@ mod tests {
     }
 
     #[test]
+    fn run_pr_ready_same_branch_marker_allows_silently() {
+        // The ship anchor end-to-end: `gh pr ready` on a branch whose marker
+        // exists → silent allow, resolved the same way a create would be.
+        let (tmp, root) = init_repo_on_branch("feat/ready");
+        write_marker(&polish_marker(&root, "feat/ready"), "{}").unwrap();
+
+        let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
+        let result = NudgePolishBeforePr.run(&input);
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(
+            result.message.is_none(),
+            "a recorded polish allows silently"
+        );
+    }
+
+    #[test]
+    fn run_pr_ready_no_marker_nudges() {
+        // `gh pr ready` with no marker for the branch → fail-open nudge.
+        let (tmp, _root) = init_repo_on_branch("feat/ready-unmarked");
+        let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
+        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn run_draft_create_allows_even_without_marker() {
+        // A `--draft` create in a resolvable repo with no marker still allows —
+        // the anchor skips drafts before any marker resolution (#297).
+        let (tmp, _root) = init_repo_on_branch("feat/draft");
+        let input = make_bash_with_cwd(
+            "gh pr create --draft --title x",
+            tmp.path().to_str().unwrap(),
+        );
+        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
     fn run_unresolved_cwd_nudges_never_blocks() {
         // No cwd at all → marker unresolved → fail-open nudge (never Block).
         let input = HookInput {
@@ -243,7 +319,149 @@ mod tests {
         assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
     }
 
-    // --- preserved matcher tests (is_gh_pr_create unchanged) ---
+    // --- worktree-stable keying (cadence-hooks#324) ---
+
+    /// `git -C primary <args>`, asserting success. Shared by the worktree
+    /// fixtures below.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    /// A primary checkout with one commit — `git worktree add` refuses an
+    /// unborn branch, unlike [`init_repo_on_branch`]'s marker-only fixtures.
+    fn init_primary_with_commit(primary: &std::path::Path) {
+        std::fs::create_dir_all(primary).unwrap();
+        git_in(primary, &["init", "-q", "-b", "main"]);
+        git_in(primary, &["config", "user.email", "t@t"]);
+        git_in(primary, &["config", "user.name", "t"]);
+        git_in(primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    #[test]
+    fn run_worktree_marker_satisfies_primary_ship_command() {
+        // #324: a marker recorded from a linked worktree must satisfy the ship
+        // command run from the primary checkout, once the primary is on the
+        // same branch — the common-dir key is shared across both checkouts.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feat/thing",
+            ],
+        );
+
+        let wt_state = GitState::resolve(&wt).expect("worktree resolves");
+        write_marker(
+            &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/thing"),
+            "{}",
+        )
+        .unwrap();
+
+        git_in(
+            &primary,
+            &["worktree", "remove", "--force", wt.to_str().unwrap()],
+        );
+        git_in(&primary, &["checkout", "-q", "feat/thing"]);
+
+        let input = make_bash_with_cwd("gh pr create --title x", primary.to_str().unwrap());
+        let result = NudgePolishBeforePr.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Allow,
+            "a worktree-recorded marker must satisfy the primary checkout on the same branch"
+        );
+    }
+
+    #[test]
+    fn run_primary_marker_satisfies_worktree_ship_command() {
+        // #324 inverse: a marker recorded from the PRIMARY checkout must
+        // satisfy a ship command run from a linked WORKTREE on the same branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        git_in(&primary, &["checkout", "-q", "-b", "feat/y"]);
+
+        let primary_state = GitState::resolve(&primary).expect("primary resolves");
+        write_marker(
+            &polish_marker(&primary_state.git_common_dir.to_string_lossy(), "feat/y"),
+            "{}",
+        )
+        .unwrap();
+
+        // Free `feat/y` from the primary so a worktree can check it out.
+        git_in(&primary, &["checkout", "-q", "main"]);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "feat/y"],
+        );
+
+        let input = make_bash_with_cwd("gh pr create --title x", wt.to_str().unwrap());
+        let result = NudgePolishBeforePr.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Allow,
+            "a primary-recorded marker must satisfy a linked worktree on the same branch"
+        );
+    }
+
+    #[test]
+    fn run_worktree_marker_does_not_satisfy_different_branch() {
+        // The common-dir re-key must not loosen branch scoping: a marker
+        // recorded from a worktree on branch A must still miss when the ship
+        // command runs on a different branch, even in the same repo.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feat/a",
+            ],
+        );
+
+        let wt_state = GitState::resolve(&wt).expect("worktree resolves");
+        write_marker(
+            &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/a"),
+            "{}",
+        )
+        .unwrap();
+
+        // Primary stays on `main` — a different branch from the marker.
+        let input = make_bash_with_cwd("gh pr create --title x", primary.to_str().unwrap());
+        let result = NudgePolishBeforePr.run(&input);
+        assert_eq!(
+            result.outcome,
+            Outcome::Nudge,
+            "a marker for a different branch must not satisfy the ship command"
+        );
+    }
+
+    // --- preserved matcher tests (is_polish_ship_anchor) ---
 
     #[test]
     fn gh_pr_create_with_heredoc_body_nudges() {

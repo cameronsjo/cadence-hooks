@@ -44,6 +44,10 @@ pub enum HookEvent {
     /// SessionStart — fires when a session begins (startup/resume/clear/compact).
     /// Nudges inject context via `hookSpecificOutput.additionalContext`.
     SessionStart,
+    /// UserPromptSubmit — fires when the user (or the harness, on an
+    /// approve-and-clear plan re-injection) submits a prompt. Nudges inject
+    /// context via `hookSpecificOutput.additionalContext`, same as SessionStart.
+    UserPromptSubmit,
 }
 
 impl HookEvent {
@@ -54,6 +58,7 @@ impl HookEvent {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
             HookEvent::SessionStart => "SessionStart",
+            HookEvent::UserPromptSubmit => "UserPromptSubmit",
         }
     }
 
@@ -69,6 +74,9 @@ impl HookEvent {
                 r#"{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"},"tool_response":{"stdout":"ok"}}"#
             }
             HookEvent::SessionStart => r#"{"session_id":"test","source":"startup"}"#,
+            // Exercises the persist-plan prefix gate — a prompt shaped like the
+            // approve-and-clear re-injection (see `session persist-plan`).
+            HookEvent::UserPromptSubmit => r#"{"prompt":"Implement the following plan:\n\ntest"}"#,
         }
     }
 }
@@ -187,6 +195,10 @@ pub struct HookInput {
     /// on payloads that omit it. Carried so the denial audit log can attribute a
     /// guard fire to the subagent that triggered it.
     pub agent_id: Option<String>,
+    /// The submitted prompt text — present on `UserPromptSubmit`, absent on
+    /// every other event. Deserializes to `None` when absent, so existing
+    /// PreToolUse/PostToolUse/SessionStart hooks are unaffected.
+    pub prompt: Option<String>,
 }
 
 /// Tool-specific fields from the hook input.
@@ -447,6 +459,11 @@ impl HookInput {
     /// The subagent id, if the payload carried one (`None` on the main thread).
     pub fn agent_id(&self) -> Option<&str> {
         self.agent_id.as_deref()
+    }
+
+    /// The submitted prompt text, if present (`UserPromptSubmit` only).
+    pub fn prompt(&self) -> Option<&str> {
+        self.prompt.as_deref()
     }
 
     /// The stdout from the tool response (PostToolUse only).
@@ -2150,6 +2167,7 @@ mod tests {
         assert_eq!(HookEvent::PreToolUse.name(), "PreToolUse");
         assert_eq!(HookEvent::PostToolUse.name(), "PostToolUse");
         assert_eq!(HookEvent::SessionStart.name(), "SessionStart");
+        assert_eq!(HookEvent::UserPromptSubmit.name(), "UserPromptSubmit");
     }
 
     #[test]
@@ -2158,6 +2176,7 @@ mod tests {
             HookEvent::PreToolUse,
             HookEvent::PostToolUse,
             HookEvent::SessionStart,
+            HookEvent::UserPromptSubmit,
         ] {
             let parsed: Result<HookInput, _> = serde_json::from_str(event.sample_payload());
             assert!(
@@ -2174,6 +2193,18 @@ mod tests {
         let input: HookInput =
             serde_json::from_str(HookEvent::PreToolUse.sample_payload()).unwrap();
         assert!(input.command().is_some());
+    }
+
+    #[test]
+    fn user_prompt_submit_sample_exercises_the_persist_plan_prefix_gate() {
+        let input: HookInput =
+            serde_json::from_str(HookEvent::UserPromptSubmit.sample_payload()).unwrap();
+        assert!(
+            input
+                .prompt()
+                .is_some_and(|p| p.starts_with("Implement the following plan:")),
+            "sample should exercise the persist-plan prefix gate"
+        );
     }
 
     #[test]

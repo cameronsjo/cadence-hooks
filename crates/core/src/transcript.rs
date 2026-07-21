@@ -53,6 +53,42 @@ pub fn last_assistant_model(transcript: &str) -> Option<String> {
     })
 }
 
+/// Minimal transcript-line shape for harness-version resolution: the
+/// top-level `version` field (the harness build string, e.g. `"2.1.214"`)
+/// alongside the nested `message.role` needed to scope the scan to assistant
+/// lines. Deliberately separate from [`ModelLine`] — `version` lives at the
+/// line's top level while `model` lives nested under `message`, so one
+/// shared struct would carry a dead field on every deserialize.
+#[derive(Deserialize)]
+struct HarnessVersionLine {
+    version: Option<String>,
+    message: Option<AssistantRole>,
+}
+
+#[derive(Deserialize)]
+struct AssistantRole {
+    role: Option<String>,
+}
+
+/// The harness build version (e.g. `"2.1.214"`) stamped on the top-level
+/// `version` field of the *last* assistant message in a session transcript,
+/// or `None` when no assistant line carries a non-empty `version`.
+///
+/// Mirrors [`last_assistant_model`]'s tail-scan discipline exactly, reading
+/// the sibling top-level field instead of the nested `message.model` one —
+/// see that function's docs for the scan/skip semantics. Pure — operates on
+/// the transcript text, no I/O.
+pub fn last_assistant_harness_version(transcript: &str) -> Option<String> {
+    transcript.lines().rev().find_map(|line| {
+        let parsed = serde_json::from_str::<HarnessVersionLine>(line).ok()?;
+        let message = parsed.message?;
+        if message.role.as_deref() != Some("assistant") {
+            return None;
+        }
+        parsed.version.filter(|v| !v.is_empty())
+    })
+}
+
 /// True when the session transcript contains a `cadence-forge:polish` Skill
 /// invocation. Pure — operates on the transcript text, no I/O.
 ///
@@ -382,5 +418,66 @@ mod tests {
     #[test]
     fn last_assistant_model_empty_transcript_is_none() {
         assert_eq!(last_assistant_model(""), None);
+    }
+
+    // --- last_assistant_harness_version ---
+
+    fn harness_line(role: &str, version: &str) -> String {
+        format!(r#"{{"version":"{version}","message":{{"role":"{role}"}}}}"#)
+    }
+
+    #[test]
+    fn last_assistant_harness_version_returns_newest() {
+        let transcript = [
+            harness_line("assistant", "2.1.200"),
+            harness_line("assistant", "2.1.214"),
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_harness_version(&transcript).as_deref(),
+            Some("2.1.214"),
+            "the last assistant harness version must win over earlier ones"
+        );
+    }
+
+    #[test]
+    fn last_assistant_harness_version_skips_trailing_user_and_corrupt_lines() {
+        let transcript = [
+            harness_line("assistant", "2.1.214"),
+            r#"{"version":"2.1.215","message":{"role":"user"}}"#.to_string(),
+            "not json {{".to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_harness_version(&transcript).as_deref(),
+            Some("2.1.214")
+        );
+    }
+
+    #[test]
+    fn last_assistant_harness_version_none_without_assistant() {
+        let transcript = [
+            r#"{"version":"2.1.214","message":{"role":"user"}}"#,
+            r#"{"version":"2.1.215","message":{"role":"user"}}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_assistant_harness_version(&transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_harness_version_none_when_assistant_has_no_version() {
+        let transcript = r#"{"message":{"role":"assistant"}}"#;
+        assert_eq!(last_assistant_harness_version(transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_harness_version_ignores_empty_version_string() {
+        let transcript = harness_line("assistant", "");
+        assert_eq!(last_assistant_harness_version(&transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_harness_version_empty_transcript_is_none() {
+        assert_eq!(last_assistant_harness_version(""), None);
     }
 }

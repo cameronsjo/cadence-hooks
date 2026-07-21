@@ -190,13 +190,13 @@ pub fn render_disclosure(own: &SessionRecord, peers: &[Peer]) -> String {
     msg.push_str(&format!(
         "\nYou are registered as **{}**.\n\
          \n\
-         Multi-session protocol (this checkout is shared mutable state):\n\
-         1. Re-verify branch and `git status` in the same turn as every mutation — a gather from a previous turn is already stale.\n\
-         2. Do not switch branches; the other session's working tree depends on the current one.\n\
-         3. Use explicit-path `git add` only — never `-A`/`-a`.\n\
-         4. Read the `[branch sha]` line in every `git commit` output; a branch you don't expect means a collision.\n\
-         5. Route writes that belong on other branches through `gh api` (contents API), not checkout.\n\
-         6. If your work overlaps a peer's declared paths, stop and tell the user the sessions need sequencing.",
+         Shared-checkout protocol (peers are live in this repo):\n\
+         1. Re-verify branch + `git status` in the same turn as every mutation — earlier gathers are stale.\n\
+         2. Never switch branches — a peer's working tree depends on the current one.\n\
+         3. Explicit-path `git add` only; never `-A`/`-a`.\n\
+         4. Read the `[branch sha]` line of every commit output — an unexpected branch means a collision.\n\
+         5. Writes for other branches go through `gh api` (contents API), not checkout.\n\
+         6. Overlapping a peer's declared paths? Stop and tell the user the sessions need sequencing.",
         own.name
     ));
 
@@ -326,9 +326,12 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(msg.contains("feat/issue-52"), "peer branch named: {msg}");
-        assert!(msg.contains("Multi-session protocol"), "protocol included");
         assert!(
-            msg.contains("explicit-path"),
+            msg.contains("Shared-checkout protocol"),
+            "protocol included"
+        );
+        assert!(
+            msg.contains("Explicit-path"),
             "field-report takeaway included"
         );
     }
@@ -448,7 +451,7 @@ mod tests {
         )];
         let msg = render_disclosure(&own, &peers);
         // The peer block is everything before the protocol footer.
-        let peer_block = msg.split("Multi-session protocol").next().unwrap();
+        let peer_block = msg.split("Shared-checkout protocol").next().unwrap();
         let peer_lines: Vec<&str> = peer_block.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(
             peer_lines.len(),
@@ -704,7 +707,7 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(msg.contains("primary checkout"));
         assert!(
-            !msg.contains("Multi-session protocol"),
+            !msg.contains("Shared-checkout protocol"),
             "no peers → no peer disclosure block: {msg}"
         );
     }
@@ -727,7 +730,7 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(msg.contains("primary checkout"), "posture line present");
         assert!(
-            msg.contains("Multi-session protocol"),
+            msg.contains("Shared-checkout protocol"),
             "peer disclosure also present: {msg}"
         );
     }

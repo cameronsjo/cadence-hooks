@@ -395,6 +395,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-commit-provenance",
+        description: "Nudge toward a Session-Id: trailer on a Claude-composed commit message",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "end",
         description: "Deregister this session's registry file when it ends (SessionEnd)",
         plugin: "session",
@@ -411,6 +417,12 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Warn at session start when the last session left loose ends",
         plugin: "session",
         event: Some(HookEvent::SessionStart),
+    },
+    HookEntry {
+        name: "persist-plan",
+        description: "Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)",
+        plugin: "session",
+        event: Some(HookEvent::UserPromptSubmit),
     },
 ];
 
@@ -496,6 +508,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "warn-branch-intent") => Some(
             r#"{"session_id":"test","tool_name":"Edit","cwd":"/tmp","tool_input":{"file_path":"/tmp/x.rs"}}"#,
         ),
+        // warn-commit-provenance early-exits unless the command is a git
+        // commit carrying an extractable message — the generic PreToolUse
+        // sample (`git status`) would never reach the Session-Id: check.
+        ("session", "warn-commit-provenance") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}"#,
+        ),
         // end gates on hook_event_name == "SessionEnd"; the generic logger
         // sample carries a different event and would no-op before the gate.
         ("session", "end") => {
@@ -519,6 +537,14 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "backstop-warn") => {
             Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#)
         }
+        // persist-plan gates on an exact "Implement the following plan:"
+        // prefix; the generic UserPromptSubmit sample carries no cwd/session_id
+        // so `try` would fail open before the write path. Carries the full
+        // shape (prompt + cwd + session_id + transcript_path) so `try` from a
+        // real checkout exercises the actual extraction and write.
+        ("session", "persist-plan") => Some(
+            r#"{"session_id":"test","prompt":"Implement the following plan:\n\n# Try Sample\n\nbody text","cwd":"/tmp","transcript_path":"/tmp/test.jsonl"}"#,
+        ),
         // warn-subagent-worktree only engages on an Agent/Task spawn; the generic
         // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a
         // directory to resolve against.

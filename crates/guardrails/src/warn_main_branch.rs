@@ -34,22 +34,31 @@ fn is_default_branch(branch: &str) -> bool {
     branch == "main" || branch == "master"
 }
 
-/// Returns true if `CADENCE_ALLOW_MAIN` env var is set to a truthy value.
+/// Resolve `CADENCE_ALLOW_MAIN` for a repo the same way `enforce-worktree`
+/// does — the shared resolution, not warn's old env-only read (cadence-hooks#164).
 ///
-/// Truthy: `"1"`, `"true"`, `"yes"` (case-insensitive). Anything else (unset,
-/// empty, `"0"`, `"false"`) is falsy. Set in `.claude/settings.json` env
-/// block — project or user-global — to permanently opt a repo out of the
-/// main-branch warning.
-fn is_main_allowed() -> bool {
-    is_main_allowed_value(std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref())
-}
-
-/// Pure: classify a `CADENCE_ALLOW_MAIN` value as truthy or falsy.
-fn is_main_allowed_value(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes")
-    )
+/// Two truthy sources, either opts the repo out permanently: the **process
+/// env** (session-wide), or — when process env doesn't set it — the target
+/// **repo's own tracked Claude settings** (`.claude/settings.json`'s `env`
+/// block), gated on a primary checkout so a linked worktree's settings can't
+/// speak for the repo. Before this collapse, warn honored *only* the process
+/// env, so a by-design-main repo (dotfiles, a vault) that declared the flag in
+/// its settings — as `enforce-worktree` already respects — still got nudged on
+/// `main`. Truthy is `"1"`/`"true"`/`"yes"` (trimmed, case-insensitive) via the
+/// shared [`is_truthy`](cadence_hooks_core::worktree::is_truthy). Absent /
+/// unparsable settings declare nothing and fall through (ADR-0001).
+fn is_main_allowed(repo_root: &Path) -> bool {
+    use cadence_hooks_core::worktree::{is_primary_checkout, is_truthy};
+    let env_allowed = is_truthy(std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref());
+    if env_allowed {
+        return true;
+    }
+    // Repo-declared: the target repo's own tracked settings, gated on a primary
+    // checkout so a linked worktree's settings can't speak for the repo.
+    is_primary_checkout(&repo_root.to_string_lossy())
+        && is_truthy(
+            cadence_hooks_core::config::repo_env_flag(repo_root, "CADENCE_ALLOW_MAIN").as_deref(),
+        )
 }
 
 /// Pure decision: should we warn about editing on this branch?
@@ -134,7 +143,7 @@ impl Check for WarnMainBranch {
         let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
         let snoozed = dismiss_main_branch_warn::is_snoozed_now(input, Path::new(&repo_root));
-        let allowed = is_main_allowed();
+        let allowed = is_main_allowed(Path::new(&repo_root));
 
         let result = should_warn(&branch, already_warned, snoozed, allowed);
 
@@ -465,46 +474,10 @@ mod tests {
         );
     }
 
-    // --- is_main_allowed_value (pure) ---
-
-    #[test]
-    fn allowed_value_unset_is_false() {
-        assert!(!is_main_allowed_value(None));
-    }
-
-    #[test]
-    fn allowed_value_empty_is_false() {
-        assert!(!is_main_allowed_value(Some("")));
-        assert!(!is_main_allowed_value(Some("   ")));
-    }
-
-    #[test]
-    fn allowed_value_falsy_strings() {
-        assert!(!is_main_allowed_value(Some("0")));
-        assert!(!is_main_allowed_value(Some("false")));
-        assert!(!is_main_allowed_value(Some("no")));
-        assert!(!is_main_allowed_value(Some("off")));
-    }
-
-    #[test]
-    fn allowed_value_truthy_strings() {
-        assert!(is_main_allowed_value(Some("1")));
-        assert!(is_main_allowed_value(Some("true")));
-        assert!(is_main_allowed_value(Some("yes")));
-    }
-
-    #[test]
-    fn allowed_value_case_insensitive() {
-        assert!(is_main_allowed_value(Some("TRUE")));
-        assert!(is_main_allowed_value(Some("True")));
-        assert!(is_main_allowed_value(Some("YES")));
-    }
-
-    #[test]
-    fn allowed_value_trims_whitespace() {
-        assert!(is_main_allowed_value(Some("  true  ")));
-        assert!(is_main_allowed_value(Some("\t1\n")));
-    }
+    // `CADENCE_ALLOW_MAIN` truthy parsing is now the shared
+    // `core::worktree::is_truthy` (tested there); warn's own duplicate was
+    // removed with the #164 resolution collapse. Repo-declared resolution is
+    // covered by `run()`-level tests below.
 
     // --- .claude/ directory carve-out (issues #33, #35) ---
 
@@ -796,5 +769,63 @@ mod tests {
         let r = WarnMainBranch.run(&input);
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(r.bypass.is_none(), "feature-branch allow is not a bypass");
+    }
+
+    // --- repo-declared CADENCE_ALLOW_MAIN (#164 resolution collapse) ---
+    //
+    // `is_main_allowed` reads real process env, which a caller's own
+    // environment may already set (CLAUDE.md: Claude sessions can ambiently
+    // carry `CADENCE_ALLOW_MAIN=true`) — clear it for the test that must prove
+    // the *repo-declared* source is what allows, serialized against every other
+    // `CADENCE_ALLOW_MAIN`-mutating test *across the crate* (not just this
+    // module) via the shared `crate::CADENCE_ALLOW_MAIN_TEST_LOCK`
+    // (cadence-hooks#298 — `warn_branch_base` mutates the same var).
+
+    #[test]
+    fn repo_declared_allow_main_suppresses_nudge() {
+        // #164: warn now honors a repo-declared CADENCE_ALLOW_MAIN in the repo's
+        // own `.claude/settings.json`, matching enforce-worktree — a
+        // by-design-main repo that opted out in settings is no longer nudged on
+        // `main`. This is the intended behavior change; everything else is
+        // verdict-locked.
+        let _guard = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("CADENCE_ALLOW_MAIN").ok();
+        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK; restored below. With
+        // process env cleared, the only allow source is the settings file.
+        unsafe {
+            std::env::remove_var("CADENCE_ALLOW_MAIN");
+        }
+
+        let (tmp, _root) = init_repo_on_main();
+        let claude = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        )
+        .unwrap();
+
+        let input = edit_input_in(tmp.path(), "warn-allow-repo-declared");
+        let r = WarnMainBranch.run(&input);
+
+        // SAFETY: serialized via ALLOW_MAIN_ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
+                None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
+            }
+        }
+
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "repo-declared allow-main suppresses the nudge"
+        );
+        assert!(
+            r.bypass.is_none(),
+            "a by-design allow-main is a bare allow, not a bypass"
+        );
     }
 }

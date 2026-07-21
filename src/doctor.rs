@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::registry;
+// The session crate's `registry` (peer-session liveness) — aliased because the
+// bare name is already taken by the binary's hook-catalog `registry` above.
+use cadence_hooks_session::registry as session_registry;
 
 /// Severity of a finding: errors block (shell bugs), warnings advise (version skew).
 #[derive(Debug, PartialEq)]
@@ -207,6 +210,26 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
             "run 'cadence-hooks doctor' for upgrade steps"
         }
     }
+}
+
+/// Build the one-line quiet SessionStart warning summary. Names an actor
+/// (Claude) and an action (run doctor, triage, surface to the user) instead of
+/// the old passive "run for details". The version-skew upgrade hint is appended
+/// only when a skew warning is present — stale-telemetry-only warnings carry no
+/// upgrade to suggest.
+fn quiet_warning_summary(
+    version: &str,
+    n_warn: usize,
+    has_skew: bool,
+    channel: InstallChannel,
+) -> String {
+    let mut summary = format!(
+        "cadence-hooks {version}: {n_warn} plugin warning(s). Claude: run 'cadence-hooks doctor', triage, and surface anything actionable to the user in one line."
+    );
+    if has_skew {
+        summary.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
+    }
+    summary
 }
 
 /// Judge an invocation against the registry.
@@ -911,6 +934,42 @@ fn prune_orphans(dirs: &[PathBuf], apply: bool, cache_root: &Path) -> (usize, u6
     (removed, freed)
 }
 
+/// Whether `doctor --prune --apply` may proceed, or is blocked because live peer
+/// sessions are still running and may be pinned to plugin-cache version dirs
+/// that pruning would pull out from under them.
+enum PruneGate {
+    Proceed,
+    Blocked(Vec<String>),
+}
+
+/// Decide whether `--prune --apply` may run. Pure over its inputs so it is
+/// testable without a live registry.
+///
+/// `force` overrides everything (the `CADENCE_DOCTOR_PRUNE_FORCE` escape hatch).
+/// A `None` sessions dir means there is nothing to protect (not inside a repo),
+/// so it proceeds. Otherwise it blocks when any non-stale peer is registered,
+/// naming them. `own_session_id` is `""` so the invoking session itself counts
+/// as a live peer — a prune must not delete dirs the caller is pinned to —
+/// matching how `run_status` enumerates peers.
+///
+/// Limitation: the session registry is repo-scoped (`<repo>/.claude/sessions`),
+/// so sessions running in other checkouts against the same global plugin cache
+/// are invisible here — the gate is under-protective across repos, never
+/// over-destructive.
+fn prune_liveness_gate(sessions_dir: Option<&Path>, stale_secs: u64, force: bool) -> PruneGate {
+    if force {
+        return PruneGate::Proceed;
+    }
+    let Some(dir) = sessions_dir else {
+        return PruneGate::Proceed;
+    };
+    let live = session_registry::live_peers(dir, "", stale_secs);
+    if live.is_empty() {
+        return PruneGate::Proceed;
+    }
+    PruneGate::Blocked(live.into_iter().map(|p| p.record.name).collect())
+}
+
 /// `doctor --prune` entry point: list (or, with `apply`, remove) orphaned
 /// plugin-cache version dirs. Dry-run by default (decision D4) — `apply`
 /// must be paired with `prune` at the call site (`run` enforces this before
@@ -986,6 +1045,33 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         }
     }
 
+    // Refuse to delete while live peer sessions may be pinned to these dirs.
+    // Only under default mode (not `--root`), mirroring the legacy-config gating
+    // below — `--root` fixtures must stay hermetic and never read live sessions.
+    // Dry-run deletes nothing, so the gate only guards the destructive `apply`.
+    if root_override.is_none() && apply {
+        let stale_secs = session_registry::stale_minutes() * 60;
+        let force = matches!(
+            std::env::var("CADENCE_DOCTOR_PRUNE_FORCE").as_deref(),
+            Ok("1") | Ok("true")
+        );
+        let sessions_dir = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| session_registry::sessions_dir(&cwd.to_string_lossy()));
+        if let PruneGate::Blocked(names) =
+            prune_liveness_gate(sessions_dir.as_deref(), stale_secs, force)
+        {
+            eprintln!(
+                "cadence-hooks doctor --prune --apply: refusing to prune — {} live session(s) may be pinned to these version dirs: {}. \
+                 Run /reload-plugins in any live session first to release the retired dirs, then re-run. \
+                 Or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway.",
+                names.len(),
+                names.join(", ")
+            );
+            return 0;
+        }
+    }
+
     let (removed, freed_bytes) = prune_orphans(&dirs, apply, &cache_root);
     let freed_mib = freed_bytes as f64 / (1024.0 * 1024.0);
 
@@ -993,6 +1079,9 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         if apply {
             println!(
                 "cadence-hooks doctor --prune --apply: removed {removed} orphaned version dir(s), freed ~{freed_mib:.1} MiB"
+            );
+            println!(
+                "  If any Claude Code session is currently running, run /reload-plugins in it now."
             );
         } else {
             println!(
@@ -1079,6 +1168,85 @@ fn canonical_remote_finding(
         ),
         remediation: "cache may not be canonical — verify before citing, or re-add the \
                       marketplace from its declared source"
+            .to_string(),
+    })
+}
+
+/// Legacy per-guard config files the unified loader no longer reads
+/// (cadence-hooks#153). Presence is a `Warning`, not an `Error`: the repo's
+/// softening is silently inert until migrated — the hard cut's non-silent net.
+const LEGACY_CONFIG_FILES: &[&str] = &["redaction.json", "terminology.json"];
+
+/// One `Warning` per orphaned legacy config file under `<root>/.claude/`, empty
+/// when none is present. Detects any entry at the path (regular file or
+/// symlink) via `symlink_metadata` — no read — so a leftover file is surfaced
+/// regardless of what it is. Pure; the caller resolves the repo root.
+fn legacy_config_findings(root: &Path) -> Vec<Finding> {
+    let claude = root.join(".claude");
+    LEGACY_CONFIG_FILES
+        .iter()
+        .filter_map(|name| {
+            let path = claude.join(name);
+            if std::fs::symlink_metadata(&path).is_err() {
+                return None;
+            }
+            Some(Finding {
+                severity: Severity::Warning,
+                plugin: "cadence-hooks".to_string(),
+                file: path.clone(),
+                line: None,
+                snippet: (*name).to_string(),
+                diagnosis: format!(
+                    "legacy guard config '{name}' present but no longer read — \
+                     unified into .claude/cadence.json (#153)"
+                ),
+                remediation: "run 'cadence-hooks migrate-config' to merge it into \
+                              .claude/cadence.json (renames the legacy file to \
+                              *.json.migrated)"
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A `Warning` when `<root>/.claude/cadence.json` is present but not valid JSON,
+/// or `None` when it is absent, unreadable/special (fail-open), or parses.
+///
+/// Runtime is fail-open — a malformed `cadence.json` silently yields every
+/// guard's default config, so its per-repo softening quietly stops applying.
+/// This makes that non-silent, without ever failing the run (advisory only).
+fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
+    let path = root.join(cadence_hooks_core::config::CADENCE_CONFIG_REL);
+    let content = cadence_hooks_core::paths::read_untrusted_config(&path)?;
+    // Two distinct failures both leave every guard on its default config: a
+    // syntax error, and a syntactically-valid but non-object top level. The
+    // latter is silent — `load_cadence_section` reads each section via
+    // `value.get(section)`, which yields nothing for an array/number/string,
+    // so the section lookup falls through to the default with no error.
+    let diagnosis = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(value) if value.is_object() => return None,
+        Ok(_) => {
+            "`.claude/cadence.json` is present but its top level is not a JSON \
+                  object — guards read their section via `value.get(section)`, which \
+                  yields nothing for a non-object, so they fall open to default \
+                  config and their per-repo softening is silently inert"
+        }
+        Err(_) => {
+            "`.claude/cadence.json` is present but not valid JSON — guards \
+                   fall open to default config, so their per-repo softening is \
+                   silently inert"
+        }
+    };
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: "cadence-hooks".to_string(),
+        file: path,
+        line: None,
+        snippet: "cadence.json".to_string(),
+        diagnosis: diagnosis.to_string(),
+        remediation: "make `.claude/cadence.json` a valid JSON object; \
+                      'cadence-hooks migrate-config' writes a valid file from any \
+                      legacy config"
             .to_string(),
     })
 }
@@ -1239,6 +1407,20 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         }
     }
 
+    // Repo-local guard-config health: orphaned legacy files (ignored under the
+    // #153 hard cut) and a malformed cadence.json. Repo-scoped, so default mode
+    // only — under `--root` (the CI/fixture path) there is no "current repo" to
+    // inspect, same live-machine-only rationale as the checks above.
+    if root_override.is_none()
+        && let Ok(cwd) = std::env::current_dir()
+        && let Some(repo_root) = cadence_hooks_core::paths::find_git_root(&cwd.to_string_lossy())
+    {
+        findings.extend(legacy_config_findings(&repo_root));
+        if let Some(finding) = cadence_config_parse_finding(&repo_root) {
+            findings.push(finding);
+        }
+    }
+
     let (errors, warnings): (Vec<&Finding>, Vec<&Finding>) =
         findings.iter().partition(|f| f.severity == Severity::Error);
 
@@ -1258,10 +1440,12 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         // telemetry, so the summary stays generic and defers the specifics to a
         // full `cadence-hooks doctor` run.
         let version = env!("CARGO_PKG_VERSION");
+        let has_skew = warnings
+            .iter()
+            .any(|w| w.diagnosis.contains("not present in this binary"));
         println!(
-            "cadence-hooks {version}: {} plugin warning(s) — run 'cadence-hooks doctor' for details ({})",
-            warnings.len(),
-            upgrade_hint_short(channel)
+            "{}",
+            quiet_warning_summary(version, warnings.len(), has_skew, channel)
         );
         return 0;
     }
@@ -2046,6 +2230,35 @@ mod tests {
         assert!(!h.contains("brew"), "{h}");
     }
 
+    // ── quiet_warning_summary (#306) ────────────────────────────────────────
+
+    #[test]
+    fn quiet_summary_names_actor_and_action() {
+        let s = quiet_warning_summary("0.60.0", 2, false, InstallChannel::Unknown);
+        assert!(s.contains("Claude:"), "must name the actor: {s}");
+        assert!(
+            s.contains("run 'cadence-hooks doctor'"),
+            "must name the action: {s}"
+        );
+    }
+
+    #[test]
+    fn quiet_summary_no_skew_omits_upgrade_hint() {
+        let s = quiet_warning_summary("0.60.0", 1, false, InstallChannel::Homebrew);
+        assert!(!s.contains("brew upgrade"), "no upgrade hint expected: {s}");
+        assert!(!s.contains("Version skew"), "no skew clause expected: {s}");
+    }
+
+    #[test]
+    fn quiet_summary_skew_includes_upgrade_hint() {
+        let s = quiet_warning_summary("0.60.0", 1, true, InstallChannel::Homebrew);
+        assert!(s.contains("Version skew"), "skew clause expected: {s}");
+        assert!(
+            s.contains("brew upgrade cadence-hooks"),
+            "Homebrew skew hint expected: {s}"
+        );
+    }
+
     // ── integration tests via run(Some(tmpdir), ...) ─────────────────────────
 
     /// Build a minimal hooks.json under a temp plugin dir structure.
@@ -2303,5 +2516,160 @@ mod tests {
         assert_eq!(freed, 0);
         assert!(outside.exists(), "outside dir must survive");
         assert!(outside.join("keepme").exists());
+    }
+
+    // ── prune_liveness_gate (#305) ──────────────────────────────────────────
+
+    /// Write a fresh peer record and return its sessions dir.
+    fn seed_session(name: &str, session_id: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude").join("sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: name.into(),
+            session_id: session_id.into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        session_registry::write_record(&dir, &rec).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn prune_liveness_gate_forces_through() {
+        // force wins even with a live session pinned.
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        assert!(matches!(
+            prune_liveness_gate(Some(&dir), 600, true),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_none_dir_proceeds() {
+        assert!(matches!(
+            prune_liveness_gate(None, 600, false),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_empty_dir_proceeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            prune_liveness_gate(Some(tmp.path()), 600, false),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_live_session_blocks_and_names() {
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        // Large stale window so the just-written record counts as live.
+        match prune_liveness_gate(Some(&dir), 600, false) {
+            PruneGate::Blocked(names) => {
+                assert!(
+                    names.contains(&"forge-anvil".to_string()),
+                    "block must name the live session: {names:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a live session must block the prune"),
+        }
+    }
+
+    #[test]
+    fn prune_liveness_gate_only_stale_proceeds() {
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        // stale_secs = 0: any measurable mtime age makes the peer stale.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(matches!(
+            prune_liveness_gate(Some(&dir), 0, false),
+            PruneGate::Proceed
+        ));
+    }
+
+    // ── legacy_config_findings / cadence_config_parse_finding (#153) ─────────
+
+    fn seed_claude(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        for (name, body) in files {
+            fs::write(claude.join(name), body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn legacy_config_findings_flags_present_files() {
+        let dir = seed_claude(&[("redaction.json", "{}"), ("terminology.json", "{}")]);
+        let findings = legacy_config_findings(dir.path());
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| f.severity == Severity::Warning));
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.remediation.contains("migrate-config")),
+            "each remediation points at migrate-config"
+        );
+        let snippets: Vec<&str> = findings.iter().map(|f| f.snippet.as_str()).collect();
+        assert!(snippets.contains(&"redaction.json"));
+        assert!(snippets.contains(&"terminology.json"));
+    }
+
+    #[test]
+    fn legacy_config_findings_clean_repo_is_empty() {
+        // Only the unified file present → nothing to warn about.
+        let dir = seed_claude(&[("cadence.json", r#"{"version":1}"#)]);
+        assert!(legacy_config_findings(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn legacy_config_findings_partial_flags_only_present() {
+        let dir = seed_claude(&[("redaction.json", "{}")]);
+        let findings = legacy_config_findings(dir.path());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].snippet, "redaction.json");
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_malformed_warns() {
+        let dir = seed_claude(&[("cadence.json", "{not valid json")]);
+        let finding =
+            cadence_config_parse_finding(dir.path()).expect("a malformed cadence.json must warn");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(finding.diagnosis.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_valid_is_none() {
+        let dir = seed_claude(&[(
+            "cadence.json",
+            r#"{"version":1,"terminology":{"exemptions":[]}}"#,
+        )]);
+        assert!(cadence_config_parse_finding(dir.path()).is_none());
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_non_object_warns() {
+        // Syntactically-valid JSON whose top level is not an object: every
+        // guard's `value.get(section)` yields nothing, so they silently fall
+        // open to defaults. Doctor must still warn, and distinguish this from
+        // the malformed-JSON case.
+        let dir = seed_claude(&[("cadence.json", "[]")]);
+        let finding =
+            cadence_config_parse_finding(dir.path()).expect("a non-object cadence.json must warn");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(finding.diagnosis.contains("not a JSON object"));
+        assert!(!finding.diagnosis.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_absent_is_none() {
+        let dir = seed_claude(&[]);
+        assert!(cadence_config_parse_finding(dir.path()).is_none());
     }
 }

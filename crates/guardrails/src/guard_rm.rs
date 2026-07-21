@@ -80,6 +80,39 @@ fn takes_value(verb: &str, flag: &str) -> bool {
     }
 }
 
+/// Does this invocation recurse? `rm` only — recursion is meaningless for
+/// `unlink`/`shred`/`truncate`, which never descend into directories. True when
+/// a short-flag cluster carries `r`/`R` (`-rf`, `-fr`) or a `--recursive` long
+/// flag (or any unambiguous abbreviation of it) appears before a `--` operand
+/// terminator.
+fn rm_is_recursive(argv: &[String], verb: &str) -> bool {
+    if verb != "rm" {
+        return false;
+    }
+    for tok in argv.iter().skip(1) {
+        if tok == "--" {
+            break; // operands only after this
+        }
+        // GNU coreutils rm accepts unambiguous long-option abbreviations, and
+        // `--recursive` is the only rm long option starting with `--r` — so
+        // `--r`/`--rec`/`--recu`/… all expand to it. Treat any `--<p>` where p is
+        // a non-empty prefix of "recursive" as recursive; `--recursivex` (not a
+        // prefix) does not match, and a bare `--` (empty p) is the terminator
+        // already handled above.
+        if let Some(rest) = tok.strip_prefix("--") {
+            if !rest.is_empty() && "recursive".starts_with(rest) {
+                return true;
+            }
+            continue; // a long flag that isn't a --recursive abbreviation
+        }
+        // A short-flag cluster (`-rf`); the leading `-` is not a `--` long flag.
+        if tok.starts_with('-') && (tok.contains('r') || tok.contains('R')) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Classification of a single resolved deletion target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TargetClass {
@@ -89,6 +122,10 @@ enum TargetClass {
     /// is NOT here — deleting it whole is not the transient-scratch case this
     /// ALLOW exists for, so it falls through to the block/ask rules.
     ClaudeManaged,
+    /// A transient scratch/editor-swap file directly under home whose name ends
+    /// in a recognized ephemeral suffix (`.tmp`/`.swp`/`.swo`). ALLOW — deleting
+    /// these is routine cleanup, not the destructive home-child case.
+    Scratch,
     /// The filesystem root `/`. BLOCK.
     Root,
     /// The user's home directory itself. BLOCK.
@@ -110,7 +147,7 @@ enum TargetClass {
 impl TargetClass {
     fn outcome(self) -> Outcome {
         match self {
-            TargetClass::Temp | TargetClass::ClaudeManaged => Outcome::Allow,
+            TargetClass::Temp | TargetClass::ClaudeManaged | TargetClass::Scratch => Outcome::Allow,
             TargetClass::Root
             | TargetClass::Home
             | TargetClass::HomeChild
@@ -137,6 +174,11 @@ struct RmContext<'a> {
 enum TargetToken {
     /// A path resolved against the effective cwd (a shell path string).
     Path(String),
+    /// A file-scoped glob (`*.tgz`, `homebridge-*.tgz`) that names artifacts
+    /// *within* `dir` rather than the directory itself. `recursive` records
+    /// whether the invocation carried `-r`/`-R` — a recursive sweep is judged
+    /// more conservatively than a flat one.
+    FileGlob { dir: String, recursive: bool },
     /// An operand that could not be resolved (unexpanded var / substitution /
     /// `..`-bearing). Always ASK.
     Unresolvable,
@@ -194,8 +236,9 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
         // on the leading word too, so they defer, never silently auto-approve.)
         let verb = basename(first).trim_start_matches('\\');
         if DELETE_VERBS.contains(&verb) {
+            let recursive = rm_is_recursive(argv, verb);
             for operand in delete_operands(argv, verb) {
-                out.push(resolve_target(&operand, &effective_dir));
+                out.push(resolve_target(&operand, &effective_dir, recursive));
             }
         } else if verb == "find" && find_is_destructive(argv) {
             // A `find` that deletes — via `-delete`/`-exec`/`-ok` running a
@@ -206,7 +249,9 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
             match find_roots(argv) {
                 FindTargets::Paths(roots) => {
                     for root in roots {
-                        out.push(resolve_target(&root, &effective_dir));
+                        // A destructive `find` recurses by nature — treat its
+                        // roots conservatively (recursive = true).
+                        out.push(resolve_target(&root, &effective_dir, true));
                     }
                 }
                 FindTargets::Unresolvable => out.push(TargetToken::Unresolvable),
@@ -328,8 +373,13 @@ fn find_roots(argv: &[String]) -> FindTargets {
 }
 
 /// Resolve one operand against the effective cwd, or mark it unresolvable.
-fn resolve_target(operand: &str, effective_dir: &str) -> TargetToken {
-    // Unexpanded variable / command substitution — can't prove anything.
+/// `recursive` records whether the invocation carried `-r`/`-R`; it rides along
+/// on a [`TargetToken::FileGlob`] so the judge can soften a flat artifact sweep
+/// but not a recursive one.
+fn resolve_target(operand: &str, effective_dir: &str, recursive: bool) -> TargetToken {
+    // Unexpanded variable / command substitution — can't prove anything. This
+    // guard (with the `..` checks below) runs AHEAD of glob detection, so an
+    // unresolvable operand never masquerades as a clean file-scoped sweep.
     if operand.contains('$') || operand.contains('`') {
         return TargetToken::Unresolvable;
     }
@@ -356,7 +406,30 @@ fn resolve_target(operand: &str, effective_dir: &str) -> TargetToken {
     if has_parent_segment(&resolved) {
         return TargetToken::Unresolvable;
     }
+    // A file-scoped glob (`*.tgz`) names artifacts within `resolved`, not the
+    // directory itself. Emit a FileGlob so the judge classifies the DIR and can
+    // soften a git-repo artifact sweep. A bare `*`/`.*` is NOT file-scoped — it
+    // means "everything here", so it stays a Path carrying the dir's verdict.
+    if is_file_scoped_glob(operand) {
+        return TargetToken::FileGlob {
+            dir: resolved,
+            recursive,
+        };
+    }
     TargetToken::Path(resolved)
+}
+
+/// True when `operand`'s final path segment is a glob that scopes to files
+/// *within* a directory rather than naming the directory itself: it contains a
+/// glob metachar (`*`/`?`/`[`), does NOT start with `.` (so `.*` — which matches
+/// dotfiles like `.git`/`.env` — is excluded), and is not composed solely of
+/// `*`/`?` (a bare `*` means "everything in this dir", not an artifact pattern).
+fn is_file_scoped_glob(operand: &str) -> bool {
+    let last = operand.rsplit('/').next().unwrap_or(operand);
+    if !last.contains(['*', '?', '[']) || last.starts_with('.') {
+        return false;
+    }
+    !last.chars().all(|c| c == '*' || c == '?')
 }
 
 /// The literal directory prefix of a (possibly globbed) operand: everything up
@@ -382,6 +455,15 @@ fn glob_literal_prefix(operand: &str) -> &str {
 /// True when any `/`-separated segment of `path` is exactly `..`.
 fn has_parent_segment(path: &str) -> bool {
     path.split('/').any(|seg| seg == "..")
+}
+
+/// True when `norm`'s final path segment ends in a recognized transient suffix
+/// (`.tmp`, `.swp`, `.swo`) — an editor swap file or a temp-write artifact.
+/// `.bak`/`.orig`/`.old` are deliberately excluded: those can be intentional
+/// backups a user means to keep, so they stay BLOCK under home.
+fn is_transient_scratch(norm: &str) -> bool {
+    let last = norm.rsplit('/').next().unwrap_or(norm);
+    last.ends_with(".tmp") || last.ends_with(".swp") || last.ends_with(".swo")
 }
 
 /// Classify a resolved target path into guard-rm's [`TargetClass`].
@@ -425,6 +507,11 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
         return TargetClass::Home;
     }
     if shared == PathClass::HomeChild {
+        // A transient scratch/swap file under home (`~/.claude.json.tmp`,
+        // `~/.foo.swp`) is routine cleanup, not the destructive home-child case.
+        if is_transient_scratch(&norm) {
+            return TargetClass::Scratch;
+        }
         return TargetClass::HomeChild;
     }
     // Vault is guard-rm-local (deferred from pathclass v1); checked ahead of the
@@ -463,6 +550,18 @@ fn judge_rm(
         let class = match target {
             TargetToken::Unresolvable => TargetClass::Unresolvable,
             TargetToken::Path(p) => classify_path(p, ctx, is_git_root),
+            TargetToken::FileGlob { dir, recursive } => {
+                match classify_path(dir, ctx, is_git_root) {
+                    // A flat artifact sweep in a git repo (`rm *.tgz`) is routine
+                    // cleanup — soften to Scratch (Allow). A recursive one
+                    // (`rm -rf project-*`) could dredge tracked directories → Ask.
+                    TargetClass::GitRepo if !*recursive => TargetClass::Scratch,
+                    TargetClass::GitRepo => TargetClass::Unknown,
+                    // Every other dir class keeps its own verdict: Temp Allow,
+                    // Home/HomeChild/Vault/Root Block, Unknown Ask.
+                    other => other,
+                }
+            }
         };
         let outcome = class.outcome();
         // Remember the FIRST block-classified target only for message wording.
@@ -502,7 +601,14 @@ fn block_message(class: TargetClass) -> String {
     };
     format!(
         "🚫 guard-rm: this deletes {what}, which is almost never intended.\n   \
-         If you're certain, run it in a terminal yourself, or:\n   \
+         To keep the file but get it out of the way, move it to the trash — \
+         guard-rm never fires on `mv`:\n   \
+         • mv <target> ~/.Trash\n   \
+         If you truly mean to delete, opt out via Claude Code's own environment. \
+         A command-line prefix (`CADENCE_DISABLE=guard-rm rm …`) has NO effect: \
+         the hook reads its own environment, never the command string. Set one of \
+         these in the `env` block of .claude/settings.json, or export it before \
+         launching Claude Code:\n   \
          • CADENCE_DISABLE=guard-rm — opt this guard out (persists in settings)\n   \
          • CADENCE_BYPASS=1 — bypass all cadence enforcement for one session"
     )
@@ -674,6 +780,23 @@ mod tests {
         assert_eq!(judge("rm -rf ~/Documents/notes", "/home"), Outcome::Ask);
     }
 
+    // --- ALLOW: transient-suffix scratch files directly under home (#316) ---
+
+    #[test]
+    fn transient_scratch_under_home_allows() {
+        // Editor swaps and temp-write artifacts under home are routine cleanup.
+        assert_eq!(judge("rm -f ~/.claude.json.tmp", "/home"), Outcome::Allow);
+        assert_eq!(judge("rm -f ~/.foo.swp", "/home"), Outcome::Allow);
+    }
+
+    #[test]
+    fn non_transient_home_child_still_blocks() {
+        assert_eq!(judge("rm -rf ~/.zshrc", "/home"), Outcome::Block);
+        assert_eq!(judge("rm -rf ~/Documents", "/home"), Outcome::Block);
+        // `.bak` is a deliberate exclusion — it can be an intentional backup.
+        assert_eq!(judge("rm -rf ~/Documents.bak", "/home"), Outcome::Block);
+    }
+
     // --- BLOCK: vault ---
 
     #[test]
@@ -772,6 +895,89 @@ mod tests {
         assert_eq!(judge("rm -rf /tmp/x $VAR", "/home"), Outcome::Ask);
         // unresolvable (ASK) + root (BLOCK) → BLOCK.
         assert_eq!(judge("rm -rf $VAR /", "/home"), Outcome::Block);
+    }
+
+    // --- file-scoped globs classified by their directory (#322) ---
+
+    #[test]
+    fn file_scoped_glob_in_git_repo_allows() {
+        // A flat artifact sweep in a git repo is routine cleanup.
+        assert_eq!(
+            judge_with("rm -f homebridge-dreo-*.tgz", "/srv/repo", &["/srv/repo"]),
+            Outcome::Allow
+        );
+        assert_eq!(
+            judge_with("rm -f *.tgz", "/srv/repo", &["/srv/repo"]),
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn file_scoped_glob_in_temp_allows() {
+        // A file-scoped glob under temp keeps the temp Allow.
+        assert_eq!(judge("rm -rf /tmp/x/*.log", "/home"), Outcome::Allow);
+    }
+
+    #[test]
+    fn bare_glob_in_git_repo_still_blocks() {
+        // `*` and `.*` mean "everything here", not a file-scoped pattern — the
+        // directory (a git repo) is the target → Block, no hole.
+        assert_eq!(
+            judge_with("rm -rf *", "/srv/repo", &["/srv/repo"]),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge_with("rm -rf .*", "/srv/repo", &["/srv/repo"]),
+            Outcome::Block
+        );
+    }
+
+    #[test]
+    fn file_scoped_glob_in_vault_still_blocks() {
+        // A non-git dir class keeps its verdict — the vault stays Block.
+        assert_eq!(judge("rm -f /vaults/main/*.md", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn recursive_file_glob_in_git_repo_asks() {
+        // A recursive sweep could dredge tracked directories → Ask, not Allow.
+        assert_eq!(
+            judge_with("rm -rf project-*", "/srv/repo", &["/srv/repo"]),
+            Outcome::Ask
+        );
+    }
+
+    #[test]
+    fn recursive_long_flag_abbreviations_detected() {
+        // GNU rm expands any unambiguous `--r…` prefix to `--recursive`.
+        let rm = |arg: &str| rm_is_recursive(&["rm".into(), arg.into(), "x".into()], "rm");
+        assert!(rm("--recursive"));
+        assert!(rm("--recu"));
+        assert!(rm("--rec"));
+        assert!(rm("--r"));
+        // A bare `--` operand terminator is not a recursive flag.
+        assert!(!rm("--"));
+        // `--recursivex` is not a prefix of "recursive" → not matched.
+        assert!(!rm("--recursivex"));
+        // An unrelated long flag is not recursive.
+        assert!(!rm("--force"));
+    }
+
+    #[test]
+    fn abbreviated_recursive_file_glob_in_git_repo_asks() {
+        // Security regression (#322): `--recu` IS a recursive delete, so a
+        // file-scoped glob sweep in a git repo must not ride through to Allow on
+        // a false non-recursive belief — it Asks, like `-rf` does.
+        assert_eq!(
+            judge_with("rm --recu project-*", "/srv/repo", &["/srv/repo"]),
+            Outcome::Ask
+        );
+    }
+
+    #[test]
+    fn root_glob_still_blocks_under_file_glob_path() {
+        // `/*` reduces to the root — the bare-glob path, never softened.
+        assert_eq!(judge("rm -rf /*", "/home"), Outcome::Block);
     }
 
     // --- non-deletions & look-alikes → ALLOW (nothing to judge) ---
@@ -1040,6 +1246,24 @@ mod tests {
         assert!(msg.contains("filesystem root"));
         assert!(msg.contains("CADENCE_DISABLE=guard-rm"));
         assert!(msg.contains("CADENCE_BYPASS=1"));
+    }
+
+    #[test]
+    fn block_message_bypass_hint_is_actionable() {
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some(VAULT),
+            tmpdir: None,
+        };
+        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| false);
+        let msg = r.message.expect("block carries a message");
+        // The recoverable alternative that never trips guard-rm.
+        assert!(msg.contains("~/.Trash"));
+        // The hatches live in Claude Code's environment, not the command line.
+        assert!(msg.contains("settings.json") || msg.contains("environment"));
+        // A command-line prefix is inert — the caveat must be spelled out.
+        assert!(msg.contains("NO effect"));
     }
 
     #[test]

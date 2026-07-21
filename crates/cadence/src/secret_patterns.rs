@@ -66,6 +66,16 @@ pub const BLOCKED_PATH_FRAGMENTS: &[&str] = &[
 /// Ambiguous patterns (warn, not block).
 pub const WARN_EXTENSIONS: &[&str] = &["pem", "p8"];
 
+/// The ambiguous-file nudge shared verbatim by `prevent_secret_writes` and
+/// `prevent_secret_leaks`'s Read arm — the latter passes `"(Read) "` as
+/// `prefix` to name the tool; the former passes `""`.
+pub fn ambiguous_key_material_message(prefix: &str, filename: &str) -> String {
+    format!(
+        "⚠️  {prefix}'{filename}' may contain private key material. \
+         Approve only if you know this is a public cert."
+    )
+}
+
 /// Check if a filename is a safe template (e.g., `.env.example`).
 pub fn is_safe_template(filename: &str) -> bool {
     let lower = filename.to_lowercase();
@@ -268,6 +278,19 @@ pub fn command_may_reference_secret(lower_command: &str) -> bool {
         || BLOCKED_PATH_FRAGMENTS
             .iter()
             .any(|frag| lower_command.contains(frag))
+}
+
+/// Substrings that mark a variable NAME as secret-shaped (`API_KEY`,
+/// `DB_PASSWORD`, `GH_TOKEN`). Matched case-insensitively against the name.
+const SECRET_VAR_NAME_KEYWORDS: &[&str] =
+    &["key", "secret", "token", "password", "credential", "auth"];
+
+/// Does this variable name look like it holds a secret? True iff its lowercased
+/// form contains any [`SECRET_VAR_NAME_KEYWORDS`] substring — the predicate the
+/// echo/printf leak nudge uses to judge an expanded var by name alone.
+pub fn is_secret_shaped_var_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SECRET_VAR_NAME_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
 /// High-confidence secret-*value* patterns: `(human name, regex)`.

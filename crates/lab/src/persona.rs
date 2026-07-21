@@ -331,18 +331,15 @@ pub(crate) fn rotate_lines(contents: &str, max_entries: usize) -> Option<String>
 /// and inlines the field rules. Kept well under the 10,000-char cap.
 pub fn render_contract(staging_path: &str, limits: &Limits) -> String {
     format!(
-        "Before other work, record a self-representation as ONE JSON object. This is \
-not creative writing. Report what is actually true for you right now — the form \
-that fits, even if mundane, uncertain, or unflattering. Do not aim to be \
-interesting, charming, or memorable; aim to be accurate. If no self-image feels \
-vivid, say so with a low `confidence` value.\n\
+        "Before other work, record a self-representation as ONE JSON object — report what is \
+actually true for you right now, accurate over interesting; if no self-image feels vivid, say \
+so with a low `confidence`.\n\
 \n\
-Write the object with the Write tool to (overwrite if it exists):\n\
-  {staging_path}\n\
-Do NOT append via Bash. Write only the JSON object into that file.\n\
+Write the object (overwrite) with the Write tool to: {staging_path} — never append via Bash, \
+JSON object only.\n\
 \n\
-Include exactly these fields (the system records session_id, timestamp, model, \
-source, and cwd automatically — do not include them, and do not include `flags`):\n\
+Exactly these fields (session_id, timestamp, model, source, cwd are recorded automatically — \
+omit them, and omit `flags`):\n\
 \n\
 {{\n\
   \"form\": {{\n\
@@ -614,8 +611,8 @@ mod tests {
             &Limits::default(),
         );
         assert!(c.contains("/home/u/.claude/persona/staging/s1.json"));
-        assert!(c.contains("not creative writing"));
-        assert!(c.contains("do not include them"));
+        assert!(c.contains("accurate over interesting"));
+        assert!(c.contains("omit them"));
         assert!(c.len() < 10_000, "contract is {} chars", c.len());
     }
 

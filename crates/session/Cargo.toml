@@ -10,6 +10,8 @@ cadence-hooks-core.workspace = true
 cadence-hooks-metrics.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+gethostname.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }

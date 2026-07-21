@@ -3,6 +3,14 @@
 //! Ownership-aware guards that prevent Claude Code from pushing to repos
 //! you don't own, writing to upstream issues, or running irreversible operations.
 
+/// Shared test lock serializing every test that mutates the process-global
+/// `CADENCE_ALLOW_MAIN` env var — read by `warn_main_branch::is_main_allowed`
+/// and `warn_branch_base`'s `would_block_here`. Module-local locks in separate
+/// files provide no mutual exclusion under cargo's parallel test runner, so
+/// they race (cadence-hooks#298); one crate-shared lock serializes them all.
+#[cfg(test)]
+pub(crate) static CADENCE_ALLOW_MAIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Per-repo snooze command + helper consumed by `enforce_worktree`.
 pub mod dismiss_enforce_worktree;
 /// Per-repo snooze command + helper consumed by `warn_main_branch`.
@@ -31,6 +39,8 @@ pub mod guard_rm;
 pub mod inject_gh_context;
 /// Shared closing-keyword detection for GitHub issue references.
 pub mod issue_refs;
+/// Shared message text duplicated across guardrails call sites (cadence-hooks#327).
+pub mod messages;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
 pub mod nudge_upgrade_after_push;
 /// Shared provenance sidecar for the `dismiss-*` snooze markers.

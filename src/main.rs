@@ -3,7 +3,8 @@
 //! Dispatches to per-crate check implementations via `clap` subcommands.
 //! Each hook subcommand reads JSON from stdin (the hook protocol) and exits
 //! with 0 (allow), 1 (warn), or 2 (block). The CLI commands (`list`, `doctor`,
-//! `configure`, `try`, `session declare`/`status`) take no stdin.
+//! `configure`, `try`, `migrate-config`, `session declare`/`status`) take no
+//! stdin.
 
 use cadence_hooks_core::HookEvent;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -21,6 +22,7 @@ mod configure;
 mod dispatch;
 mod doctor;
 mod hook_latency;
+mod migrate;
 mod registry;
 mod try_hook;
 use registry::{HOOKS, HookEntry};
@@ -123,6 +125,9 @@ enum Commands {
         #[arg(long)]
         apply: bool,
     },
+
+    /// Convert legacy .claude/{redaction,terminology}.json into the unified .claude/cadence.json (#153)
+    MigrateConfig,
 }
 
 #[derive(Subcommand)]
@@ -321,12 +326,16 @@ enum SessionCommands {
     WarnBranchDrift,
     /// Nudge when new work starts on a stale, unrelated feature branch (PreToolUse)
     WarnBranchIntent,
+    /// Nudge toward a `Session-Id:` trailer on a Claude-composed commit message (PreToolUse)
+    WarnCommitProvenance,
     /// Deregister this session's registry file when it ends (SessionEnd logger)
     End,
     /// Record loose ends when the session ends, for the next start to surface (SessionEnd logger)
     BackstopRecord,
     /// Warn at session start when the last session in this repo left loose ends (SessionStart)
     BackstopWarn,
+    /// Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)
+    PersistPlan,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -431,9 +440,11 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::Guard => "guard",
             SessionCommands::WarnBranchDrift => "warn-branch-drift",
             SessionCommands::WarnBranchIntent => "warn-branch-intent",
+            SessionCommands::WarnCommitProvenance => "warn-commit-provenance",
             SessionCommands::End => "end",
             SessionCommands::BackstopRecord => "backstop-record",
             SessionCommands::BackstopWarn => "backstop-warn",
+            SessionCommands::PersistPlan => "persist-plan",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -442,7 +453,8 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         Commands::Try { .. }
         | Commands::List
         | Commands::Configure { .. }
-        | Commands::Doctor { .. } => None,
+        | Commands::Doctor { .. }
+        | Commands::MigrateConfig => None,
     }
 }
 
@@ -504,11 +516,12 @@ fn print_hook_list() {
 fn main() {
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
-    // Note: `list`, `configure`, `doctor`, `try`, and the session CLI actions
-    // (`declare`, `status`) are exempt — they're CLI/diagnostic commands, not
-    // enforcement paths, and must work always. A bypassed doctor would report
-    // false-clean in CI; a bypassed `session status` would hide live peers
-    // exactly when someone is debugging coordination.
+    // Note: `list`, `configure`, `doctor`, `try`, `migrate-config`, and the
+    // session CLI actions (`declare`, `status`) are exempt — they're
+    // CLI/diagnostic/maintenance commands, not enforcement paths, and must work
+    // always. A bypassed doctor would report false-clean in CI; a bypassed
+    // `session status` would hide live peers exactly when someone is debugging
+    // coordination; a bypassed `migrate-config` would silently migrate nothing.
     let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
     // Match on subcommand *position* (argv[1], or argv[1]+argv[2] for session
     // CLI actions) — not any argv token, which would let a hook argument that
@@ -516,8 +529,10 @@ fn main() {
     let mut positional = std::env::args().skip(1);
     let bypass_exempt = matches!(
         (positional.next().as_deref(), positional.next().as_deref()),
-        (Some("list" | "configure" | "doctor" | "try"), _)
-            | (Some("session"), Some("declare" | "status"))
+        (
+            Some("list" | "configure" | "doctor" | "try" | "migrate-config"),
+            _
+        ) | (Some("session"), Some("declare" | "status"))
     );
     if bypassed && !bypass_exempt {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
@@ -671,6 +686,7 @@ fn main() {
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
     let session = HookEvent::SessionStart;
+    let user_prompt_submit = HookEvent::UserPromptSubmit;
 
     match cli.command {
         Commands::Try {
@@ -713,6 +729,9 @@ fn main() {
             apply,
         } => {
             process::exit(doctor::run(root.as_deref(), quiet, prune, apply).into());
+        }
+        Commands::MigrateConfig => {
+            process::exit(migrate::run().into());
         }
         Commands::Cadence(cmd) => match cmd {
             CadenceCommands::Terminology => dispatch::run_logged_check(
@@ -1068,6 +1087,11 @@ fn main() {
                 pre,
                 canonical_hook,
             ),
+            SessionCommands::WarnCommitProvenance => dispatch::run_logged_check(
+                &cadence_hooks_session::warn_commit_provenance::WarnCommitProvenance,
+                pre,
+                canonical_hook,
+            ),
             SessionCommands::End => dispatch::run_logged_logger(
                 &cadence_hooks_session::end::End,
                 registry::sample_for("session", "end"),
@@ -1081,6 +1105,11 @@ fn main() {
             SessionCommands::BackstopWarn => dispatch::run_logged_check(
                 &cadence_hooks_session::backstop::BackstopWarn,
                 session,
+                canonical_hook,
+            ),
+            SessionCommands::PersistPlan => dispatch::run_logged_check(
+                &cadence_hooks_session::persist_plan::PersistPlan,
+                user_prompt_submit,
                 canonical_hook,
             ),
             SessionCommands::Declare {

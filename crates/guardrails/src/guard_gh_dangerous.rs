@@ -70,10 +70,7 @@ impl Check for GhDangerousGuard {
 
         // Pass 1: direct invocation (after stripping quotes)
         if let Some(m) = GH_REPO_DELETE.find(&stripped) {
-            return CheckResult::block(format!(
-                "🚫 git-guardrails: gh repo delete is blocked\n   \
-                 Found: `{}`\n   \
-                 Fix: delete manually via github.com — this is irreversible",
+            return CheckResult::block(crate::messages::repo_delete_blocked_message(
                 m.as_str().trim(),
             ));
         }
@@ -82,10 +79,7 @@ impl Check for GhDangerousGuard {
         if EXEC_WRAPPER.is_match(&stripped)
             && let Some(m) = GH_REPO_DELETE.find(command)
         {
-            return CheckResult::block(format!(
-                "🚫 git-guardrails: gh repo delete is blocked\n   \
-                     Found: `{}`\n   \
-                     Fix: delete manually via github.com — this is irreversible",
+            return CheckResult::block(crate::messages::repo_delete_blocked_message(
                 m.as_str().trim(),
             ));
         }
@@ -105,10 +99,7 @@ impl Check for GhDangerousGuard {
                 continue;
             }
             if has_delete_method(&tokens) && tokens.iter().any(|t| API_REPO_PATH.is_match(t)) {
-                return CheckResult::block(format!(
-                    "🚫 git-guardrails: gh repo delete is blocked\n   \
-                     Found: `{}`\n   \
-                     Fix: delete manually via github.com — this is irreversible",
+                return CheckResult::block(crate::messages::repo_delete_blocked_message(
                     segment.trim(),
                 ));
             }
