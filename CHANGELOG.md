@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`MetricsInput`/`HookInput` tolerate non-object `tool_response`/`tool_input` shapes (cameronsjo/cadence-hooks#356; PR #363).** The heartbeat logger (the sole PostToolUse `matcher:"*"` logger) was recording ~242 stdin-parse failures per 7 days: a tool's `tool_response` shape varies by tool — a plain string (`Read`), an array (`Glob`), a Bash-style object (`Bash`) — but both input structs typed it as a strict struct, and because `from_json` parses the whole payload at once, one mismatched field failed the **entire** parse and silently dropped the metrics row (fail-open, zero symptom). A `lenient_option` deserializer degrades a shape-mismatched typed field to `None` instead of failing the payload; for enforcement (`HookInput`) this also stops a weird `tool_response` from blinding a guard that only needs `tool_input`.
+
+### Removed
+
+- **`metrics log-plan-phase` subcommand removed (cameronsjo/cadence#506; PR #363).** Claude Code's platform never delivers plan-mode tool events (`EnterPlanMode`/`ExitPlanMode`) to PostToolUse hooks, so `plan-phases.jsonl` recorded zero rows since it shipped. Removed the subcommand, its module, the unused `PLAN_PHASE_SCHEMA_VERSION` const, and all registry/dispatch/clap wiring. The plugin-side wiring is removed in cameronsjo/cadence#528; the live plan-approval signal is captured by `plan-links.jsonl` (persist-plan).
+
 ## [0.62.0] - 2026-07-20
 
 ### Added
