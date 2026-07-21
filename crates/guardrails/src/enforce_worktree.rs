@@ -125,13 +125,17 @@
 
 use crate::dismiss_enforce_worktree;
 use crate::messages::WORKTREE_CREATE_RECIPE;
-use crate::warn_main_branch::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, child_scripts, redirect_targets, resolve_cd_target,
     split_segments_with_ops, tokenize,
 };
-use cadence_hooks_core::worktree::{is_primary_checkout, is_temp_root, is_truthy, should_block};
+// Carve-out predicates and `git_dir_for_input` come straight from
+// `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
+use cadence_hooks_core::worktree::{
+    git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir, is_primary_checkout, is_temp_root,
+    is_truthy, should_block,
+};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

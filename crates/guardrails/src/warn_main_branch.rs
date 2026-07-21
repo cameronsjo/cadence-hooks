@@ -18,51 +18,16 @@
 //! branch. That work is never the branch-worthy product change the warning targets.
 
 use crate::dismiss_main_branch_warn;
-pub(crate) use cadence_hooks_core::worktree::{is_claude_managed_dir, is_plan_doc_dir};
 use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Resolve the directory to pass to `git -C` for a given hook input.
-///
-/// When the hook fires for an Edit/Write, returns the parent directory of
-/// the edited file. `git -C <dir>` walks upward to find `.git`, so this
-/// routes branch detection to the file's enclosing repo — even when CWD
-/// belongs to an outer parent repo (the nested-repo case).
-///
-/// Relative `file_path` values are joined against `input.cwd` so we resolve
-/// against the hook event's CWD, not the hook process's CWD. For Bash hooks
-/// (no file path), falls back to `input.cwd` then `.` so we still target the
-/// session's working directory rather than wherever the hook process started.
-pub(crate) fn git_dir_for_input(input: &HookInput) -> PathBuf {
-    let cwd = input
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let Some(file_path) = input.file_path() else {
-        return cwd;
-    };
-
-    let path = Path::new(&file_path);
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-
-    resolved
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or(cwd)
-}
-
-// `is_claude_managed_dir` and `is_plan_doc_dir` moved to
-// `cadence_hooks_core::worktree` (cadence-hooks#236) so `enforce_worktree`
-// and `session::start`'s posture line share the exact same carve-out
-// predicate — re-imported above.
+// `git_dir_for_input`, `is_claude_managed_dir`, and `is_plan_doc_dir` all live
+// in `cadence_hooks_core::worktree` now, so `warn-main-branch` and
+// `enforce-worktree` each import the single core definition rather than
+// `enforce` borrowing this guard's copy (`git_dir_for_input` relocated in
+// cadence-hooks#164; the carve-out predicates in #236).
+use cadence_hooks_core::worktree::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
 
 /// Returns true if the branch name is a default branch (`main` or `master`).
 fn is_default_branch(branch: &str) -> bool {
