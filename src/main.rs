@@ -289,13 +289,6 @@ enum MetricsCommands {
     },
     /// Capture session start timestamp (SessionStart)
     LogSessionStart,
-    /// Log plan-lifecycle events: EnterPlanMode / ExitPlanMode (PostToolUse)
-    LogPlanPhase {
-        /// Override path to the model price table (JSON). Falls back to the
-        /// embedded default; `CADENCE_METRICS_PRICES` env takes precedence.
-        #[arg(long, value_name = "PATH")]
-        prices: Option<String>,
-    },
     /// Log polish-nudge skips: `gh pr create` + whether /polish ran (PostToolUse)
     LogPolishNudge,
     /// Log AskUserQuestion: asked (PreToolUse) + answered (PostToolUse)
@@ -424,7 +417,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::LogSubagent => "log-subagent",
             MetricsCommands::LogSession { .. } => "log-session",
             MetricsCommands::LogSessionStart => "log-session-start",
-            MetricsCommands::LogPlanPhase { .. } => "log-plan-phase",
             MetricsCommands::LogPolishNudge => "log-polish-nudge",
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
             MetricsCommands::LogSkill => "log-skill",
@@ -1013,13 +1005,6 @@ fn main() {
             MetricsCommands::LogSessionStart => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogSessionStart,
                 registry::sample_for("metrics", "log-session-start"),
-                canonical_hook,
-            ),
-            MetricsCommands::LogPlanPhase { prices } => dispatch::run_logged_logger(
-                &cadence_hooks_metrics::LogPlanPhase {
-                    prices_path: prices,
-                },
-                registry::sample_for("metrics", "log-plan-phase"),
                 canonical_hook,
             ),
             MetricsCommands::LogPolishNudge => dispatch::run_logged_logger(

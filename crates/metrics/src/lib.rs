@@ -20,8 +20,6 @@ pub mod log_commit;
 pub mod log_denial;
 /// Append fail-open telemetry (panic / parse / version-skew) to `failopen.jsonl`.
 pub mod log_failopen;
-/// Append plan-lifecycle records (EnterPlanMode/ExitPlanMode) to `plan-phases.jsonl`.
-pub mod log_plan_phase;
 /// Append polish-nudge (`gh pr create`) records to `polish_nudges.jsonl`.
 pub mod log_polish_nudge;
 /// Append per-session cost records to `sessions.jsonl` at `SessionEnd`.
@@ -59,7 +57,6 @@ pub use log_bypass::{BypassEvent, log_bypass};
 pub use log_commit::LogCommit;
 pub use log_denial::log_denial;
 pub use log_failopen::log_failopen;
-pub use log_plan_phase::LogPlanPhase;
 pub use log_polish_nudge::LogPolishNudge;
 pub use log_session::LogSession;
 pub use log_session_start::LogSessionStart;

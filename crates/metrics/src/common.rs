@@ -150,9 +150,6 @@ pub fn utc_timestamp() -> String {
 // *next* shape change (opportunistic adoption, cadence#238) — historical
 // un-stamped lines are never backfilled.
 
-/// Schema version stamped on every `plan-phases.jsonl` row.
-pub const PLAN_PHASE_SCHEMA_VERSION: u32 = 1;
-
 /// Schema version stamped on every `skills.jsonl` row.
 pub const SKILL_SCHEMA_VERSION: u32 = 1;
 
