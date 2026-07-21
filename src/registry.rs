@@ -321,12 +321,6 @@ pub const HOOKS: &[HookEntry] = &[
         event: None,
     },
     HookEntry {
-        name: "log-plan-phase",
-        description: "Log plan-lifecycle events: EnterPlanMode / ExitPlanMode (PostToolUse)",
-        plugin: "metrics",
-        event: None,
-    },
-    HookEntry {
         name: "log-polish-nudge",
         description: "Log polish-nudge skips: gh pr create + whether /polish ran (PostToolUse)",
         plugin: "metrics",
@@ -475,12 +469,6 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("metrics", "log-session-start") => {
             Some(r#"{"session_id":"test","hook_event_name":"SessionStart","cwd":"/tmp"}"#)
         }
-        // log-plan-phase gates on hook_event_name == "PostToolUse" plus a
-        // tool_name of EnterPlanMode/ExitPlanMode; the generic logger sample
-        // carries neither and would no-op.
-        ("metrics", "log-plan-phase") => Some(
-            r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_name":"ExitPlanMode","transcript_path":"/tmp/transcript.jsonl","cwd":"/tmp"}"#,
-        ),
         // log-polish-nudge gates on a `gh pr create` command (the nudge denominator)
         ("metrics", "log-polish-nudge") => Some(
             r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"gh pr create --title test"},"transcript_path":"/tmp/transcript.jsonl"}"#,
@@ -638,13 +626,7 @@ mod tests {
     fn sample_overrides_exist_for_event_gated_loggers() {
         // These loggers gate on specific hook_event_name values or command
         // shapes — the generic fallback would no-op them.
-        for name in [
-            "snapshot",
-            "log-commit",
-            "log-subagent",
-            "log-session",
-            "log-plan-phase",
-        ] {
+        for name in ["snapshot", "log-commit", "log-subagent", "log-session"] {
             assert!(
                 sample_for("metrics", name).is_some(),
                 "{name} needs a sample override"
@@ -688,7 +670,6 @@ mod tests {
             "log-subagent",
             "log-session",
             "log-session-start",
-            "log-plan-phase",
             "log-polish-nudge",
             "log-ask-user-question",
             "log-skill",

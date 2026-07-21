@@ -1,8 +1,7 @@
 //! `AskUserQuestion` — append one line per lifecycle phase to
 //! `<metrics_dir>/askuserquestion.jsonl`.
 //!
-//! Dual-event, following [`crate::log_plan_phase`]'s widening precedent: one
-//! subcommand, one stream, a `phase` discriminator.
+//! Dual-event: one subcommand, one stream, a `phase` discriminator.
 //!
 //! - `PreToolUse` → `"asked"`: the call's *stance* (recommended /
 //!   declared-no-rec / silent) and *shape* (multiSelect, question and option

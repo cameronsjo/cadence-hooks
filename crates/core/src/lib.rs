@@ -531,8 +531,8 @@ pub struct MetricsInput {
     pub model: Option<String>,
     /// The tool that fired this event (e.g. `EnterPlanMode`, `ExitPlanMode`,
     /// `Bash`). Mirrors [`HookInput::tool_name`]; deserializes to `None` when
-    /// absent. Powers event-derivation loggers like `log-plan-phase` that key
-    /// off which tool ran rather than a fixed `hook_event_name`.
+    /// absent. Powers event-derivation loggers like `log-ask-user-question`
+    /// that key off which tool ran rather than a fixed `hook_event_name`.
     pub tool_name: Option<String>,
     /// The tool response, available in PostToolUse payloads. Mirrors
     /// [`HookInput::tool_response`]; deserializes to `None` on PreToolUse and
@@ -2208,7 +2208,7 @@ mod tests {
 
     #[test]
     fn metrics_input_parses_tool_name_from_post_tool_use() {
-        // log-plan-phase keys its event derivation off this field.
+        // Event-derivation loggers key off this field.
         let json =
             r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"ExitPlanMode"}"#;
         let input = MetricsInput::from_json(json).unwrap();
