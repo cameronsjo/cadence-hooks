@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`metrics log-plan-phase` subcommand removed (cameronsjo/cadence#506; PR #363).** Claude Code's platform never delivers plan-mode tool events (`EnterPlanMode`/`ExitPlanMode`) to PostToolUse hooks, so `plan-phases.jsonl` recorded zero rows since it shipped. Removed the subcommand, its module, the unused `PLAN_PHASE_SCHEMA_VERSION` const, and all registry/dispatch/clap wiring. The plugin-side wiring is removed in cameronsjo/cadence#528; the live plan-approval signal is captured by `plan-links.jsonl` (persist-plan).
 
+## [0.63.0] - 2026-07-20
+
+### Changed
+
+- **`enforce-worktree` no longer borrows its carve-out predicates from `warn-main-branch` (#164 PR4a; PR #288).** `git_dir_for_input`, `is_claude_managed_dir`, and `is_plan_doc_dir` now come from `core::worktree` directly, dropping the cross-guard import that made the guards' layering circular. Internal refactor — no behavioral change to either guard; PR4b (the resolution split) stays deferred.
+
 ## [0.62.0] - 2026-07-20
 
 ### Added
