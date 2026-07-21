@@ -173,9 +173,12 @@ pub fn normalize_path(path: &str) -> String {
 #[derive(Debug, Default, Deserialize)]
 pub struct HookInput {
     pub tool_name: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option")]
     pub tool_input: Option<ToolInput>,
     /// The tool response (stdout, stderr) from the tool execution.
     /// Available in PostToolUse hooks — absent in PreToolUse and SessionStart.
+    /// Shape varies by tool; a mismatch degrades to `None` (see `lenient_option`).
+    #[serde(default, deserialize_with = "lenient_option")]
     pub tool_response: Option<ToolResponse>,
     pub cwd: Option<String>,
     /// Absolute path to the session transcript (`.jsonl`). A documented common
@@ -278,6 +281,21 @@ pub struct ToolResponse {
     /// (multiSelect = comma-joined) or null when unanswered. Present only on the
     /// PostToolUse payload for AskUserQuestion.
     pub answers: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Deserialize an optional typed field leniently: a present value whose JSON
+/// shape does not match `T` degrades to `None` instead of failing the entire
+/// payload parse. Claude Code's `tool_input`/`tool_response` shapes vary by
+/// tool — a plain string for `Read`, an array for `Glob`, a Bash-style object
+/// for `Bash` — and one mismatched field must not blind an enforcement guard or
+/// silently drop a metrics row for the rest of the payload (cadence-hooks#356).
+fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 impl HookInput {
@@ -495,6 +513,7 @@ pub struct MetricsInput {
     pub transcript_path: Option<String>,
     pub hook_event_name: Option<String>,
     pub cwd: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option")]
     pub tool_input: Option<ToolInput>,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
@@ -518,7 +537,9 @@ pub struct MetricsInput {
     /// The tool response, available in PostToolUse payloads. Mirrors
     /// [`HookInput::tool_response`]; deserializes to `None` on PreToolUse and
     /// other events that carry no response. Additive — every existing logger
-    /// ignores it.
+    /// ignores it. Shape varies by tool; a mismatch degrades to `None` rather
+    /// than failing the whole payload parse (see `lenient_option`).
+    #[serde(default, deserialize_with = "lenient_option")]
     pub tool_response: Option<ToolResponse>,
     /// Top-level keys present in the raw payload. Populated by [`Self::from_json`],
     /// not deserialized — powers the `CADENCE_METRICS_DEBUG` `_keys` field that
@@ -2149,6 +2170,40 @@ mod tests {
     #[test]
     fn metrics_input_rejects_malformed_json() {
         assert!(MetricsInput::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn metrics_input_tolerates_non_object_tool_response() {
+        // A tool's `tool_response` shape varies by tool: a plain string (Read),
+        // an array (Glob), a Bash-style object (Bash). A shape that does not
+        // match the typed `ToolResponse` must degrade to `None`, not fail the
+        // whole payload parse and silently drop the metrics row (#356).
+        let string_shaped =
+            MetricsInput::from_json(r#"{"tool_name":"Read","tool_response":"file contents"}"#)
+                .expect("string tool_response must not fail the parse");
+        assert!(string_shaped.tool_response.is_none());
+        assert_eq!(string_shaped.tool_name.as_deref(), Some("Read"));
+
+        let array_shaped =
+            MetricsInput::from_json(r#"{"tool_name":"Glob","tool_response":["a.txt","b.txt"]}"#)
+                .expect("array tool_response must not fail the parse");
+        assert!(array_shaped.tool_response.is_none());
+    }
+
+    #[test]
+    fn hook_input_tolerates_non_object_tool_response() {
+        // Enforcement guards parse `HookInput`; a mismatched `tool_response`
+        // must not blind a guard that only needs `tool_input` — the typed
+        // response degrades to `None` while `tool_input` still parses (#356).
+        let input: HookInput = serde_json::from_str(
+            r#"{"tool_name":"Read","tool_input":{"file_path":"src/main.rs"},"tool_response":"contents"}"#,
+        )
+        .expect("string tool_response must not fail HookInput parse");
+        assert!(input.tool_response.is_none());
+        assert_eq!(
+            input.tool_input.and_then(|ti| ti.file_path).as_deref(),
+            Some("src/main.rs")
+        );
     }
 
     #[test]
