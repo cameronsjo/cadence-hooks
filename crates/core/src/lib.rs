@@ -289,6 +289,14 @@ pub struct ToolResponse {
 /// tool — a plain string for `Read`, an array for `Glob`, a Bash-style object
 /// for `Bash` — and one mismatched field must not blind an enforcement guard or
 /// silently drop a metrics row for the rest of the payload (cadence-hooks#356).
+///
+/// The degradation is **deliberately silent**: the common case is expected
+/// per-tool variance, and logging it would reintroduce the ~242/week failopen
+/// noise this fix removes (it fires on every non-Bash tool call). The tradeoff
+/// is that a *genuine* future schema drift in these fields also degrades
+/// unobserved; distinguishing expected variance from real drift (log only an
+/// object whose typed fields mismatch, not a non-object shape) is tracked in
+/// cadence-hooks#364.
 fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2188,6 +2196,11 @@ mod tests {
             MetricsInput::from_json(r#"{"tool_name":"Glob","tool_response":["a.txt","b.txt"]}"#)
                 .expect("array tool_response must not fail the parse");
         assert!(array_shaped.tool_response.is_none());
+
+        // Explicit `null` also degrades to `None` (serde's Option handling).
+        let null_shaped = MetricsInput::from_json(r#"{"tool_name":"Read","tool_response":null}"#)
+            .expect("null tool_response must not fail the parse");
+        assert!(null_shaped.tool_response.is_none());
     }
 
     #[test]
@@ -2209,10 +2222,9 @@ mod tests {
     #[test]
     fn metrics_input_parses_tool_name_from_post_tool_use() {
         // Event-derivation loggers key off this field.
-        let json =
-            r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"ExitPlanMode"}"#;
+        let json = r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash"}"#;
         let input = MetricsInput::from_json(json).unwrap();
-        assert_eq!(input.tool_name.as_deref(), Some("ExitPlanMode"));
+        assert_eq!(input.tool_name.as_deref(), Some("Bash"));
     }
 
     // --- Interactive terminal guidance ---
