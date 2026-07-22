@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`warn-subagent-worktree`'s message names a known false-positive shape (cameronsjo/cadence-hooks#371).** The check can only see structural signals (`isolation`, cwd, sibling-worktree count) — the dispatch prompt text itself isn't in the hook payload today, so a dispatch whose prompt has the agent create and operate on its own explicit worktree (`git -C <repo> worktree add ...`, then `git -C <path>` throughout — the `orchestrating-issue-slates` pattern) still nudges even though the work lands exactly where intended. The nudge now names this case explicitly so an operator can recognize and disregard it rather than learning to ignore the warning broadly.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
