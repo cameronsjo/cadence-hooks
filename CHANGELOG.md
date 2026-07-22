@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`try` no longer writes real metrics rows into the production metrics dir (cameronsjo/cadence-hooks#269).** `cadence-hooks try metrics <logger>` self-execs the compiled binary against a generated sample payload, but metrics loggers write unconditionally and silently — a `try` run had appended a real row to the live `skills.jsonl` stream. `try_hook.rs` now sandboxes the self-exec'd child to a scratch tempdir via `CADENCE_METRICS_DIR` (best-effort: if the scratch dir can't be created, a stderr warning names the risk instead of silently falling back to the real dir). `tempfile` promoted from a dev-dependency to a real one in the root crate.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
