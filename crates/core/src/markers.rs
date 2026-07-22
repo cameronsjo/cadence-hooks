@@ -553,11 +553,19 @@ mod tests {
 
     #[test]
     fn polish_marker_present_false_when_no_marker() {
+        // polish_marker_present reads marker_dir() (env), so hold ENV_LOCK
+        // against concurrent with_marker_dir writers (#369) and keep the lookup
+        // off the real per-user dir (#302). Unlike the two-read stability tests
+        // this can't flip its assertion, but an unguarded env read still races
+        // a writer's set_var (unsound in edition 2024).
         let (tmp, _root) = init_repo_on_branch("feat/unmarked");
-        assert!(!polish_marker_present(
-            "gh pr create --title x",
-            Some(tmp.path().to_str().unwrap())
-        ));
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            assert!(!polish_marker_present(
+                "gh pr create --title x",
+                Some(tmp.path().to_str().unwrap())
+            ));
+        });
     }
 
     #[test]

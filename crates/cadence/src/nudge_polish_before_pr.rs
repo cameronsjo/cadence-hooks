@@ -270,10 +270,16 @@ mod tests {
     #[test]
     fn run_no_marker_in_real_repo_nudges() {
         // Fail-open: a resolvable repo/branch but no marker → Nudge, never Block.
+        // run() reads marker_dir() (env) via polish_marker_present, so hold
+        // ENV_LOCK against concurrent with_marker_dir writers (#369), off the
+        // real per-user dir (#302).
         let (tmp, _root) = init_repo_on_branch("feat/unmarked");
-        let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
-        let result = NudgePolishBeforePr.run(&input);
-        assert_eq!(result.outcome, Outcome::Nudge);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Nudge);
+        });
     }
 
     #[test]
@@ -298,9 +304,13 @@ mod tests {
     #[test]
     fn run_pr_ready_no_marker_nudges() {
         // `gh pr ready` with no marker for the branch → fail-open nudge.
+        // Under ENV_LOCK (#369/#302), same as the create-side sibling above.
         let (tmp, _root) = init_repo_on_branch("feat/ready-unmarked");
-        let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
-        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
+            assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+        });
     }
 
     #[test]
