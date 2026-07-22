@@ -336,9 +336,15 @@ mod tests {
 
     #[test]
     fn session_marker_stable_for_same_inputs() {
-        let a = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo"));
-        let b = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo"));
-        assert_eq!(a, b, "same inputs must produce the same marker");
+        // Holds ENV_LOCK across both reads so a concurrent `with_marker_dir`
+        // test can't flip CADENCE_MARKER_DIR between them (#369): the stability
+        // property is "same inputs + same env → same marker".
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo"));
+            let b = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo"));
+            assert_eq!(a, b, "same inputs must produce the same marker");
+        });
     }
 
     #[test]
@@ -354,18 +360,23 @@ mod tests {
     fn session_marker_never_embeds_raw_session_id() {
         // A path-traversal session id must be hashed to a plain filename — the
         // result is always a direct child of marker_dir(), never an escape.
-        let input = input_with_session("../../evil");
-        let p = session_marker(&input, "test-kind", None);
-        assert_eq!(
-            p.parent(),
-            Some(marker_dir().as_path()),
-            "marker must be a direct child of the private dir: {p:?}"
-        );
-        let name = p.file_name().unwrap().to_string_lossy();
-        assert!(
-            !name.contains('/') && !name.contains(".."),
-            "filename must carry no traversal: {name}"
-        );
+        // Under ENV_LOCK so the `session_marker` read and the `marker_dir()`
+        // read in the assert resolve the same base (#369).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let input = input_with_session("../../evil");
+            let p = session_marker(&input, "test-kind", None);
+            assert_eq!(
+                p.parent(),
+                Some(marker_dir().as_path()),
+                "marker must be a direct child of the private dir: {p:?}"
+            );
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(
+                !name.contains('/') && !name.contains(".."),
+                "filename must carry no traversal: {name}"
+            );
+        });
     }
 
     #[test]
@@ -384,41 +395,56 @@ mod tests {
 
     #[test]
     fn polish_marker_stable_for_same_inputs() {
-        let a = polish_marker("/tmp/repo", "main");
-        let b = polish_marker("/tmp/repo", "main");
-        assert_eq!(a, b, "same inputs must produce the same marker");
+        // Under ENV_LOCK so a concurrent `with_marker_dir` test can't flip the
+        // base between the two reads (#369).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = polish_marker("/tmp/repo", "main");
+            let b = polish_marker("/tmp/repo", "main");
+            assert_eq!(a, b, "same inputs must produce the same marker");
+        });
     }
 
     #[test]
     fn polish_marker_never_embeds_raw_branch_or_repo() {
         // A path-traversal branch/repo must be hashed to a plain filename — the
         // result is always a direct child of marker_dir(), never an escape.
-        let p = polish_marker("../../evil-repo", "../../evil-branch");
-        assert_eq!(
-            p.parent(),
-            Some(marker_dir().as_path()),
-            "marker must be a direct child of the private dir: {p:?}"
-        );
-        let name = p.file_name().unwrap().to_string_lossy();
-        assert!(
-            !name.contains('/') && !name.contains(".."),
-            "filename must carry no traversal: {name}"
-        );
+        // Under ENV_LOCK so both reads resolve the same base (#369).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let p = polish_marker("../../evil-repo", "../../evil-branch");
+            assert_eq!(
+                p.parent(),
+                Some(marker_dir().as_path()),
+                "marker must be a direct child of the private dir: {p:?}"
+            );
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(
+                !name.contains('/') && !name.contains(".."),
+                "filename must carry no traversal: {name}"
+            );
+        });
     }
 
     #[cfg(unix)]
     #[test]
     fn marker_dir_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = marker_dir();
-        // marker_dir() only returns the private path when it secured it; if it
-        // fell back to the shared temp root, that's the fail-open path and 0700
-        // is not asserted. In the normal test environment the private dir is
-        // created and locked down.
-        if dir != paths::marker_temp_dir() {
-            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o700, "marker dir must be owner-only");
-        }
+        // Under ENV_LOCK + an override base so this never creates/hardens the
+        // real per-user marker dir (#302/#369); the override is still hardened,
+        // so the 0700 property holds on it just the same.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let dir = marker_dir();
+            // marker_dir() only returns the private path when it secured it; if it
+            // fell back to the shared temp root, that's the fail-open path and 0700
+            // is not asserted. In the normal test environment the private dir is
+            // created and locked down.
+            if dir != paths::marker_temp_dir() {
+                let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "marker dir must be owner-only");
+            }
+        });
     }
 
     #[cfg(unix)]
