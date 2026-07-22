@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`warn-commit-provenance` nudges once per session, not once per commit (cameronsjo/cadence-hooks#370).** A session making many commits under an explicit no-trailer message contract (e.g. a dispatched implementer following a fixed commit-message spec) saw the provenance nudge fire on every single commit — pure noise once the session already knows the trailer format. Reuses the `session_marker`/`write_marker` primitive already established by `warn-main-branch`, scoped globally (not per-repo) since "does this session know the trailer format" is a session-level fact.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
