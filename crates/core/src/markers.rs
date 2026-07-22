@@ -36,8 +36,36 @@ use std::path::{Path, PathBuf};
 /// **Fails open** to the shared [`paths::marker_temp_dir`] when the private dir
 /// can't be created or secured (or a symlink squats its path): markers are
 /// advisory, so a re-fired nudge is the acceptable degraded mode, never a block.
+///
+/// Honors `CADENCE_MARKER_DIR` as a base-directory override, read
+/// unconditionally like `CADENCE_METRICS_DIR` (`crates/metrics/src/common.rs`)
+/// — not `#[cfg(test)]`-gated, since the integration suite (`tests/session_markers.rs`)
+/// exercises the real compiled binary, which must honor it too. When set and
+/// non-empty, the per-user hashed subdir is created under it instead of the
+/// shared [`paths::marker_temp_dir`]; [`harden_marker_dir`] still runs on the
+/// result, so an override can never skip the `0700` lockdown — it can only
+/// fail open to an *unhardened override base* the same way the default path
+/// fails open to an unhardened [`paths::marker_temp_dir`]. Intended for tests
+/// today (#302); a real caller setting it changes only which advisory nudge
+/// state that caller's own process sees.
 pub fn marker_dir() -> PathBuf {
-    let base = paths::marker_temp_dir();
+    marker_dir_from(std::env::var("CADENCE_MARKER_DIR").ok())
+}
+
+/// Pure resolver behind [`marker_dir`]: takes the `CADENCE_MARKER_DIR` value
+/// explicitly (rather than reading process-global env) so the override is
+/// unit-testable without env mutation, mirroring `metrics_dir_from`
+/// (`crates/metrics/src/common.rs`). `None` or an empty string falls through to
+/// the shared [`paths::marker_temp_dir`].
+///
+/// The override replaces only the *base* the per-user hashed subdir is created
+/// under — [`harden_marker_dir`] still runs on the derived path, so an override
+/// never bypasses the `0700` lockdown.
+fn marker_dir_from(override_dir: Option<String>) -> PathBuf {
+    let base = match override_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => paths::marker_temp_dir(),
+    };
     let mut hasher = DefaultHasher::new();
     paths::user_home_lossy_or_default().hash(&mut hasher);
     let dir = base.join(format!("cadence-hooks-{:x}", hasher.finish()));
@@ -217,6 +245,73 @@ pub fn write_marker(path: &Path, contents: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- marker_dir_from (pure resolver behind CADENCE_MARKER_DIR) ---
+
+    #[test]
+    fn marker_dir_from_override_is_used_as_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = marker_dir_from(Some(tmp.path().to_string_lossy().into_owned()));
+        assert!(
+            dir.starts_with(tmp.path()),
+            "override must become the base the hashed subdir is created under: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn marker_dir_from_empty_override_falls_through() {
+        // An empty CADENCE_MARKER_DIR must not shadow the default (guards the
+        // `!dir.is_empty()` branch), mirroring metrics_dir_from's same guard.
+        let dir = marker_dir_from(Some(String::new()));
+        assert!(
+            dir.starts_with(paths::marker_temp_dir()),
+            "empty override must fall through to marker_temp_dir: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn marker_dir_from_none_falls_through() {
+        let dir = marker_dir_from(None);
+        assert!(dir.starts_with(paths::marker_temp_dir()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_dir_from_override_is_still_hardened() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = marker_dir_from(Some(tmp.path().to_string_lossy().into_owned()));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "an overridden base must still get the 0700-hardened derived dir"
+        );
+    }
+
+    // --- crate-local env-mutating test serialization (mirrors the metrics
+    // crate's `common::ENV_LOCK` / per-module `with_metrics_dir`, #302) ---
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `CADENCE_MARKER_DIR` set to `dir`, serialized against every
+    /// other marker-dir-mutating test in this module via [`ENV_LOCK`] — keeps
+    /// `polish_marker_present_*` tests below from ever writing into the real
+    /// per-user production marker directory.
+    fn with_marker_dir<F: FnOnce()>(dir: &Path, f: F) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized against every other env-mutating test in this
+        // module via ENV_LOCK.
+        unsafe {
+            std::env::set_var("CADENCE_MARKER_DIR", dir);
+        }
+        f();
+        // SAFETY: serialized against every other env-mutating test in this
+        // module via ENV_LOCK.
+        unsafe {
+            std::env::remove_var("CADENCE_MARKER_DIR");
+        }
+    }
 
     fn input_with_session(sid: &str) -> HookInput {
         HookInput {
@@ -406,22 +501,28 @@ mod tests {
     #[test]
     fn polish_marker_present_true_for_current_branch_with_marker() {
         let (tmp, root) = init_repo_on_branch("feat/thing");
-        write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
-        assert!(polish_marker_present(
-            "gh pr create --title x",
-            Some(tmp.path().to_str().unwrap())
-        ));
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
+            assert!(polish_marker_present(
+                "gh pr create --title x",
+                Some(tmp.path().to_str().unwrap())
+            ));
+        });
     }
 
     #[test]
     fn polish_marker_present_false_for_different_branch_marker() {
         // A marker for branch A must NOT satisfy a repo checked out on branch B.
         let (tmp, root) = init_repo_on_branch("branch-b");
-        write_marker(&polish_marker(&root, "branch-a"), "{}").unwrap();
-        assert!(!polish_marker_present(
-            "gh pr create --title x",
-            Some(tmp.path().to_str().unwrap())
-        ));
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "branch-a"), "{}").unwrap();
+            assert!(!polish_marker_present(
+                "gh pr create --title x",
+                Some(tmp.path().to_str().unwrap())
+            ));
+        });
     }
 
     #[test]
