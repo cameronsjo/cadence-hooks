@@ -9,7 +9,11 @@
 use std::io::Write;
 use std::process::Command;
 
-fn cadence_hooks() -> Command {
+/// Build the child command, sandboxed to `marker_dir` via `CADENCE_MARKER_DIR`
+/// so the marker this binary writes never lands in the real per-user marker
+/// directory (#302) — `.env()` only affects the *child's* environment, so this
+/// needs no serialization against other tests in this file.
+fn cadence_hooks(marker_dir: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     // Don't inherit enforcement toggles from the test runner's session.
     cmd.env_remove("CADENCE_BYPASS");
@@ -19,6 +23,7 @@ fn cadence_hooks() -> Command {
     // exercised deterministically. CADENCE_ALLOW_MAIN would silence the nudge.
     cmd.env_remove("PPID");
     cmd.env_remove("CADENCE_ALLOW_MAIN");
+    cmd.env("CADENCE_MARKER_DIR", marker_dir);
     cmd
 }
 
@@ -52,8 +57,10 @@ fn init_main_repo() -> tempfile::TempDir {
     dir
 }
 
-/// A payload unique per run so markers from prior test runs (which persist in
-/// the temp marker dir) never mask the assertion.
+/// A payload unique per run. Each test's marker dir is now a fresh, isolated
+/// tempdir (#302), so a leftover marker from a prior run can no longer mask
+/// the assertion — the session_id is still generated per-run as a defensive
+/// habit against any future shared-dir regression.
 ///
 /// Built with a JSON serializer, NOT `format!`: on Windows the repo/file paths
 /// carry backslashes (`C:\Users\...`), and a raw `\U`/`\r` in a JSON string is an
@@ -83,9 +90,12 @@ fn warn_main_branch_nudges_once_per_session() {
             .as_nanos()
     );
     let payload = edit_payload(repo.path(), &session_id);
+    // Both invocations must share one marker dir — invocation 2 needs to see
+    // invocation 1's marker — but isolated to this test alone (#302).
+    let marker_dir = tempfile::tempdir().expect("marker tempdir");
 
     // Invocation 1: same session, first edit on main → nudge.
-    let mut cmd1 = cadence_hooks();
+    let mut cmd1 = cadence_hooks(marker_dir.path());
     cmd1.args(["guardrails", "warn-main-branch"]);
     let out1 = run_with_stdin(cmd1, &payload);
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
@@ -97,7 +107,7 @@ fn warn_main_branch_nudges_once_per_session() {
 
     // Invocation 2: same session id, distinct process (distinct pid) → the
     // marker written by invocation 1 must suppress this one.
-    let mut cmd2 = cadence_hooks();
+    let mut cmd2 = cadence_hooks(marker_dir.path());
     cmd2.args(["guardrails", "warn-main-branch"]);
     let out2 = run_with_stdin(cmd2, &payload);
     let stdout2 = String::from_utf8_lossy(&out2.stdout);

@@ -108,6 +108,7 @@ pub fn run_record(repo_root: Option<String>, branch: Option<String>, scope: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::with_marker_dir;
     use cadence_hooks_core::markers::polish_marker;
 
     #[test]
@@ -147,33 +148,36 @@ mod tests {
 
     #[test]
     fn run_record_writes_marker_at_expected_path_with_parseable_content() {
-        // With explicit overrides the write path is `polish_marker(repo, branch)`
-        // — the same value this test recomputes, since both calls resolve
-        // `marker_dir()` from the same environment. No env mutation needed: the
-        // marker lands in the real private dir at a hashed, unique name; we read
-        // it back and clean up. A repo/branch unlikely to collide with any peer.
-        let repo = "/tmp/record-polish-test-repo";
-        let branch = "feat/record-polish-y";
-        let path = polish_marker(repo, branch);
-        let _ = std::fs::remove_file(&path); // ensure a clean slate
+        // Both `polish_marker` calls below resolve `marker_dir()` from the same
+        // (overridden) environment, so the recomputed path matches what
+        // `run_record` actually wrote — isolated to a tempdir so this never
+        // lands in the real per-user marker directory (#302).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-test-repo";
+            let branch = "feat/record-polish-y";
+            let path = polish_marker(repo, branch);
 
-        run_record(Some(repo.into()), Some(branch.into()), Some("code".into()));
+            run_record(Some(repo.into()), Some(branch.into()), Some("code".into()));
 
-        assert!(path.is_file(), "marker should exist at {path:?}");
-        let content = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(v["branch"], branch);
-        assert_eq!(v["scope"], "code");
-
-        let _ = std::fs::remove_file(&path);
+            assert!(path.is_file(), "marker should exist at {path:?}");
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["branch"], branch);
+            assert_eq!(v["scope"], "code");
+        });
     }
 
     #[test]
     fn run_record_degrades_to_noop_when_repo_unresolved() {
-        // No overrides + a non-repo cwd → resolve returns None → no panic, no
-        // marker. Asserts the call simply returns (fail-open) without unwinding;
-        // a bad marker dir would likewise exit via the write_marker arm.
-        run_record(None, None, Some("full".into()));
+        // No overrides, and `cargo test`'s cwd IS this real git checkout, so
+        // `resolve` actually succeeds here (unlike the name implies) and
+        // `run_record` really does write a marker — isolate it (#302), same as
+        // every other write-path test in this module.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            run_record(None, None, Some("full".into()));
+        });
     }
 
     // --- worktree-stable keying (cadence-hooks#324) ---
@@ -233,26 +237,29 @@ mod tests {
             "feat/thing",
         ]);
 
-        // Record from the WORKTREE path — the record side's own resolution.
-        let wt_str = wt.to_str().unwrap().to_string();
-        let (repo_root, branch, head_sha) =
-            resolve(&wt_str, None, None).expect("worktree resolves repo/branch");
-        assert_eq!(branch, "feat/thing");
-        let content = marker_content(&branch, &head_sha, "full");
-        write_marker(&polish_marker(&repo_root, &branch), &content).unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            // Record from the WORKTREE path — the record side's own resolution.
+            let wt_str = wt.to_str().unwrap().to_string();
+            let (repo_root, branch, head_sha) =
+                resolve(&wt_str, None, None).expect("worktree resolves repo/branch");
+            assert_eq!(branch, "feat/thing");
+            let content = marker_content(&branch, &head_sha, "full");
+            write_marker(&polish_marker(&repo_root, &branch), &content).unwrap();
 
-        // Free the branch from the worktree and check it out on the primary —
-        // the realistic sequel to "finished the worktree, shipping from primary".
-        git(&["worktree", "remove", "--force", wt.to_str().unwrap()]);
-        git(&["checkout", "-q", "feat/thing"]);
+            // Free the branch from the worktree and check it out on the primary —
+            // the realistic sequel to "finished the worktree, shipping from primary".
+            git(&["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            git(&["checkout", "-q", "feat/thing"]);
 
-        assert!(
-            cadence_hooks_core::markers::polish_marker_present(
-                "gh pr create --title x",
-                Some(primary.to_str().unwrap()),
-            ),
-            "a polish marker recorded from a linked worktree must satisfy a ship \
-             command run from the primary checkout on the same branch"
-        );
+            assert!(
+                cadence_hooks_core::markers::polish_marker_present(
+                    "gh pr create --title x",
+                    Some(primary.to_str().unwrap()),
+                ),
+                "a polish marker recorded from a linked worktree must satisfy a ship \
+                 command run from the primary checkout on the same branch"
+            );
+        });
     }
 }

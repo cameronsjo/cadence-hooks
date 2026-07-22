@@ -33,3 +33,7 @@ pub mod validate_line_endings;
 pub mod warn_docs_update;
 /// Nudge to audit about-to-ship content for personal-context overshare.
 pub mod warn_overshare;
+
+/// Shared test-only helpers for tests that write real marker files (#302).
+#[cfg(test)]
+pub(crate) mod test_support;

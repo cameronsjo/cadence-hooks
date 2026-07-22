@@ -106,6 +106,7 @@ fn nudge_message() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::with_marker_dir;
     use cadence_hooks_core::gitstate::GitState;
     use cadence_hooks_core::markers::{polish_marker, write_marker};
     use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
@@ -237,10 +238,13 @@ mod tests {
         // #146 RED (integration): repo is on branch B, but the only marker is for
         // branch A → the different-branch marker must NOT satisfy → Nudge.
         let (tmp, root) = init_repo_on_branch("branch-b");
-        write_marker(&polish_marker(&root, "branch-a"), "{}").unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "branch-a"), "{}").unwrap();
 
-        let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
-        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+        });
     }
 
     #[test]
@@ -249,24 +253,33 @@ mod tests {
         // Allow, silent. Also the #154 regression end-to-end: no transcript at
         // all is involved, purely the marker.
         let (tmp, root) = init_repo_on_branch("feat/thing");
-        write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/thing"), "{}").unwrap();
 
-        let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
-        let result = NudgePolishBeforePr.run(&input);
-        assert_eq!(result.outcome, Outcome::Allow);
-        assert!(
-            result.message.is_none(),
-            "a recorded polish allows silently"
-        );
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(
+                result.message.is_none(),
+                "a recorded polish allows silently"
+            );
+        });
     }
 
     #[test]
     fn run_no_marker_in_real_repo_nudges() {
         // Fail-open: a resolvable repo/branch but no marker → Nudge, never Block.
+        // run() reads marker_dir() (env) via polish_marker_present, so hold
+        // ENV_LOCK against concurrent with_marker_dir writers (#369), off the
+        // real per-user dir (#302).
         let (tmp, _root) = init_repo_on_branch("feat/unmarked");
-        let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
-        let result = NudgePolishBeforePr.run(&input);
-        assert_eq!(result.outcome, Outcome::Nudge);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Nudge);
+        });
     }
 
     #[test]
@@ -274,23 +287,30 @@ mod tests {
         // The ship anchor end-to-end: `gh pr ready` on a branch whose marker
         // exists → silent allow, resolved the same way a create would be.
         let (tmp, root) = init_repo_on_branch("feat/ready");
-        write_marker(&polish_marker(&root, "feat/ready"), "{}").unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/ready"), "{}").unwrap();
 
-        let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
-        let result = NudgePolishBeforePr.run(&input);
-        assert_eq!(result.outcome, Outcome::Allow);
-        assert!(
-            result.message.is_none(),
-            "a recorded polish allows silently"
-        );
+            let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(
+                result.message.is_none(),
+                "a recorded polish allows silently"
+            );
+        });
     }
 
     #[test]
     fn run_pr_ready_no_marker_nudges() {
         // `gh pr ready` with no marker for the branch → fail-open nudge.
+        // Under ENV_LOCK (#369/#302), same as the create-side sibling above.
         let (tmp, _root) = init_repo_on_branch("feat/ready-unmarked");
-        let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
-        assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let input = make_bash_with_cwd("gh pr ready 12", tmp.path().to_str().unwrap());
+            assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+        });
     }
 
     #[test]
@@ -369,25 +389,28 @@ mod tests {
         );
 
         let wt_state = GitState::resolve(&wt).expect("worktree resolves");
-        write_marker(
-            &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/thing"),
-            "{}",
-        )
-        .unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/thing"),
+                "{}",
+            )
+            .unwrap();
 
-        git_in(
-            &primary,
-            &["worktree", "remove", "--force", wt.to_str().unwrap()],
-        );
-        git_in(&primary, &["checkout", "-q", "feat/thing"]);
+            git_in(
+                &primary,
+                &["worktree", "remove", "--force", wt.to_str().unwrap()],
+            );
+            git_in(&primary, &["checkout", "-q", "feat/thing"]);
 
-        let input = make_bash_with_cwd("gh pr create --title x", primary.to_str().unwrap());
-        let result = NudgePolishBeforePr.run(&input);
-        assert_eq!(
-            result.outcome,
-            Outcome::Allow,
-            "a worktree-recorded marker must satisfy the primary checkout on the same branch"
-        );
+            let input = make_bash_with_cwd("gh pr create --title x", primary.to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(
+                result.outcome,
+                Outcome::Allow,
+                "a worktree-recorded marker must satisfy the primary checkout on the same branch"
+            );
+        });
     }
 
     #[test]
@@ -400,27 +423,30 @@ mod tests {
         git_in(&primary, &["checkout", "-q", "-b", "feat/y"]);
 
         let primary_state = GitState::resolve(&primary).expect("primary resolves");
-        write_marker(
-            &polish_marker(&primary_state.git_common_dir.to_string_lossy(), "feat/y"),
-            "{}",
-        )
-        .unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&primary_state.git_common_dir.to_string_lossy(), "feat/y"),
+                "{}",
+            )
+            .unwrap();
 
-        // Free `feat/y` from the primary so a worktree can check it out.
-        git_in(&primary, &["checkout", "-q", "main"]);
-        let wt = tmp.path().join("wt");
-        git_in(
-            &primary,
-            &["worktree", "add", "-q", wt.to_str().unwrap(), "feat/y"],
-        );
+            // Free `feat/y` from the primary so a worktree can check it out.
+            git_in(&primary, &["checkout", "-q", "main"]);
+            let wt = tmp.path().join("wt");
+            git_in(
+                &primary,
+                &["worktree", "add", "-q", wt.to_str().unwrap(), "feat/y"],
+            );
 
-        let input = make_bash_with_cwd("gh pr create --title x", wt.to_str().unwrap());
-        let result = NudgePolishBeforePr.run(&input);
-        assert_eq!(
-            result.outcome,
-            Outcome::Allow,
-            "a primary-recorded marker must satisfy a linked worktree on the same branch"
-        );
+            let input = make_bash_with_cwd("gh pr create --title x", wt.to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(
+                result.outcome,
+                Outcome::Allow,
+                "a primary-recorded marker must satisfy a linked worktree on the same branch"
+            );
+        });
     }
 
     #[test]
@@ -445,20 +471,23 @@ mod tests {
         );
 
         let wt_state = GitState::resolve(&wt).expect("worktree resolves");
-        write_marker(
-            &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/a"),
-            "{}",
-        )
-        .unwrap();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/a"),
+                "{}",
+            )
+            .unwrap();
 
-        // Primary stays on `main` — a different branch from the marker.
-        let input = make_bash_with_cwd("gh pr create --title x", primary.to_str().unwrap());
-        let result = NudgePolishBeforePr.run(&input);
-        assert_eq!(
-            result.outcome,
-            Outcome::Nudge,
-            "a marker for a different branch must not satisfy the ship command"
-        );
+            // Primary stays on `main` — a different branch from the marker.
+            let input = make_bash_with_cwd("gh pr create --title x", primary.to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(
+                result.outcome,
+                Outcome::Nudge,
+                "a marker for a different branch must not satisfy the ship command"
+            );
+        });
     }
 
     // --- preserved matcher tests (is_polish_ship_anchor) ---
