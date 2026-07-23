@@ -200,12 +200,15 @@ struct RedactionConfig {
     /// Extra literal/regex patterns to flag, each with the replacement to show.
     #[serde(default)]
     additional_patterns: Vec<AdditionalPattern>,
-    /// Tokens that suppress a hit. Two forms, by colon presence:
+    /// Tokens that suppress a hit. Colon presence changes what a colon-free
+    /// entry means per category — see [`is_allowlisted`] for the full rule:
     /// - **full token** (`cadence:writing-skills`) → suppresses only that exact
     ///   matched snippet, in any category;
-    /// - **bare namespace** (`cadence`, `cadence-forge`, `mcp`) → suppresses
-    ///   every skill-id (category 1) hit whose namespace equals it; never
-    ///   touches path/marketplace/harness-noun hits.
+    /// - **bare namespace**, for `skill-id` hits (`cadence`, `cadence-forge`,
+    ///   `mcp`) → suppresses every skill-id hit whose namespace equals it;
+    /// - **bare exact-match**, for any other category (`local-path`,
+    ///   `marketplace`, `harness-noun`, `custom`) → suppresses a hit whose
+    ///   snippet equals the entry exactly (#318).
     ///
     /// The bare-namespace form lets a repo that legitimately discusses a whole
     /// namespace (the meta-repo dogfooding all cadence skills, say) allow-list it
@@ -520,16 +523,24 @@ fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
 
 /// Is `hit` suppressed by the allowlist? An entry with a colon is a **full
 /// token** — it suppresses only a hit whose exact snippet equals it (any
-/// category). An entry without a colon is a **bare namespace** — it suppresses
-/// only skill-id hits whose namespace equals it (matched via the `<ns>:` prefix,
-/// so `cadence` never swallows `cadence-forge:…`); it never touches
-/// path/marketplace/harness-noun hits.
+/// category). A colon-free entry's meaning depends on the hit's category:
+/// for `skill-id` it's a **bare namespace** — suppresses only a hit whose
+/// namespace equals it (matched via the `<ns>:` prefix, so `cadence` never
+/// swallows `cadence-forge:…`); for every other category (`local-path`,
+/// `marketplace`, `harness-noun`, `custom`) a colon-free entry has no
+/// namespace structure to prefix-match, so it suppresses a hit whose exact
+/// snippet equals it (#318: a repo whose own subject matter uses a harness
+/// noun as domain vocabulary — e.g. a transcript-viewer tool discussing
+/// "transcript" — can allowlist that literal term without suppressing the
+/// whole `harness-noun` category or a differently-worded hit like "harness").
 fn is_allowlisted(hit: &Hit, allowlist: &[String]) -> bool {
     allowlist.iter().any(|entry| {
         if entry.contains(':') {
             entry == &hit.snippet
+        } else if hit.category == "skill-id" {
+            hit.snippet.starts_with(&format!("{entry}:"))
         } else {
-            hit.category == "skill-id" && hit.snippet.starts_with(&format!("{entry}:"))
+            entry == &hit.snippet
         }
     })
 }
@@ -898,13 +909,36 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_bare_namespace_only_touches_skill_ids() {
-        // Bare entries apply ONLY to category 1 — a harness noun matching the
-        // entry text is NOT suppressed.
+    fn allowlist_bare_term_suppresses_matching_harness_noun() {
+        // #318: a bare (non-namespace) allowlist entry that exactly matches a
+        // harness-noun hit's own text suppresses that literal term — the
+        // repo's own domain vocabulary (e.g. a transcript-viewer tool
+        // discussing "transcript") shouldn't read as harness leakage.
         let repo = temp_repo_with_config(r#"{"allowlist":["transcript"]}"#);
         let cmd = "gh pr create --body \"parse the transcript correctly\"";
         let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn allowlist_bare_term_does_not_suppress_a_different_harness_noun() {
+        // Allowlisting "transcript" must not blanket-suppress the whole
+        // harness-noun category — "harness" itself still flags.
+        let repo = temp_repo_with_config(r#"{"allowlist":["transcript"]}"#);
+        let cmd = "gh pr create --body \"the test harness needs work\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn allowlist_bare_term_suppresses_matching_local_path() {
+        // The exact-match rule isn't skill-id/harness-noun-specific — it
+        // applies to any non-skill-id category, e.g. a repo-specific path
+        // fragment repeatedly flagged as a local-path hit.
+        let repo = temp_repo_with_config(r#"{"allowlist":["/Users/alice/x"]}"#);
+        let cmd = "gh pr create --body \"edit /Users/alice/x\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
     }
 
     #[test]

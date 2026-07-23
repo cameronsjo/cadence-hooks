@@ -21,6 +21,21 @@
 //! in `<repo>/.claude/settings.json`'s `env` block (or `~/.claude/settings.json`
 //! for user-global). For repos where dispatching subagents from main is the
 //! intended workflow.
+//!
+//! **Known false-positive class (#331):** a genuinely read-only dispatch
+//! (explicit "read-only"/"inventory"/"review only" instructions in the prompt)
+//! makes isolation moot — nothing can land anywhere — but the guard has no
+//! general way to see write *intent* from the Agent tool's `PreToolUse`
+//! payload: whether the platform even carries the dispatch prompt text in
+//! that payload is an open question (cadence-hooks#374), so a prompt-text
+//! heuristic is not implemented here. The one case this guard CAN see
+//! structurally is [`READ_ONLY_SUBAGENT_TYPES`] — the built-in `subagent_type`
+//! values whose own tool grant excludes `Edit`/`Write`/`NotebookEdit` — and
+//! those are exempted below. A plugin-provided or custom-instructed read-only
+//! dispatch (e.g. `cadence:explorer`, or a `general-purpose` agent told
+//! "read-only" in its prompt) is not detectable today and still nudges; the
+//! escape hatches are dispatching from inside the worktree or the
+//! `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` env var above.
 
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::git_command;
@@ -41,6 +56,22 @@ pub(crate) fn count_worktrees(porcelain: &str) -> usize {
         .lines()
         .filter(|l| l.starts_with("worktree "))
         .count()
+}
+
+/// Built-in `subagent_type` values whose OWN tool grant excludes
+/// `Edit`/`Write`/`NotebookEdit` (per the platform's agent-type roster) —
+/// the one class of "this dispatch cannot mutate anything" this guard can
+/// confirm structurally rather than by reading prompt text (#331). Exact,
+/// case-sensitive match against the platform's own type names. Advisory-grade
+/// like the rest of this check: both retain `Bash`, so a shell command could
+/// still mutate a file in principle — the exemption trusts the platform's own
+/// framing of these types as read-only-by-convention, it is not a sandbox
+/// guarantee.
+const READ_ONLY_SUBAGENT_TYPES: &[&str] = &["Explore", "Plan"];
+
+/// Is `subagent_type` one of [`READ_ONLY_SUBAGENT_TYPES`]?
+fn is_read_only_by_convention(subagent_type: Option<&str>) -> bool {
+    subagent_type.is_some_and(|t| READ_ONLY_SUBAGENT_TYPES.contains(&t))
 }
 
 /// Returns true if `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` is set to a truthy value.
@@ -66,28 +97,48 @@ fn is_allowed_value(value: Option<&str>) -> bool {
 
 /// The nudge message: names the behavior (cwd inheritance → main, not the
 /// worktree) and both fixes, plus the silence env var.
+///
+/// Known false-positive shape (cadence-hooks#371): this check can only see
+/// structural signals (`isolation`, cwd, sibling-worktree count) — the actual
+/// dispatch prompt text isn't in the hook payload, so a dispatch whose prompt
+/// itself instructs the agent to `git -C <path> worktree add ...` and operate
+/// exclusively via that explicit path (the `orchestrating-issue-slates`
+/// pattern) still nudges even though the work lands exactly where intended.
+/// The message names this case explicitly so an operator can recognize and
+/// disregard it, rather than the warning training "ignore this" broadly.
 fn warn_message() -> String {
     "Subagent dispatched from the main checkout while a sibling worktree exists — subagents \
-     inherit this session's cwd, so the work lands in main, not the worktree. To isolate: \
-     dispatch from inside the worktree, or pass isolation: \"worktree\". Silence for this repo: \
-     CADENCE_ALLOW_SUBAGENT_FROM_MAIN=true in .claude/settings.json"
+     inherit this session's cwd, so the work lands in main, not the worktree. Known false \
+     positive: if the dispatch prompt itself has the agent create and operate on its own \
+     explicit worktree (`git -C <repo> worktree add ...`, then `git -C <path>` throughout), \
+     disregard this nudge. To isolate otherwise: dispatch from inside the worktree, or pass \
+     isolation: \"worktree\". Silence for this repo: CADENCE_ALLOW_SUBAGENT_FROM_MAIN=true in \
+     .claude/settings.json"
         .to_string()
 }
 
 /// Pure decision: should we warn about this subagent dispatch?
 ///
 /// Nudge only when the session is in the primary checkout, a sibling worktree
-/// exists, the spawn isn't already worktree-isolated, we haven't warned this
+/// exists, the spawn isn't already worktree-isolated, the `subagent_type`
+/// isn't one of [`READ_ONLY_SUBAGENT_TYPES`] (#331), we haven't warned this
 /// session, and the repo isn't permanently opted out. Any one of those
 /// suppresses the nudge.
 fn assess_spawn(
     in_main: bool,
     worktree_exists: bool,
     isolation_worktree: bool,
+    read_only_type: bool,
     already_warned: bool,
     allowed: bool,
 ) -> CheckResult {
-    if allowed || already_warned || isolation_worktree || !in_main || !worktree_exists {
+    if allowed
+        || already_warned
+        || isolation_worktree
+        || read_only_type
+        || !in_main
+        || !worktree_exists
+    {
         return CheckResult::allow();
     }
     CheckResult::nudge(warn_message())
@@ -147,6 +198,7 @@ impl Check for WarnSubagentWorktree {
             .map(|out| count_worktrees(&out) > 1)
             .unwrap_or(false);
         let isolation_worktree = input.isolation() == Some("worktree");
+        let read_only_type = is_read_only_by_convention(input.subagent_type());
 
         let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
@@ -156,6 +208,7 @@ impl Check for WarnSubagentWorktree {
             in_main,
             worktree_exists,
             isolation_worktree,
+            read_only_type,
             already_warned,
             allowed,
         );
@@ -177,7 +230,7 @@ mod tests {
 
     #[test]
     fn all_conditions_met_warns() {
-        let result = assess_spawn(true, true, false, false, false);
+        let result = assess_spawn(true, true, false, false, false, false);
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.expect("nudge has a message");
         assert!(msg.contains("worktree"));
@@ -185,21 +238,46 @@ mod tests {
     }
 
     #[test]
+    fn warn_message_names_the_explicit_worktree_false_positive() {
+        // #371: the check can't see the dispatch prompt text, so it can't
+        // auto-suppress the "agent creates its own worktree" pattern — the
+        // message must name it explicitly so an operator can recognize and
+        // disregard it instead of learning to ignore the warning wholesale.
+        let msg = warn_message();
+        assert!(
+            msg.contains("false positive"),
+            "message should name the known false-positive shape: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("git -c"),
+            "message should describe the explicit-worktree pattern concretely: {msg}"
+        );
+    }
+
+    #[test]
     fn allowed_suppresses() {
-        let result = assess_spawn(true, true, false, false, true);
+        let result = assess_spawn(true, true, false, false, false, true);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
     fn already_warned_suppresses() {
-        let result = assess_spawn(true, true, false, true, false);
+        let result = assess_spawn(true, true, false, false, true, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
     fn isolation_worktree_suppresses() {
         // The spawn already gets a fresh worktree — nothing to warn about.
-        let result = assess_spawn(true, true, true, false, false);
+        let result = assess_spawn(true, true, true, false, false, false);
+        assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn read_only_subagent_type_suppresses() {
+        // #331: a structurally read-only dispatch (Explore/Plan) can't mutate
+        // anywhere, so isolation is moot.
+        let result = assess_spawn(true, true, false, true, false, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
@@ -207,14 +285,14 @@ mod tests {
     fn inside_worktree_suppresses() {
         // Session is already inside a worktree (.git is a file) → its subagents
         // inherit that worktree, so no nudge.
-        let result = assess_spawn(false, true, false, false, false);
+        let result = assess_spawn(false, true, false, false, false, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]
     fn no_sibling_worktree_suppresses() {
         // In main but no worktree in play — the common case, stays silent.
-        let result = assess_spawn(true, false, false, false, false);
+        let result = assess_spawn(true, false, false, false, false, false);
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
@@ -354,6 +432,17 @@ mod tests {
             "dispatch from inside a worktree already inherits its isolation"
         );
 
+        // #331: same primary + sibling-worktree setup, but a structurally
+        // read-only subagent_type → silent even though every other condition
+        // that would otherwise nudge still holds.
+        let read_only = make_agent(Some("Explore"), None, primary.to_str().unwrap());
+        let r = WarnSubagentWorktree.run(&read_only);
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "Explore dispatch from primary + sibling worktree is silent (read-only by convention)"
+        );
+
         // SAFETY: serialized via ENV_LOCK.
         unsafe {
             match prev {
@@ -424,6 +513,34 @@ mod tests {
             "marker name must be guard-specific: {}",
             m.display()
         );
+    }
+
+    // --- is_read_only_by_convention (pure) ---
+
+    #[test]
+    fn read_only_types_match() {
+        assert!(is_read_only_by_convention(Some("Explore")));
+        assert!(is_read_only_by_convention(Some("Plan")));
+    }
+
+    #[test]
+    fn mutation_capable_types_do_not_match() {
+        assert!(!is_read_only_by_convention(Some("general-purpose")));
+        assert!(!is_read_only_by_convention(Some("cadence:implementer")));
+        assert!(!is_read_only_by_convention(Some("cadence:explorer")));
+    }
+
+    #[test]
+    fn read_only_match_is_case_sensitive() {
+        // "explore" / "PLAN" are not the platform's own type names — only an
+        // exact match is trusted.
+        assert!(!is_read_only_by_convention(Some("explore")));
+        assert!(!is_read_only_by_convention(Some("PLAN")));
+    }
+
+    #[test]
+    fn read_only_type_absent_does_not_match() {
+        assert!(!is_read_only_by_convention(None));
     }
 
     // --- is_allowed_value (pure) ---

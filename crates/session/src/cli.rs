@@ -8,11 +8,41 @@
 use crate::identity;
 use crate::registry;
 
-/// Resolve this session's id: explicit flag first, then `CLAUDE_SESSION_ID`
-/// (exported by Claude Code into every Bash invocation).
+/// Priority order for resolving a session id: explicit flag, then
+/// `CLAUDE_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID` (#366: a shell Claude
+/// Code spawns via its Bash tool does not carry `CLAUDE_SESSION_ID`, but does
+/// carry `CLAUDE_CODE_SESSION_ID` — without this fallback, `session declare`
+/// run from the Bash tool can't self-identify at all). Pure — env values
+/// passed as arguments, never read from `std::env` here, so the ordering is
+/// fixture-testable without mutating process-global env (mirrors
+/// `redact_external_content::resolve_dest_tier`'s seam).
+///
+/// Each candidate is validated BEFORE selection, not after: an `.or().or()`
+/// chain followed by a single trailing `.filter()` would pick the first
+/// *present* candidate regardless of safety, then reject the whole result if
+/// that one candidate is unsafe — never falling through to a later, safe
+/// candidate. `find` validates in priority order instead, so an unsafe
+/// `CLAUDE_SESSION_ID` correctly falls through to a safe
+/// `CLAUDE_CODE_SESSION_ID` rather than failing the whole resolution.
+fn resolve_session_id_from(
+    flag: Option<String>,
+    claude_session_id: Option<String>,
+    claude_code_session_id: Option<String>,
+) -> Option<String> {
+    [flag, claude_session_id, claude_code_session_id]
+        .into_iter()
+        .flatten()
+        .find(|s| identity::is_safe_session_id(s))
+}
+
+/// Resolve this session's id from the real environment. See
+/// [`resolve_session_id_from`] for the priority order and rationale.
 fn resolve_session_id(flag: Option<String>) -> Option<String> {
-    flag.or_else(|| std::env::var("CLAUDE_SESSION_ID").ok())
-        .filter(|s| identity::is_safe_session_id(s))
+    resolve_session_id_from(
+        flag,
+        std::env::var("CLAUDE_SESSION_ID").ok(),
+        std::env::var("CLAUDE_CODE_SESSION_ID").ok(),
+    )
 }
 
 /// Apply a declaration to a record. Pure — fully testable.
@@ -49,7 +79,7 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
     let Some(sid) = resolve_session_id(session_id) else {
         println!(
             "session declare: no session id. Pass --session-id or run inside Claude Code \
-             (CLAUDE_SESSION_ID)."
+             (CLAUDE_SESSION_ID or CLAUDE_CODE_SESSION_ID)."
         );
         return;
     };
@@ -162,8 +192,81 @@ mod tests {
     }
 
     #[test]
-    fn resolve_session_id_rejects_unsafe_flag() {
-        assert!(resolve_session_id(Some("../escape".into())).is_none());
+    fn resolve_session_id_from_rejects_unsafe_flag_with_no_fallback() {
+        // Via the pure seam with explicit None env args, not the real
+        // resolve_session_id(Some("../escape".into())): with the #366 fix,
+        // an unsafe flag now correctly falls through to a real
+        // CLAUDE_CODE_SESSION_ID when this test process actually has one set
+        // (true whenever this suite runs inside a live Claude Code session),
+        // so asserting None through the impure entry point would be
+        // environment-dependent rather than a property of the resolver.
+        assert!(resolve_session_id_from(Some("../escape".into()), None, None).is_none());
+    }
+
+    // --- #366: CLAUDE_CODE_SESSION_ID fallback, via the pure seam ---
+
+    #[test]
+    fn resolve_session_id_from_prefers_flag_over_both_env_vars() {
+        let resolved = resolve_session_id_from(
+            Some("from-flag".into()),
+            Some("from-claude-session-id".into()),
+            Some("from-claude-code-session-id".into()),
+        );
+        assert_eq!(resolved.as_deref(), Some("from-flag"));
+    }
+
+    #[test]
+    fn resolve_session_id_from_prefers_claude_session_id_over_claude_code_session_id() {
+        let resolved = resolve_session_id_from(
+            None,
+            Some("from-claude-session-id".into()),
+            Some("from-claude-code-session-id".into()),
+        );
+        assert_eq!(resolved.as_deref(), Some("from-claude-session-id"));
+    }
+
+    #[test]
+    fn resolve_session_id_from_falls_back_to_claude_code_session_id() {
+        // The reported bug: a Bash-tool-spawned subshell has no
+        // CLAUDE_SESSION_ID, only CLAUDE_CODE_SESSION_ID — declare must
+        // still self-identify from it.
+        let resolved =
+            resolve_session_id_from(None, None, Some("from-claude-code-session-id".into()));
+        assert_eq!(resolved.as_deref(), Some("from-claude-code-session-id"));
+    }
+
+    #[test]
+    fn resolve_session_id_from_none_when_all_absent() {
+        assert!(resolve_session_id_from(None, None, None).is_none());
+    }
+
+    #[test]
+    fn resolve_session_id_from_rejects_unsafe_claude_code_session_id() {
+        assert!(resolve_session_id_from(None, None, Some("../escape".into())).is_none());
+    }
+
+    #[test]
+    fn resolve_session_id_from_unsafe_claude_session_id_falls_through_to_safe_claude_code_session_id()
+     {
+        // The critical case: an unsafe higher-priority candidate must not
+        // fail the whole resolution when a safe lower-priority one exists —
+        // each candidate is validated before selection, not after.
+        let resolved = resolve_session_id_from(
+            None,
+            Some("../escape".into()),
+            Some("from-claude-code-session-id".into()),
+        );
+        assert_eq!(resolved.as_deref(), Some("from-claude-code-session-id"));
+    }
+
+    #[test]
+    fn resolve_session_id_from_unsafe_flag_falls_through_to_safe_claude_session_id() {
+        let resolved = resolve_session_id_from(
+            Some("../escape".into()),
+            Some("from-claude-session-id".into()),
+            None,
+        );
+        assert_eq!(resolved.as_deref(), Some("from-claude-session-id"));
     }
 
     // --- declaration semantics ---
@@ -225,7 +328,9 @@ mod tests {
         assert_eq!(rec.touching, vec!["crates/session/", "src/"]);
     }
 
-    // Note: the env-var fallback and the run_declare/run_status I/O paths are
-    // exercised end-to-end by the plugin smoke test; here they'd require
-    // mutating process-global state (env, cwd) which races parallel tests.
+    // Note: the run_declare/run_status I/O paths are exercised end-to-end by
+    // the plugin smoke test; here they'd require mutating process-global
+    // state (env, cwd) which races parallel tests. The env-var fallback
+    // priority itself is covered above via the pure resolve_session_id_from
+    // seam, which needs no env mutation.
 }
