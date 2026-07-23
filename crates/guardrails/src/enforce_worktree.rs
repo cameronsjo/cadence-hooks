@@ -78,19 +78,20 @@
 //!   rm|mv|stash pop` (not commit boundaries, so the commit flag-walk never
 //!   matches them). The package-manager/`sed`/`tee`/redirect list is a floor;
 //!   widening it is follow-up.
-//! - **Relative `$VAR`/`$(…)`-pathed targets** — `cat > "$OUT"`, `> "$(…)"`:
-//!   the scoped walk carries no assignment expansion (that lives only on the
-//!   flat `command_segments` view, the #228 bypass class this predicate MUST
-//!   NOT use), so the target's true location is unknown and the nudge is
-//!   **silently skipped** for that target rather than guessed (#362). Prior to
-//!   #362 this joined the literal token onto the effective dir instead
-//!   (`<cwd>/$OUT`), which over-fired whenever the cwd was in-primary — e.g. a
-//!   `$SCRATCH`-style redirect into a legitimate out-of-tree `/tmp` scratch
-//!   path was misjudged as in-primary. Advisory-only, so the silent miss is
-//!   the accepted trade (a missed nudge is cheap; a false one is friction). An
-//!   *absolute* `$VAR`-containing target (`/tmp/$SESSION/f`) is unaffected —
-//!   it resolves via the absolute-path branch before variable expansion would
-//!   matter.
+//! - **Relative `$VAR`/`$(…)`/backtick-pathed targets** — `cat > "$OUT"`,
+//!   `> "$(…)"`, `` > `cmd` ``: the scoped walk carries no assignment/
+//!   substitution expansion (that lives only on the flat `command_segments`
+//!   view, the #228 bypass class this predicate MUST NOT use), so the
+//!   target's true location is unknown and the nudge is **silently skipped**
+//!   for that target rather than guessed (#362). Prior to #362 this joined
+//!   the literal token onto the effective dir instead (`<cwd>/$OUT`), which
+//!   over-fired whenever the cwd was in-primary — e.g. a `$SCRATCH`-style
+//!   redirect into a legitimate out-of-tree `/tmp` scratch path was
+//!   misjudged as in-primary. Advisory-only, so the silent miss is the
+//!   accepted trade (a missed nudge is cheap; a false one is friction). An
+//!   *absolute* target with an embedded substitution (`/tmp/$SESSION/f`) is
+//!   unaffected — it resolves via the absolute-path branch before expansion
+//!   would matter.
 //! - **Prefix-flag wrappers** — `nice -n 10 <mutator>`, `env -i sh -c '…'`,
 //!   `sudo <mutator>`: the transparent-prefix stripper stops at a prefix whose
 //!   next token is a flag (and `sudo` isn't a transparent prefix here), so the
@@ -521,25 +522,29 @@ fn file_mutation_targets(argv: &[String]) -> Vec<String> {
 /// same way the commit arm resolves a `-C` redirect: an absolute path (POSIX or
 /// Windows-drive via [`is_shell_absolute`]) or a `~`-path stands alone; a
 /// relative path joins onto the effective dir. `None` when the token is a
-/// **relative, unexpanded shell variable reference** (`$VAR/…`, `$(…)/…`) —
-/// the scoped walk carries no assignment expansion (widening to the flat
-/// `command_segments` view is rejected; it's the #228 bypass primitive), so
-/// this token's true location is unknown. Joining it onto `effective_dir`
-/// would fabricate an in-primary path regardless of what the variable
-/// actually resolves to at runtime — e.g. `cat > "$SCRATCH/f"` where
-/// `$SCRATCH` holds an out-of-tree `/tmp` scratch path still gets treated as
-/// `<effective_dir>/$SCRATCH/f`, an in-primary false positive (#362). Skipping
-/// resolution is the safer default for an advisory-only nudge: a false
-/// silent-miss is cheap, a false nudge on a legitimate out-of-tree write is
-/// friction. An *absolute* `$VAR`-containing target (`/tmp/$SESSION/f`) is
-/// unaffected — it stands alone via [`is_shell_absolute`] before this branch
-/// and resolves (with the variable segment literal) same as before.
+/// **relative, unexpanded shell substitution** — a variable reference
+/// (`$VAR/…`, `$(…)/…`) or a backtick command substitution (`` `cmd`/… ``) —
+/// the scoped walk carries no assignment/substitution expansion (widening to
+/// the flat `command_segments` view is rejected; it's the #228 bypass
+/// primitive), so this token's true location is unknown. Joining it onto
+/// `effective_dir` would fabricate an in-primary path regardless of what the
+/// substitution actually resolves to at runtime — e.g. `cat > "$SCRATCH/f"`
+/// where `$SCRATCH` holds an out-of-tree `/tmp` scratch path still gets
+/// treated as `<effective_dir>/$SCRATCH/f`, an in-primary false positive
+/// (#362; the identical shape reproduces for a bare backtick-led target like
+/// `` `date +%s`.log ``, since [`redirect_targets`] returns that token's
+/// leading backtick unchanged). Skipping resolution is the safer default for
+/// an advisory-only nudge: a false silent-miss is cheap, a false nudge on a
+/// legitimate out-of-tree write is friction. An *absolute* target with an
+/// embedded substitution (`/tmp/$SESSION/f`) is unaffected — it stands alone
+/// via [`is_shell_absolute`] before this branch and resolves (with the
+/// substitution segment literal) same as before.
 fn resolve_mutation_target(path: &str, effective_dir: &str) -> Option<String> {
     if path.starts_with('~') {
         Some(resolve_cd_target(path, effective_dir))
     } else if is_shell_absolute(path) {
         Some(path.to_string())
-    } else if path.starts_with('$') {
+    } else if path.starts_with('$') || path.starts_with('`') {
         None
     } else {
         Some(format!("{effective_dir}/{path}"))
@@ -3209,6 +3214,21 @@ mod tests {
         assert!(mutation_targets("echo x > $OUT", "/cwd").is_empty());
         assert!(mutation_targets("tee \"$OUT\"", "/cwd").is_empty());
         assert!(mutation_targets("sed -i s/a/b/ \"$OUT\"", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn relative_backtick_redirect_target_is_skipped_not_joined_to_cwd() {
+        // #362 code-review follow-up: a bare backtick-led target is the same
+        // unresolvable shape as `$VAR` — `redirect_targets`/`tokenize` return
+        // a leading backtick unchanged (backtick isn't in either parser's
+        // break/quote set), so without this it would fall into the `else`
+        // branch and get joined onto the effective dir exactly like the
+        // original bug. No whitespace inside the backticks — `redirect_targets`
+        // stops target collection at the first whitespace regardless of
+        // quoting, so a whitespace-bearing substitution body would truncate
+        // before the backtick-handling in this fix is even exercised.
+        assert!(mutation_targets("cat > `whoami`.log", "/cwd").is_empty());
+        assert!(mutation_targets("sed -i s/a/b/ `pwd`/f", "/cwd").is_empty());
     }
 
     #[test]
