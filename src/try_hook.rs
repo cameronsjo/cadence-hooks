@@ -81,13 +81,33 @@ pub fn run(
     );
     println!();
 
-    let mut child = match Command::new(&exe)
+    // A metrics logger writes unconditionally and silently (no stdout on
+    // success), so without this override `try` appends a real row to the
+    // live production metrics stream every time it exercises one (#269).
+    // Scratch dir is best-effort: if it can't be created, the child falls
+    // back to the real metrics dir rather than failing the `try` run — the
+    // pre-existing (buggy) behavior, not a new failure mode — but this must
+    // never be a *silent* fallback, or the exact bug being fixed recurs
+    // invisibly.
+    let metrics_scratch = tempfile::tempdir().ok();
+    if metrics_scratch.is_none() {
+        eprintln!(
+            "cadence-hooks: could not create a scratch metrics dir — this run \
+             may write a real row into the production metrics directory."
+        );
+    }
+
+    let mut command = Command::new(&exe);
+    command
         .args([namespace, subcommand])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if let Some(scratch) = &metrics_scratch {
+        command.env("CADENCE_METRICS_DIR", scratch.path());
+    }
+
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cadence-hooks: failed to spawn {}: {e}", exe.display());
