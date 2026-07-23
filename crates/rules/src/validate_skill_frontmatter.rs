@@ -19,10 +19,16 @@ const VALID_FIELDS: &[&str] = &[
     "user-invocable",
     "model",
     "context",
+    "background",
     "agent",
     "hooks",
     "paths",
 ];
+
+// House strictness: boolean fields take exactly `true` or `false`. The
+// platform (Claude Code >= 2.1.218) also accepts yes/no/on/off/1/0 —
+// cadence deliberately does not: one spelling keeps the corpus greppable.
+const BOOLEAN_FIELDS: &[&str] = &["background", "disable-model-invocation", "user-invocable"];
 
 // Kebab-case name, optionally prefixed by a kebab `namespace:` (the
 // `plugin:directory` invocation id, e.g. `cadence:attune`). Both sides are
@@ -122,6 +128,16 @@ impl Check for ValidateSkillFrontmatter {
         for (key, _) in &fields {
             if !VALID_FIELDS.contains(&key.as_str()) {
                 errors.push(format!("Unknown frontmatter field: '{key}'"));
+            }
+        }
+
+        // Boolean fields: exactly `true` or `false` — house strictness, one
+        // rule for all three (the platform accepts yes/no/on/off/1/0).
+        for (key, value) in &fields {
+            if BOOLEAN_FIELDS.contains(&key.as_str()) && value != "true" && value != "false" {
+                errors.push(format!(
+                    "'{key}' must be exactly 'true' or 'false' (got: '{value}') — the platform accepts yes/no/on/off/1/0, cadence house style does not"
+                ));
             }
         }
 
@@ -590,6 +606,90 @@ mod tests {
         let input = make_write_input(
             "/plugins/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\npaths: src/**/*.rs\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- Background fork skills (Claude Code 2.1.218) + strict booleans ---
+
+    #[test]
+    fn run_skill_with_background_true_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_with_background_false_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: false\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_background_yes_blocks() {
+        // The platform loosened boolean parsing (yes/no/on/off/1/0) in
+        // 2.1.218; cadence house style stays strict true/false.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: yes\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("must be exactly 'true' or 'false'")
+        );
+    }
+
+    #[test]
+    fn run_skill_user_invocable_yes_blocks() {
+        // One rule for all boolean fields — pre-existing booleans get the
+        // same strictness as the new `background` field.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\nuser-invocable: yes\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("'user-invocable' must be exactly 'true' or 'false'")
+        );
+    }
+
+    #[test]
+    fn run_skill_disable_model_invocation_numeric_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ndisable-model-invocation: 1\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("'disable-model-invocation' must be exactly 'true' or 'false'")
+        );
+    }
+
+    #[test]
+    fn run_skill_boolean_true_false_still_pass() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\nuser-invocable: false\ndisable-model-invocation: true\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
