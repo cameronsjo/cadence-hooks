@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`validate-skill-frontmatter` accepts the `background` field and enforces strict booleans.** Claude Code 2.1.218 made `context: fork` skills background-by-default with `background: false` as the per-skill opt-out; the field allowlist now admits `background` so the opt-out is writable. New value-validation applies one rule to all three boolean fields (`background`, `disable-model-invocation`, `user-invocable`): exactly `true` or `false`. The platform also accepts `yes/no/on/off/1/0` as of 2.1.218 — cadence deliberately does not; one spelling keeps the skill corpus greppable.
+
 ### Fixed
 
 - **`warn-subagent-worktree` no longer nudges on a structurally read-only dispatch (cameronsjo/cadence-hooks#331).** The built-in `Explore`/`Plan` `subagent_type` values have their own tool grant exclude `Edit`/`Write`/`NotebookEdit` — nothing can land in the worktree or the primary checkout either way, so isolation is moot. These two are now exempted. A plugin-provided or custom-instructed read-only dispatch (e.g. `cadence:explorer`, or a `general-purpose` agent told "read-only" in its prompt) is not detectable today — whether the Agent tool's `PreToolUse` payload even carries the dispatch prompt text is an open question (cameronsjo/cadence-hooks#374) — and still nudges; documented as a known false-positive class in the check's doc comment.
