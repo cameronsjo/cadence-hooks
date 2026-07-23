@@ -24,15 +24,30 @@ const VALID_FIELDS: &[&str] = &[
     "paths",
 ];
 
-// Kebab-case name, optionally prefixed by a kebab `namespace:` (the
-// `plugin:directory` invocation id, e.g. `cadence:attune`). Both sides are
-// independently multi-segment kebab; the optional trailing group rejects a
-// dangling colon (`cadence:`), a leading colon (`:attune`), and a double
-// colon (`a::b`) for free.
-static NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*(:[a-z0-9]+(-[a-z0-9]+)*)?$")
-        .expect("pattern should compile")
-});
+// Kebab-case name with NO namespace prefix — a colon is rejected outright.
+//
+// Claude Code owns the prefix: it builds a skill's invocation id from
+// `<plugin>:<directory>` and prepends the prefix itself, so a declared
+// `cadence:attune` renders as `/cadence:cadence:attune`. Release 2.1.216
+// ("fixed plugin skills with a `name` frontmatter field losing their plugin
+// prefix in slash-command autocomplete") is what made the prefix doubling;
+// 2.1.218 then made agent markdown reject `:` in a name for the same reason,
+// reserving the character for plugin namespacing.
+//
+// This pattern previously allowed an optional `namespace:` prefix (0.19.0),
+// because 2.1.94 had made plugin skills use the frontmatter `name` as the
+// invocation name — which made the prefixed form render correctly. That is the
+// convention this reverses.
+//
+// IF THE PLATFORM FLIPS BACK (e.g. Anthropic de-duplicates an already-prefixed
+// name), the order matters: relax this pattern and SHIP A RELEASE FIRST, then
+// sweep the corpus with `cadence/scripts/skill-names.py --prefixed`. Tightened
+// as it stands, this check blocks every edit to a prefixed SKILL.md — including
+// the sweep that would undo it. Restoring the old form means re-adding the
+// optional trailing group `(:[a-z0-9]+(-[a-z0-9]+)*)?` and the `rsplit_once`
+// suffix comparison in `run` below.
+static NAME_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*$").expect("pattern should compile"));
 
 #[derive(Debug, PartialEq)]
 enum FileType {
@@ -138,24 +153,20 @@ impl Check for ValidateSkillFrontmatter {
                 }
 
                 if let Some((_, name_value)) = fields.iter().find(|(k, _)| k == "name") {
-                    // Check name format
+                    // Check name format. A colon fails here, which is the whole
+                    // point: Claude Code prepends `<plugin>:` itself, so a
+                    // declared prefix doubles in the slash menu.
                     if !NAME_PATTERN.is_match(name_value) {
                         errors.push(format!(
-                            "name must use only lowercase letters, numbers, and hyphens, with an optional 'namespace:' prefix (got: '{name_value}')"
+                            "name must be the bare skill directory — only lowercase letters, numbers, and hyphens, no 'plugin:' prefix (got: '{name_value}')"
                         ));
                     }
 
-                    // Check the skill part matches the directory. The optional
-                    // `namespace:` prefix is permitted but not required, and the
-                    // namespace itself is not verified against the plugin name —
-                    // deriving the plugin from the path is fragile (source vs
-                    // cache) and cadence-hooks must not force the prefix on
-                    // non-cadence users. Only the post-colon suffix must match.
-                    let skill_part = name_value
-                        .rsplit_once(':')
-                        .map_or(name_value.as_str(), |(_, s)| s);
+                    // Check the name matches the directory. With colons rejected
+                    // above, the declared name IS the skill part, so this is a
+                    // direct comparison.
                     if let Some(dir_name) = skill_dir_name(&path)
-                        && skill_part != dir_name
+                        && name_value.as_str() != dir_name
                     {
                         errors.push(format!(
                             "name '{name_value}' must match directory '{dir_name}'"
@@ -207,15 +218,17 @@ mod tests {
     fn valid_name_format() {
         assert!(NAME_PATTERN.is_match("my-skill"));
         assert!(NAME_PATTERN.is_match("skill123"));
-        // Optional `namespace:` prefix (the plugin:directory invocation id).
-        assert!(NAME_PATTERN.is_match("cadence:attune"));
-        assert!(NAME_PATTERN.is_match("cadence-forge:add-narrative-logging"));
-        assert!(NAME_PATTERN.is_match("cadence-rules:init-all"));
+        assert!(NAME_PATTERN.is_match("add-narrative-logging"));
         assert!(!NAME_PATTERN.is_match("My-Skill"));
         assert!(!NAME_PATTERN.is_match("-leading"));
         assert!(!NAME_PATTERN.is_match("trailing-"));
         assert!(!NAME_PATTERN.is_match("double--hyphen"));
-        // Colon edge cases the optional trailing group must reject.
+        // A `plugin:` prefix is rejected outright — Claude Code prepends it
+        // itself (2.1.216), so declaring it renders `/cadence:cadence:attune`.
+        assert!(!NAME_PATTERN.is_match("cadence:attune"));
+        assert!(!NAME_PATTERN.is_match("cadence-forge:add-narrative-logging"));
+        assert!(!NAME_PATTERN.is_match("cadence-rules:init-all"));
+        // Colon edge cases stay rejected for the same reason.
         assert!(!NAME_PATTERN.is_match("cadence:")); // dangling colon
         assert!(!NAME_PATTERN.is_match(":attune")); // leading colon
         assert!(!NAME_PATTERN.is_match("a::b")); // double colon
@@ -339,21 +352,23 @@ mod tests {
     }
 
     #[test]
-    fn run_skill_namespaced_name_matching_dir_passes() {
-        // The plugin:directory form is allowed: the post-colon suffix matches
-        // the directory, so the prefix is accepted.
+    fn run_skill_namespaced_name_blocks_even_when_suffix_matches() {
+        // The plugin:directory form is rejected even though the post-colon
+        // suffix equals the directory — this is the form 0.19.0 through
+        // 0.63.0 accepted, and the one that renders `/cadence:cadence:my-skill`.
         let input = make_write_input(
             "/plugins/cadence/skills/my-skill/SKILL.md",
             "---\nname: cadence:my-skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("bare skill directory"));
     }
 
     #[test]
     fn run_skill_namespaced_name_suffix_mismatch_blocks() {
-        // A prefix does not excuse a mismatched skill part: suffix `wrong`
-        // still has to equal the directory `my-skill`.
+        // Still blocks, now for two reasons rather than one: the colon fails
+        // the format check AND `cadence:wrong` is not the directory `my-skill`.
         let input = make_write_input(
             "/plugins/cadence/skills/my-skill/SKILL.md",
             "---\nname: cadence:wrong\ndescription: test\n---\n# Content",
@@ -361,6 +376,17 @@ mod tests {
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(result.message.unwrap().contains("must match directory"));
+    }
+
+    #[test]
+    fn run_skill_bare_name_matching_dir_passes() {
+        // The correct form as of Claude Code 2.1.216.
+        let input = make_write_input(
+            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]

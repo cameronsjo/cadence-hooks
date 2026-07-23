@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **`validate-skill-frontmatter` now rejects a `plugin:` prefix in a skill's `name` (cameronsjo/cadence#545).** Claude Code builds a skill's invocation id from `<plugin>:<directory>` and, as of **2.1.216** ("fixed plugin skills with a `name` frontmatter field losing their plugin prefix in slash-command autocomplete"), prepends the prefix itself — so a declared `name: cadence:tend` renders as `/cadence:cadence:tend` in the slash menu. `NAME_PATTERN` drops the optional `namespace:` group it gained in 0.19.0, and the name-vs-directory check becomes a direct comparison now that the post-colon suffix cannot exist. **This reverses 0.19.0**, which relaxed the guard to permit the prefix after **2.1.94** made plugin skills use the frontmatter `name` as the invocation name. The cadence ecosystem was swept bare in the same change (142 skills across cadence, cadence-lab, and auditing-claude-md).
+
+  **If the platform flips back** — e.g. Anthropic de-duplicates an already-prefixed name — **relax the pattern and ship a release BEFORE sweeping the corpus.** Tightened as it stands, this check blocks every edit to a prefixed `SKILL.md`, including the sweep that would undo it. The sweep itself is `cadence/scripts/skill-names.py --bare|--prefixed`, which runs in either direction.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
