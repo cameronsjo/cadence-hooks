@@ -103,7 +103,10 @@ fn ceiling_ord(s: &str) -> u8 {
 /// init. `mcp` is both a namespace and a prefix of `cadence-mcp`; the regex
 /// builder sorts longest-first so `cadence-mcp:x` is caught as `cadence-mcp:x`,
 /// not as `cadence` + leftover or bare `mcp`.
-const NAMESPACES: &[&str] = &[
+/// `pub` (rather than crate-private) so the cross-sibling namespace-parity
+/// audit test (`tests/hook_registration_audit.rs`) can read it directly and
+/// diff it against the plugin-side `redact-check.sh` namespace list.
+pub const NAMESPACES: &[&str] = &[
     "cadence",
     "cadence-forge",
     "cadence-groundwork",
@@ -749,7 +752,9 @@ mod tests {
     fn category_skill_id() {
         let result = run("gh issue create --body \"calls cadence-forge:polish\"");
         assert_eq!(result.outcome, Outcome::Nudge);
-        // Category tag is `skill-id` (lockstep with redaction.schema.json).
+        // Category tag is `skill-id` (lockstep with the `redaction` section of
+        // the unified cadence config schema, schemas/cadence.json in the
+        // cadence monorepo).
         assert!(
             result.message.as_deref().unwrap().contains("[skill-id]"),
             "expected the [skill-id] category tag in: {:?}",
@@ -792,7 +797,9 @@ mod tests {
             "expected the full cadence-mcp:server snippet in: {:?}",
             result.message
         );
-        // Emitted under the `skill-id` category (schema lockstep).
+        // Emitted under the `skill-id` category (lockstep with the
+        // `redaction` section of the unified cadence config schema,
+        // schemas/cadence.json in the cadence monorepo).
         assert!(
             msg.contains("[skill-id]"),
             "expected the [skill-id] category tag in: {:?}",
@@ -999,7 +1006,10 @@ mod tests {
     // script `redact-check.sh` cases a–i. Ordinals: owned-internal=1,
     // private-external=2, public=3. Cases inlined as Rust tests (rather than a
     // shared JSON/TSV fixture) — the fixture would add setup scope with no
-    // parity win here, since Rust and the bash port are separately validated. ---
+    // parity win here, since Rust and the bash port are separately validated.
+    // A cheaper, different property — that the two sides' namespace LISTS
+    // (not their full scan behavior) agree — is audited cross-sibling by
+    // `tests/hook_registration_audit.rs::namespace_list_matches_redact_check_sh`. ---
 
     /// Parse a `redaction`-section body into a [`RedactionConfig`].
     fn cfg(json: &str) -> RedactionConfig {
