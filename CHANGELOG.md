@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`session declare` falls back to `CLAUDE_CODE_SESSION_ID` when `CLAUDE_SESSION_ID` is unset (cameronsjo/cadence-hooks#366).** A shell Claude Code spawns via its Bash tool does not carry `CLAUDE_SESSION_ID` in its environment, so `session declare`/`session status` couldn't self-identify without an explicit `--session-id`. Mirrors the existing `dismiss_main_branch_warn.rs` precedent. The priority order (flag → `CLAUDE_SESSION_ID` → `CLAUDE_CODE_SESSION_ID`) is now a pure, fixture-testable function (`resolve_session_id_from`) rather than reading `std::env` inline.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
