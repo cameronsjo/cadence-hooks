@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **`validate-skill-frontmatter` now rejects a `plugin:` prefix in a skill's `name` (cameronsjo/cadence#545).** Claude Code builds a skill's invocation id from `<plugin>:<directory>` and, as of **2.1.216** ("fixed plugin skills with a `name` frontmatter field losing their plugin prefix in slash-command autocomplete"), prepends the prefix itself — so a declared `name: cadence:tend` renders as `/cadence:cadence:tend` in the slash menu. `NAME_PATTERN` drops the optional `namespace:` group it gained in 0.19.0, and the name-vs-directory check becomes a direct comparison now that the post-colon suffix cannot exist. **This reverses 0.19.0**, which relaxed the guard to permit the prefix after **2.1.94** made plugin skills use the frontmatter `name` as the invocation name. The cadence ecosystem was swept bare in the same change (142 skills across cadence, cadence-lab, and auditing-claude-md).
+
+  **If the platform flips back** — e.g. Anthropic de-duplicates an already-prefixed name — **relax the pattern and ship a release BEFORE sweeping the corpus.** Tightened as it stands, this check blocks every edit to a prefixed `SKILL.md`, including the sweep that would undo it. The sweep itself is `cadence/scripts/skill-names.py --bare|--prefixed`, which runs in either direction.
+
 ## [0.65.0] - 2026-07-23
 
 ### Added
@@ -20,7 +28,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`warn-commit-provenance` nudges once per session, not once per commit (cameronsjo/cadence-hooks#370).** A session making many commits under an explicit no-trailer message contract (e.g. a dispatched implementer following a fixed commit-message spec) saw the provenance nudge fire on every single commit — pure noise once the session already knows the trailer format. Reuses the `session_marker`/`write_marker` primitive already established by `warn-main-branch`, scoped globally (not per-repo) since "does this session know the trailer format" is a session-level fact.
 - **`warn-subagent-worktree`'s message names a known false-positive shape (cameronsjo/cadence-hooks#371).** The check can only see structural signals (`isolation`, cwd, sibling-worktree count) — the dispatch prompt text itself isn't in the hook payload today, so a dispatch whose prompt has the agent create and operate on its own explicit worktree (`git -C <repo> worktree add ...`, then `git -C <path>` throughout — the `orchestrating-issue-slates` pattern) still nudges even though the work lands exactly where intended. The nudge now names this case explicitly so an operator can recognize and disregard it rather than learning to ignore the warning broadly.
 - **`try` no longer writes real metrics rows into the production metrics dir (cameronsjo/cadence-hooks#269).** `cadence-hooks try metrics <logger>` self-execs the compiled binary against a generated sample payload, but metrics loggers write unconditionally and silently — a `try` run had appended a real row to the live `skills.jsonl` stream. `try_hook.rs` now sandboxes the self-exec'd child to a scratch tempdir via `CADENCE_METRICS_DIR` (best-effort: if the scratch dir can't be created, a stderr warning names the risk instead of silently falling back to the real dir). `tempfile` promoted from a dev-dependency to a real one in the root crate.
-
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
