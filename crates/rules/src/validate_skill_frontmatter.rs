@@ -92,6 +92,19 @@ fn skill_dir_name(path: &str) -> Option<&str> {
     parent.rsplit('/').next()
 }
 
+/// Strip a trailing inline YAML comment from a scalar value. Per YAML, `#`
+/// opens a comment only when preceded by whitespace — `true  # why` yields
+/// `true`, while `true#x` stays intact (it is the value, not a comment).
+fn strip_inline_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i] == b'#' && bytes[i - 1].is_ascii_whitespace() {
+            return value[..i].trim_end();
+        }
+    }
+    value
+}
+
 /// Validates YAML frontmatter in skill and command markdown files.
 pub struct ValidateSkillFrontmatter;
 
@@ -132,11 +145,14 @@ impl Check for ValidateSkillFrontmatter {
         }
 
         // Boolean fields: exactly `true` or `false` — house strictness, one
-        // rule for all three (the platform accepts yes/no/on/off/1/0).
+        // rule for all three (the platform accepts yes/no/on/off/1/0). A
+        // trailing inline comment is not part of the value; quoted values
+        // (`"true"`) stay blocked — unquoted is the house spelling.
         for (key, value) in &fields {
-            if BOOLEAN_FIELDS.contains(&key.as_str()) && value != "true" && value != "false" {
+            let bare = strip_inline_comment(value);
+            if BOOLEAN_FIELDS.contains(&key.as_str()) && bare != "true" && bare != "false" {
                 errors.push(format!(
-                    "'{key}' must be exactly 'true' or 'false' (got: '{value}') — the platform accepts yes/no/on/off/1/0, cadence house style does not"
+                    "'{key}' must be exactly 'true' or 'false' (got: '{bare}') — the platform accepts yes/no/on/off/1/0, cadence house style does not"
                 ));
             }
         }
@@ -693,6 +709,46 @@ mod tests {
         );
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_boolean_with_inline_comment_passes() {
+        // A trailing YAML comment is not part of the value — `true  # why`
+        // is the boolean true, not a malformed spelling.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true  # opt out later\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_quoted_boolean_blocks() {
+        // Deliberate: `"true"` is a string spelling, not the house boolean.
+        // Unquoted true/false is the one greppable form.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: \"true\"\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("must be exactly 'true' or 'false'")
+        );
+    }
+
+    #[test]
+    fn strip_inline_comment_edges() {
+        assert_eq!(strip_inline_comment("true  # opt out later"), "true");
+        assert_eq!(strip_inline_comment("true"), "true");
+        // `#` without preceding whitespace is part of the value, not a comment.
+        assert_eq!(strip_inline_comment("true#x"), "true#x");
+        assert_eq!(strip_inline_comment("#leading"), "#leading");
+        assert_eq!(strip_inline_comment(""), "");
     }
 
     #[test]
