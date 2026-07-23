@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Cross-sibling namespace-parity audit test.** `tests/hook_registration_audit.rs::namespace_list_matches_redact_check_sh` now diffs `redact_external_content::NAMESPACES` (newly `pub`) against the sibling plugin's `redact-check.sh` `NS='...'` alternation as sets, catching drift between the Rust and bash namespace blocklists. Mirrors the existing sibling-resolution and silent-skip posture used by `all_binary_subcommands_are_registered` — no sibling checkout, no failure.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed

@@ -680,6 +680,76 @@ fn hook_event_types_match_hooks_json() {
     );
 }
 
+/// Parse the `NS='...'` single-quoted pipe-alternation line out of the
+/// sibling plugin's `redact-check.sh`. Matched by the `NS='` prefix, never
+/// by line number, so the script can grow unrelated lines above or below it
+/// without breaking this parse.
+fn parse_redact_check_namespaces(content: &str) -> Vec<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("NS='")
+            && let Some(list) = rest.strip_suffix('\'')
+        {
+            return list.split('|').map(str::to_string).collect();
+        }
+    }
+    Vec::new()
+}
+
+#[test]
+fn namespace_list_matches_redact_check_sh() {
+    // Sibling plugin script that carries a bash-side copy of the same
+    // namespace list used to build `redact_external_content::NAMESPACES`.
+    // Resolved the same way as the plugin hooks.json siblings above — skip
+    // (not fail) when the sibling checkout isn't present, e.g. bare CI.
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cadence-hooks should be inside claude-configurations")
+        .to_path_buf();
+    let script_path =
+        workspace_root.join("cadence/plugins/cadence/skills/redaction/scripts/redact-check.sh");
+
+    if !script_path.exists() {
+        eprintln!(
+            "SKIPPED: sibling redact-check.sh not found at {} (plugin dir not alongside workspace)",
+            script_path.display()
+        );
+        return;
+    }
+
+    let content = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
+
+    let script_namespaces: BTreeSet<String> = parse_redact_check_namespaces(&content)
+        .into_iter()
+        .collect();
+    assert!(
+        !script_namespaces.is_empty(),
+        "failed to find a `NS='...'` line in {}",
+        script_path.display()
+    );
+
+    let rust_namespaces: BTreeSet<String> =
+        cadence_hooks_cadence::redact_external_content::NAMESPACES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+    let missing_from_script: Vec<&String> =
+        rust_namespaces.difference(&script_namespaces).collect();
+    let missing_from_rust: Vec<&String> = script_namespaces.difference(&rust_namespaces).collect();
+
+    assert!(
+        missing_from_script.is_empty() && missing_from_rust.is_empty(),
+        "namespace list drift between Rust NAMESPACES and {}'s `NS=` line:\n\
+         in Rust but missing from redact-check.sh: {:?}\n\
+         in redact-check.sh but missing from Rust: {:?}",
+        script_path.display(),
+        missing_from_script,
+        missing_from_rust,
+    );
+}
+
 #[test]
 fn settings_json_shell_scripts_exist() {
     let (shell_scripts, _) = settings_json_hooks();
