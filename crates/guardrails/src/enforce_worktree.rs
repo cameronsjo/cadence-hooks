@@ -78,16 +78,19 @@
 //!   rm|mv|stash pop` (not commit boundaries, so the commit flag-walk never
 //!   matches them). The package-manager/`sed`/`tee`/redirect list is a floor;
 //!   widening it is follow-up.
-//! - **`$VAR`/`$(…)`-pathed targets** — `cat > "$OUT"`, `> "$(…)"`: the scoped
-//!   walk carries no assignment expansion (that lives only on the flat
-//!   `command_segments` view, the #228 bypass class this predicate MUST NOT
-//!   use), so the target stays the literal token (`<cwd>/$OUT`). This is
-//!   imprecise both ways: the *intended* file is never resolved (a true target
-//!   is missed), and the literal token's own nearest-existing-ancestor is
-//!   usually the cwd — so if the cwd is in-primary the nudge **over-fires** on
-//!   the wrong path rather than silently missing. Advisory-only, so an
-//!   imprecise nudge is acceptable; widening to the flat expansion view is
-//!   rejected (it is the #228 bypass primitive).
+//! - **Relative `$VAR`/`$(…)`-pathed targets** — `cat > "$OUT"`, `> "$(…)"`:
+//!   the scoped walk carries no assignment expansion (that lives only on the
+//!   flat `command_segments` view, the #228 bypass class this predicate MUST
+//!   NOT use), so the target's true location is unknown and the nudge is
+//!   **silently skipped** for that target rather than guessed (#362). Prior to
+//!   #362 this joined the literal token onto the effective dir instead
+//!   (`<cwd>/$OUT`), which over-fired whenever the cwd was in-primary — e.g. a
+//!   `$SCRATCH`-style redirect into a legitimate out-of-tree `/tmp` scratch
+//!   path was misjudged as in-primary. Advisory-only, so the silent miss is
+//!   the accepted trade (a missed nudge is cheap; a false one is friction). An
+//!   *absolute* `$VAR`-containing target (`/tmp/$SESSION/f`) is unaffected —
+//!   it resolves via the absolute-path branch before variable expansion would
+//!   matter.
 //! - **Prefix-flag wrappers** — `nice -n 10 <mutator>`, `env -i sh -c '…'`,
 //!   `sudo <mutator>`: the transparent-prefix stripper stops at a prefix whose
 //!   next token is a flag (and `sudo` isn't a transparent prefix here), so the
@@ -517,15 +520,29 @@ fn file_mutation_targets(argv: &[String]) -> Vec<String> {
 /// Resolve a mutator's target path against the segment's effective dir, the
 /// same way the commit arm resolves a `-C` redirect: an absolute path (POSIX or
 /// Windows-drive via [`is_shell_absolute`]) or a `~`-path stands alone; a
-/// relative path joins onto the effective dir. A `$VAR`/`$(…)`-pathed target
-/// stays unexpanded → resolves to no repo downstream (fail-open miss).
-fn resolve_mutation_target(path: &str, effective_dir: &str) -> String {
+/// relative path joins onto the effective dir. `None` when the token is a
+/// **relative, unexpanded shell variable reference** (`$VAR/…`, `$(…)/…`) —
+/// the scoped walk carries no assignment expansion (widening to the flat
+/// `command_segments` view is rejected; it's the #228 bypass primitive), so
+/// this token's true location is unknown. Joining it onto `effective_dir`
+/// would fabricate an in-primary path regardless of what the variable
+/// actually resolves to at runtime — e.g. `cat > "$SCRATCH/f"` where
+/// `$SCRATCH` holds an out-of-tree `/tmp` scratch path still gets treated as
+/// `<effective_dir>/$SCRATCH/f`, an in-primary false positive (#362). Skipping
+/// resolution is the safer default for an advisory-only nudge: a false
+/// silent-miss is cheap, a false nudge on a legitimate out-of-tree write is
+/// friction. An *absolute* `$VAR`-containing target (`/tmp/$SESSION/f`) is
+/// unaffected — it stands alone via [`is_shell_absolute`] before this branch
+/// and resolves (with the variable segment literal) same as before.
+fn resolve_mutation_target(path: &str, effective_dir: &str) -> Option<String> {
     if path.starts_with('~') {
-        resolve_cd_target(path, effective_dir)
+        Some(resolve_cd_target(path, effective_dir))
     } else if is_shell_absolute(path) {
-        path.to_string()
+        Some(path.to_string())
+    } else if path.starts_with('$') {
+        None
     } else {
-        format!("{effective_dir}/{path}")
+        Some(format!("{effective_dir}/{path}"))
     }
 }
 
@@ -545,16 +562,14 @@ fn detect_mutations(
         mutations.push(MutationTarget::Dir(effective_dir.to_string()));
     }
     for target in file_mutation_targets(argv) {
-        mutations.push(MutationTarget::File(resolve_mutation_target(
-            &target,
-            effective_dir,
-        )));
+        if let Some(resolved) = resolve_mutation_target(&target, effective_dir) {
+            mutations.push(MutationTarget::File(resolved));
+        }
     }
     for target in redirect_targets(segment) {
-        mutations.push(MutationTarget::File(resolve_mutation_target(
-            &target,
-            effective_dir,
-        )));
+        if let Some(resolved) = resolve_mutation_target(&target, effective_dir) {
+            mutations.push(MutationTarget::File(resolved));
+        }
     }
 }
 
@@ -3185,6 +3200,30 @@ mod tests {
     }
 
     #[test]
+    fn relative_dollar_var_redirect_target_is_skipped_not_joined_to_cwd() {
+        // #362: a relative `$VAR`-pathed redirect target is unresolvable — do
+        // NOT join it onto the effective dir (that fabricates a false
+        // in-primary location regardless of what the variable holds at
+        // runtime).
+        assert!(mutation_targets("cat > \"$SCRATCH/f\"", "/cwd").is_empty());
+        assert!(mutation_targets("echo x > $OUT", "/cwd").is_empty());
+        assert!(mutation_targets("tee \"$OUT\"", "/cwd").is_empty());
+        assert!(mutation_targets("sed -i s/a/b/ \"$OUT\"", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn absolute_dollar_var_component_target_still_resolves() {
+        // An absolute target is unaffected by the #362 fix even when a LATER
+        // path segment contains an unexpanded variable — the absolute-path
+        // branch is checked first and the token (variable segment literal) is
+        // used as-is, same as before.
+        assert_eq!(
+            mutation_targets("cat > /tmp/$SESSION/f", "/cwd"),
+            vec![MutationTarget::File("/tmp/$SESSION/f".to_string())]
+        );
+    }
+
+    #[test]
     fn cd_scopes_mutation_target_like_commit() {
         // A leading `cd` moves the effective dir for the mutation, exactly as
         // for a commit — reusing the same scoped walk.
@@ -3311,6 +3350,26 @@ mod tests {
                 "mutating an EXISTING tracked file must nudge: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn scratch_var_redirect_in_primary_does_not_nudge() {
+        // #362 end-to-end repro: a `$SCRATCH`-style heredoc redirect into a
+        // legitimate out-of-tree scratch path, from a primary checkout, must
+        // NOT nudge — the guard cannot know where `$SCRATCH` actually points,
+        // and assuming worst-case (in-primary) was the false positive.
+        let scratch = Scratch::new("mut-scratch-var");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash(
+            "SCRATCH=/tmp/scratch\ncat > \"$SCRATCH/payload.json\" <<'JSON'\n{}\nJSON\ncat \"$SCRATCH/payload.json\"",
+        );
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "an unresolvable $VAR redirect target must not be assumed in-primary"
+        );
     }
 
     #[test]

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`enforce-worktree`'s subprocess-mutation nudge no longer over-fires on a redirect target with an unresolved `$VAR` reference (cameronsjo/cadence-hooks#362).** A relative redirect/mutator target like `cat > "$SCRATCH/f"` was joined onto the effective directory verbatim (`<cwd>/$SCRATCH/f`) since the scoped walk carries no assignment expansion — this fabricated an in-primary path regardless of what `$SCRATCH` actually resolved to, false-nudging on legitimate out-of-tree writes (e.g. a `/tmp` scratch-dir redirect). Such a target is now skipped rather than resolved — a silent miss, which is the safer default for an advisory-only check. An absolute target with a `$VAR` component (e.g. `/tmp/$SESSION/f`) is unaffected.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
