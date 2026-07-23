@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`prevent-secret-leaks` allowlists `forgectl env`'s value-free subcommands (cameronsjo/cadence-hooks#315).** `forgectl env keys`/`set`/`get`/`check`/`redact` are structurally value-free on stdout by design (cameronsjo/forgectl#82) — the guard was blocking every one of them anyway because a `.env`-shaped `--file` operand made the whole command look like a leak, the exact catch-22 the tool was built to avoid. `forgectl` command groups other than `env` still get no free pass.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
