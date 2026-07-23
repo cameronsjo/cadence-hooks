@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`warn-subagent-worktree` no longer nudges on a structurally read-only dispatch (cameronsjo/cadence-hooks#331).** The built-in `Explore`/`Plan` `subagent_type` values have their own tool grant exclude `Edit`/`Write`/`NotebookEdit` — nothing can land in the worktree or the primary checkout either way, so isolation is moot. These two are now exempted. A plugin-provided or custom-instructed read-only dispatch (e.g. `cadence:explorer`, or a `general-purpose` agent told "read-only" in its prompt) is not detectable today — whether the Agent tool's `PreToolUse` payload even carries the dispatch prompt text is an open question (cameronsjo/cadence-hooks#374) — and still nudges; documented as a known false-positive class in the check's doc comment.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
