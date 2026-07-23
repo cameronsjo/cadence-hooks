@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`warn-subagent-worktree`'s message names a known false-positive shape (cameronsjo/cadence-hooks#371).** The check can only see structural signals (`isolation`, cwd, sibling-worktree count) — the dispatch prompt text itself isn't in the hook payload today, so a dispatch whose prompt has the agent create and operate on its own explicit worktree (`git -C <repo> worktree add ...`, then `git -C <path>` throughout — the `orchestrating-issue-slates` pattern) still nudges even though the work lands exactly where intended. The nudge now names this case explicitly so an operator can recognize and disregard it rather than learning to ignore the warning broadly.
 - **`try` no longer writes real metrics rows into the production metrics dir (cameronsjo/cadence-hooks#269).** `cadence-hooks try metrics <logger>` self-execs the compiled binary against a generated sample payload, but metrics loggers write unconditionally and silently — a `try` run had appended a real row to the live `skills.jsonl` stream. `try_hook.rs` now sandboxes the self-exec'd child to a scratch tempdir via `CADENCE_METRICS_DIR` (best-effort: if the scratch dir can't be created, a stderr warning names the risk instead of silently falling back to the real dir). `tempfile` promoted from a dev-dependency to a real one in the root crate.
 
 ## [0.64.0] - 2026-07-21
