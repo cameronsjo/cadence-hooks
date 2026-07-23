@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`redact-external-content` allowlist entries now suppress an exact-match non-skill-id hit (cameronsjo/cadence-hooks#318).** A colon-free `.claude/cadence.json` `redaction.allowlist` entry previously suppressed only `skill-id` hits (as a bare-namespace prefix match); it was silently inert for `local-path`/`marketplace`/`harness-noun` hits, even one whose snippet equaled the entry exactly. A repo whose own domain vocabulary includes a harness noun (e.g. a transcript-viewer tool discussing "transcript") had no way to allowlist that literal term short of suppressing the whole category via a `categories.<name>.ceiling` override. Now a colon-free entry exact-matches any non-skill-id hit's snippet. Automatic repo-visibility detection (this issue's other suggested facet) is declined — it would need a network call (`gh repo view`) in a hot-path PreToolUse guard, and this repo's other guards already show real latency/cancellation cost under slow subprocess I/O (#271); the existing per-repo `originAudience` config knob is the intended manual escape hatch for that case.
+
 ## [0.64.0] - 2026-07-21
 
 ### Fixed
