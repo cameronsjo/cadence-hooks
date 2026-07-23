@@ -97,11 +97,23 @@ fn is_allowed_value(value: Option<&str>) -> bool {
 
 /// The nudge message: names the behavior (cwd inheritance → main, not the
 /// worktree) and both fixes, plus the silence env var.
+///
+/// Known false-positive shape (cadence-hooks#371): this check can only see
+/// structural signals (`isolation`, cwd, sibling-worktree count) — the actual
+/// dispatch prompt text isn't in the hook payload, so a dispatch whose prompt
+/// itself instructs the agent to `git -C <path> worktree add ...` and operate
+/// exclusively via that explicit path (the `orchestrating-issue-slates`
+/// pattern) still nudges even though the work lands exactly where intended.
+/// The message names this case explicitly so an operator can recognize and
+/// disregard it, rather than the warning training "ignore this" broadly.
 fn warn_message() -> String {
     "Subagent dispatched from the main checkout while a sibling worktree exists — subagents \
-     inherit this session's cwd, so the work lands in main, not the worktree. To isolate: \
-     dispatch from inside the worktree, or pass isolation: \"worktree\". Silence for this repo: \
-     CADENCE_ALLOW_SUBAGENT_FROM_MAIN=true in .claude/settings.json"
+     inherit this session's cwd, so the work lands in main, not the worktree. Known false \
+     positive: if the dispatch prompt itself has the agent create and operate on its own \
+     explicit worktree (`git -C <repo> worktree add ...`, then `git -C <path>` throughout), \
+     disregard this nudge. To isolate otherwise: dispatch from inside the worktree, or pass \
+     isolation: \"worktree\". Silence for this repo: CADENCE_ALLOW_SUBAGENT_FROM_MAIN=true in \
+     .claude/settings.json"
         .to_string()
 }
 
@@ -223,6 +235,23 @@ mod tests {
         let msg = result.message.expect("nudge has a message");
         assert!(msg.contains("worktree"));
         assert!(msg.contains("CADENCE_ALLOW_SUBAGENT_FROM_MAIN"));
+    }
+
+    #[test]
+    fn warn_message_names_the_explicit_worktree_false_positive() {
+        // #371: the check can't see the dispatch prompt text, so it can't
+        // auto-suppress the "agent creates its own worktree" pattern — the
+        // message must name it explicitly so an operator can recognize and
+        // disregard it instead of learning to ignore the warning wholesale.
+        let msg = warn_message();
+        assert!(
+            msg.contains("false positive"),
+            "message should name the known false-positive shape: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("git -c"),
+            "message should describe the explicit-worktree pattern concretely: {msg}"
+        );
     }
 
     #[test]

@@ -2,6 +2,11 @@
 //! (cadence#473, commit half; the persist-plan half lives in
 //! [`crate::persist_plan`] and shares [`crate::provenance::machine_digest`]).
 //!
+//! Fires once per session (tracked via a temp-file marker, mirroring
+//! `warn_main_branch`), not once per commit (#370) — a session making many
+//! commits under an explicit no-trailer message contract saw this nudge on
+//! every single one, pure noise once the session already knows the format.
+//!
 //! A Claude-composed commit is easier to trace back to its producing session
 //! when its message carries a `Session-Id:` trailer. Rather than asking every
 //! session to remember the format, this check watches `git commit` at
@@ -81,7 +86,25 @@ pub fn run_warn_commit_provenance(input: &HookInput, host: &str) -> CheckResult 
         return CheckResult::allow();
     }
 
-    CheckResult::nudge(build_nudge(input, host))
+    // Once-per-session, not once-per-commit (#370): a session that makes many
+    // commits under an explicit no-trailer message contract (e.g. a dispatched
+    // implementer following a fixed commit-message spec) saw this nudge fire
+    // on every single one — pure noise once the session has already seen the
+    // format. Global (repo_root: None), unlike warn-main-branch's per-repo
+    // marker: "does this session know the trailer format" doesn't reset per
+    // repo the way "is this branch main" does.
+    let marker = cadence_hooks_core::markers::session_marker(input, "provenance-nudge-shown", None);
+    if marker.exists() {
+        return CheckResult::allow();
+    }
+
+    // Build the message BEFORE writing the marker: if build_nudge ever panics
+    // (caught by the caller's catch_unwind), the marker must not already be on
+    // disk — that would permanently suppress a nudge the user never saw.
+    let msg = build_nudge(input, host);
+    let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+
+    CheckResult::nudge(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -516,12 +539,64 @@ mod tests {
 
     #[test]
     fn missing_session_id_marker_nudges() {
-        let input = bash_input("git commit -m 'fix: thing'", Some("sid12345"), None, None);
-        let result = run_warn_commit_provenance(&input, "host");
-        assert_eq!(result.outcome, Outcome::Nudge);
-        let msg = result.message.unwrap();
-        assert!(msg.contains("Session-Id:"));
-        assert!(msg.contains("Machine:"));
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let input = bash_input("git commit -m 'fix: thing'", Some("sid12345"), None, None);
+            let result = run_warn_commit_provenance(&input, "host");
+            assert_eq!(result.outcome, Outcome::Nudge);
+            let msg = result.message.unwrap();
+            assert!(msg.contains("Session-Id:"));
+            assert!(msg.contains("Machine:"));
+        });
+    }
+
+    // --- once-per-session suppression (#370) ---
+
+    #[test]
+    fn second_commit_same_session_does_not_renudge() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let input = bash_input("git commit -m 'fix: thing'", Some("slate-sid"), None, None);
+            assert_eq!(
+                run_warn_commit_provenance(&input, "host").outcome,
+                Outcome::Nudge,
+                "first commit this session must still nudge"
+            );
+
+            let input2 = bash_input(
+                "git commit -m 'fix: another thing'",
+                Some("slate-sid"),
+                None,
+                None,
+            );
+            assert_eq!(
+                run_warn_commit_provenance(&input2, "host").outcome,
+                Outcome::Allow,
+                "a second commit in the same session must not renudge — the session already saw it"
+            );
+        });
+    }
+
+    #[test]
+    fn different_session_still_nudges_after_another_sessions_marker() {
+        // The marker is session-scoped, not global-forever: a distinct
+        // session_id must see its own first nudge regardless of what any
+        // other session already acknowledged.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let first = bash_input("git commit -m 'fix: thing'", Some("session-a"), None, None);
+            assert_eq!(
+                run_warn_commit_provenance(&first, "host").outcome,
+                Outcome::Nudge
+            );
+
+            let other = bash_input("git commit -m 'fix: thing'", Some("session-b"), None, None);
+            assert_eq!(
+                run_warn_commit_provenance(&other, "host").outcome,
+                Outcome::Nudge,
+                "a different session_id must still nudge on its own first commit"
+            );
+        });
     }
 
     #[test]
@@ -549,33 +624,37 @@ mod tests {
         )
         .unwrap();
 
-        let input = bash_input(
-            "git commit -m 'fix: thing'",
-            Some("cedar-session-id"),
-            None,
-            Some(&transcript_path.to_string_lossy()),
-        );
-        let result = run_warn_commit_provenance(&input, "sjomba.local");
-        assert_eq!(result.outcome, Outcome::Nudge);
-        let msg = result.message.unwrap();
+        // Same tempdir doubles as the marker-dir sandbox (#370) — this test
+        // reaches the nudge point, which now writes a session marker.
+        with_marker_dir(tmp.path(), || {
+            let input = bash_input(
+                "git commit -m 'fix: thing'",
+                Some("cedar-session-id"),
+                None,
+                Some(&transcript_path.to_string_lossy()),
+            );
+            let result = run_warn_commit_provenance(&input, "sjomba.local");
+            assert_eq!(result.outcome, Outcome::Nudge);
+            let msg = result.message.unwrap();
 
-        assert!(
-            msg.contains(&format!(
-                "Session-Name: {}",
-                identity::generate_name("cedar-session-id")
-            )),
-            "computed session name present: {msg}"
-        );
-        assert!(msg.contains("Session-Id: cedar-session-id"), "{msg}");
-        assert!(msg.contains("Model: claude-fable-5"), "{msg}");
-        assert!(msg.contains("Harness: claude-code 2.1.214"), "{msg}");
-        assert!(
-            msg.contains(&format!(
-                "Machine: {}",
-                provenance::machine_digest("sjomba.local")
-            )),
-            "computed machine digest present: {msg}"
-        );
+            assert!(
+                msg.contains(&format!(
+                    "Session-Name: {}",
+                    identity::generate_name("cedar-session-id")
+                )),
+                "computed session name present: {msg}"
+            );
+            assert!(msg.contains("Session-Id: cedar-session-id"), "{msg}");
+            assert!(msg.contains("Model: claude-fable-5"), "{msg}");
+            assert!(msg.contains("Harness: claude-code 2.1.214"), "{msg}");
+            assert!(
+                msg.contains(&format!(
+                    "Machine: {}",
+                    provenance::machine_digest("sjomba.local")
+                )),
+                "computed machine digest present: {msg}"
+            );
+        });
     }
 
     #[test]
@@ -587,16 +666,19 @@ mod tests {
         // AI_AGENT is explicitly cleared — this session's own real Claude
         // Code process sets it, which would otherwise let Harness: resolve
         // and falsify the "nothing but Machine resolves" premise.
+        let marker_tmp = tempfile::tempdir().unwrap();
         with_ai_agent_env(None, || {
-            let input = bash_input("git commit -m 'fix: thing'", None, None, None);
-            let result = run_warn_commit_provenance(&input, "host");
-            assert_eq!(result.outcome, Outcome::Nudge);
-            let msg = result.message.unwrap();
-            assert!(!msg.contains("Session-Name: "), "{msg}");
-            assert!(!msg.contains("Session-Id: "), "{msg}");
-            assert!(!msg.contains("Model: "), "{msg}");
-            assert!(!msg.contains("Harness: "), "{msg}");
-            assert!(msg.contains("Machine: "), "{msg}");
+            with_marker_dir(marker_tmp.path(), || {
+                let input = bash_input("git commit -m 'fix: thing'", None, None, None);
+                let result = run_warn_commit_provenance(&input, "host");
+                assert_eq!(result.outcome, Outcome::Nudge);
+                let msg = result.message.unwrap();
+                assert!(!msg.contains("Session-Name: "), "{msg}");
+                assert!(!msg.contains("Session-Id: "), "{msg}");
+                assert!(!msg.contains("Model: "), "{msg}");
+                assert!(!msg.contains("Harness: "), "{msg}");
+                assert!(msg.contains("Machine: "), "{msg}");
+            });
         });
     }
 
@@ -622,6 +704,33 @@ mod tests {
             match prior {
                 Some(v) => std::env::set_var("AI_AGENT", v),
                 None => std::env::remove_var("AI_AGENT"),
+            }
+        }
+        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
+    }
+
+    // --- CADENCE_MARKER_DIR (process-global — serialized + restored) ---
+
+    /// Serializes tests that mutate `CADENCE_MARKER_DIR`, a separate lock from
+    /// `ENV_LOCK` above since the two env vars never race each other. Any test
+    /// that reaches the nudge point now also writes a session marker (#370) —
+    /// isolate it to a scratch tempdir so `cargo test` never writes into the
+    /// real per-user marker directory (the exact #302/#269 class of bug).
+    static MARKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_marker_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = MARKER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var("CADENCE_MARKER_DIR").ok();
+        // SAFETY: serialized via MARKER_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("CADENCE_MARKER_DIR", dir);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: same lock still held; restoring prior state.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("CADENCE_MARKER_DIR", v),
+                None => std::env::remove_var("CADENCE_MARKER_DIR"),
             }
         }
         result.unwrap_or_else(|e| std::panic::resume_unwind(e))

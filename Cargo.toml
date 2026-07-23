@@ -44,7 +44,6 @@ path = "src/main.rs"
 
 [dev-dependencies]
 serde_json.workspace = true
-tempfile = "3"
 
 [dependencies]
 clap.workspace = true
@@ -58,3 +57,4 @@ cadence-hooks-obsidian.workspace = true
 cadence-hooks-metrics.workspace = true
 cadence-hooks-lab.workspace = true
 cadence-hooks-session.workspace = true
+tempfile = "3"
