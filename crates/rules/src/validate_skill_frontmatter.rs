@@ -39,8 +39,9 @@ const VALID_FIELDS: &[&str] = &[
 // invocation name — which made the prefixed form render correctly. That is the
 // convention this reverses.
 //
-// IF THE PLATFORM FLIPS BACK (e.g. Anthropic de-duplicates an already-prefixed
-// name), the order matters: relax this pattern and SHIP A RELEASE FIRST, then
+// IF THE PLATFORM FLIPS BACK — de-duplication is requested upstream in
+// anthropics/claude-code#80631; watch that issue — the order matters:
+// relax this pattern and SHIP A RELEASE FIRST, then
 // sweep the corpus with `cadence/scripts/skill-names.py --prefixed`. Tightened
 // as it stands, this check blocks every edit to a prefixed SKILL.md — including
 // the sweep that would undo it. Restoring the old form means re-adding the
