@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`doctor`'s `stdin-parse failure` finding now carries recency + version context**, so a burst whose fix already shipped reads differently from a live wiring problem. The diagnosis gains when the reason last fired, on which binary version, and how many of the windowed rows are on the *current* binary — e.g. `221 stdin-parse failure(s) in the last 7 days (failopen.jsonl; last: 2026-07-20T20:51:00Z on 0.61.0 — none on current 0.66.0)` — and the remediation notes that no failures on the current version usually means the feed was already fixed, so check the CHANGELOG before chasing wiring. The *count* stays window-wide (unlike `version_mismatch`, a bad-stdin feed problem is not version-specific, so filtering it would under-report a live one); only the presentation gains the disambiguating fields, surfaced from data already in each row (`ts`, `binaryVersion`) by a single `recent_failopen_report` read that returns the counts and the parse recency together. Motivated by the cameronsjo/cadence-hooks#356 burst, whose fix shipped in 0.64.0 yet warned identically for the full 7-day window as it aged out.
+
 ## [0.67.0] - 2026-07-24
 
 ### Added

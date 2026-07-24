@@ -73,9 +73,9 @@ pub fn log_failopen(
 
 /// Fail-open row counts within a time window, grouped by `reason`.
 ///
-/// `version_mismatch` is pre-filtered (by [`recent_failopen_counts`]) to rows
-/// whose `binaryVersion` equals the caller's `current_version` — see that
-/// function's doc for why.
+/// `version_mismatch` is pre-filtered (by [`counts_from`]) to rows whose
+/// `binaryVersion` equals the caller's `current_version` — see that function's
+/// doc for why.
 #[derive(Debug, PartialEq, Eq, Default)]
 pub struct FailopenCounts {
     pub panic: u64,
@@ -89,24 +89,55 @@ pub struct FailopenCounts {
     pub deadline_block_suppressed: u64,
 }
 
-/// Count `failopen.jsonl` rows within `window` of `now`, filtered by `reason`
-/// and (when `version_filter` is `Some`) an exact `binaryVersion` match. Pure
-/// — operates on file contents, no I/O.
+/// Recency + version context for one `reason`'s windowed rows — the fields
+/// doctor needs to tell a *fixed* fail-open burst from a *live* one. Counting
+/// stays window-wide (a wiring problem is not version-specific, so filtering
+/// the count the way `version_mismatch` does would under-report a live issue);
+/// this rides alongside the count instead. It names when the reason last fired,
+/// on which binary version, and how many of the windowed rows carry the CURRENT
+/// binary's version. Zero on the current version is the tell that the feed was
+/// already fixed in a shipped release and the burst is just aging out of the
+/// 7-day window.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FailopenRecency {
+    /// The most recent windowed row's `ts` for this reason.
+    pub last_ts: String,
+    /// The `binaryVersion` on that most recent row (`"unknown"` if it was
+    /// absent — every row written by this binary stamps one).
+    pub last_version: String,
+    /// How many of this reason's windowed rows carry `current_version`.
+    pub on_current_version: u64,
+}
+
+/// The `failopen.jsonl` rows matching `reason` within the window — the single
+/// filter both counting and recency read, so their row sets are structurally
+/// the same rather than two prose-aligned re-implementations. Pure — operates
+/// on file contents, no I/O.
 ///
 /// `ts` is compared lexicographically against `cutoff` — valid because both
 /// are the same fixed-width ISO 8601 (`%Y-%m-%dT%H:%M:%SZ`) shape, which sorts
-/// identically to chronological order. Unparsable rows and rows missing a
-/// required field are skipped, not counted.
-fn count_recent(jsonl: &str, cutoff: &str, reason: &str, version_filter: Option<&str>) -> u64 {
+/// identically to chronological order. Unparsable rows and rows missing
+/// `reason` or `ts` are skipped.
+fn windowed_rows<'a>(
+    jsonl: &'a str,
+    cutoff: &'a str,
+    reason: &'a str,
+) -> impl Iterator<Item = Value> + 'a {
     jsonl
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|v| v.get("reason").and_then(Value::as_str) == Some(reason))
-        .filter(|v| {
+        .filter(move |v| v.get("reason").and_then(Value::as_str) == Some(reason))
+        .filter(move |v| {
             v.get("ts")
                 .and_then(Value::as_str)
                 .is_some_and(|ts| ts >= cutoff)
         })
+}
+
+/// Count [`windowed_rows`] for `reason`, optionally narrowing to an exact
+/// `binaryVersion` match (`version_filter`). Pure — no I/O.
+fn count_recent(jsonl: &str, cutoff: &str, reason: &str, version_filter: Option<&str>) -> u64 {
+    windowed_rows(jsonl, cutoff, reason)
         .filter(|v| match version_filter {
             Some(want) => v.get("binaryVersion").and_then(Value::as_str) == Some(want),
             None => true,
@@ -114,7 +145,19 @@ fn count_recent(jsonl: &str, cutoff: &str, reason: &str, version_filter: Option<
         .count() as u64
 }
 
-/// Count `failopen.jsonl` rows within `window` of `now`, grouped by `reason`.
+/// Lexicographically-comparable ISO 8601 (`%Y-%m-%dT%H:%M:%SZ`) lower bound for
+/// `window` before `now` — the cutoff every row's `ts` is compared against, by
+/// both counting and recency. Its fixed-width shape sorts identically to
+/// chronological order, so a plain string compare is a valid time compare.
+fn window_cutoff(now: SystemTime, window: Duration) -> String {
+    let cutoff_ts =
+        jiff::Timestamp::try_from(now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH))
+            .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+    cutoff_ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Counts grouped by `reason` over already-read `failopen.jsonl` `contents`.
+/// Pure — no I/O.
 ///
 /// `version_mismatch` counts ONLY rows whose `binaryVersion` equals
 /// `current_version` (the caller's own running binary version) — this is the
@@ -125,43 +168,97 @@ fn count_recent(jsonl: &str, cutoff: &str, reason: &str, version_filter: Option<
 /// binary's own version means the skew didn't resolve, which is what's worth
 /// surfacing. `panic`/`parse` counts are NOT version-filtered — any occurrence
 /// on any version is worth counting.
-///
-/// Fail-open: a missing/unreadable `<dir>/failopen.jsonl`, or any unparsable
-/// row, contributes 0 / is skipped rather than erroring. Doctor visibility
-/// only — never gates anything.
-pub fn recent_failopen_counts(
-    dir: &Path,
-    window: Duration,
-    now: SystemTime,
-    current_version: &str,
-) -> FailopenCounts {
-    let Ok(contents) = std::fs::read_to_string(dir.join("failopen.jsonl")) else {
-        return FailopenCounts::default();
-    };
-    let cutoff_ts =
-        jiff::Timestamp::try_from(now.checked_sub(window).unwrap_or(SystemTime::UNIX_EPOCH))
-            .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
-    let cutoff = cutoff_ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
-
+fn counts_from(contents: &str, cutoff: &str, current_version: &str) -> FailopenCounts {
     FailopenCounts {
-        panic: count_recent(&contents, &cutoff, "panic", None),
-        parse: count_recent(&contents, &cutoff, "parse", None),
-        version_mismatch: count_recent(
-            &contents,
-            &cutoff,
-            "version_mismatch",
-            Some(current_version),
-        ),
+        panic: count_recent(contents, cutoff, "panic", None),
+        parse: count_recent(contents, cutoff, "parse", None),
+        version_mismatch: count_recent(contents, cutoff, "version_mismatch", Some(current_version)),
         // Deadline rows are environment-correlated (slow disk, load), not
         // version-correlated — count across versions, like panic/parse.
-        deadline: count_recent(&contents, &cutoff, "deadline", None),
+        deadline: count_recent(contents, cutoff, "deadline", None),
         deadline_block_suppressed: count_recent(
-            &contents,
-            &cutoff,
+            contents,
+            cutoff,
             "deadline_block_suppressed",
             None,
         ),
     }
+}
+
+/// Per-reason counts plus recency + version context for `recency_reason`, from a
+/// single read of `<dir>/failopen.jsonl`. Doctor's `parse` finding needs both
+/// the count and the recency clause, so folding them into one reader parses the
+/// file once — the counts and the recency derive from the same [`windowed_rows`]
+/// pass, not two independent reads.
+///
+/// The recency component is `None` when `recency_reason` has no rows in the
+/// window. Fail-open: a missing/unreadable file yields `(FailopenCounts::default(),
+/// None)` rather than erroring. Doctor visibility only — never gates anything.
+pub fn recent_failopen_report(
+    dir: &Path,
+    window: Duration,
+    now: SystemTime,
+    current_version: &str,
+    recency_reason: &str,
+) -> (FailopenCounts, Option<FailopenRecency>) {
+    let Ok(contents) = std::fs::read_to_string(dir.join("failopen.jsonl")) else {
+        return (FailopenCounts::default(), None);
+    };
+    let cutoff = window_cutoff(now, window);
+    let counts = counts_from(&contents, &cutoff, current_version);
+    let recency = recency_from(&contents, &cutoff, recency_reason, current_version);
+    (counts, recency)
+}
+
+/// Strip control characters (ANSI escapes, newlines) from a file-sourced string
+/// before it is interpolated into terminal-printed `doctor` output.
+fn display_safe(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Pure recency computation over `failopen.jsonl` contents. Reads the same
+/// [`windowed_rows`] `count_recent` counts — so the recency row set *is* the
+/// counted set, not a parallel re-derivation — then reports the max-`ts` row's
+/// timestamp and version plus the current-version row count. `None` when no row
+/// matches.
+fn recency_from(
+    jsonl: &str,
+    cutoff: &str,
+    reason: &str,
+    current_version: &str,
+) -> Option<FailopenRecency> {
+    let rows: Vec<Value> = windowed_rows(jsonl, cutoff, reason).collect();
+
+    // Comparator form, not `max_by_key`: the key borrows from the row, which a
+    // `-> B` key closure can't outlive. On a `ts` tie (two rows in the same
+    // second, plausible under a burst) `max_by` keeps the later row in file
+    // order — an arbitrary but deterministic winner, which is all a recency
+    // display needs.
+    let last = rows.iter().max_by(|a, b| {
+        let ta = a.get("ts").and_then(Value::as_str).unwrap_or("");
+        let tb = b.get("ts").and_then(Value::as_str).unwrap_or("");
+        ta.cmp(tb)
+    })?;
+    // display_safe: these land verbatim in a terminal-printed doctor diagnosis.
+    // The values are this binary's own `ts`/`binaryVersion`, so only a
+    // hand-tampered failopen.jsonl could smuggle ANSI/control bytes through —
+    // strip them as defense-in-depth against escape-sequence injection.
+    let last_ts = display_safe(last.get("ts").and_then(Value::as_str)?);
+    let last_version = display_safe(
+        last.get("binaryVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    let on_current_version = rows
+        .iter()
+        .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
+        .count() as u64;
+
+    Some(FailopenRecency {
+        last_ts,
+        last_version,
+        on_current_version,
+    })
 }
 
 #[cfg(test)]
@@ -318,22 +415,24 @@ mod tests {
         );
     }
 
-    // --- recent_failopen_counts end-to-end (tempdir) ---
+    // --- recent_failopen_report end-to-end (tempdir) ---
 
     #[test]
-    fn recent_failopen_counts_missing_file_is_zero() {
+    fn recent_failopen_report_missing_file_is_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let counts = recent_failopen_counts(
+        let (counts, recency) = recent_failopen_report(
             tmp.path(),
             Duration::from_secs(7 * 86_400),
             SystemTime::now(),
             "1.0.0",
+            "parse",
         );
         assert_eq!(counts, FailopenCounts::default());
+        assert!(recency.is_none());
     }
 
     #[test]
-    fn recent_failopen_counts_groups_by_reason_and_current_version() {
+    fn recent_failopen_report_groups_by_reason_and_current_version() {
         let tmp = tempfile::tempdir().unwrap();
         with_metrics_dir(tmp.path(), || {
             log_failopen("panic", Some("cadence"), Some("terminology"), "1.0.0");
@@ -343,11 +442,12 @@ mod tests {
             // Current-version mismatch: didn't resolve — counted.
             log_failopen("version_mismatch", Some("future"), Some("hook"), "1.0.0");
         });
-        let counts = recent_failopen_counts(
+        let (counts, _) = recent_failopen_report(
             tmp.path(),
             Duration::from_secs(7 * 86_400),
             SystemTime::now(),
             "1.0.0",
+            "parse",
         );
         assert_eq!(
             counts,
@@ -361,17 +461,111 @@ mod tests {
         );
     }
 
+    // --- recency (pure + end-to-end) ---
+
     #[test]
-    fn recent_failopen_counts_excludes_outside_window() {
+    fn recency_from_reports_last_row_and_current_version_count() {
+        let jsonl = [
+            r#"{"reason":"parse","binaryVersion":"0.61.0","ts":"2026-07-18T00:00:00Z"}"#,
+            r#"{"reason":"parse","binaryVersion":"0.61.0","ts":"2026-07-20T20:51:00Z"}"#,
+            r#"{"reason":"parse","binaryVersion":"0.66.0","ts":"2026-07-19T00:00:00Z"}"#,
+        ]
+        .join("\n");
+        let recency = recency_from(&jsonl, "2026-07-01T00:00:00Z", "parse", "0.66.0").unwrap();
+        // Max-ts row is the 0.61.0 one at 20:51, even though it is not last in
+        // file order — recency picks by timestamp, not position.
+        assert_eq!(recency.last_ts, "2026-07-20T20:51:00Z");
+        assert_eq!(recency.last_version, "0.61.0");
+        assert_eq!(recency.on_current_version, 1);
+    }
+
+    #[test]
+    fn recency_from_none_on_current_version_is_the_fixed_burst_signal() {
+        let jsonl = [
+            r#"{"reason":"parse","binaryVersion":"0.61.0","ts":"2026-07-18T00:00:00Z"}"#,
+            r#"{"reason":"parse","binaryVersion":"0.61.0","ts":"2026-07-20T20:51:00Z"}"#,
+        ]
+        .join("\n");
+        let recency = recency_from(&jsonl, "2026-07-01T00:00:00Z", "parse", "0.66.0").unwrap();
+        assert_eq!(recency.on_current_version, 0);
+        assert_eq!(recency.last_version, "0.61.0");
+    }
+
+    #[test]
+    fn recency_from_ts_tie_keeps_later_file_order_row() {
+        // Two rows in the same second — the documented `max_by` tie rule keeps
+        // the later one in file order.
+        let jsonl = [
+            r#"{"reason":"parse","binaryVersion":"0.61.0","ts":"2026-07-20T20:51:00Z"}"#,
+            r#"{"reason":"parse","binaryVersion":"0.62.0","ts":"2026-07-20T20:51:00Z"}"#,
+        ]
+        .join("\n");
+        let recency = recency_from(&jsonl, "2026-07-01T00:00:00Z", "parse", "0.66.0").unwrap();
+        assert_eq!(recency.last_version, "0.62.0");
+    }
+
+    #[test]
+    fn recency_from_no_matching_rows_is_none() {
+        let jsonl = r#"{"reason":"panic","binaryVersion":"1.0.0","ts":"2026-07-20T00:00:00Z"}"#;
+        assert!(recency_from(jsonl, "2026-07-01T00:00:00Z", "parse", "1.0.0").is_none());
+    }
+
+    #[test]
+    fn recency_from_excludes_rows_outside_window() {
+        let jsonl = r#"{"reason":"parse","binaryVersion":"1.0.0","ts":"2000-01-01T00:00:00Z"}"#;
+        assert!(recency_from(jsonl, "2026-07-01T00:00:00Z", "parse", "1.0.0").is_none());
+    }
+
+    #[test]
+    fn recency_from_missing_binary_version_reports_unknown() {
+        let jsonl = r#"{"reason":"parse","ts":"2026-07-20T20:51:00Z"}"#;
+        let recency = recency_from(jsonl, "2026-07-01T00:00:00Z", "parse", "0.66.0").unwrap();
+        assert_eq!(recency.last_version, "unknown");
+        assert_eq!(recency.on_current_version, 0);
+    }
+
+    #[test]
+    fn recency_from_strips_control_bytes_from_display_fields() {
+        // A hand-tampered row smuggling an ANSI escape (JSON \u001b) into
+        // binaryVersion — the ESC byte is stripped, leaving the sequence's inert
+        // tail as plain text rather than a terminal color command.
+        let jsonl =
+            r#"{"reason":"parse","binaryVersion":"0.61.0\u001b[31mX","ts":"2026-07-20T20:51:00Z"}"#;
+        let recency = recency_from(jsonl, "2026-07-01T00:00:00Z", "parse", "0.66.0").unwrap();
+        assert_eq!(recency.last_version, "0.61.0[31mX");
+    }
+
+    #[test]
+    fn recent_failopen_report_recency_reads_written_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_metrics_dir(tmp.path(), || {
+            log_failopen("parse", Some("cadence"), Some("heartbeat"), "0.61.0");
+        });
+        let (_, recency) = recent_failopen_report(
+            tmp.path(),
+            Duration::from_secs(7 * 86_400),
+            SystemTime::now(),
+            "0.66.0",
+            "parse",
+        );
+        let recency = recency.unwrap();
+        assert_eq!(recency.last_version, "0.61.0");
+        assert_eq!(recency.on_current_version, 0);
+    }
+
+    #[test]
+    fn recent_failopen_report_excludes_outside_window() {
         let tmp = tempfile::tempdir().unwrap();
         let old_row = r#"{"schemaVersion":1,"reason":"panic","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"2000-01-01T00:00:00Z"}"#;
         std::fs::write(tmp.path().join("failopen.jsonl"), format!("{old_row}\n")).unwrap();
-        let counts = recent_failopen_counts(
+        let (counts, recency) = recent_failopen_report(
             tmp.path(),
             Duration::from_secs(7 * 86_400),
             SystemTime::now(),
             "1.0.0",
+            "parse",
         );
         assert_eq!(counts, FailopenCounts::default());
+        assert!(recency.is_none());
     }
 }
