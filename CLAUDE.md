@@ -25,6 +25,8 @@ Manual tagging or formula edits race the automation. Post-release: `brew update 
 
 **To bundle N PRs into ONE release, hold the version.** Every push to `main` that changes the `Cargo.toml` version auto-tags and releases — so merging N version-bumping PRs cuts N releases. When landing a merge train, resolve each rebased PR's `Cargo.toml`/`Cargo.lock` version conflict to `main`'s *current* value (`git checkout --ours Cargo.toml Cargo.lock`, then `cargo build` to re-sync the lock) so the merges don't auto-tag, then `make bump` **once** at the end for a single release. (Verified 2026-06-08 bundling #75/#76/#78 into 0.25.0; #79 had already self-released 0.24.0 on its own merge because its bump survived.)
 
+**Held-version bundling still hits a real `CHANGELOG.md` merge conflict, not a clean fast-forward, when two PRs both stage a bullet under `[Unreleased]`.** Merging the first PR lands cleanly; the second PR's branch then reports `GraphQL: Pull Request has merge conflicts` on the exact same file both PRs were told to touch (per "Each PR stages its CHANGELOG bullet under `[Unreleased]`" above). Fix: `git merge origin/main` into the second PR's branch, keep both bullets (they're additive, not competing), push, then merge. Held-version bundling prevents double-*releases*; it doesn't prevent this one predictable merge conflict. (Bit bundling #391/#393 into 0.67.0, 2026-07-24.)
+
 ## Gotchas
 
 - **Ignore `make bump`'s "next steps" output** — it suggests `git tag` + `git push --tags`, which predates and races the auto-tag automation. Just commit and push; `auto-tag.yml` owns tagging.
