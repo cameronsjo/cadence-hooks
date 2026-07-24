@@ -105,7 +105,9 @@ fn ceiling_ord(s: &str) -> u8 {
 /// not as `cadence` + leftover or bare `mcp`.
 /// `pub` (rather than crate-private) so the cross-sibling namespace-parity
 /// audit test (`tests/hook_registration_audit.rs`) can read it directly and
-/// diff it against the plugin-side `redact-check.sh` namespace list.
+/// diff it against the plugin-side `redact-check.sh` namespace list. Exposed
+/// for that in-repo test linkage only — not a supported public API.
+#[doc(hidden)]
 pub const NAMESPACES: &[&str] = &[
     "cadence",
     "cadence-forge",

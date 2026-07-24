@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - **Cross-sibling namespace-parity audit test.** `tests/hook_registration_audit.rs::namespace_list_matches_redact_check_sh` now diffs `redact_external_content::NAMESPACES` (newly `pub`) against the sibling plugin's `redact-check.sh` `NS='...'` alternation as sets, catching drift between the Rust and bash namespace blocklists. Mirrors the existing sibling-resolution and silent-skip posture used by `all_binary_subcommands_are_registered` — no sibling checkout, no failure.
+- **Hardened the namespace-parity audit's sibling resolution and `NS=` parsing.** The skip now keys off the sibling plugin's `skills/redaction` *directory* existing (mirroring `all_binary_subcommands_are_registered`'s directory-keyed skip), not the script file itself — so a present plugin checkout with a moved or renamed `redact-check.sh` fails loudly instead of silently skipping. `parse_redact_check_namespaces` now collects every `NS='...'` line and asserts there's exactly one, rather than trusting the first match. Also extracted a shared `workspace_root()` helper (was duplicated three times) and marked `NAMESPACES` `#[doc(hidden)]` as an in-repo test-linkage exposure, not a supported public API.
 
 ## [0.66.0] - 2026-07-23
 

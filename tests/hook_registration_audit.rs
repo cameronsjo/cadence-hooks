@@ -11,6 +11,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The workspace parent directory — one level above this crate's manifest
+/// dir — where sibling plugin checkouts (`cadence/`, `cadence-guardrails/`,
+/// etc.) live alongside this repo. Shared by every audit that cross-checks
+/// a sibling plugin.
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cadence-hooks should be inside claude-configurations")
+        .to_path_buf()
+}
+
 /// All valid `<plugin> <subcommand>` pairs the binary accepts.
 /// Discovered by running `cadence-hooks <plugin> --help` for each plugin group.
 fn binary_subcommands() -> BTreeSet<String> {
@@ -144,10 +155,7 @@ const KNOWN_DISTINCT_SETTINGS_SCRIPTS: &[&str] = &[
 
 /// Plugin name -> list of `<plugin> <subcommand>` strings referenced in its hooks.json.
 fn hooks_json_references() -> BTreeMap<String, Vec<HookRef>> {
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cadence-hooks should be inside claude-configurations")
-        .to_path_buf();
+    let workspace_root = workspace_root();
 
     let plugin_dirs = BINARY_PLUGIN_DIRS;
 
@@ -372,10 +380,7 @@ fn all_binary_subcommands_are_registered() {
     // (not hooks.json existence) so a checked-out plugin with missing wiring
     // fails the audit instead of hiding behind the exemption. Remove the
     // PENDING_PLUGIN_GROUPS entry in the plugin's wiring PR.
-    let workspace_parent = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cadence-hooks should be inside claude-configurations")
-        .to_path_buf();
+    let workspace_parent = workspace_root();
     let pending_groups: BTreeSet<&str> = PENDING_PLUGIN_GROUPS
         .iter()
         .filter(|(group, _)| {
@@ -684,38 +689,59 @@ fn hook_event_types_match_hooks_json() {
 /// sibling plugin's `redact-check.sh`. Matched by the `NS='` prefix, never
 /// by line number, so the script can grow unrelated lines above or below it
 /// without breaking this parse.
+///
+/// Collects every matching line (rather than returning on the first) and
+/// asserts there is exactly one — a future unrelated line shaped like
+/// `NS='...'` (e.g. a comment or a second variable) would otherwise
+/// silently win by first-match instead of failing loudly.
 fn parse_redact_check_namespaces(content: &str) -> Vec<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("NS='")
-            && let Some(list) = rest.strip_suffix('\'')
-        {
-            return list.split('|').map(str::to_string).collect();
-        }
-    }
-    Vec::new()
+    let matches: Vec<&str> = content
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("NS='"))
+        .filter_map(|rest| rest.strip_suffix('\''))
+        .collect();
+
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one `NS='...'` line in redact-check.sh, found {}: {matches:?}",
+        matches.len()
+    );
+
+    matches[0].split('|').map(str::to_string).collect()
 }
 
 #[test]
 fn namespace_list_matches_redact_check_sh() {
     // Sibling plugin script that carries a bash-side copy of the same
     // namespace list used to build `redact_external_content::NAMESPACES`.
-    // Resolved the same way as the plugin hooks.json siblings above — skip
-    // (not fail) when the sibling checkout isn't present, e.g. bare CI.
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cadence-hooks should be inside claude-configurations")
-        .to_path_buf();
-    let script_path =
-        workspace_root.join("cadence/plugins/cadence/skills/redaction/scripts/redact-check.sh");
-
-    if !script_path.exists() {
+    //
+    // The skip is keyed off the sibling's `skills/redaction` DIRECTORY
+    // existing, not the script file — mirroring how
+    // `all_binary_subcommands_are_registered` keys its exemption off plugin
+    // directory existence. That distinguishes two different situations:
+    // the sibling checkout genuinely isn't present alongside this repo
+    // (bare CI, no siblings — benign, silent skip), versus the checkout IS
+    // present but `redact-check.sh` has moved or been renamed underneath
+    // it (a real regression this test should fail loudly on, not swallow).
+    let skill_dir = workspace_root().join("cadence/plugins/cadence/skills/redaction");
+    if !skill_dir.is_dir() {
         eprintln!(
-            "SKIPPED: sibling redact-check.sh not found at {} (plugin dir not alongside workspace)",
-            script_path.display()
+            "SKIPPED: sibling cadence plugin's redaction skill dir not found at {} \
+             (plugin dir not alongside workspace)",
+            skill_dir.display()
         );
         return;
     }
+
+    let script_path = skill_dir.join("scripts/redact-check.sh");
+    assert!(
+        script_path.exists(),
+        "sibling redaction skill dir exists at {} but scripts/redact-check.sh is missing — \
+         has the script moved or been renamed? Update this test's expected path.",
+        skill_dir.display()
+    );
 
     let content = std::fs::read_to_string(&script_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
@@ -723,11 +749,6 @@ fn namespace_list_matches_redact_check_sh() {
     let script_namespaces: BTreeSet<String> = parse_redact_check_namespaces(&content)
         .into_iter()
         .collect();
-    assert!(
-        !script_namespaces.is_empty(),
-        "failed to find a `NS='...'` line in {}",
-        script_path.display()
-    );
 
     let rust_namespaces: BTreeSet<String> =
         cadence_hooks_cadence::redact_external_content::NAMESPACES
