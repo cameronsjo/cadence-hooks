@@ -15,6 +15,8 @@ const VALID_FIELDS: &[&str] = &[
     "metadata",
     "allowed-tools",
     "argument-hint",
+    "arguments",
+    "disallowed-tools",
     "disable-model-invocation",
     "user-invocable",
     "model",
@@ -23,12 +25,23 @@ const VALID_FIELDS: &[&str] = &[
     "agent",
     "hooks",
     "paths",
+    "when_to_use",
+    "effort",
+    "shell",
 ];
 
 // House strictness: boolean fields take exactly `true` or `false`. The
 // platform (Claude Code >= 2.1.218) also accepts yes/no/on/off/1/0 —
 // cadence deliberately does not: one spelling keeps the corpus greppable.
 const BOOLEAN_FIELDS: &[&str] = &["background", "disable-model-invocation", "user-invocable"];
+
+// Enum fields: value must be exactly one of the listed options (same
+// unquoted-only house strictness as BOOLEAN_FIELDS). Sets verified against
+// the raw Claude Code docs (code.claude.com/docs/en/skills), not assumed.
+const ENUM_FIELDS: &[(&str, &[&str])] = &[
+    ("effort", &["low", "medium", "high", "xhigh", "max"]),
+    ("shell", &["bash", "powershell"]),
+];
 
 // Kebab-case name with NO namespace prefix — a colon is rejected outright.
 //
@@ -169,6 +182,18 @@ impl Check for ValidateSkillFrontmatter {
             if BOOLEAN_FIELDS.contains(&key.as_str()) && bare != "true" && bare != "false" {
                 errors.push(format!(
                     "'{key}' must be exactly 'true' or 'false' (got: '{bare}') — the platform accepts yes/no/on/off/1/0, cadence house style does not"
+                ));
+            }
+        }
+
+        // Enum fields: value must exactly match one of the allowed options.
+        for (key, value) in &fields {
+            let bare = strip_inline_comment(value);
+            if let Some((_, allowed)) = ENUM_FIELDS.iter().find(|(k, _)| *k == key.as_str())
+                && !allowed.contains(&bare)
+            {
+                errors.push(format!(
+                    "'{key}' must be one of {allowed:?} (got: '{bare}')"
                 ));
             }
         }
@@ -808,5 +833,107 @@ mod tests {
         let content = "---\nname: my-skill\nbroken line\ndescription: test\n---\n";
         let fields = extract_frontmatter(content).unwrap();
         assert_eq!(fields.len(), 2); // broken line is skipped
+    }
+
+    // --- Platform sweep: when_to_use, arguments, disallowed-tools, effort, shell ---
+
+    #[test]
+    fn run_skill_with_when_to_use_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\nwhen_to_use: Use when doing X\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_with_arguments_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\narguments: issue branch\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_with_disallowed_tools_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\ndisallowed-tools: AskUserQuestion\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_with_valid_effort_passes() {
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            let content =
+                format!("---\nname: my-skill\ndescription: test\neffort: {level}\n---\n# Content");
+            let input = make_write_input("/plugins/skills/my-skill/SKILL.md", &content);
+            let result = ValidateSkillFrontmatter.run(&input);
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "effort: {level} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn run_skill_with_invalid_effort_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\neffort: extreme\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("'effort' must be one of"));
+    }
+
+    #[test]
+    fn run_skill_with_valid_shell_passes() {
+        for shell in ["bash", "powershell"] {
+            let content =
+                format!("---\nname: my-skill\ndescription: test\nshell: {shell}\n---\n# Content");
+            let input = make_write_input("/plugins/skills/my-skill/SKILL.md", &content);
+            let result = ValidateSkillFrontmatter.run(&input);
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "shell: {shell} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn run_skill_with_invalid_shell_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\nshell: zsh\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("'shell' must be one of"));
+    }
+
+    #[test]
+    fn run_skill_unknown_field_still_rejected_alongside_new_fields() {
+        // The new fields don't loosen the allowlist — an unrelated unknown
+        // key is still rejected.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\neffort: high\ntotally-made-up: value\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("Unknown frontmatter field: 'totally-made-up'")
+        );
     }
 }
