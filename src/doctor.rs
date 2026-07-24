@@ -488,19 +488,32 @@ fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option
 /// because each one is an enforcement block that did not fire;
 /// `version_mismatch` only counts rows
 /// tagged with the CURRENT binary's own version (see
-/// `log_failopen::recent_failopen_counts`'s doc) — an older-version row is the
+/// `log_failopen::counts_from`'s doc) — an older-version row is the
 /// sanctioned release-transition case and is excluded by construction.
+///
+/// Counts and the `parse` recency come from a single `recent_failopen_report`
+/// read. The `parse` finding additionally carries recency + version context:
+/// when it last fired, on which binary version,
+/// and how many of the windowed rows are on the CURRENT version. Its *count*
+/// stays window-wide — unlike `version_mismatch`, a bad-stdin wiring problem is
+/// not version-specific, so filtering the count would under-report a live one —
+/// but zero on the current version disambiguates a burst whose fix already
+/// shipped (aging out of the 7-day window) from an ongoing feed problem, which
+/// the bare count could not.
 fn failopen_findings(
     dir: &Path,
     window: Duration,
     now: SystemTime,
     current_version: &str,
 ) -> Vec<Finding> {
-    let counts = cadence_hooks_metrics::log_failopen::recent_failopen_counts(
+    // One read of failopen.jsonl yields both the per-reason counts and the
+    // recency context for the `parse` finding (the only reason that shows it).
+    let (counts, parse_recency) = cadence_hooks_metrics::log_failopen::recent_failopen_report(
         dir,
         window,
         now,
         current_version,
+        "parse",
     );
     let days = window.as_secs() / 86_400;
     let mut findings = Vec::new();
@@ -523,6 +536,22 @@ fn failopen_findings(
     }
 
     if counts.parse >= 3 {
+        // Recency + version context so a burst whose fix already shipped reads
+        // differently from a live wiring problem — see this fn's doc comment.
+        let recency = parse_recency
+            .as_ref()
+            .map(|r| {
+                let current_clause = if r.on_current_version == 0 {
+                    format!("none on current {current_version}")
+                } else {
+                    format!("{} on current {current_version}", r.on_current_version)
+                };
+                format!(
+                    "; last: {} on {} — {current_clause}",
+                    r.last_ts, r.last_version
+                )
+            })
+            .unwrap_or_default();
         findings.push(Finding {
             severity: Severity::Warning,
             plugin: "cadence-metrics".to_string(),
@@ -530,12 +559,14 @@ fn failopen_findings(
             line: None,
             snippet: format!("parse: {}", counts.parse),
             diagnosis: format!(
-                "{} stdin-parse failure(s) in the last {days} days (failopen.jsonl)",
+                "{} stdin-parse failure(s) in the last {days} days (failopen.jsonl{recency})",
                 counts.parse
             ),
             remediation: "occasional malformed payloads are tolerated; 3+ suggests \
-                          a wiring problem feeding this binary bad stdin — inspect \
-                          failopen.jsonl"
+                          a wiring problem feeding this binary bad stdin. No failures \
+                          on the current binary version usually means the feed was \
+                          already fixed — check the CHANGELOG before chasing wiring. \
+                          Inspect failopen.jsonl"
                 .to_string(),
         });
     }
@@ -640,6 +671,109 @@ fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> 
 /// Prints an informational (non-blocking, not a `Finding`) count of recent
 /// registry-file reaps when nonzero. No threshold — reaping is normal
 /// operation; this is visibility, not an alarm.
+/// Find the plugin-shipped platform baseline in the marketplace cache.
+/// Newest pin wins when more than one SHA-pinned copy exists (a mid-update
+/// transient, or a stale sibling left behind) — `None` when the cadence
+/// plugin's cache directory, or every pin's baseline file, is missing.
+fn find_baseline_in_cache() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let cadence_dir = PathBuf::from(home).join(".claude/plugins/cache/workbench/cadence");
+    let entries = std::fs::read_dir(&cadence_dir).ok()?;
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("config/platform-baseline.json");
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let is_newer = newest.as_ref().is_none_or(|(t, _)| modified > *t);
+        if is_newer {
+            newest = Some((modified, candidate));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// The Claude Code platform version, via a local `claude --version` exec —
+/// zero network, same as every other `doctor` data source. `doctor` is a
+/// manual, interactive command, so a subprocess here (unlike the SessionStart
+/// hook, which resolves the version from the transcript) is acceptable.
+fn installed_claude_code_version() -> Option<String> {
+    let output = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// Pure formatting core: given an explicit baseline path and a pre-resolved
+/// Claude Code version, produce the doctor status lines. Unconditional and
+/// unthresholded — unlike the SessionStart nudge (which only fires past a
+/// gap), `doctor` always shows both current-state lines when a baseline is
+/// found, so a `doctor` run never has to guess whether drift-checking ran at
+/// all. Testable with a tempdir baseline fixture and an injected version —
+/// no live-machine dependency (unlike [`find_baseline_in_cache`] and
+/// [`installed_claude_code_version`], which resolve those inputs).
+fn platform_drift_status_lines(
+    baseline_path: Option<&Path>,
+    cc_version: Option<&str>,
+) -> Vec<String> {
+    let Some(baseline_path) = baseline_path else {
+        return vec![
+            "cadence-hooks doctor: platform baseline not found under ~/.claude/plugins/cache/workbench/cadence/*/config/platform-baseline.json"
+                .to_string(),
+        ];
+    };
+    let Ok(content) = std::fs::read_to_string(baseline_path) else {
+        return vec![format!(
+            "cadence-hooks doctor: platform baseline unreadable: {}",
+            baseline_path.display()
+        )];
+    };
+    let Ok(baseline) =
+        serde_json::from_str::<cadence_hooks_cadence::platform_drift::Baseline>(&content)
+    else {
+        return vec![format!(
+            "cadence-hooks doctor: platform baseline malformed: {}",
+            baseline_path.display()
+        )];
+    };
+
+    let installed_hooks_version = env!("CARGO_PKG_VERSION");
+    let mut lines = vec![format!(
+        "cadence-hooks doctor: cadence-hooks {installed_hooks_version} (baseline expects {})",
+        baseline.cadence_hooks.current_version
+    )];
+    lines.push(match cc_version {
+        Some(v) => format!(
+            "cadence-hooks doctor: Claude Code {v} (last platform sweep: {})",
+            baseline.claude_code.last_swept_version
+        ),
+        None => "cadence-hooks doctor: Claude Code version unavailable (`claude --version` failed)"
+            .to_string(),
+    });
+    lines
+}
+
+/// Report cadence-hooks and Claude Code version status against the
+/// plugin-shipped baseline — the live-machine wrapper around
+/// [`platform_drift_status_lines`].
+fn print_platform_drift_status() {
+    let baseline_path = find_baseline_in_cache();
+    let cc_version = installed_claude_code_version();
+    for line in platform_drift_status_lines(baseline_path.as_deref(), cc_version.as_deref()) {
+        println!("{line}");
+    }
+}
+
 fn print_sweep_summary(dir: &Path, window: Duration, now: SystemTime) {
     let count = cadence_hooks_metrics::log_sweep::recent_sweep_count(dir, window, now);
     if count == 0 {
@@ -1373,6 +1507,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         ));
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);
+            print_platform_drift_status();
         }
     }
 
@@ -1522,6 +1657,14 @@ mod tests {
 
     const WEEK: Duration = Duration::from_secs(7 * 86_400);
 
+    /// A deterministic `now` two days after the fixed `2026-07-20` rows the
+    /// recency tests use — keeps those rows inside the 7-day window without
+    /// leaning on the wall clock, which would age the fixed date out and turn
+    /// the assertions into a time bomb. `2026-07-22T00:00:00Z` in Unix seconds.
+    fn fixed_now_after_the_rows() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_784_678_400)
+    }
+
     #[test]
     fn failopen_findings_missing_file_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1575,6 +1718,59 @@ mod tests {
         let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
         assert_eq!(findings.len(), 1);
         assert!(findings[0].diagnosis.contains("parse"));
+    }
+
+    #[test]
+    fn failopen_findings_parse_diagnosis_carries_recency_and_current_version() {
+        // A burst on an OLD binary version — the fixed-and-aging-out case. The
+        // diagnosis must name the last failure, its version, and that none are
+        // on the current binary, so a fixed burst is not read as a live one.
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: String = (0..3)
+            .map(|_| {
+                r#"{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"0.61.0","ts":"2026-07-20T20:51:00Z"}"#
+                    .to_string()
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        assert_eq!(findings.len(), 1);
+        let diagnosis = &findings[0].diagnosis;
+        assert!(
+            diagnosis.contains("last: 2026-07-20T20:51:00Z on 0.61.0"),
+            "{diagnosis}"
+        );
+        assert!(diagnosis.contains("none on current 0.66.0"), "{diagnosis}");
+        assert!(
+            findings[0].remediation.contains("check the CHANGELOG"),
+            "{}",
+            findings[0].remediation
+        );
+    }
+
+    #[test]
+    fn failopen_findings_parse_diagnosis_counts_current_version_failures() {
+        // Same reason, but the failures are on the CURRENT binary — a live feed
+        // problem. The current-version clause must report the count, not "none".
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: String = (0..3)
+            .map(|_| {
+                r#"{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"0.66.0","ts":"2026-07-20T20:51:00Z"}"#
+                    .to_string()
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains("3 on current 0.66.0"),
+            "{}",
+            findings[0].diagnosis
+        );
     }
 
     #[test]
@@ -2671,5 +2867,78 @@ mod tests {
     fn cadence_config_parse_finding_absent_is_none() {
         let dir = seed_claude(&[]);
         assert!(cadence_config_parse_finding(dir.path()).is_none());
+    }
+
+    // ── platform_drift_status_lines tests ───────────────────────────────────
+
+    fn write_platform_baseline(dir: &Path, hooks_version: &str, cc_version: &str) -> PathBuf {
+        let path = dir.join("platform-baseline.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"claude_code":{{"last_swept_version":"{cc_version}","swept_on":"2026-07-23","sweep_doc":"n/a"}},"cadence_hooks":{{"current_version":"{hooks_version}"}}}}"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn platform_drift_status_missing_baseline_is_one_info_line() {
+        let lines = platform_drift_status_lines(None, Some("2.1.218"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("baseline not found"));
+    }
+
+    #[test]
+    fn platform_drift_status_unreadable_baseline_is_one_info_line() {
+        let lines = platform_drift_status_lines(
+            Some(Path::new("/nonexistent/baseline.json")),
+            Some("2.1.218"),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("unreadable"));
+    }
+
+    #[test]
+    fn platform_drift_status_malformed_baseline_is_one_info_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("platform-baseline.json");
+        fs::write(&path, "not json").unwrap();
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("malformed"));
+    }
+
+    #[test]
+    fn platform_drift_status_current_baseline_is_two_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), env!("CARGO_PKG_VERSION"), "2.1.218");
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("cadence-hooks"));
+        assert!(lines[1].contains("Claude Code"));
+    }
+
+    #[test]
+    fn platform_drift_status_far_ahead_baseline_is_still_two_lines() {
+        // Unthresholded: doctor shows both current-state lines regardless of
+        // gap size, unlike the SessionStart nudge's >= 5 threshold.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), "0.1.0", "2.0.0");
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("0.1.0"));
+        assert!(lines[1].contains("2.1.218"));
+        assert!(lines[1].contains("2.0.0"));
+    }
+
+    #[test]
+    fn platform_drift_status_missing_cc_version_notes_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), env!("CARGO_PKG_VERSION"), "2.1.218");
+        let lines = platform_drift_status_lines(Some(&path), None);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("unavailable"));
     }
 }

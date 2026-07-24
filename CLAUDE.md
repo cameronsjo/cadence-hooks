@@ -17,6 +17,13 @@ Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatch
 
 Manual tagging or formula edits race the automation. Post-release: `brew update && brew upgrade cadence-hooks`, verify `cadence-hooks --version`.
 
+**Two upkeep steps for the `cadence` plugin's `platform-drift` check** (`plugins/cadence/config/platform-baseline.json` in the cadence monorepo — the SessionStart nudge and `doctor`'s unconditional status report both read it):
+
+1. **Every cadence-hooks release bumps `cadence_hooks.current_version` to the new tag.** Derive it from the tag (`gh release view -R cameronsjo/cadence-hooks --json tagName`), never hand-type it — parallel sessions release from this repo too, and a stale value under-nudges (degrades quietly: no error, just a check that never fires). A CI automation for this bump is a named follow-up, not yet built.
+2. **Every future platform-adoption sweep bumps `claude_code.last_swept_version`** to the Claude Code version swept, alongside `swept_on`.
+
+A stale baseline in either direction fails open (ADR-0001) — it never blocks, just under- or (if hand-typed wrong) over-nudges.
+
 **From a Claude session the bump commit to main is blocked by this repo's own `enforce-worktree` guard** (a primary-checkout `git commit`), unless the session happens to carry `CADENCE_ALLOW_MAIN` in its env. Do the bump in a worktree and push its tip to main: `git worktree add .claude/worktrees/release-X -b release/X origin/main`, then `make bump` + `cargo check` + stamp the CHANGELOG (`## [Unreleased]` → `## [X] - DATE`) **in the worktree**, `git commit`, then `git push origin release/X:main` (fast-forward → triggers auto-tag). `git rebase` is also guard-blocked (git-safety hook), so reshape commits with `reset`, not rebase. Note `release.yml` builds and publishes even when `ci.yml` is red (it doesn't gate on the test suite) — verify the release via the tag/Release workflow/tap formula, not the CI check.
 
 **Check `git log --oneline -5` on main for bump commits before choosing the next version number.** Parallel Claude sessions release from this repo too — a 0.15.1 shipped mid-session while another session was building what became 0.15.2. The race only surfaced because the bump commit failed loudly; don't rely on that.
