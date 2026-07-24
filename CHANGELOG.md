@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`doctor`'s `stdin-parse failure` finding now carries recency + version context**, so a burst whose fix already shipped reads differently from a live wiring problem. The diagnosis gains when the reason last fired, on which binary version, and how many of the windowed rows are on the *current* binary — e.g. `221 stdin-parse failure(s) in the last 7 days (failopen.jsonl; last: 2026-07-20T20:51:00Z on 0.61.0 — none on current 0.66.0)` — and the remediation notes that no failures on the current version usually means the feed was already fixed, so check the CHANGELOG before chasing wiring. The *count* stays window-wide (unlike `version_mismatch`, a bad-stdin feed problem is not version-specific, so filtering it would under-report a live one); only the presentation gains the disambiguating fields, surfaced by the new `recent_failopen_recency` from data already in each row (`ts`, `binaryVersion`). Motivated by the cameronsjo/cadence-hooks#356 burst, whose fix shipped in 0.64.0 yet warned identically for the full 7-day window as it aged out.
+
 ### Added
 
 - **Cross-sibling namespace-parity audit test.** `tests/hook_registration_audit.rs::namespace_list_matches_redact_check_sh` now diffs `redact_external_content::NAMESPACES` (newly `pub`) against the sibling plugin's `redact-check.sh` `NS='...'` alternation as sets, catching drift between the Rust and bash namespace blocklists. Mirrors the existing sibling-resolution and silent-skip posture used by `all_binary_subcommands_are_registered` — no sibling checkout, no failure.
