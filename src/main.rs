@@ -158,6 +158,13 @@ enum CadenceCommands {
     MarkdownLint,
     /// Nudge when an external post mentions internal harness vocabulary
     RedactExternalContent,
+    /// Nudge when the cadence-hooks binary or Claude Code has drifted behind
+    /// the plugin-shipped platform baseline (SessionStart)
+    PlatformDrift {
+        /// Path to the platform-baseline.json shipped by the cadence plugin
+        #[arg(long, value_name = "PATH")]
+        baseline: Option<String>,
+    },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
     RecordPolish {
         #[arg(long, value_name = "PATH")]
@@ -363,6 +370,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::RedactExternalContent => "redact-external-content",
+            CadenceCommands::PlatformDrift { .. } => "platform-drift",
             // record-polish is a CLI action, not a hook — no hooks.json wiring
             // and not subject to CADENCE_DISABLE (same treatment as declare /
             // status / dismiss-*).
@@ -789,6 +797,13 @@ fn main() {
             CadenceCommands::RedactExternalContent => dispatch::run_logged_check(
                 &cadence_hooks_cadence::redact_external_content::RedactExternalContent,
                 pre,
+                canonical_hook,
+            ),
+            CadenceCommands::PlatformDrift { baseline } => dispatch::run_logged_check(
+                &cadence_hooks_cadence::platform_drift::PlatformDrift {
+                    baseline_path: baseline,
+                },
+                session,
                 canonical_hook,
             ),
             CadenceCommands::RecordPolish {

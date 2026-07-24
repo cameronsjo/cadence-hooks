@@ -13,6 +13,9 @@ pub mod markdown_lint;
 pub mod memory_guard;
 /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR.
 pub mod nudge_polish_before_pr;
+/// Nudge when the installed cadence-hooks binary or Claude Code has drifted
+/// behind the plugin-shipped platform baseline (SessionStart).
+pub mod platform_drift;
 /// Block reading secrets (.env, credentials, private keys) into context.
 pub mod prevent_secret_leaks;
 /// Block writing or deleting secrets (.env, credentials, private keys).
