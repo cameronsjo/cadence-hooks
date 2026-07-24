@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.67.0] - 2026-07-24
+
 ### Added
 
 - **New `cadence platform-drift` SessionStart check** nudges when the installed cadence-hooks binary or Claude Code has drifted behind a plugin-shipped `platform-baseline.json`. Work-machine-safe: the cadence-hooks half compares the compiled binary version against the baseline file only (no network); the Claude Code half resolves the running platform version from the transcript's last assistant line (`transcript::last_assistant_harness_version`), never a network call. Nudges when major/minor differ at all, or patch delta is >= 5 within the same major.minor. A cold `source:"startup"` transcript has no assistant line yet, so the Claude Code half silently skips on fresh starts — an accepted limitation; the nudge effectively fires on resume/clear/compact sessions. `cadence-hooks doctor` reports both version comparisons unconditionally (no threshold) via a local `claude --version` exec and a newest-pin glob of the marketplace cache. Version held — bundling with the frontmatter-allowlist PR into one release.
