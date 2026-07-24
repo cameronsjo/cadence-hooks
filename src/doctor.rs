@@ -671,6 +671,109 @@ fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> 
 /// Prints an informational (non-blocking, not a `Finding`) count of recent
 /// registry-file reaps when nonzero. No threshold — reaping is normal
 /// operation; this is visibility, not an alarm.
+/// Find the plugin-shipped platform baseline in the marketplace cache.
+/// Newest pin wins when more than one SHA-pinned copy exists (a mid-update
+/// transient, or a stale sibling left behind) — `None` when the cadence
+/// plugin's cache directory, or every pin's baseline file, is missing.
+fn find_baseline_in_cache() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let cadence_dir = PathBuf::from(home).join(".claude/plugins/cache/workbench/cadence");
+    let entries = std::fs::read_dir(&cadence_dir).ok()?;
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("config/platform-baseline.json");
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let is_newer = newest.as_ref().is_none_or(|(t, _)| modified > *t);
+        if is_newer {
+            newest = Some((modified, candidate));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// The Claude Code platform version, via a local `claude --version` exec —
+/// zero network, same as every other `doctor` data source. `doctor` is a
+/// manual, interactive command, so a subprocess here (unlike the SessionStart
+/// hook, which resolves the version from the transcript) is acceptable.
+fn installed_claude_code_version() -> Option<String> {
+    let output = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// Pure formatting core: given an explicit baseline path and a pre-resolved
+/// Claude Code version, produce the doctor status lines. Unconditional and
+/// unthresholded — unlike the SessionStart nudge (which only fires past a
+/// gap), `doctor` always shows both current-state lines when a baseline is
+/// found, so a `doctor` run never has to guess whether drift-checking ran at
+/// all. Testable with a tempdir baseline fixture and an injected version —
+/// no live-machine dependency (unlike [`find_baseline_in_cache`] and
+/// [`installed_claude_code_version`], which resolve those inputs).
+fn platform_drift_status_lines(
+    baseline_path: Option<&Path>,
+    cc_version: Option<&str>,
+) -> Vec<String> {
+    let Some(baseline_path) = baseline_path else {
+        return vec![
+            "cadence-hooks doctor: platform baseline not found under ~/.claude/plugins/cache/workbench/cadence/*/config/platform-baseline.json"
+                .to_string(),
+        ];
+    };
+    let Ok(content) = std::fs::read_to_string(baseline_path) else {
+        return vec![format!(
+            "cadence-hooks doctor: platform baseline unreadable: {}",
+            baseline_path.display()
+        )];
+    };
+    let Ok(baseline) =
+        serde_json::from_str::<cadence_hooks_cadence::platform_drift::Baseline>(&content)
+    else {
+        return vec![format!(
+            "cadence-hooks doctor: platform baseline malformed: {}",
+            baseline_path.display()
+        )];
+    };
+
+    let installed_hooks_version = env!("CARGO_PKG_VERSION");
+    let mut lines = vec![format!(
+        "cadence-hooks doctor: cadence-hooks {installed_hooks_version} (baseline expects {})",
+        baseline.cadence_hooks.current_version
+    )];
+    lines.push(match cc_version {
+        Some(v) => format!(
+            "cadence-hooks doctor: Claude Code {v} (last platform sweep: {})",
+            baseline.claude_code.last_swept_version
+        ),
+        None => "cadence-hooks doctor: Claude Code version unavailable (`claude --version` failed)"
+            .to_string(),
+    });
+    lines
+}
+
+/// Report cadence-hooks and Claude Code version status against the
+/// plugin-shipped baseline — the live-machine wrapper around
+/// [`platform_drift_status_lines`].
+fn print_platform_drift_status() {
+    let baseline_path = find_baseline_in_cache();
+    let cc_version = installed_claude_code_version();
+    for line in platform_drift_status_lines(baseline_path.as_deref(), cc_version.as_deref()) {
+        println!("{line}");
+    }
+}
+
 fn print_sweep_summary(dir: &Path, window: Duration, now: SystemTime) {
     let count = cadence_hooks_metrics::log_sweep::recent_sweep_count(dir, window, now);
     if count == 0 {
@@ -1404,6 +1507,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         ));
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);
+            print_platform_drift_status();
         }
     }
 
@@ -2763,5 +2867,78 @@ mod tests {
     fn cadence_config_parse_finding_absent_is_none() {
         let dir = seed_claude(&[]);
         assert!(cadence_config_parse_finding(dir.path()).is_none());
+    }
+
+    // ── platform_drift_status_lines tests ───────────────────────────────────
+
+    fn write_platform_baseline(dir: &Path, hooks_version: &str, cc_version: &str) -> PathBuf {
+        let path = dir.join("platform-baseline.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"claude_code":{{"last_swept_version":"{cc_version}","swept_on":"2026-07-23","sweep_doc":"n/a"}},"cadence_hooks":{{"current_version":"{hooks_version}"}}}}"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn platform_drift_status_missing_baseline_is_one_info_line() {
+        let lines = platform_drift_status_lines(None, Some("2.1.218"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("baseline not found"));
+    }
+
+    #[test]
+    fn platform_drift_status_unreadable_baseline_is_one_info_line() {
+        let lines = platform_drift_status_lines(
+            Some(Path::new("/nonexistent/baseline.json")),
+            Some("2.1.218"),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("unreadable"));
+    }
+
+    #[test]
+    fn platform_drift_status_malformed_baseline_is_one_info_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("platform-baseline.json");
+        fs::write(&path, "not json").unwrap();
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("malformed"));
+    }
+
+    #[test]
+    fn platform_drift_status_current_baseline_is_two_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), env!("CARGO_PKG_VERSION"), "2.1.218");
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("cadence-hooks"));
+        assert!(lines[1].contains("Claude Code"));
+    }
+
+    #[test]
+    fn platform_drift_status_far_ahead_baseline_is_still_two_lines() {
+        // Unthresholded: doctor shows both current-state lines regardless of
+        // gap size, unlike the SessionStart nudge's >= 5 threshold.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), "0.1.0", "2.0.0");
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("0.1.0"));
+        assert!(lines[1].contains("2.1.218"));
+        assert!(lines[1].contains("2.0.0"));
+    }
+
+    #[test]
+    fn platform_drift_status_missing_cc_version_notes_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), env!("CARGO_PKG_VERSION"), "2.1.218");
+        let lines = platform_drift_status_lines(Some(&path), None);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("unavailable"));
     }
 }

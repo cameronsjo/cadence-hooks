@@ -100,6 +100,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "cadence",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "platform-drift",
+        description: "Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline",
+        plugin: "cadence",
+        event: Some(HookEvent::SessionStart),
+    },
     // guardrails
     HookEntry {
         name: "guard-push-remote",
