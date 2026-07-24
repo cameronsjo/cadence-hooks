@@ -167,6 +167,22 @@ pub fn make_session(session_id: &str, source: &str) -> HookInput {
     }
 }
 
+/// Build a `HookInput` for a `SessionStart` event that also carries a
+/// transcript path — for checks (like `platform-drift`) that resolve state
+/// from the transcript rather than live git/registry state.
+pub fn make_session_with_transcript(
+    session_id: &str,
+    source: &str,
+    transcript_path: &str,
+) -> HookInput {
+    HookInput {
+        session_id: Some(session_id.into()),
+        source: Some(source.into()),
+        transcript_path: Some(transcript_path.into()),
+        ..Default::default()
+    }
+}
+
 /// Build a `HookInput` for a `UserPromptSubmit` event.
 pub fn make_user_prompt_submit(
     session_id: &str,
