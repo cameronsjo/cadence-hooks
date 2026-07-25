@@ -114,17 +114,23 @@ pub fn looks_absolute(p: &str) -> bool {
 /// `log-polish-nudge` metrics Logger so the logged denominator equals the
 /// nudge-fire set.
 ///
-/// Evaluated **per shell segment** ([`split_segments`]) so the draft-flag check
-/// is scoped to the `gh pr create` invocation's OWN args — a bare `-d` from an
-/// unrelated sibling command on a compound line (`curl -d x && gh pr create`,
-/// `docker run -d img ; gh pr create`) must not misclassify a real ship as a
-/// draft. Each segment is tokenized with [`tokenize`] (not `split_whitespace`)
-/// so a quoted `gh pr create` inside a `-m`/`--body` arg collapses to one token
-/// and cannot line up in the 3-window — a branch named
+/// Evaluated **per shell segment** ([`command_segments`]) so the draft-flag
+/// check is scoped to the `gh pr create` invocation's OWN args — a bare `-d`
+/// from an unrelated sibling command on a compound line (`curl -d x && gh pr
+/// create`, `docker run -d img ; gh pr create`) must not misclassify a real
+/// ship as a draft. Each segment is tokenized with [`tokenize`] (not
+/// `split_whitespace`) so a quoted `gh pr create` inside a `-m`/`--body` arg
+/// collapses to one token and cannot line up as a command word — a branch named
 /// `gh-pr-create-experiments`, or that phrase inside a commit message, must
 /// never match.
+///
+/// Segments come from [`command_segments`] rather than [`split_segments`] so a
+/// ship wrapped in `sh -c '…'` is seen (cadence-hooks#303 L1). The wrapper's
+/// own segment still tokenizes the script as ONE quoted token, so only the
+/// expanded inner segment can match — and per-segment draft scoping survives
+/// the expansion, leaving `sh -c 'gh pr create --draft'` correctly skipped.
 pub fn is_polish_ship_anchor(command: &str) -> bool {
-    split_segments(command)
+    command_segments(command)
         .iter()
         .any(|segment| segment_is_ship_anchor(segment))
 }
@@ -136,18 +142,48 @@ pub fn is_polish_ship_anchor(command: &str) -> bool {
 /// splits first rather than scanning the whole token stream).
 fn segment_is_ship_anchor(segment: &str) -> bool {
     let tokens = tokenize(segment);
-    let is_gh_pr = |sub: &str| {
-        tokens
-            .windows(3)
-            .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == sub)
-    };
-    if is_gh_pr("ready") {
-        return true;
+    match gh_pr_subcommand(&tokens) {
+        Some("ready") => true,
+        Some("create") => !tokens.iter().any(|t| t == "--draft" || t == "-d"),
+        _ => false,
     }
-    if is_gh_pr("create") {
-        return !tokens.iter().any(|t| t == "--draft" || t == "-d");
+}
+
+/// The subcommand of a `gh pr <sub>` invocation in `tokens`, or `None`.
+///
+/// Walks forward from a `gh` command word, skipping gh's GLOBAL flags before
+/// requiring the literal `pr` token — so `gh --repo owner/r pr create` is seen
+/// where a strict `[gh, pr, <sub>]` adjacency window missed it
+/// (cadence-hooks#303 L2). `--repo`/`-R` is gh's only global flag that takes a
+/// SEPARATE value, so it consumes one extra token; the self-contained
+/// `--repo=owner/r` form consumes nothing extra.
+///
+/// Demanding a literal `pr` token is what preserves every existing negative:
+/// `gh issue create` stops at `issue`, and a quoted `'gh pr create'` collapses
+/// to a single token that is never the `gh` command word.
+fn gh_pr_subcommand(tokens: &[String]) -> Option<&str> {
+    for (gh_index, token) in tokens.iter().enumerate() {
+        if token != "gh" {
+            continue;
+        }
+        let mut i = gh_index + 1;
+        while let Some(flag) = tokens.get(i) {
+            if !flag.starts_with('-') {
+                break;
+            }
+            i += if flag == "--repo" || flag == "-R" {
+                2
+            } else {
+                1
+            };
+        }
+        if tokens.get(i).map(String::as_str) == Some("pr")
+            && let Some(sub) = tokens.get(i + 1)
+        {
+            return Some(sub.as_str());
+        }
     }
-    false
+    None
 }
 
 /// Extract `(host, "owner/repo")` from any git remote URL format.
@@ -1290,6 +1326,50 @@ mod tests {
         // A quoted `gh pr ready` inside a body arg must not line up either.
         assert!(!is_polish_ship_anchor(
             "gh pr comment -b 'run gh pr ready next'"
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_matches_sh_c_wrapper() {
+        // #303 L1: a ship wrapped in a shell invocation is a real ship.
+        assert!(is_polish_ship_anchor("sh -c 'gh pr create --title x'"));
+        assert!(is_polish_ship_anchor("bash -c \"gh pr ready 12\""));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_sh_c_draft_still_skipped() {
+        // Per-segment draft scoping must survive the wrapper expansion — the
+        // inner segment carries its own `--draft`.
+        assert!(!is_polish_ship_anchor("sh -c 'gh pr create --draft'"));
+        assert!(!is_polish_ship_anchor("bash -c 'gh pr create -d --fill'"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_matches_global_flag_form() {
+        // #303 L2: a gh GLOBAL flag before the subcommand breaks strict
+        // `[gh, pr, create]` adjacency but is still a ship.
+        assert!(is_polish_ship_anchor(
+            "gh --repo owner/r pr create --title x"
+        ));
+        assert!(is_polish_ship_anchor("gh -R owner/r pr ready 12"));
+        // The self-contained `=` form consumes no extra token.
+        assert!(is_polish_ship_anchor("gh --repo=owner/r pr create --fill"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_global_flag_draft_skipped() {
+        assert!(!is_polish_ship_anchor(
+            "gh --repo owner/r pr create --draft --title x"
+        ));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_global_flag_form_rejects_non_anchor() {
+        // Tolerating global flags must not loosen the subcommand test itself.
+        assert!(!is_polish_ship_anchor("gh --repo owner/r pr list"));
+        assert!(!is_polish_ship_anchor("gh --repo owner/r pr merge 12"));
+        assert!(!is_polish_ship_anchor(
+            "gh --repo owner/r issue create -t x"
         ));
     }
 
