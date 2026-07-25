@@ -87,11 +87,18 @@ impl Check for PersistPlan {
         let host = gethostname::gethostname().to_string_lossy().into_owned();
         let utc_now = cadence_hooks_core::time::utc_timestamp();
         let local_date = cadence_hooks_core::time::local_date();
-        // Narrow defense-in-depth: `PersistPlan` fires on every UserPromptSubmit
-        // (every turn), and the `Check` dispatch path (unlike `Logger`'s) has no
-        // panic guard today (a separate, broader gap tracked elsewhere). A bug
-        // here must not eat a user prompt, so a panic degrades to a silent
-        // allow rather than propagating.
+        // Narrow defense-in-depth: `PersistPlan` fires on every
+        // UserPromptSubmit (every turn), so a bug here must not eat a user
+        // prompt — a panic degrades to a silent allow rather than propagating.
+        //
+        // The broader dispatch-layer guard now exists and works
+        // (cameronsjo/cadence-hooks#349: `src/dispatch.rs` brackets
+        // `decide_check` with `PANIC_GUARDED` so the global panic hook yields
+        // the unwind instead of exiting the process). This one is kept anyway:
+        // it costs nothing, it covers the highest-frequency hook in the tree,
+        // and an allow here is a *quieter* degradation than dispatch's — no
+        // stderr breadcrumb, no failopen row for a hook that fires on every
+        // single turn.
         std::panic::catch_unwind(|| run_persist_plan(input, &utc_now, &local_date, &host))
             .unwrap_or_else(|_| CheckResult::allow())
     }
