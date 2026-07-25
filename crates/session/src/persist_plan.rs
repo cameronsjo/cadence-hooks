@@ -410,7 +410,15 @@ fn strip_leading_frontmatter(doc: &str) -> &str {
 /// [`IDEMPOTENCY_MAX_FILE_BYTES`], hash differs) returns `false` and lets the
 /// suffix ladder run. The conversion is therefore **one-way**: a document that
 /// previously read as "no marker, no match" may now match, but a document that
-/// already matched by provenance line can never stop matching.
+/// already matched by provenance line can never stop matching — with one
+/// boundary case, stated so the invariant is not read as broader than it is.
+/// The old reader was uncapped, so a provenance-carrying file that later grows
+/// past [`IDEMPOTENCY_MAX_FILE_BYTES`] flips from match to no-match, and
+/// ladders. Nothing here reaches that: this hook writes a plan exactly once
+/// through `create_new` and never appends, and the measured corpus tops out
+/// near 37 KiB against a 1 MiB cap. It would take external growth of a
+/// document this hook already wrote, which is a laddered sibling rather than a
+/// lost one.
 fn file_matches_body(path: &Path, body_hash: &str) -> bool {
     use std::io::Read as _;
 
