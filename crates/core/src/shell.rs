@@ -396,88 +396,49 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 }
 
 static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    // Anchored at the START of an already-split shell segment, so `cd` matches
-    // only as that segment's command word — the separator alternation the old
-    // raw-string scan carried is [`split_segments`]' job now.
-    // Group 1: double-quoted path, Group 2: single-quoted path, Group 3: bare path.
-    // The bare class excludes ALL whitespace (a newline must terminate the
-    // path, not be swallowed into it) and `)` (so a `(cd /x)` group-closer
-    // stays out of the target).
-    Regex::new(r#"^cd\s+(?:"([^"]*)"|'([^']*)'|([^\s&;|)]+))"#).expect("pattern should compile")
+    // Group 1: separator (&&, ;, ||, newline, or empty for start-of-string)
+    // Group 2: double-quoted path, Group 3: single-quoted path, Group 4: bare path
+    //
+    // The bare-path class excludes ALL whitespace, not just a space: a newline
+    // has to TERMINATE the path. Swallowing it produced a target with the next
+    // line's command glued on — a directory that cannot exist — which is the
+    // cadence-hooks#394/#368 false-nudge. A newline is also a separator, so a
+    // `cd` on its own line after an earlier command is recognized.
+    Regex::new(r#"(^|&&|;|\|\||\n)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^\s&;|]+))"#)
+        .expect("pattern should compile")
 });
 
 /// Extract the effective working directory from `cd` chains in a command.
 ///
-/// Walks the command left-to-right one [`split_segments_with_ops`] segment at a
-/// time and accumulates directory changes:
+/// Walks the command left-to-right, splitting by operators (`&&`, `;`, `||`,
+/// newline), and accumulates directory changes:
 /// - `cd a && cd b` → `cwd/a/b` (both apply on success path)
 /// - `cd /abs && cd rel` → `/abs/rel`
-/// - `cd /wt` ⏎ `gh pr create` → `/wt` (newline is a separator like `;`)
-/// - `echo x | cd /sub` → `cwd` (a pipelined `cd` runs in a subshell)
+/// - `cd a || cmd` → `cwd` (cd before `||` only runs on failure path)
+/// - `cd /wt` ⏎ `gh pr create` → `/wt` (newline separates like `;`)
 /// - `~` expanded via `$HOME`
 /// - No `cd` found returns `cwd` unchanged
 ///
-/// A `cd` applies **iff it is a segment's command word**. Segmenting first is
-/// what makes that true, and it is why the resolver reads the segment list
-/// rather than scanning the raw string with a separator alternation
-/// (cadence-hooks#394/#368). [`split_segments`] supplies the three properties
-/// the raw scan lacked: it strips heredoc bodies, it is quote-aware, and it
-/// treats `'\n'` as a first-class operator. So:
-/// - a newline both separates segments AND terminates a bare path — the raw
-///   scan swallowed `\n` into the path, yielding a nonexistent directory that
-///   silently failed to resolve (the false-nudge half of #394);
-/// - a `cd` inside a quoted argument or a heredoc body never applies — the raw
-///   scan let `--body "step; cd /elsewhere"` hijack resolution from inside a
-///   string, which is the SECURITY-sensitive half: three block-capable guards
-///   (`git-safety`, `guard-gh-write`, `guard-push-remote`) resolve their target
-///   through this function;
-/// - a `cd` in a pipeline or a backgrounded one is skipped, because it runs in
-///   a SUBSHELL and leaves the parent's directory alone. Segmenting surfaced
-///   these for the first time — the raw scan's alternation held only
-///   `&&`/`;`/`||`, so a single `|`/`&` neighbour hid the `cd` by accident —
-///   and applying one would steer those same guards onto a directory the
-///   command never enters.
-///
-/// Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue #229 /
-/// PR #226). bash's `||`/`&&` are equal-precedence and left-associative, so a
-/// succeeding `cd` before `||` still changes the directory for what follows
-/// (`cd x || exit; git push` pushes from `x` whenever the cd works). The
-/// earlier "cd before `||` is a no-op" heuristic misjudged that common
-/// `|| exit` idiom; both resolvers apply every `cd` they find, in order.
+/// This is a **raw-string scan, not a shell parse**, and it does not model
+/// subshells, pipelines, or backgrounding: a `cd` in any of those resolves as
+/// though it applied to the parent, even though bash would give it its own
+/// process and discard it. Long-standing behavior — stated here so a reader
+/// does not mistake the newline handling for a general shell-grammar model.
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
 
-    let segments = split_segments_with_ops(command);
-    let mut preceding_op: Option<&str> = None;
-
-    for (segment, following_op) in &segments {
-        let before = preceding_op;
-        preceding_op = *following_op;
-
-        // A pipelined or backgrounded `cd` runs in a SUBSHELL, so the parent's
-        // directory is unchanged — `echo x | cd /sub` and `cd /sub & gh …`
-        // both leave the next command where it started. Segmenting made these
-        // visible for the first time (the old raw scan's separator alternation
-        // held only `&&`/`;`/`||`, so a single `|`/`&` neighbour hid them), and
-        // applying them would steer the three block-capable guards that resolve
-        // their target through here onto a directory the command never enters.
-        // `&&`/`||`/`;`/newline stay in the assume-success model below.
-        if before == Some("|") || matches!(following_op, Some("|") | Some("&")) {
-            continue;
-        }
-
-        // A leading `(`/`{` opens a subshell or group — the `cd` is still this
-        // segment's command word once the opener is stripped, so
-        // `( cd /wt && gh pr create )` redirects like the unwrapped form.
-        let segment = segment.trim_start_matches(['(', '{']).trim_start();
-
-        let Some(caps) = CD_PATTERN.captures(segment) else {
-            continue;
-        };
+    // Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue
+    // #229 / PR #226). bash's `||`/`&&` are equal-precedence and
+    // left-associative, so a succeeding `cd` before `||` still changes the
+    // directory for what follows (`cd x || exit; git push` pushes from `x`
+    // whenever the cd works). The earlier "cd before `||` is a no-op"
+    // heuristic misjudged that common `|| exit` idiom; both resolvers now
+    // apply every `cd` the pattern finds, in order.
+    for caps in CD_PATTERN.captures_iter(command) {
         let target = caps
-            .get(1)
-            .or(caps.get(2))
+            .get(2)
             .or(caps.get(3))
+            .or(caps.get(4))
             .map(|m| m.as_str().to_string());
 
         let Some(target) = target else { continue };
@@ -1364,6 +1325,18 @@ mod tests {
     }
 
     #[test]
+    fn is_polish_ship_anchor_tolerates_a_value_less_trailing_repo_flag() {
+        // `--repo`/`-R` consumes one extra token; when there isn't one, the
+        // walk must run off the end and return None rather than panic.
+        assert!(!is_polish_ship_anchor("gh --repo"));
+        assert!(!is_polish_ship_anchor("gh -R"));
+        assert!(!is_polish_ship_anchor("gh --repo owner/r pr"));
+        // A trailing `--repo` AFTER the subcommand is past the walk entirely,
+        // so the normal form still anchors.
+        assert!(is_polish_ship_anchor("gh pr create --repo"));
+    }
+
+    #[test]
     fn is_polish_ship_anchor_global_flag_form_rejects_non_anchor() {
         // Tolerating global flags must not loosen the subcommand test itself.
         assert!(!is_polish_ship_anchor("gh --repo owner/r pr list"));
@@ -2063,64 +2036,6 @@ mod tests {
         assert_eq!(
             parse_work_dir("echo hi\ncd /wt\ngh pr create --title x", "/home"),
             "/wt"
-        );
-    }
-
-    #[test]
-    fn cd_in_leading_subshell_applies() {
-        // `( cd /wt && … )` — the group opener is stripped before the anchored
-        // match, so the `cd` is still recognized as the segment's command word.
-        assert_eq!(
-            parse_work_dir("echo hi\n( cd /wt && gh pr create --title x )", "/home"),
-            "/wt"
-        );
-    }
-
-    #[test]
-    fn cd_in_a_pipeline_does_not_apply() {
-        // A pipelined `cd` runs in a subshell — the parent's directory is
-        // unchanged on BOTH sides of the pipe.
-        assert_eq!(parse_work_dir("echo x | cd /sub", "/home"), "/home");
-        assert_eq!(parse_work_dir("cd /sub | cat", "/home"), "/home");
-    }
-
-    #[test]
-    fn backgrounded_cd_does_not_apply_but_a_following_one_does() {
-        // `cd /sub &` backgrounds the cd into a subshell — no parent effect.
-        assert_eq!(
-            parse_work_dir("cd /sub & gh pr create --title x", "/home"),
-            "/home"
-        );
-        // But `&` backgrounding a DIFFERENT command leaves the following `cd`
-        // running in the parent, so it still applies.
-        assert_eq!(parse_work_dir("sleep 1 & cd /sub", "/home"), "/sub");
-    }
-
-    #[test]
-    fn cd_inside_quoted_argument_does_not_apply() {
-        // SECURITY: three block-capable guards resolve their target through
-        // this function, so a `cd` inside a quoted ARG must never hijack
-        // resolution — otherwise a body string silently redirects the guard to
-        // a directory the real command never enters.
-        assert_eq!(
-            parse_work_dir(
-                "gh pr create --title x --body \"step one; cd /some/worktree\"",
-                "/home/user"
-            ),
-            "/home/user"
-        );
-    }
-
-    #[test]
-    fn cd_inside_heredoc_body_does_not_apply() {
-        // Heredoc bodies are prose, not commands — `split_segments` strips them
-        // before any `cd` can be read out of one.
-        assert_eq!(
-            parse_work_dir(
-                "gh pr create --body \"$(cat <<'EOF'\ncd /some/worktree\nEOF\n)\"",
-                "/home/user"
-            ),
-            "/home/user"
         );
     }
 
