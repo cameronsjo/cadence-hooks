@@ -19,6 +19,25 @@ fn home_with_empty_cache() -> tempfile::TempDir {
     home
 }
 
+/// A doctor command whose default scan is pinned to `home`. Removing
+/// `CLAUDE_CONFIG_DIR` is load-bearing: `plugins_dir()` prefers
+/// `<CLAUDE_CONFIG_DIR>/plugins` over `$HOME/.claude/plugins`, so an ambient
+/// (absolute) value silently bypasses the HOME override and scans the live
+/// machine. Metrics is pinned for the same reason — its default resolves
+/// through the same config dir.
+///
+/// Every default-scan test routes through here, so the isolation is total and
+/// greppable rather than per-test discipline.
+fn doctor_in_home(home: &std::path::Path, metrics: &std::path::Path) -> Command {
+    let mut cmd = cadence_hooks();
+    cmd.arg("doctor")
+        .env("HOME", home)
+        .env("CADENCE_METRICS_DIR", metrics)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CADENCE_METRICS_STALE_DAYS");
+    cmd
+}
+
 /// Create `<root>/<plugin>/hooks/hooks.json` with the given JSON body.
 fn write_plugin(root: &std::path::Path, plugin: &str, hooks_json: &str) {
     let dir = root.join(plugin).join("hooks");
@@ -397,9 +416,8 @@ fn doctor_default_scan_reads_installed_plugins_manifest() {
     )
     .unwrap();
 
-    let output = cadence_hooks()
-        .arg("doctor")
-        .env("HOME", tmp.path())
+    let metrics = tempfile::tempdir().unwrap();
+    let output = doctor_in_home(tmp.path(), metrics.path())
         .output()
         .expect("failed to execute");
 
@@ -437,12 +455,7 @@ fn doctor_default_scan_warns_on_stale_metrics() {
         .set_modified(old)
         .unwrap();
 
-    let output = cadence_hooks()
-        .arg("doctor")
-        .env("HOME", home.path())
-        .env("CADENCE_METRICS_DIR", metrics.path())
-        .env_remove("CADENCE_METRICS_STALE_DAYS")
-        .env_remove("CLAUDE_CONFIG_DIR")
+    let output = doctor_in_home(home.path(), metrics.path())
         .output()
         .expect("failed to execute");
 
@@ -471,12 +484,7 @@ fn doctor_default_scan_clean_on_fresh_metrics() {
     let metrics = tempfile::tempdir().unwrap();
     std::fs::write(metrics.path().join("subagents.jsonl"), "{}\n").unwrap();
 
-    let output = cadence_hooks()
-        .arg("doctor")
-        .env("HOME", home.path())
-        .env("CADENCE_METRICS_DIR", metrics.path())
-        .env_remove("CADENCE_METRICS_STALE_DAYS")
-        .env_remove("CLAUDE_CONFIG_DIR")
+    let output = doctor_in_home(home.path(), metrics.path())
         .output()
         .expect("failed to execute");
 
@@ -718,9 +726,8 @@ fn doctor_default_scan_falls_back_to_cache_walk_without_manifest() {
     std::fs::create_dir_all(&plugin_dir).unwrap();
     std::fs::write(plugin_dir.join("hooks.json"), BUGGY_HOOKS_JSON).unwrap();
 
-    let output = cadence_hooks()
-        .arg("doctor")
-        .env("HOME", tmp.path())
+    let metrics = tempfile::tempdir().unwrap();
+    let output = doctor_in_home(tmp.path(), metrics.path())
         .output()
         .expect("failed to execute");
 
