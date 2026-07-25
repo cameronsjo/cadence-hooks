@@ -2349,6 +2349,28 @@ mod tests {
         assert!(!is_executable_at(&dir.path().join("no-such-file")));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn on_path_resolves_pathext_shims_not_just_exe() {
+        // Node's global installs ship `.cmd` shims — `prettier.cmd`,
+        // `markdownlint-cli2.cmd` — so resolving only `.exe` would report a
+        // large share of the CLIs hooks actually shell to as missing. This
+        // runs ONLY on the Windows leg, which is the point: the branch it
+        // covers cannot be exercised from the author's machine, and shipping
+        // an unexercised platform branch is how a fail-open gets missed.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("cadence-probe-tool.cmd");
+        fs::write(&shim, "@echo off\n").unwrap();
+        assert!(
+            is_executable_at(&dir.path().join("cadence-probe-tool")),
+            "a .cmd shim must resolve for its extensionless name"
+        );
+        assert!(
+            !is_executable_at(&dir.path().join("cadence-probe-absent")),
+            "an absent name must not resolve through PATHEXT"
+        );
+    }
+
     #[test]
     fn missing_cli_findings_flag_only_what_path_cannot_resolve() {
         // `sh` is on PATH everywhere the suite runs; the invented name is not.
