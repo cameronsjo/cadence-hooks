@@ -2286,16 +2286,15 @@ mod tests {
 
     #[test]
     fn interactive_help_names_hook_event_and_commands() {
-        let argv: Vec<String> = ["cadence-hooks", "lab", "persona-nudge"]
+        let argv: Vec<String> = ["cadence-hooks", "session", "start"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let msg =
-            interactive_terminal_help("persona-nudge", Some(HookEvent::SessionStart), None, &argv);
-        assert!(msg.contains("'persona-nudge'"));
+        let msg = interactive_terminal_help("start", Some(HookEvent::SessionStart), None, &argv);
+        assert!(msg.contains("'start'"));
         assert!(msg.contains("SessionStart"));
-        assert!(msg.contains("cadence-hooks try lab persona-nudge"));
-        assert!(msg.contains("| cadence-hooks lab persona-nudge"));
+        assert!(msg.contains("cadence-hooks try session start"));
+        assert!(msg.contains("| cadence-hooks session start"));
         assert!(msg.contains(HookEvent::SessionStart.sample_payload()));
         assert!(msg.contains("cadence-hooks list"));
         assert!(msg.contains("cadence-hooks doctor"));

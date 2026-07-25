@@ -9,7 +9,7 @@ use cadence_hooks_core::HookEvent;
 pub struct HookEntry {
     pub name: &'static str,
     pub description: &'static str,
-    /// CLI namespace: cadence | guardrails | rules | obsidian | metrics | lab | session
+    /// CLI namespace: cadence | guardrails | rules | obsidian | metrics | session
     pub plugin: &'static str,
     /// Hook event this command serves — drives `try`'s sample-payload shape.
     /// `None` for fire-and-forget loggers, which react to `hook_event_name`
@@ -350,19 +350,6 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "metrics",
         event: Some(HookEvent::SessionStart),
     },
-    // lab
-    HookEntry {
-        name: "persona-nudge",
-        description: "Inject the self-representation contract on session start",
-        plugin: "lab",
-        event: Some(HookEvent::SessionStart),
-    },
-    HookEntry {
-        name: "persona-gate",
-        description: "Validate and promote a self-representation candidate",
-        plugin: "lab",
-        event: Some(HookEvent::PostToolUse),
-    },
     // session (cadence-canon)
     HookEntry {
         name: "start",
@@ -619,7 +606,7 @@ mod tests {
 
     #[test]
     fn entry_returns_event_for_sample_payload_selection() {
-        let e = entry("lab", "persona-nudge").expect("persona-nudge registered");
+        let e = entry("session", "start").expect("start registered");
         assert_eq!(e.event, Some(HookEvent::SessionStart));
     }
 

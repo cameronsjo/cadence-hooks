@@ -55,6 +55,5 @@ cadence-hooks-guardrails.workspace = true
 cadence-hooks-rules.workspace = true
 cadence-hooks-obsidian.workspace = true
 cadence-hooks-metrics.workspace = true
-cadence-hooks-lab.workspace = true
 cadence-hooks-session.workspace = true
 tempfile = "3"

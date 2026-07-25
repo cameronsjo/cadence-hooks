@@ -78,17 +78,13 @@ enum Commands {
     #[command(subcommand)]
     Metrics(MetricsCommands),
 
-    /// Cadence lab (experimental) hooks (read hook JSON on stdin)
-    #[command(subcommand)]
-    Lab(LabCommands),
-
     /// Multi-session coordination hooks (cadence-canon; hooks read JSON on stdin)
     #[command(subcommand)]
     Session(SessionCommands),
 
     /// Run a hook against a generated sample payload (manual testing)
     Try {
-        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, lab, session)
+        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, session)
         namespace: String,
         /// Hook name (see `cadence-hooks list`)
         subcommand: String,
@@ -307,14 +303,6 @@ enum MetricsCommands {
 }
 
 #[derive(Subcommand)]
-enum LabCommands {
-    /// Inject the self-representation contract on session start (SessionStart)
-    PersonaNudge,
-    /// Validate and promote a self-representation candidate (PostToolUse)
-    PersonaGate,
-}
-
-#[derive(Subcommand)]
 enum SessionCommands {
     /// Register this session in the repo registry and disclose live peers (SessionStart)
     Start,
@@ -429,10 +417,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
             MetricsCommands::LogSkill => "log-skill",
             MetricsCommands::WarnStale => "warn-stale",
-        }),
-        Commands::Lab(l) => Some(match l {
-            LabCommands::PersonaNudge => "persona-nudge",
-            LabCommands::PersonaGate => "persona-gate",
         }),
         Commands::Session(s) => Some(match s {
             SessionCommands::Start => "start",
@@ -1045,18 +1029,6 @@ fn main() {
                 canonical_hook,
             ),
         },
-        Commands::Lab(cmd) => match cmd {
-            LabCommands::PersonaNudge => dispatch::run_logged_check(
-                &cadence_hooks_lab::nudge::PersonaNudge,
-                session,
-                canonical_hook,
-            ),
-            LabCommands::PersonaGate => dispatch::run_logged_check(
-                &cadence_hooks_lab::gate::PersonaGate,
-                post,
-                canonical_hook,
-            ),
-        },
         Commands::Session(cmd) => match cmd {
             SessionCommands::Start => dispatch::run_logged_check(
                 &cadence_hooks_session::start::Start,
@@ -1170,7 +1142,6 @@ mod tests {
             "rules",
             "obsidian",
             "metrics",
-            "lab",
             "session",
         ];
         // clap subcommands that are CLI actions, not hooks (no hooks.json wiring).

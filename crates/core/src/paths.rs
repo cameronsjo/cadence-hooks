@@ -6,7 +6,7 @@
 //! path must read the variable itself.
 //!
 //! The variable's value may be a comma-separated list of directories; for the
-//! purpose of *writing* state (metrics, persona ledger, insights) we take the
+//! purpose of *writing* state (metrics, insights) we take the
 //! first non-empty entry. The pure [`resolve_config_dir`] form keeps the logic
 //! unit-testable without touching process env (which is process-global and
 //! races parallel tests), mirroring the `expand_tilde`/`expand_tilde_with`
@@ -474,12 +474,12 @@ mod tests {
 
     #[test]
     fn is_within_checks_prefix_and_traversal() {
-        let dir = Path::new("/home/u/.claude/persona/staging");
-        assert!(is_within("/home/u/.claude/persona/staging/s1.json", dir));
-        assert!(!is_within("/home/u/.claude/persona/personas.jsonl", dir));
+        let dir = Path::new("/home/u/.claude/metrics/staging");
+        assert!(is_within("/home/u/.claude/metrics/staging/s1.json", dir));
+        assert!(!is_within("/home/u/.claude/metrics/commits.jsonl", dir));
         assert!(!is_within("/etc/passwd", dir));
         assert!(!is_within(
-            "/home/u/.claude/persona/staging/../personas.jsonl",
+            "/home/u/.claude/metrics/staging/../commits.jsonl",
             dir
         ));
     }
@@ -496,9 +496,9 @@ mod tests {
     fn is_within_normalizes_backslash_dir() {
         // On Windows the dir is backslash-joined while the hook path is
         // forward-slash-normalized; both sides must normalize to match.
-        let dir = Path::new(r"C:\Users\u\.claude\persona\staging");
-        assert!(is_within("C:/Users/u/.claude/persona/staging/s1.json", dir));
-        assert!(!is_within("C:/Users/u/.claude/persona/personas.jsonl", dir));
+        let dir = Path::new(r"C:\Users\u\.claude\metrics\staging");
+        assert!(is_within("C:/Users/u/.claude/metrics/staging/s1.json", dir));
+        assert!(!is_within("C:/Users/u/.claude/metrics/commits.jsonl", dir));
     }
 
     #[test]
