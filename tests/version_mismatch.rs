@@ -3,19 +3,34 @@
 //!
 //! Covers ADR 0008 failure modes:
 //! - Unknown subcommand/argument (clap interception) — tested below
-//! - Panic in check logic (panic handler) — exits 1 via set_hook in main();
-//!   not directly testable through CLI args without a synthetic panic path
+//! - Panic in check logic — an *unguarded* panic exits 1 via `set_hook` in
+//!   `main()`; one inside a dispatch guard fails open at exit 0 instead
+//!   (cameronsjo/cadence-hooks#349). Both live in `failopen_telemetry.rs`,
+//!   which owns the synthetic `CADENCE_TEST_PANIC` trigger
 //! - Missing binary (exit 127) — handled by consuming plugins' shell guards
 
 use std::process::Command;
 
-fn cadence_hooks() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+/// The binary under test, with `CADENCE_METRICS_DIR` pointed at a fresh temp
+/// dir. Several of these invocations write a `failopen.jsonl` row; without the
+/// override they land in the operator's live ledger and inflate `doctor`'s own
+/// counts with synthetic subcommand names (cameronsjo/cadence-hooks#398).
+///
+/// The `TempDir` rides along in the return value because it must outlive the
+/// spawned process — dropping it deletes the directory, so a caller that
+/// discards it would be writing into a path that no longer exists. Bind it as
+/// `_tmp`, never `_`.
+fn cadence_hooks() -> (Command, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("create a temp metrics dir");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    cmd.env("CADENCE_METRICS_DIR", tmp.path());
+    (cmd, tmp)
 }
 
 #[test]
 fn unknown_top_level_subcommand_fails_open() {
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["future-plugin", "some-hook"])
         .output()
         .expect("failed to execute binary");
@@ -40,7 +55,8 @@ fn unknown_top_level_subcommand_fails_open() {
 
 #[test]
 fn unknown_plugin_subcommand_fails_open() {
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["cadence", "not-a-real-hook"])
         .output()
         .expect("failed to execute binary");
@@ -61,7 +77,8 @@ fn unknown_plugin_subcommand_fails_open() {
 
 #[test]
 fn unknown_guardrails_subcommand_fails_open() {
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["guardrails", "guard-new-feature"])
         .output()
         .expect("failed to execute binary");
@@ -82,7 +99,8 @@ fn unknown_guardrails_subcommand_fails_open() {
 
 #[test]
 fn stderr_includes_version_and_release_url() {
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["cadence", "nonexistent-hook"])
         .output()
         .expect("failed to execute binary");
@@ -100,7 +118,8 @@ fn stderr_includes_version_and_release_url() {
 
 #[test]
 fn help_flag_still_works() {
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["--help"])
         .output()
         .expect("failed to execute binary");
@@ -116,7 +135,8 @@ fn help_flag_still_works() {
 
 #[test]
 fn version_flag_still_works() {
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["--version"])
         .output()
         .expect("failed to execute binary");
@@ -134,7 +154,8 @@ fn distant_name_subcommand_fails_open() {
     // A name that is far from any existing subcommand — ensures clap doesn't
     // treat it as a typo with a "did you mean?" suggestion that bypasses our
     // InvalidSubcommand catch.
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["cadence", "zzz-future-hook"])
         .output()
         .expect("failed to execute binary");
@@ -157,7 +178,8 @@ fn distant_name_subcommand_fails_open() {
 fn missing_subcommand_fails_open() {
     // Running `cadence-hooks` with no arguments triggers MissingSubcommand.
     // This must exit 1 (warn), not 2 (block).
-    let output = cadence_hooks().output().expect("failed to execute binary");
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd.output().expect("failed to execute binary");
 
     assert_eq!(
         output.status.code(),
@@ -182,7 +204,8 @@ fn namespace_without_hook_says_no_subcommand() {
     // `cadence-hooks cadence` — a real namespace with no hook name. Hits the
     // same MissingSubcommand arm as a bare run, so it gets plain guidance, not
     // the version-skew warning (#223).
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["cadence"])
         .output()
         .expect("failed to execute binary");
@@ -209,7 +232,8 @@ fn namespace_without_hook_says_no_subcommand() {
 fn valid_subcommand_with_empty_input_allows() {
     // A valid subcommand with valid JSON on stdin should work normally.
     // Send a minimal allow-case input to terminology.
-    let output = cadence_hooks()
+    let (mut cmd, _tmp) = cadence_hooks();
+    let output = cmd
         .args(["cadence", "terminology"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

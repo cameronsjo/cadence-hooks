@@ -57,6 +57,25 @@ const DEFAULT_SLUG: &str = "approved-plan";
 /// suffixes taken" in the plan doc), after which [`fallback_path`] is tried.
 const NUMERIC_SUFFIXES: std::ops::RangeInclusive<u32> = 2..=9;
 
+/// The provenance line label carrying the plan body's hash. Shared by the
+/// writer ([`provenance_block`]) and the reader ([`file_matches_body`]) so the
+/// two can never drift apart: since the reader now falls back to recomputing
+/// the body when no such line is found, a label mismatch would no longer be a
+/// visible no-match — it would silently reclassify every document this hook
+/// wrote as one it didn't.
+const PROVENANCE_HASH_LABEL: &str = "Plan-body-SHA256:";
+
+/// Cap on a candidate document's size before [`file_matches_body`] declines to
+/// consider it a re-fire. Plan docs run single-digit KB; anything past 1 MiB is
+/// not a plan this hook wrote.
+const IDEMPOTENCY_MAX_FILE_BYTES: u64 = 1024 * 1024;
+
+/// How many lines past an opening `---` [`strip_leading_frontmatter`] will scan
+/// for the closing fence. Real backfill frontmatter runs ~12 lines; the bound
+/// keeps a body that merely opens with a thematic break from consuming the
+/// whole document looking for a fence that was never there.
+const FRONTMATTER_SCAN_MAX_LINES: usize = 100;
+
 /// How far back a sibling transcript may sit and still be scanned for the
 /// approving `ExitPlanMode` call.
 const PARENT_SCAN_MAX_AGE: Duration = Duration::from_secs(48 * 3600);
@@ -87,11 +106,18 @@ impl Check for PersistPlan {
         let host = gethostname::gethostname().to_string_lossy().into_owned();
         let utc_now = cadence_hooks_core::time::utc_timestamp();
         let local_date = cadence_hooks_core::time::local_date();
-        // Narrow defense-in-depth: `PersistPlan` fires on every UserPromptSubmit
-        // (every turn), and the `Check` dispatch path (unlike `Logger`'s) has no
-        // panic guard today (a separate, broader gap tracked elsewhere). A bug
-        // here must not eat a user prompt, so a panic degrades to a silent
-        // allow rather than propagating.
+        // Narrow defense-in-depth: `PersistPlan` fires on every
+        // UserPromptSubmit (every turn), so a bug here must not eat a user
+        // prompt — a panic degrades to a silent allow rather than propagating.
+        //
+        // The broader dispatch-layer guard now exists and works
+        // (cameronsjo/cadence-hooks#349: `src/dispatch.rs` brackets
+        // `decide_check` with `PANIC_GUARDED` so the global panic hook yields
+        // the unwind instead of exiting the process). This one is kept anyway:
+        // it costs nothing, it covers the highest-frequency hook in the tree,
+        // and an allow here is a *quieter* degradation than dispatch's — no
+        // stderr breadcrumb, no failopen row for a hook that fires on every
+        // single turn.
         std::panic::catch_unwind(|| run_persist_plan(input, &utc_now, &local_date, &host))
             .unwrap_or_else(|_| CheckResult::allow())
     }
@@ -338,23 +364,95 @@ fn fallback_path(dir: &Path, stem: &str, session_id: &str) -> PathBuf {
     dir.join(format!("{stem}-{}.md", identity::short_id(session_id)))
 }
 
-/// Read `path` and return the value of its LAST `Plan-body-SHA256:`
-/// provenance line, if any. The real provenance block is always appended at
-/// the end of the document (see [`provenance_block`]), so anchoring on the
-/// last occurrence — not the first — means a plan body that itself embeds a
-/// decoy line of that exact shape can never spoof the idempotency check.
-fn file_body_hash(path: &Path) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
-    content.lines().rev().find_map(|line| {
-        line.strip_prefix("Plan-body-SHA256:")
-            .map(|rest| rest.trim().to_string())
-    })
+/// Strip a leading YAML frontmatter block, returning the document body.
+///
+/// Engages ONLY when the very first line is exactly `---` (after trimming),
+/// then scans forward at most [`FRONTMATTER_SCAN_MAX_LINES`] lines for the
+/// closing fence. **No closing fence in the window → the input is returned
+/// unchanged**, so a plan body that opens with a thematic break can at worst
+/// produce a hash mismatch (which ladders, the pre-existing behavior) and
+/// never a false match.
+fn strip_leading_frontmatter(doc: &str) -> &str {
+    let mut lines = doc.split_inclusive('\n');
+    let Some(first) = lines.next() else {
+        return doc;
+    };
+    if first.trim() != "---" {
+        return doc;
+    }
+    let mut offset = first.len();
+    for line in lines.take(FRONTMATTER_SCAN_MAX_LINES) {
+        offset += line.len();
+        if line.trim() == "---" {
+            return &doc[offset..];
+        }
+    }
+    doc
+}
+
+/// Does the document at `path` carry the plan body `body_hash` identifies?
+///
+/// Two sources answer that, in order, from a single capped read:
+///
+/// 1. The LAST `Plan-body-SHA256:` provenance line. The real provenance block
+///    is always appended at the end of the document (see [`provenance_block`]),
+///    so anchoring on the last occurrence — not the first — means a plan body
+///    that itself embeds a decoy line of that exact shape can never spoof the
+///    check. When such a line exists it is authoritative: a mismatch ladders,
+///    it does not fall through to a recompute.
+/// 2. No provenance line at all — a document this hook did not write, such as a
+///    backfilled plan carrying only frontmatter (cadence-hooks#399). The body
+///    is then recomputed the way [`run_persist_plan`] computes it: strip
+///    leading frontmatter, strip the trailing harness suffix lines and trim,
+///    hash.
+///
+/// Only an equality returns `true`; every ambiguity (unreadable, over
+/// [`IDEMPOTENCY_MAX_FILE_BYTES`], hash differs) returns `false` and lets the
+/// suffix ladder run. The conversion is therefore **one-way**: a document that
+/// previously read as "no marker, no match" may now match, but a document that
+/// already matched by provenance line can never stop matching — with one
+/// boundary case, stated so the invariant is not read as broader than it is.
+/// The old reader was uncapped, so a provenance-carrying file that later grows
+/// past [`IDEMPOTENCY_MAX_FILE_BYTES`] flips from match to no-match, and
+/// ladders. Nothing here reaches that: this hook writes a plan exactly once
+/// through `create_new` and never appends, and the measured corpus tops out
+/// near 37 KiB against a 1 MiB cap. It would take external growth of a
+/// document this hook already wrote, which is a laddered sibling rather than a
+/// lost one.
+fn file_matches_body(path: &Path, body_hash: &str) -> bool {
+    use std::io::Read as _;
+
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut content = String::new();
+    // Cap the read itself rather than stat-then-read: a file over the cap is
+    // not a plan this hook wrote, and must not become an unbounded read.
+    if file
+        .take(IDEMPOTENCY_MAX_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .is_err()
+        || content.len() as u64 > IDEMPOTENCY_MAX_FILE_BYTES
+    {
+        return false;
+    }
+
+    if let Some(recorded) = content
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(PROVENANCE_HASH_LABEL).map(str::trim))
+    {
+        return recorded == body_hash;
+    }
+
+    let body = strip_trailing_suffix_lines_and_trim(strip_leading_frontmatter(&content));
+    sha256_hex(body.as_bytes()) == body_hash
 }
 
 /// Try each candidate in order with `create_new` (O_EXCL): a fresh path wins
-/// outright; an occupied path is re-checked by hash — a match is a re-fire
-/// (idempotent skip), a mismatch tries the next candidate. Never overwrites
-/// anything.
+/// outright; an occupied path is re-checked by
+/// [`file_matches_body`] — a match is a re-fire (idempotent skip), a mismatch
+/// tries the next candidate. Never overwrites anything.
 fn claim_target(
     dir: &Path,
     stem: &str,
@@ -379,7 +477,7 @@ fn claim_target(
                 return Claim::GiveUp;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if file_body_hash(&path).as_deref() == Some(body_hash) {
+                if file_matches_body(&path, body_hash) {
                     return Claim::AlreadyPersisted(path);
                 }
                 // Different plan at this path — try the next suffix.
@@ -575,7 +673,7 @@ fn provenance_block(
     };
     format!(
         "{approved_in}\nExecuting session: {own_name} ({own_session_id}) @ {machine_digest}\n\
-         Persisted: {utc_now}\nPlan-body-SHA256: {body_hash}\n"
+         Persisted: {utc_now}\n{PROVENANCE_HASH_LABEL} {body_hash}\n"
     )
 }
 
@@ -959,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn file_body_hash_anchors_on_last_occurrence_not_a_decoy() {
+    fn file_matches_body_anchors_on_last_occurrence_not_a_decoy() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("plan.md");
         fs::write(
@@ -968,7 +1066,148 @@ mod tests {
              real-value\n",
         )
         .unwrap();
-        assert_eq!(file_body_hash(&path).as_deref(), Some("real-value"));
+        assert!(file_matches_body(&path, "real-value"));
+        assert!(
+            !file_matches_body(&path, "decoy-value"),
+            "the decoy must never satisfy the check"
+        );
+    }
+
+    #[test]
+    fn file_matches_body_decoy_at_line_start_does_not_spoof() {
+        // The sibling decoy tests embed the decoy MID-line, where `strip_prefix`
+        // rejects it on its own — so neither actually exercises the `.rev()`
+        // last-occurrence anchor they are named for. Only a decoy at the START
+        // of a line reaches `strip_prefix`, making this the single case where
+        // the anchor is load-bearing. It matters more since cadence-hooks#399:
+        // the anchor now also decides whether the recompute fallback runs.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        fs::write(
+            &path,
+            "Plan-body-SHA256: decoy-value\n\n# Title\n\nbody\n\n---\n\nPlan-body-SHA256: \
+             real-value\n",
+        )
+        .unwrap();
+        assert!(file_matches_body(&path, "real-value"));
+        assert!(
+            !file_matches_body(&path, "decoy-value"),
+            "a decoy at line start must not spoof the check — the LAST line anchors"
+        );
+    }
+
+    #[test]
+    fn file_matches_body_recomputes_when_no_hash_line() {
+        // A document this hook did not write — backfill frontmatter, no
+        // provenance block. The body must still be recognized (cadence-hooks#399).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        let body = "# Title\n\nbody text";
+        fs::write(
+            &path,
+            format!("---\ndate: 2026-07-11\nsource_plan: whatever.md\n---\n\n{body}\n"),
+        )
+        .unwrap();
+        assert!(file_matches_body(&path, &sha256_hex(body.as_bytes())));
+    }
+
+    #[test]
+    fn file_matches_body_recompute_ignores_trailing_harness_suffix() {
+        // Some backfilled docs kept the harness's trailing suffix line. The
+        // recompute runs the same strip the live path runs, so it still matches.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        let body = "# Title\n\nbody text";
+        fs::write(
+            &path,
+            format!(
+                "---\ndate: 2026-07-11\n---\n\n{body}\n\n{SUFFIX_LINE_PREFIX} into discrete \
+                 tasks, consider using the Agent tool.\n"
+            ),
+        )
+        .unwrap();
+        assert!(file_matches_body(&path, &sha256_hex(body.as_bytes())));
+    }
+
+    #[test]
+    fn file_matches_body_different_body_without_hash_line_still_ladders() {
+        // The safety invariant: a recompute may only ever CONFIRM a match. A
+        // different body under identical frontmatter must not be swallowed.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        fs::write(
+            &path,
+            "---\ndate: 2026-07-11\n---\n\n# Title\n\nsomeone else's plan\n",
+        )
+        .unwrap();
+        assert!(!file_matches_body(
+            &path,
+            &sha256_hex(b"# Title\n\nbody text")
+        ));
+    }
+
+    #[test]
+    fn strip_leading_frontmatter_leaves_a_thematic_break_body_alone() {
+        // A body opening with a thematic break and no closing fence in the
+        // window is returned unchanged — at worst a mismatch, never a false match.
+        let doc = "---\n\n# Title\n\nbody text\n";
+        assert_eq!(strip_leading_frontmatter(doc), doc);
+
+        let mut long = String::from("---\n");
+        for n in 0..(FRONTMATTER_SCAN_MAX_LINES + 5) {
+            long.push_str(&format!("line {n}\n"));
+        }
+        long.push_str("---\n");
+        assert_eq!(
+            strip_leading_frontmatter(&long),
+            long,
+            "a closing fence beyond the scan window does not engage the strip"
+        );
+    }
+
+    #[test]
+    fn file_matches_body_oversized_file_is_not_a_match() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        let mut content = doc_with_hash("hash-a");
+        content.push_str(&"x".repeat((IDEMPOTENCY_MAX_FILE_BYTES as usize) + 1));
+        fs::write(&path, content).unwrap();
+        assert!(
+            !file_matches_body(&path, "hash-a"),
+            "past the cap the document is not considered a re-fire"
+        );
+    }
+
+    #[test]
+    fn claim_target_backfilled_frontmatter_doc_is_idempotent_skip() {
+        // The regression that IS cadence-hooks#399: before the recompute, a
+        // backfilled plan (frontmatter, no provenance block) could never be
+        // recognized, so every re-fire laddered to `-2` — permanently.
+        let tmp = TempDir::new().unwrap();
+        let body = "# Title\n\nbody text";
+        let body_hash = sha256_hex(body.as_bytes());
+        let base = tmp.path().join("2026-07-20-x.md");
+        fs::write(
+            &base,
+            format!("---\ndate: 2026-07-20\nsource_plan: whatever.md\n---\n\n{body}\n"),
+        )
+        .unwrap();
+
+        let claim = claim_target(
+            tmp.path(),
+            "2026-07-20-x",
+            "sid12345",
+            &body_hash,
+            "ignored",
+        );
+        match claim {
+            Claim::AlreadyPersisted(path) => assert_eq!(path, base),
+            _ => panic!("a backfilled doc holding this exact body is a re-fire, not a new plan"),
+        }
+        assert!(
+            !tmp.path().join("2026-07-20-x-2.md").exists(),
+            "the ladder must not fire"
+        );
     }
 
     #[test]
