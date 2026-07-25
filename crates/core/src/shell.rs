@@ -398,12 +398,12 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Anchored at the START of an already-split shell segment, so `cd` matches
     // only as that segment's command word — the separator alternation the old
-    // raw-string scan carried is [`split_segments`]' job now.
+    // raw-string scan carried is [`split_segments_with_ops`]' job now.
     // Group 1: double-quoted path, Group 2: single-quoted path, Group 3: bare path.
     // The bare class excludes ALL whitespace (a newline must terminate the
-    // path, not be swallowed into it) and `)` (so a `(cd /x)` group-closer
-    // stays out of the target).
-    Regex::new(r#"^cd\s+(?:"([^"]*)"|'([^']*)'|([^\s&;|)]+))"#).expect("pattern should compile")
+    // path, not be swallowed into it) and both group closers `)`/`}` (so a
+    // `(cd /x)` closer stays out of the target).
+    Regex::new(r#"^cd\s+(?:"([^"]*)"|'([^']*)'|([^\s&;|)}]+))"#).expect("pattern should compile")
 });
 
 /// Extract the effective working directory from `cd` chains in a command.
@@ -414,29 +414,35 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// - `cd /abs && cd rel` → `/abs/rel`
 /// - `cd /wt` ⏎ `gh pr create` → `/wt` (newline is a separator like `;`)
 /// - `echo x | cd /sub` → `cwd` (a pipelined `cd` runs in a subshell)
+/// - `( cd /sub ) && git push` → `cwd` (the subshell's `cd` dies at the `)`)
 /// - `~` expanded via `$HOME`
 /// - No `cd` found returns `cwd` unchanged
 ///
 /// A `cd` applies **iff it is a segment's command word**. Segmenting first is
 /// what makes that true, and it is why the resolver reads the segment list
 /// rather than scanning the raw string with a separator alternation
-/// (cadence-hooks#394/#368). [`split_segments`] supplies the three properties
-/// the raw scan lacked: it strips heredoc bodies, it is quote-aware, and it
-/// treats `'\n'` as a first-class operator. So:
+/// (cadence-hooks#394/#368). [`split_segments_with_ops`] supplies what the raw
+/// scan lacked: it treats `'\n'` as a first-class operator, and it reports the
+/// operator joining each pair of segments. So:
 /// - a newline both separates segments AND terminates a bare path — the raw
 ///   scan swallowed `\n` into the path, yielding a nonexistent directory that
 ///   silently failed to resolve (the false-nudge half of #394);
-/// - a `cd` inside a quoted argument or a heredoc body never applies — the raw
-///   scan let `--body "step; cd /elsewhere"` hijack resolution from inside a
-///   string, which is the SECURITY-sensitive half: three block-capable guards
-///   (`git-safety`, `guard-gh-write`, `guard-push-remote`) resolve their target
-///   through this function;
-/// - a `cd` in a pipeline or a backgrounded one is skipped, because it runs in
-///   a SUBSHELL and leaves the parent's directory alone. Segmenting surfaced
-///   these for the first time — the raw scan's alternation held only
-///   `&&`/`;`/`||`, so a single `|`/`&` neighbour hid the `cd` by accident —
-///   and applying one would steer those same guards onto a directory the
-///   command never enters.
+/// - a `cd` bash runs in a SUBSHELL does not reach the parent: a pipelined one,
+///   a backgrounded one, and one inside a `( … )` group once the group closes.
+///   Segmenting is what made these reachable at all — the raw scan's
+///   alternation held only `&&`/`;`/`||`, so a lone `|`/`&` neighbour excluded
+///   the `cd` by accident rather than by rule.
+///
+/// `(` and `{` are **not** symmetric and must not be treated as one case: a
+/// `( … )` subshell gets its own process, so its `cd` is discarded at the `)`,
+/// while a `{ … }` brace group runs in the current shell and its `cd` persists.
+/// Both openers are stripped so the `cd` behind them is still recognized as a
+/// command word; only `(` also pushes a restore point.
+///
+/// Precision here reaches past the polish nudge: three block-capable guards
+/// (`git-safety`, `guard-gh-write`, `guard-push-remote`) resolve their target
+/// directory through this function, so whatever it returns is the repository
+/// those guards go on to evaluate.
 ///
 /// Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue #229 /
 /// PR #226). bash's `||`/`&&` are equal-precedence and left-associative, so a
@@ -446,46 +452,89 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// `|| exit` idiom; both resolvers apply every `cd` they find, in order.
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
-
-    let segments = split_segments_with_ops(command);
+    // Directory to restore as each open `( … )` subshell closes, innermost last.
+    let mut subshells: Vec<String> = Vec::new();
+    let mut pending_restore: Option<String> = None;
     let mut preceding_op: Option<&str> = None;
 
-    for (segment, following_op) in &segments {
+    for (segment, following_op) in split_segments_with_ops(command) {
         let before = preceding_op;
-        preceding_op = *following_op;
+        preceding_op = following_op;
 
-        // A pipelined or backgrounded `cd` runs in a SUBSHELL, so the parent's
-        // directory is unchanged — `echo x | cd /sub` and `cd /sub & gh …`
-        // both leave the next command where it started. Segmenting made these
-        // visible for the first time (the old raw scan's separator alternation
-        // held only `&&`/`;`/`||`, so a single `|`/`&` neighbour hid them), and
-        // applying them would steer the three block-capable guards that resolve
-        // their target through here onto a directory the command never enters.
-        // `&&`/`||`/`;`/newline stay in the assume-success model below.
-        if before == Some("|") || matches!(following_op, Some("|") | Some("&")) {
-            continue;
+        // A subshell that closed in an EARLIER segment restores here, not at
+        // the `)` itself. A trailing `)` closes a group that nothing else runs
+        // in, and undoing its `cd` there would misreport the directory the
+        // final command actually ran in — which is the one a caller is asking
+        // about. Deferring the restore to the next segment means it happens
+        // exactly when there IS a next command to attribute it to.
+        if let Some(saved) = pending_restore.take() {
+            effective = saved;
         }
 
-        // A leading `(`/`{` opens a subshell or group — the `cd` is still this
-        // segment's command word once the opener is stripped, so
-        // `( cd /wt && gh pr create )` redirects like the unwrapped form.
-        let segment = segment.trim_start_matches(['(', '{']).trim_start();
+        let (opens, closes) = unquoted_subshell_parens(&segment);
+        for _ in 0..opens {
+            subshells.push(effective.clone());
+        }
 
-        let Some(caps) = CD_PATTERN.captures(segment) else {
-            continue;
-        };
-        let target = caps
-            .get(1)
-            .or(caps.get(2))
-            .or(caps.get(3))
-            .map(|m| m.as_str().to_string());
+        // A pipelined or backgrounded `cd` gets its own process too, so it
+        // likewise never reaches the parent — `echo x | cd /sub` and
+        // `cd /sub & gh …` both leave the next command where it started.
+        // `&&`/`||`/`;`/newline stay in the assume-success model below.
+        let forked = before == Some("|") || matches!(following_op, Some("|") | Some("&"));
 
-        let Some(target) = target else { continue };
+        if !forked {
+            // Strip the group openers so the `cd` behind them is still read as
+            // this segment's command word; the `(` restore point is already
+            // recorded above, and `{` needs none.
+            let body = segment.trim_start_matches(['(', '{']).trim_start();
 
-        effective = resolve_cd_target(&target, &effective);
+            if let Some(caps) = CD_PATTERN.captures(body) {
+                let target = caps.get(1).or(caps.get(2)).or(caps.get(3));
+                if let Some(target) = target {
+                    effective = resolve_cd_target(target.as_str(), &effective);
+                }
+            }
+        }
+
+        for _ in 0..closes {
+            if let Some(saved) = subshells.pop() {
+                pending_restore = Some(saved);
+            }
+        }
     }
 
     effective
+}
+
+/// Count the `(` and `)` that open and close real subshells in one segment —
+/// those outside any quoted region. A paren inside `'…'`/`"…"` is literal text
+/// (`gh pr create --body "done (finally)"`), so counting it would push or pop a
+/// restore point that no subshell corresponds to.
+///
+/// `{`/`}` are deliberately absent: a brace group runs in the current shell, so
+/// it has no directory to restore. See [`parse_work_dir`].
+fn unquoted_subshell_parens(segment: &str) -> (usize, usize) {
+    let mut opens = 0;
+    let mut closes = 0;
+    let mut quote: Option<char> = None;
+
+    for c in segment.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => opens += 1,
+                ')' => closes += 1,
+                _ => {}
+            },
+        }
+    }
+
+    (opens, closes)
 }
 
 /// Resolve a single cd target against the current effective directory.
@@ -1364,6 +1413,18 @@ mod tests {
     }
 
     #[test]
+    fn is_polish_ship_anchor_tolerates_a_value_less_trailing_repo_flag() {
+        // `--repo`/`-R` consumes one extra token; when there isn't one, the
+        // walk must run off the end and return None rather than panic.
+        assert!(!is_polish_ship_anchor("gh --repo"));
+        assert!(!is_polish_ship_anchor("gh -R"));
+        assert!(!is_polish_ship_anchor("gh --repo owner/r pr"));
+        // A trailing `--repo` AFTER the subcommand is past the walk entirely,
+        // so the normal form still anchors.
+        assert!(is_polish_ship_anchor("gh pr create --repo"));
+    }
+
+    #[test]
     fn is_polish_ship_anchor_global_flag_form_rejects_non_anchor() {
         // Tolerating global flags must not loosen the subcommand test itself.
         assert!(!is_polish_ship_anchor("gh --repo owner/r pr list"));
@@ -2067,12 +2128,54 @@ mod tests {
     }
 
     #[test]
-    fn cd_in_leading_subshell_applies() {
+    fn cd_in_leading_subshell_applies_to_commands_inside_the_group() {
         // `( cd /wt && … )` — the group opener is stripped before the anchored
-        // match, so the `cd` is still recognized as the segment's command word.
+        // match, so the `cd` is still recognized as the segment's command word,
+        // and the `gh pr create` sharing the group really does run in `/wt`.
         assert_eq!(
             parse_work_dir("echo hi\n( cd /wt && gh pr create --title x )", "/home"),
             "/wt"
+        );
+    }
+
+    #[test]
+    fn subshell_cd_does_not_survive_the_closing_paren() {
+        // A `( … )` subshell gets its own process, so its `cd` is gone by the
+        // time the next command runs.
+        assert_eq!(parse_work_dir("(cd /sub) ; git push", "/home"), "/home");
+        assert_eq!(
+            parse_work_dir("( cd /sub && echo hi ) && git push", "/home"),
+            "/home"
+        );
+        // A command substitution is a subshell too.
+        assert_eq!(
+            parse_work_dir("echo $(true; cd /sub) && git push", "/home"),
+            "/home"
+        );
+        // Nested groups unwind to the directory in effect before the outermost.
+        assert_eq!(
+            parse_work_dir("( cd /a && ( cd /b ) ) ; git push", "/home"),
+            "/home"
+        );
+    }
+
+    #[test]
+    fn brace_group_cd_persists_past_the_closing_brace() {
+        // The `(`/`{` asymmetry: a brace group runs in the CURRENT shell, so
+        // unlike a subshell its `cd` survives for what follows.
+        assert_eq!(parse_work_dir("{ cd /sub; } && git push", "/home"), "/sub");
+    }
+
+    #[test]
+    fn paren_inside_a_quoted_argument_is_not_a_subshell() {
+        // A literal paren in an argument must not push or pop a restore point,
+        // or the unbalanced count would corrupt a later `cd`.
+        assert_eq!(
+            parse_work_dir(
+                "cd /sub && gh pr create --title \"done (finally)\"",
+                "/home"
+            ),
+            "/sub"
         );
     }
 
@@ -2097,27 +2200,12 @@ mod tests {
     }
 
     #[test]
-    fn cd_inside_quoted_argument_does_not_apply() {
-        // SECURITY: three block-capable guards resolve their target through
-        // this function, so a `cd` inside a quoted ARG must never hijack
-        // resolution — otherwise a body string silently redirects the guard to
-        // a directory the real command never enters.
+    fn cd_in_a_plain_double_quoted_argument_is_not_a_command_word() {
+        // A `;` between plain double quotes does not end a segment, so the `cd`
+        // after it stays inside the argument and never becomes a command word.
         assert_eq!(
             parse_work_dir(
                 "gh pr create --title x --body \"step one; cd /some/worktree\"",
-                "/home/user"
-            ),
-            "/home/user"
-        );
-    }
-
-    #[test]
-    fn cd_inside_heredoc_body_does_not_apply() {
-        // Heredoc bodies are prose, not commands — `split_segments` strips them
-        // before any `cd` can be read out of one.
-        assert_eq!(
-            parse_work_dir(
-                "gh pr create --body \"$(cat <<'EOF'\ncd /some/worktree\nEOF\n)\"",
                 "/home/user"
             ),
             "/home/user"
