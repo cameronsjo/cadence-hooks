@@ -585,8 +585,24 @@ fn main() {
         let subcommand = argv.next();
         // The payload plus the source location — the two things that make this
         // row answer "why did it panic?" instead of merely "it panicked"
-        // (cameronsjo/cadence-hooks#398). Both are this binary's own text; no
-        // hook payload is captured.
+        // (cameronsjo/cadence-hooks#398).
+        //
+        // NO CURRENTLY-REACHABLE PATH LEAKS HOOK DATA HERE, but this is text
+        // the repo does not author, so the property is not structural. A panic
+        // anywhere in the process lands here, including inside `regex`,
+        // `serde_json`, `jiff`, and `brush-parser` — which is fed raw
+        // `tool_input.command` (crates/core/src/loop_analysis.rs). Rust's own
+        // panic messages are *designed* to embed data: `slice_error_fail`
+        // quotes the offending string, `Result::unwrap` prints `{:?}` of the
+        // error. So the first future `&s[..n]` on a payload-derived string
+        // would write up to 200 characters of hook input into a durable
+        // ledger. Today every production `panic!`/`.expect()` carries a static
+        // message, the config-driven regex compiles use `if let Ok(re)` rather
+        // than `.expect`, and every byte-index slice derives its offsets from
+        // ASCII-anchored searches. If that ever stops holding, redact through
+        // the same seam `crates/cadence/src/secret_patterns.rs`'s
+        // `scan_secret_values` uses — it returns a pattern *name*, never the
+        // matched value.
         let error = match info.location() {
             Some(loc) => format!("{payload} (at {}:{})", loc.file(), loc.line()),
             None => payload,

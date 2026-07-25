@@ -186,15 +186,19 @@ fn malformed_stdin_on_a_logger_writes_parse_row() {
 fn a_panicking_check_fails_open_and_dispatch_survives_it() {
     // The one test that proves #349 fixed. Before the fix the global panic hook
     // called `process::exit(1)` *before* unwinding began, so `catch_unwind` in
-    // dispatch never regained control: the run ended at exit 1 with no timing
-    // row. Three assertions, each pinning a distinct half of the fix.
+    // dispatch never regained control and the run ended mid-flight.
+    //
+    // The exit code is deliberately UNCHANGED at 1 — it is the fail-open warn
+    // code, and it keeps the panic visible (Claude Code surfaces stderr on a
+    // non-zero, non-2 exit). So the exit code alone cannot distinguish fixed
+    // from broken here; the `hooks.jsonl` row below is what does, because it is
+    // written only after `catch_unwind` returns.
     let (out, tmp) = run_with_panic_armed(&["cadence", "terminology"]);
 
     assert_eq!(
         out.status.code(),
-        Some(0),
-        "a panicking check fails open (exit 0) — not 1 (the old panic-hook \
-         exit) and certainly not 2 (a block): {}",
+        Some(1),
+        "a panicking check warns (exit 1) and never blocks (exit 2): {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -209,8 +213,9 @@ fn a_panicking_check_fails_open_and_dispatch_survives_it() {
         "payload and source location are both recorded: {error}"
     );
 
-    // The timing row is the proof dispatch RESUMED past the panic rather than
-    // being aborted mid-flight — it is written after the `catch_unwind` returns.
+    // THE load-bearing assertion: the timing row proves dispatch RESUMED past
+    // the panic rather than being aborted. Pre-fix this file is empty, because
+    // the panic hook exited the process before the telemetry tail could run.
     let timings = read_jsonl(&tmp.path().join("hooks.jsonl"));
     assert_eq!(
         timings.len(),
@@ -218,6 +223,13 @@ fn a_panicking_check_fails_open_and_dispatch_survives_it() {
         "dispatch ran its telemetry tail after catching the panic: {timings:?}"
     );
     assert_eq!(timings[0]["hook"], "terminology");
+
+    // The breadcrumb the non-zero exit exists to surface.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("internal error (panic)"),
+        "the operator sees the panic on the turn it happens: {stderr}"
+    );
 }
 
 #[test]
@@ -225,6 +237,10 @@ fn a_panicking_logger_still_exits_zero() {
     // `run_logged_logger` documents an always-exit-0 contract. Until #349 that
     // contract was violated by any panic, because the panic hook exited 1
     // before the existing `catch_unwind` could see the unwind.
+    //
+    // The logger keeps exit 0 where the check path above keeps exit 1: a logger
+    // enforces nothing, so a panicking one has no enforcement failure to make
+    // visible, and its contract is the stronger constraint.
     let (out, tmp) = run_with_panic_armed(&["metrics", "log-subagent"]);
 
     assert_eq!(

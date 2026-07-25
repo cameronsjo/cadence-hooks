@@ -252,10 +252,44 @@ pub fn recent_failopen_report(
     (counts, recency)
 }
 
-/// Strip control characters (ANSI escapes, newlines) from a file-sourced string
-/// before it is interpolated into terminal-printed `doctor` output.
+/// Strip display-affecting characters from a file-sourced string before it is
+/// interpolated into terminal-printed `doctor` output.
+///
+/// Two families, not one. `char::is_control` covers only **Cc** — C0, DEL, C1 —
+/// which handles ANSI escapes and newlines. It passes **Cf** (format)
+/// characters, and those reorder rendered text without being "control"
+/// characters at all: U+202E RIGHT-TO-LEFT OVERRIDE and the U+2066–U+2069
+/// directional isolates are the Trojan-Source primitives, and they would
+/// otherwise survive both this filter and [`sanitize_error`] to scramble the
+/// rest of a `doctor` finding line. U+2028/U+2029 are line/paragraph separators
+/// that some renderers break on. Strip all of them.
 fn display_safe(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
+    s.chars().filter(|c| !is_display_unsafe(*c)).collect()
+}
+
+/// Whether `c` can alter how the rest of a terminal line renders: any Cc
+/// control, any Cf format character (bidi overrides/isolates, zero-width
+/// joiners), or the Unicode line/paragraph separators.
+///
+/// Cf is matched by explicit ranges rather than a Unicode-property crate — this
+/// stays dependency-free, and these are the blocks that carry the reordering
+/// primitives. `is_control` already covers Cc.
+fn is_display_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{2028}' | '\u{2029}'          // line / paragraph separator
+            | '\u{00AD}'                      // soft hyphen
+            | '\u{0600}'..='\u{0605}'         // Arabic number signs
+            | '\u{061C}'                      // Arabic letter mark
+            | '\u{06DD}' | '\u{070F}' | '\u{08E2}'
+            | '\u{180E}'                      // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}'         // zero-width space … RTL mark
+            | '\u{202A}'..='\u{202E}'         // bidi embeddings + OVERRIDE
+            | '\u{2060}'..='\u{2064}'         // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}'         // directional isolates
+            | '\u{FEFF}'                      // zero-width no-break space (BOM)
+            | '\u{FFF9}'..='\u{FFFB}'         // interlinear annotation
+        )
 }
 
 /// [`display_safe`] plus a length ceiling — the write-side sanitizer for the
@@ -447,6 +481,43 @@ mod tests {
     #[test]
     fn sanitize_error_leaves_a_short_message_intact() {
         assert_eq!(sanitize_error("InvalidSubcommand"), "InvalidSubcommand");
+    }
+
+    #[test]
+    fn sanitize_error_strips_bidi_overrides_and_isolates() {
+        // Trojan Source: U+202E reorders everything after it when rendered, so
+        // a stored error could scramble the doctor finding line it lands in.
+        // These are Cf, not Cc, so `is_control` alone passes them through.
+        let spoof = "panic at \u{202E}gnp.eliforp\u{202C} end";
+        assert_eq!(sanitize_error(spoof), "panic at gnp.eliforp end");
+
+        let isolated = "a\u{2066}b\u{2067}c\u{2068}d\u{2069}e";
+        assert_eq!(sanitize_error(isolated), "abcde");
+    }
+
+    #[test]
+    fn sanitize_error_strips_zero_width_and_separators() {
+        assert_eq!(
+            sanitize_error("a\u{200B}b\u{FEFF}c\u{2028}d\u{2029}e\u{00AD}f"),
+            "abcdef"
+        );
+    }
+
+    #[test]
+    fn display_safe_strips_the_same_families_on_read() {
+        // The read side shares the filter, so a hand-edited ledger written
+        // before this landed is neutralized at render time too.
+        assert_eq!(display_safe("0.61.0\u{202E}X\u{1b}[31m"), "0.61.0X[31m");
+    }
+
+    #[test]
+    fn sanitize_error_keeps_ordinary_non_ascii() {
+        // The filter targets display-affecting characters, not non-ASCII —
+        // an accented or CJK panic message must survive intact.
+        assert_eq!(
+            sanitize_error("échec du café 日本語"),
+            "échec du café 日本語"
+        );
     }
 
     // --- log_failopen end-to-end (tempdir) ---

@@ -481,17 +481,39 @@ fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option
     })
 }
 
+/// Wrap `s` in single quotes for safe inclusion in a rendered shell command,
+/// escaping any embedded single quote via the POSIX `'\''` idiom (close, emit
+/// an escaped quote, reopen).
+///
+/// **Single quotes, not double.** Inside double quotes a shell still expands
+/// `$`, backticks and `\`, and a `"` ends the string outright — so a
+/// double-quoted path is safe against *spaces* and nothing else. Every
+/// interpolated value here is env-derived (`CADENCE_METRICS_DIR`,
+/// `CLAUDE_CONFIG_DIR`) and Claude Code injects env vars from a project's
+/// checked-in `.claude/settings.json`, so a cloned repository can choose it.
+/// The operator then runs `doctor` and pastes what it prints — which is exactly
+/// the affordance these remediations added. Inside single quotes nothing is
+/// special but `'` itself, which this escapes; a literal newline stays inside
+/// the quotes as data rather than becoming a command separator.
+///
+/// Use this for **every** value interpolated into a command a human is invited
+/// to run. Plain diagnostic prose that merely names a path does not need it —
+/// nobody executes a sentence.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// A copy-pasteable command that lists the recent `failopen.jsonl` rows for one
 /// `reason`. Replaces the bare "inspect failopen.jsonl" guidance, which named a
-/// file but not a way to read it (cameronsjo/cadence-hooks#398). The path is
-/// double-quoted because the metrics dir routinely sits under a home directory
-/// that may contain spaces; `grep` matches the serialized key/value pair
-/// verbatim, since `serde_json` writes compact JSON with no inner spaces.
+/// file but not a way to read it (cameronsjo/cadence-hooks#398).
+///
+/// `reason` is always a hardcoded literal from this module; the path is not, so
+/// it goes through [`shell_single_quote`]. `grep` matches the serialized
+/// key/value pair verbatim, since `serde_json` writes compact JSON with no
+/// inner spaces.
 fn failopen_inspect_cmd(dir: &Path, reason: &str) -> String {
-    format!(
-        r#"grep '"reason":"{reason}"' "{}/failopen.jsonl" | tail -5"#,
-        dir.display()
-    )
+    let path = shell_single_quote(&format!("{}/failopen.jsonl", dir.display()));
+    format!(r#"grep '"reason":"{reason}"' {path} | tail -5"#)
 }
 
 /// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
@@ -1899,14 +1921,67 @@ mod tests {
         }
     }
 
+    /// A metrics dir exercising every character that is live inside double
+    /// quotes — command substitution both ways, a quote-closing `"`, a
+    /// backslash — plus a `'` to drive the escape idiom itself. The `$(...)`
+    /// and backtick bodies are inert `echo`s: if quoting ever regresses, the
+    /// shell round-trip below returns "INJECTED"/"ALSO" instead of the literal
+    /// and the test fails loudly rather than doing anything.
+    const HOSTILE_DIR: &str = r#"/tmp/m$(echo INJECTED)`echo ALSO`"x\y'z w"#;
+
     #[test]
-    fn failopen_inspect_cmd_quotes_a_path_with_spaces() {
-        let cmd = failopen_inspect_cmd(Path::new("/Users/a b/.claude/metrics"), "panic");
+    fn failopen_inspect_cmd_neutralizes_shell_metacharacters_in_the_path() {
+        // Structural half: the path is single-quoted, and the only `'` inside
+        // it is the escape idiom.
+        let cmd = failopen_inspect_cmd(Path::new(HOSTILE_DIR), "panic");
+        assert!(cmd.contains(r#"grep '"reason":"panic"'"#), "{cmd}");
         assert!(
-            cmd.contains(r#""/Users/a b/.claude/metrics/failopen.jsonl""#),
+            cmd.contains(r#"'/tmp/m$(echo INJECTED)`echo ALSO`"x\y'\''z w/failopen.jsonl'"#),
             "{cmd}"
         );
-        assert!(cmd.contains(r#"grep '"reason":"panic"'"#), "{cmd}");
+    }
+
+    #[test]
+    fn shell_single_quote_survives_a_real_shell_round_trip() {
+        // Behavioral half, and the one that actually proves inertness: hand the
+        // quoted string to `sh` and confirm it parses back to the original
+        // bytes. Equality can only hold if no substitution, no quote break, and
+        // no backslash escape occurred — a structural assertion alone would
+        // still pass against a subtly wrong escape.
+        let quoted = shell_single_quote(HOSTILE_DIR);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .expect("spawn sh");
+
+        assert!(
+            out.status.success(),
+            "sh rejected the quoted string: {out:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            HOSTILE_DIR,
+            "the shell must reproduce the path verbatim — anything else means a \
+             metacharacter was live"
+        );
+        // Explicit about the discriminator: the marker word appears in the
+        // literal too, so its presence proves nothing. What proves inertness is
+        // that the substitution *syntax* came back as text — had `sh` evaluated
+        // it, `$(echo INJECTED)` would have collapsed to `INJECTED`.
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("$(echo INJECTED)"),
+            "the substitution syntax must survive uninterpreted"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_handles_spaces_and_plain_paths() {
+        assert_eq!(
+            shell_single_quote("/Users/a b/.claude/metrics"),
+            "'/Users/a b/.claude/metrics'"
+        );
+        assert_eq!(shell_single_quote(""), "''");
     }
 
     #[test]

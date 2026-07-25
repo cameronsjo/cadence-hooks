@@ -44,15 +44,51 @@ use std::time::Instant;
 /// `#[cfg(debug_assertions)]` is load-bearing: the trigger does not exist in a
 /// release binary, so a shipped build cannot be made to panic through it even
 /// with `CADENCE_TEST_PANIC=1` set.
+///
+/// In a *debug* build it is a real enforcement bypass — it fires ahead of
+/// `decide_check`, so every guard degrades to non-enforcing — and this repo runs
+/// `./target/debug/cadence-hooks` routinely. So it announces itself on stderr,
+/// exactly as `CADENCE_BYPASS=1` does in `main`: suppression always leaves a
+/// trace (#89).
 #[cfg(debug_assertions)]
 fn test_panic_trigger() {
     if std::env::var("CADENCE_TEST_PANIC").as_deref() == Ok("1") {
+        eprintln!(
+            "⚠️  cadence-hooks: enforcement bypassed — CADENCE_TEST_PANIC=1 is forcing a \
+             synthetic panic before this hook can decide (debug builds only)"
+        );
         panic!("CADENCE_TEST_PANIC: synthetic panic exercising the dispatch panic guard");
     }
 }
 
 #[cfg(not(debug_assertions))]
 fn test_panic_trigger() {}
+
+/// Sets `main::PANIC_GUARDED` for as long as it is alive, clearing it on drop.
+///
+/// The flag must be cleared on **both** exits from a guarded region — the
+/// ordinary return and the unwind — or a later panic outside the region would
+/// find a guard that is no longer there and be swallowed instead of taking the
+/// fail-open exit. A manual set/clear pair holds that invariant only by virtue
+/// of how the two call sites happen to be written today; an `?`, an early
+/// return, or a new branch slipped between them would break it silently, with
+/// no test to catch it. `Drop` cannot be skipped, and — the point here — it
+/// runs *during* the unwind, so the guarded and panicking paths clear the flag
+/// through the same line of code.
+struct PanicGuard;
+
+impl PanicGuard {
+    fn arm() -> Self {
+        crate::PANIC_GUARDED.store(true, Ordering::Relaxed);
+        PanicGuard
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        crate::PANIC_GUARDED.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Run a single check from stdin, record its decision to `denials.jsonl` and its
 /// wall-clock time to `hooks.jsonl`, then emit and exit exactly as
@@ -110,21 +146,34 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             input.session_id(),
         );
     };
-    crate::PANIC_GUARDED.store(true, Ordering::Relaxed);
-    let decided = catch_unwind(AssertUnwindSafe(|| {
-        test_panic_trigger();
-        decide_check(check, &input)
-    }));
-    crate::PANIC_GUARDED.store(false, Ordering::Relaxed);
+    let decided = {
+        let _guard = PanicGuard::arm();
+        catch_unwind(AssertUnwindSafe(|| {
+            test_panic_trigger();
+            decide_check(check, &input)
+        }))
+    };
     let decided = match decided {
         Ok(decided) => decided,
         Err(_) => {
             // The panic hook already printed the breadcrumb and wrote the
             // `panic` failopen row with the payload and location — one row per
             // panic. What is lost without this arm is the rest of the dispatch
-            // tail, so emit it and fail open.
+            // tail, so emit it before leaving.
             emit_telemetry_tail(false);
-            process::exit(Outcome::Allow.code());
+            // Exit 1, not 0. Neither code blocks — `Outcome::code` maps every
+            // non-Block outcome to 0 — so the *user's* operation proceeds
+            // either way, and this arm does not need 0 to fail open. What 1
+            // buys is DETECTABILITY: Claude Code surfaces a hook's stderr on a
+            // non-zero, non-2 exit and discards it on 0. At 0, a check that
+            // panics on every invocation — total enforcement failure for a
+            // block-capable guard like `guard-gh-write` — is indistinguishable
+            // in real time from one that works, with the panic breadcrumb
+            // written to stderr and thrown away and the only record a
+            // `failopen.jsonl` row nobody reads until they run `doctor`.
+            // A panic is the loudest thing this binary can notice about itself;
+            // it keeps the louder exit.
+            process::exit(1);
         }
     };
     match decided {
@@ -193,16 +242,20 @@ pub fn run_logged_logger(
             // the global panic hook exits the process before unwinding starts,
             // so the documented always-exit-0 contract did not actually hold
             // (cameronsjo/cadence-hooks#349).
-            crate::PANIC_GUARDED.store(true, Ordering::Relaxed);
+            let _guard = PanicGuard::arm();
             // The `Err` is deliberately discarded: no `log_failopen` belongs
             // here, because the panic hook already wrote the `panic` row with
             // the payload and source location this site never had. One row per
             // panic. A logger has no result to report either way.
+            //
+            // Unlike the check path above, a panicking logger still exits 0 —
+            // that is `run_logged_logger`'s documented contract, and a logger
+            // enforces nothing, so there is no enforcement failure to make
+            // visible.
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 test_panic_trigger();
                 logger.run(&input)
             }));
-            crate::PANIC_GUARDED.store(false, Ordering::Relaxed);
         }
         Err(e) => {
             cadence_hooks_metrics::log_failopen(
