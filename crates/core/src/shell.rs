@@ -396,28 +396,41 @@ pub fn git_command(work_dir: &str, args: &[&str]) -> Option<String> {
 }
 
 static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    // Group 1: separator (&&, ;, ||, newline, or empty for start-of-string)
+    // Group 1: separator (&&, ;, ||, or empty for start-of-string)
     // Group 2: double-quoted path, Group 3: single-quoted path, Group 4: bare path
     //
     // The bare-path class excludes ALL whitespace, not just a space: a newline
     // has to TERMINATE the path. Swallowing it produced a target with the next
     // line's command glued on — a directory that cannot exist — which is the
-    // cadence-hooks#394/#368 false-nudge. A newline is also a separator, so a
-    // `cd` on its own line after an earlier command is recognized.
-    Regex::new(r#"(^|&&|;|\|\||\n)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^\s&;|]+))"#)
+    // cadence-hooks#394/#368 false-nudge. Every shortening this causes moves
+    // the result toward what bash actually does, so it repairs disagreements
+    // rather than introducing any.
+    //
+    // A newline is deliberately NOT a separator: adding one would recognize a
+    // `cd` on its own line after an earlier command, but it would also match
+    // every line-initial `cd` in prose this tool routinely composes — a
+    // heredoc PR body carrying a shell snippet — and `\s*` would match an
+    // indented one inside a fenced block. That is a much wider accidental
+    // trigger surface for a primitive three block-capable guards resolve
+    // through, bought for a shape neither issue reports.
+    Regex::new(r#"(^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^\s&;|]+))"#)
         .expect("pattern should compile")
 });
 
 /// Extract the effective working directory from `cd` chains in a command.
 ///
-/// Walks the command left-to-right, splitting by operators (`&&`, `;`, `||`,
-/// newline), and accumulates directory changes:
+/// Walks the command left-to-right, splitting by operators (`&&`, `;`, `||`),
+/// and accumulates directory changes:
 /// - `cd a && cd b` → `cwd/a/b` (both apply on success path)
 /// - `cd /abs && cd rel` → `/abs/rel`
 /// - `cd a || cmd` → `cwd` (cd before `||` only runs on failure path)
-/// - `cd /wt` ⏎ `gh pr create` → `/wt` (newline separates like `;`)
+/// - `cd /wt` ⏎ `gh pr create` → `/wt` (the newline ends the path)
 /// - `~` expanded via `$HOME`
 /// - No `cd` found returns `cwd` unchanged
+///
+/// A newline **ends** a `cd` target but does not **separate** commands here, so
+/// a `cd` on its own line *after* an earlier command is still not recognized —
+/// unchanged behavior, and deliberate (see [`CD_PATTERN`]).
 ///
 /// This is a **raw-string scan, not a shell parse**, and it does not model
 /// subshells, pipelines, or backgrounding: a `cd` in any of those resolves as
@@ -2030,12 +2043,15 @@ mod tests {
     }
 
     #[test]
-    fn cd_after_a_newline_separator_applies() {
-        // A newline separates segments exactly like `;`, so a `cd` on its own
-        // line is a command word and redirects what follows.
+    fn cd_on_a_line_after_another_command_is_not_recognized() {
+        // A newline ENDS a `cd` target but does not SEPARATE commands, so a
+        // `cd` that is not at the start of the string (or after `&&`/`;`/`||`)
+        // is not seen. Deliberate: making a newline a separator would also
+        // match every line-initial `cd` in a heredoc PR body, which is a far
+        // wider accidental-trigger surface than the shape it would fix.
         assert_eq!(
             parse_work_dir("echo hi\ncd /wt\ngh pr create --title x", "/home"),
-            "/wt"
+            "/home"
         );
     }
 
