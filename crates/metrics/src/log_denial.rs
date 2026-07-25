@@ -1,6 +1,6 @@
 //! Append-only audit log for guard fires at the dispatch outcome→exit-code
 //! seam: one line per hard `deny` to `<metrics_dir>/denials.jsonl` (and per
-//! `nudge` when `CADENCE_LOG_NUDGES` is set).
+//! `nudge`, unless `CADENCE_LOG_NUDGES` opts out).
 //!
 //! Called from the **binary** (`src/dispatch.rs`), not from a `Logger`: the
 //! denial is a side effect of an *enforcement* check, and only the binary knows
@@ -22,10 +22,11 @@ use std::io::Write;
 /// Record a guard's decision at the dispatch seam.
 ///
 /// - `Block` → always logged as `decision: "deny"`.
-/// - `Nudge` / `LoopBlock` → logged as `decision: "nudge"` **only** when
-///   `CADENCE_LOG_NUDGES` is set to a non-empty value (default OFF, so the
-///   common advisory path adds zero hot-path I/O).
-/// - `Allow` → never logged.
+/// - `Nudge` / `LoopBlock` → logged as `decision: "nudge"` by **default**;
+///   `CADENCE_LOG_NUDGES=0|false|off` opts out (cadence-hooks#420 — nudge-fire
+///   rates are the denominator for every adherence measurement, and a
+///   dark-by-default layer went unnoticed for its whole life).
+/// - `Allow` → never logged (the hot path stays I/O-free).
 ///
 /// `hook` is the canonical registry name threaded from the binary (e.g.
 /// `terminology`, not the `Check::name()` value `terminology-guard`).
@@ -56,11 +57,21 @@ pub fn log_denial(hook: &str, event: HookEvent, input: &HookInput, outcome: Outc
     }
 }
 
-/// True when `CADENCE_LOG_NUDGES` is set to a non-empty value.
+/// True unless `CADENCE_LOG_NUDGES` explicitly opts out: `0` / `false` / `off`
+/// (ASCII case-insensitive) or set-but-empty (`CADENCE_LOG_NUDGES=`, which was
+/// OFF under the old opt-in semantics and stays OFF — a value-free kill
+/// switch). Unset — the common case — means ON (#420). Any other value,
+/// including the legacy opt-in `1`, also means ON, so a config written against
+/// the old default keeps working unchanged.
 fn nudges_enabled() -> bool {
     std::env::var("CADENCE_LOG_NUDGES")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off"
+            )
+        })
+        .unwrap_or(true)
 }
 
 /// Map an [`Outcome`] to the `decision` field, or `None` when nothing should be
@@ -279,9 +290,9 @@ mod tests {
     }
 
     #[test]
-    fn nudge_skipped_without_env_logged_with_env() {
+    fn nudge_logged_by_default_and_with_legacy_opt_in() {
         let tmp = tempfile::tempdir().unwrap();
-        // Env unset → no row.
+        // Env unset (the common case) → one nudge row, ON by default (#420).
         with_metrics_dir(tmp.path(), None, || {
             log_denial(
                 "warn-main-branch",
@@ -290,12 +301,16 @@ mod tests {
                 Outcome::Nudge,
             );
         });
-        assert!(
-            read_lines(tmp.path()).is_empty(),
-            "nudge without env must not write"
+        let rows = read_lines(tmp.path());
+        assert_eq!(
+            rows.len(),
+            1,
+            "nudge with env unset must write (default ON)"
         );
+        assert_eq!(rows[0]["decision"], "nudge");
 
-        // Env set → exactly one nudge row.
+        // The legacy opt-in value stays ON — configs written against the old
+        // default keep working unchanged.
         with_metrics_dir(tmp.path(), Some("1"), || {
             log_denial(
                 "warn-main-branch",
@@ -304,8 +319,37 @@ mod tests {
                 Outcome::Nudge,
             );
         });
+        assert_eq!(read_lines(tmp.path()).len(), 2);
+    }
+
+    #[test]
+    fn nudge_opt_out_values_suppress_the_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        for off in ["0", "false", "off", "FALSE", " Off ", ""] {
+            with_metrics_dir(tmp.path(), Some(off), || {
+                log_denial(
+                    "warn-main-branch",
+                    HookEvent::PreToolUse,
+                    &edit_input(),
+                    Outcome::Nudge,
+                );
+            });
+        }
+        assert!(
+            read_lines(tmp.path()).is_empty(),
+            "every opt-out spelling must suppress the nudge row"
+        );
+        // Opt-out never touches deny rows.
+        with_metrics_dir(tmp.path(), Some("0"), || {
+            log_denial(
+                "terminology",
+                HookEvent::PreToolUse,
+                &edit_input(),
+                Outcome::Block,
+            );
+        });
         let rows = read_lines(tmp.path());
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["decision"], "nudge");
+        assert_eq!(rows[0]["decision"], "deny");
     }
 }
