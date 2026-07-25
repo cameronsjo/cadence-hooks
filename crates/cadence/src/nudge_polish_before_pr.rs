@@ -523,7 +523,18 @@ mod tests {
 
             // cwd is the PRIMARY (still on `main`) — only the `cd` redirects to
             // the worktree, so the newline handling is the whole test.
-            let command = format!("cd {}\ngh pr create --title x", wt.to_str().unwrap());
+            //
+            // The `cd` target must be spelled as a SHELL path, not a native
+            // one. `resolve_cd_target` and `looks_absolute` are both documented
+            // to take forward-slash paths — that is how Git Bash spells a
+            // Windows path, and it is what a hook payload's `command` actually
+            // carries. A `PathBuf`-native `C:\…` fails `looks_absolute`'s
+            // `b[2] == b'/'` drive test, so it resolves as RELATIVE and gets
+            // joined onto cwd, and the gate never finds the marker. That is
+            // green on POSIX and red on Windows for a reason unrelated to the
+            // newline handling this test exists to pin.
+            let cd_target = wt.to_str().unwrap().replace('\\', "/");
+            let command = format!("cd {cd_target}\ngh pr create --title x");
             let input = make_bash_with_cwd(&command, primary.to_str().unwrap());
             let result = NudgePolishBeforePr.run(&input);
             assert_eq!(
