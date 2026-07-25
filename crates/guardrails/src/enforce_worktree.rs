@@ -72,6 +72,15 @@
 //! are no longer a silent miss — but the nudge's own coverage is a curated
 //! floor, not a fence. Named v1 misses of the mutation-nudge channel, each
 //! degrading to the pre-#234 silent-allow (never a weakened block):
+//! - **Any file target that does not yet exist on disk** — the gate that stops
+//!   `git diff > report.txt` from claiming to mutate tracked content (#377)
+//!   cannot tell a scratch report from a brand-new SOURCE file, because both are
+//!   equally absent at hook time. So a first write of `src/newmod/lib.rs` (or
+//!   `tee src/new_config.toml`) into the primary is silent, even though that is
+//!   exactly the "writes accumulate unseen until commit" case the nudge names.
+//!   Separating them needs a git query per target, which the #271 probe budget
+//!   rules out. Existing files — including dangling symlinks, hence
+//!   `symlink_metadata` rather than `exists` — still nudge.
 //! - **Non-enumerated mutator verbs** — `cp`/`mv`/`install` into a tracked path,
 //!   `dd of=…`, `truncate`, `patch`, `ed`/`ex`, `perl -i`, `awk -i inplace`,
 //!   `python -c 'open(p,"w")'`, and the git tree-mutators `git apply|restore|
@@ -125,11 +134,16 @@
 //! Commits inside `sh -c '…'` wrappers, `$(…)`/backtick substitutions, and
 //! behind `env`/`VAR=value` prefixes ARE seen (#228) — any run of
 //! transparent-prefix or assignment words ahead of a wrapper
-//! (`env exec sh -c '…'`) is stripped before the wrapper detection runs. Three
-//! misses remain, all deliberate: a prefix's own *option flags* are never parsed,
-//! so `nice -n 10 …` / `env -i …` in front of a wrapper or commit stay misses (a
-//! flag could bind a value we'd misread); `xargs`-fed commits are not
-//! reconstructed; and wrappers past [`MAX_WRAPPER_DEPTH`] are not descended.
+//! (`env exec sh -c '…'`) is stripped before the wrapper detection runs, and a
+//! `GIT_WORK_TREE=`/`GIT_DIR=` prefix is inherited by the wrapper's child the
+//! way the shell exports it. Four commit-channel misses remain, all deliberate:
+//! a prefix's own *option flags* are never parsed, so `nice -n 10 …` /
+//! `env -i …` in front of a wrapper or commit stay misses (a flag could bind a
+//! value we'd misread); `xargs`-fed commits are not reconstructed; wrappers past
+//! [`MAX_WRAPPER_DEPTH`] are not descended; and a git env var set by a standalone
+//! `export` in an earlier segment (`export GIT_DIR=… && git commit`) is not
+//! tracked — only an assignment word prefixed to the command itself is, since
+//! tracking `export` means modelling shell variable scope across segments.
 //!
 //! Every target above is resolved SOLELY from the payload `cwd` — the guard
 //! reads no session state and no process cwd. A dispatched subagent inherits the
@@ -139,6 +153,7 @@
 
 use crate::dismiss_enforce_worktree;
 use crate::messages::WORKTREE_CREATE_RECIPE;
+use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, child_scripts, redirect_targets, resolve_cd_target,
@@ -422,8 +437,8 @@ fn is_prefix_word(tokens: &[String], idx: usize) -> bool {
 }
 
 /// Read `GIT_WORK_TREE=`/`GIT_DIR=` out of the leading assignment words that
-/// [`skip_transparent_prefixes`] otherwise discards, returning them resolved
-/// against `effective_dir` as `(work_tree, git_dir)`.
+/// [`skip_transparent_prefixes`] otherwise discards, returning the values
+/// **RAW** as `(work_tree, git_dir)`.
 ///
 /// `GIT_DIR=… GIT_WORK_TREE=… git commit` names a target tree just as plainly as
 /// `--work-tree` does, and the walk was throwing that away — a bypass from a
@@ -432,19 +447,47 @@ fn is_prefix_word(tokens: &[String], idx: usize) -> bool {
 /// [`skip_transparent_prefixes`], over the shared [`is_prefix_word`] predicate
 /// (assignment words and transparent prefixes may interleave:
 /// `env GIT_DIR=… command git commit`), and stops at the command word.
-fn git_env_overrides(tokens: &[String], effective_dir: &str) -> (Option<String>, Option<String>) {
+///
+/// **Raw, not resolved, and that is load-bearing.** This walk runs over the raw
+/// token stream, before the global-flag walk has seen `-C` — and git applies the
+/// `-C` chdir BEFORE repository setup, so a relative env value is relative to
+/// the POST-`-C` directory. Resolving here against the pre-`-C` dir while the
+/// env value outranks the `-C` redirect turned `GIT_WORK_TREE=. git -C <primary>
+/// commit` into an Allow: the guard resolved the session's own worktree while
+/// git committed into the primary. [`commit_targets_of`] resolves these against
+/// the same post-`-C` base the explicit flags use, which also keeps both call
+/// sites in sync by construction (security review, #378).
+fn git_env_overrides(tokens: &[String]) -> (Option<&str>, Option<&str>) {
     let (mut work_tree, mut git_dir) = (None, None);
     let mut idx = 0;
     while idx + 1 < tokens.len() && is_prefix_word(tokens, idx) {
         let tok = tokens[idx].as_str();
         if let Some(v) = tok.strip_prefix("GIT_WORK_TREE=") {
-            work_tree = Some(resolve_git_path(v, effective_dir));
+            work_tree = Some(v);
         } else if let Some(v) = tok.strip_prefix("GIT_DIR=") {
-            git_dir = Some(resolve_git_path(v, effective_dir));
+            git_dir = Some(v);
         }
         idx += 1;
     }
     (work_tree, git_dir)
+}
+
+/// True when a `--git-dir`/`GIT_DIR` value names a LINKED worktree's admin
+/// directory (`<primary>/.git/worktrees/<name>`) rather than a repository's own
+/// git dir.
+///
+/// Such a path must not be emitted as a commit target: git resolves it to the
+/// linked worktree, but a naive walk up from it lands on the primary checkout
+/// and would false-block the legitimate spelling for committing into a worktree
+/// (security review, #378).
+fn is_linked_worktree_admin_dir(path: &str) -> bool {
+    let names: Vec<&str> = Path::new(path)
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    names
+        .windows(2)
+        .any(|w| w[0] == ".git" && w[1] == "worktrees")
 }
 
 /// A leading `NAME=value` shell assignment word: a valid variable name
@@ -481,7 +524,7 @@ fn is_shell_absolute(path: &str) -> bool {
 fn scan_targets(command: &str, cwd: &str) -> (Vec<CommitTarget>, Vec<MutationTarget>) {
     let mut commits = Vec::new();
     let mut mutations = Vec::new();
-    collect_targets(command, cwd, 0, &mut commits, &mut mutations);
+    collect_targets(command, cwd, 0, &mut commits, &mut mutations, (None, None));
     (commits, mutations)
 }
 
@@ -646,12 +689,19 @@ fn detect_mutations(
 /// nudge inherits the #228-safe cd-scoping rather than reintroducing the flat
 /// primitive. Depth shares [`MAX_WRAPPER_DEPTH`] with `command_segments`'s own
 /// expansion budget.
+///
+/// `inherited_env` carries a `GIT_WORK_TREE=`/`GIT_DIR=` prefix down into child
+/// scripts, because the shell really does export it: `GIT_WORK_TREE=<primary>
+/// sh -c 'git commit'` runs the child with that variable set, so the child's
+/// commit lands in `<primary>` (security review, #378). A segment's own prefix
+/// wins over an inherited one, as a nearer assignment does in the shell.
 fn collect_targets(
     script: &str,
     cwd: &str,
     depth: usize,
     targets: &mut Vec<CommitTarget>,
     mutations: &mut Vec<MutationTarget>,
+    inherited_env: (Option<&str>, Option<&str>),
 ) {
     let mut effective_dir = cwd.to_string();
 
@@ -670,12 +720,27 @@ fn collect_targets(
         // `env`/`exec`.
         let argv = skip_transparent_prefixes(&tokens);
 
+        // The git env prefix comes from the RAW tokens — `skip_transparent_prefixes`
+        // has already dropped it from `argv` — and a nearer assignment wins over
+        // one inherited from a parent script, as in the shell. Computed before
+        // the child recursion so a wrapper's child inherits it (#378).
+        let (seg_work_tree, seg_git_dir) = git_env_overrides(&tokens);
+        let env_work_tree = seg_work_tree.or(inherited_env.0);
+        let env_git_dir = seg_git_dir.or(inherited_env.1);
+
         // Child scripts execute with the directory in effect HERE — a
         // substitution is evaluated before its own segment runs, and a
         // wrapper inherits the cwd accumulated so far — in their own scope.
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, segment) {
-                collect_targets(&child, &effective_dir, depth + 1, targets, mutations);
+                collect_targets(
+                    &child,
+                    &effective_dir,
+                    depth + 1,
+                    targets,
+                    mutations,
+                    (env_work_tree, env_git_dir),
+                );
             }
         }
 
@@ -718,20 +783,16 @@ fn collect_targets(
         // `argv` is the prefix-/assignment-stripped view computed above
         // (`command`/`env`/`VAR=x git commit` → leading `git`); the commit
         // detection (leading-word gate, git-global walk, `-C`/`--work-tree`/
-        // `--git-dir` redirects) lives in [`commit_target_of`] so the #323
-        // in-chain scan resolves a commit target identically (#239 F4, #228).
-        // The env overrides come from the RAW tokens — `skip_transparent_prefixes`
-        // has already dropped them from `argv` — and both call sites must read
-        // them the same way or the in-chain dismiss map stops matching (#378).
-        let (env_work_tree, env_git_dir) = git_env_overrides(&tokens, &effective_dir);
-        if let Some(target) = commit_target_of(
+        // `--git-dir` redirects) lives in [`commit_targets_of`] so the #323
+        // in-chain scan resolves commit targets identically (#239 F4, #228) —
+        // both call sites must resolve the same way or the in-chain dismiss map
+        // stops matching (#378).
+        targets.extend(commit_targets_of(
             argv,
             &effective_dir,
-            env_work_tree.as_deref(),
-            env_git_dir.as_deref(),
-        ) {
-            targets.push(target);
-        }
+            env_work_tree,
+            env_git_dir,
+        ));
     }
 }
 
@@ -747,9 +808,9 @@ fn resolve_git_path(path: &str, base: &str) -> String {
 }
 
 /// If `argv` (already prefix-/assignment-stripped) is a `git … commit …`
-/// invocation, return the directory the commit lands in — the `effective_dir`,
-/// or the tree named by a `--work-tree`, `--git-dir`, or `-C <path>` redirect
-/// resolved against it. `None` when the segment is not a git-commit.
+/// invocation, return every directory the commit lands in — the `effective_dir`,
+/// or the trees named by `--work-tree`, `--git-dir`, and a `-C <path>` redirect
+/// resolved against it. Empty when the segment is not a git-commit.
 ///
 /// Walks git's own global flags to find the subcommand, capturing the redirects
 /// on the way. Indices are into the quote-aware token stream, so a spaced quoted
@@ -763,10 +824,16 @@ fn resolve_git_path(path: &str, base: &str) -> String {
 /// - **`-C` accumulates.** git documents each subsequent non-absolute
 ///   `-C <path>` as relative to the preceding one, so the running redirect is
 ///   the base for the next.
-/// - **Precedence is `--work-tree` → `--git-dir` → `-C` → `effective_dir`.**
-///   `--work-tree` outranks `--git-dir` because it names the checkout actually
-///   being mutated, which is what this guard judges. A `--git-dir` value needs
-///   no `.git` stripping: [`GitState`] resolves `<repo>/.git` to `<repo>`.
+/// - **`--work-tree` and `--git-dir` are BOTH emitted; `-C` or `effective_dir`
+///   is the fallback when neither is named.** They are not ranked against each
+///   other, because they name two different things a commit mutates — the tree
+///   it reads and the repository whose HEAD and index it advances — and either
+///   one landing in a primary checkout is the harm. A `<repo>/.git` value is
+///   normalized to `<repo>` — not because [`GitState`] needs it (it resolves
+///   either) but because the in-chain dismiss map is keyed by the raw target
+///   string, so the two spellings of one repo must converge or a dismissed
+///   chain half-matches and blocks. One naming a linked worktree's admin dir is
+///   dropped by [`is_linked_worktree_admin_dir`] to avoid a false block.
 /// - **An explicit flag outranks the `GIT_WORK_TREE=`/`GIT_DIR=` env prefix**
 ///   (`env_work_tree`/`env_git_dir`, already resolved by the caller), as it does
 ///   in git.
@@ -774,14 +841,14 @@ fn resolve_git_path(path: &str, base: &str) -> String {
 /// These were previously an `ambiguous` early return — a MISS dressed as a
 /// fail-open, since the targets resolve fine (#378). An unresolvable value still
 /// fails open downstream: [`assess_dir`] Allows when [`GitState`] finds no repo.
-fn commit_target_of(
+fn commit_targets_of(
     argv: &[String],
     effective_dir: &str,
     env_work_tree: Option<&str>,
     env_git_dir: Option<&str>,
-) -> Option<CommitTarget> {
+) -> Vec<CommitTarget> {
     if argv.first().map(String::as_str) != Some("git") {
-        return None;
+        return Vec::new();
     }
     const VALUE_GLOBALS: &[&str] = &[
         "-C",
@@ -824,26 +891,56 @@ fn commit_target_of(
         idx += 1;
     }
     if argv.get(idx).map(String::as_str) != Some("commit") {
-        return None;
+        return Vec::new();
     }
-    // A relative flag value resolves against the cwd git is already standing in
-    // — the accumulated `-C` when there was one, else the segment's dir.
+    // Every relative value — flag OR env — resolves against the cwd git is
+    // already standing in: the accumulated `-C` when there was one, else the
+    // segment's dir. git applies the `-C` chdir before repository setup, so
+    // resolving the env values anywhere else is the bypass described on
+    // [`git_env_overrides`].
     let base = redirect.as_deref().unwrap_or(effective_dir);
     // Per-flag precedence: each explicit flag overrides only its OWN env var,
-    // exactly as git does, so `--git-dir=X` with `GIT_WORK_TREE=Y` still lands
-    // in Y. Then work-tree outranks git-dir for the final target.
+    // exactly as git does, so `--git-dir=X` with `GIT_WORK_TREE=Y` still reads
+    // its tree from Y.
     let resolved_work_tree = work_tree
-        .map(|p| resolve_git_path(p, base))
-        .or_else(|| env_work_tree.map(str::to_string));
-    let resolved_git_dir = git_dir
-        .map(|p| resolve_git_path(p, base))
-        .or_else(|| env_git_dir.map(str::to_string));
-    Some(
-        resolved_work_tree
-            .or(resolved_git_dir)
-            .or(redirect)
-            .unwrap_or_else(|| effective_dir.to_string()),
-    )
+        .or(env_work_tree)
+        .map(|p| resolve_git_path(p, base));
+    let resolved_git_dir = git_dir.or(env_git_dir).map(|p| resolve_git_path(p, base));
+
+    // BOTH are emitted, because they name two different things git mutates and
+    // either one landing in a primary checkout is the harm this guard exists to
+    // stop. `--git-dir=<primary>/.git --work-tree=<elsewhere> commit` writes the
+    // tree read from `<elsewhere>` but advances the PRIMARY's HEAD and index —
+    // collapsing to a single work-tree-wins target allowed exactly that
+    // (security review, #378). The caller assesses each target independently and
+    // dedups, so two targets cost at most one extra probe.
+    let mut targets: Vec<CommitTarget> = Vec::new();
+    if let Some(wt) = resolved_work_tree {
+        targets.push(wt);
+    }
+    if let Some(gd) = resolved_git_dir.filter(|p| !is_linked_worktree_admin_dir(p)) {
+        // Normalize `<repo>/.git` to `<repo>` so the two spellings of one repo
+        // converge on ONE target string. `assess_dir` would resolve either, but
+        // the in-chain dismiss map is keyed by the raw string: a
+        // `dismiss --repo <repo> && GIT_DIR=<repo>/.git git commit` chain matched
+        // the work-tree target and missed the git-dir one, and the undismissed
+        // half blocked. Only an exact final `.git` component is stripped, so a
+        // bare repo (`/srv/thing.git`) is untouched.
+        let gd = match Path::new(&gd) {
+            p if p.file_name().is_some_and(|n| n == ".git") => p
+                .parent()
+                .map(|q| q.to_string_lossy().into_owned())
+                .unwrap_or(gd),
+            _ => gd,
+        };
+        if !targets.contains(&gd) {
+            targets.push(gd);
+        }
+    }
+    if targets.is_empty() {
+        targets.push(redirect.unwrap_or_else(|| effective_dir.to_string()));
+    }
+    targets
 }
 
 /// Scan `command`'s **top-level** segments for a leading in-chain
@@ -898,20 +995,17 @@ fn inchain_dismissed_commits(command: &str, cwd: &str) -> HashMap<CommitTarget, 
                 dismiss_target_dir(argv, &effective_dir),
                 crate::snooze_meta::normalize_reason(flag_value(argv, "--reason").as_deref()),
             );
-        } else if let Some(target) = {
+        } else {
             // Resolved EXACTLY as [`collect_targets`] does — the dismiss map is
             // keyed by target string, so any divergence silently stops a
-            // `dismiss && commit` chain from matching (#378).
-            let (env_work_tree, env_git_dir) = git_env_overrides(&tokens, &effective_dir);
-            commit_target_of(
-                argv,
-                &effective_dir,
-                env_work_tree.as_deref(),
-                env_git_dir.as_deref(),
-            )
-        } && let Some(reason) = active.get(&target)
-        {
-            dismissed.entry(target).or_insert_with(|| reason.clone());
+            // `dismiss && commit` chain from matching (#378). No `inherited_env`
+            // here: this walk is top-level-only by design and never recurses.
+            let (env_work_tree, env_git_dir) = git_env_overrides(&tokens);
+            for target in commit_targets_of(argv, &effective_dir, env_work_tree, env_git_dir) {
+                if let Some(reason) = active.get(&target) {
+                    dismissed.entry(target).or_insert_with(|| reason.clone());
+                }
+            }
         }
 
         // GATE RIDER: only an `&&` connector preserves the active dismiss set
@@ -1180,12 +1274,19 @@ fn mutation_nudge(
         // nudging on it told the reporter their command "mutates tracked files"
         // when it created one (#377). Gated BEFORE the `.parent()` ascent, which
         // would otherwise hand a nonexistent path to the containing directory and
-        // nudge identically to an existing tracked file. A pure `Path::exists()`
-        // — no git spawn, honoring the #271 probe discipline. `Dir` targets (a
+        // nudge identically to an existing tracked file. A pure metadata probe —
+        // no git spawn, honoring the #271 probe discipline. `Dir` targets (a
         // package-manager verb's cwd) keep nudging: the install mutates whatever
         // is already there.
+        //
+        // `symlink_metadata`, not `exists()`: the latter follows the link and
+        // reports false for a DANGLING symlink, so a redirect onto a tracked but
+        // broken symlink would be silenced (security review). This gate cannot
+        // separate a scratch `report.txt` from a brand-new SOURCE file — both are
+        // equally absent — so a first write of `src/newmod/lib.rs` in the primary
+        // is now silent too; that widened miss is enumerated in the module header.
         if let MutationTarget::File(f) = target
-            && !Path::new(f).exists()
+            && std::fs::symlink_metadata(f).is_err()
         {
             continue;
         }
@@ -1226,11 +1327,16 @@ fn mutation_nudge(
             let repo = probe
                 .repo_root(&dir)
                 .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            // The path comes out of the user's command, so it goes through the
+            // same display sanitizer every other untrusted field in this binary
+            // uses — a filename carrying a newline must not be able to forge an
+            // extra line in the guard's own advisory (security review).
             let path = match target {
                 MutationTarget::Dir(d) => d,
                 MutationTarget::File(f) => f,
             };
-            return Some(CheckResult::nudge(mutation_nudge_message(&repo, path)));
+            let path = sanitize_field(path, MAX_PATH_DISPLAY);
+            return Some(CheckResult::nudge(mutation_nudge_message(&repo, &path)));
         }
     }
     None
@@ -1638,21 +1744,49 @@ mod tests {
         );
         assert_eq!(
             git_commit_targets("git --git-dir=/o/.git commit -m 'x'", "/cwd"),
-            vec!["/o/.git".to_string()],
-            "GitState resolves a `.git` dir back to its checkout — no stripping here"
+            vec!["/o".to_string()],
+            "a `<repo>/.git` value normalizes to `<repo>` so the two spellings of \
+             one repo share a dismiss-map key"
         );
         // Relative values resolve against the segment's dir, like `-C` does.
         assert_eq!(
             git_commit_targets("git --work-tree=sub commit -m 'x'", "/cwd"),
             vec!["/cwd/sub".to_string()]
         );
-        // work-tree outranks git-dir: it names the checkout actually mutated.
+        // BOTH are emitted when both are named — they are two different things
+        // the commit mutates (the tree it reads, the repo whose HEAD advances),
+        // and collapsing to one let a git-dir naming the primary slip through.
+        // The git-dir is normalized `<repo>/.git` → `<repo>`.
         assert_eq!(
             git_commit_targets(
                 "git --git-dir=/o/.git --work-tree=/other commit -m 'x'",
                 "/cwd"
             ),
+            vec!["/other".to_string(), "/o".to_string()]
+        );
+        // Two spellings of the SAME repo collapse to one target, so an in-chain
+        // dismiss keyed on that repo matches every target the commit produces.
+        assert_eq!(
+            git_commit_targets(
+                "git --git-dir=/other/.git --work-tree=/other commit -m 'x'",
+                "/cwd"
+            ),
             vec!["/other".to_string()]
+        );
+        // A bare repo's dir is not `<repo>/.git` and must not be stripped.
+        assert_eq!(
+            git_commit_targets("git --git-dir=/srv/thing.git commit -m 'x'", "/cwd"),
+            vec!["/srv/thing.git".to_string()]
+        );
+        // A git-dir naming a LINKED worktree's admin dir is dropped, not
+        // emitted: walking up from it lands on the primary and would false-block
+        // the legitimate spelling.
+        assert_eq!(
+            git_commit_targets(
+                "git --git-dir=/p/.git/worktrees/a --work-tree=/wt commit -m 'x'",
+                "/cwd"
+            ),
+            vec!["/wt".to_string()]
         );
         // Code-review finding: a token that is the VALUE of a preceding global
         // must not be re-read as a flag. `-c` consumes the next token as its
@@ -3728,22 +3862,158 @@ mod tests {
 
     #[test]
     fn explicit_flags_outrank_git_env_prefix() {
-        // git's own precedence: an explicit flag overrides its env var. Pins
-        // that ordering AND proves the tightening did not create a false block —
-        // the env names the primary, but the command really commits into the
-        // worktree, so it must be allowed.
+        // git's own precedence: an explicit flag overrides its OWN env var.
+        // Pins that ordering AND proves the tightening did not create a false
+        // block — GIT_WORK_TREE names the primary, but the explicit flag wins
+        // and the commit really lands in the worktree, so it must be allowed.
+        //
+        // Deliberately no `GIT_DIR` here. An earlier version of this test set
+        // GIT_DIR=<primary>/.git alongside and still asserted Allow, which was
+        // wrong: with the repo dir pointed at the primary, that commit advances
+        // the PRIMARY's HEAD and index. `git_dir_naming_primary_blocks_even_with_a_work_tree`
+        // below now pins that case as a Block (security review, #378).
         let scratch = Scratch::new("cw-env-precedence");
         let (primary, wt) = primary_and_worktree(&scratch);
         let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
-        let cmd = format!("GIT_DIR={p}/.git GIT_WORK_TREE={p} git --work-tree={w} commit -m x");
+        let cmd = format!("GIT_WORK_TREE={p} git --work-tree={w} commit -m x");
         let mut input = make_bash(&cmd);
         input.cwd = Some(wt.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
         assert_eq!(
             r.outcome,
             Outcome::Allow,
-            "an explicit --work-tree outranks GIT_WORK_TREE/GIT_DIR: {cmd}"
+            "an explicit --work-tree outranks GIT_WORK_TREE: {cmd}"
         );
+    }
+
+    #[test]
+    fn git_dir_naming_primary_blocks_even_with_a_work_tree() {
+        // A commit reads its tree from --work-tree but advances HEAD and the
+        // index in --git-dir's repository. Ranking work-tree above git-dir and
+        // returning ONE target dropped the git-dir entirely, so this mutated the
+        // primary and Allowed. Both targets are emitted now.
+        let scratch = Scratch::new("cw-gitdir-both");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
+        for cmd in [
+            format!("git --git-dir={p}/.git --work-tree={w} commit -m x"),
+            format!("GIT_DIR={p}/.git git --work-tree={w} commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a git-dir naming the primary must block regardless of work-tree: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_git_env_resolves_after_the_dash_c_chdir() {
+        // THE regression this pass exists to catch. git applies the `-C` chdir
+        // BEFORE repository setup, so a relative env value is relative to the
+        // POST-`-C` directory. Resolving it against the pre-`-C` dir while it
+        // outranked the `-C` redirect made this Allow while git committed into
+        // the primary — a bypass the branch itself introduced, and one every
+        // absolute-path env test missed (security review, #378).
+        let scratch = Scratch::new("cw-rel-env");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
+
+        for cmd in [
+            format!("GIT_WORK_TREE=. git -C {p} commit -m x"),
+            format!("GIT_DIR=.git git -C {p} commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a relative git env var resolves against the -C target: {cmd}"
+            );
+        }
+
+        // Mirror direction — the false block. From the primary, `-C <worktree>`
+        // with a relative env value lands in the worktree, so it must allow.
+        for cmd in [
+            format!("GIT_WORK_TREE=. git -C {w} commit -m x"),
+            format!("GIT_DIR=.git git -C {w} commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "a relative env value under -C <worktree> is not a primary commit: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn inchain_dismiss_covers_every_target_a_commit_emits() {
+        // Emitting BOTH a work-tree and a git-dir target reopened the parity
+        // hazard from the other side: the dismiss map is keyed by target string,
+        // so a chain dismissing `<repo>` matched the work-tree target and missed
+        // the `<repo>/.git` one, and the undismissed half blocked a chain the
+        // user had explicitly licensed. Normalizing `<repo>/.git` → `<repo>`
+        // collapses them; this pins that a dismiss still covers the commit.
+        let scratch = Scratch::new("cw-dismiss-parity");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        let dismiss =
+            format!("cadence-hooks guardrails dismiss-enforce-worktree --for 30m --repo {p}");
+
+        for tail in [
+            format!("GIT_WORK_TREE={p} GIT_DIR={p}/.git git commit -m x"),
+            format!("git --git-dir={p}/.git --work-tree={p} commit -m x"),
+        ] {
+            let mut input = make_bash(&format!("{dismiss} && {tail}"));
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "an in-chain dismiss must cover every target the commit emits: {tail}"
+            );
+
+            // GATE RIDER intact: a `;` breaks the chain and it blocks again.
+            let mut input = make_bash(&format!("{dismiss} ; {tail}"));
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a non-&& connector still fails closed: {tail}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_env_prefix_is_inherited_by_a_wrapper_child() {
+        // The shell exports an assignment-word prefix into the child, so
+        // `GIT_WORK_TREE=<primary> sh -c 'git commit'` really does commit into
+        // the primary. The per-segment capture never reached the child script
+        // recursion (security review, #378).
+        let scratch = Scratch::new("cw-env-child");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        for cmd in [
+            format!("GIT_WORK_TREE={p} sh -c 'git commit -m x'"),
+            format!("GIT_DIR={p}/.git bash -c 'git commit -m x'"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a git env prefix reaches the wrapper's child: {cmd}"
+            );
+        }
     }
 
     #[test]

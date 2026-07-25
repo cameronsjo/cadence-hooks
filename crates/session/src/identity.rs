@@ -145,16 +145,11 @@ pub const MAX_LANES: usize = 32;
 /// crafted file must not be able to inject multi-line instruction blocks
 /// into the `additionalContext` text Claude reads — sanitization happens at
 /// display time, so the registry keeps raw data and every render is safe.
+/// Delegates to [`cadence_hooks_core::display::sanitize_field`], which the
+/// guardrails crate shares — a second copy of a security-display helper is a
+/// second place for it to drift.
 pub fn sanitize_field(s: &str, max: usize) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let mut out: String = cleaned.chars().take(max).collect();
-    if cleaned.chars().count() > max {
-        out.push('…');
-    }
-    out
+    cadence_hooks_core::display::sanitize_field(s, max)
 }
 
 /// Render seconds as a human-relative age: `just now`, `N min ago`, `N hr ago`,
