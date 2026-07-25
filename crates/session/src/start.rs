@@ -5,6 +5,14 @@
 //! injects a disclosure with a lane assessment and the multi-session
 //! protocol. The disclosure automates what was previously a hand-typed
 //! `<disclosure>` block (see the 2026-06-01 branch-collision field report).
+//!
+//! Also surfaces in-flight/blocked plans from `docs/plans/*.md` frontmatter
+//! ([`crate::plan_scan`], cadence-hooks#429) — the living-plan lifecycle's
+//! answer to a resuming session (auth-swap restart, `/clear`) having no
+//! memory of what was open. Chosen over a new SessionStart subcommand: this
+//! surface already runs unconditionally on every SessionStart and already
+//! joins independent disclosure parts in [`finish`], so a third part costs no
+//! new hooks.json row.
 
 use crate::identity::{self, SessionRecord};
 use crate::registry::{self, Peer};
@@ -53,12 +61,17 @@ pub fn run_start(
     // `enforce-worktree` uses to decide a real block, so the two can never
     // drift apart (cadence-hooks#236).
     let posture = input.cwd.as_deref().and_then(worktree_posture_line);
+    // Independent of session registration and identity, same as `posture`
+    // above: a plan's frontmatter is repo state, not session state, so this
+    // must surface even when the session id is missing/unsafe or the
+    // registry write below fails.
+    let plan_disclosure = input.cwd.as_deref().and_then(plan_disclosure_line);
 
     let Some(sid) = input
         .session_id()
         .filter(|s| identity::is_safe_session_id(s))
     else {
-        return finish(posture, None);
+        return finish(posture, None, plan_disclosure);
     };
 
     // Register (or re-register on resume — preserves any declared
@@ -105,7 +118,7 @@ pub fn run_start(
     };
     if registry::write_record(dir, &record).is_err() {
         // Fail open: a read-only filesystem must not break session start.
-        return finish(posture, None);
+        return finish(posture, None, plan_disclosure);
     }
 
     // Housekeeping: presumed-dead peers leave the room before roll call. Our
@@ -115,7 +128,7 @@ pub fn run_start(
     // Disclose live peers, if any.
     let peers = registry::live_peers(dir, sid, stale_secs);
     let peer_disclosure = (!peers.is_empty()).then(|| render_disclosure(&record, &peers));
-    finish(posture, peer_disclosure)
+    finish(posture, peer_disclosure, plan_disclosure)
 }
 
 /// The worktree-posture line for `cwd`, or `None` when `enforce-worktree`
@@ -133,11 +146,28 @@ fn worktree_posture_line(cwd: &str) -> Option<String> {
     })
 }
 
-/// Compose the final result from the optional posture line and optional peer
-/// disclosure: `Nudge` if either is present, else `Allow`. The single point
-/// where the two independent disclosures on this surface are joined.
-fn finish(posture: Option<String>, peer_disclosure: Option<String>) -> CheckResult {
-    let parts: Vec<String> = [posture, peer_disclosure].into_iter().flatten().collect();
+/// The in-flight/blocked plan disclosure for `cwd`'s repo, or `None` when
+/// `cwd` isn't inside a git repo, `docs/plans/` doesn't exist, or no plan
+/// there is `in-flight`/`blocked` — [`crate::plan_scan::scan_in_flight_plans`]
+/// carries the actual scan and fail-open behavior; this only resolves the
+/// repo root the same way [`crate::persist_plan`] does.
+fn plan_disclosure_line(cwd: &str) -> Option<String> {
+    let root = registry::repo_root(cwd)?;
+    crate::plan_scan::scan_in_flight_plans(&root)
+}
+
+/// Compose the final result from the optional posture line, peer disclosure,
+/// and plan disclosure: `Nudge` if any is present, else `Allow`. The single
+/// point where the independent disclosures on this surface are joined.
+fn finish(
+    posture: Option<String>,
+    peer_disclosure: Option<String>,
+    plan_disclosure: Option<String>,
+) -> CheckResult {
+    let parts: Vec<String> = [posture, peer_disclosure, plan_disclosure]
+        .into_iter()
+        .flatten()
+        .collect();
     if parts.is_empty() {
         CheckResult::allow()
     } else {
@@ -366,6 +396,54 @@ mod tests {
         run_start(&input, tmp.path(), None, 600);
         let r = run_start(&input, tmp.path(), None, 600);
         assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    // --- plan disclosure (cadence-hooks#429) ---
+    //
+    // Fixtures live under `target/`, not a tempdir — same carve-out reason as
+    // the worktree-posture tests below (`Scratch`, `init_repo`): a real git
+    // repo is needed for `registry::repo_root` to resolve.
+
+    #[test]
+    fn run_start_surfaces_in_flight_plan_disclosure() {
+        let scratch = Scratch::new("plan-disclosure");
+        init_repo(&scratch.0);
+        let plans_dir = scratch.0.join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(
+            plans_dir.join("2026-07-25-x.md"),
+            "---\nstatus: in-flight\nnext: \"ship it\"\n---\n\nbody\n",
+        )
+        .unwrap();
+        let registry_dir = TempDir::new().unwrap();
+        let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
+        let r = with_clean_worktree_env(|| {
+            run_start(&input, registry_dir.path(), Some("main".into()), 600)
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains("1 in-flight plan in docs/plans/"),
+            "plan disclosure header present: {msg}"
+        );
+        assert!(msg.contains("2026-07-25-x"), "slug named: {msg}");
+        assert!(msg.contains("ship it"), "next: text named: {msg}");
+    }
+
+    #[test]
+    fn run_start_stays_silent_with_no_in_flight_plans() {
+        let scratch = Scratch::new("plan-disclosure-empty");
+        init_repo(&scratch.0);
+        let registry_dir = TempDir::new().unwrap();
+        let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
+        let r = with_clean_worktree_env(|| {
+            run_start(&input, registry_dir.path(), Some("main".into()), 600)
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "no docs/plans/ dir at all → silence"
+        );
     }
 
     // --- render_disclosure ---

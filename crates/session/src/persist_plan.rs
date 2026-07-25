@@ -542,7 +542,13 @@ fn strip_leading_frontmatter(doc: &str) -> &str {
 /// exclusive), or `None` when the document doesn't open with one. Thin
 /// wrapper over [`frontmatter_extent`] sharing its single scan implementation
 /// with [`strip_leading_frontmatter`].
-fn leading_frontmatter_block(doc: &str) -> Option<&str> {
+///
+/// `pub(crate)`: [`crate::plan_scan`] reuses this exact bounded scan to read
+/// `docs/plans/*.md` frontmatter at `session start` — the same
+/// first-fence/[`FRONTMATTER_SCAN_MAX_LINES`]-window discipline this hook
+/// already relies on for idempotency, so the two readers can never disagree
+/// on where a plan's frontmatter ends (Design 2's "one schema, one scanner").
+pub(crate) fn leading_frontmatter_block(doc: &str) -> Option<&str> {
     frontmatter_extent(doc).map(|(start, end, _)| &doc[start..end])
 }
 
