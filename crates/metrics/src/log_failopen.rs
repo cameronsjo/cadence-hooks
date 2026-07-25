@@ -132,6 +132,11 @@ pub struct FailopenRecency {
     pub last_version: String,
     /// How many of this reason's windowed rows carry `current_version`.
     pub on_current_version: u64,
+    /// How many DISTINCT calendar days this reason fired on, within the window.
+    /// The shape signal a total cannot carry: at the same count, `1` is a burst
+    /// to correlate with a release or config change, and a number approaching
+    /// the window length is a sustained feed problem (#404).
+    pub distinct_days: u64,
     /// The `error` string on that most recent row, when it has one. `None` for
     /// a v1 row (written before the field existed), for a reason that records
     /// no error text (the deadline pair), and for a row whose `error` is an
@@ -353,11 +358,24 @@ fn recency_from(
         .iter()
         .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
         .count() as u64;
+    // The DATE prefix of the fixed-width `%Y-%m-%dT%H:%M:%SZ` stamp. A count of
+    // distinct days is the shape signal a bare total cannot carry: 120 rows on
+    // one day is an episode to correlate with a release or a config change,
+    // 120 across seven is the sustained wiring problem the remediation text
+    // used to assert unconditionally (#404). Rows whose `ts` is missing or too
+    // short are skipped rather than folded into a bogus day.
+    let distinct_days = rows
+        .iter()
+        .filter_map(|v| v.get("ts").and_then(Value::as_str))
+        .filter_map(|ts| ts.get(..10))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64;
 
     Some(FailopenRecency {
         last_ts,
         last_version,
         on_current_version,
+        distinct_days,
         last_error,
     })
 }
@@ -707,6 +725,50 @@ mod tests {
     }
 
     // --- recency (pure + end-to-end) ---
+
+    #[test]
+    fn recency_from_counts_distinct_days_not_rows() {
+        // The whole point of #404: an identical TOTAL must read differently
+        // depending on how it is distributed. Same count, same last_ts — only
+        // the day spread separates a burst from a drip.
+        let burst: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    r#"{{"reason":"parse","binaryVersion":"0.67.0","ts":"2026-07-19T{i:02}:00:00Z"}}"#
+                )
+            })
+            .collect();
+        let drip: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    r#"{{"reason":"parse","binaryVersion":"0.67.0","ts":"2026-07-{:02}T00:00:00Z"}}"#,
+                    14 + i % 6
+                )
+            })
+            .collect();
+
+        let b = recency_from(&burst.join("\n"), "2026-07-01T00:00:00Z", "parse", "0.67.0").unwrap();
+        let d = recency_from(&drip.join("\n"), "2026-07-01T00:00:00Z", "parse", "0.67.0").unwrap();
+
+        assert_eq!(b.on_current_version, 12, "same total");
+        assert_eq!(d.on_current_version, 12, "same total");
+        assert_eq!(b.distinct_days, 1, "twelve rows, all on 2026-07-19");
+        assert_eq!(d.distinct_days, 6, "twelve rows across six dates");
+    }
+
+    #[test]
+    fn recency_from_skips_rows_whose_ts_cannot_carry_a_date() {
+        // A malformed `ts` must not fold into a bogus day and inflate the
+        // spread — that would read as a drip and send the operator chasing
+        // live wiring.
+        let jsonl = [
+            r#"{"reason":"parse","binaryVersion":"0.67.0","ts":"2026-07-19T00:00:00Z"}"#,
+            r#"{"reason":"parse","binaryVersion":"0.67.0","ts":"2026-07-19T01:00:00Z"}"#,
+        ]
+        .join("\n");
+        let r = recency_from(&jsonl, "2026-07-01T00:00:00Z", "parse", "0.67.0").unwrap();
+        assert_eq!(r.distinct_days, 1);
+    }
 
     #[test]
     fn recency_from_reports_last_row_and_current_version_count() {

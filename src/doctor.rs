@@ -313,6 +313,18 @@ fn scan_hooks_json(
                     continue;
                 };
 
+                // Check 0: a third-party CLI this hook shells to that PATH
+                // cannot resolve (#319). Emitted per plugin rather than
+                // deduped globally — knowing WHICH hook went inert is the
+                // actionable half; a bare "jq is missing" leaves the operator
+                // to find the silent no-op themselves.
+                findings.extend(missing_cli_findings(
+                    cmd,
+                    plugin,
+                    path,
+                    find_line_number(raw, cmd),
+                ));
+
                 // Check 1: shell-expansion bug (Error).
                 if let Some(span) = detect_single_quoted_envvar(cmd) {
                     findings.push(Finding {
@@ -538,6 +550,315 @@ fn failopen_inspect_cmd(dir: &Path, reason: &str) -> String {
 /// but zero on the current version disambiguates a burst whose fix already
 /// shipped (aging out of the 7-day window) from an ongoing feed problem, which
 /// the bare count could not.
+/// Words that occupy command position while the thing that actually has to
+/// exist is their ARGUMENT. [`referenced_clis`] walks past these.
+///
+/// `time` is here and also deliberately absent from [`NOT_A_PATH_LOOKUP`]:
+/// stock macOS ships no `/usr/bin/time`, so treating it as a CLI would emit a
+/// bogus "missing CLI: time" on every such machine.
+const TRANSPARENT_PREFIXES: &[&str] = &[
+    "sudo", "env", "time", "nice", "nohup", "command", "builtin", "exec", "stdbuf",
+];
+
+/// Shell builtins and control words that occupy command position but are never
+/// a PATH lookup. Anything here is skipped by [`referenced_clis`].
+const NOT_A_PATH_LOOKUP: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "function", "return", "exit", "cd", "echo", "test", "true", "false", "set", "unset", "export",
+    "local", "read", "shift", "eval", "exec", "source", ".", "[", "[[", ":",
+];
+
+/// External CLI names referenced in command position across `commands`.
+///
+/// Command position only — a bare word that is the first token of a segment. A
+/// word appearing as an ARGUMENT (`--formatter markdownlint`) is not something
+/// the hook shells to, and flagging it would produce noise the operator learns
+/// to ignore, which is exactly how a real missing dependency gets skipped.
+///
+/// Skipped by construction: shell builtins ([`NOT_A_PATH_LOOKUP`]), anything
+/// containing `/` (a path, resolved without PATH), anything containing `$` (an
+/// unexpanded variable this cannot resolve), and assignment words.
+fn referenced_clis(command: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for segment in cadence_hooks_core::shell::command_segments(command) {
+        // Grouping punctuation first: a subshell like `(mytool --version)` is
+        // one segment, and its first token is the garbage string `(mytool` —
+        // which is never on PATH, so it would report a permanently-missing CLI
+        // that does not exist while never checking the real command word.
+        let segment = segment
+            .trim_start_matches(['(', '{', ' ', '\t'])
+            .trim_end_matches([')', '}', ';', ' ', '\t']);
+        let tokens = cadence_hooks_core::shell::tokenize(segment);
+
+        // Then transparent prefixes. `sudo mytool` / `env FOO=x mytool` /
+        // `nice -n 10 mytool` otherwise name the PREFIX as the referenced CLI
+        // and never see `mytool` — a false negative in exactly the case this
+        // check exists for. `sudo` is included here though the guard-side
+        // equivalent excludes it: this asks "will this hook run", and under
+        // `sudo` the thing that must exist is the argument.
+        let mut idx = 0;
+        while let Some(word) = tokens.get(idx) {
+            if TRANSPARENT_PREFIXES.contains(&word.as_str()) {
+                idx += 1;
+                // Skip the prefix's own flags and any assignment words it
+                // carries, so `env FOO=x mytool` and `nice -n 10 mytool` both
+                // land on `mytool`.
+                while tokens
+                    .get(idx)
+                    .is_some_and(|t| t.starts_with('-') || t.contains('='))
+                {
+                    idx += 1;
+                    // A flag taking a separate value (`nice -n 10`) consumes
+                    // the value too; a numeric follower is that value.
+                    if tokens.get(idx).is_some_and(|t| t.parse::<i64>().is_ok()) {
+                        idx += 1;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        let Some(word) = tokens.get(idx) else {
+            continue;
+        };
+        if word.contains('/')
+            || word.contains('$')
+            || word.contains('=')
+            || word.is_empty()
+            || NOT_A_PATH_LOOKUP.contains(&word.as_str())
+        {
+            continue;
+        }
+        out.insert(word.clone());
+    }
+    out
+}
+
+/// True when `name` resolves on the current `PATH`.
+///
+/// A plain PATH walk rather than shelling to `which`/`command -v`: this check
+/// exists precisely because a CLI may be absent, and asking a subprocess to
+/// answer that question adds a second dependency to the dependency check.
+fn on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| is_executable_at(&dir.join(name)))
+}
+
+/// True when `candidate` is something the shell could actually exec.
+///
+/// On unix that means the executable bit, not merely `is_file()`: a stray
+/// `chmod 644` placeholder earlier on PATH would otherwise read as present
+/// while the shell fails to run it — the check would report health where there
+/// is none.
+#[cfg(unix)]
+fn is_executable_at(candidate: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(candidate)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// True when `candidate`, or `candidate` plus any `PATHEXT` suffix, is a file.
+///
+/// Windows resolves an extensionless name through `PATHEXT`, and the default
+/// list is not just `.exe`. Node's global installs ship `.cmd` shims —
+/// `prettier.cmd`, `eslint.cmd`, `markdownlint-cli2.cmd` — so hardcoding `.exe`
+/// would report a large share of the CLIs hooks actually shell to as missing.
+/// No executable-bit concept applies here; presence is the whole test.
+#[cfg(windows)]
+fn is_executable_at(candidate: &Path) -> bool {
+    if candidate.is_file() {
+        return true;
+    }
+    let pathext = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC".to_string());
+    pathext.split(';').filter(|e| !e.is_empty()).any(|ext| {
+        let mut with_ext = candidate.as_os_str().to_os_string();
+        with_ext.push(ext);
+        Path::new(&with_ext).is_file()
+    })
+}
+
+/// Warn once per CLI that an installed hook shells to but PATH cannot resolve.
+///
+/// The dependency-level sibling of the wrapper-level fail-open in #69. A hook
+/// that shells to a third-party CLI and fails open when it is absent becomes a
+/// **silent no-op**: no error, no nudge, just a pass — so a guardrail the
+/// operator believes is enforcing is quietly inert (#319).
+///
+/// Setup-time, not per-invocation: the failure mode is a machine that never had
+/// the CLI, so paying a PATH walk on every tool call would be pure overhead.
+/// `doctor` catches it once.
+///
+/// Warning, not Error, and deliberately not fatal: this reads a *heuristic*
+/// command-word extraction over arbitrary bash, so a false positive is possible
+/// and must not be able to fail the run.
+fn missing_cli_findings(
+    command: &str,
+    plugin: &str,
+    path: &Path,
+    line: Option<usize>,
+) -> Vec<Finding> {
+    referenced_clis(command)
+        .into_iter()
+        .filter(|name| !on_path(name))
+        .map(|name| Finding {
+            severity: Severity::Warning,
+            plugin: plugin.to_string(),
+            file: path.to_path_buf(),
+            line,
+            snippet: format!("missing CLI: {name}"),
+            diagnosis: format!(
+                "an installed hook shells to `{name}`, which PATH cannot \
+                 resolve — that hook fails open silently, so a guardrail you \
+                 believe is enforcing is inert (no error, no nudge, just a pass)"
+            ),
+            remediation: format!(
+                "install `{name}` or put it on PATH; if the hook is no longer \
+                 wanted, remove its entry rather than leaving it inert"
+            ),
+        })
+        .collect()
+}
+
+/// Path fragments that mark a cloud-sync provider's local mirror.
+///
+/// Matched case-insensitively against a path's own components, never as a bare
+/// substring — `~/src/dropbox-client` is a project, not a synced tree, and a
+/// substring test would flag it. Each entry is a directory NAME a provider
+/// creates: macOS iCloud Drive lives under `Library/Mobile Documents`, and
+/// modern macOS third-party providers mount under `Library/CloudStorage`.
+const CLOUD_SYNC_MARKERS: &[&str] = &[
+    "OneDrive",
+    "Dropbox",
+    "CloudStorage",
+    "Mobile Documents",
+    "Google Drive",
+    "GoogleDrive",
+    "pCloud Drive",
+    "Sync.com",
+];
+
+/// The provider marker in `path`, if any component names one.
+///
+/// Component-wise and case-insensitive: a provider directory is a real path
+/// segment, so testing components avoids the `dropbox-client` false positive a
+/// substring search produces, while still catching a nested repo far below the
+/// sync root.
+///
+/// A component matches on exact equality **or** on a `"<marker> - "` prefix.
+/// The second form is not a nicety: a Microsoft 365 business or school tenant
+/// syncs to a folder named `OneDrive - <Organization>`, which is the dominant
+/// real-world shape of the very deployment this check exists to catch, and
+/// exact equality alone silently never fires for it. The separator is spelled
+/// with surrounding spaces deliberately — a bare `-` boundary would re-admit
+/// `dropbox-client`, the exact false positive component matching was chosen to
+/// avoid.
+fn cloud_sync_marker(path: &Path) -> Option<&'static str> {
+    path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .find_map(|segment| {
+            CLOUD_SYNC_MARKERS
+                .iter()
+                .find(|m| {
+                    segment.eq_ignore_ascii_case(m)
+                        || segment.len() > m.len() + 3
+                            && segment[..m.len()].eq_ignore_ascii_case(m)
+                            && segment[m.len()..].starts_with(" - ")
+                })
+                .copied()
+        })
+}
+
+/// Warn when a directory the guard suite reads on every hook sits inside a
+/// cloud-synced tree.
+///
+/// This names a *cause* the existing `deadline` finding could only tell the
+/// operator to go looking for. A synced working directory turns every `.git`
+/// stat and read into a network round-trip, which is what drove the #271
+/// latency to the point that git-backed checks degraded to fail-open — and it
+/// is diagnosable up front from the path alone, months before the latency
+/// becomes a P0 (#278).
+///
+/// Warning, not Error: a synced checkout is slow, not broken, and plenty of
+/// people deliberately keep a config dir in one. The point is to name it.
+fn cloud_sync_findings(candidates: &[(&str, PathBuf)]) -> Vec<Finding> {
+    candidates
+        .iter()
+        .filter_map(|(label, path)| {
+            let provider = cloud_sync_marker(path)?;
+            Some(Finding {
+                severity: Severity::Warning,
+                plugin: "cadence-hooks".to_string(),
+                file: path.clone(),
+                line: None,
+                snippet: format!("{label}: {}", path.display()),
+                diagnosis: format!(
+                    "the {label} sits inside a {provider} synced tree — every \
+                     .git stat and read a guard performs becomes a network \
+                     round-trip, which is the precondition that drove git-backed \
+                     checks to degrade to fail-open under a deadline (#271)"
+                ),
+                remediation: format!(
+                    "move the {label} outside {provider}, or exclude it from \
+                     sync; if it must stay, raise CADENCE_HOOK_DEADLINE_MS and \
+                     watch the deadline count in this report"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The distribution half of a failopen diagnosis: how many distinct days of the
+/// window the reason actually fired on.
+///
+/// A rolling count alone cannot tell a burst from a drip — 120 rows on one past
+/// day and 120 spread across seven read identically, and only the second is the
+/// "wiring problem" the remediation text used to assert unconditionally (#404).
+/// Rendered only when the window is longer than a day, since `1 of 1 day` says
+/// nothing.
+fn shape_clause(distinct_days: u64, window_days: u64) -> String {
+    match (distinct_days, window_days) {
+        (_, w) if w <= 1 => String::new(),
+        // Unreachable in practice: `windowed_rows` drops any row without a
+        // parseable `ts`, so a `Some(FailopenRecency)` always carries at least
+        // one dated row. Kept so the match is total without an `unwrap`-shaped
+        // assumption about a helper in another crate.
+        (0, _) => String::new(),
+        (1, _) => "; all on ONE day".to_string(),
+        (d, w) => format!("; spread over {d} of {w} days"),
+    }
+}
+
+/// Remediation keyed to the shape [`shape_clause`] reports, rather than one
+/// sentence asserting a sustained problem regardless of distribution.
+///
+/// The two shapes want genuinely different next actions: a single-day spike is
+/// an episode to correlate against a release or a config change, while a drip
+/// across most of the window is a live feed to chase. A count in between says
+/// neither confidently, so it says nothing rather than guessing.
+///
+/// The `>= 5` floor is chosen for the **7-day** window this is called with —
+/// "most days of the week". Should the window ever become configurable, derive
+/// it from the window length rather than leaving this literal, or the split
+/// silently misfires at the new scale.
+fn shape_remediation(distinct_days: u64) -> String {
+    match distinct_days {
+        1 => " Every row landed on a single day — that is an episode, not a \
+               steady feed: correlate the date with a release or a config change \
+               rather than chasing live wiring."
+            .to_string(),
+        d if d >= 5 => format!(
+            " Rows on {d} separate days is a sustained feed problem, not a \
+             one-off burst — chase the wiring."
+        ),
+        _ => String::new(),
+    }
+}
+
 fn failopen_findings(
     dir: &Path,
     window: Duration,
@@ -598,10 +919,16 @@ fn failopen_findings(
                     .map(|e| format!("; last error: {e}"))
                     .unwrap_or_default();
                 format!(
-                    "; last: {} on {} — {current_clause}{error_clause}",
-                    r.last_ts, r.last_version
+                    "; last: {} on {} — {current_clause}{error_clause}{}",
+                    r.last_ts,
+                    r.last_version,
+                    shape_clause(r.distinct_days, days)
                 )
             })
+            .unwrap_or_default();
+        let shape_remediation = recency
+            .get("parse")
+            .map(|r| shape_remediation(r.distinct_days))
             .unwrap_or_default();
         findings.push(Finding {
             severity: Severity::Warning,
@@ -614,11 +941,10 @@ fn failopen_findings(
                 counts.parse
             ),
             remediation: format!(
-                "occasional malformed payloads are tolerated; 3+ suggests \
-                 a wiring problem feeding this binary bad stdin. No failures \
-                 on the current binary version usually means the feed was \
-                 already fixed — check the CHANGELOG before chasing wiring. \
-                 List the rows with `{}`",
+                "occasional malformed payloads are tolerated.{shape_remediation} \
+                 No failures on the current binary version usually means the \
+                 feed was already fixed — check the CHANGELOG before chasing \
+                 wiring. List the rows with `{}`",
                 failopen_inspect_cmd(dir, "parse")
             ),
         });
@@ -1558,6 +1884,25 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             window,
             now,
         ));
+        // Names the CAUSE the deadline finding above can only tell the operator
+        // to go looking for (#278). Gated with the other live-machine reads:
+        // under `--root` these would report the dev machine's real dirs, not
+        // the fixture.
+        let mut sync_candidates: Vec<(&str, PathBuf)> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            sync_candidates.push(("working directory", cwd));
+        }
+        // Through the shared resolver, NOT a raw `CLAUDE_CONFIG_DIR` read —
+        // the same call `plugins_dir()` makes above. Most operators never set
+        // that variable, so reading it directly skipped the DEFAULT config dir
+        // entirely: `$HOME/.claude`. That default is exactly what Windows
+        // Known Folder Redirection parks inside OneDrive under corporate
+        // policy, which is the deployment this check exists to surface.
+        sync_candidates.push((
+            "Claude config dir",
+            cadence_hooks_core::paths::claude_config_dir(),
+        ));
+        findings.extend(cloud_sync_findings(&sync_candidates));
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);
             print_platform_drift_status();
@@ -1771,6 +2116,296 @@ mod tests {
         let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
         assert_eq!(findings.len(), 1);
         assert!(findings[0].diagnosis.contains("parse"));
+    }
+
+    #[test]
+    fn failopen_findings_distinguish_a_burst_from_a_drip_at_the_same_count() {
+        // #404: same total, opposite shapes, and the remediation must send the
+        // operator somewhere DIFFERENT for each. A one-day spike is an episode
+        // to correlate; a spread is the live feed the old text asserted for
+        // both.
+        let burst_dir = tempfile::tempdir().unwrap();
+        let burst: String = (0..6)
+            .map(|i| format!(
+                "{{\"reason\":\"parse\",\"binaryVersion\":\"0.66.0\",\"ts\":\"2026-07-20T{i:02}:00:00Z\"}}\n"
+            ))
+            .collect();
+        fs::write(burst_dir.path().join("failopen.jsonl"), burst).unwrap();
+
+        let drip_dir = tempfile::tempdir().unwrap();
+        let drip: String = (0..6)
+            .map(|i| format!(
+                "{{\"reason\":\"parse\",\"binaryVersion\":\"0.66.0\",\"ts\":\"2026-07-{:02}T00:00:00Z\"}}\n",
+                15 + i
+            ))
+            .collect();
+        fs::write(drip_dir.path().join("failopen.jsonl"), drip).unwrap();
+
+        let b = failopen_findings(burst_dir.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        let d = failopen_findings(drip_dir.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        assert_eq!(b.len(), 1);
+        assert_eq!(d.len(), 1);
+
+        // Identical counts — the snippet proves the totals really do match, so
+        // the difference below can only come from the distribution.
+        assert_eq!(b[0].snippet, d[0].snippet, "same total");
+
+        assert!(
+            b[0].diagnosis.contains("all on ONE day"),
+            "{}",
+            b[0].diagnosis
+        );
+        assert!(
+            b[0].remediation.contains("episode, not a")
+                && !b[0].remediation.contains("sustained feed"),
+            "{}",
+            b[0].remediation
+        );
+
+        assert!(
+            d[0].diagnosis.contains("spread over 6 of 7 days"),
+            "{}",
+            d[0].diagnosis
+        );
+        assert!(
+            d[0].remediation.contains("sustained feed problem")
+                && !d[0].remediation.contains("episode, not a"),
+            "{}",
+            d[0].remediation
+        );
+    }
+
+    #[test]
+    fn cloud_sync_marker_matches_components_not_substrings() {
+        // Component-wise is load-bearing. A substring test flags a project
+        // NAMED after a provider, and a check that cries wolf on ~/src is one
+        // the operator stops reading.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/OneDrive/repo")),
+            Some("OneDrive")
+        );
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/Library/Mobile Documents/repo")),
+            Some("Mobile Documents")
+        );
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/Library/CloudStorage/Box-x/repo")),
+            Some("CloudStorage")
+        );
+        // Case-insensitive: providers vary the casing across platforms.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/home/x/dropbox/repo")),
+            Some("Dropbox")
+        );
+        // A project merely NAMED after a provider is not a synced tree.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/src/dropbox-client")),
+            None
+        );
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/src/my-onedrive-tool")),
+            None
+        );
+        assert_eq!(cloud_sync_marker(Path::new("/Users/x/Projects/repo")), None);
+    }
+
+    #[test]
+    fn cloud_sync_marker_catches_the_m365_organization_suffix() {
+        // A Microsoft 365 business or school tenant syncs to
+        // `OneDrive - <Organization>`, which is the DOMINANT real-world shape
+        // of the deployment this check exists to catch. Exact-component
+        // matching alone never fired for it.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/OneDrive - Acme Corp/repo")),
+            Some("OneDrive")
+        );
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/OneDrive - Contoso Ltd/dev/repo")),
+            Some("OneDrive")
+        );
+        // The separator carries surrounding SPACES on purpose: a bare `-`
+        // boundary would re-admit the very false positive component matching
+        // was chosen to avoid.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/OneDrive-backups")),
+            None
+        );
+    }
+
+    #[test]
+    fn cloud_sync_findings_name_the_provider_and_the_directory() {
+        let findings = cloud_sync_findings(&[
+            ("working directory", PathBuf::from("/Users/x/OneDrive/repo")),
+            ("CLAUDE_CONFIG_DIR", PathBuf::from("/Users/x/.claude")),
+        ]);
+        assert_eq!(findings.len(), 1, "only the synced path is flagged");
+        assert_eq!(findings[0].severity, Severity::Warning, "slow, not broken");
+        assert!(
+            findings[0].diagnosis.contains("OneDrive"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0].diagnosis.contains("working directory"),
+            "{}",
+            findings[0].diagnosis
+        );
+    }
+
+    #[test]
+    fn referenced_clis_takes_command_position_only() {
+        // An argument that happens to name a tool is not something the hook
+        // shells to; flagging it is the noise that gets a real missing
+        // dependency skipped.
+        let clis = referenced_clis("markdownlint-cli2 --config x.jsonc");
+        assert!(clis.contains("markdownlint-cli2"));
+        assert!(!clis.contains("--config"));
+
+        let clis = referenced_clis("prettier --formatter markdownlint");
+        assert!(clis.contains("prettier"));
+        assert!(!clis.contains("markdownlint"), "argument, not command word");
+
+        // Paths and unexpanded variables resolve without PATH.
+        let clis = referenced_clis("\"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" guardrails x");
+        assert!(clis.is_empty(), "{clis:?}");
+        let clis = referenced_clis("/usr/bin/env python3");
+        assert!(!clis.contains("/usr/bin/env"), "{clis:?}");
+
+        // Builtins are never a PATH lookup.
+        let clis = referenced_clis("cd /tmp && echo hi && exit 0");
+        assert!(clis.is_empty(), "{clis:?}");
+
+        // Both sides of a chain are command words.
+        let clis = referenced_clis("jq -r .x < f.json | shellcheck -");
+        assert!(clis.contains("jq"), "{clis:?}");
+    }
+
+    #[test]
+    fn referenced_clis_walks_past_transparent_prefixes() {
+        // Under a prefix, the thing that must EXIST is the argument. Naming
+        // the prefix instead is a false negative in exactly the case this
+        // check exists for — a hook silently going inert.
+        for command in [
+            "sudo mytool --run",
+            "env FOO=x mytool --run",
+            "nice -n 10 mytool --run",
+            "nohup mytool --run",
+            "command mytool --run",
+            "env FOO=x sudo nice -n 5 mytool",
+        ] {
+            let clis = referenced_clis(command);
+            assert!(clis.contains("mytool"), "{command}: {clis:?}");
+            assert!(!clis.contains("sudo"), "{command}: {clis:?}");
+            assert!(!clis.contains("env"), "{command}: {clis:?}");
+            assert!(!clis.contains("nice"), "{command}: {clis:?}");
+        }
+        // `time` is a prefix, not a CLI: stock macOS ships no /usr/bin/time,
+        // so treating it as one emits a bogus finding on every such machine.
+        let clis = referenced_clis("time mytool");
+        assert!(clis.contains("mytool"), "{clis:?}");
+        assert!(!clis.contains("time"), "{clis:?}");
+    }
+
+    #[test]
+    fn referenced_clis_strips_group_wrappers() {
+        // `(mytool --version)` is ONE segment whose first token is the garbage
+        // string `(mytool` — never on PATH, so it would report a permanently
+        // missing CLI that does not exist while never checking the real one.
+        for command in ["(mytool --version)", "{ mytool --version; }", "( mytool )"] {
+            let clis = referenced_clis(command);
+            assert!(clis.contains("mytool"), "{command}: {clis:?}");
+            assert!(
+                !clis
+                    .iter()
+                    .any(|c| c.starts_with('(') || c.starts_with('{')),
+                "{command}: {clis:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_path_requires_an_executable_bit_not_merely_a_file() {
+        // A `chmod 644` placeholder earlier on PATH would otherwise read as
+        // present while the shell fails to exec it — reporting health where
+        // there is none. Unix-only: Windows has no executable bit, and its
+        // resolution goes through PATHEXT instead.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let inert = dir.path().join("cadence-inert-probe");
+            fs::write(&inert, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&inert, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                !is_executable_at(&inert),
+                "non-executable file is not a CLI"
+            );
+
+            fs::set_permissions(&inert, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(is_executable_at(&inert), "executable file is a CLI");
+        }
+        // Present on both platforms: an absent path is never executable.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_executable_at(&dir.path().join("no-such-file")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_path_resolves_pathext_shims_not_just_exe() {
+        // Node's global installs ship `.cmd` shims — `prettier.cmd`,
+        // `markdownlint-cli2.cmd` — so resolving only `.exe` would report a
+        // large share of the CLIs hooks actually shell to as missing. This
+        // runs ONLY on the Windows leg, which is the point: the branch it
+        // covers cannot be exercised from the author's machine, and shipping
+        // an unexercised platform branch is how a fail-open gets missed.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("cadence-probe-tool.cmd");
+        fs::write(&shim, "@echo off\n").unwrap();
+        assert!(
+            is_executable_at(&dir.path().join("cadence-probe-tool")),
+            "a .cmd shim must resolve for its extensionless name"
+        );
+        assert!(
+            !is_executable_at(&dir.path().join("cadence-probe-absent")),
+            "an absent name must not resolve through PATHEXT"
+        );
+    }
+
+    #[test]
+    fn missing_cli_findings_flag_only_what_path_cannot_resolve() {
+        // `sh` is on PATH everywhere the suite runs; the invented name is not.
+        // Asserting both directions in one test keeps this from passing
+        // vacuously if `on_path` ever returned a constant.
+        let found = missing_cli_findings(
+            "sh -c true && cadence-doctor-no-such-cli-xyz --run",
+            "test-plugin",
+            Path::new("/x/hooks.json"),
+            Some(7),
+        );
+        let names: Vec<&str> = found.iter().map(|f| f.snippet.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|s| s.contains("cadence-doctor-no-such-cli-xyz")),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|s| s.contains("sh")), "{names:?}");
+        assert_eq!(found[0].plugin, "test-plugin");
+        assert_eq!(found[0].line, Some(7));
+        assert_eq!(
+            found[0].severity,
+            Severity::Warning,
+            "heuristic extraction must never be able to fail the run"
+        );
+    }
+
+    #[test]
+    fn shape_clause_is_silent_when_it_would_say_nothing() {
+        // `1 of 1 day` carries no information, and neither does a middling
+        // spread — better silent than confidently wrong about the shape.
+        assert_eq!(shape_clause(1, 1), "");
+        assert_eq!(shape_clause(0, 7), "");
+        assert_eq!(shape_remediation(3), "");
     }
 
     #[test]
