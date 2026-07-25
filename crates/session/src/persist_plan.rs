@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn file_body_hash_anchors_on_last_occurrence_not_a_decoy() {
+    fn file_matches_body_anchors_on_last_occurrence_not_a_decoy() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("plan.md");
         fs::write(
