@@ -481,6 +481,19 @@ fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option
     })
 }
 
+/// A copy-pasteable command that lists the recent `failopen.jsonl` rows for one
+/// `reason`. Replaces the bare "inspect failopen.jsonl" guidance, which named a
+/// file but not a way to read it (cameronsjo/cadence-hooks#398). The path is
+/// double-quoted because the metrics dir routinely sits under a home directory
+/// that may contain spaces; `grep` matches the serialized key/value pair
+/// verbatim, since `serde_json` writes compact JSON with no inner spaces.
+fn failopen_inspect_cmd(dir: &Path, reason: &str) -> String {
+    format!(
+        r#"grep '"reason":"{reason}"' "{}/failopen.jsonl" | tail -5"#,
+        dir.display()
+    )
+}
+
 /// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
 /// none when all counts are below their thresholds. `panic` and `parse` are
 /// warned on any/moderate occurrence; the #271 deadline pair is load-correlated
@@ -491,9 +504,12 @@ fn staleness_finding(dir: &Path, threshold: Duration, now: SystemTime) -> Option
 /// `log_failopen::counts_from`'s doc) — an older-version row is the
 /// sanctioned release-transition case and is excluded by construction.
 ///
-/// Counts and the `parse` recency come from a single `recent_failopen_report`
-/// read. The `parse` finding additionally carries recency + version context:
-/// when it last fired, on which binary version,
+/// Counts and the `parse`/`panic` recency come from a single
+/// `recent_failopen_report` read. Both of those findings name the last recorded
+/// `error` — the field that makes the "inspect failopen.jsonl" guidance
+/// answerable (cameronsjo/cadence-hooks#398); rows written before that field
+/// existed simply omit the clause. The `parse` finding additionally carries
+/// recency + version context: when it last fired, on which binary version,
 /// and how many of the windowed rows are on the CURRENT version. Its *count*
 /// stays window-wide — unlike `version_mismatch`, a bad-stdin wiring problem is
 /// not version-specific, so filtering the count would under-report a live one —
@@ -506,19 +522,24 @@ fn failopen_findings(
     now: SystemTime,
     current_version: &str,
 ) -> Vec<Finding> {
-    // One read of failopen.jsonl yields both the per-reason counts and the
-    // recency context for the `parse` finding (the only reason that shows it).
-    let (counts, parse_recency) = cadence_hooks_metrics::log_failopen::recent_failopen_report(
+    // One read of failopen.jsonl yields the per-reason counts plus the recency
+    // context for both reasons that show one.
+    let (counts, recency) = cadence_hooks_metrics::log_failopen::recent_failopen_report(
         dir,
         window,
         now,
         current_version,
-        "parse",
+        &["parse", "panic"],
     );
     let days = window.as_secs() / 86_400;
     let mut findings = Vec::new();
 
     if counts.panic >= 1 {
+        let last_error = recency
+            .get("panic")
+            .and_then(|r| r.last_error.as_deref())
+            .map(|e| format!("; last error: {e}"))
+            .unwrap_or_default();
         findings.push(Finding {
             severity: Severity::Warning,
             plugin: "cadence-metrics".to_string(),
@@ -526,28 +547,36 @@ fn failopen_findings(
             line: None,
             snippet: format!("panic: {}", counts.panic),
             diagnosis: format!(
-                "{} panic(s) in the last {days} days (failopen.jsonl)",
+                "{} panic(s) in the last {days} days (failopen.jsonl{last_error})",
                 counts.panic
             ),
-            remediation: "a panic in a check/logger is always a bug — inspect \
-                          failopen.jsonl for the namespace/subcommand and file an issue"
-                .to_string(),
+            remediation: format!(
+                "a panic in a check/logger is always a bug — list the rows with \
+                 `{}` and file an issue at \
+                 https://github.com/cameronsjo/cadence-hooks/issues",
+                failopen_inspect_cmd(dir, "panic")
+            ),
         });
     }
 
     if counts.parse >= 3 {
         // Recency + version context so a burst whose fix already shipped reads
         // differently from a live wiring problem — see this fn's doc comment.
-        let recency = parse_recency
-            .as_ref()
+        let recency_clause = recency
+            .get("parse")
             .map(|r| {
                 let current_clause = if r.on_current_version == 0 {
                     format!("none on current {current_version}")
                 } else {
                     format!("{} on current {current_version}", r.on_current_version)
                 };
+                let error_clause = r
+                    .last_error
+                    .as_deref()
+                    .map(|e| format!("; last error: {e}"))
+                    .unwrap_or_default();
                 format!(
-                    "; last: {} on {} — {current_clause}",
+                    "; last: {} on {} — {current_clause}{error_clause}",
                     r.last_ts, r.last_version
                 )
             })
@@ -559,15 +588,17 @@ fn failopen_findings(
             line: None,
             snippet: format!("parse: {}", counts.parse),
             diagnosis: format!(
-                "{} stdin-parse failure(s) in the last {days} days (failopen.jsonl{recency})",
+                "{} stdin-parse failure(s) in the last {days} days (failopen.jsonl{recency_clause})",
                 counts.parse
             ),
-            remediation: "occasional malformed payloads are tolerated; 3+ suggests \
-                          a wiring problem feeding this binary bad stdin. No failures \
-                          on the current binary version usually means the feed was \
-                          already fixed — check the CHANGELOG before chasing wiring. \
-                          Inspect failopen.jsonl"
-                .to_string(),
+            remediation: format!(
+                "occasional malformed payloads are tolerated; 3+ suggests \
+                 a wiring problem feeding this binary bad stdin. No failures \
+                 on the current binary version usually means the feed was \
+                 already fixed — check the CHANGELOG before chasing wiring. \
+                 List the rows with `{}`",
+                failopen_inspect_cmd(dir, "parse")
+            ),
         });
     }
 
@@ -1771,6 +1802,111 @@ mod tests {
             "{}",
             findings[0].diagnosis
         );
+    }
+
+    #[test]
+    fn failopen_findings_panic_names_the_last_error_and_a_runnable_command() {
+        // The #398 complaint in one test: a panic finding that says only "N
+        // panic(s)" and "inspect failopen.jsonl" gives an operator nowhere to
+        // go. The error text and a copy-pasteable command are the fix.
+        let tmp = tempfile::tempdir().unwrap();
+        let row = r#"{"schemaVersion":2,"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","error":"index out of bounds (at crates/cadence/src/terminology.rs:88)","ts":"TS"}"#
+            .replace("TS", &cadence_hooks_core::time::utc_timestamp());
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains(
+                "last error: index out of bounds (at crates/cadence/src/terminology.rs:88)"
+            ),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0]
+                .remediation
+                .contains(r#"grep '"reason":"panic"'"#),
+            "{}",
+            findings[0].remediation
+        );
+        assert!(
+            !findings[0].remediation.contains("inspect failopen.jsonl"),
+            "the unactionable phrasing is gone: {}",
+            findings[0].remediation
+        );
+    }
+
+    #[test]
+    fn failopen_findings_parse_diagnosis_carries_the_last_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: String = (0..3)
+            .map(|_| {
+                r#"{"schemaVersion":2,"reason":"parse","namespace":"cadence","subcommand":"heartbeat","binaryVersion":"0.66.0","error":"Failed to parse hook JSON: expected value at line 1 column 1","ts":"2026-07-20T20:51:00Z"}"#
+                    .to_string()
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains(
+                "last error: Failed to parse hook JSON: expected value at line 1 column 1"
+            ),
+            "{}",
+            findings[0].diagnosis
+        );
+    }
+
+    #[test]
+    fn failopen_findings_render_cleanly_for_v1_rows_without_an_error() {
+        // BACKWARD COMPAT at the render layer: an operator's existing ledger is
+        // entirely v1. The clause is omitted, not filled with a literal "null"
+        // or an empty "last error: ".
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let panic_row = format!(
+            r#"{{"schemaVersion":1,"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","ts":"{ts}"}}"#
+        );
+        let parse_rows: String = (0..3)
+            .map(|_| {
+                format!(
+                    r#"{{"schemaVersion":1,"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"{ts}"}}"#
+                ) + "\n"
+            })
+            .collect();
+        fs::write(
+            tmp.path().join("failopen.jsonl"),
+            format!("{panic_row}\n{parse_rows}"),
+        )
+        .unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 2);
+        for finding in &findings {
+            assert!(
+                !finding.diagnosis.contains("last error"),
+                "no empty error clause: {}",
+                finding.diagnosis
+            );
+            assert!(
+                !finding.diagnosis.contains("null"),
+                "no literal null leaks into the diagnosis: {}",
+                finding.diagnosis
+            );
+        }
+    }
+
+    #[test]
+    fn failopen_inspect_cmd_quotes_a_path_with_spaces() {
+        let cmd = failopen_inspect_cmd(Path::new("/Users/a b/.claude/metrics"), "panic");
+        assert!(
+            cmd.contains(r#""/Users/a b/.claude/metrics/failopen.jsonl""#),
+            "{cmd}"
+        );
+        assert!(cmd.contains(r#"grep '"reason":"panic"'"#), "{cmd}");
     }
 
     #[test]

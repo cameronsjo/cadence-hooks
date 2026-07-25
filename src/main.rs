@@ -9,6 +9,35 @@
 use cadence_hooks_core::HookEvent;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::process;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::ThreadId;
+
+/// Set by [`dispatch`] around the region its `catch_unwind` covers, and read by
+/// the global panic hook below.
+///
+/// A panic hook runs **before** unwinding begins, so the hook's
+/// `process::exit(1)` terminated the process and no `catch_unwind` downstream
+/// ever regained control — every guard in the tree was dead code
+/// (cameronsjo/cadence-hooks#349). This flag lets the hook *return* instead,
+/// handing the unwind to the waiting guard, and only where a guard is actually
+/// waiting. Unguarded panics keep the historical exit-1 path exactly.
+///
+/// `Relaxed` is sufficient: the store and the panic hook's load happen on the
+/// same thread in program order, and a load from any *other* thread is
+/// short-circuited by the `MAIN_THREAD` test below before its value matters.
+pub(crate) static PANIC_GUARDED: AtomicBool = AtomicBool::new(false);
+
+/// The thread `main` runs on, pinned at entry.
+///
+/// `PANIC_GUARDED` is a process-global, but the `catch_unwind` it advertises
+/// only catches unwinds on the **main** thread. Guarded regions spawn worker
+/// threads (`core::shell::run_bounded_with`'s stdout drain), and a panic there
+/// unwinds that thread, not `main` — so without this test the hook would skip
+/// the exit for a panic nothing is positioned to catch, silently losing the
+/// fail-open exit. `OnceLock` rather than a constant because a thread id is
+/// only knowable at runtime.
+static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
 /// Return true when running inside Claude Code. Detected via `CLAUDECODE=1`,
 /// which Claude Code exports for every spawned shell. Empty/unset means no.
@@ -498,6 +527,13 @@ fn print_hook_list() {
 }
 
 fn main() {
+    // Pin the main thread before anything can spawn — the panic hook's guard
+    // test below is only meaningful once this is set. The `Result` is
+    // discarded because `main` runs once: an `Err` would mean the cell was
+    // already set, which cannot happen, and failing open on it is right anyway
+    // (an unset cell just restores the unconditional exit-1 path).
+    let _ = MAIN_THREAD.set(std::thread::current().id());
+
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
     // Note: `list`, `configure`, `doctor`, `try`, `migrate-config`, and the
@@ -523,8 +559,11 @@ fn main() {
         process::exit(0);
     }
 
-    // Catch panics and exit 1 (warn) instead of the default exit 101.
-    // A panic means a bug in a check — it should not block the user's operation.
+    // Catch panics and exit 1 (warn) instead of the default exit 101 — a panic
+    // means a bug in a check, and it must not block the user's operation.
+    // Exception: inside a `PANIC_GUARDED` region this hook returns instead of
+    // exiting, so the waiting `catch_unwind` can finish the dispatch tail and
+    // fail open at exit 0 (see the flag's doc, cameronsjo/cadence-hooks#349).
     std::panic::set_hook(Box::new(|info| {
         let payload = if let Some(msg) = info.payload().downcast_ref::<&str>() {
             (*msg).to_string()
@@ -544,13 +583,28 @@ fn main() {
         let mut argv = std::env::args().skip(1);
         let namespace = argv.next();
         let subcommand = argv.next();
+        // The payload plus the source location — the two things that make this
+        // row answer "why did it panic?" instead of merely "it panicked"
+        // (cameronsjo/cadence-hooks#398). Both are this binary's own text; no
+        // hook payload is captured.
+        let error = match info.location() {
+            Some(loc) => format!("{payload} (at {}:{})", loc.file(), loc.line()),
+            None => payload,
+        };
         cadence_hooks_metrics::log_failopen(
             "panic",
             namespace.as_deref(),
             subcommand.as_deref(),
             env!("CARGO_PKG_VERSION"),
+            Some(&error),
         );
-        process::exit(1);
+        // Exit only when nothing downstream is positioned to catch this unwind.
+        // A panic hook runs before unwinding starts, so exiting here would make
+        // every `catch_unwind` in the tree unreachable — see `PANIC_GUARDED`.
+        let on_main = MAIN_THREAD.get() == Some(&std::thread::current().id());
+        if !(on_main && PANIC_GUARDED.load(Ordering::Relaxed)) {
+            process::exit(1);
+        }
     }));
 
     // Build the clap Command. Under Claude Code, hide `configure` from --help
@@ -620,11 +674,16 @@ fn main() {
                     let mut argv = std::env::args().skip(1);
                     let namespace = argv.next();
                     let subcommand = argv.next();
+                    // The clap error *kind* ("InvalidSubcommand" /
+                    // "UnknownArgument"), not the full error — that is
+                    // multi-line and ANSI-colored, and the kind is the whole
+                    // diagnostic here anyway.
                     cadence_hooks_metrics::log_failopen(
                         "version_mismatch",
                         namespace.as_deref(),
                         subcommand.as_deref(),
                         installed,
+                        Some(&format!("{:?}", e.kind())),
                     );
                     process::exit(1);
                 }
