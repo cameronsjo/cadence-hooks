@@ -499,27 +499,40 @@ fn git_env_overrides(tokens: &[String]) -> (Option<&str>, Option<&str>) {
 /// KEPT rather than excluded, and the kept target is then assessed by
 /// [`GitState`], which canonicalizes properly.
 fn lexical_normalize(path: &str) -> String {
-    use std::path::Component;
-    let mut out: Vec<Component> = Vec::new();
-    for comp in Path::new(path).components() {
-        match comp {
-            // `components()` already drops `.` and collapses `//`.
-            Component::ParentDir => match out.last() {
-                // Only a normal component can be popped: `/..` is `/`, and a
-                // leading run of `..` in a relative path must survive.
-                Some(Component::Normal(_)) => {
+    // A pure STRING fold over `/`-separated segments — deliberately NOT a
+    // `Path`/`PathBuf` round-trip. Every target in this module is a SHELL path
+    // (forward slash, even under Git Bash on Windows), and collecting into a
+    // `PathBuf` re-joins with the PLATFORM separator: on Windows `/p/.git`
+    // comes back as `\p\.git`, so a normalized target stops matching the
+    // un-normalized ones the rest of the module produces and the dismiss map
+    // keyed on them never hits. `resolve_cd_target` carries the same warning
+    // about `PathBuf::join` for the same reason.
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            // An empty segment is a `//` collapse or a trailing slash.
+            "" | "." => {}
+            ".." => match out.last() {
+                // Only a real name can be popped. A leading run of `..` in a
+                // relative path must survive, so `..` never pops a `..`.
+                Some(&last) if last != ".." => {
                     out.pop();
                 }
-                Some(Component::RootDir) => {}
-                _ => out.push(comp),
+                // `/..` is `/`.
+                _ if absolute => {}
+                _ => out.push(".."),
             },
-            other => out.push(other),
+            name => out.push(name),
         }
     }
-    let joined: PathBuf = out.iter().collect();
-    match joined.as_os_str().is_empty() {
-        true => path.to_string(),
-        false => joined.to_string_lossy().into_owned(),
+    let body = out.join("/");
+    match (absolute, body.is_empty()) {
+        (true, _) => format!("/{body}"),
+        // Nothing survived a relative fold (`a/..`) — leave the caller's
+        // spelling alone rather than inventing a `.`; `GitState` resolves it.
+        (false, true) => path.to_string(),
+        (false, false) => body,
     }
 }
 
@@ -4167,10 +4180,34 @@ mod tests {
         // A leading run of `..` in a RELATIVE path has nothing to pop and must
         // survive, or the path would silently change meaning.
         assert_eq!(lexical_normalize("../sibling"), "../sibling");
+        // `..` never pops a `..`.
+        assert_eq!(lexical_normalize("../../x"), "../../x");
+        // Nothing survives a relative fold — the caller's spelling is kept
+        // rather than invented into a `.`.
+        assert_eq!(lexical_normalize("a/.."), "a/..");
         // `<repo>/.git` collapses; a bare repo's own dir does not.
         assert_eq!(normalize_target("/p/.git"), "/p");
         assert_eq!(normalize_target("/p/.git/"), "/p");
         assert_eq!(normalize_target("/srv/thing.git"), "/srv/thing.git");
+        // SEPARATOR INVARIANT. Every target here is a shell path, so the fold
+        // must emit `/` on every platform. Collecting into a `PathBuf` re-joins
+        // with the platform separator and returned `\p\.git` on Windows, which
+        // silently stopped every normalized target matching the un-normalized
+        // ones — the dismiss map is keyed on these strings. Asserted rather
+        // than left to a doc comment, because the failure is invisible on the
+        // developer's own machine.
+        for spelling in [
+            "/p/.git/worktrees/..",
+            "/p/./sub/",
+            "/p//q/../r",
+            "../sibling",
+        ] {
+            let folded = lexical_normalize(spelling);
+            assert!(
+                !folded.contains('\\'),
+                "fold must stay a shell path on every platform: {spelling} -> {folded}"
+            );
+        }
     }
 
     #[test]
