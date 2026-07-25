@@ -161,12 +161,22 @@ fn segment_is_ship_anchor(segment: &str) -> bool {
 /// Demanding a literal `pr` token is what preserves every existing negative:
 /// `gh issue create` stops at `issue`, and a quoted `'gh pr create'` collapses
 /// to a single token that is never the `gh` command word.
+///
+/// The scan RESUMES from where each walk stopped rather than restarting at the
+/// next token. A `--repo` skip can hop over a later `gh`, so restarting made
+/// the walk unamortized: `gh --repo` repeated M times is O(n^2), and at command
+/// sizes this tool actually composes that is enough to push the check past its
+/// deadline. Resuming keeps the whole scan linear, and cannot lose a match — a
+/// `gh` the walk hopped over was, by construction, being consumed as a flag's
+/// value (security review, PR #414).
 fn gh_pr_subcommand(tokens: &[String]) -> Option<&str> {
-    for (gh_index, token) in tokens.iter().enumerate() {
-        if token != "gh" {
+    let mut scan = 0;
+    while scan < tokens.len() {
+        if tokens[scan] != "gh" {
+            scan += 1;
             continue;
         }
-        let mut i = gh_index + 1;
+        let mut i = scan + 1;
         while let Some(flag) = tokens.get(i) {
             if !flag.starts_with('-') {
                 break;
@@ -182,6 +192,9 @@ fn gh_pr_subcommand(tokens: &[String]) -> Option<&str> {
         {
             return Some(sub.as_str());
         }
+        // Always advance: `i` can equal `scan + 1` when the very next token is
+        // not a flag, so `scan = i` alone would not terminate.
+        scan = i.max(scan + 1);
     }
     None
 }
@@ -399,12 +412,22 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Group 1: separator (&&, ;, ||, or empty for start-of-string)
     // Group 2: double-quoted path, Group 3: single-quoted path, Group 4: bare path
     //
-    // The bare-path class excludes ALL whitespace, not just a space: a newline
-    // has to TERMINATE the path. Swallowing it produced a target with the next
-    // line's command glued on — a directory that cannot exist — which is the
-    // cadence-hooks#394/#368 false-nudge. Every shortening this causes moves
-    // the result toward what bash actually does, so it repairs disagreements
-    // rather than introducing any.
+    // The bare-path class excludes ASCII whitespace, not just a space: a
+    // newline has to TERMINATE the path. Swallowing it produced a target with
+    // the next line's command glued on — a directory that cannot exist — which
+    // is the cadence-hooks#394/#368 false-nudge.
+    //
+    // The class names bash's default IFS literally — space, tab, newline —
+    // rather than `\s`. This crate takes `regex` with default features, so a
+    // bare `\s` means `\p{White_Space}`: U+00A0, U+2028, U+3000 and friends.
+    // Every one of those is an ORDINARY character in an unquoted bash word, so
+    // a Unicode-aware class truncates a path bash keeps whole. That divergence
+    // runs in the fail-open direction: a truncated prefix can name a DIFFERENT
+    // real checkout than the one the command runs in, and `guard-push-remote`
+    // allows when it cannot resolve a git dir. Matching bash's own splitting
+    // set is the only spelling that cannot invent a target (security review,
+    // PR #414). Spelled as a literal class rather than `(?-u:…)`, which would
+    // let the pattern match invalid UTF-8 and is rejected by the `&str` API.
     //
     // A newline is deliberately NOT a separator: adding one would recognize a
     // `cd` on its own line after an earlier command, but it would also match
@@ -413,7 +436,7 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // indented one inside a fenced block. That is a much wider accidental
     // trigger surface for a primitive three block-capable guards resolve
     // through, bought for a shape neither issue reports.
-    Regex::new(r#"(^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^\s&;|]+))"#)
+    Regex::new(r#"(^|&&|;|\|\|)\s*cd\s+(?:"([^"]*)"|'([^']*)'|([^ \t\n&;|]+))"#)
         .expect("pattern should compile")
 });
 
@@ -432,13 +455,29 @@ static CD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// a `cd` on its own line *after* an earlier command is still not recognized —
 /// unchanged behavior, and deliberate (see [`CD_PATTERN`]).
 ///
-/// This is a **raw-string scan, not a shell parse**, and it does not model
-/// subshells, pipelines, or backgrounding: a `cd` in any of those resolves as
-/// though it applied to the parent, even though bash would give it its own
-/// process and discard it. Long-standing behavior — stated here so a reader
-/// does not mistake the newline handling for a general shell-grammar model.
+/// Heredoc bodies are stripped first ([`strip_heredoc_bodies`]), the same way
+/// [`split_segments_with_ops`] does and for the same reason: a heredoc body is
+/// DATA bash never executes, so a `cd` written in prose there must not re-point
+/// the resolver. Without this, `git commit -F - <<'EOF'` carrying the ordinary
+/// `mkdir -p <dir> && cd <dir>` idiom re-pointed every guard that resolves
+/// through here — and once the target resolves to a real checkout, the two
+/// consumers that treat "unresolvable" as a deliberate fail-CLOSED block
+/// (`git_safety`'s bare-HEAD force-push check, `guard_gh_write`'s ownership
+/// check) silently judge the wrong directory instead of blocking. The
+/// segmenter already stripped; this resolver did not, and that asymmetry was
+/// the bug (security review, PR #414).
+///
+/// This is otherwise a **raw-string scan, not a shell parse**, and it does not
+/// model subshells, pipelines, or backgrounding: a `cd` in any of those
+/// resolves as though it applied to the parent, even though bash would give it
+/// its own process and discard it. Long-standing behavior — stated here so a
+/// reader does not mistake the newline handling for a general shell-grammar
+/// model.
 pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     let mut effective = cwd.to_string();
+
+    // Prose in a heredoc body is data, not commands — see the doc comment.
+    let command = strip_heredoc_bodies(command);
 
     // Assumes every `cd` succeeds — aligns with `git_commit_targets` (issue
     // #229 / PR #226). bash's `||`/`&&` are equal-precedence and
@@ -447,7 +486,7 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
     // whenever the cd works). The earlier "cd before `||` is a no-op"
     // heuristic misjudged that common `|| exit` idiom; both resolvers now
     // apply every `cd` the pattern finds, in order.
-    for caps in CD_PATTERN.captures_iter(command) {
+    for caps in CD_PATTERN.captures_iter(&command) {
         let target = caps
             .get(2)
             .or(caps.get(3))
@@ -1350,6 +1389,19 @@ mod tests {
     }
 
     #[test]
+    fn gh_pr_subcommand_scan_is_linear_and_still_finds_a_later_gh() {
+        // The `--repo` skip can hop over a later `gh`. Resuming from where the
+        // walk stopped keeps the scan linear, and this pins that it does not
+        // cost a match: the second `gh` here is a real ship and must be found.
+        assert!(is_polish_ship_anchor("gh --repo gh pr create --title x"));
+        assert!(is_polish_ship_anchor("gh auth status && gh pr ready 12"));
+        // A crafted `gh --repo` flood was quadratic before; it must terminate
+        // promptly and reject. 5k pairs finishes instantly when linear.
+        let flood = "gh --repo ".repeat(5000);
+        assert!(!is_polish_ship_anchor(&flood));
+    }
+
+    #[test]
     fn is_polish_ship_anchor_global_flag_form_rejects_non_anchor() {
         // Tolerating global flags must not loosen the subcommand test itself.
         assert!(!is_polish_ship_anchor("gh --repo owner/r pr list"));
@@ -2040,6 +2092,42 @@ mod tests {
             parse_work_dir("cd /wt\ngh pr create --title x", "/home"),
             "/wt"
         );
+    }
+
+    #[test]
+    fn cd_in_a_heredoc_body_does_not_repoint_the_resolver() {
+        // A heredoc body is DATA bash never executes. `mkdir -p <d> && cd <d>`
+        // is the most ordinary shell idiom in prose, and a composed PR body
+        // carries it constantly — before the strip, it re-pointed every guard
+        // resolving through here. The damage is not the wrong directory per se:
+        // `git_safety` and `guard_gh_write` treat an UNRESOLVABLE target as a
+        // deliberate fail-closed block, so a target that resolves to a real
+        // checkout downgrades a loud block into a silent wrong answer.
+        let command = "git commit -F - <<'EOF'\nsetup: mkdir -p /wt/feature && cd /wt/feature\nEOF\ngit push --force origin HEAD";
+        assert_eq!(parse_work_dir(command, "/primary"), "/primary");
+    }
+
+    #[test]
+    fn cd_bare_path_splits_on_bash_ifs_not_unicode_whitespace() {
+        // The class is ASCII-only. Bash's default IFS is space, tab, newline —
+        // every other Unicode space is an ordinary character in an unquoted
+        // word, so truncating there would name a DIFFERENT real checkout than
+        // the one the command runs in, and `guard-push-remote` allows when it
+        // cannot resolve a git dir. Fail-open direction, so it is pinned.
+        for sep in ["\u{00A0}", "\u{2028}", "\u{2029}", "\u{3000}", "\u{202F}"] {
+            let command = format!("cd /repo{sep}fork && git push");
+            assert_eq!(
+                parse_work_dir(&command, "/home"),
+                format!("/repo{sep}fork"),
+                "U+{:04X} is not in bash's IFS and must stay part of the path",
+                sep.chars().next().unwrap() as u32
+            );
+        }
+        // The three that ARE in bash's IFS still terminate.
+        for sep in [" ", "\t", "\n"] {
+            let command = format!("cd /repo{sep}rest && git push");
+            assert_eq!(parse_work_dir(&command, "/home"), "/repo");
+        }
     }
 
     #[test]
