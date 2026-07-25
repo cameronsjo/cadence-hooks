@@ -524,18 +524,20 @@ mod tests {
             // cwd is the PRIMARY (still on `main`) — only the `cd` redirects to
             // the worktree, so the newline handling is the whole test.
             //
-            // The `cd` target must be spelled as a SHELL path, not a native
-            // one. `resolve_cd_target` and `looks_absolute` are both documented
-            // to take forward-slash paths — that is how Git Bash spells a
-            // Windows path, and it is what a hook payload's `command` actually
-            // carries. A `PathBuf`-native `C:\…` fails `looks_absolute`'s
-            // `b[2] == b'/'` drive test, so it resolves as RELATIVE and gets
-            // joined onto cwd, and the gate never finds the marker. That is
-            // green on POSIX and red on Windows for a reason unrelated to the
-            // newline handling this test exists to pin.
-            let cd_target = wt.to_str().unwrap().replace('\\', "/");
-            let command = format!("cd {cd_target}\ngh pr create --title x");
-            let input = make_bash_with_cwd(&command, primary.to_str().unwrap());
+            // The `cd` target is spelled RELATIVE deliberately, so this test
+            // pins the newline handling on every platform.
+            //
+            // `resolve_cd_target` treats a target as absolute only when it
+            // starts with `/` — it never consults `looks_absolute`, so a
+            // Windows drive path (`C:\…` or `C:/…`, either slash) takes the
+            // relative branch and gets joined onto cwd. An absolute-path
+            // fixture would therefore resolve to nothing on Windows and the
+            // gate would nudge, failing for a reason that has nothing to do
+            // with the newline. A relative target goes down the same code path
+            // on both platforms, and the bare-path class still has to stop at
+            // the newline for it to resolve — which is the property under test.
+            let command = "cd ../wt\ngh pr create --title x";
+            let input = make_bash_with_cwd(command, primary.to_str().unwrap());
             let result = NudgePolishBeforePr.run(&input);
             assert_eq!(
                 result.outcome,
