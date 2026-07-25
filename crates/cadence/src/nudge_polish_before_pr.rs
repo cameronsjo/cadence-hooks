@@ -490,6 +490,93 @@ mod tests {
         });
     }
 
+    #[test]
+    fn run_newline_separated_cd_to_worktree_satisfies_gate() {
+        // #394/#368 regression. The filed hypothesis blamed writer/reader key
+        // divergence; the real defect was the READER's cwd resolver swallowing
+        // the newline into the `cd` target, so the ship command resolved to a
+        // nonexistent directory and never found the (correct) marker.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feat/newline",
+            ],
+        );
+
+        let wt_state = GitState::resolve(&wt).expect("worktree resolves");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/newline"),
+                "{}",
+            )
+            .unwrap();
+
+            // cwd is the PRIMARY (still on `main`) — only the `cd` redirects to
+            // the worktree, so the newline handling is the whole test.
+            let command = format!("cd {}\ngh pr create --title x", wt.to_str().unwrap());
+            let input = make_bash_with_cwd(&command, primary.to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(
+                result.outcome,
+                Outcome::Allow,
+                "a newline-separated `cd` into a marked worktree must satisfy the gate"
+            );
+        });
+    }
+
+    #[test]
+    fn run_subshell_cd_to_worktree_satisfies_gate() {
+        // Same defect, subshell shape: `( cd <wt> && gh pr create )` after a
+        // newline. The group opener must not hide the `cd` command word.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feat/subshell",
+            ],
+        );
+
+        let wt_state = GitState::resolve(&wt).expect("worktree resolves");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/subshell"),
+                "{}",
+            )
+            .unwrap();
+
+            let command = format!(
+                "echo x\n( cd {} && gh pr create --title x )",
+                wt.to_str().unwrap()
+            );
+            let input = make_bash_with_cwd(&command, primary.to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(
+                result.outcome,
+                Outcome::Allow,
+                "a subshell `cd` into a marked worktree must satisfy the gate"
+            );
+        });
+    }
+
     // --- preserved matcher tests (is_polish_ship_anchor) ---
 
     #[test]
