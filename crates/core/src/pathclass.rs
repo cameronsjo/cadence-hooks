@@ -84,6 +84,23 @@ pub enum PathClass {
     /// A git repo root (has a `.git` child, per the injected probe) or any path
     /// carrying a `.git` component.
     GitRoot,
+    /// Under a `.claude/` directory but **not** session scratch: the durable,
+    /// untracked half of the tree — session transcripts, the metrics audit
+    /// trail, skills, rules, hooks, agents, plugins, and both memory trees.
+    ///
+    /// Distinct from [`Source`] on purpose. Both mean "not proven safe", but a
+    /// consumer that *softens* its `Source` verdict — guard_rm allows a
+    /// single-file delete in the ambiguous middle — must not soften this one: a
+    /// lone session transcript is still the only copy of that transcript.
+    /// Separating them is what keeps a softening rule from silently re-opening
+    /// the subtree the scratch allowlist just closed.
+    ///
+    /// Sits below the structural classes, so `~/.claude/.git` still reports
+    /// [`GitRoot`](PathClass::GitRoot) and `~/.claude` itself still reports
+    /// [`HomeChild`](PathClass::HomeChild) — but **above**
+    /// [`DocsPlans`](PathClass::DocsPlans), which has no ALLOW consumer and so
+    /// reads as the ambiguous middle to guard_rm.
+    ClaudeState,
     /// The residual: an ordinary path matching no more-specific class.
     Source,
 }
@@ -169,11 +186,32 @@ pub fn classify(
     if has_git_component(&norm) || is_git_root(&norm) {
         return PathClass::GitRoot;
     }
+    // Everything else under `.claude` is durable state. Below the structural
+    // classes — so `~/.claude/.git` still reports git-root and `~/.claude`
+    // itself still reports home-child — but ABOVE `DocsPlans`, which has no
+    // ALLOW consumer and therefore reads as the ambiguous middle to guard_rm.
+    // With the order reversed, `~/.claude/docs/plans/x.md` reported `DocsPlans`
+    // and rode guard_rm's single-file softening to a silent ALLOW, defeating
+    // this class for exactly the subtree it was added to protect.
+    if under_claude_dir(&norm) {
+        return PathClass::ClaudeState;
+    }
     if under_docs_plans(&norm) {
         return PathClass::DocsPlans;
     }
 
     PathClass::Source
+}
+
+/// `.claude` appears as a path component AND is not the final one — the path
+/// lives *under* a `.claude` dir rather than being it. The coarse fact;
+/// [`under_claude_scratch`] is the narrow allowlist within it.
+fn under_claude_dir(norm: &str) -> bool {
+    let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    match segs.iter().position(|s| *s == ".claude") {
+        Some(pos) => pos + 1 < segs.len(),
+        None => false,
+    }
 }
 
 /// The subdirectories of a `.claude/` root that hold genuine session scratch —
@@ -335,11 +373,11 @@ mod tests {
         // disposable item the class exists for, so it falls through.
         assert_eq!(
             class("/srv/repo/.claude/worktrees", "/Users/x"),
-            PathClass::Source
+            PathClass::ClaudeState
         );
         assert_eq!(
             class("/srv/repo/.claude/intros", "/Users/x"),
-            PathClass::Source
+            PathClass::ClaudeState
         );
     }
 
@@ -360,7 +398,7 @@ mod tests {
             "/srv/repo/.claude/agent-memory",
             "/srv/repo/.claude/memory",
         ] {
-            assert_eq!(class(path, "/Users/x"), PathClass::Source, "{path}");
+            assert_eq!(class(path, "/Users/x"), PathClass::ClaudeState, "{path}");
         }
     }
 
@@ -604,14 +642,46 @@ mod tests {
         // "not proven disposable".
         assert_eq!(
             class("/Users/x/.claude/projects/some-proj/memory", "/Users/x"),
-            PathClass::Source
+            PathClass::ClaudeState
         );
         assert_eq!(
             class(
                 "/Users/x/.claude/projects/some-proj/memory/note.md",
                 "/Users/x"
             ),
+            PathClass::ClaudeState
+        );
+    }
+
+    #[test]
+    fn claude_state_is_distinct_from_source() {
+        // The distinction the single-file softening depends on: an ordinary
+        // project path and a durable `.claude` path must NOT share a class, or
+        // a consumer softening the residual would re-open the subtree the
+        // scratch allowlist closed.
+        assert_eq!(
+            class("/srv/repo/src/main.rs", "/Users/x"),
             PathClass::Source
+        );
+        assert_eq!(
+            class("/Users/x/.claude/projects/proj/session.jsonl", "/Users/x"),
+            PathClass::ClaudeState
+        );
+    }
+
+    #[test]
+    fn claude_state_outranks_docs_plans() {
+        // `DocsPlans` has no guard-rm arm, so it reads as the ambiguous middle
+        // and would ride a softening rule. A plan doc under `.claude` must
+        // report the durable-state fact instead.
+        assert_eq!(
+            class("/Users/x/.claude/docs/plans/2026-07-25-x.md", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        // …while a repo's own docs/plans still reports DocsPlans.
+        assert_eq!(
+            class("/srv/repo/docs/plans/2026-07-25-x.md", "/Users/x"),
+            PathClass::DocsPlans
         );
     }
 }

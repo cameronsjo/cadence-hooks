@@ -11,9 +11,24 @@
 //!   child, inside `$OBSIDIAN_VAULT`, or a git repo root / any path with a
 //!   `.git` component.
 //! - **ASK** ([`Outcome::Ask`], the prompt) — an unexpanded variable, a command
-//!   substitution, a `..`-bearing path, or anything else not proven safe. This
-//!   is the default, so nothing that prompts today stops prompting unless it is
-//!   structurally proven safe.
+//!   substitution, a `..`-bearing path, a brace list, durable `.claude` state,
+//!   or anything else not proven safe. This is the default, so nothing that
+//!   prompts today stops prompting unless it is structurally proven safe.
+//!
+//! **The single-file rule is the one softening of the ambiguous middle.**
+//! Without `-r`, `rm` and `unlink` cannot remove a directory — the shell
+//! refuses — so a glob-free operand names exactly one file. That is a shell
+//! guarantee costing no I/O, unlike a recoverability probe, and it lifts only
+//! [`TargetClass::Unknown`] to ALLOW. Every protected class still blocks, and
+//! durable `.claude` state is a separate class specifically so this rule cannot
+//! reach it: one session transcript is still the only copy of that transcript.
+//!
+//! Three exclusions keep the premise true. `rm -d`/`--dir` leaves the class —
+//! it removes an empty directory without `-r`. A glob-bearing operand leaves it
+//! — `rm *` resolves to the *directory* the sweep runs in. And a brace-bearing
+//! operand is unresolvable outright, because one token naming many targets
+//! cannot be enumerated here, and `strip_group_wrappers` mangles it into a
+//! single plausible-looking path whose first alternative escapes its class.
 //!
 //! **Charter:** a *discipline guard with an allow-granting edge*, not a security
 //! boundary. Fails open (ADR-0001). Deliberately NOT in `PROTECTED_GUARDS`, so
@@ -37,6 +52,14 @@
 //!   misread; the miss is intentional.
 //! - A `..`-bearing target resolves ambiguously (symlinks, escapes), so it
 //!   downgrades to ASK rather than a guessed BLOCK/ALLOW.
+//! - Same-command variable expansion is deliberately **absent**. Resolving
+//!   `SP=/tmp/x; rm -rf "$SP"` was built and then withdrawn: three adversarial
+//!   review rounds found sixteen silent-ALLOW misses in it, and the last round
+//!   found four *categorically* new mutation routes — `printf -v`, a
+//!   transparent prefix defeating a builtin gate, `IFS` redefining word
+//!   splitting, and subshell scoping erased by `strip_group_wrappers`. The
+//!   shell moves a variable through more routes than a parser at this altitude
+//!   can enumerate, so an unexpanded variable stays ASK.
 //!
 //! **Segment-aware parsing:** targets are collected by mirroring
 //! `enforce_worktree::collect_commit_targets` — walking `split_segments_with_ops`
@@ -106,27 +129,38 @@ fn takes_value(verb: &str, flag: &str) -> bool {
 /// flag (or any unambiguous abbreviation of it) appears before a `--` operand
 /// terminator.
 fn rm_is_recursive(argv: &[String], verb: &str) -> bool {
-    if verb != "rm" {
-        return false;
-    }
+    verb == "rm" && rm_has_flag(argv, &['r', 'R'], "recursive")
+}
+
+/// Does this `rm` carry `-d`/`--dir`, which removes an EMPTY directory without
+/// `-r`? The single-file class rests on "without `-r` the shell refuses to
+/// remove a directory", and this is the one flag that makes that false.
+fn rm_removes_dir(argv: &[String]) -> bool {
+    rm_has_flag(argv, &['d'], "dir")
+}
+
+/// Does `argv` carry a flag, in either the short-cluster form (`-rf` carrying
+/// any of `shorts`) or a long form abbreviating `long`?
+///
+/// One implementation for both flags guard-rm cares about, because the fiddly
+/// parts are identical and easy to get subtly different: the `--` operand
+/// terminator must stop the scan, and GNU coreutils accepts any unambiguous
+/// long-option abbreviation — `--r`, `--rec`, `--recu` all mean `--recursive`.
+/// `--recursivex` is not a prefix and does not match; a bare `--` carries an
+/// empty prefix and is the terminator handled above.
+fn rm_has_flag(argv: &[String], shorts: &[char], long: &str) -> bool {
     for tok in argv.iter().skip(1) {
         if tok == "--" {
             break; // operands only after this
         }
-        // GNU coreutils rm accepts unambiguous long-option abbreviations, and
-        // `--recursive` is the only rm long option starting with `--r` — so
-        // `--r`/`--rec`/`--recu`/… all expand to it. Treat any `--<p>` where p is
-        // a non-empty prefix of "recursive" as recursive; `--recursivex` (not a
-        // prefix) does not match, and a bare `--` (empty p) is the terminator
-        // already handled above.
         if let Some(rest) = tok.strip_prefix("--") {
-            if !rest.is_empty() && "recursive".starts_with(rest) {
+            if !rest.is_empty() && long.starts_with(rest) {
                 return true;
             }
-            continue; // a long flag that isn't a --recursive abbreviation
+            continue; // a long flag that abbreviates something else
         }
         // A short-flag cluster (`-rf`); the leading `-` is not a `--` long flag.
-        if tok.starts_with('-') && (tok.contains('r') || tok.contains('R')) {
+        if tok.starts_with('-') && tok.chars().any(|c| shorts.contains(&c)) {
             return true;
         }
     }
@@ -160,6 +194,12 @@ enum TargetClass {
     /// A git repo root (has a `.git` child), or any path with a `.git`
     /// component. BLOCK.
     GitRepo,
+    /// Durable state under a `.claude/` directory — transcripts, the metrics
+    /// audit trail, skills, rules, both memory trees. ASK, and deliberately a
+    /// class of its own rather than [`Unknown`](TargetClass::Unknown): the
+    /// single-file softening lifts `Unknown` to ALLOW, and one session
+    /// transcript is still the only copy of that transcript.
+    ClaudeState,
     /// Unexpanded variable, command substitution, or a `..`-bearing path that
     /// cannot be confidently resolved. ASK.
     Unresolvable,
@@ -176,7 +216,9 @@ impl TargetClass {
             | TargetClass::HomeChild
             | TargetClass::Vault
             | TargetClass::GitRepo => Outcome::Block,
-            TargetClass::Unresolvable | TargetClass::Unknown => Outcome::Ask,
+            TargetClass::ClaudeState | TargetClass::Unresolvable | TargetClass::Unknown => {
+                Outcome::Ask
+            }
         }
     }
 }
@@ -202,16 +244,35 @@ enum TargetToken {
     /// whether the invocation carried `-r`/`-R` — a recursive sweep is judged
     /// more conservatively than a flat one.
     FileGlob { dir: String, recursive: bool },
+    /// A non-recursive `rm`/`unlink` naming one concrete path — no glob, so
+    /// exactly one filesystem entry. Without `-r` the shell **refuses** to
+    /// remove a directory, so this can only ever delete a single file; that is
+    /// a shell guarantee, not a filesystem probe, and costs no I/O.
+    ///
+    /// Judged one step softer than [`Path`](TargetToken::Path), and only in the
+    /// ambiguous middle. Every protected class still blocks, and durable
+    /// `.claude` state has its own class precisely so it is not swept in here.
+    SingleFile(String),
     /// An operand that could not be resolved (unexpanded var / substitution /
-    /// `..`-bearing). Always ASK.
+    /// `..`-bearing / brace list). Always ASK.
     Unresolvable,
 }
 
 /// Walk one script's segments, collecting every rm-family deletion target,
 /// tracking the effective cwd across `cd`s and recursing into child scripts —
 /// a direct mirror of `enforce_worktree::collect_commit_targets` (issue #228).
-fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetToken>) {
+fn collect_targets(
+    script: &str,
+    cwd: &str,
+    cwd_known: bool,
+    depth: usize,
+    out: &mut Vec<TargetToken>,
+) {
     let mut effective_dir = cwd.to_string();
+    // False once a `cd` moves somewhere this parser cannot name. A relative
+    // target after that resolves against a directory the shell has already
+    // left, so it must not carry the old directory's verdict.
+    let mut dir_known = cwd_known;
 
     for (segment, _next_op) in split_segments_with_ops(script) {
         let segment = strip_group_wrappers(&segment);
@@ -224,7 +285,7 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
         // never leaks back into this script's tracking.
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, segment) {
-                collect_targets(&child, &effective_dir, depth + 1, out);
+                collect_targets(&child, &effective_dir, dir_known, depth + 1, out);
             }
         }
 
@@ -240,11 +301,15 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
             {
                 idx += 1;
             }
-            if let Some(target) = tokens.get(idx)
-                && target != "-"
-                && !target.starts_with('$')
-            {
-                effective_dir = resolve_cd_target(target, &effective_dir);
+            // A bare `-`, a missing target, or an unexpanded variable makes the
+            // new directory UNKNOWN. Keeping the pre-cd directory was a silent
+            // ALLOW: `cd $HOME; rm -rf Documents` from a `/tmp` cwd resolved
+            // `Documents` under `/tmp` and allowed a delete of `~/Documents`.
+            match tokens.get(idx) {
+                Some(target) if target != "-" && !target.starts_with('$') => {
+                    effective_dir = resolve_cd_target(target, &effective_dir);
+                }
+                _ => dir_known = false,
             }
             continue;
         }
@@ -263,8 +328,20 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
             if recursive && operands.is_empty() {
                 out.push(TargetToken::Unresolvable);
             }
+            // Without `-r`, `rm` and `unlink` cannot remove a directory — the
+            // shell refuses. `rm -d`/`--dir` is the exception: it removes an
+            // EMPTY directory without `-r`, so it is excluded rather than left
+            // to falsify the premise.
+            let single_file =
+                !recursive && matches!(verb, "rm" | "unlink") && !rm_removes_dir(argv);
             for operand in operands {
-                out.push(resolve_target(&operand, &effective_dir, recursive));
+                out.push(resolve_target(
+                    &operand,
+                    &effective_dir,
+                    dir_known,
+                    recursive,
+                    single_file,
+                ));
             }
         } else if verb == "xargs" && xargs_runs_delete(argv) {
             // `… | xargs rm -rf` takes its targets from stdin, so there is no
@@ -284,7 +361,13 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
                     for root in roots {
                         // A destructive `find` recurses by nature — treat its
                         // roots conservatively (recursive = true).
-                        out.push(resolve_target(&root, &effective_dir, true));
+                        out.push(resolve_target(
+                            &root,
+                            &effective_dir,
+                            dir_known,
+                            true,
+                            false,
+                        ));
                     }
                 }
                 FindTargets::Unresolvable => out.push(TargetToken::Unresolvable),
@@ -418,11 +501,26 @@ fn find_roots(argv: &[String]) -> FindTargets {
 /// `recursive` records whether the invocation carried `-r`/`-R`; it rides along
 /// on a [`TargetToken::FileGlob`] so the judge can soften a flat artifact sweep
 /// but not a recursive one.
-fn resolve_target(operand: &str, effective_dir: &str, recursive: bool) -> TargetToken {
+fn resolve_target(
+    operand: &str,
+    effective_dir: &str,
+    dir_known: bool,
+    recursive: bool,
+    single_file: bool,
+) -> TargetToken {
     // Unexpanded variable / command substitution — can't prove anything. This
     // guard (with the `..` checks below) runs AHEAD of glob detection, so an
     // unresolvable operand never masquerades as a clean file-scoped sweep.
     if operand.contains('$') || operand.contains('`') {
+        return TargetToken::Unresolvable;
+    }
+    // Brace expansion turns ONE token into many targets, and this parser has no
+    // way to enumerate them. `rm -f ~/{Documents/notes,.zshrc}` reads as a
+    // single glob-free path whose first alternative escapes its protected class
+    // — which the single-file rule below would then soften to a silent ALLOW
+    // while bash deleted both entries. Treat any brace-bearing operand as
+    // unresolvable, the same posture `$` gets.
+    if operand.contains('{') || operand.contains('}') {
         return TargetToken::Unresolvable;
     }
     // Reduce a glob to the literal directory it lives in: `rm -rf /tmp/x/*`
@@ -430,6 +528,14 @@ fn resolve_target(operand: &str, effective_dir: &str, recursive: bool) -> Target
     // classifies `/`.
     let literal = glob_literal_prefix(operand);
     if has_parent_segment(literal) {
+        return TargetToken::Unresolvable;
+    }
+    // A relative target only means something against a known directory. After a
+    // `cd` this parser could not follow, the shell is somewhere else entirely,
+    // so carrying the stale directory's verdict would describe the wrong path.
+    // A `~`-anchored path is not relative — it resolves to home wherever the
+    // shell stands — so gating it here would only lose a BLOCK.
+    if !dir_known && !looks_absolute(literal) && !literal.starts_with('~') {
         return TargetToken::Unresolvable;
     }
     // A bare glob-less cwd reference (`*` → "", or a literal `.`) is the
@@ -457,6 +563,13 @@ fn resolve_target(operand: &str, effective_dir: &str, recursive: bool) -> Target
             dir: resolved,
             recursive,
         };
+    }
+    // A glob-free operand under a non-recursive `rm`/`unlink` names exactly one
+    // entry, and the shell will not let that entry be a directory. The
+    // glob-metachar check is what keeps `rm *` out: that resolves to the
+    // *directory* the sweep runs in, which is emphatically not one file.
+    if single_file && !operand.contains(['*', '?', '[']) {
+        return TargetToken::SingleFile(resolved);
     }
     TargetToken::Path(resolved)
 }
@@ -566,6 +679,9 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
     if shared == PathClass::GitRoot {
         return TargetClass::GitRepo;
     }
+    if shared == PathClass::ClaudeState {
+        return TargetClass::ClaudeState;
+    }
 
     TargetClass::Unknown
 }
@@ -580,7 +696,7 @@ fn judge_rm(
     is_git_root: &dyn Fn(&str) -> bool,
 ) -> CheckResult {
     let mut targets = Vec::new();
-    collect_targets(command, cwd, 0, &mut targets);
+    collect_targets(command, cwd, true, 0, &mut targets);
     if targets.is_empty() {
         // Not a deletion at all — no delete verb, or one that removes nothing
         // (`rm --help`, a non-recursive `rm -f` with no operand). A *recursive*
@@ -595,6 +711,14 @@ fn judge_rm(
         let class = match target {
             TargetToken::Unresolvable => TargetClass::Unresolvable,
             TargetToken::Path(p) => classify_path(p, ctx, is_git_root),
+            // One file, no recursion. Only the ambiguous middle softens: every
+            // protected class keeps blocking, and `ClaudeState` is a separate
+            // class precisely so it is not swept in here — a lone transcript is
+            // still the only copy of that transcript.
+            TargetToken::SingleFile(p) => match classify_path(p, ctx, is_git_root) {
+                TargetClass::Unknown => TargetClass::Scratch,
+                other => other,
+            },
             TargetToken::FileGlob { dir, recursive } => {
                 match classify_path(dir, ctx, is_git_root) {
                     // A flat artifact sweep in a git repo (`rm *.tgz`) is routine
@@ -1437,5 +1561,129 @@ mod tests {
     fn run_allows_non_rm() {
         let input = make_bash("charm install something");
         assert_eq!(GuardRm.run(&input).outcome, Outcome::Allow);
+    }
+
+    // --- single-file severity class ---
+
+    #[test]
+    fn single_file_delete_in_the_ambiguous_middle_allows() {
+        // Without `-r` the shell refuses to remove a directory, so this can
+        // only ever delete one file.
+        assert_eq!(judge("rm build.log", "/srv/project"), Outcome::Allow);
+        assert_eq!(judge("rm -f build.log", "/srv/project"), Outcome::Allow);
+        assert_eq!(judge("rm /opt/app/cache/x.bin", "/home"), Outcome::Allow);
+        assert_eq!(judge("unlink /opt/app/x.sock", "/home"), Outcome::Allow);
+        // A tracked source file: git has it.
+        assert_eq!(judge("rm src/main.rs", "/srv/project"), Outcome::Allow);
+    }
+
+    #[test]
+    fn single_file_does_not_soften_a_protected_class() {
+        assert_eq!(judge("rm ~/.zshrc", "/home"), Outcome::Block);
+        assert_eq!(judge("rm /vaults/main/notes/x.md", "/home"), Outcome::Block);
+        assert_eq!(judge("rm /srv/repo/.git/config", "/home"), Outcome::Block);
+        assert_eq!(judge("rm /", "/home"), Outcome::Block);
+        assert_eq!(judge("rm ~", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn single_file_does_not_soften_durable_claude_state() {
+        // The interaction that would otherwise re-open the subtree the scratch
+        // allowlist closed: one transcript is still the only copy of it.
+        assert_eq!(
+            judge("rm ~/.claude/projects/proj/session.jsonl", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm /srv/repo/.claude/agent-memory/reviewer.md", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm ~/.claude/metrics/denials.jsonl", "/home"),
+            Outcome::Ask
+        );
+        // `DocsPlans` has no guard-rm arm and so reads as the ambiguous middle;
+        // a plan doc under `.claude` must report durable state instead of
+        // riding the softening.
+        assert_eq!(
+            judge("rm ~/.claude/docs/plans/2026-07-25-x.md", "/home"),
+            Outcome::Ask
+        );
+    }
+
+    #[test]
+    fn single_file_requires_no_glob_and_no_recursion() {
+        // `rm *` resolves to the DIRECTORY the sweep runs in — not one file.
+        assert_eq!(
+            judge_with("rm *", "/srv/repo", &["/srv/repo"]),
+            Outcome::Block
+        );
+        // A recursive delete is never a single file, however it is spelled.
+        assert_eq!(judge("rm -rf build.log", "/srv/project"), Outcome::Ask);
+        assert_eq!(
+            judge("rm --recursive build.log", "/srv/project"),
+            Outcome::Ask
+        );
+        assert_eq!(judge("rm --recu build.log", "/srv/project"), Outcome::Ask);
+        // `shred`/`truncate` keep their existing verdicts — not in the class.
+        assert_eq!(judge("truncate -s 0 ~/Documents", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn rm_dash_d_is_not_a_single_file() {
+        // `rm -d` removes an empty directory without `-r`, so the "the shell
+        // refuses to remove a directory" premise does not hold for it.
+        assert_eq!(judge("rm -d /opt/app/emptydir", "/home"), Outcome::Ask);
+        assert_eq!(judge("rm --dir /opt/app/emptydir", "/home"), Outcome::Ask);
+        assert_eq!(judge("rm -fd /opt/app/emptydir", "/home"), Outcome::Ask);
+    }
+
+    #[test]
+    fn brace_expansion_is_not_one_target() {
+        // One token, many targets. The first alternative's prefix would
+        // otherwise pull the whole list out of its protected class, and the
+        // single-file rule would soften it to silence while bash deleted every
+        // entry. (`strip_group_wrappers` trims the trailing `}`, so this never
+        // even reads as a brace list by the time it is classified.)
+        assert_eq!(
+            judge("rm -f ~/{Documents/notes,.zshrc}", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm -f /srv/repo/{README.md,.git/config}", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(judge("rm -f build/{a,b}.o", "/srv/repo"), Outcome::Ask);
+    }
+
+    #[test]
+    fn single_file_still_asks_when_the_path_is_unresolvable() {
+        assert_eq!(judge("rm $SOMEFILE", "/srv/project"), Outcome::Ask);
+        assert_eq!(judge("rm ../sibling/x", "/srv/project"), Outcome::Ask);
+    }
+
+    #[test]
+    fn unfollowable_cd_makes_relative_targets_unresolvable() {
+        // Keeping the pre-cd directory allowed `rm -rf Documents` to be judged
+        // against a temp cwd the shell had already left.
+        assert_eq!(
+            judge("cd $UNKNOWN; rm -rf Documents", "/private/tmp"),
+            Outcome::Ask
+        );
+        assert_eq!(judge("cd; rm -rf Documents", "/private/tmp"), Outcome::Ask);
+        assert_eq!(
+            judge("cd -; rm -rf Documents", "/private/tmp"),
+            Outcome::Ask
+        );
+        // An absolute target after an unfollowable `cd` is still judgeable, and
+        // so is a `~`-anchored one — neither is relative.
+        assert_eq!(
+            judge("cd $UNKNOWN; rm -rf /", "/private/tmp"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("cd $UNKNOWN; rm -rf ~/Documents", "/private/tmp"),
+            Outcome::Block
+        );
     }
 }
