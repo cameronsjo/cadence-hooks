@@ -129,27 +129,38 @@ fn takes_value(verb: &str, flag: &str) -> bool {
 /// flag (or any unambiguous abbreviation of it) appears before a `--` operand
 /// terminator.
 fn rm_is_recursive(argv: &[String], verb: &str) -> bool {
-    if verb != "rm" {
-        return false;
-    }
+    verb == "rm" && rm_has_flag(argv, &['r', 'R'], "recursive")
+}
+
+/// Does this `rm` carry `-d`/`--dir`, which removes an EMPTY directory without
+/// `-r`? The single-file class rests on "without `-r` the shell refuses to
+/// remove a directory", and this is the one flag that makes that false.
+fn rm_removes_dir(argv: &[String]) -> bool {
+    rm_has_flag(argv, &['d'], "dir")
+}
+
+/// Does `argv` carry a flag, in either the short-cluster form (`-rf` carrying
+/// any of `shorts`) or a long form abbreviating `long`?
+///
+/// One implementation for both flags guard-rm cares about, because the fiddly
+/// parts are identical and easy to get subtly different: the `--` operand
+/// terminator must stop the scan, and GNU coreutils accepts any unambiguous
+/// long-option abbreviation — `--r`, `--rec`, `--recu` all mean `--recursive`.
+/// `--recursivex` is not a prefix and does not match; a bare `--` carries an
+/// empty prefix and is the terminator handled above.
+fn rm_has_flag(argv: &[String], shorts: &[char], long: &str) -> bool {
     for tok in argv.iter().skip(1) {
         if tok == "--" {
             break; // operands only after this
         }
-        // GNU coreutils rm accepts unambiguous long-option abbreviations, and
-        // `--recursive` is the only rm long option starting with `--r` — so
-        // `--r`/`--rec`/`--recu`/… all expand to it. Treat any `--<p>` where p is
-        // a non-empty prefix of "recursive" as recursive; `--recursivex` (not a
-        // prefix) does not match, and a bare `--` (empty p) is the terminator
-        // already handled above.
         if let Some(rest) = tok.strip_prefix("--") {
-            if !rest.is_empty() && "recursive".starts_with(rest) {
+            if !rest.is_empty() && long.starts_with(rest) {
                 return true;
             }
-            continue; // a long flag that isn't a --recursive abbreviation
+            continue; // a long flag that abbreviates something else
         }
         // A short-flag cluster (`-rf`); the leading `-` is not a `--` long flag.
-        if tok.starts_with('-') && (tok.contains('r') || tok.contains('R')) {
+        if tok.starts_with('-') && tok.chars().any(|c| shorts.contains(&c)) {
             return true;
         }
     }
@@ -561,27 +572,6 @@ fn resolve_target(
         return TargetToken::SingleFile(resolved);
     }
     TargetToken::Path(resolved)
-}
-
-/// Does this `rm` carry `-d`/`--dir`, which removes an EMPTY directory without
-/// `-r`? The single-file class rests on "without `-r` the shell refuses to
-/// remove a directory", and this is the one flag that makes that false.
-fn rm_removes_dir(argv: &[String]) -> bool {
-    for tok in argv.iter().skip(1) {
-        if tok == "--" {
-            break;
-        }
-        if let Some(rest) = tok.strip_prefix("--") {
-            if !rest.is_empty() && "dir".starts_with(rest) {
-                return true;
-            }
-            continue;
-        }
-        if tok.starts_with('-') && tok.contains('d') {
-            return true;
-        }
-    }
-    false
 }
 
 /// True when `operand`'s final path segment is a glob that scopes to files
