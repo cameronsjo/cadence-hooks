@@ -125,10 +125,16 @@ fn nudge_writes_one_row_by_default() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("cwd");
     std::fs::create_dir_all(&cwd).unwrap();
-    let payload = format!(
-        r#"{{"tool_name":"Bash","tool_input":{{"command":"git checkout -b probe-branch probe-base"}},"session_id":"itnudge","cwd":"{}"}}"#,
-        cwd.display()
-    );
+    // Build via serde_json so the cwd is JSON-escaped — a raw format! left
+    // Windows path backslashes unescaped, the binary failed open on the
+    // malformed payload, and the test failed only on Windows CI.
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git checkout -b probe-branch probe-base"},
+        "session_id": "itnudge",
+        "cwd": cwd,
+    })
+    .to_string();
 
     let mut cmd = cadence_hooks();
     cmd.args(["guardrails", "warn-branch-base"]);
