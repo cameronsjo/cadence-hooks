@@ -24,11 +24,22 @@
 //! carve-out.
 //!
 //! **v1 scope (cadence-hooks#164 D5): live-consumer classes only.** Ships
-//! [`PathClass::Temp`], [`PathClass::ClaudeManaged`], [`PathClass::DocsPlans`],
+//! [`PathClass::Temp`], [`PathClass::ClaudeScratch`], [`PathClass::DocsPlans`],
 //! [`PathClass::HomeChild`], [`PathClass::GitRoot`], and the residual
 //! [`PathClass::Source`]. The `memory` and `vault` classes are deferred to land
 //! with their second consumer — `guard_rm` is their only consumer today, so
 //! those stay guard-local (YAGNI) until a second guard needs them.
+//!
+//! **The `.claude` carve-out is an allowlist of session scratch, not the whole
+//! tree.** It once granted the ALLOW class to *any* path under a `.claude`
+//! component, which read as "Claude's own working directory" but is false in
+//! practice: `~/.claude` holds ~40 entries and a repo's `.claude` holds a dozen,
+//! nearly all durable and none of it git-tracked — session transcripts
+//! (`projects/`), the `metrics` audit trail, `skills`, `rules`, `hooks`,
+//! `agents`, `plugins`, and both memory trees. Only
+//! [`CLAUDE_SCRATCH_DIRS`] earn the class now; anything else under `.claude`
+//! falls through to the structural classes, so a directory nobody has vetted is
+//! ambiguous by default rather than silently disposable.
 
 use crate::normalize_path;
 use crate::worktree::path_under_temp_root;
@@ -40,7 +51,7 @@ use std::path::Path;
 ///
 /// [`classify`] returns exactly one class per path, resolved by a load-bearing
 /// precedence (see the module docs): the allow-granting carve-outs
-/// ([`Temp`](PathClass::Temp), [`ClaudeManaged`](PathClass::ClaudeManaged)) —
+/// ([`Temp`](PathClass::Temp), [`ClaudeScratch`](PathClass::ClaudeScratch)) —
 /// the two with a live ALLOW consumer — resolve first, then the structural
 /// classes ([`HomeChild`](PathClass::HomeChild), [`GitRoot`](PathClass::GitRoot)),
 /// then [`DocsPlans`](PathClass::DocsPlans), then the residual
@@ -51,11 +62,18 @@ use std::path::Path;
 pub enum PathClass {
     /// Under a temp root (`/tmp`, `/private/tmp`, `$TMPDIR`).
     Temp,
-    /// Strictly *under* a `.claude/` directory (worktrees, session dirs,
-    /// scratchpads). The `.claude` dir itself is **not** this class — it falls
-    /// through to the structural classes so a guard can treat deleting the
-    /// whole config tree differently from deleting scratch under it.
-    ClaudeManaged,
+    /// Session scratch inside a `.claude/` directory: strictly *under* one of
+    /// the [`CLAUDE_SCRATCH_DIRS`] — a single worktree
+    /// (`.claude/worktrees/feat-x`) or a session intro
+    /// (`.claude/intros/2026-01-01-foo.md`).
+    ///
+    /// Two exclusions are deliberate, and both keep a whole-tree delete out of
+    /// the ALLOW: the `.claude` dir itself is not this class, and neither is a
+    /// scratch dir itself — `.claude/worktrees` is *every* worktree at once,
+    /// including whatever is uncommitted in them, which is not the
+    /// one-disposable-thing case this class exists for. Both fall through to
+    /// the structural classes.
+    ClaudeScratch,
     /// Under a `docs/plans/` directory (consecutive `docs` then `plans`
     /// components). Cadence mandates copying approved plans there on the default
     /// branch, so plan-doc work is exempt from the branch-worthy-change guards.
@@ -121,17 +139,17 @@ pub fn classify(
 ) -> PathClass {
     let norm = normalize(path);
 
-    // Allow-granting carve-outs first — `Temp` and `ClaudeManaged` are the only
+    // Allow-granting carve-outs first — `Temp` and `ClaudeScratch` are the only
     // classes with a live ALLOW consumer (guard_rm), so they must out-rank the
     // escalating structural classes: a scratch target under a protected
     // ancestor (a worktree under `.claude`, a repo in `/tmp`) resolves to its
     // allow-class before git-root can match. This ordering is load-bearing and
-    // locked by `claude_managed_wins_over_git_root_probe`.
+    // locked by `claude_scratch_wins_over_git_root_probe`.
     if path_under_temp_root(Path::new(&norm), ctx.tmpdir) {
         return PathClass::Temp;
     }
-    if under_claude_dir(&norm) {
-        return PathClass::ClaudeManaged;
+    if under_claude_scratch(&norm) {
+        return PathClass::ClaudeScratch;
     }
 
     // Structural classes. HomeChild resolves before GitRoot so a home-child that
@@ -158,15 +176,44 @@ pub fn classify(
     PathClass::Source
 }
 
-/// `.claude` appears as a path component AND is not the final one — the path
-/// lives *under* a `.claude` dir rather than being it. Operates on the
-/// `normalize`d form, so a `.` segment is a no-op and a `..` cannot spoof it.
-fn under_claude_dir(norm: &str) -> bool {
+/// The subdirectories of a `.claude/` root that hold genuine session scratch —
+/// content regenerated per session that is never the only copy of anything.
+///
+/// `worktrees` holds cadence's git worktrees: a worktree is a checkout, and
+/// removing one loses nothing its repo does not already have. `intros` holds
+/// gitignored session kickoff notes that `cadence:tend` reclaims as routine
+/// housekeeping.
+///
+/// Everything else under `.claude` is durable state and deliberately absent:
+/// `projects` (every session transcript), `metrics` (the audit trail these
+/// guards write), `skills`, `rules`, `hooks`, `agents`, `commands`, `plugins`,
+/// `sessions`, `memory`, and `agent-memory`. None of it is git-tracked, so a
+/// delete there is unrecoverable outside a filesystem snapshot.
+///
+/// This is an **allowlist on purpose**: an unrecognized directory under
+/// `.claude` should cost a permission prompt, not a silent delete. Adding an
+/// entry here grants a silent ALLOW over that subtree — do it only for content
+/// that is provably regenerable.
+pub const CLAUDE_SCRATCH_DIRS: &[&str] = &["worktrees", "intros"];
+
+/// The path lives strictly *under* a `.claude/<scratch>/` directory for a
+/// recognized [`CLAUDE_SCRATCH_DIRS`] entry. Operates on the `normalize`d form,
+/// so a `.` segment is a no-op and a `..` cannot spoof it.
+///
+/// Requires a component *after* the scratch dir, so the scratch dir itself
+/// (`.claude/worktrees`) is excluded — deleting it takes every worktree at once,
+/// which is not the single-disposable-item case. Mirrors the `.claude` dir's own
+/// exclusion one level down.
+fn under_claude_scratch(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    match segs.iter().position(|s| *s == ".claude") {
-        Some(pos) => pos + 1 < segs.len(),
-        None => false,
-    }
+    let Some(pos) = segs.iter().position(|s| *s == ".claude") else {
+        return false;
+    };
+    let Some(scratch) = segs.get(pos + 1) else {
+        return false;
+    };
+    // `pos + 2 < len` is the "something after the scratch dir" requirement.
+    CLAUDE_SCRATCH_DIRS.contains(scratch) && pos + 2 < segs.len()
 }
 
 /// Consecutive `docs` then `plans` components appear anywhere in `norm`.
@@ -262,32 +309,81 @@ mod tests {
         assert_eq!(class("/tmpfoo/x", "/Users/x"), PathClass::Source);
     }
 
-    // --- ClaudeManaged (strictly under) ---
+    // --- ClaudeScratch (strictly under a recognized scratch dir) ---
 
     #[test]
-    fn under_claude_is_managed() {
+    fn under_claude_scratch_dir_is_scratch() {
         assert_eq!(
             class("/srv/repo/.claude/worktrees/x", "/Users/x"),
-            PathClass::ClaudeManaged
+            PathClass::ClaudeScratch
+        );
+        assert_eq!(
+            class("/srv/repo/.claude/intros/2026-01-01-foo.md", "/Users/x"),
+            PathClass::ClaudeScratch
         );
     }
 
     #[test]
-    fn claude_dir_itself_is_not_managed() {
+    fn claude_dir_itself_is_not_scratch() {
         // `~/.claude` the dir itself is a home child, not "under .claude".
         assert_eq!(class("/Users/x/.claude", "/Users/x"), PathClass::HomeChild);
     }
 
     #[test]
-    fn claude_curdir_segment_still_managed() {
+    fn scratch_dir_itself_is_not_scratch() {
+        // `.claude/worktrees` is EVERY worktree at once — not the single
+        // disposable item the class exists for, so it falls through.
         assert_eq!(
-            class("/srv/repo/.claude/./worktrees/f", "/Users/x"),
-            PathClass::ClaudeManaged
+            class("/srv/repo/.claude/worktrees", "/Users/x"),
+            PathClass::Source
+        );
+        assert_eq!(
+            class("/srv/repo/.claude/intros", "/Users/x"),
+            PathClass::Source
         );
     }
 
     #[test]
-    fn claude_lookalike_is_not_managed() {
+    fn durable_claude_state_is_not_scratch() {
+        // The narrowing (#361 cluster F follow-up): `.claude` holds durable,
+        // untracked state that a silent ALLOW would destroy. Each of these was
+        // a verified silent-ALLOW hole in guard-rm before the allowlist.
+        for path in [
+            "/Users/x/.claude/projects",
+            "/Users/x/.claude/projects/some-proj/memory/note.md",
+            "/Users/x/.claude/metrics",
+            "/Users/x/.claude/plugins",
+            "/Users/x/.claude/agent-memory",
+            "/Users/x/.claude/skills/some-skill",
+            "/Users/x/.claude/rules",
+            "/Users/x/.claude/hooks",
+            "/srv/repo/.claude/agent-memory",
+            "/srv/repo/.claude/memory",
+        ] {
+            assert_eq!(class(path, "/Users/x"), PathClass::Source, "{path}");
+        }
+    }
+
+    #[test]
+    fn claude_git_dir_reports_git_root() {
+        // `~/.claude/.git` (the chezmoi-migration target) used to ride the
+        // blanket `.claude` carve-out to ALLOW, masking the git-root fact.
+        assert_eq!(
+            class("/Users/x/.claude/.git", "/Users/x"),
+            PathClass::GitRoot
+        );
+    }
+
+    #[test]
+    fn claude_curdir_segment_still_scratch() {
+        assert_eq!(
+            class("/srv/repo/.claude/./worktrees/f", "/Users/x"),
+            PathClass::ClaudeScratch
+        );
+    }
+
+    #[test]
+    fn claude_lookalike_is_not_scratch() {
         assert_eq!(
             class("/Users/x/repo/myclaude/a", "/Users/x"),
             PathClass::Source
@@ -406,13 +502,29 @@ mod tests {
     }
 
     #[test]
-    fn claude_managed_wins_over_git_root_probe() {
-        // A worktree's `.git` is a file → probe would fire, but ClaudeManaged
-        // resolves first, so scratch cleanup under `.claude` is not a git root.
+    fn claude_scratch_wins_over_git_root_probe() {
+        // A worktree's `.git` is a file → probe would fire, but ClaudeScratch
+        // resolves first, so worktree cleanup is not blocked as a git root.
         let probe = |_: &str| true;
         assert_eq!(
             classify("/srv/repo/.claude/worktrees/x", &ctx("/Users/x"), &probe),
-            PathClass::ClaudeManaged
+            PathClass::ClaudeScratch
+        );
+    }
+
+    #[test]
+    fn durable_claude_state_does_not_win_over_git_root_probe() {
+        // The counterpart: narrowing the carve-out means a durable `.claude`
+        // subtree that IS a repo now reports the git-root fact instead of
+        // shadowing it with an ALLOW class.
+        let probe = |p: &str| p == "/Users/x/.claude/plugins/cache/some-plugin";
+        assert_eq!(
+            classify(
+                "/Users/x/.claude/plugins/cache/some-plugin",
+                &ctx("/Users/x"),
+                &probe
+            ),
+            PathClass::GitRoot
         );
     }
 
@@ -454,17 +566,18 @@ mod tests {
         // …while a benign `.` segment inside the carve-out stays exempt.
         assert_eq!(
             class("/Users/x/repo/.claude/./worktrees/f", "/Users/x"),
-            PathClass::ClaudeManaged
+            PathClass::ClaudeScratch
         );
     }
 
     #[test]
-    fn seed_33_claude_worktrees_dir_is_managed() {
+    fn seed_33_claude_worktrees_dir_is_scratch() {
         // #33: work under `.claude/worktrees/` is Claude-managed regardless of
-        // the branch it sits on — the fact the warn-main-branch carve-out reads.
+        // the branch it sits on. The worktree case is the one the ALLOW-granting
+        // class still covers after the allowlist narrowing.
         assert_eq!(
             class("/Users/x/repo/.claude/worktrees/feat-foo", "/Users/x"),
-            PathClass::ClaudeManaged
+            PathClass::ClaudeScratch
         );
         // A nested-repo worktree layout still matches (`.claude` anywhere).
         assert_eq!(
@@ -472,25 +585,33 @@ mod tests {
                 "/Users/x/repo/inner/.claude/worktrees/x/crates/guardrails/src",
                 "/Users/x"
             ),
-            PathClass::ClaudeManaged
+            PathClass::ClaudeScratch
         );
     }
 
     #[test]
-    fn seed_35_memory_tree_under_claude_is_managed() {
-        // #35: the auto-written memory tree lives under `~/.claude`, so it is
-        // covered by the `.claude` component fact — no separate `memory` class
-        // is needed for this incident (that class stays deferred, #164 D5).
+    fn seed_35_memory_tree_is_durable_state_not_scratch() {
+        // #35: the auto-written memory tree lives under `~/.claude`. It used to
+        // ride the blanket `.claude` component fact into the ALLOW-granting
+        // class; the allowlist narrowing puts it back in the residual, because
+        // this tree is durable and untracked — the opposite of scratch.
+        //
+        // This does NOT re-open #35. That incident's live consumer is
+        // warn-main-branch, which reads `worktree::is_claude_managed_dir` (the
+        // coarse `.claude`-anywhere match, unchanged and separately tested
+        // there) — never this classifier. `pathclass` has exactly one consumer,
+        // `guard_rm`, and for it the correct fact about the memory tree is
+        // "not proven disposable".
         assert_eq!(
             class("/Users/x/.claude/projects/some-proj/memory", "/Users/x"),
-            PathClass::ClaudeManaged
+            PathClass::Source
         );
         assert_eq!(
             class(
                 "/Users/x/.claude/projects/some-proj/memory/note.md",
                 "/Users/x"
             ),
-            PathClass::ClaudeManaged
+            PathClass::Source
         );
     }
 }

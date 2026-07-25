@@ -4,8 +4,9 @@
 //! inspects each command's deletion targets and returns a graduated decision:
 //!
 //! - **ALLOW** (silent, exit 0) — a target under a temp root (`/tmp`,
-//!   `/private/tmp`, `$TMPDIR`) or strictly under a `.claude/` directory
-//!   (worktrees, session dirs, scratchpads). The friction removed.
+//!   `/private/tmp`, `$TMPDIR`) or inside a `.claude/` session-scratch
+//!   directory (one worktree, one session intro — see
+//!   `pathclass::CLAUDE_SCRATCH_DIRS`). The friction removed.
 //! - **BLOCK** (exit 2, disclosed message) — `/`, `$HOME`, a first-level home
 //!   child, inside `$OBSIDIAN_VAULT`, or a git repo root / any path with a
 //!   `.git` component.
@@ -63,6 +64,25 @@ use std::path::Path;
 /// path class), so a shared const would couple them without real reuse.
 const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 
+/// The command word `token` names, stripped to what the shell will actually
+/// run: `basename` so `/bin/rm` matches, and a leading `\` removed so the
+/// alias-bypass form `\rm` is still seen as `rm`.
+///
+/// (Deliberate miss: `RM` on a case-insensitive volume — matching
+/// case-insensitively would be wrong on Linux. Mitigated: a settings
+/// `allow Bash(rm:*)` rule keys on the leading word too, so it defers, never
+/// silently auto-approves.)
+fn command_word(token: &str) -> &str {
+    basename(token).trim_start_matches('\\')
+}
+
+/// `token` names one of the [`DELETE_VERBS`]. Shared by every site that has to
+/// recognize a delete verb, so the `\`-strip above lives in exactly one place —
+/// forgetting it at a new call site would silently re-open the alias bypass.
+fn is_delete_verb(token: &str) -> bool {
+    DELETE_VERBS.contains(&command_word(token))
+}
+
 /// Does `flag` (in separate-token form) consume the following token as a value
 /// for `verb`? Prevents a `shred -n 3` iteration count or a `truncate -s 0`
 /// size from being misread as a path operand (which would resolve to a bogus
@@ -118,10 +138,13 @@ fn rm_is_recursive(argv: &[String], verb: &str) -> bool {
 enum TargetClass {
     /// Under a temp root. ALLOW.
     Temp,
-    /// Strictly *under* a `.claude/` directory. ALLOW. The `.claude` dir itself
-    /// is NOT here — deleting it whole is not the transient-scratch case this
-    /// ALLOW exists for, so it falls through to the block/ask rules.
-    ClaudeManaged,
+    /// Strictly *under* a `.claude/` session-scratch directory (one worktree,
+    /// one session intro). ALLOW. Neither the `.claude` dir nor a scratch dir
+    /// itself is here — deleting either wholesale is not the transient-scratch
+    /// case this ALLOW exists for, so both fall through to the block/ask rules,
+    /// as does every durable `.claude` subtree (transcripts, metrics, skills,
+    /// memory).
+    ClaudeScratch,
     /// A transient scratch/editor-swap file directly under home whose name ends
     /// in a recognized ephemeral suffix (`.tmp`/`.swp`/`.swo`). ALLOW — deleting
     /// these is routine cleanup, not the destructive home-child case.
@@ -147,7 +170,7 @@ enum TargetClass {
 impl TargetClass {
     fn outcome(self) -> Outcome {
         match self {
-            TargetClass::Temp | TargetClass::ClaudeManaged | TargetClass::Scratch => Outcome::Allow,
+            TargetClass::Temp | TargetClass::ClaudeScratch | TargetClass::Scratch => Outcome::Allow,
             TargetClass::Root
             | TargetClass::Home
             | TargetClass::HomeChild
@@ -227,19 +250,29 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
         }
 
         let Some(first) = argv.first() else { continue };
-        // basename so `/bin/rm` matches; strip a leading `\` so the alias-bypass
-        // form `\rm` is still seen as `rm`. (Deliberate misses: `xargs rm` —
-        // the targets arrive on stdin, unclassifiable, and treating it as an rm
-        // with no operand would ALLOW, worse than deferring; and `RM` on a
-        // case-insensitive volume — matching case-insensitively would be wrong
-        // on Linux. Both are mitigated: a settings `allow Bash(rm:*)` rule keys
-        // on the leading word too, so they defer, never silently auto-approve.)
-        let verb = basename(first).trim_start_matches('\\');
+        let verb = command_word(first);
         if DELETE_VERBS.contains(&verb) {
             let recursive = rm_is_recursive(argv, verb);
-            for operand in delete_operands(argv, verb) {
+            let operands = delete_operands(argv, verb);
+            // A recursive delete with no operand in the command text still
+            // deletes something — the target reaches the shell by a route this
+            // parser cannot see. An empty target list used to judge as ALLOW
+            // ("not ours"), which turned an unreadable `rm -rf` into a silent
+            // approval. A non-recursive `rm -f` and a `rm --help` carry no
+            // recursion flag and stay out of this.
+            if recursive && operands.is_empty() {
+                out.push(TargetToken::Unresolvable);
+            }
+            for operand in operands {
                 out.push(resolve_target(&operand, &effective_dir, recursive));
             }
+        } else if verb == "xargs" && xargs_runs_delete(argv) {
+            // `… | xargs rm -rf` takes its targets from stdin, so there is no
+            // path in the command to classify. Emitting one Unresolvable defers
+            // to the user; the previous behaviour — no targets at all — judged
+            // as ALLOW and silently approved a recursive delete of whatever the
+            // upstream stage produced.
+            out.push(TargetToken::Unresolvable);
         } else if verb == "find" && find_is_destructive(argv) {
             // A `find` that deletes — via `-delete`/`-exec`/`-ok` running a
             // delete verb — targets its search roots. When the roots can't be
@@ -260,6 +293,20 @@ fn collect_targets(script: &str, cwd: &str, depth: usize, out: &mut Vec<TargetTo
     }
 }
 
+/// The command `xargs` will run is a delete verb (`… | xargs rm -rf`).
+///
+/// Deliberately coarse — any token whose basename is a delete verb counts,
+/// rather than parsing `xargs`'s own option grammar to locate the command word.
+/// The precise version carries a real miss: a separate-token long option
+/// (`xargs --max-args 3 rm -rf`) leaves its value exactly where the command word
+/// is expected, so the scan stops on `3` and never sees the `rm`. A miss here is
+/// a silent recursive delete; the cost of over-matching is one extra prompt on a
+/// command that merely mentions a delete verb. Every outcome of this predicate
+/// feeds an ASK, never an ALLOW, so it cannot open a hole in either direction.
+fn xargs_runs_delete(argv: &[String]) -> bool {
+    argv.iter().skip(1).any(|tok| is_delete_verb(tok))
+}
+
 /// A `find` invocation that deletes: it carries `-delete`, or an
 /// `-exec`/`-execdir`/`-ok`/`-okdir` whose command is a delete verb
 /// (`find … -exec rm …`). The command word is scanned up to its `;`/`+`
@@ -275,12 +322,7 @@ fn find_is_destructive(argv: &[String]) -> bool {
         match tok.as_str() {
             "-exec" | "-execdir" | "-ok" | "-okdir" => after_exec = true,
             ";" | "\\;" | "+" => after_exec = false,
-            other
-                if after_exec
-                    && DELETE_VERBS.contains(&basename(other).trim_start_matches('\\')) =>
-            {
-                return true;
-            }
+            other if after_exec && is_delete_verb(other) => return true,
             _ => {}
         }
     }
@@ -491,10 +533,10 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
     };
     let shared = pathclass::classify(&norm, &pc_ctx, is_git_root);
 
-    // ALLOW rules first — the shared classifier owns Temp and ClaudeManaged.
+    // ALLOW rules first — the shared classifier owns Temp and ClaudeScratch.
     match shared {
         PathClass::Temp => return TargetClass::Temp,
-        PathClass::ClaudeManaged => return TargetClass::ClaudeManaged,
+        PathClass::ClaudeScratch => return TargetClass::ClaudeScratch,
         _ => {}
     }
 
@@ -540,7 +582,10 @@ fn judge_rm(
     let mut targets = Vec::new();
     collect_targets(command, cwd, 0, &mut targets);
     if targets.is_empty() {
-        // Not an rm-family deletion, or an rm with no operands — not ours.
+        // Not a deletion at all — no delete verb, or one that removes nothing
+        // (`rm --help`, a non-recursive `rm -f` with no operand). A *recursive*
+        // delete with no readable operand does NOT land here: `collect_targets`
+        // emits an Unresolvable for it, so it asks rather than falling through.
         return CheckResult::allow();
     }
 
@@ -739,10 +784,60 @@ mod tests {
     }
 
     #[test]
+    fn session_intro_allows() {
+        assert_eq!(
+            judge("rm -f /srv/repo/.claude/intros/2026-01-01-foo.md", "/home"),
+            Outcome::Allow
+        );
+    }
+
+    #[test]
     fn claude_dir_itself_is_not_allowed() {
         // Deleting `~/.claude` whole is not the transient-scratch case — it is a
         // first-level home child → BLOCK, never a silent ALLOW.
         assert_eq!(judge("rm -rf ~/.claude", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn scratch_dir_wholesale_is_not_allowed() {
+        // One worktree is disposable; the whole worktrees folder is every
+        // worktree at once, uncommitted work included.
+        assert_eq!(
+            judge("rm -rf /srv/repo/.claude/worktrees", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm -rf /srv/repo/.claude/intros", "/home"),
+            Outcome::Ask
+        );
+    }
+
+    #[test]
+    fn durable_claude_state_asks() {
+        // The holes table: every row was a verified SILENT ALLOW before the
+        // `.claude` carve-out became an allowlist. None of these paths is
+        // git-tracked, so nothing but a filesystem snapshot could restore them.
+        for command in [
+            "rm -rf ~/.claude/projects",     // every session transcript
+            "rm -rf ~/.claude/metrics",      // the guards' own audit trail
+            "rm -rf ~/.claude/plugins",      //
+            "rm -rf ~/.claude/agent-memory", // accumulated reviewer learnings
+            "rm -rf ~/.claude/skills",
+            "rm -rf ~/.claude/rules",
+            "rm -rf ~/.claude/hooks",
+            "rm -rf ~/.claude/sessions",
+            "rm -rf /srv/repo/.claude/agent-memory", // same, per-repo
+            "rm -rf /srv/repo/.claude/memory",
+        ] {
+            assert_eq!(judge(command, "/home"), Outcome::Ask, "{command}");
+        }
+    }
+
+    #[test]
+    fn claude_git_dir_blocks() {
+        // `rm -rf ~/.claude/.git` (a real chezmoi-migration step) rode the
+        // blanket carve-out to a silent ALLOW, masking the git-root fact.
+        assert_eq!(judge("rm -rf ~/.claude/.git", "/home"), Outcome::Block);
     }
 
     // --- BLOCK: root / home / home-child ---
@@ -994,9 +1089,43 @@ mod tests {
     }
 
     #[test]
-    fn rm_with_no_operands_allows() {
-        assert_eq!(judge("rm -rf", "/home"), Outcome::Allow);
+    fn rm_with_no_operands_allows_unless_recursive() {
+        // A delete that removes nothing is not ours.
         assert_eq!(judge("rm --help", "/home"), Outcome::Allow);
+        assert_eq!(judge("rm -f", "/home"), Outcome::Allow);
+        // …but a bare recursive delete IS deleting something the guard cannot
+        // see. It used to fall through to Allow.
+        assert_eq!(judge("rm -rf", "/home"), Outcome::Ask);
+        assert_eq!(judge("rm -r", "/home"), Outcome::Ask);
+        assert_eq!(judge("rm --recursive", "/home"), Outcome::Ask);
+    }
+
+    #[test]
+    fn xargs_delete_asks() {
+        // Targets arrive on stdin — unclassifiable, so defer rather than the
+        // previous silent Allow.
+        assert_eq!(judge("echo /etc | xargs rm -rf", "/home"), Outcome::Ask);
+        assert_eq!(
+            judge("find . -print0 | xargs -0 rm -rf", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(judge("xargs rm < list.txt", "/home"), Outcome::Ask);
+        assert_eq!(judge("cat l | xargs /bin/rm -rf", "/home"), Outcome::Ask);
+        assert_eq!(judge("cat l | xargs env rm -rf", "/home"), Outcome::Ask);
+        // The separate-token long option that a precise option-parser misses.
+        assert_eq!(
+            judge("cat l | xargs --max-args 3 rm -rf", "/home"),
+            Outcome::Ask
+        );
+    }
+
+    #[test]
+    fn xargs_without_delete_verb_allows() {
+        assert_eq!(
+            judge("git ls-files | xargs grep -l foo", "/home"),
+            Outcome::Allow
+        );
+        assert_eq!(judge("ls | xargs -n1 basename", "/home"), Outcome::Allow);
     }
 
     #[test]
