@@ -208,8 +208,12 @@ fn a_panicking_check_fails_open_and_dispatch_survives_it() {
     let error = rows[0]["error"]
         .as_str()
         .expect("the panic row carries the payload");
+    // Match on the file name alone, without a leading separator: `Location::file()`
+    // yields the path as the compiler saw it, so a `src/` prefix is `src\` on
+    // Windows. The property under test is that the location was recorded and
+    // points at the dispatch site, which the bare file name pins on every host.
     assert!(
-        error.contains("CADENCE_TEST_PANIC") && error.contains("at src/dispatch.rs:"),
+        error.contains("CADENCE_TEST_PANIC") && error.contains("dispatch.rs:"),
         "payload and source location are both recorded: {error}"
     );
 
