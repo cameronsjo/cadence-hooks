@@ -4,8 +4,8 @@ Hook subcommands expect piped stdin. Run one bare in a terminal and it prints
 guidance instead of hanging:
 
 ```text
-$ cadence-hooks lab persona-nudge
-cadence-hooks: 'persona-nudge' is a Claude Code hook, not an interactive command.
+$ cadence-hooks guardrails inject-gh-context
+cadence-hooks: 'inject-gh-context' is a Claude Code hook, not an interactive command.
 
 It reads a JSON payload on stdin — Claude Code pipes this automatically on
 SessionStart. Nothing was piped and stdin is a terminal, so it would wait forever.
@@ -16,16 +16,16 @@ The fastest way to see what a hook does is `try` — it generates a sample
 payload for the hook's event, runs the hook against it, and reports the outcome:
 
 ```bash
-$ cadence-hooks try lab persona-nudge
-Hook:     lab persona-nudge — Inject the self-representation contract on session start
+$ cadence-hooks try guardrails inject-gh-context
+Hook:     guardrails inject-gh-context — Inject the gh-write allowlist + `-R` rule on SessionStart
 Event:    SessionStart
 Payload:  {"cwd":"...","session_id":"test","source":"startup"}
 
 Outcome:  NUDGE (exit 0)
 Context injected (what Claude sees):
 
-  Before other work, record a self-representation as ONE JSON object.
-  This is not creative writing. Report what is actually true for you...
+  git-guardrails: gh writes (pr/issue/release/repo/api mutations) are
+  allowlist-policed. Always pass `-R owner/repo` on writes...
 
 Stderr:   (none)
 ```

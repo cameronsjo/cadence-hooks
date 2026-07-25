@@ -3,14 +3,6 @@ name = "cadence-hooks-lab"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Experimental lab hooks: the self-representation persona ledger"
+description = "Experimental lab hooks — currently empty, kept as a landing pad for the next experiment"
 
 [dependencies]
-cadence-hooks-core.workspace = true
-regex.workspace = true
-serde = { workspace = true }
-serde_json.workspace = true
-
-[dev-dependencies]
-cadence-hooks-core = { workspace = true, features = ["test-builders"] }
-tempfile = "3"

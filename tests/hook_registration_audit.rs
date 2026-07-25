@@ -32,7 +32,6 @@ fn binary_subcommands() -> BTreeSet<String> {
         "rules",
         "obsidian",
         "metrics",
-        "lab",
         "session",
     ];
     let mut commands = BTreeSet::new();
@@ -107,7 +106,6 @@ const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
     ("cadence", "cadence"),
     ("cadence-canon", "session"),
     ("cadence-guardrails", "guardrails"),
-    ("cadence-lab", "lab"),
     ("cadence-metrics", "metrics"),
     ("cadence-rules", "rules"),
 ];
@@ -617,8 +615,6 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
                     "rules"
                 } else if prev.contains("ObsidianCommands") {
                     "obsidian"
-                } else if prev.contains("LabCommands") {
-                    "lab"
                 } else if prev.contains("SessionCommands") {
                     "session"
                 } else {

@@ -1,20 +1,10 @@
 //! Experimental "lab" hooks for Claude Code.
 //!
-//! Currently houses the **self-representation persona ledger**: a two-hook system
-//! that captures a constrained, per-session self-representation from the model and
-//! appends it to an append-only JSONL ledger.
+//! The `lab` namespace exists for experiments that are not yet ready to earn a
+//! namespace of their own. It is currently **empty**: its only occupant, the
+//! self-representation persona ledger, was removed once the feature was retired
+//! without ever going into service.
 //!
-//! - [`nudge::PersonaNudge`] — `SessionStart` hook; injects the contract.
-//! - [`gate::PersonaGate`] — `PostToolUse(Write)` hook; validates and promotes.
-//!
-//! The namespace is `lab` (matching the `cadence-lab` plugin); `persona` is the
-//! feature within it, leaving room for future lab experiments.
-
-/// Runtime configuration: compiled defaults + optional JSON override.
-pub mod config;
-/// H2 — the `PostToolUse(Write)` validation/promotion gate.
-pub mod gate;
-/// H1 — the `SessionStart` contract nudge.
-pub mod nudge;
-/// Pure domain logic: validation, cheek heuristics, record construction.
-pub mod persona;
+//! The crate is kept as a landing pad so the next experiment has somewhere to
+//! start. Nothing links against it today — the binary does not depend on it, and
+//! there is no `lab` command group.

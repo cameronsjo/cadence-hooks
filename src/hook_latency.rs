@@ -69,13 +69,12 @@ fn cadence_subcommand(command: &str) -> Option<String> {
     // non-hook `command` that merely contains the marker string can't surface
     // an arbitrary path fragment or option into doctor output. The namespace
     // is checked against the known set; the subcommand against its charset.
-    const NAMESPACES: [&str; 7] = [
+    const NAMESPACES: [&str; 6] = [
         "cadence",
         "guardrails",
         "rules",
         "obsidian",
         "metrics",
-        "lab",
         "session",
     ];
     if !NAMESPACES.contains(&ns) || !is_kebab_id(sub) {

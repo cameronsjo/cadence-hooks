@@ -1,6 +1,6 @@
 # cadence-hooks
 
-Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatches Claude Code hook checks via clap subcommands, organized by namespace (cadence, guardrails, rules, obsidian, metrics, lab, session).
+Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatches Claude Code hook checks via clap subcommands, organized by namespace (cadence, guardrails, rules, obsidian, metrics, session).
 
 ## Build & Test
 
