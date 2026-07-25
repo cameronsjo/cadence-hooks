@@ -17,6 +17,12 @@
 //! write) sequenced *after* the decision is recorded and *before* the process
 //! emits and exits, so the block a guard emits, its exit code, and a logger's
 //! output are all byte-for-byte unchanged.
+//!
+//! One deliberate divergence from core: both wrappers bracket the check/logger
+//! call with `main::PANIC_GUARDED` so a panic unwinds into their `catch_unwind`
+//! instead of being cut short by the global panic hook's exit
+//! (cameronsjo/cadence-hooks#349). Core's `run_check_from_stdin` has no such
+//! guard — it is the unlogged path, with no telemetry tail to protect.
 
 use cadence_hooks_core::{
     Check, HookEvent, HookInput, Logger, MetricsInput, Outcome, decide_check, emit_and_exit,
@@ -24,7 +30,65 @@ use cadence_hooks_core::{
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+/// Debug-only, env-gated panic source for the dispatch panic-guard tests.
+///
+/// No check or logger has a CLI-reachable panic trigger — which is exactly why
+/// cameronsjo/cadence-hooks#349 (the Check path's missing guard) survived
+/// unnoticed: nothing could spawn-test the panic path end to end. This supplies
+/// one, from inside the guarded region so it exercises the real
+/// `catch_unwind` seam rather than a stand-in.
+///
+/// `#[cfg(debug_assertions)]` is load-bearing: the trigger does not exist in a
+/// release binary, so a shipped build cannot be made to panic through it even
+/// with `CADENCE_TEST_PANIC=1` set.
+///
+/// In a *debug* build it is a real enforcement bypass — it fires ahead of
+/// `decide_check`, so every guard degrades to non-enforcing — and this repo runs
+/// `./target/debug/cadence-hooks` routinely. So it announces itself on stderr,
+/// exactly as `CADENCE_BYPASS=1` does in `main`: suppression always leaves a
+/// trace (#89).
+#[cfg(debug_assertions)]
+fn test_panic_trigger() {
+    if std::env::var("CADENCE_TEST_PANIC").as_deref() == Ok("1") {
+        eprintln!(
+            "⚠️  cadence-hooks: enforcement bypassed — CADENCE_TEST_PANIC=1 is forcing a \
+             synthetic panic before this hook can decide (debug builds only)"
+        );
+        panic!("CADENCE_TEST_PANIC: synthetic panic exercising the dispatch panic guard");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_panic_trigger() {}
+
+/// Sets `main::PANIC_GUARDED` for as long as it is alive, clearing it on drop.
+///
+/// The flag must be cleared on **both** exits from a guarded region — the
+/// ordinary return and the unwind — or a later panic outside the region would
+/// find a guard that is no longer there and be swallowed instead of taking the
+/// fail-open exit. A manual set/clear pair holds that invariant only by virtue
+/// of how the two call sites happen to be written today; an `?`, an early
+/// return, or a new branch slipped between them would break it silently, with
+/// no test to catch it. `Drop` cannot be skipped, and — the point here — it
+/// runs *during* the unwind, so the guarded and panicking paths clear the flag
+/// through the same line of code.
+struct PanicGuard;
+
+impl PanicGuard {
+    fn arm() -> Self {
+        crate::PANIC_GUARDED.store(true, Ordering::Relaxed);
+        PanicGuard
+    }
+}
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        crate::PANIC_GUARDED.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Run a single check from stdin, record its decision to `denials.jsonl` and its
 /// wall-clock time to `hooks.jsonl`, then emit and exit exactly as
@@ -47,16 +111,72 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
         Ok(input) => input,
         Err(e) => {
             eprintln!("cadence-hooks: {e}");
+            // `e` is this binary's own message ("Failed to parse hook JSON:
+            // <serde error>") — a line/column locator, never an echo of the
+            // payload, so recording it keeps the no-payload posture.
             cadence_hooks_metrics::log_failopen(
                 "parse",
                 crate::registry::plugin_for(hook_name),
                 Some(hook_name),
                 env!("CARGO_PKG_VERSION"),
+                Some(&e),
             );
             process::exit(0); // Fail open on parse errors (ADR-0001)
         }
     };
-    match decide_check(check, &input) {
+    // A panicking check must not skip the telemetry writes or reach the user as
+    // a hard exit. `PANIC_GUARDED` tells the global panic hook (src/main.rs) to
+    // *return* instead of calling `process::exit` — a panic hook runs before
+    // unwinding begins, so its exit would kill the process and this
+    // `catch_unwind` would never regain control (cameronsjo/cadence-hooks#349).
+    // The guard lives here rather than inside `core::decide_check` because core
+    // can reach neither the metrics crate nor the canonical registry hook name
+    // (see this module's header).
+    // The deadline + timing writes that close out every dispatch, shared by the
+    // decided arm and the panic arm so a future edit to the tail cannot land in
+    // one and drift in the other. `enforced` is the only thing that differs: a
+    // panic stopped nothing, so it always passes `false`.
+    let emit_telemetry_tail = |enforced: bool| {
+        log_deadline_degradation(hook_name, crate::registry::plugin_for(hook_name), enforced);
+        cadence_hooks_metrics::log_timing(
+            hook_name,
+            crate::registry::plugin_for(hook_name).unwrap_or("unknown"),
+            event.name(),
+            started.elapsed().as_millis(),
+            input.session_id(),
+        );
+    };
+    let decided = {
+        let _guard = PanicGuard::arm();
+        catch_unwind(AssertUnwindSafe(|| {
+            test_panic_trigger();
+            decide_check(check, &input)
+        }))
+    };
+    let decided = match decided {
+        Ok(decided) => decided,
+        Err(_) => {
+            // The panic hook already printed the breadcrumb and wrote the
+            // `panic` failopen row with the payload and location — one row per
+            // panic. What is lost without this arm is the rest of the dispatch
+            // tail, so emit it before leaving.
+            emit_telemetry_tail(false);
+            // Exit 1, not 0. Neither code blocks — `Outcome::code` maps every
+            // non-Block outcome to 0 — so the *user's* operation proceeds
+            // either way, and this arm does not need 0 to fail open. What 1
+            // buys is DETECTABILITY: Claude Code surfaces a hook's stderr on a
+            // non-zero, non-2 exit and discards it on 0. At 0, a check that
+            // panics on every invocation — total enforcement failure for a
+            // block-capable guard like `guard-gh-write` — is indistinguishable
+            // in real time from one that works, with the panic breadcrumb
+            // written to stderr and thrown away and the only record a
+            // `failopen.jsonl` row nobody reads until they run `doctor`.
+            // A panic is the loudest thing this binary can notice about itself;
+            // it keeps the louder exit.
+            process::exit(1);
+        }
+    };
+    match decided {
         // Effort-skipped → silent Allow, nothing to record.
         None => process::exit(Outcome::Allow.code()),
         Some(result) => {
@@ -76,14 +196,7 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             // did not degrade to fail-open — don't emit the plain deadline row
             // (Allow/Nudge let the tool proceed, so those still do).
             let enforced = matches!(result.outcome, Outcome::Block | Outcome::Ask);
-            log_deadline_degradation(hook_name, crate::registry::plugin_for(hook_name), enforced);
-            cadence_hooks_metrics::log_timing(
-                hook_name,
-                crate::registry::plugin_for(hook_name).unwrap_or("unknown"),
-                event.name(),
-                started.elapsed().as_millis(),
-                input.session_id(),
-            );
+            emit_telemetry_tail(enforced);
             emit_and_exit(&result, event);
         }
     }
@@ -124,22 +237,33 @@ pub fn run_logged_logger(
             // implementation. `AssertUnwindSafe` is required because
             // `&dyn Logger` is not `UnwindSafe`; we exit immediately
             // afterward, so there is no post-panic state to corrupt.
-            let result = catch_unwind(AssertUnwindSafe(|| logger.run(&input)));
-            if result.is_err() {
-                cadence_hooks_metrics::log_failopen(
-                    "panic",
-                    namespace,
-                    hook,
-                    env!("CARGO_PKG_VERSION"),
-                );
-            }
+            //
+            // `PANIC_GUARDED` is what makes this reachable at all: without it
+            // the global panic hook exits the process before unwinding starts,
+            // so the documented always-exit-0 contract did not actually hold
+            // (cameronsjo/cadence-hooks#349).
+            let _guard = PanicGuard::arm();
+            // The `Err` is deliberately discarded: no `log_failopen` belongs
+            // here, because the panic hook already wrote the `panic` row with
+            // the payload and source location this site never had. One row per
+            // panic. A logger has no result to report either way.
+            //
+            // Unlike the check path above, a panicking logger still exits 0 —
+            // that is `run_logged_logger`'s documented contract, and a logger
+            // enforces nothing, so there is no enforcement failure to make
+            // visible.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                test_panic_trigger();
+                logger.run(&input)
+            }));
         }
-        Err(_) => {
+        Err(e) => {
             cadence_hooks_metrics::log_failopen(
                 "parse",
                 namespace,
                 hook,
                 env!("CARGO_PKG_VERSION"),
+                Some(&e),
             );
         }
     }
@@ -183,6 +307,9 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
             namespace,
             Some(hook_name),
             env!("CARGO_PKG_VERSION"),
+            // A deadline is a timeout, not a failure carrying a message —
+            // `reason` already says everything there is to say.
+            None,
         );
         eprintln!(
             "cadence-hooks: {hook_name}: git probe deadline exceeded; a fail-closed block was degraded to allow (see failopen.jsonl)"
@@ -193,6 +320,7 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
             namespace,
             Some(hook_name),
             env!("CARGO_PKG_VERSION"),
+            None,
         );
         eprintln!(
             "cadence-hooks: {hook_name}: git probe deadline exceeded; git-backed checks degraded to fail-open"

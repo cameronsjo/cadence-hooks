@@ -85,7 +85,7 @@ None.
 - **894 test functions** across 30 test modules
 - **Pure function isolation**: All classifiable pure functions have direct unit tests
 - **Edge case hardening**: Secret patterns have 150+ tests including bypass vectors
-- **Integration audit**: `hook_registration_audit.rs` prevents drift between binary, plugins, and event types (7 tests)
+- **Integration audit**: `hook_registration_audit.rs` prevents drift between binary, plugins, and event types (11 tests)
 - **Version mismatch tests**: `version_mismatch.rs` validates fail-open on unknown subcommands (9 tests)
 - **Event type cross-reference**: New test verifies HookEvent in main.rs matches hooks.json registration
 
