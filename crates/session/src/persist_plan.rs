@@ -1,19 +1,34 @@
-//! `session persist-plan` — UserPromptSubmit hook (cadence#505).
+//! `session persist-plan` (UserPromptSubmit) and `session persist-plan-approval`
+//! (PostToolUse:ExitPlanMode) — persist an approved plan whose approving turn
+//! would otherwise leave no durable trace (cadence#505, cadence-hooks#396).
 //!
-//! Cameron's standard plan-approval path is "approve-and-clear": the parent
-//! transcript records `ExitPlanMode` as rejected (`[Request interrupted by
-//! user for tool use]`), and the harness injects a fresh user prompt
-//! `Implement the following plan:\n\n<full plan markdown>` — killing the
-//! post-approval turn a conversational "save the plan" rule would have relied
-//! on. This hook intercepts that injected prompt deterministically: every
-//! `UserPromptSubmit` payload is checked against an exact prefix gate, and on
-//! match the plan body is extracted, written to `docs/plans/` (idempotent by
-//! body hash), linked to its approving transcript when resolvable, and named
-//! in a context line so the session verifies placement and commits it.
+//! Two distinct gaps, two triggers, one shared persist core:
 //!
-//! Never blocks (ADR-0001): every failure path — no prompt, no match, no
-//! `cwd`, not a git repo, unsafe session id, exhausted suffix ladder — exits
-//! silently via `CheckResult::allow()`. A hook bug must not eat a user prompt.
+//! - **Cross-session wipe (`PersistPlan`, UserPromptSubmit).** Cameron's
+//!   "approve-and-clear" path: the parent transcript records `ExitPlanMode` as
+//!   rejected (`[Request interrupted by user for tool use]`), and the harness
+//!   injects a fresh user prompt `Implement the following plan:\n\n<full plan
+//!   markdown>` into a NEW session — killing the post-approval turn a
+//!   conversational "save the plan" rule would have relied on. This hook
+//!   intercepts that injected prompt deterministically via an exact prefix gate.
+//! - **Same-session approval (`PersistPlanApproval`, PostToolUse).** No wipe
+//!   occurs — the harness stays in the same session and injects no prompt at
+//!   all, so `PersistPlan`'s prefix gate structurally never fires
+//!   (cadence-hooks#396). Live probe (2026-07-25, cadence-hooks#396 comment
+//!   5080816947) established that `PostToolUse:ExitPlanMode` DOES fire here,
+//!   carrying the plan text in `tool_response.plan` — `tool_input.plan` is
+//!   EMPTY on this path.
+//!
+//! Both triggers normalize to the same body-hash-idempotent write through
+//! [`persist_and_nudge`]: `claim_target`'s `O_EXCL` collision ladder, a shared
+//! frontmatter render ([`render_document`]), and one `plan-links.jsonl` row
+//! format. `PersistPlan` alone keeps the PLAN_PREFIX/suffix-strip extraction —
+//! that pipeline is specific to the harness's re-injected prompt shape.
+//!
+//! Never blocks (ADR-0001): every failure path — no prompt/no plan text, no
+//! match, no `cwd`, not a git repo, unsafe session id, exhausted suffix ladder,
+//! a subagent-context approval — exits silently via `CheckResult::allow()`. A
+//! hook bug must not eat a user prompt or a same-session approval.
 
 use crate::identity;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -40,10 +55,9 @@ const SUFFIX_LINE_PREFIX: &str = "If this plan can be broken down";
 /// ("...before exiting plan mode..."). Live-verified 2026-07-20 (see the plan
 /// doc's execution addendum): without stripping this too, the persisted body
 /// glues harness text onto every plan AND the parent-transcript hash match
-/// (Approach step 4) systematically misses, since `ExitPlanMode`'s raw
-/// `input.plan` never carries either paragraph. Stripped by the same
-/// trailing-line-prefix mechanism as `SUFFIX_LINE_PREFIX` — a line matching
-/// EITHER prefix pops.
+/// systematically misses, since `ExitPlanMode`'s raw `input.plan` never
+/// carries either paragraph. Stripped by the same trailing-line-prefix
+/// mechanism as `SUFFIX_LINE_PREFIX` — a line matching EITHER prefix pops.
 const POINTER_PARAGRAPH_PREFIX: &str = "If you need specific details from before exiting plan mode";
 
 /// Cap on the generated slug's length (before the date prefix).
@@ -57,23 +71,39 @@ const DEFAULT_SLUG: &str = "approved-plan";
 /// suffixes taken" in the plan doc), after which [`fallback_path`] is tried.
 const NUMERIC_SUFFIXES: std::ops::RangeInclusive<u32> = 2..=9;
 
-/// The provenance line label carrying the plan body's hash. Shared by the
-/// writer ([`provenance_block`]) and the reader ([`file_matches_body`]) so the
-/// two can never drift apart: since the reader now falls back to recomputing
-/// the body when no such line is found, a label mismatch would no longer be a
-/// visible no-match — it would silently reclassify every document this hook
-/// wrote as one it didn't.
+/// The frontmatter key carrying the plan body's hash — the tier-1 idempotency
+/// anchor for every document this hook persists from birth (Design 18,
+/// cadence-hooks#396's plan). Parsed only from the LEADING frontmatter block
+/// ([`leading_frontmatter_block`]), never a whole-document scan: the body now
+/// grows by design (checkbox ticks, appended `## Deviations`/`## Learnings`
+/// sections) and may itself quote this exact key, so anchoring anywhere but
+/// the bounded frontmatter prefix would let a body-authored decoy — or a
+/// legitimately mutated body — spoof or defeat the match.
+const FRONTMATTER_HASH_KEY: &str = "body_sha256:";
+
+/// The legacy provenance line label carrying the plan body's hash, from the
+/// plain-trailer format this hook wrote before frontmatter emission
+/// (cadence-hooks#396). Only a TIER-2 fallback now — see [`file_matches_body`] —
+/// kept so plan docs already on disk in the old format stay recognized as
+/// re-fires rather than laddering into a duplicate `-2` file.
 const PROVENANCE_HASH_LABEL: &str = "Plan-body-SHA256:";
 
 /// Cap on a candidate document's size before [`file_matches_body`] declines to
-/// consider it a re-fire. Plan docs run single-digit KB; anything past 1 MiB is
-/// not a plan this hook wrote.
+/// consider it a re-fire. A living plan now grows by design over its
+/// lifecycle (frontmatter status flips, ticked checklists, `## Deviations`/
+/// `## Learnings` entries) — this cap is a defensive bound against a
+/// pathological file, not a signal that growth itself is unexpected. It
+/// remains generous against the measured corpus (single-digit KB to ~37 KiB):
+/// this hook itself still writes a plan exactly once through `create_new` and
+/// never appends, so ordinary growth is always EXTERNAL (another edit to a
+/// file this hook already wrote) — a laddered sibling on the rare doc that
+/// clears the cap, never a silently lost match.
 const IDEMPOTENCY_MAX_FILE_BYTES: u64 = 1024 * 1024;
 
-/// How many lines past an opening `---` [`strip_leading_frontmatter`] will scan
-/// for the closing fence. Real backfill frontmatter runs ~12 lines; the bound
-/// keeps a body that merely opens with a thematic break from consuming the
-/// whole document looking for a fence that was never there.
+/// How many lines past an opening `---` [`frontmatter_extent`] will scan for
+/// the closing fence. Real frontmatter runs well under this; the bound keeps
+/// a body that merely opens with a thematic break from consuming the whole
+/// document looking for a fence that was never there.
 const FRONTMATTER_SCAN_MAX_LINES: usize = 100;
 
 /// How far back a sibling transcript may sit and still be scanned for the
@@ -94,7 +124,8 @@ const PARENT_SCAN_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// existing version constants; this one lives with its own writer.
 const PLAN_LINKS_SCHEMA_VERSION: u32 = 1;
 
-/// Persist an approved plan whose post-approval turn was wiped.
+/// Persist an approved plan whose post-approval turn was wiped
+/// (approve-and-clear, cross-session).
 pub struct PersistPlan;
 
 impl Check for PersistPlan {
@@ -119,6 +150,26 @@ impl Check for PersistPlan {
         // stderr breadcrumb, no failopen row for a hook that fires on every
         // single turn.
         std::panic::catch_unwind(|| run_persist_plan(input, &utc_now, &local_date, &host))
+            .unwrap_or_else(|_| CheckResult::allow())
+    }
+}
+
+/// Persist an approved plan on same-session approval — no wipe, no injected
+/// prompt, so [`PersistPlan`]'s prefix gate never fires (cadence-hooks#396).
+pub struct PersistPlanApproval;
+
+impl Check for PersistPlanApproval {
+    fn name(&self) -> &str {
+        "persist-plan-approval"
+    }
+
+    fn run(&self, input: &HookInput) -> CheckResult {
+        let host = gethostname::gethostname().to_string_lossy().into_owned();
+        let utc_now = cadence_hooks_core::time::utc_timestamp();
+        let local_date = cadence_hooks_core::time::local_date();
+        // Same narrow defense-in-depth as `PersistPlan` above: this fires on
+        // every `ExitPlanMode` call, and a bug here must not eat the approval.
+        std::panic::catch_unwind(|| run_persist_plan_approval(input, &utc_now, &local_date, &host))
             .unwrap_or_else(|_| CheckResult::allow())
     }
 }
@@ -165,66 +216,152 @@ pub fn run_persist_plan(
     }
     let stem = format!("{local_date}-{slug}");
 
-    let parent = input
+    let parent_session_id = input
         .transcript_path()
         .and_then(|tp| find_parent(Path::new(tp), &body_hash, SystemTime::now()));
-    let parent_session_id = parent.as_ref().map(|p| p.session_id.as_str());
-    let parent_name = parent_session_id.map(identity::generate_name);
+    let parent_name = parent_session_id.as_deref().map(identity::generate_name);
     let own_name = identity::generate_name(session_id);
     let machine_digest = crate::provenance::machine_digest(host);
 
-    let approving_parent = parent
-        .as_ref()
+    let transcript_content = input
+        .transcript_path()
+        .and_then(|tp| fs::read_to_string(tp).ok());
+    let model = crate::warn_commit_provenance::resolve_model(transcript_content.as_deref());
+    let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref());
+    let branch = current_branch(cwd);
+
+    let approved_in = parent_session_id
+        .as_deref()
         .zip(parent_name.as_deref())
-        .map(|(p, name)| ApprovingParent {
-            name,
-            session_id: p.session_id.as_str(),
-            model: p.model.as_deref(),
-            harness_version: p.harness_version.as_deref(),
-        });
+        .map(|(sid, name)| (name, sid));
 
-    let provenance = provenance_block(
-        approving_parent,
-        &own_name,
-        session_id,
-        &machine_digest,
-        utc_now,
-        &body_hash,
-    );
-    let document = format!("{body}\n\n---\n\n{provenance}");
-
-    let path = match claim_target(&plans_dir, &stem, session_id, &body_hash, &document) {
-        Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
-        Claim::GiveUp => return CheckResult::allow(),
+    let fields = FrontmatterFields {
+        updated: local_date,
+        branch: branch.as_deref(),
+        body_hash: &body_hash,
+        own_name: &own_name,
+        own_session_id: session_id,
+        model: model.as_deref(),
+        harness: harness.as_deref(),
+        machine_digest: &machine_digest,
+        approved_in,
     };
+    let document = render_document(&fields, &body);
 
-    // Normalized to forward slashes (the core crate's own convention — see
-    // `cadence_hooks_core::normalize_path`) so the linkage row's `plan_path`
-    // is a stable, cross-platform value for consumers, regardless of the
-    // native separator `PathBuf::to_string_lossy` would otherwise render on
-    // Windows.
-    let plan_path_rel = cadence_hooks_core::normalize_path(
-        &path
-            .strip_prefix(&repo_root)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned()),
-    );
-    append_plan_links_row(&plan_links_row(
+    let approved_label = parent_name.as_deref().unwrap_or("unknown");
+    persist_and_nudge(
+        &plans_dir,
+        &stem,
+        session_id,
+        &body_hash,
+        &document,
         utc_now,
-        parent_session_id,
+        parent_session_id.as_deref(),
         session_id,
         host,
-        &repo_root.to_string_lossy(),
-        &plan_path_rel,
-        &body_hash,
-    ));
+        &repo_root,
+        approved_label,
+    )
+}
 
-    let parent_label = parent_name.as_deref().unwrap_or("unknown");
-    CheckResult::nudge(format!(
-        "Approved plan persisted to {} (approved in {parent_label}). Verify placement, then \
-         commit it (explicit-path git add) before implementation.",
-        path.display()
-    ))
+/// Testable core for the PostToolUse trigger. Same injected clock/host
+/// discipline as [`run_persist_plan`].
+pub fn run_persist_plan_approval(
+    input: &HookInput,
+    utc_now: &str,
+    local_date: &str,
+    host: &str,
+) -> CheckResult {
+    if input.tool_name() != Some("ExitPlanMode") {
+        return CheckResult::allow();
+    }
+    // A subagent's own plan approval doesn't persist — only a top-level
+    // session's approval does (the plan doc's Task 1 step 2). `is_agent`
+    // rides `tool_response`, alongside `plan`.
+    if input
+        .tool_response
+        .as_ref()
+        .and_then(|tr| tr.is_agent)
+        .unwrap_or(false)
+    {
+        return CheckResult::allow();
+    }
+    let Some(raw_plan) = input.tool_response_plan() else {
+        return CheckResult::allow();
+    };
+    // Same normalization `run_persist_plan` applies to its extracted body
+    // (Design 18): both triggers must hash byte-identical text so a plan
+    // approved through either path is recognized as the same re-fire.
+    let body = strip_trailing_suffix_lines_and_trim(raw_plan);
+    if body.is_empty() {
+        return CheckResult::allow();
+    }
+    let Some(cwd) = input.cwd.as_deref() else {
+        return CheckResult::allow();
+    };
+    let Some(repo_root) = crate::registry::repo_root(cwd) else {
+        return CheckResult::allow();
+    };
+    let Some(session_id) = input
+        .session_id()
+        .filter(|s| identity::is_safe_session_id(s))
+    else {
+        return CheckResult::allow();
+    };
+
+    let body_hash = sha256_hex(body.as_bytes());
+    let slug = slugify(&body);
+    let plans_dir = repo_root.join("docs").join("plans");
+    if fs::create_dir_all(&plans_dir).is_err() {
+        return CheckResult::allow();
+    }
+    let stem = format!("{local_date}-{slug}");
+
+    let own_name = identity::generate_name(session_id);
+    let machine_digest = crate::provenance::machine_digest(host);
+    let transcript_content = input
+        .transcript_path()
+        .and_then(|tp| fs::read_to_string(tp).ok());
+    let model = crate::warn_commit_provenance::resolve_model(transcript_content.as_deref());
+    let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref());
+    let branch = current_branch(cwd);
+
+    let fields = FrontmatterFields {
+        updated: local_date,
+        branch: branch.as_deref(),
+        body_hash: &body_hash,
+        own_name: &own_name,
+        own_session_id: session_id,
+        model: model.as_deref(),
+        harness: harness.as_deref(),
+        machine_digest: &machine_digest,
+        // Same-session approval: the approving identity IS the executing
+        // session — no sibling-transcript scan needed (Design record item 2).
+        approved_in: Some((own_name.as_str(), session_id)),
+    };
+    let document = render_document(&fields, &body);
+
+    persist_and_nudge(
+        &plans_dir,
+        &stem,
+        session_id,
+        &body_hash,
+        &document,
+        utc_now,
+        Some(session_id),
+        session_id,
+        host,
+        &repo_root,
+        &own_name,
+    )
+}
+
+/// The current checked-out branch of the repo containing `cwd`, or `None`
+/// when unresolvable (no git repo, detached HEAD, unreadable `HEAD` file).
+/// Pure filesystem resolution ([`cadence_hooks_core::gitstate`]) — no `git`
+/// subprocess spawn on this every-turn/every-approval hot path.
+fn current_branch(cwd: &str) -> Option<String> {
+    cadence_hooks_core::gitstate::GitState::resolve(Path::new(cwd)).and_then(|gs| gs.branch)
 }
 
 // ---------------------------------------------------------------------------
@@ -364,61 +501,76 @@ fn fallback_path(dir: &Path, stem: &str, session_id: &str) -> PathBuf {
     dir.join(format!("{stem}-{}.md", identity::short_id(session_id)))
 }
 
-/// Strip a leading YAML frontmatter block, returning the document body.
+/// Byte offsets of a leading YAML frontmatter block: `(content_start,
+/// content_end, body_start)` — `content_start..content_end` is the raw text
+/// between the two `---` fences (no fence lines themselves), `body_start` is
+/// where the document's body begins (just past the closing fence line).
 ///
 /// Engages ONLY when the very first line is exactly `---` (after trimming),
 /// then scans forward at most [`FRONTMATTER_SCAN_MAX_LINES`] lines for the
-/// closing fence. **No closing fence in the window → the input is returned
-/// unchanged**, so a plan body that opens with a thematic break can at worst
-/// produce a hash mismatch (which ladders, the pre-existing behavior) and
-/// never a false match.
-fn strip_leading_frontmatter(doc: &str) -> &str {
+/// closing fence. **No closing fence in the window → `None`**, so a plan body
+/// that opens with a thematic break can at worst produce a hash mismatch
+/// (which ladders, the pre-existing behavior) and never a false match.
+fn frontmatter_extent(doc: &str) -> Option<(usize, usize, usize)> {
     let mut lines = doc.split_inclusive('\n');
-    let Some(first) = lines.next() else {
-        return doc;
-    };
+    let first = lines.next()?;
     if first.trim() != "---" {
-        return doc;
+        return None;
     }
-    let mut offset = first.len();
+    let content_start = first.len();
+    let mut offset = content_start;
     for line in lines.take(FRONTMATTER_SCAN_MAX_LINES) {
-        offset += line.len();
         if line.trim() == "---" {
-            return &doc[offset..];
+            return Some((content_start, offset, offset + line.len()));
         }
+        offset += line.len();
     }
-    doc
+    None
+}
+
+/// Strip a leading YAML frontmatter block, returning the document body.
+/// A thin wrapper over [`frontmatter_extent`] — see its doc for engagement
+/// rules. Returns `doc` unchanged when no block is found.
+fn strip_leading_frontmatter(doc: &str) -> &str {
+    match frontmatter_extent(doc) {
+        Some((_, _, body_start)) => &doc[body_start..],
+        None => doc,
+    }
+}
+
+/// The raw text of a leading YAML frontmatter block (between the fences,
+/// exclusive), or `None` when the document doesn't open with one. Thin
+/// wrapper over [`frontmatter_extent`] sharing its single scan implementation
+/// with [`strip_leading_frontmatter`].
+fn leading_frontmatter_block(doc: &str) -> Option<&str> {
+    frontmatter_extent(doc).map(|(start, end, _)| &doc[start..end])
 }
 
 /// Does the document at `path` carry the plan body `body_hash` identifies?
 ///
-/// Two sources answer that, in order, from a single capped read:
+/// Three sources answer that, tried in order, from a single capped read:
 ///
-/// 1. The LAST `Plan-body-SHA256:` provenance line. The real provenance block
-///    is always appended at the end of the document (see [`provenance_block`]),
-///    so anchoring on the last occurrence — not the first — means a plan body
-///    that itself embeds a decoy line of that exact shape can never spoof the
-///    check. When such a line exists it is authoritative: a mismatch ladders,
-///    it does not fall through to a recompute.
-/// 2. No provenance line at all — a document this hook did not write, such as a
-///    backfilled plan carrying only frontmatter (cadence-hooks#399). The body
-///    is then recomputed the way [`run_persist_plan`] computes it: strip
-///    leading frontmatter, strip the trailing harness suffix lines and trim,
-///    hash.
+/// 1. The parsed LEADING frontmatter block's [`FRONTMATTER_HASH_KEY`]
+///    (`body_sha256:`) — the format every document persisted since
+///    cadence-hooks#396 carries from birth. Bounded to the frontmatter
+///    prefix, never a whole-document scan: a living plan's body grows by
+///    design (ticked checkboxes, appended `## Deviations`/`## Learnings`),
+///    and may itself quote this exact key — anchoring anywhere else would let
+///    a body-authored decoy spoof the match, OR let a legitimately mutated
+///    body wrongly defeat it (Design 18).
+/// 2. No frontmatter key (a document predating cadence-hooks#396, or a
+///    backfilled plan carrying only ad-hoc frontmatter) — the LAST
+///    `Plan-body-SHA256:` legacy trailer line, if present. Anchored on the
+///    last occurrence, not the first, so a plan body that itself embeds a
+///    decoy line of that exact shape can never spoof the check.
+/// 3. Neither marker — a document neither trigger wrote, such as a backfilled
+///    plan carrying only frontmatter with no hash key (cadence-hooks#399). The
+///    body is recomputed the way both triggers compute it: strip leading
+///    frontmatter, strip the trailing harness suffix lines and trim, hash.
 ///
 /// Only an equality returns `true`; every ambiguity (unreadable, over
 /// [`IDEMPOTENCY_MAX_FILE_BYTES`], hash differs) returns `false` and lets the
-/// suffix ladder run. The conversion is therefore **one-way**: a document that
-/// previously read as "no marker, no match" may now match, but a document that
-/// already matched by provenance line can never stop matching — with one
-/// boundary case, stated so the invariant is not read as broader than it is.
-/// The old reader was uncapped, so a provenance-carrying file that later grows
-/// past [`IDEMPOTENCY_MAX_FILE_BYTES`] flips from match to no-match, and
-/// ladders. Nothing here reaches that: this hook writes a plan exactly once
-/// through `create_new` and never appends, and the measured corpus tops out
-/// near 37 KiB against a 1 MiB cap. It would take external growth of a
-/// document this hook already wrote, which is a laddered sibling rather than a
-/// lost one.
+/// suffix ladder run.
 fn file_matches_body(path: &Path, body_hash: &str) -> bool {
     use std::io::Read as _;
 
@@ -435,6 +587,13 @@ fn file_matches_body(path: &Path, body_hash: &str) -> bool {
         || content.len() as u64 > IDEMPOTENCY_MAX_FILE_BYTES
     {
         return false;
+    }
+
+    if let Some(recorded) = leading_frontmatter_block(&content).and_then(|fm| {
+        fm.lines()
+            .find_map(|l| l.strip_prefix(FRONTMATTER_HASH_KEY))
+    }) {
+        return recorded.trim() == body_hash;
     }
 
     if let Some(recorded) = content
@@ -492,34 +651,14 @@ fn claim_target(
 // Provenance: parent resolution (Approach step 4)
 // ---------------------------------------------------------------------------
 
-/// The parent transcript's approving turn, resolved by [`find_parent`]: the
-/// matched sibling's session id plus the fields the `Approved in:` line's
-/// bracket segment needs. `model`/`harness_version` are `None` when the
-/// matched line doesn't carry them — the bracket segment is then omitted
-/// entirely (see [`provenance_block`]) rather than rendered empty.
-#[derive(Debug, PartialEq, Eq)]
-struct ParentTuple {
-    session_id: String,
-    model: Option<String>,
-    harness_version: Option<String>,
-}
-
-/// One transcript line's `ExitPlanMode` tool_use match: the plan text plus
-/// the approving turn's model (`message.model`) and harness version
-/// (top-level `version`), when this line is an assistant message carrying an
-/// `ExitPlanMode` call. Mirrors
+/// The `ExitPlanMode` plan text on one transcript line, if `line` is an
+/// assistant message carrying that tool call. Mirrors
 /// `cadence_hooks_core::transcript::line_is_polish_skill_use`'s traversal.
-struct ExitPlanModeMatch {
-    plan_text: String,
-    model: Option<String>,
-    harness_version: Option<String>,
-}
-
-fn exit_plan_mode_match(line: &str) -> Option<ExitPlanModeMatch> {
+fn exit_plan_mode_match(line: &str) -> Option<String> {
     let value: Value = serde_json::from_str(line).ok()?;
     let message = value.get("message")?;
     let content = message.get("content")?.as_array()?;
-    let plan_text = content.iter().find_map(|block| {
+    content.iter().find_map(|block| {
         if block.get("type").and_then(Value::as_str) != Some("tool_use") {
             return None;
         }
@@ -531,19 +670,6 @@ fn exit_plan_mode_match(line: &str) -> Option<ExitPlanModeMatch> {
             .get("plan")?
             .as_str()
             .map(str::to_string)
-    })?;
-    let model = message
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let harness_version = value
-        .get("version")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    Some(ExitPlanModeMatch {
-        plan_text,
-        model,
-        harness_version,
     })
 }
 
@@ -555,12 +681,12 @@ fn exit_plan_mode_match(line: &str) -> Option<ExitPlanModeMatch> {
 /// streamed line-by-line (never loading a whole sibling into memory) with a
 /// substring pre-filter on each line before any JSON parse. `now` is the
 /// caller's `SystemTime::now()`, threaded through for testability without a
-/// frozen clock. Returns a [`ParentTuple`] on the first exact match — never a
-/// fuzzy guess — and only when the sibling's file stem passes
+/// frozen clock. Returns the matched sibling's session id on the first exact
+/// match — never a fuzzy guess — and only when its file stem passes
 /// [`identity::is_safe_session_id`]; a match against a hostile-named sibling
 /// is treated as no-match (`unknown`), since the returned id flows raw into
 /// the provenance text and the linkage row.
-fn find_parent(transcript_path: &Path, target_hash: &str, now: SystemTime) -> Option<ParentTuple> {
+fn find_parent(transcript_path: &Path, target_hash: &str, now: SystemTime) -> Option<String> {
     let dir = transcript_path.parent()?;
     let mut candidates: Vec<(SystemTime, PathBuf)> = fs::read_dir(dir)
         .ok()?
@@ -599,82 +725,159 @@ fn find_parent(transcript_path: &Path, target_hash: &str, now: SystemTime) -> Op
             if !line.contains("ExitPlanMode") {
                 continue;
             }
-            let Some(exit_plan) = exit_plan_mode_match(&line) else {
+            let Some(plan_text) = exit_plan_mode_match(&line) else {
                 continue;
             };
-            let normalized = strip_trailing_suffix_lines_and_trim(&exit_plan.plan_text);
+            let normalized = strip_trailing_suffix_lines_and_trim(&plan_text);
             if sha256_hex(normalized.as_bytes()) == target_hash {
-                let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-                return stem
-                    .filter(|s| identity::is_safe_session_id(s))
-                    .map(|session_id| ParentTuple {
-                        session_id,
-                        model: exit_plan.model,
-                        harness_version: exit_plan.harness_version,
-                    });
+                return path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .filter(|s| identity::is_safe_session_id(s));
             }
         }
     }
     None
 }
 
-/// The `Approved in:`/model+harness bracket segment, e.g. `" [claude-fable-5,
-/// claude-code 2.1.214]"` — rendered with its own leading space so the
-/// caller can splice it directly after the `(id)` segment. `None` when
-/// neither field is present, so the caller omits the bracket entirely rather
-/// than printing an empty or dangling one; when only one field is present,
-/// the bracket carries just that field (still never empty).
-fn model_harness_bracket(model: Option<&str>, harness_version: Option<&str>) -> Option<String> {
-    match (model, harness_version) {
-        (Some(m), Some(v)) => Some(format!(" [{m}, claude-code {v}]")),
-        (Some(m), None) => Some(format!(" [{m}]")),
-        (None, Some(v)) => Some(format!(" [claude-code {v}]")),
-        (None, None) => None,
-    }
-}
+// ---------------------------------------------------------------------------
+// Frontmatter (Design 2 / Design 18) + shared persist tail (Approach step 5)
+// ---------------------------------------------------------------------------
 
-/// The approving parent's rendered fields for [`provenance_block`]'s
-/// `Approved in:` line — bundled to keep the render function's arity under
-/// clippy's `too_many_arguments` threshold. `name` is the parent's generated
-/// display name (`identity::generate_name`), computed by the caller since
-/// [`find_parent`] only resolves the raw [`ParentTuple`].
-struct ApprovingParent<'a> {
-    name: &'a str,
-    session_id: &'a str,
+/// Fields resolved for a newly persisted plan's frontmatter — the
+/// execution-zone metadata a resume/scan/outro reconciliation reads (the
+/// plan-as-living-document lifecycle's Design record item 2). An unresolved
+/// optional field is OMITTED from the render entirely, never written as a
+/// placeholder (`unknown`, an empty string) — silence, not a guess.
+struct FrontmatterFields<'a> {
+    /// Local date this document was (first) persisted — `updated:`.
+    updated: &'a str,
+    /// The cwd's current checked-out branch, if resolvable.
+    branch: Option<&'a str>,
+    /// The plan body's SHA-256 hex digest — the tier-1 idempotency anchor.
+    body_hash: &'a str,
+    /// The executing session's generated display name.
+    own_name: &'a str,
+    /// The executing session's id.
+    own_session_id: &'a str,
+    /// The executing session's model, resolved from its own transcript tail.
     model: Option<&'a str>,
-    harness_version: Option<&'a str>,
+    /// The executing session's harness version (transcript tail, or the
+    /// `AI_AGENT` env fallback).
+    harness: Option<&'a str>,
+    /// Salted, truncated machine digest (never the raw hostname).
+    machine_digest: &'a str,
+    /// The approving session's `(name, session_id)` — identical to
+    /// `(own_name, own_session_id)` on same-session approval, the
+    /// `find_parent`-resolved sibling on a cross-session approve-and-clear
+    /// wipe, or `None` when no approving parent was found.
+    approved_in: Option<(&'a str, &'a str)>,
 }
 
-/// Render the provenance block appended to every persisted plan.
+/// Render the frontmatter block for a newly persisted plan.
 ///
-/// `machine_digest` is the salted, truncated digest from
-/// [`crate::provenance::machine_digest`] — never the raw hostname (cadence#248
-/// fixes the doctrine violation of a bare hostname in a committed artifact).
-/// It appears on both lines: transcripts are machine-local, so a resolved
-/// parent is same-machine by construction. The executing-session line never
-/// carries model/harness — on a same-session wipe it would be identical to
-/// the parent's, and on a fresh pickup it's simply unknown.
-fn provenance_block(
-    parent: Option<ApprovingParent>,
-    own_name: &str,
-    own_session_id: &str,
-    machine_digest: &str,
-    utc_now: &str,
+/// `status: in-flight` is a fixed constant: this hook only ever fires at the
+/// moment a plan is approved, so a freshly persisted document is never
+/// anything else. Reserved keys the living-plan lifecycle owns for a later
+/// consumer — `next`, `pr`, `card`, `blocked` — are never emitted here (Task 1
+/// step 3 of the plan-as-living-document lifecycle plan); a session or the
+/// scanner fills those in on a later touch.
+///
+/// Free-text fields sourced from the transcript (`model`, `harness`) or the
+/// filesystem (`branch`) are passed through [`identity::sanitize_field`] —
+/// the same discipline `warn_commit_provenance`'s nudge applies to the same
+/// two fields — before interpolation, since none of the three come from a
+/// value this crate itself generated or validated.
+fn render_frontmatter(f: &FrontmatterFields) -> String {
+    let mut lines = vec![
+        "---".to_string(),
+        "status: in-flight".to_string(),
+        format!("updated: {}", f.updated),
+    ];
+    if let Some(b) = f.branch {
+        lines.push(format!(
+            "branch: {}",
+            identity::sanitize_field(b, identity::MAX_FIELD_DISPLAY)
+        ));
+    }
+    lines.push(format!("{FRONTMATTER_HASH_KEY} {}", f.body_hash));
+    lines.push(format!("session: {}", f.own_name));
+    lines.push(format!("session_id: {}", f.own_session_id));
+    if let Some(m) = f.model {
+        lines.push(format!(
+            "model: {}",
+            identity::sanitize_field(m, identity::MAX_FIELD_DISPLAY)
+        ));
+    }
+    if let Some(h) = f.harness {
+        lines.push(format!(
+            "harness: claude-code {}",
+            identity::sanitize_field(h, identity::MAX_FIELD_DISPLAY)
+        ));
+    }
+    lines.push(format!("machine: {}", f.machine_digest));
+    if let Some((name, sid)) = f.approved_in {
+        lines.push(format!("approved_in: {name}"));
+        lines.push(format!("approved_session_id: {sid}"));
+    }
+    lines.push("---".to_string());
+    lines.join("\n")
+}
+
+/// The full document written to disk: frontmatter, a blank line, then the
+/// plan body, trailing-newline terminated.
+fn render_document(f: &FrontmatterFields, body: &str) -> String {
+    format!("{}\n\n{body}\n", render_frontmatter(f))
+}
+
+/// The shared tail both triggers converge on once each has resolved its own
+/// body/session/approval fields: claim a target, append the linkage row,
+/// render the nudge. Never overwrites anything (see [`claim_target`]).
+#[allow(clippy::too_many_arguments)]
+fn persist_and_nudge(
+    plans_dir: &Path,
+    stem: &str,
+    session_id: &str,
     body_hash: &str,
-) -> String {
-    let approved_in = match parent {
-        Some(p) => {
-            let bracket = model_harness_bracket(p.model, p.harness_version).unwrap_or_default();
-            let name = p.name;
-            let sid = p.session_id;
-            format!("Approved in: {name} ({sid}){bracket} @ {machine_digest}")
-        }
-        None => "Approved in: unknown".to_string(),
+    document: &str,
+    utc_now: &str,
+    parent_session_id: Option<&str>,
+    child_session_id: &str,
+    host: &str,
+    repo_root: &Path,
+    approved_label: &str,
+) -> CheckResult {
+    let path = match claim_target(plans_dir, stem, session_id, body_hash, document) {
+        Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
+        Claim::GiveUp => return CheckResult::allow(),
     };
-    format!(
-        "{approved_in}\nExecuting session: {own_name} ({own_session_id}) @ {machine_digest}\n\
-         Persisted: {utc_now}\n{PROVENANCE_HASH_LABEL} {body_hash}\n"
-    )
+
+    // Normalized to forward slashes (the core crate's own convention — see
+    // `cadence_hooks_core::normalize_path`) so the linkage row's `plan_path`
+    // is a stable, cross-platform value for consumers, regardless of the
+    // native separator `PathBuf::to_string_lossy` would otherwise render on
+    // Windows.
+    let plan_path_rel = cadence_hooks_core::normalize_path(
+        &path
+            .strip_prefix(repo_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned()),
+    );
+    append_plan_links_row(&plan_links_row(
+        utc_now,
+        parent_session_id,
+        child_session_id,
+        host,
+        &repo_root.to_string_lossy(),
+        &plan_path_rel,
+        body_hash,
+    ));
+
+    CheckResult::nudge(format!(
+        "Approved plan persisted to {} (approved in {approved_label}). Verify placement, then \
+         commit it (explicit-path git add) before implementation.",
+        path.display()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +930,7 @@ mod tests {
     use super::*;
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::make_user_prompt_submit;
+    use cadence_hooks_core::{ToolInput, ToolResponse};
     use tempfile::TempDir;
 
     // --- extraction: prefix gate ---
@@ -1079,8 +1283,7 @@ mod tests {
         // rejects it on its own — so neither actually exercises the `.rev()`
         // last-occurrence anchor they are named for. Only a decoy at the START
         // of a line reaches `strip_prefix`, making this the single case where
-        // the anchor is load-bearing. It matters more since cadence-hooks#399:
-        // the anchor now also decides whether the recompute fallback runs.
+        // the anchor is load-bearing.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("plan.md");
         fs::write(
@@ -1098,8 +1301,9 @@ mod tests {
 
     #[test]
     fn file_matches_body_recomputes_when_no_hash_line() {
-        // A document this hook did not write — backfill frontmatter, no
-        // provenance block. The body must still be recognized (cadence-hooks#399).
+        // A document neither trigger wrote — backfill frontmatter, no
+        // hash key and no legacy trailer. The body must still be recognized
+        // (cadence-hooks#399).
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("plan.md");
         let body = "# Title\n\nbody text";
@@ -1232,28 +1436,185 @@ mod tests {
         );
     }
 
+    // --- idempotency: frontmatter tier-1 anchor (Design 18) ---
+
+    fn frontmatter_doc_with_hash(hash: &str, body: &str) -> String {
+        format!("---\nstatus: in-flight\nbody_sha256: {hash}\n---\n\n{body}\n")
+    }
+
+    #[test]
+    fn file_matches_body_frontmatter_key_is_tier_one() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        let body = "# Title\n\nbody text";
+        let hash = sha256_hex(body.as_bytes());
+        fs::write(&path, frontmatter_doc_with_hash(&hash, body)).unwrap();
+        assert!(file_matches_body(&path, &hash));
+        assert!(!file_matches_body(&path, "some-other-hash"));
+    }
+
+    #[test]
+    fn file_matches_body_recognizes_mutated_body_via_frontmatter_key() {
+        // The exact Design-18 scenario: a plan persisted once, then its BODY
+        // is mutated in place (checkbox ticked, a `## Deviations` entry
+        // appended) while the frontmatter block is left untouched. A re-fire
+        // of the SAME original approval must still recognize this as the plan
+        // it already wrote — recomputing against the current (mutated) body
+        // would wrongly ladder to a `-2` duplicate.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        let original_body = "# Title\n\n- [ ] Task one";
+        let hash = sha256_hex(original_body.as_bytes());
+        fs::write(&path, frontmatter_doc_with_hash(&hash, original_body)).unwrap();
+
+        let mutated = format!(
+            "---\nstatus: in-flight\nbody_sha256: {hash}\n---\n\n# Title\n\n- [x] Task one\n\n\
+             ## Deviations\n\nnone\n"
+        );
+        fs::write(&path, mutated).unwrap();
+
+        assert!(
+            file_matches_body(&path, &hash),
+            "the frontmatter key must anchor the match even though the body mutated"
+        );
+    }
+
+    #[test]
+    fn file_matches_body_frontmatter_key_not_spoofed_by_body_decoy() {
+        // A body that itself quotes `body_sha256:` (e.g. explaining this exact
+        // mechanism) must not be read as the frontmatter key — only the
+        // bounded LEADING frontmatter block is ever scanned for it.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        let body = "# Title\n\nThe idempotency reader parses a leading `body_sha256: decoy` key.";
+        let hash = sha256_hex(body.as_bytes());
+        fs::write(&path, frontmatter_doc_with_hash(&hash, body)).unwrap();
+        assert!(
+            file_matches_body(&path, &hash),
+            "the real frontmatter key still matches"
+        );
+        assert!(
+            !file_matches_body(&path, "decoy"),
+            "a body-authored decoy key must never spoof the match"
+        );
+    }
+
+    #[test]
+    fn leading_frontmatter_block_returns_none_without_a_fence() {
+        assert_eq!(leading_frontmatter_block("# Title\n\nbody"), None);
+    }
+
+    // --- cross-trigger hash normalization (Design 18) ---
+
+    #[test]
+    fn cross_trigger_normalization_hashes_match() {
+        // The UserPromptSubmit path strips PLAN_PREFIX then normalizes; the
+        // PostToolUse path consumes `tool_response.plan` raw and normalizes
+        // the SAME way. Both must land on byte-identical text so a plan
+        // approved through either path hashes the same.
+        let prompt = format!(
+            "{PLAN_PREFIX}\n\n# Title\n\nbody text\n\nIf this plan can be broken down into \
+             discrete units of work, consider using the Agent tool to dispatch them."
+        );
+        let user_prompt_submit_body =
+            strip_trailing_suffix_lines_and_trim(prompt.strip_prefix(PLAN_PREFIX).unwrap());
+
+        // ExitPlanMode's own tool_input.plan never carries the harness prefix
+        // or suffix — but may carry an incidental trailing blank line.
+        let raw_exit_plan_mode_text = "# Title\n\nbody text\n\n";
+        let post_tool_use_body = strip_trailing_suffix_lines_and_trim(raw_exit_plan_mode_text);
+
+        assert_eq!(user_prompt_submit_body, post_tool_use_body);
+        assert_eq!(
+            sha256_hex(user_prompt_submit_body.as_bytes()),
+            sha256_hex(post_tool_use_body.as_bytes())
+        );
+    }
+
+    // --- frontmatter rendering ---
+
+    fn base_fields<'a>(body_hash: &'a str, machine_digest: &'a str) -> FrontmatterFields<'a> {
+        FrontmatterFields {
+            updated: "2026-07-25",
+            branch: None,
+            body_hash,
+            own_name: "own-name",
+            own_session_id: "own-sid",
+            model: None,
+            harness: None,
+            machine_digest,
+            approved_in: None,
+        }
+    }
+
+    #[test]
+    fn render_frontmatter_omits_unresolved_optional_fields() {
+        let fields = base_fields("hash", "digest");
+        let fm = render_frontmatter(&fields);
+        assert!(fm.starts_with("---\nstatus: in-flight\nupdated: 2026-07-25\n"));
+        assert!(fm.contains("body_sha256: hash"));
+        assert!(fm.contains("session: own-name"));
+        assert!(fm.contains("session_id: own-sid"));
+        assert!(fm.contains("machine: digest"));
+        assert!(fm.ends_with("---"));
+        assert!(
+            !fm.contains("branch:"),
+            "unresolved branch is omitted: {fm}"
+        );
+        assert!(!fm.contains("model:"), "unresolved model is omitted: {fm}");
+        assert!(
+            !fm.contains("harness:"),
+            "unresolved harness is omitted: {fm}"
+        );
+        assert!(
+            !fm.contains("approved_in:"),
+            "unresolved approved_in is omitted: {fm}"
+        );
+        assert!(!fm.contains("next:"), "next: is reserved, never emitted");
+        assert!(!fm.contains("pr:"), "pr: is reserved, never emitted");
+        assert!(!fm.contains("card:"), "card: is reserved, never emitted");
+        assert!(
+            !fm.contains("blocked:"),
+            "blocked: is reserved, never emitted"
+        );
+    }
+
+    #[test]
+    fn render_frontmatter_includes_every_resolved_field() {
+        let mut fields = base_fields("hash", "digest");
+        fields.branch = Some("feat/x");
+        fields.model = Some("claude-fable-5");
+        fields.harness = Some("2.1.220");
+        fields.approved_in = Some(("parent-name", "parent-sid"));
+        let fm = render_frontmatter(&fields);
+        assert!(fm.contains("branch: feat/x"));
+        assert!(fm.contains("model: claude-fable-5"));
+        assert!(fm.contains("harness: claude-code 2.1.220"));
+        assert!(fm.contains("approved_in: parent-name"));
+        assert!(fm.contains("approved_session_id: parent-sid"));
+    }
+
+    #[test]
+    fn render_document_places_body_after_the_closing_fence() {
+        let fields = base_fields("hash", "digest");
+        let doc = render_document(&fields, "# Title\n\nbody text");
+        let (frontmatter, body) = doc
+            .split_once("---\n\n")
+            .expect("closing fence + blank line");
+        assert!(frontmatter.starts_with("---\nstatus: in-flight"));
+        assert_eq!(body, "# Title\n\nbody text\n");
+    }
+
     // --- provenance: parent resolution ---
 
-    /// `model`/`harness_version` model the assistant line's `message.model`
-    /// and top-level `version` — both `None` reproduces the older transcript
-    /// shape that carries neither.
-    fn exit_plan_mode_line(
-        plan: &str,
-        model: Option<&str>,
-        harness_version: Option<&str>,
-    ) -> String {
-        let mut message = serde_json::json!({
-            "role": "assistant",
-            "content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": plan}}]
-        });
-        if let Some(m) = model {
-            message["model"] = serde_json::json!(m);
-        }
-        let mut line = serde_json::json!({ "message": message });
-        if let Some(v) = harness_version {
-            line["version"] = serde_json::json!(v);
-        }
-        line.to_string()
+    fn exit_plan_mode_line(plan: &str) -> String {
+        serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": plan}}],
+            }
+        })
+        .to_string()
     }
 
     #[test]
@@ -1262,67 +1623,13 @@ mod tests {
         let plan_text = "# Title\n\nbody text";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
 
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
         let found = find_parent(&own, &hash, SystemTime::now());
-        assert_eq!(
-            found,
-            Some(ParentTuple {
-                session_id: "parent-session-id".to_string(),
-                model: None,
-                harness_version: None,
-            })
-        );
-    }
-
-    #[test]
-    fn find_parent_extracts_model_and_harness_version_from_matched_line() {
-        // Real transcripts stamp the approving assistant line with both
-        // `message.model` and a top-level `version` — verified live against
-        // an actual ExitPlanMode transcript line (2026-07-20). A fixture
-        // carrying neither would pass this assertion vacuously, so both
-        // fields must be populated here.
-        let tmp = TempDir::new().unwrap();
-        let plan_text = "# Title\n\nbody text";
-        let hash = sha256_hex(plan_text.as_bytes());
-        let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(
-            &sibling,
-            exit_plan_mode_line(plan_text, Some("claude-fable-5"), Some("2.1.214")),
-        )
-        .unwrap();
-        let own = tmp.path().join("own-session-id.jsonl");
-        fs::write(&own, "{}").unwrap();
-
-        let found = find_parent(&own, &hash, SystemTime::now());
-        assert_eq!(
-            found,
-            Some(ParentTuple {
-                session_id: "parent-session-id".to_string(),
-                model: Some("claude-fable-5".to_string()),
-                harness_version: Some("2.1.214".to_string()),
-            })
-        );
-    }
-
-    #[test]
-    fn find_parent_missing_model_and_harness_version_is_gracefully_none() {
-        // Older transcript lines (or a stripped-down fixture) may carry
-        // neither field — the tuple must still resolve, with both absent.
-        let tmp = TempDir::new().unwrap();
-        let plan_text = "# Title\n\nbody text";
-        let hash = sha256_hex(plan_text.as_bytes());
-        let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
-        let own = tmp.path().join("own-session-id.jsonl");
-        fs::write(&own, "{}").unwrap();
-
-        let found = find_parent(&own, &hash, SystemTime::now()).expect("parent must be found");
-        assert_eq!(found.model, None);
-        assert_eq!(found.harness_version, None);
+        assert_eq!(found.as_deref(), Some("parent-session-id"));
     }
 
     #[test]
@@ -1331,11 +1638,11 @@ mod tests {
         let plan_text = "# Title\n\nbody text";
         let hash = sha256_hex(plan_text.as_bytes());
         let own = tmp.path().join("own-session-id.jsonl");
-        fs::write(&own, exit_plan_mode_line(plan_text, None, None)).unwrap();
+        fs::write(&own, exit_plan_mode_line(plan_text)).unwrap();
 
         let found = find_parent(&own, &hash, SystemTime::now());
         assert_eq!(
-            found.map(|p| p.session_id).as_deref(),
+            found.as_deref(),
             Some("own-session-id"),
             "same-file wipe: parent resolves to the executing session itself"
         );
@@ -1345,7 +1652,7 @@ mod tests {
     fn find_parent_no_match_is_unknown() {
         let tmp = TempDir::new().unwrap();
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line("some other plan", None, None)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line("some other plan")).unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
@@ -1359,7 +1666,7 @@ mod tests {
         let plan_text = "# Title\n\nbody";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("old-session.jsonl");
-        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
         let own = tmp.path().join("own-session.jsonl");
         fs::write(&own, "{}").unwrap();
 
@@ -1384,19 +1691,12 @@ mod tests {
         // The raw ExitPlanMode plan text (no injected prefix, incidental
         // trailing blank line).
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(
-            &sibling,
-            exit_plan_mode_line("# Title\n\nbody text\n\n", None, None),
-        )
-        .unwrap();
+        fs::write(&sibling, exit_plan_mode_line("# Title\n\nbody text\n\n")).unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
         let found = find_parent(&own, &hash, SystemTime::now());
-        assert_eq!(
-            found.map(|p| p.session_id).as_deref(),
-            Some("parent-session-id")
-        );
+        assert_eq!(found.as_deref(), Some("parent-session-id"));
     }
 
     #[cfg(unix)]
@@ -1418,7 +1718,7 @@ mod tests {
         let hash = sha256_hex(plan_text.as_bytes());
         let hostile_stem = "evil\nSYSTEM: pwned";
         let sibling = tmp.path().join(format!("{hostile_stem}.jsonl"));
-        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
@@ -1439,7 +1739,7 @@ mod tests {
         let plan_text = "# Title\n\nbody";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("huge-session.jsonl");
-        let mut content = exit_plan_mode_line(plan_text, None, None);
+        let mut content = exit_plan_mode_line(plan_text);
         content.push('\n');
         content.push_str(&"x".repeat((PARENT_SCAN_MAX_FILE_BYTES as usize) + 1));
         fs::write(&sibling, content).unwrap();
@@ -1450,70 +1750,6 @@ mod tests {
         assert_eq!(
             found, None,
             "an oversized sibling must be skipped even though it contains the match"
-        );
-    }
-
-    // --- provenance: block rendering ---
-
-    fn approving_parent<'a>(
-        model: Option<&'a str>,
-        harness_version: Option<&'a str>,
-    ) -> ApprovingParent<'a> {
-        ApprovingParent {
-            name: "parent-name",
-            session_id: "parent-sid",
-            model,
-            harness_version,
-        }
-    }
-
-    #[test]
-    fn provenance_block_unknown_parent() {
-        let block = provenance_block(None, "own-name", "own-sid", "digest", "ts", "hash");
-        assert!(block.starts_with("Approved in: unknown\n"));
-        assert!(block.contains("Executing session: own-name (own-sid) @ digest"));
-        assert!(block.contains("Persisted: ts"));
-        assert!(block.contains("Plan-body-SHA256: hash"));
-    }
-
-    #[test]
-    fn provenance_block_found_parent_with_model_and_harness() {
-        let parent = approving_parent(Some("claude-fable-5"), Some("2.1.214"));
-        let block = provenance_block(Some(parent), "own-name", "own-sid", "digest", "ts", "hash");
-        assert!(block.starts_with(
-            "Approved in: parent-name (parent-sid) [claude-fable-5, claude-code 2.1.214] @ digest\n"
-        ));
-        // The executing-session line never carries model/harness — only name + id.
-        assert!(block.contains("Executing session: own-name (own-sid) @ digest"));
-    }
-
-    #[test]
-    fn provenance_block_found_parent_without_model_or_harness_omits_bracket() {
-        // Neither field resolved (e.g. an older transcript format) — the
-        // bracket segment must be omitted entirely, never rendered empty.
-        let parent = approving_parent(None, None);
-        let block = provenance_block(Some(parent), "own-name", "own-sid", "digest", "ts", "hash");
-        assert!(block.starts_with("Approved in: parent-name (parent-sid) @ digest\n"));
-        assert!(!block.contains('['), "no dangling/empty bracket: {block}");
-    }
-
-    #[test]
-    fn provenance_block_found_parent_with_model_only() {
-        let parent = approving_parent(Some("claude-fable-5"), None);
-        let block = provenance_block(Some(parent), "own-name", "own-sid", "digest", "ts", "hash");
-        assert!(
-            block.starts_with("Approved in: parent-name (parent-sid) [claude-fable-5] @ digest\n")
-        );
-    }
-
-    #[test]
-    fn provenance_block_found_parent_with_harness_only() {
-        let parent = approving_parent(None, Some("2.1.214"));
-        let block = provenance_block(Some(parent), "own-name", "own-sid", "digest", "ts", "hash");
-        assert!(
-            block.starts_with(
-                "Approved in: parent-name (parent-sid) [claude-code 2.1.214] @ digest\n"
-            )
         );
     }
 
@@ -1571,6 +1807,25 @@ mod tests {
         git(&["config", "user.name", "t"]);
     }
 
+    /// Crate-wide serialization lock for the `CADENCE_METRICS_DIR` env-mutating
+    /// tests, mirroring `cadence_hooks_metrics::common::ENV_LOCK`'s pattern —
+    /// this crate has its own env-mutating tests, so its own lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_metrics_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized against every other test in this module via ENV_LOCK.
+        unsafe {
+            std::env::set_var("CADENCE_METRICS_DIR", dir);
+        }
+        let result = f();
+        // SAFETY: serialized against every other test in this module via ENV_LOCK.
+        unsafe {
+            std::env::remove_var("CADENCE_METRICS_DIR");
+        }
+        result
+    }
+
     #[test]
     fn end_to_end_fresh_write_produces_nudge_and_linkage_row() {
         let tmp = TempDir::new().unwrap();
@@ -1602,15 +1857,20 @@ mod tests {
 
         let written =
             fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
-        assert!(written.starts_with("# Fix the Widget"));
+        assert!(written.starts_with("---\nstatus: in-flight\n"));
+        assert!(written.contains("# Fix the Widget"));
         assert!(!written.contains("If this plan can be broken down"));
-        assert!(written.contains("Executing session:"));
-        assert!(written.contains("Plan-body-SHA256:"));
+        assert!(written.contains("session_id: child-session-id"));
+        assert!(written.contains("body_sha256:"));
+        assert!(
+            !written.contains("approved_in:"),
+            "no parent resolved — approved_in must be omitted, never written as 'unknown'"
+        );
         // Doctrine fix (cadence#248): the committed block carries the salted
         // digest, never the raw hostname.
         assert!(
             !written.contains("test-host"),
-            "the raw hostname must never reach the committed provenance block"
+            "the raw hostname must never reach the committed frontmatter"
         );
         assert!(written.contains(&crate::provenance::machine_digest("test-host")));
 
@@ -1698,22 +1958,218 @@ mod tests {
         assert!(!tmp.path().join("docs").exists(), "nothing written");
     }
 
-    /// Crate-wide serialization lock for the `CADENCE_METRICS_DIR` env-mutating
-    /// tests, mirroring `cadence_hooks_metrics::common::ENV_LOCK`'s pattern —
-    /// this crate has its own env-mutating tests, so its own lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // --- PersistPlanApproval: same-session PostToolUse trigger ---
 
-    fn with_metrics_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized against every other test in this module via ENV_LOCK.
-        unsafe {
-            std::env::set_var("CADENCE_METRICS_DIR", dir);
+    fn exit_plan_mode_post_tool_use(
+        session_id: &str,
+        plan: &str,
+        cwd: &str,
+        transcript_path: &str,
+        is_agent: Option<bool>,
+    ) -> HookInput {
+        HookInput {
+            tool_name: Some("ExitPlanMode".into()),
+            tool_input: Some(ToolInput::default()),
+            tool_response: Some(ToolResponse {
+                plan: Some(plan.into()),
+                is_agent,
+                ..Default::default()
+            }),
+            session_id: Some(session_id.into()),
+            cwd: Some(cwd.into()),
+            transcript_path: Some(transcript_path.into()),
+            ..Default::default()
         }
-        let result = f();
-        // SAFETY: serialized against every other test in this module via ENV_LOCK.
-        unsafe {
-            std::env::remove_var("CADENCE_METRICS_DIR");
-        }
-        result
+    }
+
+    #[test]
+    fn approval_non_exit_plan_mode_tool_allows() {
+        let input = HookInput {
+            tool_name: Some("Bash".into()),
+            tool_response: Some(ToolResponse {
+                plan: Some("# X\n\nbody".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn approval_no_tool_response_plan_allows() {
+        let input = HookInput {
+            tool_name: Some("ExitPlanMode".into()),
+            ..Default::default()
+        };
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn approval_subagent_context_allows() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let input = exit_plan_mode_post_tool_use(
+            "sub-session-id",
+            "# X\n\nbody",
+            &cwd,
+            &tmp.path().join("t.jsonl").to_string_lossy(),
+            Some(true),
+        );
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(
+            !tmp.path().join("docs").exists(),
+            "a subagent's own plan approval must not persist"
+        );
+    }
+
+    #[test]
+    fn approval_no_cwd_allows() {
+        let input = HookInput {
+            tool_name: Some("ExitPlanMode".into()),
+            tool_response: Some(ToolResponse {
+                plan: Some("# X\n\nbody".into()),
+                ..Default::default()
+            }),
+            session_id: Some("sid".into()),
+            ..Default::default()
+        };
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn approval_non_git_repo_cwd_allows() {
+        let tmp = TempDir::new().unwrap();
+        let input = exit_plan_mode_post_tool_use(
+            "sid",
+            "# X\n\nbody",
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("t.jsonl").to_string_lossy(),
+            None,
+        );
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn approval_unsafe_session_id_allows() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let input = exit_plan_mode_post_tool_use(
+            "../escape",
+            "# X\n\nbody",
+            &cwd,
+            &tmp.path().join("t.jsonl").to_string_lossy(),
+            None,
+        );
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(!tmp.path().join("docs").exists(), "nothing written");
+    }
+
+    #[test]
+    fn approval_empty_plan_text_allows() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let input = exit_plan_mode_post_tool_use(
+            "sid",
+            "   \n\n  ",
+            &cwd,
+            &tmp.path().join("t.jsonl").to_string_lossy(),
+            None,
+        );
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn end_to_end_same_session_approval_persists_with_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript_path = tmp.path().join("own-session-id.jsonl");
+        fs::write(&transcript_path, "{}").unwrap();
+
+        let input = exit_plan_mode_post_tool_use(
+            "own-session-id",
+            "# Fix the Widget\n\nDo the thing.",
+            &cwd,
+            &transcript_path.to_string_lossy(),
+            Some(false),
+        );
+
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(msg.contains(&format!(
+            "approved in {}",
+            identity::generate_name("own-session-id")
+        )));
+
+        let written =
+            fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
+        assert!(written.starts_with("---\nstatus: in-flight\n"));
+        assert!(written.contains("# Fix the Widget"));
+        assert!(written.contains("session_id: own-session-id"));
+        assert!(written.contains(&format!(
+            "approved_in: {}",
+            identity::generate_name("own-session-id")
+        )));
+        assert!(written.contains("approved_session_id: own-session-id"));
+        assert!(written.contains(&crate::provenance::machine_digest("test-host")));
+
+        let links = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
+        assert!(links.contains("\"parent_session_id\":\"own-session-id\""));
+        assert!(links.contains("\"child_session_id\":\"own-session-id\""));
+    }
+
+    #[test]
+    fn approval_double_fire_is_idempotent_skip_no_dash_two_file() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript_path = tmp.path().join("own-session-id.jsonl");
+        fs::write(&transcript_path, "{}").unwrap();
+
+        let input = exit_plan_mode_post_tool_use(
+            "own-session-id",
+            "# Fix the Widget\n\nDo the thing.",
+            &cwd,
+            &transcript_path.to_string_lossy(),
+            Some(false),
+        );
+
+        with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host");
+        });
+        let first_write =
+            fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
+
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-07-20T01:00:00Z", "2026-07-20", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge, "re-fire still nudges");
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-07-20-fix-the-widget-2.md")
+                .exists(),
+            "double-fire of the same approval must not ladder to a duplicate file"
+        );
+        let second_write =
+            fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
+        assert_eq!(
+            first_write, second_write,
+            "the file must never be rewritten"
+        );
     }
 }

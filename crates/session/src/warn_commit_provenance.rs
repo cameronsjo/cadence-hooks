@@ -323,7 +323,11 @@ fn resolve_session_name_and_id(input: &HookInput) -> Option<(String, String)> {
 /// pattern as `guardrails::guard_read_model::GuardReadModel::run`. Takes the
 /// already-read transcript content rather than re-reading the file, so a
 /// single run resolves both `Model:` and `Harness:` off one read.
-fn resolve_model(transcript_content: Option<&str>) -> Option<String> {
+///
+/// `pub(crate)`: `persist_plan`'s frontmatter emitter reuses this rather than
+/// re-deriving model resolution a second way (cadence-hooks#396's "reuse the
+/// existing provenance machinery" design point).
+pub(crate) fn resolve_model(transcript_content: Option<&str>) -> Option<String> {
     transcript::last_assistant_model(transcript_content?)
 }
 
@@ -332,7 +336,9 @@ fn resolve_model(transcript_content: Option<&str>) -> Option<String> {
 /// (`claude-code_2-1-215_agent` → `2.1.215`) when the transcript doesn't
 /// resolve it. `None` when neither source yields a version — the `Harness:`
 /// line is then omitted entirely rather than rendered from a guess.
-fn resolve_harness(transcript_content: Option<&str>) -> Option<String> {
+///
+/// `pub(crate)`: shared with `persist_plan` — see [`resolve_model`].
+pub(crate) fn resolve_harness(transcript_content: Option<&str>) -> Option<String> {
     if let Some(content) = transcript_content
         && let Some(version) = transcript::last_assistant_harness_version(content)
     {

@@ -353,6 +353,8 @@ enum SessionCommands {
     BackstopWarn,
     /// Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)
     PersistPlan,
+    /// Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)
+    PersistPlanApproval,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -458,6 +460,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::BackstopRecord => "backstop-record",
             SessionCommands::BackstopWarn => "backstop-warn",
             SessionCommands::PersistPlan => "persist-plan",
+            SessionCommands::PersistPlanApproval => "persist-plan-approval",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -1157,6 +1160,11 @@ fn main() {
             SessionCommands::PersistPlan => dispatch::run_logged_check(
                 &cadence_hooks_session::persist_plan::PersistPlan,
                 user_prompt_submit,
+                canonical_hook,
+            ),
+            SessionCommands::PersistPlanApproval => dispatch::run_logged_check(
+                &cadence_hooks_session::persist_plan::PersistPlanApproval,
+                post,
                 canonical_hook,
             ),
             SessionCommands::Declare {

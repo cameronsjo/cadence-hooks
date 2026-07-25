@@ -411,6 +411,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: Some(HookEvent::UserPromptSubmit),
     },
+    HookEntry {
+        name: "persist-plan-approval",
+        description: "Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)",
+        plugin: "session",
+        event: Some(HookEvent::PostToolUse),
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
@@ -525,6 +531,16 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // real checkout exercises the actual extraction and write.
         ("session", "persist-plan") => Some(
             r#"{"session_id":"test","prompt":"Implement the following plan:\n\n# Try Sample\n\nbody text","cwd":"/tmp","transcript_path":"/tmp/test.jsonl"}"#,
+        ),
+        // persist-plan-approval gates on tool_name == "ExitPlanMode" and a
+        // non-empty tool_response.plan; the generic PostToolUse sample carries
+        // neither, so `try` would fail open before the write path.
+        ("session", "persist-plan-approval") => Some(
+            // Extra `#` in the raw-string delimiter: the payload's own plan
+            // text embeds a literal `"#` (a quote immediately followed by an
+            // ATX heading marker), which would otherwise close a `r#"..."#`
+            // raw string early.
+            r##"{"session_id":"test","tool_name":"ExitPlanMode","cwd":"/tmp","transcript_path":"/tmp/test.jsonl","tool_response":{"plan":"# Try Sample\n\nbody text","isAgent":false}}"##,
         ),
         // warn-subagent-worktree only engages on an Agent/Task spawn; the generic
         // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a
