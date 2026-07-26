@@ -335,6 +335,45 @@ fn try_metrics_logger_never_writes_into_the_configured_metrics_dir() {
     );
 }
 
+#[test]
+fn try_persist_plan_never_writes_a_real_plan_doc() {
+    // Regression (cameronsjo/cadence-hooks#396 review): `try`'s normal cwd
+    // injection (the real current_dir(), so most checks exercise real repo
+    // detection) let a bare `cadence-hooks try session persist-plan` (or
+    // `persist-plan-approval`) actually create a plan doc in whatever repo
+    // the user was standing in — verified end to end during review, a real
+    // file landed and had to be manually removed. Stand explicitly inside a
+    // REAL git repo (the worst case: the check's `repo_root` resolution
+    // would otherwise succeed) and confirm neither subcommand writes
+    // anything, regardless of the process's actual OS-level cwd.
+    let repo = tempfile::tempdir().unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(repo.path())
+        .status()
+        .expect("git init");
+    assert!(init.success());
+
+    for subcommand in ["persist-plan", "persist-plan-approval"] {
+        let mut cmd = cadence_hooks();
+        cmd.args(["try", "session", subcommand]);
+        cmd.current_dir(repo.path());
+
+        let output = cmd.output().expect("failed to execute binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{subcommand} stdout: {stdout}"
+        );
+    }
+
+    assert!(
+        !repo.path().join("docs").exists(),
+        "try must never write a real plan doc, even standing inside a real git repo"
+    );
+}
+
 // ── interactive guard: piped stdin must never trip it ────────────────
 
 #[test]
