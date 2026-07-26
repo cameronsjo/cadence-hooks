@@ -14,8 +14,12 @@
 //! one-shot diagnostic.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::registry;
+// The session crate's `registry` (peer-session liveness) — aliased because the
+// bare name is already taken by the binary's hook-catalog `registry` above.
+use cadence_hooks_session::registry as session_registry;
 
 /// Severity of a finding: errors block (shell bugs), warnings advise (version skew).
 #[derive(Debug, PartialEq)]
@@ -208,6 +212,26 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
     }
 }
 
+/// Build the one-line quiet SessionStart warning summary. Names an actor
+/// (Claude) and an action (run doctor, triage, surface to the user) instead of
+/// the old passive "run for details". The version-skew upgrade hint is appended
+/// only when a skew warning is present — stale-telemetry-only warnings carry no
+/// upgrade to suggest.
+fn quiet_warning_summary(
+    version: &str,
+    n_warn: usize,
+    has_skew: bool,
+    channel: InstallChannel,
+) -> String {
+    let mut summary = format!(
+        "cadence-hooks {version}: {n_warn} plugin warning(s). Claude: run 'cadence-hooks doctor', triage, and surface anything actionable to the user in one line."
+    );
+    if has_skew {
+        summary.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
+    }
+    summary
+}
+
 /// Judge an invocation against the registry.
 /// Returns `None` when the pair is known-good.
 /// Returns `Some(SkewDiagnosis)` for a namespace mismatch or unknown subcommand.
@@ -288,6 +312,18 @@ fn scan_hooks_json(
                 let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) else {
                     continue;
                 };
+
+                // Check 0: a third-party CLI this hook shells to that PATH
+                // cannot resolve (#319). Emitted per plugin rather than
+                // deduped globally — knowing WHICH hook went inert is the
+                // actionable half; a bare "jq is missing" leaves the operator
+                // to find the silent no-op themselves.
+                findings.extend(missing_cli_findings(
+                    cmd,
+                    plugin,
+                    path,
+                    find_line_number(raw, cmd),
+                ));
 
                 // Check 1: shell-expansion bug (Error).
                 if let Some(span) = detect_single_quoted_envvar(cmd) {
@@ -370,6 +406,124 @@ fn manifest_install_paths(manifest: &Path) -> Option<Vec<(String, PathBuf)>> {
     Some(out)
 }
 
+/// Every `enabledPlugins` entry across `settings.json` and
+/// `settings.local.json`, keyed by plugin ID (`<plugin>@<marketplace>` — the
+/// same key shape `installed_plugins.json` uses, so the two join directly).
+/// A local entry wins, matching Claude Code's own settings precedence.
+///
+/// Returns `None` when no file yields a **non-empty** `enabledPlugins` object.
+/// That distinction is load-bearing: an empty map reads as "nothing is enabled"
+/// and would warn about every installed hook-shipping plugin at once, so a
+/// missing, unparseable, *or empty* settings file must mean *cannot judge*, not
+/// *all broken*. An operator with plugins installed and a literally empty
+/// `enabledPlugins` is indistinguishable from one whose config has not been
+/// written yet, and the second reading is the safe one.
+///
+/// Membership is keyed on **presence, not value**. The boolean is recorded for
+/// callers that want it, but a non-bool value (`{"p@m": "true"}`) still counts
+/// as an entry: the question this answers is *did the operator make a decision
+/// about this plugin*, and a malformed value is still a decision. Dropping it
+/// would make the key read as **absent** and produce exactly the false warning
+/// the absent-vs-`false` rule exists to avoid.
+///
+/// Read through `read_untrusted_config` — a settings file is not this binary's
+/// own output, and that reader caps the read and refuses a non-regular file.
+fn enabled_plugin_map(config_dir: &Path) -> Option<std::collections::HashMap<String, bool>> {
+    let mut map: Option<std::collections::HashMap<String, bool>> = None;
+    // Base first, then local — a later insert overwrites, so local wins.
+    for name in ["settings.json", "settings.local.json"] {
+        let Some(content) =
+            cadence_hooks_core::paths::read_untrusted_config(&config_dir.join(name))
+        else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let Some(entries) = json.get("enabledPlugins").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        if entries.is_empty() {
+            continue;
+        }
+        let target = map.get_or_insert_with(std::collections::HashMap::new);
+        for (key, value) in entries {
+            target.insert(key.clone(), value.as_bool().unwrap_or(false));
+        }
+    }
+    map
+}
+
+/// Hook-shipping plugins that are installed but carry **no** `enabledPlugins`
+/// entry — so their hooks cannot fire and nothing else reports it (#397).
+///
+/// This is the self-referential blind spot in one sentence: `warn-stale` is
+/// wired *inside* the metrics plugin, so disabling that plugin takes the canary
+/// down with the subsystem it watches. The observed cost was a metrics
+/// subsystem dark for one to two months on a live machine with no alarm. Doctor
+/// is the binary, not a plugin, so it stays up when any plugin is down — which
+/// is the only reason this check can see what `warn-stale` structurally cannot.
+///
+/// **Absent, not `false`.** An explicit `false` is a deliberate choice and stays
+/// silent; a missing key is the actual #397 fingerprint (the metrics plugin had
+/// no entry at all, unlike the deliberately-disabled plugins beside it).
+/// Warning on a deliberate disable would be nagging the operator about their own
+/// decision, which is how a real finding gets tuned out.
+///
+/// Only plugins that actually ship `hooks/hooks.json` are considered — a
+/// skills-only plugin being off costs no telemetry and blocks no guard.
+fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) -> Vec<Finding> {
+    let Some(enabled) = enabled_plugin_map(config_dir) else {
+        return Vec::new();
+    };
+    // One finding per plugin, not per install. `manifest_install_paths` emits a
+    // row per entry in a plugin's `installs` array, so a plugin with two
+    // installed versions would otherwise be reported twice for one decision the
+    // operator makes once.
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    installs
+        .iter()
+        .filter(|(label, _)| !enabled.contains_key(label.as_str()))
+        .filter_map(|(label, dir)| {
+            let hooks = dir.join("hooks/hooks.json");
+            hooks.is_file().then_some((label, hooks))
+        })
+        // Dedup AFTER the hooks test, never before: an install without a
+        // hooks.json must not claim the label and mask a sibling install that
+        // has one.
+        .filter(|(label, _)| seen.insert(label.as_str()))
+        .map(|(label, hooks)| Finding {
+            severity: Severity::Warning,
+            // The label is an `installed_plugins.json` key — third-party
+            // influenced, and every `Finding` field prints verbatim. Sanitizing
+            // at construction is the narrow fix; the broader one (sanitize once
+            // at the `Finding` display boundary, covering the pre-existing raw
+            // hooks.json snippets too) is filed rather than smuggled in here.
+            plugin: cadence_hooks_metrics::common::display_safe(label),
+            file: hooks,
+            line: None,
+            snippet: format!(
+                "{}: no enabledPlugins entry",
+                cadence_hooks_metrics::common::display_safe(label)
+            ),
+            diagnosis: format!(
+                "{} is installed and ships hooks, but has no entry in \
+                 enabledPlugins — none of its hooks can fire. Any logger or \
+                 guard it wires is silently inert, including a staleness \
+                 canary wired inside the plugin it watches (#397)",
+                cadence_hooks_metrics::common::display_safe(label)
+            ),
+            remediation: format!(
+                "enable it (`/plugin` → enable {}) if its hooks should be \
+                 running, or set it to false in {} to record the choice — an \
+                 explicit false is silent here, a missing key is not",
+                cadence_hooks_metrics::common::display_safe(label),
+                config_dir.join("settings.json").display()
+            ),
+        })
+        .collect()
+}
+
 /// Scan a single plugin install dir's `hooks/hooks.json`, if present.
 fn scan_plugin_dir(label: &str, plugin_dir: &Path, channel: InstallChannel) -> Vec<Finding> {
     let hooks_path = plugin_dir.join("hooks/hooks.json");
@@ -433,6 +587,1388 @@ fn scan_root(root: &Path, channel: InstallChannel) -> Vec<Finding> {
     findings
 }
 
+/// Telemetry staleness or per-stream flatline as a doctor [`Finding`], or
+/// `None` when the watched telemetry is healthy, missing, or empty (fail-open —
+/// a fresh install stays silent).
+///
+/// This is the diagnostic twin of the `metrics warn-stale` SessionStart check:
+/// same `telemetry_verdict` core, but doctor consults no once-per-day marker —
+/// a diagnostic always reports the current state. Always a `Warning` (exit 1),
+/// never an `Error` — telemetry going quiet is advisory, not a shell bug.
+fn telemetry_finding(
+    dir: &Path,
+    extra: &[PathBuf],
+    threshold: Duration,
+    now: SystemTime,
+) -> Option<Finding> {
+    use cadence_hooks_metrics::warn_stale::Verdict;
+    let verdict = cadence_hooks_metrics::warn_stale::telemetry_verdict(dir, extra, threshold, now)?;
+    // The snippet is the finding's identity line, so it names what actually
+    // went quiet: the newest file for a whole-subsystem stall, the dead streams
+    // for a flatline.
+    let snippet = match &verdict {
+        Verdict::Stale(report) => report.newest_file.clone(),
+        Verdict::Flatline(report) => report
+            .streams
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: "cadence-metrics".to_string(),
+        file: dir.to_path_buf(),
+        line: None,
+        snippet,
+        diagnosis: cadence_hooks_metrics::warn_stale::verdict_summary(&verdict),
+        remediation: "compare wiring against a healthy machine — the metrics \
+                      plugin may be disabled or its hooks mis-wired \
+                      (`cadence-hooks list` shows what should be firing)"
+            .to_string(),
+    })
+}
+
+/// Wrap `s` in single quotes for safe inclusion in a rendered shell command,
+/// escaping any embedded single quote via the POSIX `'\''` idiom (close, emit
+/// an escaped quote, reopen).
+///
+/// **Single quotes, not double.** Inside double quotes a shell still expands
+/// `$`, backticks and `\`, and a `"` ends the string outright — so a
+/// double-quoted path is safe against *spaces* and nothing else. Every
+/// interpolated value here is env-derived (`CADENCE_METRICS_DIR`,
+/// `CLAUDE_CONFIG_DIR`) and Claude Code injects env vars from a project's
+/// checked-in `.claude/settings.json`, so a cloned repository can choose it.
+/// The operator then runs `doctor` and pastes what it prints — which is exactly
+/// the affordance these remediations added. Inside single quotes nothing is
+/// special but `'` itself, which this escapes; a literal newline stays inside
+/// the quotes as data rather than becoming a command separator.
+///
+/// Use this for **every** value interpolated into a command a human is invited
+/// to run. Plain diagnostic prose that merely names a path does not need it —
+/// nobody executes a sentence.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// A copy-pasteable command that lists the recent `failopen.jsonl` rows for one
+/// `reason`. Replaces the bare "inspect failopen.jsonl" guidance, which named a
+/// file but not a way to read it (cameronsjo/cadence-hooks#398).
+///
+/// `reason` is always a hardcoded literal from this module; the path is not, so
+/// it goes through [`shell_single_quote`]. `grep` matches the serialized
+/// key/value pair verbatim, since `serde_json` writes compact JSON with no
+/// inner spaces.
+fn failopen_inspect_cmd(dir: &Path, reason: &str) -> String {
+    let path = shell_single_quote(&format!("{}/failopen.jsonl", dir.display()));
+    format!(r#"grep '"reason":"{reason}"' {path} | tail -5"#)
+}
+
+/// Fail-open telemetry as doctor `Finding`s — up to 5 (one per `reason`), or
+/// none when all counts are below their thresholds. `panic` and `parse` are
+/// warned on any/moderate occurrence; the #271 deadline pair is load-correlated
+/// (`deadline` warns at 3+) except the suppressed-block row, which warns at 1
+/// because each one is an enforcement block that did not fire;
+/// `version_mismatch` only counts rows
+/// tagged with the CURRENT binary's own version (see
+/// `log_failopen::counts_from`'s doc) — an older-version row is the
+/// sanctioned release-transition case and is excluded by construction.
+///
+/// Counts and the `parse`/`panic` recency come from a single
+/// `recent_failopen_report` read. Both of those findings name the last recorded
+/// `error` — the field that makes the "inspect failopen.jsonl" guidance
+/// answerable (cameronsjo/cadence-hooks#398); rows written before that field
+/// existed simply omit the clause. The `parse` finding additionally carries
+/// recency + version context: when it last fired, on which binary version,
+/// and how many of the windowed rows are on the CURRENT version. Its *count*
+/// stays window-wide — unlike `version_mismatch`, a bad-stdin wiring problem is
+/// not version-specific, so filtering the count would under-report a live one —
+/// but zero on the current version disambiguates a burst whose fix already
+/// shipped (aging out of the 7-day window) from an ongoing feed problem, which
+/// the bare count could not.
+/// Words that occupy command position while the thing that actually has to
+/// exist is their ARGUMENT. [`referenced_clis`] walks past these.
+///
+/// `time` is here and also deliberately absent from [`NOT_A_PATH_LOOKUP`]:
+/// stock macOS ships no `/usr/bin/time`, so treating it as a CLI would emit a
+/// bogus "missing CLI: time" on every such machine.
+const TRANSPARENT_PREFIXES: &[&str] = &[
+    "sudo", "env", "time", "nice", "nohup", "command", "builtin", "exec", "stdbuf",
+];
+
+/// Shell builtins and control words that occupy command position but are never
+/// a PATH lookup. Anything here is skipped by [`referenced_clis`].
+const NOT_A_PATH_LOOKUP: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "function", "return", "exit", "cd", "echo", "test", "true", "false", "set", "unset", "export",
+    "local", "read", "shift", "eval", "exec", "source", ".", "[", "[[", ":",
+];
+
+/// External CLI names referenced in command position across `commands`.
+///
+/// Command position only — a bare word that is the first token of a segment. A
+/// word appearing as an ARGUMENT (`--formatter markdownlint`) is not something
+/// the hook shells to, and flagging it would produce noise the operator learns
+/// to ignore, which is exactly how a real missing dependency gets skipped.
+///
+/// Skipped by construction: shell builtins ([`NOT_A_PATH_LOOKUP`]), anything
+/// containing `/` (a path, resolved without PATH), anything containing `$` (an
+/// unexpanded variable this cannot resolve), and assignment words.
+fn referenced_clis(command: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for segment in cadence_hooks_core::shell::command_segments(command) {
+        // Grouping punctuation first: a subshell like `(mytool --version)` is
+        // one segment, and its first token is the garbage string `(mytool` —
+        // which is never on PATH, so it would report a permanently-missing CLI
+        // that does not exist while never checking the real command word.
+        let segment = segment
+            .trim_start_matches(['(', '{', ' ', '\t'])
+            .trim_end_matches([')', '}', ';', ' ', '\t']);
+        let tokens = cadence_hooks_core::shell::tokenize(segment);
+
+        // Then transparent prefixes. `sudo mytool` / `env FOO=x mytool` /
+        // `nice -n 10 mytool` otherwise name the PREFIX as the referenced CLI
+        // and never see `mytool` — a false negative in exactly the case this
+        // check exists for. `sudo` is included here though the guard-side
+        // equivalent excludes it: this asks "will this hook run", and under
+        // `sudo` the thing that must exist is the argument.
+        let mut idx = 0;
+        while let Some(word) = tokens.get(idx) {
+            if TRANSPARENT_PREFIXES.contains(&word.as_str()) {
+                idx += 1;
+                // Skip the prefix's own flags and any assignment words it
+                // carries, so `env FOO=x mytool` and `nice -n 10 mytool` both
+                // land on `mytool`.
+                while tokens
+                    .get(idx)
+                    .is_some_and(|t| t.starts_with('-') || t.contains('='))
+                {
+                    idx += 1;
+                    // A flag taking a separate value (`nice -n 10`) consumes
+                    // the value too; a numeric follower is that value.
+                    if tokens.get(idx).is_some_and(|t| t.parse::<i64>().is_ok()) {
+                        idx += 1;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        let Some(word) = tokens.get(idx) else {
+            continue;
+        };
+        if word.contains('/')
+            || word.contains('$')
+            || word.contains('=')
+            || word.is_empty()
+            || NOT_A_PATH_LOOKUP.contains(&word.as_str())
+        {
+            continue;
+        }
+        out.insert(word.clone());
+    }
+    out
+}
+
+/// True when `name` resolves on the current `PATH`.
+///
+/// A plain PATH walk rather than shelling to `which`/`command -v`: this check
+/// exists precisely because a CLI may be absent, and asking a subprocess to
+/// answer that question adds a second dependency to the dependency check.
+fn on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| is_executable_at(&dir.join(name)))
+}
+
+/// True when `candidate` is something the shell could actually exec.
+///
+/// On unix that means the executable bit, not merely `is_file()`: a stray
+/// `chmod 644` placeholder earlier on PATH would otherwise read as present
+/// while the shell fails to run it — the check would report health where there
+/// is none.
+#[cfg(unix)]
+fn is_executable_at(candidate: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(candidate)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// True when `candidate`, or `candidate` plus any `PATHEXT` suffix, is a file.
+///
+/// Windows resolves an extensionless name through `PATHEXT`, and the default
+/// list is not just `.exe`. Node's global installs ship `.cmd` shims —
+/// `prettier.cmd`, `eslint.cmd`, `markdownlint-cli2.cmd` — so hardcoding `.exe`
+/// would report a large share of the CLIs hooks actually shell to as missing.
+/// No executable-bit concept applies here; presence is the whole test.
+#[cfg(windows)]
+fn is_executable_at(candidate: &Path) -> bool {
+    if candidate.is_file() {
+        return true;
+    }
+    let pathext = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC".to_string());
+    pathext.split(';').filter(|e| !e.is_empty()).any(|ext| {
+        let mut with_ext = candidate.as_os_str().to_os_string();
+        with_ext.push(ext);
+        Path::new(&with_ext).is_file()
+    })
+}
+
+/// Warn once per CLI that an installed hook shells to but PATH cannot resolve.
+///
+/// The dependency-level sibling of the wrapper-level fail-open in #69. A hook
+/// that shells to a third-party CLI and fails open when it is absent becomes a
+/// **silent no-op**: no error, no nudge, just a pass — so a guardrail the
+/// operator believes is enforcing is quietly inert (#319).
+///
+/// Setup-time, not per-invocation: the failure mode is a machine that never had
+/// the CLI, so paying a PATH walk on every tool call would be pure overhead.
+/// `doctor` catches it once.
+///
+/// Warning, not Error, and deliberately not fatal: this reads a *heuristic*
+/// command-word extraction over arbitrary bash, so a false positive is possible
+/// and must not be able to fail the run.
+fn missing_cli_findings(
+    command: &str,
+    plugin: &str,
+    path: &Path,
+    line: Option<usize>,
+) -> Vec<Finding> {
+    referenced_clis(command)
+        .into_iter()
+        .filter(|name| !on_path(name))
+        .map(|name| Finding {
+            severity: Severity::Warning,
+            plugin: plugin.to_string(),
+            file: path.to_path_buf(),
+            line,
+            snippet: format!("missing CLI: {name}"),
+            diagnosis: format!(
+                "an installed hook shells to `{name}`, which PATH cannot \
+                 resolve — that hook fails open silently, so a guardrail you \
+                 believe is enforcing is inert (no error, no nudge, just a pass)"
+            ),
+            remediation: format!(
+                "install `{name}` or put it on PATH; if the hook is no longer \
+                 wanted, remove its entry rather than leaving it inert"
+            ),
+        })
+        .collect()
+}
+
+/// Path fragments that mark a cloud-sync provider's local mirror.
+///
+/// Matched case-insensitively against a path's own components, never as a bare
+/// substring — `~/src/dropbox-client` is a project, not a synced tree, and a
+/// substring test would flag it. Each entry is a directory NAME a provider
+/// creates: macOS iCloud Drive lives under `Library/Mobile Documents`, and
+/// modern macOS third-party providers mount under `Library/CloudStorage`.
+const CLOUD_SYNC_MARKERS: &[&str] = &[
+    "OneDrive",
+    "Dropbox",
+    "CloudStorage",
+    "Mobile Documents",
+    "Google Drive",
+    "GoogleDrive",
+    "pCloud Drive",
+    "Sync.com",
+];
+
+/// The provider marker in `path`, if any component names one.
+///
+/// Component-wise and case-insensitive: a provider directory is a real path
+/// segment, so testing components avoids the `dropbox-client` false positive a
+/// substring search produces, while still catching a nested repo far below the
+/// sync root.
+///
+/// A component matches on exact equality **or** on a `"<marker> - "` prefix.
+/// The second form is not a nicety: a Microsoft 365 business or school tenant
+/// syncs to a folder named `OneDrive - <Organization>`, which is the dominant
+/// real-world shape of the very deployment this check exists to catch, and
+/// exact equality alone silently never fires for it. The separator is spelled
+/// with surrounding spaces deliberately — a bare `-` boundary would re-admit
+/// `dropbox-client`, the exact false positive component matching was chosen to
+/// avoid.
+fn cloud_sync_marker(path: &Path) -> Option<&'static str> {
+    path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .find_map(|segment| {
+            CLOUD_SYNC_MARKERS
+                .iter()
+                .find(|m| {
+                    segment.eq_ignore_ascii_case(m)
+                        || segment.len() > m.len() + 3
+                            && segment[..m.len()].eq_ignore_ascii_case(m)
+                            && segment[m.len()..].starts_with(" - ")
+                })
+                .copied()
+        })
+}
+
+/// Warn when a directory the guard suite reads on every hook sits inside a
+/// cloud-synced tree.
+///
+/// This names a *cause* the existing `deadline` finding could only tell the
+/// operator to go looking for. A synced working directory turns every `.git`
+/// stat and read into a network round-trip, which is what drove the #271
+/// latency to the point that git-backed checks degraded to fail-open — and it
+/// is diagnosable up front from the path alone, months before the latency
+/// becomes a P0 (#278).
+///
+/// Warning, not Error: a synced checkout is slow, not broken, and plenty of
+/// people deliberately keep a config dir in one. The point is to name it.
+fn cloud_sync_findings(candidates: &[(&str, PathBuf)]) -> Vec<Finding> {
+    candidates
+        .iter()
+        .filter_map(|(label, path)| {
+            let provider = cloud_sync_marker(path)?;
+            Some(Finding {
+                severity: Severity::Warning,
+                plugin: "cadence-hooks".to_string(),
+                file: path.clone(),
+                line: None,
+                snippet: format!("{label}: {}", path.display()),
+                diagnosis: format!(
+                    "the {label} sits inside a {provider} synced tree — every \
+                     .git stat and read a guard performs becomes a network \
+                     round-trip, which is the precondition that drove git-backed \
+                     checks to degrade to fail-open under a deadline (#271)"
+                ),
+                remediation: format!(
+                    "move the {label} outside {provider}, or exclude it from \
+                     sync; if it must stay, raise CADENCE_HOOK_DEADLINE_MS and \
+                     watch the deadline count in this report"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The distribution half of a failopen diagnosis: how many distinct days of the
+/// window the reason actually fired on.
+///
+/// A rolling count alone cannot tell a burst from a drip — 120 rows on one past
+/// day and 120 spread across seven read identically, and only the second is the
+/// "wiring problem" the remediation text used to assert unconditionally (#404).
+/// Rendered only when the window is longer than a day, since `1 of 1 day` says
+/// nothing.
+fn shape_clause(distinct_days: u64, window_days: u64) -> String {
+    match (distinct_days, window_days) {
+        (_, w) if w <= 1 => String::new(),
+        // Unreachable in practice: `windowed_rows` drops any row without a
+        // parseable `ts`, so a `Some(FailopenRecency)` always carries at least
+        // one dated row. Kept so the match is total without an `unwrap`-shaped
+        // assumption about a helper in another crate.
+        (0, _) => String::new(),
+        (1, _) => "; all on ONE day".to_string(),
+        (d, w) => format!("; spread over {d} of {w} days"),
+    }
+}
+
+/// Remediation keyed to the shape [`shape_clause`] reports, rather than one
+/// sentence asserting a sustained problem regardless of distribution.
+///
+/// The two shapes want genuinely different next actions: a single-day spike is
+/// an episode to correlate against a release or a config change, while a drip
+/// across most of the window is a live feed to chase. A count in between says
+/// neither confidently, so it says nothing rather than guessing.
+///
+/// The `>= 5` floor is chosen for the **7-day** window this is called with —
+/// "most days of the week". Should the window ever become configurable, derive
+/// it from the window length rather than leaving this literal, or the split
+/// silently misfires at the new scale.
+fn shape_remediation(distinct_days: u64) -> String {
+    match distinct_days {
+        1 => " Every row landed on a single day — that is an episode, not a \
+               steady feed: correlate the date with a release or a config change \
+               rather than chasing live wiring."
+            .to_string(),
+        d if d >= 5 => format!(
+            " Rows on {d} separate days is a sustained feed problem, not a \
+             one-off burst — chase the wiring."
+        ),
+        _ => String::new(),
+    }
+}
+
+fn failopen_findings(
+    dir: &Path,
+    window: Duration,
+    now: SystemTime,
+    current_version: &str,
+) -> Vec<Finding> {
+    // One read of failopen.jsonl yields the per-reason counts plus the recency
+    // context for every reason whose finding shows one.
+    let (counts, recency) = cadence_hooks_metrics::log_failopen::recent_failopen_report(
+        dir,
+        window,
+        now,
+        current_version,
+        &["parse", "panic", "version_mismatch"],
+    );
+    let days = window.as_secs() / 86_400;
+    let mut findings = Vec::new();
+
+    if counts.panic >= 1 {
+        let last_error = recency
+            .get("panic")
+            .and_then(|r| r.last_error.as_deref())
+            .map(|e| format!("; last error: {e}"))
+            .unwrap_or_default();
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("panic: {}", counts.panic),
+            diagnosis: format!(
+                "{} panic(s) in the last {days} days (failopen.jsonl{last_error})",
+                counts.panic
+            ),
+            remediation: format!(
+                "a panic in a check/logger is always a bug — list the rows with \
+                 `{}` and file an issue at \
+                 https://github.com/cameronsjo/cadence-hooks/issues",
+                failopen_inspect_cmd(dir, "panic")
+            ),
+        });
+    }
+
+    if counts.parse >= 3 {
+        // Recency + version context so a burst whose fix already shipped reads
+        // differently from a live wiring problem — see this fn's doc comment.
+        let recency_clause = recency
+            .get("parse")
+            .map(|r| {
+                let current_clause = if r.on_current_version == 0 {
+                    format!("none on current {current_version}")
+                } else {
+                    format!("{} on current {current_version}", r.on_current_version)
+                };
+                let error_clause = r
+                    .last_error
+                    .as_deref()
+                    .map(|e| format!("; last error: {e}"))
+                    .unwrap_or_default();
+                format!(
+                    "; last: {} on {} — {current_clause}{error_clause}{}",
+                    r.last_ts,
+                    r.last_version,
+                    shape_clause(r.distinct_days, days)
+                )
+            })
+            .unwrap_or_default();
+        let shape_remediation = recency
+            .get("parse")
+            .map(|r| shape_remediation(r.distinct_days))
+            .unwrap_or_default();
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("parse: {}", counts.parse),
+            diagnosis: format!(
+                "{} stdin-parse failure(s) in the last {days} days (failopen.jsonl{recency_clause})",
+                counts.parse
+            ),
+            remediation: format!(
+                "occasional malformed payloads are tolerated.{shape_remediation} \
+                 No failures on the current binary version usually means the \
+                 feed was already fixed — check the CHANGELOG before chasing \
+                 wiring. List the rows with `{}`",
+                failopen_inspect_cmd(dir, "parse")
+            ),
+        });
+    }
+
+    if counts.version_mismatch >= 1 {
+        // Name the invocations, not just the count (#183). The count alone
+        // leaves the operator auditing every installed plugin by hand; the
+        // pairs turn it into one grep. Absent for rows written before the
+        // namespace/subcommand fields existed, so the clause simply drops.
+        let missing = recency
+            .get("version_mismatch")
+            .map(|r| r.subcommands.as_slice())
+            .unwrap_or_default();
+        let missing_clause = if missing.is_empty() {
+            String::new()
+        } else {
+            format!(" — this binary does not recognize: {}", missing.join(", "))
+        };
+        let remediation = if missing.is_empty() {
+            "compare installed plugin hooks.json subcommand references \
+             against 'cadence-hooks list' — this binary doesn't \
+             recognize something a plugin expects"
+                .to_string()
+        } else {
+            // EVERY pair, not just the first. The diagnosis names up to four,
+            // and an operator following a one-pair grep fixes one inert
+            // hooks.json and leaves the rest inert — the multi-pair case is
+            // precisely the skew #183 exists to resolve.
+            //
+            // `-F` with repeated `-e`: fixed strings, so a subcommand carrying
+            // a regex metacharacter cannot widen the search to everything, and
+            // no alternation needs escaping. The full `namespace subcommand`
+            // pair is the needle because that is how a hooks.json line spells
+            // the invocation.
+            let needles = missing
+                .iter()
+                .map(|pair| format!("-e {}", shell_single_quote(pair)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // The RESOLVED cache dir, never a `~/.claude/...` literal.
+            // `plugins_dir` honors CLAUDE_CONFIG_DIR precisely because the
+            // config dir moves (the `claude-as` profile pattern), and a
+            // remediation that greps the wrong tree returns zero hits and reads
+            // as "no stale wiring" — a silent false negative inside the one
+            // command #183 exists to hand the operator.
+            //
+            // The two branches quote DIFFERENTLY, on purpose. A resolved path
+            // is data, so it is single-quoted. The fallback is a literal
+            // authored here whose whole job is to expand — single-quoting it
+            // would emit `'~/.claude/plugins/cache'`, and the shell does not
+            // expand `~` inside single quotes, so the paste would search a
+            // nonexistent relative directory and return zero hits: the same
+            // silent "reads as no stale wiring" false negative this branch
+            // exists to prevent, just wearing the other face. Double quotes
+            // let `$HOME` expand while still surviving a spaced home dir.
+            // The fallback is a BARE tilde, not `'~/…'` and not `"$HOME/…"`.
+            // Single quotes suppress tilde expansion, so the paste would search
+            // a nonexistent relative dir and read as "no stale wiring" — the
+            // same false negative this branch exists to prevent. `$HOME` is no
+            // better: this branch is reached only when `user_home()` fails,
+            // which is precisely when `$HOME` is likely unset in the operator's
+            // shell too, expanding to `/.claude/…`. A bare `~` falls back to the
+            // passwd entry when `$HOME` is missing, so it is the one form that
+            // still resolves here. Safe unquoted: a hardcoded literal with no
+            // spaces and no metacharacters.
+            let cache = match plugins_dir() {
+                Some(dir) => shell_single_quote(&dir.join("cache").display().to_string()),
+                None => "~/.claude/plugins/cache".to_string(),
+            };
+            format!(
+                "grep the installed plugins for the named invocation(s) — \
+                 `grep -rlF {needles} {cache}` finds every hooks.json carrying \
+                 a named invocation; either upgrade this binary or drop the \
+                 stale wiring. `cadence-hooks list` shows what this build \
+                 accepts"
+            )
+        };
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("version_mismatch: {}", counts.version_mismatch),
+            diagnosis: format!(
+                "{} version_mismatch failopen(s) on this binary's own version \
+                 ({current_version}) in the last {days} days — a hooks.json/binary \
+                 skew that hasn't resolved{missing_clause}",
+                counts.version_mismatch
+            ),
+            remediation,
+        });
+    }
+
+    if counts.deadline >= 3 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!("deadline: {}", counts.deadline),
+            diagnosis: format!(
+                "{} git-probe deadline hit(s) in the last {days} days (failopen.jsonl) \
+                 — git-backed checks are degrading to fail-open under slow subprocess I/O",
+                counts.deadline
+            ),
+            remediation: "git is stalling under this environment: check for a \
+                          cloud-synced working directory (OneDrive/iCloud/Dropbox), \
+                          endpoint-protection scanning, or heavy concurrent session \
+                          load; CADENCE_HOOK_DEADLINE_MS tunes the budget (#271)"
+                .to_string(),
+        });
+    }
+
+    // Threshold 1, not 3: each row is an enforcement block that did not fire.
+    if counts.deadline_block_suppressed >= 1 {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-metrics".to_string(),
+            file: dir.to_path_buf(),
+            line: None,
+            snippet: format!(
+                "deadline_block_suppressed: {}",
+                counts.deadline_block_suppressed
+            ),
+            diagnosis: format!(
+                "{} fail-closed block(s) suppressed by the git-probe deadline in the \
+                 last {days} days (failopen.jsonl) — ownership/branch enforcement was \
+                 bypassed, not just slowed",
+                counts.deadline_block_suppressed
+            ),
+            remediation: "inspect failopen.jsonl for the affected guards; until git \
+                          latency is addressed, pass explicit targets (-R owner/repo, \
+                          explicit push remotes) so those guards don't need git probes \
+                          (#271)"
+                .to_string(),
+        });
+    }
+
+    findings
+}
+
+/// Cadence hook latency from Claude Code session logs as a doctor `Finding`
+/// (cadence-hooks#271 prevention P2). The binary can't self-report an external
+/// timeout kill — a killed process logs nothing — but Claude Code records every
+/// hook's `durationMs`, so a scan of recent session logs surfaces guards that
+/// are degrading (incl. pure-CPU guards the deadline telemetry never sees). A
+/// `Warning`, never an `Error`: slow hooks are an environment problem to
+/// diagnose, not a shell bug.
+fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> Vec<Finding> {
+    let tallies = crate::hook_latency::scan_recent(projects, window, now);
+    let days = window.as_secs() / 86_400;
+    match crate::hook_latency::summary(&tallies, days) {
+        None => Vec::new(),
+        Some(diagnosis) => vec![Finding {
+            severity: Severity::Warning,
+            plugin: "cadence-hooks".to_string(),
+            file: projects.to_path_buf(),
+            line: None,
+            snippet: "Claude Code session logs".to_string(),
+            diagnosis,
+            remediation: "git-backed guards are bounded by the internal deadline \
+                          (CADENCE_HOOK_DEADLINE_MS); a pure-CPU guard that's still \
+                          slow points at fork/exec contention — check for a \
+                          cloud-synced working dir, endpoint-protection scanning, or \
+                          heavy concurrent-session load (#271)"
+                .to_string(),
+        }],
+    }
+}
+
+/// Prints an informational (non-blocking, not a `Finding`) count of recent
+/// registry-file reaps when nonzero. No threshold — reaping is normal
+/// operation; this is visibility, not an alarm.
+/// Find the plugin-shipped platform baseline in the marketplace cache.
+/// Newest pin wins when more than one SHA-pinned copy exists (a mid-update
+/// transient, or a stale sibling left behind) — `None` when the cadence
+/// plugin's cache directory, or every pin's baseline file, is missing.
+fn find_baseline_in_cache() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let cadence_dir = PathBuf::from(home).join(".claude/plugins/cache/workbench/cadence");
+    let entries = std::fs::read_dir(&cadence_dir).ok()?;
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join("config/platform-baseline.json");
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let is_newer = newest.as_ref().is_none_or(|(t, _)| modified > *t);
+        if is_newer {
+            newest = Some((modified, candidate));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// The Claude Code platform version, via a local `claude --version` exec —
+/// zero network, same as every other `doctor` data source. `doctor` is a
+/// manual, interactive command, so a subprocess here (unlike the SessionStart
+/// hook, which resolves the version from the transcript) is acceptable.
+fn installed_claude_code_version() -> Option<String> {
+    let output = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// Pure formatting core: given an explicit baseline path and a pre-resolved
+/// Claude Code version, produce the doctor status lines. Unconditional and
+/// unthresholded — unlike the SessionStart nudge (which only fires past a
+/// gap), `doctor` always shows both current-state lines when a baseline is
+/// found, so a `doctor` run never has to guess whether drift-checking ran at
+/// all. Testable with a tempdir baseline fixture and an injected version —
+/// no live-machine dependency (unlike [`find_baseline_in_cache`] and
+/// [`installed_claude_code_version`], which resolve those inputs).
+fn platform_drift_status_lines(
+    baseline_path: Option<&Path>,
+    cc_version: Option<&str>,
+) -> Vec<String> {
+    let Some(baseline_path) = baseline_path else {
+        return vec![
+            "cadence-hooks doctor: platform baseline not found under ~/.claude/plugins/cache/workbench/cadence/*/config/platform-baseline.json"
+                .to_string(),
+        ];
+    };
+    let Ok(content) = std::fs::read_to_string(baseline_path) else {
+        return vec![format!(
+            "cadence-hooks doctor: platform baseline unreadable: {}",
+            baseline_path.display()
+        )];
+    };
+    let Ok(baseline) =
+        serde_json::from_str::<cadence_hooks_cadence::platform_drift::Baseline>(&content)
+    else {
+        return vec![format!(
+            "cadence-hooks doctor: platform baseline malformed: {}",
+            baseline_path.display()
+        )];
+    };
+
+    let installed_hooks_version = env!("CARGO_PKG_VERSION");
+    let mut lines = vec![format!(
+        "cadence-hooks doctor: cadence-hooks {installed_hooks_version} (baseline expects {})",
+        baseline.cadence_hooks.current_version
+    )];
+    lines.push(match cc_version {
+        Some(v) => format!(
+            "cadence-hooks doctor: Claude Code {v} (last platform sweep: {})",
+            baseline.claude_code.last_swept_version
+        ),
+        None => "cadence-hooks doctor: Claude Code version unavailable (`claude --version` failed)"
+            .to_string(),
+    });
+    lines
+}
+
+/// Report cadence-hooks and Claude Code version status against the
+/// plugin-shipped baseline — the live-machine wrapper around
+/// [`platform_drift_status_lines`].
+fn print_platform_drift_status() {
+    let baseline_path = find_baseline_in_cache();
+    let cc_version = installed_claude_code_version();
+    for line in platform_drift_status_lines(baseline_path.as_deref(), cc_version.as_deref()) {
+        println!("{line}");
+    }
+}
+
+fn print_sweep_summary(dir: &Path, window: Duration, now: SystemTime) {
+    let count = cadence_hooks_metrics::log_sweep::recent_sweep_count(dir, window, now);
+    if count == 0 {
+        return;
+    }
+    let days = window.as_secs() / 86_400;
+    println!(
+        "cadence-hooks doctor: {count} session-registry sweep(s) in the last {days} days (sweeps.jsonl)"
+    );
+}
+
+/// Sum the byte size of every regular file under `dir`, walking recursively.
+///
+/// Symlinks are skipped (mirrors [`scan_root`]'s cycle guard) — including
+/// `dir` itself: a caller that hands us a symlinked top-level path (e.g. a
+/// planted symlink masquerading as an orphaned cache dir) gets `0`, not a
+/// recursive sum of whatever the link actually points at. The walk is also
+/// best-effort: an unreadable subdirectory just contributes 0 rather than
+/// failing the whole count.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    // `is_dir()`/`read_dir` follow symlinks; `symlink_metadata` does not, so
+    // this catches a symlinked `dir` argument before ever following it.
+    if std::fs::symlink_metadata(dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return 0;
+    }
+
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if is_symlink {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+
+    total
+}
+
+/// True when `path` resolves under `root` — delegates to
+/// [`cadence_hooks_core::paths::is_within`], the shared lexical containment
+/// primitive (existence-independent, rejects any `..` outright). Every pinned
+/// `installPath` and every candidate orphan sibling is checked against the
+/// plugin-cache root before it can influence a scan or a deletion, so a
+/// manifest entry pointing outside the cache (`/etc`, a `..`-climbing
+/// relative path) can never steer `remove_dir_all` anywhere but the cache.
+fn is_contained(path: &Path, root: &Path) -> bool {
+    cadence_hooks_core::paths::is_within(&path.to_string_lossy(), root)
+}
+
+/// Case-insensitive basename comparison. macOS/APFS default volumes are
+/// case-insensitive, so a manifest basename that diverges only in case from
+/// the on-disk directory name must still be recognized as the same pin —
+/// otherwise the active dir is misjudged as an orphan. Deliberately applied
+/// on every platform (not `cfg`-gated to macOS): a case-insensitive match is
+/// never wrong on a case-sensitive filesystem — basenames written by Claude
+/// Code's own installer never differ only in case — so the uniform
+/// comparison is simpler than platform-conditional logic for the same result.
+fn eq_ignore_case(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+/// Concrete orphaned version directories across every `(label, install_path)`
+/// pair in `pinned` — siblings of a pinned dir's parent whose basename isn't
+/// ANY pinned basename sharing that parent. Pure (no filesystem writes);
+/// reused by both [`orphan_findings`] (advisory count/bytes) and the
+/// `doctor --prune` flow (actual removal via [`prune_orphans`]), so the
+/// sibling-scan + symlink + containment guards live in exactly one place.
+///
+/// `cache_root` bounds every pin: an `installPath` that does not resolve
+/// under it (a bogus or malicious manifest entry) is skipped entirely — its
+/// parent is never scanned, so nothing outside the plugin cache can ever be
+/// nominated as an orphan. Pins are grouped by parent directory first, so
+/// when two active pins share a parent (multi-scope installs, or two SHAs of
+/// the same plugin key), scanning that parent excludes BOTH pinned
+/// basenames — an active pin is never returned as an orphan just because a
+/// sibling pin's own scan didn't know about it.
+fn orphan_dirs(pinned: &[(String, PathBuf)], cache_root: &Path) -> Vec<PathBuf> {
+    let mut pinned_by_parent: std::collections::HashMap<PathBuf, Vec<std::ffi::OsString>> =
+        std::collections::HashMap::new();
+
+    for (_label, install_path) in pinned {
+        if !is_contained(install_path, cache_root) {
+            continue;
+        }
+        let Some(parent) = install_path.parent() else {
+            continue;
+        };
+        let Some(pinned_name) = install_path.file_name() else {
+            continue;
+        };
+        pinned_by_parent
+            .entry(parent.to_path_buf())
+            .or_default()
+            .push(pinned_name.to_os_string());
+    }
+
+    let mut out = Vec::new();
+
+    for (parent, pinned_names) in &pinned_by_parent {
+        let Ok(siblings) = std::fs::read_dir(parent) else {
+            continue;
+        };
+
+        for sibling in siblings.flatten() {
+            // `DirEntry::file_type()` does NOT follow symlinks (unlike
+            // `sibling.path().is_dir()`, which does) — a symlinked sibling
+            // must never be treated as an orphan version dir to recurse
+            // into, or a planted symlink (e.g. pointing at `$HOME` or `/`)
+            // gets summed/removed as if it were real cache content.
+            let is_real_dir = sibling.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_real_dir {
+                continue;
+            }
+            let sibling_name = sibling.file_name();
+            if pinned_names
+                .iter()
+                .any(|name| eq_ignore_case(name, &sibling_name))
+            {
+                continue;
+            }
+            out.push(sibling.path());
+        }
+    }
+
+    out
+}
+
+/// Findings for orphaned and missing/empty pinned plugin-cache version dirs.
+///
+/// `pinned` is `(label, install_path)` from [`manifest_install_paths`] — the
+/// version dir the manifest actually points at. Any sibling directory under
+/// an `install_path`'s parent that isn't ANY pinned basename sharing that
+/// parent is an orphan: a stale SHA-pinned version left behind by an update,
+/// since the cache never garbage-collects.
+///
+/// The missing/empty-pinned-dir warning fires in both quiet and verbose modes
+/// (it means the active plugin literally won't load). The orphan-count
+/// warning is `quiet`-suppressed — orphans are cosmetic cache bloat, not a
+/// functional break, and would otherwise nag every SessionStart forever.
+///
+/// Orphans are computed ONCE over the full `pinned` slice (never per-pin) —
+/// calling [`orphan_dirs`] with a single-element slice per label would
+/// reintroduce the exact multi-pin bug that function's own containment
+/// guards against: when two active pins share a parent (multi-scope
+/// installs, or two SHAs of one plugin key), a single-pin view can't see the
+/// other pin's basename, so it would misreport a live install as "safe to
+/// prune". `cache_root` is forwarded to [`orphan_dirs`] — see that
+/// function's doc for the containment guarantee.
+fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool, cache_root: &Path) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    for (label, install_path) in pinned {
+        let content_missing = match std::fs::read_dir(install_path) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(_) => true,
+        };
+        if content_missing {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                plugin: label.clone(),
+                file: install_path.clone(),
+                line: None,
+                snippet: install_path.display().to_string(),
+                diagnosis: "pinned cache dir missing or empty".to_string(),
+                remediation: "reinstall the plugin (`cadence-hooks list` shows install state, \
+                              or reload via the marketplace)"
+                    .to_string(),
+            });
+        }
+    }
+
+    if quiet {
+        return findings;
+    }
+
+    let orphans = orphan_dirs(pinned, cache_root);
+    let mut orphans_by_parent: std::collections::HashMap<PathBuf, Vec<PathBuf>> =
+        std::collections::HashMap::new();
+    for dir in orphans {
+        if let Some(parent) = dir.parent() {
+            orphans_by_parent
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(dir);
+        }
+    }
+
+    for (parent, dirs) in &orphans_by_parent {
+        // Attribute the finding to any label actually pinned at this parent
+        // — arbitrary-but-deterministic among labels sharing it, since the
+        // finding describes the parent directory, not a single pin.
+        let Some((label, _)) = pinned
+            .iter()
+            .find(|(_, install_path)| install_path.parent() == Some(parent.as_path()))
+        else {
+            continue;
+        };
+
+        let orphan_count = dirs.len();
+        let orphan_bytes: u64 = dirs.iter().map(|d| dir_size_bytes(d)).sum();
+        let mib = orphan_bytes as f64 / (1024.0 * 1024.0);
+        findings.push(Finding {
+            severity: Severity::Warning,
+            plugin: label.clone(),
+            file: parent.clone(),
+            line: None,
+            snippet: format!("{orphan_count} orphaned version dir(s)"),
+            diagnosis: format!(
+                "{orphan_count} orphaned version dir(s) (~{mib:.1} MiB) left in cache"
+            ),
+            remediation: "safe to prune — not the active pinned version".to_string(),
+        });
+    }
+
+    findings
+}
+
+/// Remove (or, when `apply` is false, merely size up) the given orphaned
+/// version directories. Returns `(removed_count, freed_bytes)` — in dry-run
+/// mode both reflect what *would* be removed, since nothing is deleted.
+///
+/// Each directory is re-verified with [`std::fs::symlink_metadata`]
+/// immediately before [`std::fs::remove_dir_all`] — narrowing the TOCTOU
+/// window between the scan that produced `dirs` and the removal itself, so a
+/// path that became a symlink (or vanished) in between is never followed or
+/// removed. Fails open per-directory: an unremovable dir is skipped with a
+/// warning to stderr, never fatal to the batch.
+///
+/// `cache_root` is a second, independent containment check — defense in
+/// depth alongside [`orphan_dirs`]'s own containment filtering, so a bug (or
+/// future caller) that hands this function an uncontained path still can't
+/// reach `remove_dir_all` on it; that dir is skipped with a stderr warning
+/// instead.
+fn prune_orphans(dirs: &[PathBuf], apply: bool, cache_root: &Path) -> (usize, u64) {
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+
+    for dir in dirs {
+        if !is_contained(dir, cache_root) {
+            eprintln!(
+                "cadence-hooks doctor --prune: refusing to touch {} — outside the plugin cache root {}",
+                dir.display(),
+                cache_root.display()
+            );
+            continue;
+        }
+
+        let is_real_dir = std::fs::symlink_metadata(dir)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        if !is_real_dir {
+            continue;
+        }
+
+        let size = dir_size_bytes(dir);
+        if !apply {
+            removed += 1;
+            freed += size;
+            continue;
+        }
+
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {
+                removed += 1;
+                freed += size;
+            }
+            Err(e) => {
+                eprintln!(
+                    "cadence-hooks doctor --prune: could not remove {}: {e}",
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    (removed, freed)
+}
+
+/// Whether `doctor --prune --apply` may proceed, or is blocked because live peer
+/// sessions are still running and may be pinned to plugin-cache version dirs
+/// that pruning would pull out from under them.
+enum PruneGate {
+    Proceed,
+    Blocked(Vec<String>),
+}
+
+/// Decide whether `--prune --apply` may run. Pure over its inputs so it is
+/// testable without a live registry.
+///
+/// `force` overrides everything (the `CADENCE_DOCTOR_PRUNE_FORCE` escape hatch).
+/// A `None` sessions dir means there is nothing to protect (not inside a repo),
+/// so it proceeds. Otherwise it blocks when any non-stale peer is registered,
+/// naming them. `own_session_id` is `""` so the invoking session itself counts
+/// as a live peer — a prune must not delete dirs the caller is pinned to —
+/// matching how `run_status` enumerates peers.
+///
+/// Limitation: the session registry is repo-scoped (`<repo>/.claude/sessions`),
+/// so sessions running in other checkouts against the same global plugin cache
+/// are invisible here — the gate is under-protective across repos, never
+/// over-destructive.
+fn prune_liveness_gate(sessions_dir: Option<&Path>, stale_secs: u64, force: bool) -> PruneGate {
+    if force {
+        return PruneGate::Proceed;
+    }
+    let Some(dir) = sessions_dir else {
+        return PruneGate::Proceed;
+    };
+    let live = session_registry::live_peers(dir, "", stale_secs);
+    if live.is_empty() {
+        return PruneGate::Proceed;
+    }
+    PruneGate::Blocked(live.into_iter().map(|p| p.record.name).collect())
+}
+
+/// `doctor --prune` entry point: list (or, with `apply`, remove) orphaned
+/// plugin-cache version dirs. Dry-run by default (decision D4) — `apply`
+/// must be paired with `prune` at the call site (`run` enforces this before
+/// dispatching here).
+///
+/// Honors `root_override` the same way the rest of `doctor` does: with
+/// `--root`, the manifest is read from `<root>/installed_plugins.json` (so
+/// integration tests can drive a fixture cache); without it, from the live
+/// `~/.claude/plugins/installed_plugins.json`. A missing manifest is not an
+/// error here — nothing to prune reports cleanly at exit 0.
+///
+/// `cache_root` — the containment boundary passed to [`orphan_dirs`] and
+/// [`prune_orphans`] — is `root` itself under `--root` (fixtures place
+/// `<root>/<marketplace>/<plugin>/<sha>` directly, matching how the manifest
+/// path above is resolved), or the live `~/.claude/plugins/cache` otherwise —
+/// the same anchor `run`'s cache-walk fallback uses.
+fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
+    let (manifest, cache_root) = match root_override {
+        Some(root) => {
+            if !root.exists() {
+                eprintln!(
+                    "cadence-hooks doctor: scan root does not exist: {}",
+                    root.display()
+                );
+                return 2;
+            }
+            (root.join("installed_plugins.json"), root.to_path_buf())
+        }
+        None => {
+            let Some(plugins) = plugins_dir() else {
+                eprintln!("cadence-hooks doctor: $HOME not set; cannot locate plugin cache");
+                return 2;
+            };
+            (
+                plugins.join("installed_plugins.json"),
+                plugins.join("cache"),
+            )
+        }
+    };
+
+    let Some(pinned) = manifest_install_paths(&manifest) else {
+        if !quiet {
+            println!(
+                "cadence-hooks doctor --prune: no installed-plugins manifest at {} — nothing to prune",
+                manifest.display()
+            );
+        }
+        return 0;
+    };
+
+    let dirs = orphan_dirs(&pinned, &cache_root);
+    if dirs.is_empty() {
+        if !quiet {
+            println!("cadence-hooks doctor --prune: no orphaned plugin-cache version dirs found");
+        }
+        return 0;
+    }
+
+    if !quiet {
+        for dir in &dirs {
+            let size = dir_size_bytes(dir);
+            let mib = size as f64 / (1024.0 * 1024.0);
+            // `.orphaned_at` is written externally by Claude Code's own
+            // plugin loader when it retires a version dir, not by anything
+            // in this repo — surfacing it here is advisory ("this one was
+            // already flagged upstream"), not a marker this codebase creates.
+            let marker_note = if dir.join(".orphaned_at").exists() {
+                " [marked .orphaned_at]"
+            } else {
+                ""
+            };
+            println!("  {} (~{mib:.1} MiB){marker_note}", dir.display());
+        }
+    }
+
+    // Refuse to delete while live peer sessions may be pinned to these dirs.
+    // Only under default mode (not `--root`), mirroring the legacy-config gating
+    // below — `--root` fixtures must stay hermetic and never read live sessions.
+    // Dry-run deletes nothing, so the gate only guards the destructive `apply`.
+    if root_override.is_none() && apply {
+        let stale_secs = session_registry::stale_minutes() * 60;
+        let force = matches!(
+            std::env::var("CADENCE_DOCTOR_PRUNE_FORCE").as_deref(),
+            Ok("1") | Ok("true")
+        );
+        let sessions_dir = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| session_registry::sessions_dir(&cwd.to_string_lossy()));
+        if let PruneGate::Blocked(names) =
+            prune_liveness_gate(sessions_dir.as_deref(), stale_secs, force)
+        {
+            eprintln!(
+                "cadence-hooks doctor --prune --apply: refusing to prune — {} live session(s) may be pinned to these version dirs: {}. \
+                 Run /reload-plugins in any live session first to release the retired dirs, then re-run. \
+                 Or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway.",
+                names.len(),
+                names.join(", ")
+            );
+            return 0;
+        }
+    }
+
+    let (removed, freed_bytes) = prune_orphans(&dirs, apply, &cache_root);
+    let freed_mib = freed_bytes as f64 / (1024.0 * 1024.0);
+
+    if !quiet {
+        if apply {
+            println!(
+                "cadence-hooks doctor --prune --apply: removed {removed} orphaned version dir(s), freed ~{freed_mib:.1} MiB"
+            );
+            println!(
+                "  If any Claude Code session is currently running, run /reload-plugins in it now."
+            );
+        } else {
+            println!(
+                "cadence-hooks doctor --prune: {removed} orphaned version dir(s) (~{freed_mib:.1} MiB) would be removed — dry-run, nothing deleted. Re-run with --apply to remove them."
+            );
+        }
+    }
+
+    0
+}
+
+/// One `(marketplace, install_location, declared_repo)` from
+/// `known_marketplaces.json` for every entry sourced from GitHub.
+///
+/// `directory`-sourced marketplaces (a local path, no remote to verify) are
+/// skipped. Fails open — a missing or unparseable file yields an empty vec,
+/// never an error — this is an advisory check, not a hard dependency.
+fn known_marketplace_sources(path: &Path) -> Vec<(String, PathBuf, String)> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(entries) = json.as_object() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for (name, entry) in entries {
+        let source = entry.get("source");
+        let is_github = source
+            .and_then(|s| s.get("source"))
+            .and_then(|v| v.as_str())
+            == Some("github");
+        if !is_github {
+            continue;
+        }
+        let Some(repo) = source.and_then(|s| s.get("repo")).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(install_location) = entry.get("installLocation").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        out.push((
+            name.clone(),
+            PathBuf::from(install_location),
+            repo.to_string(),
+        ));
+    }
+    out
+}
+
+/// A marketplace checkout finding when its `git remote` diverges from its
+/// declared `known_marketplaces.json` source, or `None` when they match.
+///
+/// Pure — the caller runs the actual `git remote get-url origin` (via
+/// [`cadence_hooks_core::shell::git_command`]) and passes the result in, so
+/// this stays testable without touching the filesystem or a git checkout.
+/// `actual_remote: None` (no `.git`, or the git call failed) fails open —
+/// a marketplace checkout not backed by git yet is not itself a problem this
+/// check exists to catch.
+fn canonical_remote_finding(
+    marketplace: &str,
+    install_dir: &Path,
+    declared_repo: &str,
+    actual_remote: Option<&str>,
+) -> Option<Finding> {
+    let actual = actual_remote?;
+    let actual_repo = cadence_hooks_core::shell::repo_from_url(actual)?;
+
+    if actual_repo.eq_ignore_ascii_case(declared_repo) {
+        return None;
+    }
+
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: marketplace.to_string(),
+        file: install_dir.to_path_buf(),
+        line: None,
+        snippet: actual.to_string(),
+        diagnosis: format!(
+            "marketplace checkout remote '{actual_repo}' does not match declared source '{declared_repo}'"
+        ),
+        remediation: "cache may not be canonical — verify before citing, or re-add the \
+                      marketplace from its declared source"
+            .to_string(),
+    })
+}
+
+/// Legacy per-guard config files the unified loader no longer reads
+/// (cadence-hooks#153). Presence is a `Warning`, not an `Error`: the repo's
+/// softening is silently inert until migrated — the hard cut's non-silent net.
+const LEGACY_CONFIG_FILES: &[&str] = &["redaction.json", "terminology.json"];
+
+/// One `Warning` per orphaned legacy config file under `<root>/.claude/`, empty
+/// when none is present. Detects any entry at the path (regular file or
+/// symlink) via `symlink_metadata` — no read — so a leftover file is surfaced
+/// regardless of what it is. Pure; the caller resolves the repo root.
+fn legacy_config_findings(root: &Path) -> Vec<Finding> {
+    let claude = root.join(".claude");
+    LEGACY_CONFIG_FILES
+        .iter()
+        .filter_map(|name| {
+            let path = claude.join(name);
+            if std::fs::symlink_metadata(&path).is_err() {
+                return None;
+            }
+            Some(Finding {
+                severity: Severity::Warning,
+                plugin: "cadence-hooks".to_string(),
+                file: path.clone(),
+                line: None,
+                snippet: (*name).to_string(),
+                diagnosis: format!(
+                    "legacy guard config '{name}' present but no longer read — \
+                     unified into .claude/cadence.json (#153)"
+                ),
+                remediation: "run 'cadence-hooks migrate-config' to merge it into \
+                              .claude/cadence.json (renames the legacy file to \
+                              *.json.migrated)"
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A `Warning` when `<root>/.claude/cadence.json` is present but not valid JSON,
+/// or `None` when it is absent, unreadable/special (fail-open), or parses.
+///
+/// Runtime is fail-open — a malformed `cadence.json` silently yields every
+/// guard's default config, so its per-repo softening quietly stops applying.
+/// This makes that non-silent, without ever failing the run (advisory only).
+fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
+    let path = root.join(cadence_hooks_core::config::CADENCE_CONFIG_REL);
+    let content = cadence_hooks_core::paths::read_untrusted_config(&path)?;
+    // Two distinct failures both leave every guard on its default config: a
+    // syntax error, and a syntactically-valid but non-object top level. The
+    // latter is silent — `load_cadence_section` reads each section via
+    // `value.get(section)`, which yields nothing for an array/number/string,
+    // so the section lookup falls through to the default with no error.
+    let diagnosis = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(value) if value.is_object() => return None,
+        Ok(_) => {
+            "`.claude/cadence.json` is present but its top level is not a JSON \
+                  object — guards read their section via `value.get(section)`, which \
+                  yields nothing for a non-object, so they fall open to default \
+                  config and their per-repo softening is silently inert"
+        }
+        Err(_) => {
+            "`.claude/cadence.json` is present but not valid JSON — guards \
+                   fall open to default config, so their per-repo softening is \
+                   silently inert"
+        }
+    };
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: "cadence-hooks".to_string(),
+        file: path,
+        line: None,
+        snippet: "cadence.json".to_string(),
+        diagnosis: diagnosis.to_string(),
+        remediation: "make `.claude/cadence.json` a valid JSON object; \
+                      'cadence-hooks migrate-config' writes a valid file from any \
+                      legacy config"
+            .to_string(),
+    })
+}
+
 /// Entry point for the `doctor` subcommand. Returns the process exit code.
 ///
 /// Exit codes:
@@ -455,11 +1991,27 @@ fn scan_root(root: &Path, channel: InstallChannel) -> Vec<Finding> {
 /// Stream split in quiet mode is deliberate: warnings go to stdout (a caller
 /// capturing stdout gets the skew nudge to inject), errors go to stderr (a
 /// caller redirecting stderr to /dev/null still fails on the exit code).
-pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
+///
+/// `prune` switches to the orphaned-cache-dir listing/removal mode (see
+/// [`run_prune`]) instead of the hooks.json scan above — dry-run by default
+/// (decision D4); `apply` actually removes and requires `prune` (a usage
+/// error, exit 2, otherwise).
+pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) -> u8 {
+    if apply && !prune {
+        eprintln!(
+            "cadence-hooks doctor: --apply requires --prune (dry-run first with --prune, then --prune --apply)"
+        );
+        return 2;
+    }
+
+    if prune {
+        return run_prune(root_override, quiet, apply);
+    }
+
     // Resolve the install channel once — it's process-invariant, so the scan
     // below shouldn't re-probe current_exe() per hook entry.
     let channel = install_channel();
-    let (findings, scanned) = match root_override {
+    let (mut findings, scanned) = match root_override {
         Some(root) => {
             if !root.exists() {
                 // Configuration error, not "clean" — exit 2 so a misconfigured
@@ -483,10 +2035,18 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
             match manifest_install_paths(&plugins.join("installed_plugins.json")) {
                 Some(installs) => {
                     let scanned = format!("{} installed plugin(s)", installs.len());
-                    let findings = installs
+                    let mut findings: Vec<Finding> = installs
                         .iter()
                         .flat_map(|(label, dir)| scan_plugin_dir(label, dir, channel))
                         .collect();
+                    // Only reachable from the manifest branch: the enablement
+                    // join needs the manifest's `<plugin>@<marketplace>` keys,
+                    // which the recursive cache walk cannot reconstruct (its
+                    // labels are directory paths).
+                    findings.extend(unenabled_plugin_findings(
+                        &installs,
+                        &cadence_hooks_core::paths::claude_config_dir(),
+                    ));
                     (findings, scanned)
                 }
                 None => {
@@ -505,6 +2065,109 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
         }
     };
 
+    // Telemetry staleness is a live-machine signal, not a hooks.json scan, so it
+    // belongs to default mode only. Under `--root` (the CI/fixture path) it would
+    // read *this* dev machine's real metrics dir and taint a fixture-scoped run.
+    if root_override.is_none()
+        && let Some(finding) = telemetry_finding(
+            &cadence_hooks_metrics::warn_stale::metrics_dir(),
+            &cadence_hooks_metrics::warn_stale::extra_watched_paths(),
+            cadence_hooks_metrics::warn_stale::stale_threshold(),
+            SystemTime::now(),
+        )
+    {
+        findings.push(finding);
+    }
+
+    // Fail-open / sweep telemetry: same live-machine-only rationale as
+    // staleness above — under `--root` this would read the dev machine's real
+    // metrics dir, not the fixture.
+    if root_override.is_none() {
+        let metrics_dir = cadence_hooks_metrics::warn_stale::metrics_dir();
+        let now = SystemTime::now();
+        let window = Duration::from_secs(7 * 24 * 60 * 60);
+
+        findings.extend(failopen_findings(
+            &metrics_dir,
+            window,
+            now,
+            env!("CARGO_PKG_VERSION"),
+        ));
+        findings.extend(hook_latency_findings(
+            &crate::hook_latency::projects_dir(),
+            window,
+            now,
+        ));
+        // Names the CAUSE the deadline finding above can only tell the operator
+        // to go looking for (#278). Gated with the other live-machine reads:
+        // under `--root` these would report the dev machine's real dirs, not
+        // the fixture.
+        let mut sync_candidates: Vec<(&str, PathBuf)> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            sync_candidates.push(("working directory", cwd));
+        }
+        // Through the shared resolver, NOT a raw `CLAUDE_CONFIG_DIR` read —
+        // the same call `plugins_dir()` makes above. Most operators never set
+        // that variable, so reading it directly skipped the DEFAULT config dir
+        // entirely: `$HOME/.claude`. That default is exactly what Windows
+        // Known Folder Redirection parks inside OneDrive under corporate
+        // policy, which is the deployment this check exists to surface.
+        sync_candidates.push((
+            "Claude config dir",
+            cadence_hooks_core::paths::claude_config_dir(),
+        ));
+        findings.extend(cloud_sync_findings(&sync_candidates));
+        if !quiet {
+            print_sweep_summary(&metrics_dir, window, now);
+            print_platform_drift_status();
+        }
+    }
+
+    // Plugin-cache health: orphaned/missing version dirs and canonical-remote
+    // drift. Same live-machine-only rationale as staleness above — under
+    // `--root` this would read the dev machine's real cache, not the fixture.
+    if root_override.is_none()
+        && let Some(plugins) = plugins_dir()
+    {
+        if let Some(pinned) = manifest_install_paths(&plugins.join("installed_plugins.json")) {
+            findings.extend(orphan_findings(&pinned, quiet, &plugins.join("cache")));
+        }
+
+        for (marketplace, install_dir, declared_repo) in
+            known_marketplace_sources(&plugins.join("known_marketplaces.json"))
+        {
+            if !install_dir.join(".git").exists() {
+                continue;
+            }
+            let actual = cadence_hooks_core::shell::git_command(
+                &install_dir.to_string_lossy(),
+                &["remote", "get-url", "origin"],
+            );
+            if let Some(finding) = canonical_remote_finding(
+                &marketplace,
+                &install_dir,
+                &declared_repo,
+                actual.as_deref(),
+            ) {
+                findings.push(finding);
+            }
+        }
+    }
+
+    // Repo-local guard-config health: orphaned legacy files (ignored under the
+    // #153 hard cut) and a malformed cadence.json. Repo-scoped, so default mode
+    // only — under `--root` (the CI/fixture path) there is no "current repo" to
+    // inspect, same live-machine-only rationale as the checks above.
+    if root_override.is_none()
+        && let Ok(cwd) = std::env::current_dir()
+        && let Some(repo_root) = cadence_hooks_core::paths::find_git_root(&cwd.to_string_lossy())
+    {
+        findings.extend(legacy_config_findings(&repo_root));
+        if let Some(finding) = cadence_config_parse_finding(&repo_root) {
+            findings.push(finding);
+        }
+    }
+
     let (errors, warnings): (Vec<&Finding>, Vec<&Finding>) =
         findings.iter().partition(|f| f.severity == Severity::Error);
 
@@ -520,11 +2183,16 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
             return 2;
         }
         // Warnings only in quiet mode: one summary line to stdout, exit 0.
+        // Warnings are now version skew (missing subcommands) and/or stale
+        // telemetry, so the summary stays generic and defers the specifics to a
+        // full `cadence-hooks doctor` run.
         let version = env!("CARGO_PKG_VERSION");
+        let has_skew = warnings
+            .iter()
+            .any(|w| w.diagnosis.contains("not present in this binary"));
         println!(
-            "cadence-hooks {version} is missing {} subcommand(s) referenced by installed plugins — {}",
-            warnings.len(),
-            upgrade_hint_short(channel)
+            "{}",
+            quiet_warning_summary(version, warnings.len(), has_skew, channel)
         );
         return 0;
     }
@@ -557,6 +2225,954 @@ pub fn run(root_override: Option<&Path>, quiet: bool) -> u8 {
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── telemetry_finding tests ─────────────────────────────────────────────
+
+    const NO_EXTRA: &[PathBuf] = &[];
+
+    /// Write `name` and backdate its mtime by `days`.
+    fn write_aged(dir: &Path, name: &str, days: u64) {
+        let path = dir.join(name);
+        fs::write(&path, "{}\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(days * 86_400))
+            .unwrap();
+    }
+
+    #[test]
+    fn telemetry_finding_stale_dir_is_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("subagents.jsonl"), "{}\n").unwrap();
+
+        let f = telemetry_finding(tmp.path(), NO_EXTRA, Duration::ZERO, SystemTime::now())
+            .expect("a stale dir must yield a finding");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.plugin, "cadence-metrics");
+        assert_eq!(f.snippet, "subagents.jsonl");
+        assert!(
+            f.diagnosis.contains("stale"),
+            "diagnosis names staleness: {}",
+            f.diagnosis
+        );
+        assert!(
+            f.remediation.contains("healthy machine"),
+            "remediation frames the compare-wiring fix: {}",
+            f.remediation
+        );
+    }
+
+    #[test]
+    fn telemetry_finding_fresh_dir_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("subagents.jsonl"), "{}\n").unwrap();
+        let huge = Duration::from_secs(3650 * 86_400);
+        assert!(telemetry_finding(tmp.path(), NO_EXTRA, huge, SystemTime::now()).is_none());
+    }
+
+    #[test]
+    fn telemetry_finding_missing_dir_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert!(telemetry_finding(&missing, NO_EXTRA, Duration::ZERO, SystemTime::now()).is_none());
+    }
+
+    // Doctor's half of #217: a dead stream beside a live one must surface here
+    // too, and the snippet must name the DEAD stream — a finding whose identity
+    // line named the fresh file would point the reader at the wrong thing.
+    #[test]
+    fn telemetry_finding_flatline_names_the_dead_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_aged(tmp.path(), "commits.jsonl", 40);
+        write_aged(tmp.path(), "sessions.jsonl", 0);
+        let four_days = Duration::from_secs(4 * 86_400);
+
+        let f = telemetry_finding(tmp.path(), NO_EXTRA, four_days, SystemTime::now())
+            .expect("a flatlined stream must yield a finding");
+        assert_eq!(f.severity, Severity::Warning);
+        assert_eq!(f.snippet, "commits.jsonl", "snippet names the DEAD stream");
+        assert!(
+            f.diagnosis.contains("flatlined") && f.diagnosis.contains("sessions.jsonl"),
+            "diagnosis contrasts dead against live: {}",
+            f.diagnosis
+        );
+    }
+
+    // ── unenabled_plugin_findings tests (#397) ──────────────────────────────
+
+    /// A plugin install dir that ships a `hooks/hooks.json`.
+    fn plugin_with_hooks(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(dir.join("hooks")).unwrap();
+        fs::write(dir.join("hooks/hooks.json"), "{}").unwrap();
+        dir
+    }
+
+    fn write_settings(config: &Path, body: &str) {
+        fs::create_dir_all(config).unwrap();
+        fs::write(config.join("settings.json"), body).unwrap();
+    }
+
+    // THE #397 REGRESSION TEST. A hook-shipping plugin with no enabledPlugins
+    // entry is exactly the fingerprint the audit found: the metrics plugin was
+    // absent from the map entirely and its loggers had been inert for months.
+    #[test]
+    fn absent_enabled_entry_is_a_finding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{"other@workbench":true}}"#);
+        let dir = plugin_with_hooks(tmp.path(), "metrics-install");
+        let installs = vec![("cadence-metrics@workbench".to_string(), dir)];
+
+        let findings = unenabled_plugin_findings(&installs, &config);
+        assert_eq!(findings.len(), 1, "the absent plugin must be reported");
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(
+            findings[0].diagnosis.contains("cadence-metrics@workbench"),
+            "names the plugin: {}",
+            findings[0].diagnosis
+        );
+    }
+
+    // The noise floor for #397: an explicit `false` is the operator's own
+    // decision. Warning on it is nagging, and a nagged operator stops reading
+    // the finding that matters.
+    #[test]
+    fn explicit_false_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{"persona@lab":false}}"#);
+        let dir = plugin_with_hooks(tmp.path(), "persona-install");
+        let installs = vec![("persona@lab".to_string(), dir)];
+
+        assert!(unenabled_plugin_findings(&installs, &config).is_empty());
+    }
+
+    #[test]
+    fn enabled_plugin_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{"live@workbench":true}}"#);
+        let dir = plugin_with_hooks(tmp.path(), "live-install");
+        let installs = vec![("live@workbench".to_string(), dir)];
+
+        assert!(unenabled_plugin_findings(&installs, &config).is_empty());
+    }
+
+    // A plugin with no hooks costs no telemetry and blocks no guard when off.
+    // One finding per plugin, not per installed version — the operator makes
+    // the enable decision once.
+    #[test]
+    fn duplicate_installs_report_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{"unrelated@m":true}}"#);
+        let a = plugin_with_hooks(tmp.path(), "v1");
+        let b = plugin_with_hooks(tmp.path(), "v2");
+        let installs = vec![
+            ("dup@workbench".to_string(), a),
+            ("dup@workbench".to_string(), b),
+        ];
+
+        assert_eq!(unenabled_plugin_findings(&installs, &config).len(), 1);
+    }
+
+    // The dedup must not run before the hooks test: a hookless install listed
+    // first would otherwise claim the label and hide the install that has one.
+    #[test]
+    fn hookless_install_does_not_mask_its_hooked_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{"unrelated@m":true}}"#);
+        let hookless = tmp.path().join("no-hooks");
+        fs::create_dir_all(&hookless).unwrap();
+        let hooked = plugin_with_hooks(tmp.path(), "has-hooks");
+        let installs = vec![
+            ("mixed@workbench".to_string(), hookless),
+            ("mixed@workbench".to_string(), hooked),
+        ];
+
+        assert_eq!(
+            unenabled_plugin_findings(&installs, &config).len(),
+            1,
+            "the hooked install must still be reported"
+        );
+    }
+
+    #[test]
+    fn plugin_without_hooks_is_not_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{"unrelated@m":true}}"#);
+        let dir = tmp.path().join("skills-only");
+        fs::create_dir_all(dir.join("skills")).unwrap();
+        let installs = vec![("skills-only@workbench".to_string(), dir)];
+
+        assert!(unenabled_plugin_findings(&installs, &config).is_empty());
+    }
+
+    // Cannot-judge must not read as all-broken: with no settings file at all,
+    // an empty map would have warned about every installed plugin at once.
+    #[test]
+    fn missing_settings_reports_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("no-such-config");
+        let dir = plugin_with_hooks(tmp.path(), "some-install");
+        let installs = vec![("some@workbench".to_string(), dir)];
+
+        assert!(unenabled_plugin_findings(&installs, &config).is_empty());
+        assert!(enabled_plugin_map(&config).is_none());
+    }
+
+    // Cannot-judge covers EMPTY too, not just missing. A literally empty
+    // enabledPlugins is indistinguishable from a config not yet written, and
+    // reading it as "nothing is enabled" warns about every hook-shipping plugin
+    // at once — the exact failure the None guard exists to prevent.
+    #[test]
+    fn empty_enabled_plugins_object_is_cannot_judge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{}}"#);
+        let dir = plugin_with_hooks(tmp.path(), "some-install");
+        let installs = vec![("some@workbench".to_string(), dir)];
+
+        assert!(enabled_plugin_map(&config).is_none());
+        assert!(unenabled_plugin_findings(&installs, &config).is_empty());
+    }
+
+    // Presence, not value: a malformed entry is still a decision the operator
+    // made. Dropping it would make the key read as ABSENT and fire the very
+    // warning the absent-vs-false rule exists to avoid.
+    #[test]
+    fn non_bool_entry_still_counts_as_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(
+            &config,
+            r#"{"enabledPlugins":{"p@m":"true","other@m":true}}"#,
+        );
+        let dir = plugin_with_hooks(tmp.path(), "p-install");
+        let installs = vec![("p@m".to_string(), dir)];
+
+        assert!(
+            unenabled_plugin_findings(&installs, &config).is_empty(),
+            "a string-valued entry is present, not absent"
+        );
+    }
+
+    #[test]
+    fn unparseable_settings_reports_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, "{ not json");
+        let dir = plugin_with_hooks(tmp.path(), "some-install");
+        let installs = vec![("some@workbench".to_string(), dir)];
+
+        assert!(unenabled_plugin_findings(&installs, &config).is_empty());
+    }
+
+    // settings.local.json wins, matching Claude Code's own precedence — so a
+    // plugin enabled only locally must not be reported as inert.
+    #[test]
+    fn local_settings_override_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{"p@m":false}}"#);
+        fs::write(
+            config.join("settings.local.json"),
+            r#"{"enabledPlugins":{"p@m":true}}"#,
+        )
+        .unwrap();
+
+        let map = enabled_plugin_map(&config).expect("both files parse");
+        assert_eq!(map.get("p@m"), Some(&true), "local wins over base");
+    }
+
+    // A local file alone is enough to judge — the base file need not exist.
+    #[test]
+    fn local_settings_alone_is_judgeable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("settings.local.json"),
+            r#"{"enabledPlugins":{"p@m":true}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            enabled_plugin_map(&config).map(|m| m.len()),
+            Some(1),
+            "local-only settings still yield a map"
+        );
+    }
+
+    // ── failopen_findings tests ─────────────────────────────────────────────
+
+    const WEEK: Duration = Duration::from_secs(7 * 86_400);
+
+    /// A deterministic `now` two days after the fixed `2026-07-20` rows the
+    /// recency tests use — keeps those rows inside the 7-day window without
+    /// leaning on the wall clock, which would age the fixed date out and turn
+    /// the assertions into a time bomb. `2026-07-22T00:00:00Z` in Unix seconds.
+    fn fixed_now_after_the_rows() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_784_678_400)
+    }
+
+    #[test]
+    fn failopen_findings_missing_file_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn failopen_findings_one_panic_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let row = r#"{"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","ts":"TS"}"#
+            .replace("TS", &cadence_hooks_core::time::utc_timestamp());
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warning);
+        assert!(findings[0].diagnosis.contains("panic"));
+    }
+
+    #[test]
+    fn failopen_findings_parse_below_threshold_is_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let rows: String = (0..2)
+            .map(|_| {
+                format!(
+                    r#"{{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"{ts}"}}"#
+                )
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        assert!(failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn failopen_findings_parse_at_threshold_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let rows: String = (0..3)
+            .map(|_| {
+                format!(
+                    r#"{{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"{ts}"}}"#
+                )
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].diagnosis.contains("parse"));
+    }
+
+    #[test]
+    fn failopen_findings_distinguish_a_burst_from_a_drip_at_the_same_count() {
+        // #404: same total, opposite shapes, and the remediation must send the
+        // operator somewhere DIFFERENT for each. A one-day spike is an episode
+        // to correlate; a spread is the live feed the old text asserted for
+        // both.
+        let burst_dir = tempfile::tempdir().unwrap();
+        let burst: String = (0..6)
+            .map(|i| format!(
+                "{{\"reason\":\"parse\",\"binaryVersion\":\"0.66.0\",\"ts\":\"2026-07-20T{i:02}:00:00Z\"}}\n"
+            ))
+            .collect();
+        fs::write(burst_dir.path().join("failopen.jsonl"), burst).unwrap();
+
+        let drip_dir = tempfile::tempdir().unwrap();
+        let drip: String = (0..6)
+            .map(|i| format!(
+                "{{\"reason\":\"parse\",\"binaryVersion\":\"0.66.0\",\"ts\":\"2026-07-{:02}T00:00:00Z\"}}\n",
+                15 + i
+            ))
+            .collect();
+        fs::write(drip_dir.path().join("failopen.jsonl"), drip).unwrap();
+
+        let b = failopen_findings(burst_dir.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        let d = failopen_findings(drip_dir.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        assert_eq!(b.len(), 1);
+        assert_eq!(d.len(), 1);
+
+        // Identical counts — the snippet proves the totals really do match, so
+        // the difference below can only come from the distribution.
+        assert_eq!(b[0].snippet, d[0].snippet, "same total");
+
+        assert!(
+            b[0].diagnosis.contains("all on ONE day"),
+            "{}",
+            b[0].diagnosis
+        );
+        assert!(
+            b[0].remediation.contains("episode, not a")
+                && !b[0].remediation.contains("sustained feed"),
+            "{}",
+            b[0].remediation
+        );
+
+        assert!(
+            d[0].diagnosis.contains("spread over 6 of 7 days"),
+            "{}",
+            d[0].diagnosis
+        );
+        assert!(
+            d[0].remediation.contains("sustained feed problem")
+                && !d[0].remediation.contains("episode, not a"),
+            "{}",
+            d[0].remediation
+        );
+    }
+
+    #[test]
+    fn cloud_sync_marker_matches_components_not_substrings() {
+        // Component-wise is load-bearing. A substring test flags a project
+        // NAMED after a provider, and a check that cries wolf on ~/src is one
+        // the operator stops reading.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/OneDrive/repo")),
+            Some("OneDrive")
+        );
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/Library/Mobile Documents/repo")),
+            Some("Mobile Documents")
+        );
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/Library/CloudStorage/Box-x/repo")),
+            Some("CloudStorage")
+        );
+        // Case-insensitive: providers vary the casing across platforms.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/home/x/dropbox/repo")),
+            Some("Dropbox")
+        );
+        // A project merely NAMED after a provider is not a synced tree.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/src/dropbox-client")),
+            None
+        );
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/src/my-onedrive-tool")),
+            None
+        );
+        assert_eq!(cloud_sync_marker(Path::new("/Users/x/Projects/repo")), None);
+    }
+
+    #[test]
+    fn cloud_sync_marker_catches_the_m365_organization_suffix() {
+        // A Microsoft 365 business or school tenant syncs to
+        // `OneDrive - <Organization>`, which is the DOMINANT real-world shape
+        // of the deployment this check exists to catch. Exact-component
+        // matching alone never fired for it.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/OneDrive - Acme Corp/repo")),
+            Some("OneDrive")
+        );
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/OneDrive - Contoso Ltd/dev/repo")),
+            Some("OneDrive")
+        );
+        // The separator carries surrounding SPACES on purpose: a bare `-`
+        // boundary would re-admit the very false positive component matching
+        // was chosen to avoid.
+        assert_eq!(
+            cloud_sync_marker(Path::new("/Users/x/OneDrive-backups")),
+            None
+        );
+    }
+
+    #[test]
+    fn cloud_sync_findings_name_the_provider_and_the_directory() {
+        let findings = cloud_sync_findings(&[
+            ("working directory", PathBuf::from("/Users/x/OneDrive/repo")),
+            ("CLAUDE_CONFIG_DIR", PathBuf::from("/Users/x/.claude")),
+        ]);
+        assert_eq!(findings.len(), 1, "only the synced path is flagged");
+        assert_eq!(findings[0].severity, Severity::Warning, "slow, not broken");
+        assert!(
+            findings[0].diagnosis.contains("OneDrive"),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0].diagnosis.contains("working directory"),
+            "{}",
+            findings[0].diagnosis
+        );
+    }
+
+    #[test]
+    fn referenced_clis_takes_command_position_only() {
+        // An argument that happens to name a tool is not something the hook
+        // shells to; flagging it is the noise that gets a real missing
+        // dependency skipped.
+        let clis = referenced_clis("markdownlint-cli2 --config x.jsonc");
+        assert!(clis.contains("markdownlint-cli2"));
+        assert!(!clis.contains("--config"));
+
+        let clis = referenced_clis("prettier --formatter markdownlint");
+        assert!(clis.contains("prettier"));
+        assert!(!clis.contains("markdownlint"), "argument, not command word");
+
+        // Paths and unexpanded variables resolve without PATH.
+        let clis = referenced_clis("\"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" guardrails x");
+        assert!(clis.is_empty(), "{clis:?}");
+        let clis = referenced_clis("/usr/bin/env python3");
+        assert!(!clis.contains("/usr/bin/env"), "{clis:?}");
+
+        // Builtins are never a PATH lookup.
+        let clis = referenced_clis("cd /tmp && echo hi && exit 0");
+        assert!(clis.is_empty(), "{clis:?}");
+
+        // Both sides of a chain are command words.
+        let clis = referenced_clis("jq -r .x < f.json | shellcheck -");
+        assert!(clis.contains("jq"), "{clis:?}");
+    }
+
+    #[test]
+    fn referenced_clis_walks_past_transparent_prefixes() {
+        // Under a prefix, the thing that must EXIST is the argument. Naming
+        // the prefix instead is a false negative in exactly the case this
+        // check exists for — a hook silently going inert.
+        for command in [
+            "sudo mytool --run",
+            "env FOO=x mytool --run",
+            "nice -n 10 mytool --run",
+            "nohup mytool --run",
+            "command mytool --run",
+            "env FOO=x sudo nice -n 5 mytool",
+        ] {
+            let clis = referenced_clis(command);
+            assert!(clis.contains("mytool"), "{command}: {clis:?}");
+            assert!(!clis.contains("sudo"), "{command}: {clis:?}");
+            assert!(!clis.contains("env"), "{command}: {clis:?}");
+            assert!(!clis.contains("nice"), "{command}: {clis:?}");
+        }
+        // `time` is a prefix, not a CLI: stock macOS ships no /usr/bin/time,
+        // so treating it as one emits a bogus finding on every such machine.
+        let clis = referenced_clis("time mytool");
+        assert!(clis.contains("mytool"), "{clis:?}");
+        assert!(!clis.contains("time"), "{clis:?}");
+    }
+
+    #[test]
+    fn referenced_clis_strips_group_wrappers() {
+        // `(mytool --version)` is ONE segment whose first token is the garbage
+        // string `(mytool` — never on PATH, so it would report a permanently
+        // missing CLI that does not exist while never checking the real one.
+        for command in ["(mytool --version)", "{ mytool --version; }", "( mytool )"] {
+            let clis = referenced_clis(command);
+            assert!(clis.contains("mytool"), "{command}: {clis:?}");
+            assert!(
+                !clis
+                    .iter()
+                    .any(|c| c.starts_with('(') || c.starts_with('{')),
+                "{command}: {clis:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_path_requires_an_executable_bit_not_merely_a_file() {
+        // A `chmod 644` placeholder earlier on PATH would otherwise read as
+        // present while the shell fails to exec it — reporting health where
+        // there is none. Unix-only: Windows has no executable bit, and its
+        // resolution goes through PATHEXT instead.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let inert = dir.path().join("cadence-inert-probe");
+            fs::write(&inert, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&inert, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                !is_executable_at(&inert),
+                "non-executable file is not a CLI"
+            );
+
+            fs::set_permissions(&inert, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(is_executable_at(&inert), "executable file is a CLI");
+        }
+        // Present on both platforms: an absent path is never executable.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_executable_at(&dir.path().join("no-such-file")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_path_resolves_pathext_shims_not_just_exe() {
+        // Node's global installs ship `.cmd` shims — `prettier.cmd`,
+        // `markdownlint-cli2.cmd` — so resolving only `.exe` would report a
+        // large share of the CLIs hooks actually shell to as missing. This
+        // runs ONLY on the Windows leg, which is the point: the branch it
+        // covers cannot be exercised from the author's machine, and shipping
+        // an unexercised platform branch is how a fail-open gets missed.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("cadence-probe-tool.cmd");
+        fs::write(&shim, "@echo off\n").unwrap();
+        assert!(
+            is_executable_at(&dir.path().join("cadence-probe-tool")),
+            "a .cmd shim must resolve for its extensionless name"
+        );
+        assert!(
+            !is_executable_at(&dir.path().join("cadence-probe-absent")),
+            "an absent name must not resolve through PATHEXT"
+        );
+    }
+
+    #[test]
+    fn missing_cli_findings_flag_only_what_path_cannot_resolve() {
+        // `sh` is on PATH everywhere the suite runs; the invented name is not.
+        // Asserting both directions in one test keeps this from passing
+        // vacuously if `on_path` ever returned a constant.
+        let found = missing_cli_findings(
+            "sh -c true && cadence-doctor-no-such-cli-xyz --run",
+            "test-plugin",
+            Path::new("/x/hooks.json"),
+            Some(7),
+        );
+        let names: Vec<&str> = found.iter().map(|f| f.snippet.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|s| s.contains("cadence-doctor-no-such-cli-xyz")),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|s| s.contains("sh")), "{names:?}");
+        assert_eq!(found[0].plugin, "test-plugin");
+        assert_eq!(found[0].line, Some(7));
+        assert_eq!(
+            found[0].severity,
+            Severity::Warning,
+            "heuristic extraction must never be able to fail the run"
+        );
+    }
+
+    #[test]
+    fn shape_clause_is_silent_when_it_would_say_nothing() {
+        // `1 of 1 day` carries no information, and neither does a middling
+        // spread — better silent than confidently wrong about the shape.
+        assert_eq!(shape_clause(1, 1), "");
+        assert_eq!(shape_clause(0, 7), "");
+        assert_eq!(shape_remediation(3), "");
+    }
+
+    #[test]
+    fn failopen_findings_parse_diagnosis_carries_recency_and_current_version() {
+        // A burst on an OLD binary version — the fixed-and-aging-out case. The
+        // diagnosis must name the last failure, its version, and that none are
+        // on the current binary, so a fixed burst is not read as a live one.
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: String = (0..3)
+            .map(|_| {
+                r#"{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"0.61.0","ts":"2026-07-20T20:51:00Z"}"#
+                    .to_string()
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        assert_eq!(findings.len(), 1);
+        let diagnosis = &findings[0].diagnosis;
+        assert!(
+            diagnosis.contains("last: 2026-07-20T20:51:00Z on 0.61.0"),
+            "{diagnosis}"
+        );
+        assert!(diagnosis.contains("none on current 0.66.0"), "{diagnosis}");
+        assert!(
+            findings[0].remediation.contains("check the CHANGELOG"),
+            "{}",
+            findings[0].remediation
+        );
+    }
+
+    #[test]
+    fn failopen_findings_parse_diagnosis_counts_current_version_failures() {
+        // Same reason, but the failures are on the CURRENT binary — a live feed
+        // problem. The current-version clause must report the count, not "none".
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: String = (0..3)
+            .map(|_| {
+                r#"{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"0.66.0","ts":"2026-07-20T20:51:00Z"}"#
+                    .to_string()
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains("3 on current 0.66.0"),
+            "{}",
+            findings[0].diagnosis
+        );
+    }
+
+    #[test]
+    fn failopen_findings_panic_names_the_last_error_and_a_runnable_command() {
+        // The #398 complaint in one test: a panic finding that says only "N
+        // panic(s)" and "inspect failopen.jsonl" gives an operator nowhere to
+        // go. The error text and a copy-pasteable command are the fix.
+        let tmp = tempfile::tempdir().unwrap();
+        let row = r#"{"schemaVersion":2,"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","error":"index out of bounds (at crates/cadence/src/terminology.rs:88)","ts":"TS"}"#
+            .replace("TS", &cadence_hooks_core::time::utc_timestamp());
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains(
+                "last error: index out of bounds (at crates/cadence/src/terminology.rs:88)"
+            ),
+            "{}",
+            findings[0].diagnosis
+        );
+        assert!(
+            findings[0]
+                .remediation
+                .contains(r#"grep '"reason":"panic"'"#),
+            "{}",
+            findings[0].remediation
+        );
+        assert!(
+            !findings[0].remediation.contains("inspect failopen.jsonl"),
+            "the unactionable phrasing is gone: {}",
+            findings[0].remediation
+        );
+    }
+
+    #[test]
+    fn failopen_findings_parse_diagnosis_carries_the_last_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows: String = (0..3)
+            .map(|_| {
+                r#"{"schemaVersion":2,"reason":"parse","namespace":"cadence","subcommand":"heartbeat","binaryVersion":"0.66.0","error":"Failed to parse hook JSON: expected value at line 1 column 1","ts":"2026-07-20T20:51:00Z"}"#
+                    .to_string()
+            })
+            .map(|r| r + "\n")
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, fixed_now_after_the_rows(), "0.66.0");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains(
+                "last error: Failed to parse hook JSON: expected value at line 1 column 1"
+            ),
+            "{}",
+            findings[0].diagnosis
+        );
+    }
+
+    #[test]
+    fn failopen_findings_render_cleanly_for_v1_rows_without_an_error() {
+        // BACKWARD COMPAT at the render layer: an operator's existing ledger is
+        // entirely v1. The clause is omitted, not filled with a literal "null"
+        // or an empty "last error: ".
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let panic_row = format!(
+            r#"{{"schemaVersion":1,"reason":"panic","namespace":"cadence","subcommand":"terminology","binaryVersion":"1.0.0","ts":"{ts}"}}"#
+        );
+        let parse_rows: String = (0..3)
+            .map(|_| {
+                format!(
+                    r#"{{"schemaVersion":1,"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"{ts}"}}"#
+                ) + "\n"
+            })
+            .collect();
+        fs::write(
+            tmp.path().join("failopen.jsonl"),
+            format!("{panic_row}\n{parse_rows}"),
+        )
+        .unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 2);
+        for finding in &findings {
+            assert!(
+                !finding.diagnosis.contains("last error"),
+                "no empty error clause: {}",
+                finding.diagnosis
+            );
+            assert!(
+                !finding.diagnosis.contains("null"),
+                "no literal null leaks into the diagnosis: {}",
+                finding.diagnosis
+            );
+        }
+    }
+
+    /// A metrics dir exercising every character that is live inside double
+    /// quotes — command substitution both ways, a quote-closing `"`, a
+    /// backslash — plus a `'` to drive the escape idiom itself. The `$(...)`
+    /// and backtick bodies are inert `echo`s: if quoting ever regresses, the
+    /// shell round-trip below returns "INJECTED"/"ALSO" instead of the literal
+    /// and the test fails loudly rather than doing anything.
+    const HOSTILE_DIR: &str = r#"/tmp/m$(echo INJECTED)`echo ALSO`"x\y'z w"#;
+
+    #[test]
+    fn failopen_inspect_cmd_neutralizes_shell_metacharacters_in_the_path() {
+        // Structural half: the path is single-quoted, and the only `'` inside
+        // it is the escape idiom.
+        let cmd = failopen_inspect_cmd(Path::new(HOSTILE_DIR), "panic");
+        assert!(cmd.contains(r#"grep '"reason":"panic"'"#), "{cmd}");
+        assert!(
+            cmd.contains(r#"'/tmp/m$(echo INJECTED)`echo ALSO`"x\y'\''z w/failopen.jsonl'"#),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_survives_a_real_shell_round_trip() {
+        // Behavioral half, and the one that actually proves inertness: hand the
+        // quoted string to `sh` and confirm it parses back to the original
+        // bytes. Equality can only hold if no substitution, no quote break, and
+        // no backslash escape occurred — a structural assertion alone would
+        // still pass against a subtly wrong escape.
+        let quoted = shell_single_quote(HOSTILE_DIR);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .expect("spawn sh");
+
+        assert!(
+            out.status.success(),
+            "sh rejected the quoted string: {out:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            HOSTILE_DIR,
+            "the shell must reproduce the path verbatim — anything else means a \
+             metacharacter was live"
+        );
+        // Explicit about the discriminator: the marker word appears in the
+        // literal too, so its presence proves nothing. What proves inertness is
+        // that the substitution *syntax* came back as text — had `sh` evaluated
+        // it, `$(echo INJECTED)` would have collapsed to `INJECTED`.
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("$(echo INJECTED)"),
+            "the substitution syntax must survive uninterpreted"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_handles_spaces_and_plain_paths() {
+        assert_eq!(
+            shell_single_quote("/Users/a b/.claude/metrics"),
+            "'/Users/a b/.claude/metrics'"
+        );
+        assert_eq!(shell_single_quote(""), "''");
+    }
+
+    #[test]
+    fn failopen_findings_version_mismatch_old_version_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"version_mismatch","namespace":"future","subcommand":"hook","binaryVersion":"0.9.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        // The current binary is 1.0.0; the row is tagged 0.9.0 — a sanctioned
+        // rollout-transition row, excluded by construction.
+        assert!(failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0").is_empty());
+    }
+
+    #[test]
+    fn failopen_findings_version_mismatch_current_version_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"version_mismatch","namespace":"future","subcommand":"hook","binaryVersion":"1.0.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].diagnosis.contains("version_mismatch"));
+    }
+
+    // #183: the count alone leaves the operator auditing every installed
+    // plugin by hand. Name the invocations so it becomes one grep — and dedup
+    // them, because a live skew fires the same pair dozens of times.
+    #[test]
+    fn failopen_findings_version_mismatch_names_the_subcommands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let rows: String = (0..20)
+            .map(|i| {
+                let sub = if i % 2 == 0 {
+                    "persona-gate"
+                } else {
+                    "persona-nudge"
+                };
+                format!(
+                    "{{\"reason\":\"version_mismatch\",\"namespace\":\"lab\",\
+                     \"subcommand\":\"{sub}\",\"binaryVersion\":\"1.0.0\",\"ts\":\"{ts}\"}}\n"
+                )
+            })
+            .collect();
+        fs::write(tmp.path().join("failopen.jsonl"), rows).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        let d = &findings[0].diagnosis;
+        assert!(d.contains("lab persona-gate"), "names the invocation: {d}");
+        assert!(d.contains("lab persona-nudge"), "names both: {d}");
+        // The grep must cover EVERY named pair. A one-pair command leaves the
+        // operator fixing one inert hooks.json while the rest stay inert —
+        // the multi-pair case is the whole point of #183.
+        let r = &findings[0].remediation;
+        assert!(r.contains("grep -rlF"), "runnable fixed-string grep: {r}");
+        assert!(r.contains("-e 'lab persona-gate'"), "covers the first: {r}");
+        assert!(
+            r.contains("-e 'lab persona-nudge'"),
+            "covers the second: {r}"
+        );
+    }
+
+    // A row set with no namespace/subcommand (a bare invocation) must degrade
+    // to the old generic guidance rather than rendering an empty clause.
+    #[test]
+    fn failopen_findings_version_mismatch_without_pairs_stays_generic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = cadence_hooks_core::time::utc_timestamp();
+        let row = format!(
+            r#"{{"reason":"version_mismatch","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"{ts}"}}"#
+        );
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        let findings = failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            !findings[0].diagnosis.contains("does not recognize"),
+            "no dangling clause: {}",
+            findings[0].diagnosis
+        );
+        assert!(findings[0].remediation.contains("cadence-hooks list"));
+    }
+
+    #[test]
+    fn failopen_findings_outside_window_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let row = r#"{"reason":"panic","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"2000-01-01T00:00:00Z"}"#;
+        fs::write(tmp.path().join("failopen.jsonl"), format!("{row}\n")).unwrap();
+
+        assert!(failopen_findings(tmp.path(), WEEK, SystemTime::now(), "1.0.0").is_empty());
+    }
 
     // ── extract_invocation table tests ──────────────────────────────────────
 
@@ -744,6 +3360,290 @@ mod tests {
         assert!(manifest_install_paths(&manifest).is_none());
     }
 
+    // ── dir_size_bytes ───────────────────────────────────────────────────────
+
+    #[test]
+    fn dir_size_bytes_sums_known_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "12345").unwrap(); // 5 bytes
+        let sub = tmp.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("b.txt"), "1234567890").unwrap(); // 10 bytes
+
+        assert_eq!(dir_size_bytes(tmp.path()), 15);
+    }
+
+    #[test]
+    fn dir_size_bytes_missing_dir_is_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(dir_size_bytes(&missing), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dir_size_bytes_symlinked_top_level_dir_is_zero() {
+        // A symlinked `dir` argument must return 0 rather than following the
+        // link and summing whatever it points at (e.g. `$HOME` or `/`).
+        let tmp = tempfile::tempdir().unwrap();
+        let real_target = tmp.path().join("real-target");
+        fs::create_dir_all(&real_target).unwrap();
+        fs::write(real_target.join("file"), "some content here").unwrap();
+
+        let link = tmp.path().join("link-to-target");
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+        assert_eq!(dir_size_bytes(&link), 0);
+        // Sanity: the real target itself does report nonzero.
+        assert!(dir_size_bytes(&real_target) > 0);
+    }
+
+    // ── orphan_findings ──────────────────────────────────────────────────────
+
+    #[test]
+    fn orphan_findings_flags_siblings_of_pinned_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        for sha in ["sha1", "sha2", "sha3"] {
+            let dir = plugin_dir.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+        let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
+
+        let findings = orphan_findings(&pinned, false, tmp.path());
+        let orphan_finding = findings
+            .iter()
+            .find(|f| f.diagnosis.contains("orphaned"))
+            .expect("should report orphans");
+        assert!(
+            orphan_finding.diagnosis.contains("2 orphaned"),
+            "diagnosis: {}",
+            orphan_finding.diagnosis
+        );
+    }
+
+    #[test]
+    fn orphan_findings_missing_pinned_dir_is_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("mp/plugin/sha-gone");
+        let pinned = vec![("plugin@mp".to_string(), missing)];
+
+        let findings = orphan_findings(&pinned, false, tmp.path());
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].diagnosis.contains("missing or empty"));
+    }
+
+    #[test]
+    fn orphan_findings_only_pinned_dir_present_is_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        let pinned_dir = plugin_dir.join("sha1");
+        fs::create_dir_all(&pinned_dir).unwrap();
+        fs::write(pinned_dir.join("marker"), "x").unwrap();
+        let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
+
+        assert!(orphan_findings(&pinned, false, tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn orphan_findings_quiet_suppresses_orphan_count_but_not_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        for sha in ["sha1", "sha2"] {
+            let dir = plugin_dir.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+        let missing = tmp.path().join("mp/other/sha-gone");
+
+        let pinned = vec![
+            ("plugin@mp".to_string(), plugin_dir.join("sha1")),
+            ("other@mp".to_string(), missing),
+        ];
+
+        let findings = orphan_findings(&pinned, true, tmp.path());
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the missing-dir warning fires quiet"
+        );
+        assert!(findings[0].diagnosis.contains("missing or empty"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn orphan_findings_does_not_follow_symlinked_sibling() {
+        // A symlinked sibling must never be treated as an orphan version dir
+        // to recurse into — a planted symlink pointing at, say, `$HOME`
+        // would otherwise get walked and summed by `dir_size_bytes`.
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        let pinned_dir = plugin_dir.join("sha1");
+        fs::create_dir_all(&pinned_dir).unwrap();
+        fs::write(pinned_dir.join("marker"), "x").unwrap();
+
+        // A real directory elsewhere with content the walk must NOT reach.
+        let escape_target = tmp.path().join("escape-target");
+        fs::create_dir_all(&escape_target).unwrap();
+        fs::write(escape_target.join("secret"), "should not be counted").unwrap();
+
+        // The planted symlinked "orphan" sibling, pointing outside the cache.
+        let symlinked_sibling = plugin_dir.join("sha-evil-link");
+        std::os::unix::fs::symlink(&escape_target, &symlinked_sibling).unwrap();
+
+        let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
+        let findings = orphan_findings(&pinned, false, tmp.path());
+
+        assert!(
+            findings.is_empty(),
+            "a symlinked sibling must not be reported as an orphan, found {} finding(s): {:?}",
+            findings.len(),
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orphan_findings_excludes_active_pins_sharing_parent() {
+        // Two active pins (sha-A/sha-B) sharing a parent must NEVER be
+        // reported as "safe to prune" — only the genuine orphan (sha-C)
+        // should generate a finding, and exactly one (not one per label).
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("cache/mp/p");
+        for sha in ["sha-A", "sha-B", "sha-C"] {
+            let dir = parent.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+
+        let pinned = vec![
+            ("p@mp".to_string(), parent.join("sha-A")),
+            ("p@mp".to_string(), parent.join("sha-B")),
+        ];
+
+        let findings = orphan_findings(&pinned, false, tmp.path());
+        let orphan_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.diagnosis.contains("orphaned"))
+            .collect();
+
+        assert_eq!(
+            orphan_findings.len(),
+            1,
+            "exactly one orphan finding (for sha-C's parent), found: {:?}",
+            orphan_findings
+                .iter()
+                .map(|f| &f.diagnosis)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            orphan_findings[0].diagnosis.contains("1 orphaned"),
+            "only sha-C should count as an orphan (a count of 2 would mean \
+             sha-A/sha-B misjudged each other as orphans): {}",
+            orphan_findings[0].diagnosis
+        );
+        assert_eq!(
+            orphan_findings[0].file, parent,
+            "the finding is attributed to the shared parent, not a sha subdir"
+        );
+    }
+
+    // ── known_marketplace_sources ────────────────────────────────────────────
+
+    #[test]
+    fn known_marketplace_sources_reads_github_entries_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("known_marketplaces.json");
+        fs::write(
+            &manifest,
+            r#"{
+  "workbench": {
+    "source": { "source": "github", "repo": "cameronsjo/workbench" },
+    "installLocation": "/home/x/.claude/plugins/marketplaces/workbench"
+  },
+  "local-dev": {
+    "source": { "source": "directory", "path": "/home/x/dev/plugin" },
+    "installLocation": "/home/x/dev/plugin"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let sources = known_marketplace_sources(&manifest);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].0, "workbench");
+        assert_eq!(sources[0].2, "cameronsjo/workbench");
+    }
+
+    #[test]
+    fn known_marketplace_sources_missing_file_is_empty() {
+        assert!(
+            known_marketplace_sources(Path::new("/nonexistent/known_marketplaces.json")).is_empty()
+        );
+    }
+
+    #[test]
+    fn known_marketplace_sources_invalid_json_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("known_marketplaces.json");
+        fs::write(&manifest, "{ not json").unwrap();
+        assert!(known_marketplace_sources(&manifest).is_empty());
+    }
+
+    // ── canonical_remote_finding ─────────────────────────────────────────────
+
+    #[test]
+    fn canonical_remote_finding_matching_https_remote_is_none() {
+        assert!(
+            canonical_remote_finding(
+                "workbench",
+                Path::new("/x"),
+                "cameronsjo/workbench",
+                Some("https://github.com/cameronsjo/workbench.git"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_remote_finding_matching_scp_remote_is_none() {
+        assert!(
+            canonical_remote_finding(
+                "workbench",
+                Path::new("/x"),
+                "cameronsjo/workbench",
+                Some("git@github.com:cameronsjo/workbench.git"),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_remote_finding_mismatched_repo_is_warning() {
+        let f = canonical_remote_finding(
+            "workbench",
+            Path::new("/x"),
+            "cameronsjo/workbench",
+            Some("https://github.com/someone-else/fork.git"),
+        )
+        .expect("mismatch should warn");
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.diagnosis.contains("someone-else/fork"), "{}", f.diagnosis);
+        assert!(
+            f.diagnosis.contains("cameronsjo/workbench"),
+            "{}",
+            f.diagnosis
+        );
+    }
+
+    #[test]
+    fn canonical_remote_finding_no_actual_remote_is_none() {
+        assert!(
+            canonical_remote_finding("workbench", Path::new("/x"), "cameronsjo/workbench", None)
+                .is_none()
+        );
+    }
+
     // ── judge_invocation tests ───────────────────────────────────────────────
 
     #[test]
@@ -890,6 +3790,35 @@ mod tests {
         assert!(!h.contains("brew"), "{h}");
     }
 
+    // ── quiet_warning_summary (#306) ────────────────────────────────────────
+
+    #[test]
+    fn quiet_summary_names_actor_and_action() {
+        let s = quiet_warning_summary("0.60.0", 2, false, InstallChannel::Unknown);
+        assert!(s.contains("Claude:"), "must name the actor: {s}");
+        assert!(
+            s.contains("run 'cadence-hooks doctor'"),
+            "must name the action: {s}"
+        );
+    }
+
+    #[test]
+    fn quiet_summary_no_skew_omits_upgrade_hint() {
+        let s = quiet_warning_summary("0.60.0", 1, false, InstallChannel::Homebrew);
+        assert!(!s.contains("brew upgrade"), "no upgrade hint expected: {s}");
+        assert!(!s.contains("Version skew"), "no skew clause expected: {s}");
+    }
+
+    #[test]
+    fn quiet_summary_skew_includes_upgrade_hint() {
+        let s = quiet_warning_summary("0.60.0", 1, true, InstallChannel::Homebrew);
+        assert!(s.contains("Version skew"), "skew clause expected: {s}");
+        assert!(
+            s.contains("brew upgrade cadence-hooks"),
+            "Homebrew skew hint expected: {s}"
+        );
+    }
+
     // ── integration tests via run(Some(tmpdir), ...) ─────────────────────────
 
     /// Build a minimal hooks.json under a temp plugin dir structure.
@@ -938,7 +3867,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), false), 0);
+        assert_eq!(run(Some(root.path()), false, false, false), 0);
     }
 
     #[test]
@@ -946,7 +3875,7 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" cadence no-such-hook"#,
         ]);
-        assert_eq!(run(Some(root.path()), false), 1);
+        assert_eq!(run(Some(root.path()), false, false, false), 1);
     }
 
     #[test]
@@ -954,7 +3883,7 @@ mod tests {
         let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), false), 2);
+        assert_eq!(run(Some(root.path()), false, false, false), 2);
     }
 
     #[test]
@@ -963,7 +3892,7 @@ mod tests {
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' cadence no-such-hook"#,
         ]);
         // Single-quoted (Error) + unknown sub (Warning) → exit 2
-        assert_eq!(run(Some(root.path()), false), 2);
+        assert_eq!(run(Some(root.path()), false, false, false), 2);
     }
 
     #[test]
@@ -973,7 +3902,7 @@ mod tests {
         ]);
         // Capture stdout is not trivial in unit tests; we verify exit code here.
         // The output assertion is covered by manually running the binary.
-        assert_eq!(run(Some(root.path()), true), 0);
+        assert_eq!(run(Some(root.path()), true, false, false), 0);
     }
 
     #[test]
@@ -981,7 +3910,7 @@ mod tests {
         let root = write_fixture(&[
             r#"'${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh' guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), true), 2);
+        assert_eq!(run(Some(root.path()), true, false, false), 2);
     }
 
     #[test]
@@ -989,6 +3918,391 @@ mod tests {
         let root = write_fixture(&[
             r#""${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh" guardrails guard-push-remote"#,
         ]);
-        assert_eq!(run(Some(root.path()), true), 0);
+        assert_eq!(run(Some(root.path()), true, false, false), 0);
+    }
+
+    // ── orphan_dirs ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn orphan_dirs_returns_stale_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        for sha in ["sha1", "sha2", "sha3"] {
+            let dir = plugin_dir.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+        let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
+
+        let mut dirs = orphan_dirs(&pinned, tmp.path());
+        dirs.sort();
+        assert_eq!(dirs, vec![plugin_dir.join("sha1"), plugin_dir.join("sha3")]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn orphan_dirs_skips_symlinked_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        let pinned_dir = plugin_dir.join("sha1");
+        fs::create_dir_all(&pinned_dir).unwrap();
+        fs::write(pinned_dir.join("marker"), "x").unwrap();
+
+        let escape_target = tmp.path().join("escape-target");
+        fs::create_dir_all(&escape_target).unwrap();
+
+        let symlinked_sibling = plugin_dir.join("sha-evil-link");
+        std::os::unix::fs::symlink(&escape_target, &symlinked_sibling).unwrap();
+
+        let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
+        assert!(orphan_dirs(&pinned, tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn orphan_dirs_skips_pin_outside_cache_root() {
+        // A manifest `installPath` that resolves outside the cache root (an
+        // absolute path elsewhere, or an `/etc`-style system dir) must be
+        // skipped entirely — its parent is never scanned, so nothing outside
+        // the root can ever be nominated as an orphan.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        // A real directory OUTSIDE the cache root, sibling to a bogus pin's
+        // parent, that must never be scanned or returned.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(outside.join("decoy")).unwrap();
+
+        let pinned = vec![("evil@mp".to_string(), outside.join("pinned-but-fake"))];
+
+        assert!(
+            orphan_dirs(&pinned, &cache_root).is_empty(),
+            "a pin outside the cache root must never be scanned"
+        );
+    }
+
+    #[test]
+    fn orphan_dirs_excludes_all_active_pins_sharing_parent() {
+        // Two active pins (e.g. two scopes/SHAs of the same plugin key) that
+        // share a parent directory must BOTH be excluded when scanning that
+        // parent — neither may be reported as an orphan just because the
+        // other pin's own scan didn't know about it. A genuine orphan
+        // sibling (sha-C) must still be returned.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("cache/mp/p");
+        for sha in ["sha-A", "sha-B", "sha-C"] {
+            let dir = parent.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+
+        let pinned = vec![
+            ("p@mp".to_string(), parent.join("sha-A")),
+            ("p@mp".to_string(), parent.join("sha-B")),
+        ];
+
+        let dirs = orphan_dirs(&pinned, tmp.path());
+        assert_eq!(
+            dirs,
+            vec![parent.join("sha-C")],
+            "only the genuine orphan (sha-C) should be returned; both active \
+             pins sharing the parent must be excluded"
+        );
+    }
+
+    // ── prune_orphans ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn prune_orphans_dry_run_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("f"), "12345").unwrap();
+
+        let (removed, _freed) = prune_orphans(&[a.clone(), b.clone()], false, tmp.path());
+        assert_eq!(removed, 2);
+        assert!(a.exists(), "dry-run must not delete a");
+        assert!(b.exists(), "dry-run must not delete b");
+    }
+
+    #[test]
+    fn prune_orphans_apply_removes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("f"), "1234567890").unwrap(); // 10 bytes
+
+        let (removed, freed) = prune_orphans(std::slice::from_ref(&a), true, tmp.path());
+        assert_eq!(removed, 1);
+        assert!(freed > 0, "freed bytes: {freed}");
+        assert!(!a.exists(), "apply must delete the orphan dir");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_orphans_skips_symlink_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real-target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keepme"), "important").unwrap();
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let (removed, freed) = prune_orphans(std::slice::from_ref(&link), true, tmp.path());
+        assert_eq!(removed, 0, "a symlink handed in must never be removed");
+        assert_eq!(freed, 0);
+        assert!(target.exists(), "symlink target must survive");
+        assert!(target.join("keepme").exists());
+    }
+
+    #[test]
+    fn prune_orphans_refuses_dir_outside_cache_root() {
+        // Defense in depth: even if a caller (bug, future code path) hands
+        // `prune_orphans` a path outside the resolved cache root, it must
+        // refuse to touch it rather than remove_dir_all-ing it.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+        fs::create_dir_all(&cache_root).unwrap();
+
+        let outside = tmp.path().join("outside-target");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keepme"), "important").unwrap();
+
+        let (removed, freed) = prune_orphans(std::slice::from_ref(&outside), true, &cache_root);
+        assert_eq!(removed, 0, "a dir outside cache_root must never be removed");
+        assert_eq!(freed, 0);
+        assert!(outside.exists(), "outside dir must survive");
+        assert!(outside.join("keepme").exists());
+    }
+
+    // ── prune_liveness_gate (#305) ──────────────────────────────────────────
+
+    /// Write a fresh peer record and return its sessions dir.
+    fn seed_session(name: &str, session_id: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude").join("sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: name.into(),
+            session_id: session_id.into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        session_registry::write_record(&dir, &rec).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn prune_liveness_gate_forces_through() {
+        // force wins even with a live session pinned.
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        assert!(matches!(
+            prune_liveness_gate(Some(&dir), 600, true),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_none_dir_proceeds() {
+        assert!(matches!(
+            prune_liveness_gate(None, 600, false),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_empty_dir_proceeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            prune_liveness_gate(Some(tmp.path()), 600, false),
+            PruneGate::Proceed
+        ));
+    }
+
+    #[test]
+    fn prune_liveness_gate_live_session_blocks_and_names() {
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        // Large stale window so the just-written record counts as live.
+        match prune_liveness_gate(Some(&dir), 600, false) {
+            PruneGate::Blocked(names) => {
+                assert!(
+                    names.contains(&"forge-anvil".to_string()),
+                    "block must name the live session: {names:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a live session must block the prune"),
+        }
+    }
+
+    #[test]
+    fn prune_liveness_gate_only_stale_proceeds() {
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let dir = tmp.path().join(".claude").join("sessions");
+        // stale_secs = 0: any measurable mtime age makes the peer stale.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(matches!(
+            prune_liveness_gate(Some(&dir), 0, false),
+            PruneGate::Proceed
+        ));
+    }
+
+    // ── legacy_config_findings / cadence_config_parse_finding (#153) ─────────
+
+    fn seed_claude(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        for (name, body) in files {
+            fs::write(claude.join(name), body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn legacy_config_findings_flags_present_files() {
+        let dir = seed_claude(&[("redaction.json", "{}"), ("terminology.json", "{}")]);
+        let findings = legacy_config_findings(dir.path());
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| f.severity == Severity::Warning));
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.remediation.contains("migrate-config")),
+            "each remediation points at migrate-config"
+        );
+        let snippets: Vec<&str> = findings.iter().map(|f| f.snippet.as_str()).collect();
+        assert!(snippets.contains(&"redaction.json"));
+        assert!(snippets.contains(&"terminology.json"));
+    }
+
+    #[test]
+    fn legacy_config_findings_clean_repo_is_empty() {
+        // Only the unified file present → nothing to warn about.
+        let dir = seed_claude(&[("cadence.json", r#"{"version":1}"#)]);
+        assert!(legacy_config_findings(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn legacy_config_findings_partial_flags_only_present() {
+        let dir = seed_claude(&[("redaction.json", "{}")]);
+        let findings = legacy_config_findings(dir.path());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].snippet, "redaction.json");
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_malformed_warns() {
+        let dir = seed_claude(&[("cadence.json", "{not valid json")]);
+        let finding =
+            cadence_config_parse_finding(dir.path()).expect("a malformed cadence.json must warn");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(finding.diagnosis.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_valid_is_none() {
+        let dir = seed_claude(&[(
+            "cadence.json",
+            r#"{"version":1,"terminology":{"exemptions":[]}}"#,
+        )]);
+        assert!(cadence_config_parse_finding(dir.path()).is_none());
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_non_object_warns() {
+        // Syntactically-valid JSON whose top level is not an object: every
+        // guard's `value.get(section)` yields nothing, so they silently fall
+        // open to defaults. Doctor must still warn, and distinguish this from
+        // the malformed-JSON case.
+        let dir = seed_claude(&[("cadence.json", "[]")]);
+        let finding =
+            cadence_config_parse_finding(dir.path()).expect("a non-object cadence.json must warn");
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(finding.diagnosis.contains("not a JSON object"));
+        assert!(!finding.diagnosis.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn cadence_config_parse_finding_absent_is_none() {
+        let dir = seed_claude(&[]);
+        assert!(cadence_config_parse_finding(dir.path()).is_none());
+    }
+
+    // ── platform_drift_status_lines tests ───────────────────────────────────
+
+    fn write_platform_baseline(dir: &Path, hooks_version: &str, cc_version: &str) -> PathBuf {
+        let path = dir.join("platform-baseline.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"claude_code":{{"last_swept_version":"{cc_version}","swept_on":"2026-07-23","sweep_doc":"n/a"}},"cadence_hooks":{{"current_version":"{hooks_version}"}}}}"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn platform_drift_status_missing_baseline_is_one_info_line() {
+        let lines = platform_drift_status_lines(None, Some("2.1.218"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("baseline not found"));
+    }
+
+    #[test]
+    fn platform_drift_status_unreadable_baseline_is_one_info_line() {
+        let lines = platform_drift_status_lines(
+            Some(Path::new("/nonexistent/baseline.json")),
+            Some("2.1.218"),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("unreadable"));
+    }
+
+    #[test]
+    fn platform_drift_status_malformed_baseline_is_one_info_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("platform-baseline.json");
+        fs::write(&path, "not json").unwrap();
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("malformed"));
+    }
+
+    #[test]
+    fn platform_drift_status_current_baseline_is_two_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), env!("CARGO_PKG_VERSION"), "2.1.218");
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("cadence-hooks"));
+        assert!(lines[1].contains("Claude Code"));
+    }
+
+    #[test]
+    fn platform_drift_status_far_ahead_baseline_is_still_two_lines() {
+        // Unthresholded: doctor shows both current-state lines regardless of
+        // gap size, unlike the SessionStart nudge's >= 5 threshold.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), "0.1.0", "2.0.0");
+        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("0.1.0"));
+        assert!(lines[1].contains("2.1.218"));
+        assert!(lines[1].contains("2.0.0"));
+    }
+
+    #[test]
+    fn platform_drift_status_missing_cc_version_notes_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_platform_baseline(tmp.path(), env!("CARGO_PKG_VERSION"), "2.1.218");
+        let lines = platform_drift_status_lines(Some(&path), None);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("unavailable"));
     }
 }

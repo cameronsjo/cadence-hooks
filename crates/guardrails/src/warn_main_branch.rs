@@ -18,104 +18,47 @@
 //! branch. That work is never the branch-worthy product change the warning targets.
 
 use crate::dismiss_main_branch_warn;
-use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput, Outcome};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Resolve the directory to pass to `git -C` for a given hook input.
-///
-/// When the hook fires for an Edit/Write, returns the parent directory of
-/// the edited file. `git -C <dir>` walks upward to find `.git`, so this
-/// routes branch detection to the file's enclosing repo — even when CWD
-/// belongs to an outer parent repo (the nested-repo case).
-///
-/// Relative `file_path` values are joined against `input.cwd` so we resolve
-/// against the hook event's CWD, not the hook process's CWD. For Bash hooks
-/// (no file path), falls back to `input.cwd` then `.` so we still target the
-/// session's working directory rather than wherever the hook process started.
-fn git_dir_for_input(input: &HookInput) -> PathBuf {
-    let cwd = input
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let Some(file_path) = input.file_path() else {
-        return cwd;
-    };
-
-    let path = Path::new(&file_path);
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-
-    resolved
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or(cwd)
-}
-
-/// Returns true if `dir` lives inside a `.claude/` directory.
-///
-/// These paths hold Claude Code tooling and state, never the branch-worthy
-/// product work the warning targets, so the check stays out of them:
-///
-/// - `<repo>/.claude/worktrees/<name>/...` — worktrees created by
-///   `EnterWorktree` / `cadence-forge:using-worktrees` are always on an
-///   intentional feature branch. A worktree that happens to sit on `main` is
-///   still ad-hoc work, never the load-bearing primary checkout (issue #33).
-/// - `~/.claude/...` — user config and the auto-written memory directory.
-///   `~/.claude` may itself be a git repo on `main`, but edits there aren't
-///   repo feature work (issue #35).
-///
-/// Matches on an exact `.claude` path component, so look-alikes like
-/// `.claude-old` or `myclaude` are not exempt.
-fn is_claude_managed_dir(dir: &Path) -> bool {
-    dir.components().any(|c| c.as_os_str() == ".claude")
-}
-
-/// Returns true if `dir` is a cadence plan-document directory (`docs/plans`).
-///
-/// Approved plans are copied to `docs/plans/` on the default branch by design —
-/// cadence's plan-execution rule mandates it — so authoring a plan there is not
-/// the branch-worthy product change this warning targets. Without the carve-out
-/// the once-per-session warning is *consumed* by that first plan-doc write, so
-/// later real product edits on `main` then escape unwarned (issue #226).
-///
-/// Matches consecutive `docs` → `plans` path components anywhere in the path, so
-/// a bare `plans/`, a non-adjacent `docs/foo/plans`, or a look-alike like
-/// `mydocs/plans` is not exempt.
-fn is_plan_doc_dir(dir: &Path) -> bool {
-    let comps: Vec<_> = dir.components().map(|c| c.as_os_str()).collect();
-    comps.windows(2).any(|w| w[0] == "docs" && w[1] == "plans")
-}
+// `git_dir_for_input`, `is_claude_managed_dir`, and `is_plan_doc_dir` all live
+// in `cadence_hooks_core::worktree` now, so `warn-main-branch` and
+// `enforce-worktree` each import the single core definition rather than
+// `enforce` borrowing this guard's copy (`git_dir_for_input` relocated in
+// cadence-hooks#164; the carve-out predicates in #236).
+use cadence_hooks_core::worktree::{git_dir_for_input, is_claude_managed_dir, is_plan_doc_dir};
 
 /// Returns true if the branch name is a default branch (`main` or `master`).
 fn is_default_branch(branch: &str) -> bool {
     branch == "main" || branch == "master"
 }
 
-/// Returns true if `CADENCE_ALLOW_MAIN` env var is set to a truthy value.
+/// Resolve `CADENCE_ALLOW_MAIN` for a repo the same way `enforce-worktree`
+/// does — the shared resolution, not warn's old env-only read (cadence-hooks#164).
 ///
-/// Truthy: `"1"`, `"true"`, `"yes"` (case-insensitive). Anything else (unset,
-/// empty, `"0"`, `"false"`) is falsy. Set in `.claude/settings.json` env
-/// block — project or user-global — to permanently opt a repo out of the
-/// main-branch warning.
-fn is_main_allowed() -> bool {
-    is_main_allowed_value(std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref())
-}
-
-/// Pure: classify a `CADENCE_ALLOW_MAIN` value as truthy or falsy.
-fn is_main_allowed_value(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes")
-    )
+/// Two truthy sources, either opts the repo out permanently: the **process
+/// env** (session-wide), or — when process env doesn't set it — the target
+/// **repo's own tracked Claude settings** (`.claude/settings.json`'s `env`
+/// block), gated on a primary checkout so a linked worktree's settings can't
+/// speak for the repo. Before this collapse, warn honored *only* the process
+/// env, so a by-design-main repo (dotfiles, a vault) that declared the flag in
+/// its settings — as `enforce-worktree` already respects — still got nudged on
+/// `main`. Truthy is `"1"`/`"true"`/`"yes"` (trimmed, case-insensitive) via the
+/// shared [`is_truthy`](cadence_hooks_core::worktree::is_truthy). Absent /
+/// unparsable settings declare nothing and fall through (ADR-0001).
+fn is_main_allowed(repo_root: &Path) -> bool {
+    use cadence_hooks_core::worktree::{is_primary_checkout, is_truthy};
+    let env_allowed = is_truthy(std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref());
+    if env_allowed {
+        return true;
+    }
+    // Repo-declared: the target repo's own tracked settings, gated on a primary
+    // checkout so a linked worktree's settings can't speak for the repo.
+    is_primary_checkout(&repo_root.to_string_lossy())
+        && is_truthy(
+            cadence_hooks_core::config::repo_env_flag(repo_root, "CADENCE_ALLOW_MAIN").as_deref(),
+        )
 }
 
 /// Pure decision: should we warn about editing on this branch?
@@ -145,22 +88,13 @@ pub struct WarnMainBranch;
 impl WarnMainBranch {
     /// Build the per-session marker path scoped to a specific repo root.
     ///
-    /// Hashes the repo root so two repos with the same name don't share
-    /// markers. The PPID component ties the marker to the Claude Code
-    /// session — hooks run as separate child processes so `process::id()`
-    /// would change every invocation.
-    fn marker_path(repo_root: &str) -> PathBuf {
-        let mut hasher = DefaultHasher::new();
-        repo_root.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let ppid = std::env::var("PPID")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or_else(std::process::id);
-
-        cadence_hooks_core::paths::marker_temp_dir()
-            .join(format!(".claude-main-branch-warned-{hash:x}-{ppid}"))
+    /// Delegates to the shared [`cadence_hooks_core::markers::session_marker`]
+    /// primitive: keyed on the Claude Code session id (stable across a session's
+    /// many separate hook processes — the pre-CP0 `PPID`→pid scheme re-warned
+    /// every edit because `PPID` is never exported, #133) and the repo-root hash,
+    /// under the private 0700 marker dir.
+    fn marker_path(input: &HookInput, repo_root: &str) -> PathBuf {
+        cadence_hooks_core::markers::session_marker(input, "main-branch-warned", Some(repo_root))
     }
 }
 
@@ -186,11 +120,10 @@ impl Check for WarnMainBranch {
         // `git -C` walks upward to find `.git`, picking the nearest enclosing
         // repository — which is what we want when editing inside a nested
         // checkout from a session whose CWD is the outer parent.
-        let branch = match Command::new("git")
-            .args(["-C", &dir_arg, "symbolic-ref", "--short", "HEAD"])
-            .output()
-        {
-            Ok(out) if out.status.success() => {
+        let mut branch_cmd = Command::new("git");
+        branch_cmd.args(["-C", &dir_arg, "symbolic-ref", "--short", "HEAD"]);
+        let branch = match cadence_hooks_core::shell::run_git_bounded(&mut branch_cmd) {
+            cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             }
             _ => return CheckResult::allow(),
@@ -198,25 +131,41 @@ impl Check for WarnMainBranch {
 
         // Repo root for marker — same source as the branch query so the
         // once-per-session suppression actually keys off the same repo.
-        let repo_root = match Command::new("git")
-            .args(["-C", &dir_arg, "rev-parse", "--show-toplevel"])
-            .output()
-        {
-            Ok(out) if out.status.success() => {
+        let mut root_cmd = Command::new("git");
+        root_cmd.args(["-C", &dir_arg, "rev-parse", "--show-toplevel"]);
+        let repo_root = match cadence_hooks_core::shell::run_git_bounded(&mut root_cmd) {
+            cadence_hooks_core::shell::GitSpawn::Completed(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
             }
             _ => return CheckResult::allow(),
         };
 
-        let marker = Self::marker_path(&repo_root);
+        let marker = Self::marker_path(input, &repo_root);
         let already_warned = marker.exists();
-        let snoozed = dismiss_main_branch_warn::is_snoozed_now(Path::new(&repo_root));
-        let allowed = is_main_allowed();
+        let snoozed = dismiss_main_branch_warn::is_snoozed_now(input, Path::new(&repo_root));
+        let allowed = is_main_allowed(Path::new(&repo_root));
 
         let result = should_warn(&branch, already_warned, snoozed, allowed);
 
         if result.outcome == Outcome::Nudge {
-            let _ = std::fs::write(&marker, "");
+            let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+            return result;
+        }
+
+        // The nudge was suppressed. Attribute it to an active dismissal when that
+        // is *why* it went quiet — a default branch, not already warned this
+        // session, and snoozed. A permanent `CADENCE_ALLOW_MAIN` allow is the
+        // by-design config for main-mode repos (dotfiles, vaults), not a bypass
+        // worth a line per edit, so it stays a bare allow.
+        if snoozed && is_default_branch(&branch) && !already_warned {
+            let meta = dismiss_main_branch_warn::read_meta(input, Path::new(&repo_root));
+            return CheckResult::allow_bypassed(BypassProvenance {
+                kind: BypassKind::Dismissal,
+                mechanism: "dismiss-main-branch-warn".to_string(),
+                reason: meta.as_ref().and_then(|m| m.reason.clone()),
+                expires_at: meta.as_ref().and_then(|m| m.expires_at),
+                armed_by_session: meta.and_then(|m| m.session_id),
+            });
         }
 
         result
@@ -324,24 +273,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn marker_uses_ppid_not_pid() {
-        // Bug: code uses process::id() (current PID) but names var "ppid"
-        // Since hooks run as separate processes, each invocation gets a new PID,
-        // so the marker file from a previous invocation is never found.
-        // The intent was to use the PARENT PID (Claude Code process) for session scoping.
-        let ppid_env = std::env::var("PPID")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
-        let current_pid = std::process::id();
-        if let Some(ppid) = ppid_env {
-            assert_ne!(
-                current_pid, ppid,
-                "PID should differ from PPID — marker_path() should use PPID for session scoping"
-            );
-        }
-    }
-
     // --- Regression: nested-repo branch resolution (issue #26) ---
     // When CWD is an outer repo and the edited file is in a nested inner repo,
     // branch resolution must follow the file path, not CWD. Using `git -C
@@ -416,22 +347,40 @@ mod tests {
         assert_eq!(git_dir_for_input(&input), PathBuf::from("."));
     }
 
+    fn input_with_session(sid: &str) -> HookInput {
+        HookInput {
+            session_id: Some(sid.into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn marker_path_differs_per_repo() {
         // Two different repo roots should produce distinct marker paths
         // so a snooze in one repo doesn't suppress warnings in another.
-        let a = WarnMainBranch::marker_path("/tmp/repo-a");
-        let b = WarnMainBranch::marker_path("/tmp/repo-b");
+        let input = input_with_session("sid");
+        let a = WarnMainBranch::marker_path(&input, "/tmp/repo-a");
+        let b = WarnMainBranch::marker_path(&input, "/tmp/repo-b");
         assert_ne!(a, b, "marker path must include a repo-specific hash");
     }
 
     #[test]
     fn marker_path_stable_for_same_repo() {
-        // Same repo root, called twice in the same process, should produce
-        // the same marker path so suppression works.
-        let a = WarnMainBranch::marker_path("/tmp/repo");
-        let b = WarnMainBranch::marker_path("/tmp/repo");
+        // Same repo root and session, called twice, should produce the same
+        // marker path so suppression works.
+        let input = input_with_session("sid");
+        let a = WarnMainBranch::marker_path(&input, "/tmp/repo");
+        let b = WarnMainBranch::marker_path(&input, "/tmp/repo");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn marker_path_differs_per_session() {
+        // The #133 fix: the marker is keyed on the session id, so two sessions
+        // in the same repo each get their own once-per-session nudge.
+        let a = WarnMainBranch::marker_path(&input_with_session("sid-a"), "/tmp/repo");
+        let b = WarnMainBranch::marker_path(&input_with_session("sid-b"), "/tmp/repo");
+        assert_ne!(a, b, "marker must be session-scoped");
     }
 
     #[test]
@@ -525,46 +474,10 @@ mod tests {
         );
     }
 
-    // --- is_main_allowed_value (pure) ---
-
-    #[test]
-    fn allowed_value_unset_is_false() {
-        assert!(!is_main_allowed_value(None));
-    }
-
-    #[test]
-    fn allowed_value_empty_is_false() {
-        assert!(!is_main_allowed_value(Some("")));
-        assert!(!is_main_allowed_value(Some("   ")));
-    }
-
-    #[test]
-    fn allowed_value_falsy_strings() {
-        assert!(!is_main_allowed_value(Some("0")));
-        assert!(!is_main_allowed_value(Some("false")));
-        assert!(!is_main_allowed_value(Some("no")));
-        assert!(!is_main_allowed_value(Some("off")));
-    }
-
-    #[test]
-    fn allowed_value_truthy_strings() {
-        assert!(is_main_allowed_value(Some("1")));
-        assert!(is_main_allowed_value(Some("true")));
-        assert!(is_main_allowed_value(Some("yes")));
-    }
-
-    #[test]
-    fn allowed_value_case_insensitive() {
-        assert!(is_main_allowed_value(Some("TRUE")));
-        assert!(is_main_allowed_value(Some("True")));
-        assert!(is_main_allowed_value(Some("YES")));
-    }
-
-    #[test]
-    fn allowed_value_trims_whitespace() {
-        assert!(is_main_allowed_value(Some("  true  ")));
-        assert!(is_main_allowed_value(Some("\t1\n")));
-    }
+    // `CADENCE_ALLOW_MAIN` truthy parsing is now the shared
+    // `core::worktree::is_truthy` (tested there); warn's own duplicate was
+    // removed with the #164 resolution collapse. Repo-declared resolution is
+    // covered by `run()`-level tests below.
 
     // --- .claude/ directory carve-out (issues #33, #35) ---
 
@@ -617,6 +530,23 @@ mod tests {
         assert!(!is_claude_managed_dir(Path::new(".")));
     }
 
+    #[test]
+    fn claude_parentdir_escape_still_warns() {
+        // #152: a crafted `..` that escapes the `.claude` segment must not spoof
+        // the carve-out — the normalized dir is `.../src`, so it still warns.
+        assert!(!is_claude_managed_dir(Path::new(
+            "/Users/x/repo/.claude/../src"
+        )));
+    }
+
+    #[test]
+    fn claude_curdir_segment_still_managed() {
+        // A `.` segment inside a `.claude` path is a no-op and stays exempt.
+        assert!(is_claude_managed_dir(Path::new(
+            "/Users/x/repo/.claude/./worktrees/f"
+        )));
+    }
+
     // --- docs/plans carve-out (#226) ---
     // Approved plans are copied to docs/plans/ on the default branch by design
     // (cadence's plan-execution rule mandates it), so plan-doc authoring there
@@ -663,5 +593,239 @@ mod tests {
     fn plan_doc_dir_components_must_be_consecutive() {
         // `docs/` then a different dir then `plans/` is not the canonical path.
         assert!(!is_plan_doc_dir(Path::new("/Users/x/repo/docs/foo/plans")));
+    }
+
+    #[test]
+    fn plan_doc_parentdir_escape_still_warns() {
+        // #152: `docs/plans/../../src` normalizes to `.../src`, so a crafted `..`
+        // escaping the plan-doc carve-out must still warn for a real product file.
+        assert!(!is_plan_doc_dir(Path::new(
+            "/Users/x/repo/docs/plans/../../src"
+        )));
+    }
+
+    #[test]
+    fn plan_doc_curdir_segment_still_exempt() {
+        // A `.` segment inside docs/plans is a no-op and stays exempt.
+        assert!(is_plan_doc_dir(Path::new("/Users/x/repo/docs/plans/./q2")));
+    }
+
+    #[test]
+    fn plan_doc_leading_parentdir_relative_still_exempt() {
+        // A leading `..` with no preceding component to pop leaves `docs/plans`
+        // intact, so a relative plan-doc path stays exempt.
+        assert!(is_plan_doc_dir(Path::new("../docs/plans")));
+    }
+
+    // --- bypass attribution via run() (real repo on main) ---
+    //
+    // The `should_warn` tests above cover the pure decision; these exercise the
+    // full `run()` path where a suppressed nudge is (or isn't) attributed to an
+    // active dismissal. A real git repo on `main` is needed because run() shells
+    // out for branch + toplevel.
+
+    /// Init a git repo checked out on `main` in a fresh tempdir; return the
+    /// tempdir plus the git-resolved (canonical) repo root.
+    fn init_repo_on_main() -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        git(&["add", "f.txt"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let root = cadence_hooks_core::shell::git_command(
+            &tmp.path().to_string_lossy(),
+            &["rev-parse", "--show-toplevel"],
+        )
+        .expect("temp repo resolves a toplevel");
+        (tmp, root)
+    }
+
+    fn edit_input_in(repo: &Path, session: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(repo.join("src.rs").to_string_lossy().into_owned()),
+                new_string: Some("x".into()),
+                old_string: Some("y".into()),
+                ..Default::default()
+            }),
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            session_id: Some(session.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Write the session-scoped snooze marker + provenance sidecar the guard
+    /// reads, keyed on the same `(input, repo_root)` as the reader.
+    fn arm_snooze(input: &HookInput, repo_root: &str, reason: Option<&str>) {
+        let marker = cadence_hooks_core::markers::session_marker(
+            input,
+            "main-branch-snooze",
+            Some(repo_root),
+        );
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        cadence_hooks_core::markers::write_marker(&marker, &format!("{until}\n")).unwrap();
+        let sidecar = crate::snooze_meta::sidecar_for(&marker);
+        let meta = crate::snooze_meta::SnoozeMeta {
+            reason: reason.map(str::to_string),
+            session_id: input.session_id().map(str::to_string),
+            armed_at: Some(1),
+            expires_at: Some(until as i64),
+        };
+        cadence_hooks_core::markers::write_marker(&sidecar, &meta.to_json()).unwrap();
+    }
+
+    #[test]
+    fn snooze_suppressed_nudge_attributes_dismissal() {
+        let (tmp, root) = init_repo_on_main();
+        let input = edit_input_in(tmp.path(), "warn-bypass-a");
+        arm_snooze(&input, &root, Some("wrap-up edits on dotfiles"));
+
+        let r = WarnMainBranch.run(&input);
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "active snooze suppresses the nudge"
+        );
+        let prov = r.bypass.expect("suppressed nudge carries provenance");
+        assert_eq!(prov.kind, BypassKind::Dismissal);
+        assert_eq!(prov.mechanism, "dismiss-main-branch-warn");
+        assert_eq!(prov.reason.as_deref(), Some("wrap-up edits on dotfiles"));
+        assert_eq!(prov.armed_by_session.as_deref(), Some("warn-bypass-a"));
+    }
+
+    #[test]
+    fn snooze_without_sidecar_attributes_dismissal_with_none_reason() {
+        // A snooze armed before the sidecar existed still attributes a Dismissal,
+        // just with no reason/session (the guard tolerates a missing sidecar).
+        let (tmp, root) = init_repo_on_main();
+        let input = edit_input_in(tmp.path(), "warn-bypass-legacy");
+        let marker =
+            cadence_hooks_core::markers::session_marker(&input, "main-branch-snooze", Some(&root));
+        let until = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        cadence_hooks_core::markers::write_marker(&marker, &format!("{until}\n")).unwrap();
+
+        let r = WarnMainBranch.run(&input);
+        assert_eq!(r.outcome, Outcome::Allow);
+        let prov = r.bypass.expect("still attributes a dismissal");
+        assert_eq!(prov.kind, BypassKind::Dismissal);
+        assert_eq!(prov.reason, None, "missing sidecar → no reason");
+        assert_eq!(prov.armed_by_session, None);
+    }
+
+    #[test]
+    fn already_warned_allow_carries_no_bypass() {
+        // Once the session has been warned, a later edit is a plain dedup allow —
+        // NOT a bypass — even if a snooze is also present. The `!already_warned`
+        // guard on attribution must hold.
+        let (tmp, root) = init_repo_on_main();
+        let input = edit_input_in(tmp.path(), "warn-bypass-warned");
+        arm_snooze(&input, &root, Some("some reason"));
+        // Pre-plant the once-per-session "warned" marker.
+        let warned =
+            cadence_hooks_core::markers::session_marker(&input, "main-branch-warned", Some(&root));
+        cadence_hooks_core::markers::write_marker(&warned, "").unwrap();
+
+        let r = WarnMainBranch.run(&input);
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(
+            r.bypass.is_none(),
+            "an already-warned dedup allow is not a bypass"
+        );
+    }
+
+    #[test]
+    fn feature_branch_edit_carries_no_bypass() {
+        // Off a default branch there's nothing to bypass — bare allow.
+        let (tmp, _root) = init_repo_on_main();
+        Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["checkout", "-q", "-b", "feat/x"])
+            .output()
+            .unwrap();
+        let input = edit_input_in(tmp.path(), "warn-bypass-feat");
+        let r = WarnMainBranch.run(&input);
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(r.bypass.is_none(), "feature-branch allow is not a bypass");
+    }
+
+    // --- repo-declared CADENCE_ALLOW_MAIN (#164 resolution collapse) ---
+    //
+    // `is_main_allowed` reads real process env, which a caller's own
+    // environment may already set (CLAUDE.md: Claude sessions can ambiently
+    // carry `CADENCE_ALLOW_MAIN=true`) — clear it for the test that must prove
+    // the *repo-declared* source is what allows, serialized against every other
+    // `CADENCE_ALLOW_MAIN`-mutating test *across the crate* (not just this
+    // module) via the shared `crate::CADENCE_ALLOW_MAIN_TEST_LOCK`
+    // (cadence-hooks#298 — `warn_branch_base` mutates the same var).
+
+    #[test]
+    fn repo_declared_allow_main_suppresses_nudge() {
+        // #164: warn now honors a repo-declared CADENCE_ALLOW_MAIN in the repo's
+        // own `.claude/settings.json`, matching enforce-worktree — a
+        // by-design-main repo that opted out in settings is no longer nudged on
+        // `main`. This is the intended behavior change; everything else is
+        // verdict-locked.
+        let _guard = crate::CADENCE_ALLOW_MAIN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("CADENCE_ALLOW_MAIN").ok();
+        // SAFETY: serialized via CADENCE_ALLOW_MAIN_TEST_LOCK; restored below. With
+        // process env cleared, the only allow source is the settings file.
+        unsafe {
+            std::env::remove_var("CADENCE_ALLOW_MAIN");
+        }
+
+        let (tmp, _root) = init_repo_on_main();
+        let claude = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        )
+        .unwrap();
+
+        let input = edit_input_in(tmp.path(), "warn-allow-repo-declared");
+        let r = WarnMainBranch.run(&input);
+
+        // SAFETY: serialized via ALLOW_MAIN_ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
+                None => std::env::remove_var("CADENCE_ALLOW_MAIN"),
+            }
+        }
+
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "repo-declared allow-main suppresses the nudge"
+        );
+        assert!(
+            r.bypass.is_none(),
+            "a by-design allow-main is a bare allow, not a bypass"
+        );
     }
 }

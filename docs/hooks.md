@@ -28,7 +28,7 @@ For how hooks communicate with Claude Code (stdin/stdout/exit codes), see
 
 `warn-overshare` does path triage only — it fires on commit/push/PR/issue Bash
 commands and on Write/Edit to `docs/field-reports/`, then leaves the content
-judgment to the model. It exempts retro paths and writes under `$OBSIDIAN_VAULT`
+judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 (the safe home for personal context), and is silenced session-wide with
 `CADENCE_SKIP_OVERSHARE_AUDIT=1`.
 
@@ -41,14 +41,14 @@ judgment to the model. It exempts retro paths and writes under `$OBSIDIAN_VAULT`
 | `guard-gh-dangerous` | PreToolUse (Bash) | Block irreversible gh operations (repo delete) |
 | `guard-git-init` | PostToolUse (Bash) | Nudge to scaffold and confirm license after `git init` or `gh repo create` |
 | `warn-main-branch` | PreToolUse (Write, Edit) | Warn when editing on main/master branch |
+| `enforce-worktree` | PreToolUse (Write, Edit, Bash) | Block mutations and `git commit` in a primary checkout of a branch-mode repo — work in a worktree instead (exempt: `CADENCE_ALLOW_MAIN` repos, temp/scratch repos, `.claude/` + `docs/plans/` paths) |
 | `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base |
 | `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs |
 | `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
-| `check-idle-return` | PreToolUse | Nudge after idle periods between edits |
 | `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main |
 | `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) |
 | `warn-pr-issue-link` | PreToolUse (Bash) | Nudge when `gh pr create` has no closing issue keyword (`Closes #N`) in the body |
-| `warn-issue-tracker` | PreToolUse (Bash) | Nudge when `gh issue create` targets an owned repo other than the canonical tracker |
+| `warn-issue-tracker` | PreToolUse (Bash) | Nudge when `gh issue create` targets an owned repo that is not a known ecosystem tracker |
 | `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge |
 | `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed |
 | `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
@@ -94,6 +94,10 @@ exit 0. They never block a tool call (see
 | `snapshot` | PreToolUse (Bash, `git commit`) | Snapshot HEAD before a commit, so `log-commit` can tell whether it landed |
 | `log-commit` | PostToolUse (Bash, `git commit`) | Scan the transcript for tokens since the last commit, compute cost, append to `commits.jsonl` |
 | `log-subagent` | SubagentStart / SubagentStop | Append a subagent lifecycle record to `subagents.jsonl` |
+| `log-session` | SessionEnd | Scan the whole session log at session end, compute per-model cost, append to `sessions.jsonl` |
+| `log-session-start` | SessionStart | Stamp the session start timestamp, so `log-session` can compute `durationMs` at `SessionEnd` |
+| `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` |
+| `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` |
 
 `log-commit` reads its price table from the embedded default, overridable with
 `--prices <path>` (or `CADENCE_METRICS_PRICES`). Set `CADENCE_METRICS_DEBUG=1`
@@ -105,24 +109,6 @@ Cost is computed **per model**: when a commit range spans multiple models
 its own rates and summed. Records carry the breakdown in a `byModel` array
 (`[{model, tokens, costUsd}]`); rows written before this field existed are
 single-model by definition.
-
-## lab (cadence-lab)
-
-Experimental hooks for the [cadence-lab](https://github.com/cameronsjo/cadence-lab)
-plugin. The first is the **self-representation persona ledger** — a two-hook system
-that captures a constrained, per-session self-representation and appends it to an
-append-only `~/.claude/persona/personas.jsonl`.
-
-| Hook | Event | What it does |
-|------|-------|--------------|
-| `persona-nudge` | SessionStart (startup, clear) | Inject a contract asking the model to record a constrained self-representation to a per-session staging file |
-| `persona-gate` | PostToolUse (Write) | Validate the staging candidate; feed itemized corrections back for a rewrite, or promote the validated record into the ledger |
-
-The gate uses the `LoopBlock` outcome — exit 0 with `{"decision":"block","reason":...}`
-— rather than a hard `exit 2`, because `PostToolUse` fires *after* the write, so the
-re-prompt convention (not the block convention) is what drives the rewrite. Cheek mode
-ships `warn` (annotate a system-written `flags` field, still promote). Configure via
-`~/.claude/persona/config.json`; record shape in the plugin's `schema/persona.schema.json`.
 
 ## session (cadence-canon)
 
@@ -138,6 +124,7 @@ give sessions *identity* within a repo via a registry at `<repo>/.claude/session
 | `heartbeat` | PostToolUse | Touch this session's registry file; refresh the recorded branch so peers see branch drift |
 | `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths |
 | `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time |
+| `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one |
 
 Liveness is mtime-based: a session that crashes or closes simply stops heartbeating
 and is presumed dead after 10 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
@@ -155,3 +142,4 @@ during maintenance.
 | `session declare` | Declare what this session is working on (`--intent`, `--touching`) so peers can assess collision risk |
 | `session status` | List live and stale sessions registered in this repo |
 | `guardrails dismiss-main-branch-warn` | Snooze `warn-main-branch` for this repo for a bounded window (`--for 2h`, capped at 24h) — see [Snoozing warn-main-branch](configuration.md#snoozing-warn-main-branch) |
+| `guardrails dismiss-enforce-worktree` | Snooze the `enforce-worktree` block for this repo for a bounded window (`--for 30m`, capped at 24h) — the one-off escape for a legitimate primary-checkout mutation |

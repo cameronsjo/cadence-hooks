@@ -3,11 +3,41 @@
 //! Dispatches to per-crate check implementations via `clap` subcommands.
 //! Each hook subcommand reads JSON from stdin (the hook protocol) and exits
 //! with 0 (allow), 1 (warn), or 2 (block). The CLI commands (`list`, `doctor`,
-//! `configure`, `try`, `session declare`/`status`) take no stdin.
+//! `configure`, `try`, `migrate-config`, `session declare`/`status`) take no
+//! stdin.
 
-use cadence_hooks_core::{HookEvent, run_check_from_stdin, run_logger_from_stdin};
+use cadence_hooks_core::HookEvent;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::process;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::ThreadId;
+
+/// Set by [`dispatch`] around the region its `catch_unwind` covers, and read by
+/// the global panic hook below.
+///
+/// A panic hook runs **before** unwinding begins, so the hook's
+/// `process::exit(1)` terminated the process and no `catch_unwind` downstream
+/// ever regained control — every guard in the tree was dead code
+/// (cameronsjo/cadence-hooks#349). This flag lets the hook *return* instead,
+/// handing the unwind to the waiting guard, and only where a guard is actually
+/// waiting. Unguarded panics keep the historical exit-1 path exactly.
+///
+/// `Relaxed` is sufficient: the store and the panic hook's load happen on the
+/// same thread in program order, and a load from any *other* thread is
+/// short-circuited by the `MAIN_THREAD` test below before its value matters.
+pub(crate) static PANIC_GUARDED: AtomicBool = AtomicBool::new(false);
+
+/// The thread `main` runs on, pinned at entry.
+///
+/// `PANIC_GUARDED` is a process-global, but the `catch_unwind` it advertises
+/// only catches unwinds on the **main** thread. Guarded regions spawn worker
+/// threads (`core::shell::run_bounded_with`'s stdout drain), and a panic there
+/// unwinds that thread, not `main` — so without this test the hook would skip
+/// the exit for a panic nothing is positioned to catch, silently losing the
+/// fail-open exit. `OnceLock` rather than a constant because a thread id is
+/// only knowable at runtime.
+static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
 /// Return true when running inside Claude Code. Detected via `CLAUDECODE=1`,
 /// which Claude Code exports for every spawned shell. Empty/unset means no.
@@ -18,7 +48,10 @@ fn under_claude_code() -> bool {
 }
 
 mod configure;
+mod dispatch;
 mod doctor;
+mod hook_latency;
+mod migrate;
 mod registry;
 mod try_hook;
 use registry::{HOOKS, HookEntry};
@@ -37,6 +70,7 @@ const PROTECTED_GUARDS: &[&str] = &[
     "guard-op-vault-scan",
     "guard-browser-device",
     "guard-dotfiles",
+    "guard-read-model",
     "trash-guard",
 ];
 
@@ -73,17 +107,13 @@ enum Commands {
     #[command(subcommand)]
     Metrics(MetricsCommands),
 
-    /// Cadence lab (experimental) hooks (read hook JSON on stdin)
-    #[command(subcommand)]
-    Lab(LabCommands),
-
     /// Multi-session coordination hooks (cadence-canon; hooks read JSON on stdin)
     #[command(subcommand)]
     Session(SessionCommands),
 
     /// Run a hook against a generated sample payload (manual testing)
     Try {
-        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, lab, session)
+        /// Hook namespace (cadence, guardrails, rules, obsidian, metrics, session)
         namespace: String,
         /// Hook name (see `cadence-hooks list`)
         subcommand: String,
@@ -113,7 +143,16 @@ enum Commands {
         /// One-line summary output; exit non-zero only on errors. For SessionStart preflight.
         #[arg(long)]
         quiet: bool,
+        /// List orphaned plugin-cache version dirs that would be removed (dry-run; no deletion)
+        #[arg(long)]
+        prune: bool,
+        /// With --prune, actually remove the orphaned version dirs (default is dry-run)
+        #[arg(long)]
+        apply: bool,
     },
+
+    /// Convert legacy .claude/{redaction,terminology}.json into the unified .claude/cadence.json (#153)
+    MigrateConfig,
 }
 
 #[derive(Subcommand)]
@@ -144,6 +183,27 @@ enum CadenceCommands {
     MarkdownLint,
     /// Nudge when an external post mentions internal harness vocabulary
     RedactExternalContent,
+    /// Nudge when the cadence-hooks binary or Claude Code has drifted behind
+    /// the plugin-shipped platform baseline (SessionStart)
+    PlatformDrift {
+        /// Path to the platform-baseline.json shipped by the cadence plugin
+        #[arg(long, value_name = "PATH")]
+        baseline: Option<String>,
+    },
+    /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
+    RecordPolish {
+        /// Repository to record against (default: the current directory's).
+        /// Resolved to the repo's shared git dir, so any worktree of it works
+        /// and the marker stays readable by the pre-PR gate
+        #[arg(long, value_name = "PATH")]
+        repo_root: Option<String>,
+        /// Branch to record against (default: the checked-out branch)
+        #[arg(long, value_name = "NAME")]
+        branch: Option<String>,
+        /// What the pass covered — `full`, `code`, or `docs` (default: full)
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -160,8 +220,8 @@ enum GuardrailsCommands {
     WarnMainBranch,
     /// Warn when dispatching a subagent from main while a sibling worktree exists
     WarnSubagentWorktree,
-    /// Nudge after idle periods between edits
-    CheckIdleReturn,
+    /// Nudge when the live subagent count is at or over the concurrency cap
+    WarnSubagentConcurrency,
     /// Warn when creating a branch from a non-main base
     WarnBranchBase,
     /// Remind to check datetime before scheduling cron jobs
@@ -172,10 +232,16 @@ enum GuardrailsCommands {
     WarnUntracked,
     /// Block direct edits to production dotfiles (opt-in via CADENCE_GUARD_DOTFILES=1)
     GuardDotfiles,
+    /// Path-aware triage of rm-family deletes (allow temp/managed, block home/vault/repo, ask the rest)
+    GuardRm,
+    /// Block Read/Grep by resolved session model (opt-in via CADENCE_READ_MODEL_GUARD_MODELS)
+    GuardReadModel,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
     WarnPrIssueLink,
     /// Nudge when `gh issue create` targets a repo other than the canonical issue tracker
     WarnIssueTracker,
+    /// Nudge on repo create/publicize when name or description telegraphs sensitive content
+    WarnGoingPublic,
     /// Verify issue auto-close after PR create/merge; close stragglers
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
@@ -197,6 +263,26 @@ enum GuardrailsCommands {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
         #[arg(long = "for", default_value = "30m", value_name = "DURATION")]
         for_: String,
+        /// Why the guard is being dismissed. Required for snoozes over 1h;
+        /// recorded in the bypass provenance log.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+    },
+    /// Block mutations in a primary checkout of a branch-mode repo
+    EnforceWorktree,
+    /// Snooze enforce-worktree for this repo for the given duration
+    DismissEnforceWorktree {
+        /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
+        #[arg(long = "for", default_value = "30m", value_name = "DURATION")]
+        for_: String,
+        /// Why the guard is being dismissed. Required for snoozes over 1h;
+        /// recorded in the repo-visible bypass provenance log.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// Repo to snooze, if not the current directory's repo — e.g. after a
+        /// `cd <other-repo> && git commit` was blocked against that repo.
+        #[arg(long, value_name = "PATH")]
+        repo: Option<String>,
     },
 }
 
@@ -231,18 +317,23 @@ enum MetricsCommands {
     },
     /// Log subagent lifecycle (SubagentStart / SubagentStop)
     LogSubagent,
+    /// Log per-session cost at SessionEnd (SessionEnd)
+    LogSession {
+        /// Override path to the model price table (JSON). Falls back to the
+        /// embedded default; `CADENCE_METRICS_PRICES` env takes precedence.
+        #[arg(long, value_name = "PATH")]
+        prices: Option<String>,
+    },
+    /// Capture session start timestamp (SessionStart)
+    LogSessionStart,
     /// Log polish-nudge skips: `gh pr create` + whether /polish ran (PostToolUse)
     LogPolishNudge,
-    /// Log AskUserQuestion stance + shape on every call (PreToolUse)
+    /// Log AskUserQuestion: asked (PreToolUse) + answered (PostToolUse)
     LogAskUserQuestion,
-}
-
-#[derive(Subcommand)]
-enum LabCommands {
-    /// Inject the self-representation contract on session start (SessionStart)
-    PersonaNudge,
-    /// Validate and promote a self-representation candidate (PostToolUse)
-    PersonaGate,
+    /// Log skill invocations (PostToolUse:Skill)
+    LogSkill,
+    /// Warn at SessionStart when metrics telemetry has gone stale (SessionStart)
+    WarnStale,
 }
 
 #[derive(Subcommand)]
@@ -255,12 +346,20 @@ enum SessionCommands {
     Guard,
     /// Warn when HEAD drifted from the session's recorded branch at git commit (PreToolUse)
     WarnBranchDrift,
+    /// Nudge when new work starts on a stale, unrelated feature branch (PreToolUse)
+    WarnBranchIntent,
+    /// Nudge toward a `Session-Id:` trailer on a Claude-composed commit message (PreToolUse)
+    WarnCommitProvenance,
     /// Deregister this session's registry file when it ends (SessionEnd logger)
     End,
     /// Record loose ends when the session ends, for the next start to surface (SessionEnd logger)
     BackstopRecord,
     /// Warn at session start when the last session in this repo left loose ends (SessionStart)
     BackstopWarn,
+    /// Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)
+    PersistPlan,
+    /// Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)
+    PersistPlanApproval,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -295,6 +394,11 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::RedactExternalContent => "redact-external-content",
+            CadenceCommands::PlatformDrift { .. } => "platform-drift",
+            // record-polish is a CLI action, not a hook — no hooks.json wiring
+            // and not subject to CADENCE_DISABLE (same treatment as declare /
+            // status / dismiss-*).
+            CadenceCommands::RecordPolish { .. } => return None,
         }),
         Commands::Guardrails(g) => Some(match g {
             GuardrailsCommands::GuardPushRemote => "guard-push-remote",
@@ -303,14 +407,17 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardGitInit => "guard-git-init",
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
             GuardrailsCommands::WarnSubagentWorktree => "warn-subagent-worktree",
-            GuardrailsCommands::CheckIdleReturn => "check-idle-return",
+            GuardrailsCommands::WarnSubagentConcurrency => "warn-subagent-concurrency",
             GuardrailsCommands::WarnBranchBase => "warn-branch-base",
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
             GuardrailsCommands::WarnUntracked => "warn-untracked",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
+            GuardrailsCommands::GuardRm => "guard-rm",
+            GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
+            GuardrailsCommands::WarnGoingPublic => "warn-going-public",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
@@ -319,11 +426,13 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             GuardrailsCommands::GuardBrowserDevice => "guard-browser-device",
             GuardrailsCommands::InjectGhContext => "inject-gh-context",
-            // dismiss-main-branch-warn is a CLI action, not a hook —
-            // it has no PreToolUse/PostToolUse wiring and isn't subject
+            GuardrailsCommands::EnforceWorktree => "enforce-worktree",
+            // The dismiss-* subcommands are CLI actions, not hooks —
+            // they have no PreToolUse/PostToolUse wiring and aren't subject
             // to CADENCE_DISABLE. Falling out of the Some(...) here is
-            // intentional; handle it specially below.
+            // intentional; handle them specially below.
             GuardrailsCommands::DismissMainBranchWarn { .. } => return None,
+            GuardrailsCommands::DismissEnforceWorktree { .. } => return None,
         }),
         Commands::Rules(r) => Some(match r {
             RulesCommands::ValidateFrontmatter => "validate-frontmatter",
@@ -338,21 +447,25 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::Snapshot => "snapshot",
             MetricsCommands::LogCommit { .. } => "log-commit",
             MetricsCommands::LogSubagent => "log-subagent",
+            MetricsCommands::LogSession { .. } => "log-session",
+            MetricsCommands::LogSessionStart => "log-session-start",
             MetricsCommands::LogPolishNudge => "log-polish-nudge",
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
-        }),
-        Commands::Lab(l) => Some(match l {
-            LabCommands::PersonaNudge => "persona-nudge",
-            LabCommands::PersonaGate => "persona-gate",
+            MetricsCommands::LogSkill => "log-skill",
+            MetricsCommands::WarnStale => "warn-stale",
         }),
         Commands::Session(s) => Some(match s {
             SessionCommands::Start => "start",
             SessionCommands::Heartbeat => "heartbeat",
             SessionCommands::Guard => "guard",
             SessionCommands::WarnBranchDrift => "warn-branch-drift",
+            SessionCommands::WarnBranchIntent => "warn-branch-intent",
+            SessionCommands::WarnCommitProvenance => "warn-commit-provenance",
             SessionCommands::End => "end",
             SessionCommands::BackstopRecord => "backstop-record",
             SessionCommands::BackstopWarn => "backstop-warn",
+            SessionCommands::PersistPlan => "persist-plan",
+            SessionCommands::PersistPlanApproval => "persist-plan-approval",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -361,7 +474,8 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         Commands::Try { .. }
         | Commands::List
         | Commands::Configure { .. }
-        | Commands::Doctor { .. } => None,
+        | Commands::Doctor { .. }
+        | Commands::MigrateConfig => None,
     }
 }
 
@@ -421,13 +535,21 @@ fn print_hook_list() {
 }
 
 fn main() {
+    // Pin the main thread before anything can spawn — the panic hook's guard
+    // test below is only meaningful once this is set. The `Result` is
+    // discarded because `main` runs once: an `Err` would mean the cell was
+    // already set, which cannot happen, and failing open on it is right anyway
+    // (an unset cell just restores the unconditional exit-1 path).
+    let _ = MAIN_THREAD.set(std::thread::current().id());
+
     // Maintenance bypass — set CADENCE_BYPASS=1 to skip all enforcement.
     // Useful when editing hook source or testing. Per-session, can't be left on accidentally.
-    // Note: `list`, `configure`, `doctor`, `try`, and the session CLI actions
-    // (`declare`, `status`) are exempt — they're CLI/diagnostic commands, not
-    // enforcement paths, and must work always. A bypassed doctor would report
-    // false-clean in CI; a bypassed `session status` would hide live peers
-    // exactly when someone is debugging coordination.
+    // Note: `list`, `configure`, `doctor`, `try`, `migrate-config`, and the
+    // session CLI actions (`declare`, `status`) are exempt — they're
+    // CLI/diagnostic/maintenance commands, not enforcement paths, and must work
+    // always. A bypassed doctor would report false-clean in CI; a bypassed
+    // `session status` would hide live peers exactly when someone is debugging
+    // coordination; a bypassed `migrate-config` would silently migrate nothing.
     let bypassed = std::env::var("CADENCE_BYPASS").as_deref() == Ok("1");
     // Match on subcommand *position* (argv[1], or argv[1]+argv[2] for session
     // CLI actions) — not any argv token, which would let a hook argument that
@@ -435,16 +557,21 @@ fn main() {
     let mut positional = std::env::args().skip(1);
     let bypass_exempt = matches!(
         (positional.next().as_deref(), positional.next().as_deref()),
-        (Some("list" | "configure" | "doctor" | "try"), _)
-            | (Some("session"), Some("declare" | "status"))
+        (
+            Some("list" | "configure" | "doctor" | "try" | "migrate-config"),
+            _
+        ) | (Some("session"), Some("declare" | "status"))
     );
     if bypassed && !bypass_exempt {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
     }
 
-    // Catch panics and exit 1 (warn) instead of the default exit 101.
-    // A panic means a bug in a check — it should not block the user's operation.
+    // Catch panics and exit 1 (warn) instead of the default exit 101 — a panic
+    // means a bug in a check, and it must not block the user's operation.
+    // Exception: inside a `PANIC_GUARDED` region this hook returns instead of
+    // exiting, so the waiting `catch_unwind` can finish the dispatch tail and
+    // fail open at exit 0 (see the flag's doc, cameronsjo/cadence-hooks#349).
     std::panic::set_hook(Box::new(|info| {
         let payload = if let Some(msg) = info.payload().downcast_ref::<&str>() {
             (*msg).to_string()
@@ -457,7 +584,51 @@ fn main() {
             "cadence-hooks: internal error (panic). This hook will not block your operation.\n\
              {payload}"
         );
-        process::exit(1);
+        // Best-effort argv re-read: this closure has no access to the `Check`/
+        // `Logger`/`hook` context computed elsewhere in `main` (a panic can
+        // strike anywhere), so it re-derives the attempted subcommand purely
+        // for diagnostic tagging — not validated against the registry.
+        let mut argv = std::env::args().skip(1);
+        let namespace = argv.next();
+        let subcommand = argv.next();
+        // The payload plus the source location — the two things that make this
+        // row answer "why did it panic?" instead of merely "it panicked"
+        // (cameronsjo/cadence-hooks#398).
+        //
+        // NO CURRENTLY-REACHABLE PATH LEAKS HOOK DATA HERE, but this is text
+        // the repo does not author, so the property is not structural. A panic
+        // anywhere in the process lands here, including inside `regex`,
+        // `serde_json`, `jiff`, and `brush-parser` — which is fed raw
+        // `tool_input.command` (crates/core/src/loop_analysis.rs). Rust's own
+        // panic messages are *designed* to embed data: `slice_error_fail`
+        // quotes the offending string, `Result::unwrap` prints `{:?}` of the
+        // error. So the first future `&s[..n]` on a payload-derived string
+        // would write up to 200 characters of hook input into a durable
+        // ledger. Today every production `panic!`/`.expect()` carries a static
+        // message, the config-driven regex compiles use `if let Ok(re)` rather
+        // than `.expect`, and every byte-index slice derives its offsets from
+        // ASCII-anchored searches. If that ever stops holding, redact through
+        // the same seam `crates/cadence/src/secret_patterns.rs`'s
+        // `scan_secret_values` uses — it returns a pattern *name*, never the
+        // matched value.
+        let error = match info.location() {
+            Some(loc) => format!("{payload} (at {}:{})", loc.file(), loc.line()),
+            None => payload,
+        };
+        cadence_hooks_metrics::log_failopen(
+            "panic",
+            namespace.as_deref(),
+            subcommand.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+            Some(&error),
+        );
+        // Exit only when nothing downstream is positioned to catch this unwind.
+        // A panic hook runs before unwinding starts, so exiting here would make
+        // every `catch_unwind` in the tree unreachable — see `PANIC_GUARDED`.
+        let on_main = MAIN_THREAD.get() == Some(&std::thread::current().id());
+        if !(on_main && PANIC_GUARDED.load(Ordering::Relaxed)) {
+            process::exit(1);
+        }
     }));
 
     // Build the clap Command. Under Claude Code, hide `configure` from --help
@@ -521,6 +692,23 @@ fn main() {
                          \n\
                          Underlying error: {e}"
                     );
+                    // Best-effort argv re-read, same as the panic hook — a
+                    // clap parse failure means `cli`/`hook_name` were never
+                    // computed, so the raw argv position is all we have.
+                    let mut argv = std::env::args().skip(1);
+                    let namespace = argv.next();
+                    let subcommand = argv.next();
+                    // The clap error *kind* ("InvalidSubcommand" /
+                    // "UnknownArgument"), not the full error — that is
+                    // multi-line and ANSI-colored, and the kind is the whole
+                    // diagnostic here anyway.
+                    cadence_hooks_metrics::log_failopen(
+                        "version_mismatch",
+                        namespace.as_deref(),
+                        subcommand.as_deref(),
+                        installed,
+                        Some(&format!("{:?}", e.kind())),
+                    );
                     process::exit(1);
                 }
                 // Everything else (--help, --version, other clap errors) uses
@@ -552,10 +740,20 @@ fn main() {
         }
     }
 
+    // The canonical registry hook name for the dispatched subcommand, threaded
+    // into the logged-dispatch wrapper so `denials.jsonl` records the name that
+    // cross-references `registry::HOOKS` / `hookFiredTotal` — not the divergent
+    // `Check::name()` (e.g. `terminology`, not `terminology-guard`). `Copy`
+    // (`Option<&'static str>`), so binding it here borrows `&cli.command` before
+    // the `match` below moves it. `None` for the CLI-action subcommands, which
+    // never dispatch a check.
+    let canonical_hook = hook_name(&cli.command);
+
     // Event type aliases for readability at callsites.
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
     let session = HookEvent::SessionStart;
+    let user_prompt_submit = HookEvent::UserPromptSubmit;
 
     match cli.command {
         Commands::Try {
@@ -591,230 +789,389 @@ fn main() {
             }
             configure::run(list, HOOKS);
         }
-        Commands::Doctor { root, quiet } => {
-            process::exit(doctor::run(root.as_deref(), quiet).into());
+        Commands::Doctor {
+            root,
+            quiet,
+            prune,
+            apply,
+        } => {
+            process::exit(doctor::run(root.as_deref(), quiet, prune, apply).into());
+        }
+        Commands::MigrateConfig => {
+            process::exit(migrate::run().into());
         }
         Commands::Cadence(cmd) => match cmd {
-            CadenceCommands::Terminology => {
-                run_check_from_stdin(&cadence_hooks_cadence::terminology::TerminologyGuard, pre)
-            }
-            CadenceCommands::OrphanedTodos => run_check_from_stdin(
+            CadenceCommands::Terminology => dispatch::run_logged_check(
+                &cadence_hooks_cadence::terminology::TerminologyGuard,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::OrphanedTodos => dispatch::run_logged_check(
                 &cadence_hooks_cadence::block_orphaned_todos::OrphanedTodoGuard,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::PreventSecretLeaks => run_check_from_stdin(
+            CadenceCommands::PreventSecretLeaks => dispatch::run_logged_check(
                 &cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::PreventSecretWrites => run_check_from_stdin(
+            CadenceCommands::PreventSecretWrites => dispatch::run_logged_check(
                 &cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::MemoryGuard => {
-                run_check_from_stdin(&cadence_hooks_cadence::memory_guard::MemoryGuard, pre)
-            }
-            CadenceCommands::GitSafety => {
-                run_check_from_stdin(&cadence_hooks_cadence::git_safety::GitSafetyGuard, pre)
-            }
-            CadenceCommands::LineEndings => run_check_from_stdin(
+            CadenceCommands::MemoryGuard => dispatch::run_logged_check(
+                &cadence_hooks_cadence::memory_guard::MemoryGuard,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::GitSafety => dispatch::run_logged_check(
+                &cadence_hooks_cadence::git_safety::GitSafetyGuard,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::LineEndings => dispatch::run_logged_check(
                 &cadence_hooks_cadence::validate_line_endings::LineEndingsGuard,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::EnvVars => {
-                run_check_from_stdin(&cadence_hooks_cadence::validate_env_vars::EnvVarGuard, pre)
-            }
-            CadenceCommands::WarnDocsUpdate => run_check_from_stdin(
+            CadenceCommands::EnvVars => dispatch::run_logged_check(
+                &cadence_hooks_cadence::validate_env_vars::EnvVarGuard,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::WarnDocsUpdate => dispatch::run_logged_check(
                 &cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::WarnOvershare => {
-                run_check_from_stdin(&cadence_hooks_cadence::warn_overshare::WarnOvershare, pre)
-            }
-            CadenceCommands::NudgePolishBeforePr => run_check_from_stdin(
+            CadenceCommands::WarnOvershare => dispatch::run_logged_check(
+                &cadence_hooks_cadence::warn_overshare::WarnOvershare,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::NudgePolishBeforePr => dispatch::run_logged_check(
                 &cadence_hooks_cadence::nudge_polish_before_pr::NudgePolishBeforePr,
                 pre,
+                canonical_hook,
             ),
-            CadenceCommands::MarkdownLint => {
-                run_check_from_stdin(&cadence_hooks_cadence::markdown_lint::MarkdownLint, pre)
-            }
-            CadenceCommands::RedactExternalContent => run_check_from_stdin(
+            CadenceCommands::MarkdownLint => dispatch::run_logged_check(
+                &cadence_hooks_cadence::markdown_lint::MarkdownLint,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::RedactExternalContent => dispatch::run_logged_check(
                 &cadence_hooks_cadence::redact_external_content::RedactExternalContent,
                 pre,
+                canonical_hook,
             ),
+            CadenceCommands::PlatformDrift { baseline } => dispatch::run_logged_check(
+                &cadence_hooks_cadence::platform_drift::PlatformDrift {
+                    baseline_path: baseline,
+                },
+                session,
+                canonical_hook,
+            ),
+            CadenceCommands::RecordPolish {
+                repo_root,
+                branch,
+                scope,
+            } => {
+                cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope);
+            }
         },
         Commands::Guardrails(cmd) => match cmd {
-            GuardrailsCommands::GuardPushRemote => run_check_from_stdin(
+            GuardrailsCommands::GuardPushRemote => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_push_remote::PushRemoteGuard,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardGhDangerous => run_check_from_stdin(
+            GuardrailsCommands::GuardGhDangerous => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_gh_dangerous::GhDangerousGuard,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardGhWrite => {
-                run_check_from_stdin(&cadence_hooks_guardrails::guard_gh_write::GhWriteGuard, pre)
-            }
-            GuardrailsCommands::GuardGitInit => run_check_from_stdin(
+            GuardrailsCommands::GuardGhWrite => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_gh_write::GhWriteGuard,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::GuardGitInit => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_git_init::GuardGitInit,
                 post,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnMainBranch => run_check_from_stdin(
+            GuardrailsCommands::WarnMainBranch => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_main_branch::WarnMainBranch,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnSubagentWorktree => run_check_from_stdin(
+            GuardrailsCommands::WarnSubagentWorktree => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_subagent_worktree::WarnSubagentWorktree,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::CheckIdleReturn => run_check_from_stdin(
-                &cadence_hooks_guardrails::check_idle_return::CheckIdleReturn,
+            GuardrailsCommands::WarnSubagentConcurrency => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::warn_subagent_concurrency::WarnSubagentConcurrency,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnBranchBase => run_check_from_stdin(
+            GuardrailsCommands::WarnBranchBase => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_branch_base::WarnBranchBase,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnCronDatetime => run_check_from_stdin(
+            GuardrailsCommands::WarnCronDatetime => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_cron_datetime::WarnCronDatetime,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::NudgeUpgradeAfterPush => run_check_from_stdin(
+            GuardrailsCommands::NudgeUpgradeAfterPush => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::nudge_upgrade_after_push::NudgeUpgradeAfterPush,
                 post,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnUntracked => run_check_from_stdin(
+            GuardrailsCommands::WarnUntracked => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_untracked::WarnUntrackedFiles,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardDotfiles => run_check_from_stdin(
+            GuardrailsCommands::GuardDotfiles => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_dotfiles::GuardDotfiles,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnPrIssueLink => run_check_from_stdin(
+            GuardrailsCommands::GuardRm => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_rm::GuardRm,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::GuardReadModel => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_read_model::GuardReadModel,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::WarnPrIssueLink => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_pr_issue_link::WarnPrIssueLink,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnIssueTracker => run_check_from_stdin(
+            GuardrailsCommands::WarnIssueTracker => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_issue_tracker::WarnIssueTracker,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::VerifyPrAutoclose => run_check_from_stdin(
+            GuardrailsCommands::WarnGoingPublic => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::warn_going_public::GoingPublicGuard,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::VerifyPrAutoclose => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::verify_pr_autoclose::VerifyPrAutoclose,
                 post,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardOpVaultScan => run_check_from_stdin(
+            GuardrailsCommands::GuardOpVaultScan => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_op_vault_scan::OpVaultScanGuard,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnCurlAlias => run_check_from_stdin(
+            GuardrailsCommands::WarnCurlAlias => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnGhMergePreflight => run_check_from_stdin(
+            GuardrailsCommands::WarnGhMergePreflight => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_gh_merge_preflight::WarnGhMergePreflight,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnCoderabbitRetrigger => run_check_from_stdin(
+            GuardrailsCommands::WarnCoderabbitRetrigger => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_coderabbit_retrigger::WarnCoderabbitRetrigger,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::WarnAliasParsing => run_check_from_stdin(
+            GuardrailsCommands::WarnAliasParsing => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_alias_parsing::WarnAliasParsing,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::GuardBrowserDevice => run_check_from_stdin(
+            GuardrailsCommands::GuardBrowserDevice => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_browser_device::GuardBrowserDevice,
                 pre,
+                canonical_hook,
             ),
-            GuardrailsCommands::InjectGhContext => run_check_from_stdin(
+            GuardrailsCommands::InjectGhContext => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::inject_gh_context::InjectGhContext,
                 session,
+                canonical_hook,
             ),
-            GuardrailsCommands::DismissMainBranchWarn { for_ } => {
-                cadence_hooks_guardrails::dismiss_main_branch_warn::run_dismiss(&for_);
+            GuardrailsCommands::EnforceWorktree => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::enforce_worktree::EnforceWorktree,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::DismissMainBranchWarn { for_, reason } => {
+                finish_dismiss(
+                    cadence_hooks_guardrails::dismiss_main_branch_warn::perform_dismiss(
+                        &for_,
+                        reason.as_deref(),
+                    ),
+                );
+            }
+            GuardrailsCommands::DismissEnforceWorktree { for_, reason, repo } => {
+                finish_dismiss(
+                    cadence_hooks_guardrails::dismiss_enforce_worktree::perform_dismiss(
+                        &for_,
+                        reason.as_deref(),
+                        repo,
+                    ),
+                );
             }
         },
         Commands::Rules(cmd) => match cmd {
-            RulesCommands::ValidateFrontmatter => run_check_from_stdin(
+            RulesCommands::ValidateFrontmatter => dispatch::run_logged_check(
                 &cadence_hooks_rules::validate_skill_frontmatter::ValidateSkillFrontmatter,
                 pre,
+                canonical_hook,
             ),
-            RulesCommands::SecurityPatterns => run_check_from_stdin(
+            RulesCommands::SecurityPatterns => dispatch::run_logged_check(
                 &cadence_hooks_rules::check_security_patterns::SecurityPatternScanner,
                 post,
+                canonical_hook,
             ),
-            RulesCommands::WarnRecommendedOption => run_check_from_stdin(
+            RulesCommands::WarnRecommendedOption => dispatch::run_logged_check(
                 &cadence_hooks_rules::askuserquestion::WarnRecommendedOption,
                 pre,
+                canonical_hook,
             ),
-            RulesCommands::WarnEmptyAnswers => run_check_from_stdin(
+            RulesCommands::WarnEmptyAnswers => dispatch::run_logged_check(
                 &cadence_hooks_rules::askuserquestion::WarnEmptyAnswers,
                 post,
+                canonical_hook,
             ),
         },
         Commands::Obsidian(cmd) => match cmd {
-            ObsidianCommands::TrashGuard => run_check_from_stdin(
+            ObsidianCommands::TrashGuard => dispatch::run_logged_check(
                 &cadence_hooks_obsidian::trash_guard::ObsidianTrashGuard,
                 pre,
+                canonical_hook,
             ),
         },
         Commands::Metrics(cmd) => match cmd {
-            MetricsCommands::Snapshot => run_logger_from_stdin(
+            MetricsCommands::Snapshot => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::Snapshot,
                 registry::sample_for("metrics", "snapshot"),
+                canonical_hook,
             ),
-            MetricsCommands::LogCommit { prices } => run_logger_from_stdin(
+            MetricsCommands::LogCommit { prices } => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogCommit {
                     prices_path: prices,
                 },
                 registry::sample_for("metrics", "log-commit"),
+                canonical_hook,
             ),
-            MetricsCommands::LogSubagent => run_logger_from_stdin(
+            MetricsCommands::LogSubagent => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogSubagent,
                 registry::sample_for("metrics", "log-subagent"),
+                canonical_hook,
             ),
-            MetricsCommands::LogPolishNudge => run_logger_from_stdin(
+            MetricsCommands::LogSession { prices } => dispatch::run_logged_logger(
+                &cadence_hooks_metrics::LogSession {
+                    prices_path: prices,
+                },
+                registry::sample_for("metrics", "log-session"),
+                canonical_hook,
+            ),
+            MetricsCommands::LogSessionStart => dispatch::run_logged_logger(
+                &cadence_hooks_metrics::LogSessionStart,
+                registry::sample_for("metrics", "log-session-start"),
+                canonical_hook,
+            ),
+            MetricsCommands::LogPolishNudge => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogPolishNudge,
                 registry::sample_for("metrics", "log-polish-nudge"),
+                canonical_hook,
             ),
-            MetricsCommands::LogAskUserQuestion => run_logger_from_stdin(
+            MetricsCommands::LogAskUserQuestion => dispatch::run_logged_logger(
                 &cadence_hooks_metrics::LogAskUserQuestion,
                 registry::sample_for("metrics", "log-ask-user-question"),
+                canonical_hook,
             ),
-        },
-        Commands::Lab(cmd) => match cmd {
-            LabCommands::PersonaNudge => {
-                run_check_from_stdin(&cadence_hooks_lab::nudge::PersonaNudge, session)
-            }
-            LabCommands::PersonaGate => {
-                run_check_from_stdin(&cadence_hooks_lab::gate::PersonaGate, post)
-            }
+            MetricsCommands::LogSkill => dispatch::run_logged_logger(
+                &cadence_hooks_metrics::LogSkill,
+                registry::sample_for("metrics", "log-skill"),
+                canonical_hook,
+            ),
+            // warn-stale is a SessionStart *check*, not a logger — it reads the
+            // metrics dir's mtimes rather than reacting to a tool event.
+            MetricsCommands::WarnStale => dispatch::run_logged_check(
+                &cadence_hooks_metrics::WarnStale,
+                session,
+                canonical_hook,
+            ),
         },
         Commands::Session(cmd) => match cmd {
-            SessionCommands::Start => {
-                run_check_from_stdin(&cadence_hooks_session::start::Start, session)
-            }
-            SessionCommands::Heartbeat => run_logger_from_stdin(
+            SessionCommands::Start => dispatch::run_logged_check(
+                &cadence_hooks_session::start::Start,
+                session,
+                canonical_hook,
+            ),
+            // Heartbeat/End/BackstopRecord run through the logged dispatcher so
+            // the #271 subprocess deadline is armed (they spawn git) and its
+            // degradation rows have an emission path — core cannot reach the
+            // metrics crate to report a deadline hit itself.
+            SessionCommands::Heartbeat => dispatch::run_logged_logger(
                 &cadence_hooks_session::heartbeat::Heartbeat,
                 registry::sample_for("session", "heartbeat"),
+                canonical_hook,
             ),
-            SessionCommands::Guard => {
-                run_check_from_stdin(&cadence_hooks_session::guard::Guard, pre)
-            }
-            SessionCommands::WarnBranchDrift => {
-                run_check_from_stdin(&cadence_hooks_session::branch_drift::WarnBranchDrift, pre)
-            }
-            SessionCommands::End => run_logger_from_stdin(
+            SessionCommands::Guard => dispatch::run_logged_check(
+                &cadence_hooks_session::guard::Guard,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::WarnBranchDrift => dispatch::run_logged_check(
+                &cadence_hooks_session::branch_drift::WarnBranchDrift,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::WarnBranchIntent => dispatch::run_logged_check(
+                &cadence_hooks_session::branch_intent::WarnBranchIntent,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::WarnCommitProvenance => dispatch::run_logged_check(
+                &cadence_hooks_session::warn_commit_provenance::WarnCommitProvenance,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::End => dispatch::run_logged_logger(
                 &cadence_hooks_session::end::End,
                 registry::sample_for("session", "end"),
+                canonical_hook,
             ),
-            SessionCommands::BackstopRecord => run_logger_from_stdin(
+            SessionCommands::BackstopRecord => dispatch::run_logged_logger(
                 &cadence_hooks_session::backstop::BackstopRecord,
                 registry::sample_for("session", "backstop-record"),
+                canonical_hook,
             ),
-            SessionCommands::BackstopWarn => {
-                run_check_from_stdin(&cadence_hooks_session::backstop::BackstopWarn, session)
-            }
+            SessionCommands::BackstopWarn => dispatch::run_logged_check(
+                &cadence_hooks_session::backstop::BackstopWarn,
+                session,
+                canonical_hook,
+            ),
+            SessionCommands::PersistPlan => dispatch::run_logged_check(
+                &cadence_hooks_session::persist_plan::PersistPlan,
+                user_prompt_submit,
+                canonical_hook,
+            ),
+            SessionCommands::PersistPlanApproval => dispatch::run_logged_check(
+                &cadence_hooks_session::persist_plan::PersistPlanApproval,
+                post,
+                canonical_hook,
+            ),
             SessionCommands::Declare {
                 intent,
                 touching,
@@ -826,6 +1183,31 @@ fn main() {
                 cadence_hooks_session::cli::run_status();
             }
         },
+    }
+}
+
+/// Finish a `dismiss-*` CLI action. On success, record the `bypass_armed` event
+/// (the binary owns the metrics writer — this keeps the guardrails crate
+/// metrics-free, mirroring the used-at-seam pattern in [`dispatch`]) and print
+/// the confirmation before exiting 0. On a handled error — already reported to
+/// stderr by `perform_dismiss` — exit 1. The armed write is fire-and-forget
+/// inside [`cadence_hooks_metrics::log_bypass`]: a failure never affects the exit.
+fn finish_dismiss(result: Result<cadence_hooks_guardrails::snooze_meta::DismissArmed, ()>) -> ! {
+    match result {
+        Ok(armed) => {
+            cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::armed(
+                armed.guard_hook,
+                armed.mechanism,
+                armed.reason.as_deref(),
+                armed.session_id.as_deref(),
+                armed.repo_root.as_deref(),
+                armed.armed_at,
+                armed.expires_at,
+            ));
+            println!("{}", armed.confirmation);
+            std::process::exit(0);
+        }
+        Err(()) => std::process::exit(1),
     }
 }
 
@@ -848,11 +1230,16 @@ mod tests {
             "rules",
             "obsidian",
             "metrics",
-            "lab",
             "session",
         ];
         // clap subcommands that are CLI actions, not hooks (no hooks.json wiring).
-        let non_hooks = ["dismiss-main-branch-warn", "declare", "status"];
+        let non_hooks = [
+            "dismiss-main-branch-warn",
+            "dismiss-enforce-worktree",
+            "declare",
+            "status",
+            "record-polish",
+        ];
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();
         for ns in namespaces {

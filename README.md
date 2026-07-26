@@ -8,17 +8,16 @@ Claude Code hooks run on every tool invocation. Shell scripts accumulate startup
 
 ## Hooks
 
-45 hooks across 7 namespaces, each named for the plugin it serves:
+64 hooks across 6 namespaces, each named for the plugin it serves:
 
 | Namespace | Plugin | Hooks | Focus |
 |-----------|--------|-------|-------|
-| `cadence` | cadence | 12 | Terminology, secret guards, git safety, memory limits, markdown/docs nudges |
-| `guardrails` | git-guardrails | 21 | Push & gh-write allowlists, branch/PR/issue nudges, dotfile & vault guards |
-| `rules` | cadence-rules | 2 | Frontmatter validation + a security anti-pattern scan |
+| `cadence` | cadence | 14 | Terminology, secret guards, git safety, memory limits, markdown/docs nudges |
+| `guardrails` | git-guardrails | 26 | Push & gh-write allowlists, branch/PR/issue nudges, dotfile & vault guards |
+| `rules` | cadence-rules | 4 | Frontmatter validation + a security anti-pattern scan |
 | `obsidian` | cadence-obsidian | 1 | Block `rm` inside the Obsidian vault |
-| `metrics` | cadence-metrics | 3 | Cost-per-commit and subagent JSONL loggers (never block) |
-| `lab` | cadence-lab | 2 | Experimental — the self-representation persona ledger |
-| `session` | cadence-canon | 4 | Multi-session identity, peer disclosure, lane warnings |
+| `metrics` | cadence-metrics | 9 | Cost-per-commit and subagent JSONL loggers (never block) |
+| `session` | cadence-canon | 10 | Multi-session identity, peer disclosure, lane warnings |
 
 **Full catalog:** [docs/hooks.md](docs/hooks.md) — every hook with its event and behavior, plus the CLI actions (`session declare`/`status`, `dismiss-main-branch-warn`) that are commands rather than hooks.
 
@@ -117,7 +116,7 @@ cadence-hooks --help
 
 - [docs/hooks.md](docs/hooks.md) — full hook catalog (all 45 hooks + CLI actions)
 - [docs/configuration.md](docs/configuration.md) — `hooks.json` wiring, environment variables, the `doctor` audit, snoozing `warn-main-branch`
-- [docs/testing.md](docs/testing.md) — run any hook against a sample payload by hand
+- [docs/testing.md](docs/testing.md) — run any hook against a sample payload by hand, including how to tell a real binary block from a wrapper fail-open
 - [CONTRIBUTING.md](CONTRIBUTING.md) — adding a hook and the check-author debugging loop
 - [SECURITY.md](SECURITY.md) — release signing, SBOM, and verification
 
@@ -131,7 +130,7 @@ cadence-hooks (binary)
 ├── crates/rules       — Rules plugin hooks
 ├── crates/obsidian    — Obsidian plugin hooks
 ├── crates/metrics     — Fire-and-forget cost/usage loggers
-├── crates/lab         — Experimental hooks (persona ledger)
+├── crates/lab         — Experimental hooks (currently empty; landing pad)
 ├── crates/session     — Multi-session coordination (cadence-canon)
 └── src/main.rs        — CLI: routes subcommands to checks
 ```

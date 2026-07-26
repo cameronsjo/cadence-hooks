@@ -7,9 +7,16 @@ description = "Multi-session coordination hooks: identity registry, disclosure, 
 
 [dependencies]
 cadence-hooks-core.workspace = true
+cadence-hooks-metrics.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+gethostname.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }
+# Dev-only: the run_start ↔ enforce-worktree parity test drives the actual
+# EnforceWorktree check to prove the posture line and the real block can
+# never disagree (cadence-hooks#236). No production dependency on guardrails.
+cadence-hooks-guardrails.workspace = true
 tempfile = "3"

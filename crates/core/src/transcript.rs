@@ -8,8 +8,86 @@
 //! gate that blocks an evidenced polish-skip share one implementation and one
 //! set of tests.
 
+use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+/// Minimal transcript-line shape for model resolution. Only the fields
+/// [`last_assistant_model`] needs are deserialized; every other key is ignored.
+/// Deliberately local (not shared with `metrics::scan_tokens`) so the guardrails
+/// path carries no `metrics` dependency — see the reference implementation
+/// `metrics::scan_tokens::scan_tokens`, which resolves the same last-assistant
+/// model as a side effect of token accounting.
+#[derive(Deserialize)]
+struct ModelLine {
+    message: Option<ModelMessage>,
+}
+
+#[derive(Deserialize)]
+struct ModelMessage {
+    role: Option<String>,
+    model: Option<String>,
+}
+
+/// The model id of the *last* assistant message in a session transcript, or
+/// `None` when no assistant message carries a non-empty `model`.
+///
+/// Scans lines from the tail (`.lines().rev()`) and returns the first that
+/// parses as a message with `role == "assistant"` and a non-empty `model` —
+/// so the newest model wins and a short transcript with a late model is cheap.
+/// Corrupt lines, non-assistant messages, and assistant messages without a
+/// model are skipped, never fatal. Pure — operates on the transcript text, no
+/// I/O.
+///
+/// Reference implementation: `metrics::scan_tokens::scan_tokens` resolves the
+/// same last-assistant model while accounting tokens; this is the minimal,
+/// dependency-free variant the read-model guard needs.
+pub fn last_assistant_model(transcript: &str) -> Option<String> {
+    transcript.lines().rev().find_map(|line| {
+        let parsed = serde_json::from_str::<ModelLine>(line).ok()?;
+        let message = parsed.message?;
+        if message.role.as_deref() != Some("assistant") {
+            return None;
+        }
+        message.model.filter(|m| !m.is_empty())
+    })
+}
+
+/// Minimal transcript-line shape for harness-version resolution: the
+/// top-level `version` field (the harness build string, e.g. `"2.1.214"`)
+/// alongside the nested `message.role` needed to scope the scan to assistant
+/// lines. Deliberately separate from [`ModelLine`] — `version` lives at the
+/// line's top level while `model` lives nested under `message`, so one
+/// shared struct would carry a dead field on every deserialize.
+#[derive(Deserialize)]
+struct HarnessVersionLine {
+    version: Option<String>,
+    message: Option<AssistantRole>,
+}
+
+#[derive(Deserialize)]
+struct AssistantRole {
+    role: Option<String>,
+}
+
+/// The harness build version (e.g. `"2.1.214"`) stamped on the top-level
+/// `version` field of the *last* assistant message in a session transcript,
+/// or `None` when no assistant line carries a non-empty `version`.
+///
+/// Mirrors [`last_assistant_model`]'s tail-scan discipline exactly, reading
+/// the sibling top-level field instead of the nested `message.model` one —
+/// see that function's docs for the scan/skip semantics. Pure — operates on
+/// the transcript text, no I/O.
+pub fn last_assistant_harness_version(transcript: &str) -> Option<String> {
+    transcript.lines().rev().find_map(|line| {
+        let parsed = serde_json::from_str::<HarnessVersionLine>(line).ok()?;
+        let message = parsed.message?;
+        if message.role.as_deref() != Some("assistant") {
+            return None;
+        }
+        parsed.version.filter(|v| !v.is_empty())
+    })
+}
 
 /// True when the session transcript contains a `cadence-forge:polish` Skill
 /// invocation. Pure — operates on the transcript text, no I/O.
@@ -273,5 +351,133 @@ mod tests {
         )
         .unwrap();
         assert!(!subagent_transcripts_have_polish_run(&parent));
+    }
+
+    // --- last_assistant_model (#144) ---
+
+    fn model_line(role: &str, model: &str) -> String {
+        format!(r#"{{"message":{{"role":"{role}","model":"{model}"}}}}"#)
+    }
+
+    #[test]
+    fn last_assistant_model_returns_newest() {
+        // Two assistant models in order — the last (tail-most) wins.
+        let transcript = [
+            model_line("assistant", "claude-sonnet-4-5"),
+            model_line("assistant", "claude-opus-4-8"),
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_model(&transcript).as_deref(),
+            Some("claude-opus-4-8"),
+            "the last assistant model must win over earlier ones"
+        );
+    }
+
+    #[test]
+    fn last_assistant_model_skips_trailing_user_and_corrupt_lines() {
+        // A trailing user turn and a corrupt line after the assistant model must
+        // not shadow it — the scan skips non-assistant and unparseable lines.
+        let transcript = [
+            model_line("assistant", "claude-opus-4-8"),
+            r#"{"message":{"role":"user","content":"next"}}"#.to_string(),
+            "not json {{".to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_model(&transcript).as_deref(),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn last_assistant_model_none_without_assistant() {
+        // Only user turns → no model to resolve.
+        let transcript = [
+            r#"{"message":{"role":"user","content":"hi"}}"#,
+            r#"{"message":{"role":"user","content":"still hi"}}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_assistant_model(&transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_model_none_when_assistant_has_no_model() {
+        // Assistant messages without a `model` field yield None, not a panic.
+        let transcript = r#"{"message":{"role":"assistant","content":"thinking"}}"#;
+        assert_eq!(last_assistant_model(transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_model_ignores_empty_model_string() {
+        // A present-but-empty model is treated as absent.
+        let transcript = model_line("assistant", "");
+        assert_eq!(last_assistant_model(&transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_model_empty_transcript_is_none() {
+        assert_eq!(last_assistant_model(""), None);
+    }
+
+    // --- last_assistant_harness_version ---
+
+    fn harness_line(role: &str, version: &str) -> String {
+        format!(r#"{{"version":"{version}","message":{{"role":"{role}"}}}}"#)
+    }
+
+    #[test]
+    fn last_assistant_harness_version_returns_newest() {
+        let transcript = [
+            harness_line("assistant", "2.1.200"),
+            harness_line("assistant", "2.1.214"),
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_harness_version(&transcript).as_deref(),
+            Some("2.1.214"),
+            "the last assistant harness version must win over earlier ones"
+        );
+    }
+
+    #[test]
+    fn last_assistant_harness_version_skips_trailing_user_and_corrupt_lines() {
+        let transcript = [
+            harness_line("assistant", "2.1.214"),
+            r#"{"version":"2.1.215","message":{"role":"user"}}"#.to_string(),
+            "not json {{".to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            last_assistant_harness_version(&transcript).as_deref(),
+            Some("2.1.214")
+        );
+    }
+
+    #[test]
+    fn last_assistant_harness_version_none_without_assistant() {
+        let transcript = [
+            r#"{"version":"2.1.214","message":{"role":"user"}}"#,
+            r#"{"version":"2.1.215","message":{"role":"user"}}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_assistant_harness_version(&transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_harness_version_none_when_assistant_has_no_version() {
+        let transcript = r#"{"message":{"role":"assistant"}}"#;
+        assert_eq!(last_assistant_harness_version(transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_harness_version_ignores_empty_version_string() {
+        let transcript = harness_line("assistant", "");
+        assert_eq!(last_assistant_harness_version(&transcript), None);
+    }
+
+    #[test]
+    fn last_assistant_harness_version_empty_transcript_is_none() {
+        assert_eq!(last_assistant_harness_version(""), None);
     }
 }

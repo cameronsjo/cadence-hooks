@@ -9,8 +9,7 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, command_segments, git_command, host_and_repo_from_url, parse_work_dir,
-    strip_quotes, tokenize,
+    LOOP_PATTERN, command_segments, host_and_repo_from_url, parse_work_dir, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -59,10 +58,26 @@ static REPO_SUBCOMMAND: LazyLock<Regex> = LazyLock::new(|| {
 static API_REPOS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
 
-/// Word-boundary, case-insensitive match for the GraphQL `mutation` keyword —
-/// the signal that a `gh api graphql` query writes rather than reads.
-static MUTATION_WORD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bmutation\b").expect("pattern should compile"));
+/// Word-boundary match for the lowercase GraphQL `mutation` operation keyword —
+/// the signal that a `gh api graphql` query writes rather than reads. Matched
+/// case-SENSITIVELY: the operation keyword is lowercase, whereas the *type* name
+/// `Mutation` (e.g. an introspection read `__type(name: "Mutation")`) is
+/// capitalized and must not be mistaken for a write (#263).
+static MUTATION_KEYWORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bmutation\b").expect("pattern should compile"));
+
+/// GraphQL mutation root fields safe to auto-allow: pure boolean thread metadata
+/// on a PR review that carries no attacker-controllable payload.
+/// `resolveReviewThread`/`unresolveReviewThread` only toggle a review thread's
+/// resolved flag, so they're allowed like reads (#262, #300, #317).
+///
+/// Deliberately EXCLUDED: `addPullRequestReviewThreadReply` posts
+/// attacker-controllable text as the user (its REST equivalent goes through
+/// owner-verified `repos/<owner>/<repo>` paths, so it stays checkable there).
+/// It's a future maintainer's-call candidate, not an oversight. `addComment` and
+/// `addPullRequestReview` are likewise out — any field that writes content stays
+/// blocked.
+static SAFE_GRAPHQL_MUTATIONS: [&str; 2] = ["resolveReviewThread", "unresolveReviewThread"];
 
 static GIST_COMMAND: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+gist\s").expect("pattern should compile"));
@@ -122,6 +137,11 @@ enum RepoResolution {
     },
     /// Cannot determine target
     Unresolvable,
+    /// Resolution abandoned at the #271 subprocess deadline. Distinct from
+    /// `Unresolvable` (git answered; genuinely ambiguous — fail-closed block
+    /// stands): a timeout is the guard's own infrastructure failing, which
+    /// degrades to a loud fail-open, never a false block (ADR-0001).
+    TimedOut,
 }
 
 fn resolve_target_repo(
@@ -184,9 +204,29 @@ fn resolve_target_repo(
 /// the command) and the deterministic-loop policy (where command-string
 /// flags are absent by definition).
 fn resolve_from_git_remotes(work_dir: &str) -> RepoResolution {
-    if let Some(upstream_url) = git_command(work_dir, &["remote", "get-url", "upstream"]) {
-        let origin_url =
-            git_command(work_dir, &["remote", "get-url", "origin"]).unwrap_or_default();
+    use cadence_hooks_core::shell::{GitQuery, git_command_detailed};
+
+    // The ownership-deciding `origin` probe runs FIRST: probes share one
+    // subprocess budget (#271), and the optional fork refinement must not
+    // starve the resolution the verdict actually hangs on.
+    let origin_url = match git_command_detailed(work_dir, &["remote", "get-url", "origin"]) {
+        GitQuery::Value(url) => Some(url),
+        GitQuery::Failed => None,
+        GitQuery::TimedOut => return RepoResolution::TimedOut,
+    };
+
+    // A timed-out upstream probe cannot degrade to origin-only judgment: in a
+    // fork clone, a bare gh write can land on upstream, so judging the fork's
+    // owned origin alone would be a wrong-target allow. Timeout anywhere in
+    // resolution → TimedOut (loud fail-open at the verdict layer).
+    let upstream_url = match git_command_detailed(work_dir, &["remote", "get-url", "upstream"]) {
+        GitQuery::Value(url) => Some(url),
+        GitQuery::Failed => None,
+        GitQuery::TimedOut => return RepoResolution::TimedOut,
+    };
+
+    if let Some(upstream_url) = upstream_url {
+        let origin_url = origin_url.unwrap_or_default();
         let (origin_host, origin) = host_and_repo_from_url(&origin_url).unwrap_or_default();
         let (upstream_host, upstream) = host_and_repo_from_url(&upstream_url).unwrap_or_default();
         return RepoResolution::Fork {
@@ -197,7 +237,7 @@ fn resolve_from_git_remotes(work_dir: &str) -> RepoResolution {
         };
     }
 
-    if let Some(origin_url) = git_command(work_dir, &["remote", "get-url", "origin"]) {
+    if let Some(origin_url) = origin_url {
         match host_and_repo_from_url(&origin_url) {
             Some((host, repo)) => return RepoResolution::Resolved { host, repo },
             None => return RepoResolution::Unresolvable,
@@ -313,8 +353,18 @@ fn judge_loop_write(
     // iteration's gh resolves to the suggested repo — same trust as a
     // single command. Anything else (strict mode, cd in body, parse
     // failure, fork, unowned/unresolvable cwd) blocks.
-    if !strict && body_mutates_cwd == Some(false) && suggestion.is_some() {
-        return LoopWriteDecision::Allow;
+    if !strict && body_mutates_cwd == Some(false) {
+        if suggestion.is_some() {
+            return LoopWriteDecision::Allow;
+        }
+        // Resolution hit the #271 subprocess deadline — mirror the
+        // single-command TimedOut arm: infrastructure failure fails open
+        // (loudly), never a false block. Strict mode still blocks above
+        // regardless of resolution, so this converts no strict verdict.
+        if matches!(cwd_resolution, RepoResolution::TimedOut) {
+            cadence_hooks_core::deadline::note_suppressed_block();
+            return LoopWriteDecision::Allow;
+        }
     }
 
     LoopWriteDecision::Block { suggestion }
@@ -454,6 +504,66 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
     Some(String::new())
 }
 
+/// True when a command segment invokes `gh` as an actual command token — some
+/// whitespace-delimited, unquoted token resolves to `gh` (bare, a `*/gh` path,
+/// or a backslash-escaped `\gh`). Gates the write-detection scan so a gh-write
+/// phrase that appears only *inside a quoted argument* of another command —
+/// e.g. a `git commit -m "…gh repo create…"` message, where the quoted text is
+/// a single non-`gh` token — is not read as a gh write (#212).
+///
+/// Any real gh invocation still surfaces a bare `gh` token, so write coverage
+/// is unchanged from the raw-substring scan: a command-word gate on the *first*
+/// token alone would silently drop writes the shell reaches through an
+/// env-assignment (`GH_TOKEN=x gh …`), a transparent prefix (`sudo`/`env`/
+/// `command`/`exec`/`nice`/`timeout gh …`), an argument position (`xargs gh …`,
+/// `find … -exec gh …`), or a leading redirect — all of which keep `gh` as its
+/// own token. So the gate skips only a match whose phrase lives wholly within
+/// quotes — a strict subset of what the substring scan caught — which is
+/// exactly the #212 false positive and nothing else.
+///
+/// `eval "<script>"` is the one execution wrapper `command_segments` does not
+/// unwrap (unlike `sh -c`), so a gh write in eval's quoted argument would
+/// tokenize as a single non-`gh` token and read as prose. When the command
+/// word is `eval`, re-tokenize its argument so the wrapped write is still seen;
+/// a plain `git commit -m "…gh…"` message is not `eval`, so the #212 prose case
+/// stays allowed.
+fn segment_invokes_gh(segment: &str) -> bool {
+    segment_invokes_gh_depth(segment, 0)
+}
+
+/// `eval` nesting is peeled at most this deep before the argument is treated as
+/// opaque — matches `core::shell`'s `MAX_WRAPPER_DEPTH` and bounds the work on
+/// a pathological `eval eval eval …` chain (each level re-tokenizes and joins).
+const MAX_EVAL_DEPTH: usize = 3;
+
+fn segment_invokes_gh_depth(segment: &str, depth: usize) -> bool {
+    let tokens = tokenize(segment);
+    if tokens_contain_gh(&tokens) {
+        return true;
+    }
+    if depth < MAX_EVAL_DEPTH
+        && tokens
+            .first()
+            .is_some_and(|t| t.rsplit('/').next().unwrap_or(t) == "eval")
+    {
+        // tokenize already unquotes eval's argument; re-splitting it surfaces
+        // the inner command tokens. Recurse (bounded) so a nested `eval 'eval …'`
+        // peels one level at a time.
+        let inner = tokens[1..].join(" ");
+        return segment_invokes_gh_depth(&inner, depth + 1);
+    }
+    false
+}
+
+/// True when any token resolves to `gh` (bare, a `*/gh` path, or a
+/// backslash-escaped `\gh`).
+fn tokens_contain_gh(tokens: &[String]) -> bool {
+    tokens.iter().any(|tok| {
+        let unescaped = tok.strip_prefix('\\').unwrap_or(tok);
+        unescaped.rsplit('/').next().unwrap_or(unescaped) == "gh"
+    })
+}
+
 /// Extract the value of a `gh api graphql` `query=` field across the
 /// `-f`/`--field`/`-F`/`--raw-field` forms (separate-token, compact `-fquery=…`,
 /// and `=`-joined `--field=query=…`). Returns the substring after `query=`.
@@ -492,7 +602,248 @@ fn graphql_mutation_status(segment: &str) -> Option<bool> {
     if query.starts_with('@') {
         return None;
     }
-    Some(MUTATION_WORD.is_match(&query))
+    // Classify on the string-stripped body so a `mutation` keyword smuggled
+    // inside a string literal (or a `Mutation` type name in an introspection
+    // read) can't flip the verdict (#263).
+    let stripped = strip_graphql_literals(&query);
+    Some(MUTATION_KEYWORD.is_match(&stripped))
+}
+
+/// Replace GraphQL string literals — both `"…"` and block `"""…"""`, honoring
+/// `\"` escapes — and `#`-to-end-of-line comments with spaces. Neutralizes
+/// braces, identifiers, and keywords hiding inside string arguments so the
+/// mutation classifier and the root-field extractor see only real query
+/// structure (#263). Length is preserved (each consumed char becomes a space)
+/// so byte offsets stay aligned for the extractor.
+fn strip_graphql_literals(query: &str) -> String {
+    let chars: Vec<char> = query.chars().collect();
+    let mut out = String::with_capacity(query.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '#' {
+            // Comment: blank through end of line (the newline itself is kept).
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if c == '"' {
+            let is_block = i + 2 < chars.len() && chars[i + 1] == '"' && chars[i + 2] == '"';
+            if is_block {
+                out.push_str("   ");
+                i += 3;
+                // Consume until the closing `"""` (or end — unterminated blanks
+                // the remainder, which fails the extractor closed).
+                while i < chars.len() {
+                    // GraphQL's ONLY block-string escape is `\"""` (a literal
+                    // triple-quote). It does NOT close the string — consume all
+                    // four chars and stay inside. Missing this let a smuggled
+                    // root field ride through: an early close turned the real
+                    // `}` chars living inside the string into structural braces,
+                    // so the extractor closed the selection set early and never
+                    // saw the trailing mutation field (#262).
+                    if chars[i] == '\\'
+                        && i + 3 < chars.len()
+                        && chars[i + 1] == '"'
+                        && chars[i + 2] == '"'
+                        && chars[i + 3] == '"'
+                    {
+                        out.push_str("    ");
+                        i += 4;
+                        continue;
+                    }
+                    if chars[i] == '"'
+                        && i + 2 < chars.len()
+                        && chars[i + 1] == '"'
+                        && chars[i + 2] == '"'
+                    {
+                        out.push_str("   ");
+                        i += 3;
+                        break;
+                    }
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            // Regular string, honoring `\"` (and `\\`) escapes.
+            out.push(' ');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    out.push(' ');
+                    i += 1;
+                    if i < chars.len() {
+                        out.push(' ');
+                        i += 1;
+                    }
+                    continue;
+                }
+                if chars[i] == '"' {
+                    out.push(' ');
+                    i += 1;
+                    break;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn is_graphql_name_start(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphabetic()
+}
+
+fn is_graphql_name_cont(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
+/// Extract the root (top-level) field names of a GraphQL mutation from an
+/// already string-stripped query. Returns `None` on ANY structural ambiguity so
+/// the caller fails closed:
+/// - not exactly one `mutation` operation keyword (a second op could hide a
+///   dangerous field),
+/// - no selection set, an unbalanced brace/paren, a truncated body, or
+/// - an unexpected token at field-head position (fragment `...`, directive `@`,
+///   variable `$`, …).
+///
+/// Aliases resolve to the underlying field (`x: deleteRepository` → `deleteRepository`).
+/// Only identifiers at brace-depth 1 / paren-depth 0 are field heads, so argument
+/// values and sub-selections never leak into the result.
+fn graphql_root_mutation_fields(stripped_query: &str) -> Option<Vec<String>> {
+    let mut kw_matches = MUTATION_KEYWORD.find_iter(stripped_query);
+    let kw = kw_matches.next()?;
+    if kw_matches.next().is_some() {
+        return None; // multiple operations — ambiguous, fail closed
+    }
+    let bytes = stripped_query.as_bytes();
+
+    // Locate the selection-set `{`: the first `{` at paren-depth 0 after the
+    // keyword, skipping an optional operation name and `(varDefs)`.
+    let mut i = kw.end();
+    let mut paren_depth: i32 = 0;
+    let mut brace_start: Option<usize> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => paren_depth += 1,
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return None;
+                }
+            }
+            b'{' if paren_depth == 0 => {
+                brace_start = Some(i);
+                break;
+            }
+            b'}' if paren_depth == 0 => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut i = brace_start?;
+
+    // Walk the selection set, collecting field heads at brace-depth 1 / paren-depth 0.
+    let mut fields: Vec<String> = Vec::new();
+    let mut brace_depth: i32 = 0;
+    let mut paren_depth: i32 = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'{' => {
+                brace_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    return Some(fields); // closed the mutation selection set
+                }
+                if brace_depth < 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            _ if brace_depth != 1 || paren_depth != 0 => {
+                // Inside an argument list or a sub-selection — not a field head.
+                i += 1;
+            }
+            _ if c.is_ascii_whitespace() || c == b',' => {
+                i += 1;
+            }
+            b':' => {
+                // Alias separator; the real field name follows.
+                i += 1;
+            }
+            _ if is_graphql_name_start(c) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_graphql_name_cont(bytes[i]) {
+                    i += 1;
+                }
+                let ident = &stripped_query[start..i];
+                // Look past whitespace/commas: a following `:` makes this an alias,
+                // so the true field name is the next identifier — skip it here.
+                let mut j = i;
+                while j < bytes.len() && (bytes[j].is_ascii_whitespace() || bytes[j] == b',') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b':' {
+                    continue;
+                }
+                fields.push(ident.to_string());
+            }
+            _ => return None, // fragment/directive/variable/etc. — ambiguous
+        }
+    }
+    None // ran off the end without closing the selection set
+}
+
+/// True when `segment` is a `gh api graphql` mutation whose root fields are ALL
+/// in [`SAFE_GRAPHQL_MUTATIONS`]. Inlines the query (a non-inline `@file` query
+/// is never safe), strips string/comment literals, requires the `mutation`
+/// keyword, and demands the extractor return a non-empty, fully-safe field set.
+/// The membership test is a subset check (`all`), never `contains`, so a single
+/// unsafe field in a composite mutation blocks the whole segment.
+fn graphql_is_safe_mutation(segment: &str) -> bool {
+    let tokens = tokenize(segment);
+    let Some(query) = graphql_query_value(&tokens) else {
+        return false;
+    };
+    if query.starts_with('@') {
+        return false;
+    }
+    let stripped = strip_graphql_literals(&query);
+    if !MUTATION_KEYWORD.is_match(&stripped) {
+        return false;
+    }
+    match graphql_root_mutation_fields(&stripped) {
+        Some(fields) => {
+            !fields.is_empty()
+                && fields
+                    .iter()
+                    .all(|f| SAFE_GRAPHQL_MUTATIONS.contains(&f.as_str()))
+        }
+        None => false,
+    }
 }
 
 /// Build the block message for a `gh api` write whose target owner can't be
@@ -500,16 +851,27 @@ fn graphql_mutation_status(segment: &str) -> Option<bool> {
 /// `repos/<owner>/<repo>`). When `undeterminable_query` is set, the GraphQL
 /// query was loaded from a file, so its mutation status couldn't be confirmed.
 fn api_unverifiable_message(segment: &str, undeterminable_query: bool) -> String {
+    let is_graphql = gh_api_endpoint(segment).as_deref() == Some("graphql");
     let note = if undeterminable_query {
         "\n   Note: the GraphQL query is loaded from a file (`-F query=@…`), so its \
          mutation status can't be verified — treated as a write."
     } else {
         ""
     };
+    // graphql has no `-R`/`repos/<owner>/<repo>` form, so the generic
+    // "use gh api repos/…" fix is unsatisfiable there — state the reality (#317).
+    let fix = if is_graphql {
+        "Fix: `gh api graphql` has no `-R` or `repos/<owner>/<repo>` form to make ownership \
+         checkable. `resolveReviewThread`/`unresolveReviewThread` mutations are auto-allowed; \
+         any other mutation must be run by the user directly (a command they execute \
+         themselves), not by the agent."
+    } else {
+        "Fix: use `gh api repos/<owner>/<repo>/…` so ownership is checkable, or ask the user"
+    };
     format!(
         "🚫 git-guardrails: gh api write to an unverifiable target — ownership can't be checked\n   \
          Command: {segment}\n   \
-         Fix: use `gh api repos/<owner>/<repo>/…` so ownership is checkable, or ask the user{note}"
+         {fix}{note}"
     )
 }
 
@@ -522,12 +884,18 @@ fn api_unverifiable_block(
     allowed_owners: &[AllowEntry],
     allowed_repos: &[AllowEntry],
 ) -> CheckResult {
+    // graphql has no -R/repos form, so its structured fix states the reality
+    // rather than the unsatisfiable "use gh api repos/…" (#317).
+    let fix = if gh_api_endpoint(segment).as_deref() == Some("graphql") {
+        "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly".to_string()
+    } else {
+        "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user".to_string()
+    };
     CheckResult::block_structured(
         api_unverifiable_message(segment, undeterminable_query),
         BlockMetadata {
             rule_id: "gh-write-api-unverifiable".to_string(),
-            fix: "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user"
-                .to_string(),
+            fix,
             allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
             severity: "error",
         },
@@ -573,6 +941,14 @@ fn judge_write_segment(
                      Use -R {upstream} to target upstream (if intended)"
                 )))
             }
+        }
+        // The resolution probes hit the #271 subprocess deadline: the guard's
+        // own infrastructure failed, which never blocks (ADR-0001). The
+        // suppressed fail-closed block is recorded so telemetry distinguishes
+        // "slow git" from "an ownership block was bypassed".
+        RepoResolution::TimedOut => {
+            cadence_hooks_core::deadline::note_suppressed_block();
+            None
         }
         RepoResolution::Unresolvable => {
             // Suggest the first allowed owner so the fix is concrete even when no
@@ -639,19 +1015,25 @@ impl Check for GhWriteGuard {
         // AST-based loop detection with regex fallback
         match loop_analysis::analyze_gh_loops(command) {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
-                // All gh commands in loops have explicit -R flags — check ownership
-                // -R targets are always on the default host (gh CLI convention)
+                // Only writes are ownership-gated; reads (gh pr view, issue list) are
+                // owner-independent and safe against any repo — mirror the MissingTargets
+                // branch, which already gates on is_write_command (#158). -R targets are
+                // always on the default host (gh CLI convention).
                 let dh = default_host();
-                let all_owned = cmds.iter().all(|c| {
-                    c.explicit_repo
-                        .as_ref()
-                        .is_some_and(|r| is_allowed(&dh, r, &allowed_owners, &allowed_repos))
-                });
-                if !all_owned {
-                    let targets: Vec<&str> = cmds
-                        .iter()
-                        .filter_map(|c| c.explicit_repo.as_deref())
-                        .collect();
+                let unowned_write_targets: Vec<&str> = cmds
+                    .iter()
+                    .filter(|c| {
+                        let reconstructed = format!("gh {}", c.args.join(" "));
+                        is_write_command(&reconstructed)
+                    })
+                    .filter(|c| {
+                        !c.explicit_repo
+                            .as_ref()
+                            .is_some_and(|r| is_allowed(&dh, r, &allowed_owners, &allowed_repos))
+                    })
+                    .filter_map(|c| c.explicit_repo.as_deref())
+                    .collect();
+                if !unowned_write_targets.is_empty() {
                     let all_entries: Vec<String> = allowed_owners
                         .iter()
                         .chain(allowed_repos.iter())
@@ -662,11 +1044,11 @@ impl Check for GhWriteGuard {
                          Found: {}\n   \
                          Allowed: {}\n   \
                          Fix: use `-R owner/repo` to target an owned repo",
-                        targets.join(", "),
+                        unowned_write_targets.join(", "),
                         all_entries.join(" "),
                     ));
                 }
-                // All targets owned — allow the loop
+                // All write targets owned (or the loop is read-only) — allow the loop
             }
             LoopAnalysis::MissingTargets(cmds) => {
                 // Only block if any looped gh command is a write — read-only
@@ -744,16 +1126,17 @@ impl Check for GhWriteGuard {
         let work_dir = parse_work_dir(command, cwd);
 
         for segment in command_segments(command) {
+            if !segment_invokes_gh(&segment) {
+                continue;
+            }
+
             if !is_write_command(&segment) {
                 continue;
             }
 
             // Fail-safe: block when unconfigured.
             if allowed_owners.is_empty() {
-                return CheckResult::block(
-                    "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
-                     CADENCE_ALLOWED_OWNERS is not set.",
-                );
+                return CheckResult::block(crate::messages::NOT_CONFIGURED_MSG);
             }
 
             // Gists are user-scoped; a fork creates under your account.
@@ -769,6 +1152,9 @@ impl Check for GhWriteGuard {
                     match graphql_mutation_status(&segment) {
                         // Inline read query — no ownership to check, allow.
                         Some(false) => continue,
+                        // Bounded, content-free thread-metadata mutation
+                        // (resolve/unresolveReviewThread) — allow like a read.
+                        _ if graphql_is_safe_mutation(&segment) => continue,
                         // Mutation (`Some(true)`) or non-inline/undeterminable
                         // (`None`) — both block; the message names the latter.
                         status => {
@@ -1978,6 +2364,169 @@ mod tests {
         );
     }
 
+    // --- #212: gh-write phrases inside non-gh command segments must not block ---
+
+    #[test]
+    fn git_commit_message_describing_gh_write_allowed() {
+        with_env(&owners_env_212(), || {
+            let input = input_with(
+                r#"git commit -m "feat: warn-going-public blocks gh repo create --visibility public""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn git_commit_message_gh_pr_create_allowed() {
+        with_env(&owners_env_212(), || {
+            let input = input_with(
+                r#"git commit -m "docs: explain when gh pr create is blocked""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn sh_c_gh_write_still_blocked() {
+        // Regression guard for the unwrap path: `sh -c '…'` surfaces the inner
+        // gh script as its own segment, still detected as a gh write.
+        with_env(&owners_env_212(), || {
+            let input = input_with("sh -c 'gh repo delete evil/unowned --yes'", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn bare_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with("gh repo create evil/x --public", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    // A first-token command-word gate skipped every one of these real,
+    // executable gh writes to an unowned repo; the invocation gate blocks them.
+    #[test]
+    fn env_prefixed_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with("GH_TOKEN=x gh repo create evil/x --public", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn sudo_prefixed_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with("sudo gh repo delete evil/x --yes", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn xargs_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with("xargs gh repo delete evil/x --yes", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn backslash_gh_write_still_blocked() {
+        with_env(&owners_env_212(), || {
+            let input = input_with(r"\gh repo create evil/x --public", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn eval_gh_write_still_blocked() {
+        // `command_segments` does not unwrap `eval`, so its quoted gh write
+        // would read as prose without the eval-aware branch in the gate.
+        with_env(&owners_env_212(), || {
+            let input = input_with(r#"eval "gh repo delete evil/x --yes""#, "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    fn owners_env_212() -> [(&'static str, Option<&'static str>); 3] {
+        [
+            ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+            ("CADENCE_ALLOWED_REPOS", None),
+            ("CADENCE_EXTRA_HOSTS", None),
+        ]
+    }
+
+    #[test]
+    fn segment_invokes_gh_bare() {
+        assert!(segment_invokes_gh("gh pr create --title test"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_absolute_path() {
+        assert!(segment_invokes_gh("/usr/bin/gh pr create --title test"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_false_for_commit_message() {
+        // The gh phrase lives wholly inside the quoted message, which tokenizes
+        // as a single non-`gh` token — the #212 false positive.
+        assert!(!segment_invokes_gh(
+            r#"git commit -m "gh repo create evil/x""#
+        ));
+    }
+
+    #[test]
+    fn segment_invokes_gh_false_for_quoted_gh_in_echo() {
+        assert!(!segment_invokes_gh(r#"echo "gh pr create""#));
+    }
+
+    // A first-token gate silently dropped every one of these real gh writes;
+    // they all keep `gh` as its own token, so the invocation gate still fires.
+    #[test]
+    fn segment_invokes_gh_true_behind_env_assignment() {
+        assert!(segment_invokes_gh(
+            "GH_TOKEN=x gh repo create evil/x --public"
+        ));
+    }
+
+    #[test]
+    fn segment_invokes_gh_true_behind_transparent_prefix() {
+        assert!(segment_invokes_gh("sudo gh repo delete evil/x --yes"));
+        assert!(segment_invokes_gh("env gh repo create evil/x --public"));
+        assert!(segment_invokes_gh("command gh repo delete evil/x --yes"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_true_as_xargs_argument() {
+        assert!(segment_invokes_gh("xargs gh repo delete --yes"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_true_backslash_escaped() {
+        assert!(segment_invokes_gh(r"\gh repo create evil/x --public"));
+    }
+
+    #[test]
+    fn segment_invokes_gh_true_inside_eval() {
+        assert!(segment_invokes_gh(r#"eval "gh repo delete evil/x --yes""#));
+    }
+
+    #[test]
+    fn segment_invokes_gh_false_for_eval_without_gh() {
+        assert!(!segment_invokes_gh(r#"eval "echo done""#));
+    }
+
     // --- #78: unverifiable gh api writes block; graphql reads exempt ---
 
     // The crate's own dir is an owned checkout (origin = cameronsjo/cadence-hooks),
@@ -2016,9 +2565,11 @@ mod tests {
             let result = GhWriteGuard.run(&input);
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+            // graphql fix states the reality (no -R/repos form) rather than the
+            // unsatisfiable generic remediation (#317).
             assert_eq!(
                 meta.fix,
-                "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user"
+                "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly"
             );
             assert_eq!(meta.severity, "error");
         });
@@ -2165,5 +2716,423 @@ mod tests {
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
+    }
+
+    // --- #158: explicit-target reads in loops must not be ownership-gated ---
+
+    #[test]
+    fn loop_all_explicit_read_unowned_allows() {
+        // #158: a loop of explicit-target READS to an unowned repo must PASS —
+        // reads are owner-independent (was false-blocked by the arm's blanket
+        // ownership check over every command).
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for q in a b; do gh issue list --repo anthropics/claude-code --limit 8; done",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn loop_all_explicit_write_unowned_blocks() {
+        // Regression: an explicit-target WRITE loop to an unowned repo still BLOCKS.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for i in 1 2; do gh issue close $i -R stranger/repo; done",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn loop_all_explicit_write_owned_allows() {
+        // An explicit-target WRITE loop to an owned repo passes.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for i in 1 2; do gh issue close $i -R cameronsjo/repo; done",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn loop_all_explicit_mixed_read_unowned_write_owned_allows() {
+        // Precision: an unowned READ + an owned WRITE in the same loop allows —
+        // ownership is judged only on the write.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for i in 1 2; do gh pr view $i -R anthropics/claude-code && gh issue close $i -R cameronsjo/repo; done",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    // --- #262/#263/#300/#317: graphql safe-mutation allowlist + string-stripped classifier ---
+
+    #[test]
+    fn graphql_resolve_review_thread_allows() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_unresolve_review_thread_allows() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { unresolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_resolve_review_thread_multiline_allows() {
+        // Whitespace/newlines between the keyword, selection set, and fields
+        // must not defeat the extractor.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "gh api graphql -f query='mutation {\n  resolveReviewThread(input: {threadId: \"T\"}) {\n    thread { id }\n  }\n}'",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_aliased_safe_field_allows() {
+        // `alias: field` resolves to the underlying safe field.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { foo: resolveReviewThread(input: {threadId: "T"}) { thread { id } } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_introspection_mutation_typename_read_allows() {
+        // #263 regression: a read whose string arg is the `Mutation` type name
+        // must not be misread as a write. Case-sensitive keyword + literal
+        // stripping both defend this.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='query { __type(name: "Mutation") { fields { name } } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_dangerous_mutations_block() {
+        // Security regression: destructive/content-writing mutations stay blocked.
+        with_env(&owners_env(), || {
+            for q in [
+                "mutation { deleteRepository(input: {repositoryId: \"R\"}) { clientMutationId } }",
+                "mutation { createRepository(input: {name: \"x\"}) { repository { id } } }",
+                "mutation { mergePullRequest(input: {pullRequestId: \"P\"}) { pullRequest { merged } } }",
+                "mutation { createRelease(input: {repositoryId: \"R\", tagName: \"v1\"}) { release { id } } }",
+                "mutation { createRef(input: {repositoryId: \"R\", name: \"refs/heads/x\", oid: \"o\"}) { ref { id } } }",
+                // Deliberately excluded from the allowlist — posts user text.
+                "mutation { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: \"T\", body: \"hi\"}) { comment { id } } }",
+            ] {
+                let cmd = format!("gh api graphql -f query='{q}'");
+                let input = input_with(&cmd, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "must block: {q}"
+                );
+                assert_eq!(
+                    result.block_metadata.expect("structured block").rule_id,
+                    "gh-write-api-unverifiable"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn graphql_composite_safe_plus_dangerous_blocks() {
+        // Subset check, not `contains`: one unsafe root field blocks the whole
+        // segment even alongside a safe one.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "T"}) { thread { id } } deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_alias_disguised_dangerous_blocks() {
+        // An alias must not launder a dangerous field past the allowlist.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { x: deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_string_injected_dangerous_blocks() {
+        // A dangerous field hidden inside a string argument is neutralized by
+        // literal stripping; the real root field (`addComment`) is unsafe → block.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { addComment(input: {body: "}} deleteRepository(input:{"}) { clientMutationId } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_chained_read_then_dangerous_mutation_blocks() {
+        // Per-segment: a benign first read can't shield a dangerous mutation.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh pr list && gh api graphql -f query='mutation { deleteRepository(input: {repositoryId: "R"}) { clientMutationId } }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_escaped_triple_quote_rider_blocks() {
+        // SECURITY REGRESSION (#262): a `\"""` escaped triple-quote keeps the
+        // block string open past the `}` chars smuggled inside it. Without
+        // honoring the escape the stripper closed early, the real `}`s read as
+        // structure, the extractor closed the selection set before the trailing
+        // field, and `deleteRepository` rode through as a safe
+        // `resolveReviewThread`. Must BLOCK.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""X\"""} } } """}) {clientMutationId} deleteRepository(input:{repositoryId:"NODE_ID"}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(
+                matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                "smuggled deleteRepository must not ride through as a safe mutation"
+            );
+            assert_eq!(
+                result.block_metadata.expect("structured block").rule_id,
+                "gh-write-api-unverifiable"
+            );
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_escaped_triple_quote_legit_allows() {
+        // A genuine `\"""` inside a string value, with no smuggled field, must
+        // still ALLOW — the escape is honored in both directions, not blanket-blocked.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""has \""" a literal triple-quote"""}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_block_string_bare_brace_no_escape_allows() {
+        // A normal block string containing a bare `}` (no escape) with a single
+        // safe root field must still ALLOW — the escape fix didn't over-tighten.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"""note } with brace"""}) {clientMutationId} }'"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn graphql_file_query_names_file_reason() {
+        // `-F query=@file` is undeterminable → block, and the message names the
+        // @file reason (the safe-mutation path can't rescue a non-inline query).
+        with_env(&owners_env(), || {
+            let input = input_with("gh api graphql -F query=@bulk.graphql", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+            let msg = result.message.expect("block message");
+            assert!(
+                msg.contains('@') && msg.to_lowercase().contains("file"),
+                "message must name the @file reason: {msg}"
+            );
+        });
+    }
+
+    // --- unit: strip_graphql_literals ---
+
+    #[test]
+    fn strip_blanks_string_content_including_braces() {
+        let out = strip_graphql_literals(r#"mutation { addComment(input: {body: "}} evil"}) }"#);
+        assert!(
+            !out.contains("evil"),
+            "string content must be blanked: {out}"
+        );
+        assert!(out.contains("mutation") && out.contains("addComment"));
+    }
+
+    #[test]
+    fn strip_blanks_block_string_content() {
+        let out = strip_graphql_literals(r#"f(note: """danger }} deleteRepository""")"#);
+        assert!(!out.contains("deleteRepository"));
+        assert!(!out.contains("danger"));
+        assert!(out.contains("note"));
+    }
+
+    #[test]
+    fn strip_blanks_comment_to_eol() {
+        let out = strip_graphql_literals("mutation { # deleteRepository\n resolveReviewThread }");
+        assert!(!out.contains("deleteRepository"));
+        assert!(out.contains("resolveReviewThread"));
+    }
+
+    #[test]
+    fn strip_honors_escaped_quote() {
+        // The escaped `\"` does not close the string, so the `}` stays inside and
+        // is blanked — it must not leak to the top level.
+        let out = strip_graphql_literals(r#"a "x \" }" b"#);
+        assert!(
+            !out.contains('}'),
+            "escaped quote must not close the string early: {out}"
+        );
+    }
+
+    // --- unit: graphql_root_mutation_fields ---
+
+    #[test]
+    fn root_fields_single_safe() {
+        assert_eq!(
+            graphql_root_mutation_fields(
+                "mutation { resolveReviewThread(input: {}) { thread { id } } }"
+            ),
+            Some(vec!["resolveReviewThread".to_string()])
+        );
+    }
+
+    #[test]
+    fn root_fields_alias_resolves_to_field() {
+        assert_eq!(
+            graphql_root_mutation_fields(
+                "mutation { x: deleteRepository(input: {}) { clientMutationId } }"
+            ),
+            Some(vec!["deleteRepository".to_string()])
+        );
+    }
+
+    #[test]
+    fn root_fields_composite_collects_all() {
+        assert_eq!(
+            graphql_root_mutation_fields(
+                "mutation { resolveReviewThread(input: {}) { thread { id } } deleteRepository(input: {}) { clientMutationId } }"
+            ),
+            Some(vec![
+                "resolveReviewThread".to_string(),
+                "deleteRepository".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn root_fields_skips_nested_and_args() {
+        // Argument identifiers and sub-selection fields must not appear as roots.
+        assert_eq!(
+            graphql_root_mutation_fields(
+                "mutation { resolveReviewThread(input: {threadId: 1}) { thread { id } } }"
+            ),
+            Some(vec!["resolveReviewThread".to_string()])
+        );
+    }
+
+    #[test]
+    fn root_fields_none_on_truncated() {
+        assert_eq!(
+            graphql_root_mutation_fields("mutation { resolveReviewThread(input: {"),
+            None
+        );
+    }
+
+    #[test]
+    fn root_fields_none_on_multiple_operations() {
+        assert_eq!(
+            graphql_root_mutation_fields("mutation A { x } mutation B { y }"),
+            None
+        );
+    }
+
+    #[test]
+    fn root_fields_none_on_no_selection_set() {
+        assert_eq!(graphql_root_mutation_fields("mutation"), None);
+    }
+
+    #[test]
+    fn root_fields_none_on_fragment_spread() {
+        // A fragment spread at field-head is a structure we don't model — fail closed.
+        assert_eq!(graphql_root_mutation_fields("mutation { ...Frag }"), None);
+    }
+
+    // --- unit: graphql_is_safe_mutation ---
+
+    #[test]
+    fn is_safe_mutation_true_for_resolve() {
+        assert!(graphql_is_safe_mutation(
+            r#"gh api graphql -f query='mutation { resolveReviewThread(input: {}) { thread { id } } }'"#
+        ));
+    }
+
+    #[test]
+    fn is_safe_mutation_false_for_file_query() {
+        assert!(!graphql_is_safe_mutation(
+            "gh api graphql -F query=@big.graphql"
+        ));
+    }
+
+    #[test]
+    fn is_safe_mutation_false_for_read() {
+        assert!(!graphql_is_safe_mutation(
+            r#"gh api graphql -f query='query { viewer { login } }'"#
+        ));
+    }
+
+    #[test]
+    fn is_safe_mutation_false_for_composite() {
+        assert!(!graphql_is_safe_mutation(
+            r#"gh api graphql -f query='mutation { resolveReviewThread(input: {}) { thread { id } } deleteRepository(input: {}) { clientMutationId } }'"#
+        ));
     }
 }

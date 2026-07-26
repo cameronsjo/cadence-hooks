@@ -10,9 +10,12 @@
 //! `select_browser`/`switch_browser` for exactly this, and
 //! `list_connected_browsers`'s description *mandates* an `AskUserQuestion`
 //! listing every browser — but that mandate is advisory; the model can skip
-//! it. This guard makes the handshake enforced: it blocks the **first**
-//! claude-in-chrome tool call of a session (exit 2, re-clarify message),
-//! writes a per-session marker, and allows every subsequent call.
+//! it. This guard surfaces the handshake with a one-time hard stop: it blocks
+//! the **first** claude-in-chrome tool call of a session (exit 2, re-clarify
+//! message), writes a per-session marker, and allows every subsequent call —
+//! including a blind retry of the same call. It *prompts* the selection; it
+//! does not *enforce* that a device was actually chosen (see the policy note
+//! below). By design a deliberate soft confirmation, not a hard gate.
 //!
 //! **Policy note (deliberate exception to `developing-guards`).** The
 //! block-vs-nudge heuristic would route "a single connected browser makes
@@ -26,48 +29,31 @@
 //! the gate for the rest of the session.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Fully-qualified prefix shared by every claude-in-chrome MCP tool.
 const CHROME_TOOL_PREFIX: &str = "mcp__claude-in-chrome__";
 
 /// The re-clarify message emitted on the first (blocked) call.
-const BLOCK_MESSAGE: &str = "BLOCKED: guard-browser-device\n\
-Found: First Claude-in-Chrome action this session — target device unconfirmed.\n\
-       Multiple Chrome browsers may be paired to this account.\n\
-Fix:   1) list_connected_browsers  2) AskUserQuestion listing every connected\n\
-       browser (label = display name, deviceId in parens)  3) select_browser with\n\
-       the chosen deviceId (or switch_browser to pair interactively).\n\
-       Then re-run this tool — it will proceed for the rest of the session.";
+const BLOCK_MESSAGE: &str = "BLOCKED: first Claude-in-Chrome action this session — target \
+device unconfirmed (multiple browsers may be paired). Fix: list_connected_browsers, then \
+AskUserQuestion listing each browser (display name, deviceId in parens), then select_browser \
+with the chosen deviceId. Re-run the tool after — confirmed for the rest of the session.";
 
 /// Block the first Claude-in-Chrome tool call per session until the target
 /// device is confirmed.
 pub struct GuardBrowserDevice;
 
 impl GuardBrowserDevice {
-    /// Per-session marker path.
+    /// Per-session marker path (session-global — no repo component).
     ///
-    /// Hashes the session id so concurrent sessions don't share the handshake.
-    /// Falls back to `PPID` (the Claude Code process — hooks run as separate
-    /// children, so `process::id()` changes every invocation) and finally to
-    /// `process::id()`, mirroring [`crate::warn_main_branch`]'s scoping.
+    /// The device handshake is once per *session*, independent of any repo, so
+    /// the marker carries no repo scope. Delegates to the shared
+    /// [`cadence_hooks_core::markers::session_marker`] primitive, which supplies
+    /// the session-id key (with a per-process fallback) under the private 0700
+    /// marker dir.
     fn marker_path(input: &HookInput) -> PathBuf {
-        let scope = input.session_id().map(str::to_string).unwrap_or_else(|| {
-            std::env::var("PPID")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or_else(std::process::id)
-                .to_string()
-        });
-
-        let mut hasher = DefaultHasher::new();
-        scope.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        cadence_hooks_core::paths::marker_temp_dir()
-            .join(format!(".claude-browser-device-{hash:x}"))
+        cadence_hooks_core::markers::session_marker(input, "browser-device", None)
     }
 }
 
@@ -94,7 +80,7 @@ impl Check for GuardBrowserDevice {
         // First call: record the handshake *before* returning so the marker
         // persists even though we exit 2, then block. A write failure is not a
         // reason to keep blocking — fail open (ADR-0001).
-        let _ = std::fs::write(&marker, "");
+        let _ = cadence_hooks_core::markers::write_marker(&marker, "");
         CheckResult::block(BLOCK_MESSAGE)
     }
 }
@@ -138,7 +124,7 @@ mod tests {
                 .message
                 .as_deref()
                 .expect("block should carry a message")
-                .contains("guard-browser-device")
+                .contains("target device unconfirmed")
         );
         assert!(marker.exists(), "first call must write the session marker");
 

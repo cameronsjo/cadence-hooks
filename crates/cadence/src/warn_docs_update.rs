@@ -154,11 +154,12 @@ fn diff_against_base() -> Option<Vec<String>> {
     // Try to find the base branch
     let base = find_base_branch()?;
 
-    let output = Command::new("git")
-        .args(["diff", "--name-only", &format!("{base}...HEAD")])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+    let mut cmd = Command::new("git");
+    cmd.args(["diff", "--name-only", &format!("{base}...HEAD")]);
+    let output = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
+        cadence_hooks_core::shell::GitSpawn::Completed(output) if output.status.success() => output,
+        _ => return None,
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let files: Vec<String> = stdout
@@ -173,10 +174,12 @@ fn diff_against_base() -> Option<Vec<String>> {
 fn find_base_branch() -> Option<String> {
     // Check if main exists
     for branch in &["main", "master"] {
-        let status = Command::new("git")
-            .args(["rev-parse", "--verify", &format!("origin/{branch}")])
-            .output()
-            .ok()?;
+        let mut cmd = Command::new("git");
+        cmd.args(["rev-parse", "--verify", &format!("origin/{branch}")]);
+        let status = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
+            cadence_hooks_core::shell::GitSpawn::Completed(output) => output,
+            _ => return None,
+        };
         if status.status.success() {
             return Some(format!("origin/{branch}"));
         }

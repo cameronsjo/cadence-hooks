@@ -10,11 +10,16 @@
 //! read that would never see EOF.
 
 pub mod config;
+pub mod deadline;
+pub mod gitstate;
 pub mod loop_analysis;
+pub mod markers;
+pub mod pathclass;
 pub mod paths;
 pub mod shell;
 pub mod time;
 pub mod transcript;
+pub mod worktree;
 
 #[cfg(feature = "test-builders")]
 pub mod test_builders;
@@ -39,6 +44,10 @@ pub enum HookEvent {
     /// SessionStart — fires when a session begins (startup/resume/clear/compact).
     /// Nudges inject context via `hookSpecificOutput.additionalContext`.
     SessionStart,
+    /// UserPromptSubmit — fires when the user (or the harness, on an
+    /// approve-and-clear plan re-injection) submits a prompt. Nudges inject
+    /// context via `hookSpecificOutput.additionalContext`, same as SessionStart.
+    UserPromptSubmit,
 }
 
 impl HookEvent {
@@ -49,6 +58,7 @@ impl HookEvent {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
             HookEvent::SessionStart => "SessionStart",
+            HookEvent::UserPromptSubmit => "UserPromptSubmit",
         }
     }
 
@@ -64,6 +74,9 @@ impl HookEvent {
                 r#"{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"},"tool_response":{"stdout":"ok"}}"#
             }
             HookEvent::SessionStart => r#"{"session_id":"test","source":"startup"}"#,
+            // Exercises the persist-plan prefix gate — a prompt shaped like the
+            // approve-and-clear re-injection (see `session persist-plan`).
+            HookEvent::UserPromptSubmit => r#"{"prompt":"Implement the following plan:\n\ntest"}"#,
         }
     }
 }
@@ -91,6 +104,14 @@ pub enum Outcome {
     /// PostToolUse feedback loops (e.g. validate-then-rewrite gates) where a
     /// hard `Block` (exit 2) cannot un-run the tool.
     LoopBlock,
+    /// Surface the interactive permission prompt (exit 0). Emits a PreToolUse
+    /// `permissionDecision: "ask"` envelope on stdout. Per Claude Code's
+    /// precedence (`deny` > `defer` > `ask` > `allow`, most-restrictive-wins),
+    /// an `ask` decision prompts the user *even when a settings `allow` rule
+    /// would otherwise auto-approve* — so a guard can force a confirmation on an
+    /// operation it can neither prove safe (Allow) nor prove dangerous (Block).
+    /// PreToolUse only; never emitted by a PostToolUse hook.
+    Ask,
 }
 
 impl Outcome {
@@ -99,14 +120,23 @@ impl Outcome {
             Outcome::Allow => 0,
             Outcome::Nudge => 0,
             Outcome::LoopBlock => 0,
+            Outcome::Ask => 0,
             Outcome::Block => 2,
         }
     }
 
     /// Merge two outcomes, keeping the more severe one.
+    ///
+    /// Severity, most-to-least: `Block` > `Ask` > `LoopBlock` > `Nudge` >
+    /// `Allow`. `Ask` outranks `Nudge` (a prompt is a stronger intervention
+    /// than a silent context line) but yields to `Block`. `Ask` (PreToolUse)
+    /// and `LoopBlock` (PostToolUse) are emitted on disjoint events and never
+    /// actually co-occur, so their relative order is a convention, not
+    /// observable behavior.
     pub fn merge(self, other: Outcome) -> Outcome {
         match (self, other) {
             (Outcome::Block, _) | (_, Outcome::Block) => Outcome::Block,
+            (Outcome::Ask, _) | (_, Outcome::Ask) => Outcome::Ask,
             (Outcome::LoopBlock, _) | (_, Outcome::LoopBlock) => Outcome::LoopBlock,
             (Outcome::Nudge, _) | (_, Outcome::Nudge) => Outcome::Nudge,
             _ => Outcome::Allow,
@@ -143,9 +173,12 @@ pub fn normalize_path(path: &str) -> String {
 #[derive(Debug, Default, Deserialize)]
 pub struct HookInput {
     pub tool_name: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option")]
     pub tool_input: Option<ToolInput>,
     /// The tool response (stdout, stderr) from the tool execution.
     /// Available in PostToolUse hooks — absent in PreToolUse and SessionStart.
+    /// Shape varies by tool; a mismatch degrades to `None` (see `lenient_option`).
+    #[serde(default, deserialize_with = "lenient_option")]
     pub tool_response: Option<ToolResponse>,
     pub cwd: Option<String>,
     /// Absolute path to the session transcript (`.jsonl`). A documented common
@@ -160,6 +193,15 @@ pub struct HookInput {
     pub source: Option<String>,
     /// Model id for the session (e.g. `claude-opus-4-8`), when supplied.
     pub model: Option<String>,
+    /// Subagent id for a dispatched agent, when the payload carries it. Mirrors
+    /// [`MetricsInput::agent_id`]; deserializes to `None` on the main thread and
+    /// on payloads that omit it. Carried so the denial audit log can attribute a
+    /// guard fire to the subagent that triggered it.
+    pub agent_id: Option<String>,
+    /// The submitted prompt text — present on `UserPromptSubmit`, absent on
+    /// every other event. Deserializes to `None` when absent, so existing
+    /// PreToolUse/PostToolUse/SessionStart hooks are unaffected.
+    pub prompt: Option<String>,
 }
 
 /// Tool-specific fields from the hook input.
@@ -185,6 +227,11 @@ pub struct ToolInput {
     /// means the spawn gets a fresh agent-owned worktree; absent means the
     /// subagent inherits the spawning session's working directory.
     pub isolation: Option<String>,
+    /// Skill tool: the invoked skill id (e.g. `cadence:attune`).
+    pub skill: Option<String>,
+    /// Skill tool: the skill's argument string. NEVER logged raw — only a
+    /// non-reversible hash of it is recorded (see `log_skill`).
+    pub args: Option<String>,
 }
 
 /// A single edit operation within a MultiEdit tool call.
@@ -234,6 +281,49 @@ pub struct ToolResponse {
     /// (multiSelect = comma-joined) or null when unanswered. Present only on the
     /// PostToolUse payload for AskUserQuestion.
     pub answers: Option<HashMap<String, serde_json::Value>>,
+    /// ExitPlanMode tool: the approved plan's full markdown body. Present on
+    /// same-session plan approval (`PostToolUse:ExitPlanMode`) — live-verified
+    /// 2026-07-25 (cadence-hooks#396) that on this path `tool_input.plan` is
+    /// EMPTY and this is the only field carrying the plan text.
+    pub plan: Option<String>,
+    /// ExitPlanMode tool: the app's own plans-store copy path, when the client
+    /// wrote one. Carried for parity with the documented payload shape; not
+    /// consulted by any check today.
+    #[serde(rename = "filePath")]
+    pub file_path: Option<String>,
+    /// ExitPlanMode tool: true when the approving turn ran inside a subagent
+    /// rather than the top-level session. `persist-plan-approval` skips these —
+    /// only a top-level session's own approval persists a plan doc.
+    #[serde(rename = "isAgent")]
+    pub is_agent: Option<bool>,
+    /// ExitPlanMode tool: true when the approving turn's tool set included the
+    /// Agent/Task tool. Carried for parity with the documented payload shape;
+    /// not consulted by any check today.
+    #[serde(rename = "hasTaskTool")]
+    pub has_task_tool: Option<bool>,
+}
+
+/// Deserialize an optional typed field leniently: a present value whose JSON
+/// shape does not match `T` degrades to `None` instead of failing the entire
+/// payload parse. Claude Code's `tool_input`/`tool_response` shapes vary by
+/// tool — a plain string for `Read`, an array for `Glob`, a Bash-style object
+/// for `Bash` — and one mismatched field must not blind an enforcement guard or
+/// silently drop a metrics row for the rest of the payload (cadence-hooks#356).
+///
+/// The degradation is **deliberately silent**: the common case is expected
+/// per-tool variance, and logging it would reintroduce the ~242/week failopen
+/// noise this fix removes (it fires on every non-Bash tool call). The tradeoff
+/// is that a *genuine* future schema drift in these fields also degrades
+/// unobserved; distinguishing expected variance from real drift (log only an
+/// object whose typed fields mismatch, not a non-object shape) is tracked in
+/// cadence-hooks#364.
+fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 impl HookInput {
@@ -335,10 +425,18 @@ impl HookInput {
     /// The full document the tool call will produce.
     ///
     /// - Write (`content` present) → the content as-is.
-    /// - Edit (`old_string`/`new_string` present) → reads `file_path` from disk,
-    ///   applies the replacement (honoring `replace_all`), returns the result.
+    /// - Edit (`old_string`/`new_string` present) → reads the **literal**
+    ///   `file_path` (falling back to `path`) from disk — *not* the
+    ///   `normalize_path`-processed value — applies the replacement (honoring
+    ///   `replace_all`), returns the result. Simulating against the literal
+    ///   write target keeps a guard validating the same file Claude Code will
+    ///   actually write, even when the path carries a trailing space/backslash
+    ///   or null byte.
     /// - MultiEdit (`edits[]` present) → reads the file, applies each edit in order.
-    /// - File unreadable or missing for Edit/MultiEdit → `None` (fail open, ADR-0001).
+    /// - File unreadable, missing, or non-UTF-8 for Edit/MultiEdit → `None`
+    ///   (fail open, ADR-0001). A future *blocking* content-security guard that
+    ///   adopts this helper must supply its own fail-closed default rather than
+    ///   treating `None` as "allow".
     pub fn effective_content(&self) -> Option<String> {
         let ti = self.tool_input.as_ref()?;
 
@@ -347,9 +445,11 @@ impl HookInput {
             return Some(content.to_string());
         }
 
-        // Edit / MultiEdit: simulate the edit against the on-disk file.
-        let path = self.file_path()?;
-        let on_disk = std::fs::read_to_string(&path).ok()?;
+        // Edit / MultiEdit: simulate the edit against the on-disk file, reading
+        // the LITERAL write target (not the normalized path) so the simulation
+        // matches the exact file Claude Code will write.
+        let path = ti.file_path.as_deref().or(ti.path.as_deref())?;
+        let on_disk = std::fs::read_to_string(path).ok()?;
 
         if let (Some(old), Some(new)) = (ti.old_string.as_deref(), ti.new_string.as_deref()) {
             return Some(apply_edit(
@@ -402,11 +502,30 @@ impl HookInput {
         self.model.as_deref()
     }
 
+    /// The subagent id, if the payload carried one (`None` on the main thread).
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+
+    /// The submitted prompt text, if present (`UserPromptSubmit` only).
+    pub fn prompt(&self) -> Option<&str> {
+        self.prompt.as_deref()
+    }
+
     /// The stdout from the tool response (PostToolUse only).
     pub fn tool_response_stdout(&self) -> Option<&str> {
         self.tool_response
             .as_ref()
             .and_then(|tr| tr.stdout.as_deref())
+    }
+
+    /// The `ExitPlanMode` plan text from a `PostToolUse` `tool_response.plan`
+    /// payload — present on same-session plan approval, where `tool_input.plan`
+    /// is empty (cadence-hooks#396).
+    pub fn tool_response_plan(&self) -> Option<&str> {
+        self.tool_response
+            .as_ref()
+            .and_then(|tr| tr.plan.as_deref())
     }
 
     /// The AskUserQuestion questions carried by this tool call, if any.
@@ -431,6 +550,7 @@ pub struct MetricsInput {
     pub transcript_path: Option<String>,
     pub hook_event_name: Option<String>,
     pub cwd: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option")]
     pub tool_input: Option<ToolInput>,
     pub agent_id: Option<String>,
     pub agent_type: Option<String>,
@@ -438,10 +558,26 @@ pub struct MetricsInput {
     pub parent_agent_id: Option<String>,
     pub source_agent_id: Option<String>,
     pub duration_ms: Option<u64>,
+    /// SessionEnd exit reason (e.g. `other`, `prompt_input_exit`, `resume`),
+    /// when the payload carries it. Recorded on the `sessions.jsonl` row so a
+    /// session's terminal cause is greppable; deserializes to `None` when absent.
+    pub reason: Option<String>,
     /// Model id for the session (e.g. `claude-opus-4-8`), when the payload
     /// carries it (SessionStart and some Pre/PostToolUse payloads). Mirrors
     /// [`HookInput::model`]; deserializes to `None` when absent.
     pub model: Option<String>,
+    /// The tool that fired this event (e.g. `EnterPlanMode`, `ExitPlanMode`,
+    /// `Bash`). Mirrors [`HookInput::tool_name`]; deserializes to `None` when
+    /// absent. Powers event-derivation loggers like `log-ask-user-question`
+    /// that key off which tool ran rather than a fixed `hook_event_name`.
+    pub tool_name: Option<String>,
+    /// The tool response, available in PostToolUse payloads. Mirrors
+    /// [`HookInput::tool_response`]; deserializes to `None` on PreToolUse and
+    /// other events that carry no response. Additive — every existing logger
+    /// ignores it. Shape varies by tool; a mismatch degrades to `None` rather
+    /// than failing the whole payload parse (see `lenient_option`).
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub tool_response: Option<ToolResponse>,
     /// Top-level keys present in the raw payload. Populated by [`Self::from_json`],
     /// not deserialized — powers the `CADENCE_METRICS_DEBUG` `_keys` field that
     /// surfaces schema additions across Claude Code releases.
@@ -508,15 +644,70 @@ pub struct BlockMetadata {
     pub severity: &'static str,
 }
 
+/// Why a guard allowed an operation it would otherwise have acted on.
+///
+/// v1 distinguishes a time-bounded `dismiss-*` snooze from a per-guard
+/// environment switch. Future kinds (`GlobalBypass`/`GlobalDisable` for the
+/// `main.rs` gates, `Exemption`, `EffortSkip`) extend this as the remaining
+/// bypass surface opts in — see the deferred follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassKind {
+    /// A `cadence-hooks guardrails dismiss-*` snooze marker was active.
+    Dismissal,
+    /// A per-guard environment switch (e.g. `CADENCE_ALLOW_MAIN`,
+    /// `CADENCE_NO_ENFORCE_WORKTREE`) suppressed the guard.
+    EnvSwitch,
+}
+
+impl BypassKind {
+    /// Stable snake_case wire token, so the metrics record shape doesn't couple
+    /// to the Rust variant spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BypassKind::Dismissal => "dismissal",
+            BypassKind::EnvSwitch => "env_switch",
+        }
+    }
+}
+
+/// Attribution for a bypass-allow: *why* a guard let an operation through that
+/// its own invariant would otherwise have blocked or nudged. Rides on
+/// [`CheckResult::bypass`] so the dispatch seam can record the ride-through
+/// (in `src/dispatch.rs`) without a new [`Outcome`] variant.
+///
+/// **Privacy contract (inherited from the denial log):** carries only the
+/// mechanism, a user-authored `reason`, the arming session, and the expiry —
+/// never a command, path, or edited content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BypassProvenance {
+    /// Dismissal vs env-switch.
+    pub kind: BypassKind,
+    /// The concrete mechanism, e.g. `dismiss-enforce-worktree` or
+    /// `CADENCE_ALLOW_MAIN`.
+    pub mechanism: String,
+    /// The user-authored `--reason` from a `dismiss-*` snooze, when present.
+    /// Always `None` for an env-switch (there is nowhere to author one).
+    pub reason: Option<String>,
+    /// Unix epoch seconds when the dismissal expires, when known.
+    pub expires_at: Option<i64>,
+    /// The session id that armed the dismissal, when the sidecar recorded it.
+    pub armed_by_session: Option<String>,
+}
+
 /// Result of running a single check.
 pub struct CheckResult {
     pub outcome: Outcome,
     pub message: Option<String>,
     /// Structured payload attached to hard blocks. Always `None` for
-    /// `Allow`, `Nudge`, and `LoopBlock` (their delivery shapes don't carry
-    /// it). When `Some`, `run_check` emits a `permissionDecision: "deny"`
-    /// JSON envelope alongside the legacy stderr message.
+    /// `Allow`, `Nudge`, `LoopBlock`, and `Ask` (their delivery shapes don't
+    /// carry it). When `Some`, its `fix` is folded into the block's stderr
+    /// message (exit 2 surfaces stderr only — see [`render_output`]).
     pub block_metadata: Option<BlockMetadata>,
+    /// Attribution when the guard allowed *because a bypass was active* — a
+    /// snooze marker or an env switch — rather than because the operation was
+    /// fine on its own. `None` for a normal allow/nudge/block. When `Some`, the
+    /// dispatch seam records a `used` line in `bypasses.jsonl`.
+    pub bypass: Option<BypassProvenance>,
 }
 
 impl CheckResult {
@@ -525,6 +716,7 @@ impl CheckResult {
             outcome: Outcome::Allow,
             message: None,
             block_metadata: None,
+            bypass: None,
         }
     }
 
@@ -533,6 +725,7 @@ impl CheckResult {
             outcome: Outcome::Nudge,
             message: Some(message.into()),
             block_metadata: None,
+            bypass: None,
         }
     }
 
@@ -541,6 +734,7 @@ impl CheckResult {
             outcome: Outcome::Block,
             message: Some(message.into()),
             block_metadata: None,
+            bypass: None,
         }
     }
 
@@ -552,6 +746,7 @@ impl CheckResult {
             outcome: Outcome::Block,
             message: Some(message.into()),
             block_metadata: Some(meta),
+            bypass: None,
         }
     }
 
@@ -562,6 +757,33 @@ impl CheckResult {
             outcome: Outcome::LoopBlock,
             message: Some(message.into()),
             block_metadata: None,
+            bypass: None,
+        }
+    }
+
+    /// Force the interactive permission prompt (exit 0). The `message` becomes
+    /// the `permissionDecisionReason` shown to the user. Use when a guard can
+    /// neither prove an operation safe (allow) nor prove it dangerous (block),
+    /// so the human decides. See [`Outcome::Ask`] for the precedence guarantee.
+    pub fn ask(message: impl Into<String>) -> Self {
+        Self {
+            outcome: Outcome::Ask,
+            message: Some(message.into()),
+            block_metadata: None,
+            bypass: None,
+        }
+    }
+
+    /// An [`Outcome::Allow`] that carries [`BypassProvenance`]: the guard let the
+    /// operation through *because a bypass was active*, not because the operation
+    /// was fine on its own. Exit code is still 0 — the provenance rides the result
+    /// so the dispatch seam records a `used` line in `bypasses.jsonl`.
+    pub fn allow_bypassed(bypass: BypassProvenance) -> Self {
+        Self {
+            outcome: Outcome::Allow,
+            message: None,
+            block_metadata: None,
+            bypass: Some(bypass),
         }
     }
 }
@@ -629,80 +851,174 @@ fn apply_feedback_footer(outcome: Outcome, msg: &str, footer: Option<&str>) -> S
     }
 }
 
-/// Run a single check, emit output, and exit.
+/// The stdout/stderr payloads to emit for a rendered check outcome.
 ///
-/// Routing:
-/// - `skip_at_effort()` matches `$CLAUDE_EFFORT` → silent Allow (exit 0),
-///   `check.run()` is not called.
-/// - Nudge → JSON to stdout with `additionalContext` (exit 0).
-///   Claude Code parses this and injects the message into Claude's context.
-///   The JSON format differs by event type (PreToolUse vs PostToolUse).
-/// - Block → plain text to stderr (exit 2). When the check supplied a
-///   [`BlockMetadata`] (via [`CheckResult::block_structured`]) and the event
-///   is `PreToolUse`, also emit a `permissionDecision: "deny"` JSON envelope
-///   on stdout so Claude reads a machine-parseable payload. Stderr is still
-///   written for clients that don't parse the envelope.
-/// - Allow → silent exit 0.
-pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
-    let current_effort = std::env::var("CLAUDE_EFFORT").ok();
-    if should_skip_for_effort(check.skip_at_effort(), current_effort.as_deref()) {
-        process::exit(Outcome::Allow.code());
-    }
+/// Extracted as a pure value so the exit-code × output-shape matrix is
+/// unit-testable — [`run_check`] itself `process::exit`s and can't be asserted
+/// directly. A `None` stream means "write nothing to it."
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RenderedOutput {
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
 
-    let result = check.run(input);
-    if let Some(msg) = &result.message {
-        let event_name = event.name();
-        match result.outcome {
-            Outcome::Nudge => {
-                let json = serde_json::json!({
+/// Pure: compute what a check outcome writes to stdout/stderr, honoring Claude
+/// Code's exit-code contract.
+///
+/// The contract (code.claude.com/docs/en/hooks):
+/// - **Exit 0** (Allow/Nudge/LoopBlock): stdout JSON is parsed for control
+///   (`hookSpecificOutput`, `decision`); stderr is ignored.
+/// - **Exit 2** (Block): stdout is **ignored entirely** — only stderr is fed
+///   back to Claude. So a block emits *no* stdout: a JSON envelope there is
+///   never read, and a wrong-shaped one (e.g. an object-valued
+///   `additionalContext`) registers as an output-schema validation failure in
+///   telemetry while delivering nothing.
+///
+/// Structured block hints ([`BlockMetadata::fix`]) therefore ride the stderr
+/// channel: the `fix` is appended as a `Fix:` line *only when the prose doesn't
+/// already carry one*, so the machine-intended hint reaches Claude via the only
+/// channel exit 2 surfaces — without duplicating a fix the block message already
+/// spells out.
+///
+/// `footer` is the resolved feedback footer ([`feedback_footer`]); passing it in
+/// keeps this pure without touching process-global env.
+fn render_output(
+    outcome: Outcome,
+    message: Option<&str>,
+    block_metadata: Option<&BlockMetadata>,
+    event: HookEvent,
+    footer: Option<&str>,
+) -> RenderedOutput {
+    let Some(msg) = message else {
+        return RenderedOutput::default();
+    };
+    let event_name = event.name();
+    match outcome {
+        Outcome::Nudge => RenderedOutput {
+            stdout: Some(
+                serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
-                        "additionalContext": msg
+                        "additionalContext": msg,
                     }
-                });
-                println!("{json}");
-            }
-            Outcome::LoopBlock => {
-                // PostToolUse re-prompt: the tool already ran, so exit 0 and use
-                // the `decision: block` convention to feed the reason back. Also
-                // mirror it into additionalContext for clients that read that.
-                let json = serde_json::json!({
+                })
+                .to_string(),
+            ),
+            stderr: None,
+        },
+        Outcome::LoopBlock => RenderedOutput {
+            // PostToolUse re-prompt: the tool already ran, so exit 0 and use the
+            // `decision: block` convention to feed the reason back. Mirror it
+            // into additionalContext for clients that read that.
+            stdout: Some(
+                serde_json::json!({
                     "decision": "block",
                     "reason": msg,
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
-                        "additionalContext": msg
+                        "additionalContext": msg,
                     }
-                });
-                println!("{json}");
-            }
-            Outcome::Block => {
-                let full = apply_feedback_footer(Outcome::Block, msg, feedback_footer().as_deref());
-                // Structured payload (when supplied) is delivered via the
-                // PreToolUse `deny` JSON envelope on stdout. The envelope
-                // names this only well-defined under PreToolUse — other
-                // events fall back to the legacy stderr-only path.
-                if let (Some(meta), HookEvent::PreToolUse) = (&result.block_metadata, event) {
-                    let json = serde_json::json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": event_name,
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": &full,
-                            "additionalContext": meta,
-                        }
-                    });
-                    println!("{json}");
+                })
+                .to_string(),
+            ),
+            stderr: None,
+        },
+        Outcome::Ask => RenderedOutput {
+            // PreToolUse ask: exit 0 with a `permissionDecision: "ask"` envelope.
+            // Claude Code shows the interactive permission prompt, using `msg` as
+            // the reason — overriding a settings `allow` rule (most-restrictive
+            // precedence). The reason field is a JSON string, mirroring the
+            // additionalContext string-type contract (never an object).
+            stdout: Some(
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "permissionDecision": "ask",
+                        "permissionDecisionReason": msg,
+                    }
+                })
+                .to_string(),
+            ),
+            stderr: None,
+        },
+        Outcome::Block => {
+            // Exit 2 = stderr only. The structured `fix` (the one part that was
+            // JSON-only) folds into the prose here, on the channel exit 2
+            // surfaces — but only when the message doesn't already carry a
+            // `Fix:` line, to avoid a duplicate.
+            let mut body = msg.to_string();
+            if let Some(meta) = block_metadata {
+                let has_fix_line = msg.lines().any(|l| l.trim_start().starts_with("Fix:"));
+                if !meta.fix.is_empty() && !has_fix_line {
+                    body.push_str(&format!("\n   Fix: {}", meta.fix));
                 }
-                // Legacy stderr surface — preserved unconditionally for
-                // backward compatibility and as the fallback when a client
-                // doesn't parse the JSON envelope.
-                eprint!("{full}");
-                if !full.ends_with('\n') {
-                    eprintln!();
-                }
             }
-            Outcome::Allow => {}
+            let mut full = apply_feedback_footer(Outcome::Block, &body, footer);
+            if !full.ends_with('\n') {
+                full.push('\n');
+            }
+            RenderedOutput {
+                stdout: None,
+                stderr: Some(full),
+            }
         }
+        Outcome::Allow => RenderedOutput::default(),
+    }
+}
+
+/// Run a single check, emit output, and exit.
+///
+/// Routing (delegated to the pure [`render_output`], then written and exited):
+/// - `skip_at_effort()` matches `$CLAUDE_EFFORT` → silent Allow (exit 0),
+///   `check.run()` is not called.
+/// - Nudge / LoopBlock → JSON to stdout (exit 0). Claude Code parses this and
+///   injects the message into Claude's context.
+/// - Block → text to stderr **only** (exit 2). Claude Code ignores stdout on a
+///   block, so no JSON envelope is emitted there; the structured [`BlockMetadata`]
+///   `fix` is folded into the stderr text instead (see [`render_output`]).
+/// - Allow → silent exit 0.
+pub fn run_check(check: &dyn Check, input: &HookInput, event: HookEvent) -> ! {
+    match decide_check(check, input) {
+        None => process::exit(Outcome::Allow.code()),
+        Some(result) => emit_and_exit(&result, event),
+    }
+}
+
+/// The decide half of [`run_check`]: honor `skip_at_effort()`, then run the
+/// check. `None` means the check was short-circuited to Allow for the current
+/// `$CLAUDE_EFFORT` and `check.run()` was **not** called — the caller must treat
+/// it as a silent Allow. `Some(result)` carries the check's outcome.
+///
+/// Split out so a caller (the binary's logged-dispatch wrapper) can observe the
+/// [`CheckResult`] — e.g. to record a denial — between deciding and exiting,
+/// without changing what [`run_check`] itself does.
+pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult> {
+    let current_effort = std::env::var("CLAUDE_EFFORT").ok();
+    if should_skip_for_effort(check.skip_at_effort(), current_effort.as_deref()) {
+        return None;
+    }
+    Some(check.run(input))
+}
+
+/// The emit-and-exit half of [`run_check`]: render the outcome to stdout/stderr
+/// per Claude Code's exit-code contract, then `process::exit` with the outcome's
+/// code. Never returns.
+///
+/// Behaviourally identical to the tail of the pre-split [`run_check`], so the
+/// `render_output` matrix tests remain the safety net for the output shape.
+pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
+    let rendered = render_output(
+        result.outcome,
+        result.message.as_deref(),
+        result.block_metadata.as_ref(),
+        event,
+        feedback_footer().as_deref(),
+    );
+    if let Some(out) = rendered.stdout {
+        println!("{out}");
+    }
+    if let Some(err) = rendered.stderr {
+        eprint!("{err}");
     }
     process::exit(result.outcome.code());
 }
@@ -772,7 +1088,10 @@ pub fn interactive_terminal_help(
 /// misuse is not a hook context, and a hook's own non-hook situation must
 /// never block (ADR-0001). Invisible in production: Claude Code always pipes,
 /// so `is_terminal()` is false there.
-fn guard_interactive_terminal(
+///
+/// `pub` so the binary's logged-dispatch wrapper ([`crate`] consumers in `src/`)
+/// can reuse the same interactive-terminal guard as [`run_check_from_stdin`].
+pub fn guard_interactive_terminal(
     hook_name: &str,
     event: Option<HookEvent>,
     sample_override: Option<&str>,
@@ -978,6 +1297,249 @@ mod tests {
         };
         let v = serde_json::to_value(meta).expect("serializes");
         assert_eq!(v["allowed_owners"], serde_json::json!([]));
+    }
+
+    // --- render_output: exit-code × output-shape matrix (#165) ---
+
+    #[test]
+    fn render_block_emits_no_stdout() {
+        // THE anti-regression assertion: a hard block (exit 2) must never write
+        // stdout. Claude Code ignores stdout on exit 2; a JSON envelope there is
+        // pure liability (#165 — 99 output-schema validation failures from one
+        // guard emitting an object-valued additionalContext on this ignored path).
+        let rendered = render_output(
+            Outcome::Block,
+            Some("🚫 blocked: target you don't own"),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert_eq!(rendered.stdout, None, "block must emit no stdout");
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(stderr.contains("target you don't own"));
+    }
+
+    #[test]
+    fn render_block_folds_fix_into_stderr_when_prose_lacks_one() {
+        // The structured `fix` was the only JSON-only datum; it must reach Claude
+        // via the exit-2-honored channel (stderr), appended as a Fix: line when
+        // the prose doesn't already carry one. This mirrors the reproduced #165
+        // case (`disallowed_message`, which has no prose Fix line).
+        let rendered = render_output(
+            Outcome::Block,
+            Some("🚫 blocked: no fix line here"),
+            Some(&sample_metadata()), // fix = "-R owner/repo"
+            HookEvent::PreToolUse,
+            None,
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        assert!(
+            stderr.contains("Fix: -R owner/repo"),
+            "fix folded into stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn render_block_does_not_duplicate_existing_fix_line() {
+        // When the prose already spells out a Fix:, the metadata fix is NOT
+        // re-appended — exactly one Fix line survives.
+        let rendered = render_output(
+            Outcome::Block,
+            Some("🚫 blocked\n   Fix: add `-R owner/repo`"),
+            Some(&sample_metadata()),
+            HookEvent::PreToolUse,
+            None,
+        );
+        let stderr = rendered.stderr.expect("block writes stderr");
+        let fix_lines = stderr
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Fix:"))
+            .count();
+        assert_eq!(fix_lines, 1, "exactly one Fix line: {stderr}");
+    }
+
+    #[test]
+    fn render_block_without_metadata_is_stderr_only() {
+        let rendered = render_output(
+            Outcome::Block,
+            Some("plain block"),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert_eq!(rendered.stdout, None);
+        assert!(rendered.stderr.expect("stderr").contains("plain block"));
+    }
+
+    #[test]
+    fn render_block_stderr_ends_with_newline() {
+        let rendered = render_output(
+            Outcome::Block,
+            Some("no trailing newline"),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert!(rendered.stderr.expect("stderr").ends_with('\n'));
+    }
+
+    #[test]
+    fn render_block_appends_feedback_footer_when_present() {
+        let rendered = render_output(
+            Outcome::Block,
+            Some("blocked"),
+            None,
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        assert!(
+            rendered
+                .stderr
+                .expect("stderr")
+                .contains("/cadence:feedback")
+        );
+    }
+
+    #[test]
+    fn render_nudge_stdout_additional_context_is_string() {
+        // Locks the field TYPE: additionalContext must be a JSON string (schema
+        // requires a string, capped 10k chars), never a struct/object.
+        let rendered = render_output(
+            Outcome::Nudge,
+            Some("heads up: editing on main"),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert_eq!(rendered.stderr, None, "nudge writes no stderr");
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered.stdout.expect("nudge writes stdout"))
+                .expect("valid JSON");
+        assert!(
+            json["hookSpecificOutput"]["additionalContext"].is_string(),
+            "additionalContext must be a string, got {}",
+            json["hookSpecificOutput"]["additionalContext"]
+        );
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    }
+
+    #[test]
+    fn render_loop_block_shape() {
+        // Documents/guards the PostToolUse re-prompt shape: top-level decision +
+        // reason, plus the nested hookSpecificOutput mirror (string context).
+        let rendered = render_output(
+            Outcome::LoopBlock,
+            Some("rewrite this"),
+            None,
+            HookEvent::PostToolUse,
+            None,
+        );
+        assert_eq!(rendered.stderr, None);
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered.stdout.expect("loop_block writes stdout"))
+                .expect("valid JSON");
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["reason"], "rewrite this");
+        assert!(json["hookSpecificOutput"]["additionalContext"].is_string());
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    }
+
+    #[test]
+    fn render_allow_and_empty_message_emit_nothing() {
+        assert_eq!(
+            render_output(Outcome::Allow, None, None, HookEvent::PreToolUse, None),
+            RenderedOutput::default()
+        );
+        // A None message on any outcome emits nothing (the skip/allow path).
+        assert_eq!(
+            render_output(Outcome::Block, None, None, HookEvent::PreToolUse, None),
+            RenderedOutput::default()
+        );
+    }
+
+    // --- Ask outcome: exit code, render shape, merge severity (#261) ---
+
+    #[test]
+    fn ask_exits_zero() {
+        // Ask is a prompt, not a hard block — it must exit 0 so the JSON on
+        // stdout is parsed for the permissionDecision (exit 2 would discard it).
+        assert_eq!(Outcome::Ask.code(), 0);
+    }
+
+    #[test]
+    fn render_ask_emits_permission_decision_ask_on_stdout() {
+        // THE Ask contract: a PreToolUse `permissionDecision: "ask"` envelope on
+        // stdout, no stderr. The reason must be a JSON string (mirroring the
+        // additionalContext string-type contract), never an object.
+        let rendered = render_output(
+            Outcome::Ask,
+            Some("rm target could not be proven safe — confirm?"),
+            None,
+            HookEvent::PreToolUse,
+            None,
+        );
+        assert_eq!(rendered.stderr, None, "ask writes no stderr");
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered.stdout.expect("ask writes stdout")).expect("valid JSON");
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(json["hookSpecificOutput"]["permissionDecision"], "ask");
+        assert!(
+            json["hookSpecificOutput"]["permissionDecisionReason"].is_string(),
+            "permissionDecisionReason must be a string, got {}",
+            json["hookSpecificOutput"]["permissionDecisionReason"]
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecisionReason"],
+            "rm target could not be proven safe — confirm?"
+        );
+    }
+
+    #[test]
+    fn render_ask_does_not_append_feedback_footer() {
+        // The feedback footer is a hard-block affordance; an Ask is a routine
+        // prompt, so the footer must not leak into the reason.
+        let rendered = render_output(
+            Outcome::Ask,
+            Some("confirm?"),
+            None,
+            HookEvent::PreToolUse,
+            Some(FEEDBACK_FOOTER),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered.stdout.expect("ask writes stdout")).expect("valid JSON");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecisionReason"], "confirm?",
+            "no footer folded into an ask reason"
+        );
+    }
+
+    #[test]
+    fn render_ask_with_none_message_emits_nothing() {
+        // A None message short-circuits before the match, like every outcome.
+        assert_eq!(
+            render_output(Outcome::Ask, None, None, HookEvent::PreToolUse, None),
+            RenderedOutput::default()
+        );
+    }
+
+    #[test]
+    fn outcome_merge_ask_below_block_above_nudge() {
+        // Block > Ask > Nudge > Allow.
+        assert_eq!(Outcome::Block.merge(Outcome::Ask), Outcome::Block);
+        assert_eq!(Outcome::Ask.merge(Outcome::Block), Outcome::Block);
+        assert_eq!(Outcome::Ask.merge(Outcome::Nudge), Outcome::Ask);
+        assert_eq!(Outcome::Nudge.merge(Outcome::Ask), Outcome::Ask);
+        assert_eq!(Outcome::Ask.merge(Outcome::Allow), Outcome::Ask);
+        assert_eq!(Outcome::Allow.merge(Outcome::Ask), Outcome::Ask);
+    }
+
+    #[test]
+    fn check_result_ask() {
+        let r = CheckResult::ask("confirm this rm");
+        assert_eq!(r.outcome, Outcome::Ask);
+        assert_eq!(r.message.as_deref(), Some("confirm this rm"));
+        assert!(r.block_metadata.is_none());
+        assert!(r.bypass.is_none());
     }
 
     #[test]
@@ -1271,6 +1833,32 @@ mod tests {
     }
 
     #[test]
+    fn effective_content_edit_reads_literal_not_normalized_path() {
+        // A path with a trailing space: normalize_path() would trim it and read
+        // a *different* (nonexistent) file. effective_content() must read the
+        // LITERAL write target so a guard validates the same file Claude Code
+        // actually writes (#129).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md ");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+
+        let literal = path.to_str().unwrap();
+        assert!(
+            literal.ends_with(' '),
+            "test path must retain its trailing space, got {literal:?}"
+        );
+        // The normalized form trims the space and points at a nonexistent file.
+        assert_ne!(normalize_path(literal), literal);
+
+        let input = make_disk_edit(literal, "line two", "line 2", None);
+        assert_eq!(
+            input.effective_content().as_deref(),
+            Some("line one\nline 2\n"),
+            "should simulate against the literal trailing-space path, not the trimmed one"
+        );
+    }
+
+    #[test]
     fn effective_content_multi_edit_applies_sequentially() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.md");
@@ -1366,6 +1954,39 @@ mod tests {
     fn check_result_accepts_string() {
         let r = CheckResult::nudge(String::from("owned"));
         assert_eq!(r.message.as_deref(), Some("owned"));
+    }
+
+    // --- bypass provenance ---
+
+    #[test]
+    fn plain_constructors_carry_no_bypass() {
+        // Only allow_bypassed sets provenance; every other constructor leaves it
+        // None so the dispatch seam records nothing for a normal allow/block.
+        assert!(CheckResult::allow().bypass.is_none());
+        assert!(CheckResult::nudge("x").bypass.is_none());
+        assert!(CheckResult::block("y").bypass.is_none());
+        assert!(CheckResult::loop_block("z").bypass.is_none());
+    }
+
+    #[test]
+    fn allow_bypassed_carries_provenance() {
+        let prov = BypassProvenance {
+            kind: BypassKind::Dismissal,
+            mechanism: "dismiss-enforce-worktree".to_string(),
+            reason: Some("dogfooding vault symlink".to_string()),
+            expires_at: Some(2_000_000_000),
+            armed_by_session: Some("sess-1".to_string()),
+        };
+        let r = CheckResult::allow_bypassed(prov.clone());
+        assert_eq!(r.outcome, Outcome::Allow, "bypass-allow still exits 0");
+        assert_eq!(r.bypass.as_ref(), Some(&prov));
+    }
+
+    #[test]
+    fn bypass_kind_wire_tokens_are_stable() {
+        // Metrics records key off these; a rename would silently break greps.
+        assert_eq!(BypassKind::Dismissal.as_str(), "dismissal");
+        assert_eq!(BypassKind::EnvSwitch.as_str(), "env_switch");
     }
 
     // --- JSON deserialization ---
@@ -1562,7 +2183,18 @@ mod tests {
         assert_eq!(input.transcript_path, None);
         assert_eq!(input.agent_id, None);
         assert_eq!(input.duration_ms, None);
+        assert_eq!(input.reason, None);
         assert_eq!(input.command(), None);
+    }
+
+    #[test]
+    fn metrics_input_parses_session_end_reason() {
+        // The SessionEnd payload carries `reason`; it lands on the
+        // `sessions.jsonl` row so a session's terminal cause is greppable.
+        let json =
+            r#"{"session_id":"s1","hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#;
+        let input = MetricsInput::from_json(json).unwrap();
+        assert_eq!(input.reason.as_deref(), Some("prompt_input_exit"));
     }
 
     #[test]
@@ -1577,6 +2209,53 @@ mod tests {
         assert!(MetricsInput::from_json("not json").is_err());
     }
 
+    #[test]
+    fn metrics_input_tolerates_non_object_tool_response() {
+        // A tool's `tool_response` shape varies by tool: a plain string (Read),
+        // an array (Glob), a Bash-style object (Bash). A shape that does not
+        // match the typed `ToolResponse` must degrade to `None`, not fail the
+        // whole payload parse and silently drop the metrics row (#356).
+        let string_shaped =
+            MetricsInput::from_json(r#"{"tool_name":"Read","tool_response":"file contents"}"#)
+                .expect("string tool_response must not fail the parse");
+        assert!(string_shaped.tool_response.is_none());
+        assert_eq!(string_shaped.tool_name.as_deref(), Some("Read"));
+
+        let array_shaped =
+            MetricsInput::from_json(r#"{"tool_name":"Glob","tool_response":["a.txt","b.txt"]}"#)
+                .expect("array tool_response must not fail the parse");
+        assert!(array_shaped.tool_response.is_none());
+
+        // Explicit `null` also degrades to `None` (serde's Option handling).
+        let null_shaped = MetricsInput::from_json(r#"{"tool_name":"Read","tool_response":null}"#)
+            .expect("null tool_response must not fail the parse");
+        assert!(null_shaped.tool_response.is_none());
+    }
+
+    #[test]
+    fn hook_input_tolerates_non_object_tool_response() {
+        // Enforcement guards parse `HookInput`; a mismatched `tool_response`
+        // must not blind a guard that only needs `tool_input` — the typed
+        // response degrades to `None` while `tool_input` still parses (#356).
+        let input: HookInput = serde_json::from_str(
+            r#"{"tool_name":"Read","tool_input":{"file_path":"src/main.rs"},"tool_response":"contents"}"#,
+        )
+        .expect("string tool_response must not fail HookInput parse");
+        assert!(input.tool_response.is_none());
+        assert_eq!(
+            input.tool_input.and_then(|ti| ti.file_path).as_deref(),
+            Some("src/main.rs")
+        );
+    }
+
+    #[test]
+    fn metrics_input_parses_tool_name_from_post_tool_use() {
+        // Event-derivation loggers key off this field.
+        let json = r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash"}"#;
+        let input = MetricsInput::from_json(json).unwrap();
+        assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+    }
+
     // --- Interactive terminal guidance ---
 
     #[test]
@@ -1584,6 +2263,7 @@ mod tests {
         assert_eq!(HookEvent::PreToolUse.name(), "PreToolUse");
         assert_eq!(HookEvent::PostToolUse.name(), "PostToolUse");
         assert_eq!(HookEvent::SessionStart.name(), "SessionStart");
+        assert_eq!(HookEvent::UserPromptSubmit.name(), "UserPromptSubmit");
     }
 
     #[test]
@@ -1592,6 +2272,7 @@ mod tests {
             HookEvent::PreToolUse,
             HookEvent::PostToolUse,
             HookEvent::SessionStart,
+            HookEvent::UserPromptSubmit,
         ] {
             let parsed: Result<HookInput, _> = serde_json::from_str(event.sample_payload());
             assert!(
@@ -1611,6 +2292,18 @@ mod tests {
     }
 
     #[test]
+    fn user_prompt_submit_sample_exercises_the_persist_plan_prefix_gate() {
+        let input: HookInput =
+            serde_json::from_str(HookEvent::UserPromptSubmit.sample_payload()).unwrap();
+        assert!(
+            input
+                .prompt()
+                .is_some_and(|p| p.starts_with("Implement the following plan:")),
+            "sample should exercise the persist-plan prefix gate"
+        );
+    }
+
+    #[test]
     fn logger_sample_payload_parses_as_metrics_input() {
         let parsed = MetricsInput::from_json(LOGGER_SAMPLE_PAYLOAD);
         assert!(parsed.is_ok(), "{:?}", parsed.err());
@@ -1622,16 +2315,15 @@ mod tests {
 
     #[test]
     fn interactive_help_names_hook_event_and_commands() {
-        let argv: Vec<String> = ["cadence-hooks", "lab", "persona-nudge"]
+        let argv: Vec<String> = ["cadence-hooks", "session", "start"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let msg =
-            interactive_terminal_help("persona-nudge", Some(HookEvent::SessionStart), None, &argv);
-        assert!(msg.contains("'persona-nudge'"));
+        let msg = interactive_terminal_help("start", Some(HookEvent::SessionStart), None, &argv);
+        assert!(msg.contains("'start'"));
         assert!(msg.contains("SessionStart"));
-        assert!(msg.contains("cadence-hooks try lab persona-nudge"));
-        assert!(msg.contains("| cadence-hooks lab persona-nudge"));
+        assert!(msg.contains("cadence-hooks try session start"));
+        assert!(msg.contains("| cadence-hooks session start"));
         assert!(msg.contains(HookEvent::SessionStart.sample_payload()));
         assert!(msg.contains("cadence-hooks list"));
         assert!(msg.contains("cadence-hooks doctor"));

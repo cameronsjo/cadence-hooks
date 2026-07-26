@@ -98,6 +98,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "bon"
 version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,12 +187,11 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 
 [[package]]
 name = "cadence-hooks"
-version = "0.41.0"
+version = "0.68.0"
 dependencies = [
  "cadence-hooks-cadence",
  "cadence-hooks-core",
  "cadence-hooks-guardrails",
- "cadence-hooks-lab",
  "cadence-hooks-metrics",
  "cadence-hooks-obsidian",
  "cadence-hooks-rules",
@@ -196,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-cadence"
-version = "0.41.0"
+version = "0.68.0"
 dependencies = [
  "cadence-hooks-core",
  "glob",
@@ -208,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-core"
-version = "0.41.0"
+version = "0.68.0"
 dependencies = [
  "brush-parser",
  "jiff",
@@ -220,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-guardrails"
-version = "0.41.0"
+version = "0.68.0"
 dependencies = [
  "cadence-hooks-core",
  "regex",
@@ -230,9 +238,15 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-lab"
-version = "0.41.0"
+version = "0.68.0"
+
+[[package]]
+name = "cadence-hooks-metrics"
+version = "0.68.0"
 dependencies = [
  "cadence-hooks-core",
+ "cadence-hooks-rules",
+ "jiff",
  "regex",
  "serde",
  "serde_json",
@@ -240,19 +254,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "cadence-hooks-metrics"
-version = "0.41.0"
-dependencies = [
- "cadence-hooks-core",
- "cadence-hooks-rules",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "cadence-hooks-obsidian"
-version = "0.41.0"
+version = "0.68.0"
 dependencies = [
  "cadence-hooks-core",
  "serde_json",
@@ -260,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-rules"
-version = "0.41.0"
+version = "0.68.0"
 dependencies = [
  "cadence-hooks-core",
  "regex",
@@ -270,11 +273,15 @@ dependencies = [
 
 [[package]]
 name = "cadence-hooks-session"
-version = "0.41.0"
+version = "0.68.0"
 dependencies = [
  "cadence-hooks-core",
+ "cadence-hooks-guardrails",
+ "cadence-hooks-metrics",
+ "gethostname",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -341,6 +348,25 @@ dependencies = [
  "once_cell",
  "unicode-width",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cpufeatures"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "crypto-common"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
+dependencies = [
+ "generic-array",
+ "typenum",
 ]
 
 [[package]]
@@ -426,6 +452,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,6 +500,26 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "generic-array"
+version = "0.14.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
+dependencies = [
+ "typenum",
+ "version_check",
+]
+
+[[package]]
+name = "gethostname"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3655aa6818d65bc620d6911f05aa7b6aeb596291e1e9f79e52df85583d1e30"
+dependencies = [
+ "rustix 0.38.44",
+ "windows-targets",
+]
 
 [[package]]
 name = "getrandom"
@@ -614,6 +670,12 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "linux-raw-sys"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+
+[[package]]
+name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
@@ -755,6 +817,19 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rustix"
+version = "0.38.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
@@ -762,7 +837,7 @@ dependencies = [
  "bitflags",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
 ]
 
@@ -822,6 +897,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -853,7 +939,7 @@ dependencies = [
  "fastrand",
  "getrandom",
  "once_cell",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -927,6 +1013,12 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
 ]
+
+[[package]]
+name = "typenum"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "unicode-ident"

@@ -14,8 +14,8 @@
 //! terms in an external post — documenting the harness itself, an issue *about*
 //! `cadence:writing-skills`, a commit that renames `tool_input`. The condition
 //! is detectable but the policy is advisory, so this is a nudge. The per-repo
-//! `.claude/redaction.json` `allowlist` is the escape hatch for the recurring
-//! legitimate case.
+//! `.claude/cadence.json` `redaction.allowlist` is the escape hatch for the
+//! recurring legitimate case.
 //!
 //! ## Body extraction (not segment-based)
 //!
@@ -35,9 +35,66 @@ use cadence_hooks_core::shell::{strip_quotes, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
+
+/// The three audience tiers, ordered narrow → wide: owned-internal(1) <
+/// private-external(2) < public(3). Deserialized where a config field is
+/// tier-typed; the ordinal mapping is the single source of truth reused by the
+/// two string-keyed ordinal fns below.
+///
+/// Redaction is `f(content, audience)`: a hit is retained (nudged) only when it
+/// crosses to a *wider* audience than the tier where it is native — redact iff
+/// destination-tier ordinal `d` > the hit's ceiling ordinal `c`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AudienceTier {
+    OwnedInternal,
+    PrivateExternal,
+    Public,
+}
+
+impl AudienceTier {
+    /// Position in the narrow→wide order.
+    fn ordinal(self) -> u8 {
+        match self {
+            AudienceTier::OwnedInternal => 1,
+            AudienceTier::PrivateExternal => 2,
+            AudienceTier::Public => 3,
+        }
+    }
+}
+
+/// Destination-tier ordinal. String-keyed (not `AudienceTier`-typed) so an
+/// unknown/typo'd string hits the documented fail-safe instead of failing to
+/// deserialize. Unknown → 3 (widest/public) so an unrecognized destination
+/// redacts MORE, never less. `always` is a config-only CEILING sentinel, never a
+/// valid destination — a stray `originAudience: "always"` must resolve to
+/// public(3), never 0, or it would suppress every hit (the total-bypass trap).
+fn dest_tier_ord(s: &str) -> u8 {
+    match s {
+        "owned-internal" => AudienceTier::OwnedInternal.ordinal(),
+        "private-external" => AudienceTier::PrivateExternal.ordinal(),
+        "public" => AudienceTier::Public.ordinal(),
+        _ => 3,
+    }
+}
+
+/// Ceiling ordinal. Unknown → 1 (owned-internal, the documented default) so a
+/// typo'd ceiling (`"owned_internal"`) never widens to public and silently
+/// suppresses a hit. Fail-safe for a ceiling is the SMALLER ordinal (redact at
+/// more destinations) — the opposite direction from a destination. `always`(0)
+/// is a config-only sentinel meaning "redact at every tier".
+fn ceiling_ord(s: &str) -> u8 {
+    match s {
+        "always" => 0,
+        "owned-internal" => AudienceTier::OwnedInternal.ordinal(),
+        "private-external" => AudienceTier::PrivateExternal.ordinal(),
+        "public" => AudienceTier::Public.ordinal(),
+        _ => 1,
+    }
+}
 
 /// Plugin/skill namespaces whose `<ns>:<name>` IDs are harness-internal.
 ///
@@ -46,7 +103,12 @@ use std::sync::LazyLock;
 /// init. `mcp` is both a namespace and a prefix of `cadence-mcp`; the regex
 /// builder sorts longest-first so `cadence-mcp:x` is caught as `cadence-mcp:x`,
 /// not as `cadence` + leftover or bare `mcp`.
-const NAMESPACES: &[&str] = &[
+/// `pub` (rather than crate-private) so the cross-sibling namespace-parity
+/// audit test (`tests/hook_registration_audit.rs`) can read it directly and
+/// diff it against the plugin-side `redact-check.sh` namespace list. Exposed
+/// for that in-repo test linkage only — not a supported public API.
+#[doc(hidden)]
+pub const NAMESPACES: &[&str] = &[
     "cadence",
     "cadence-forge",
     "cadence-groundwork",
@@ -119,27 +181,56 @@ static HARNESS_NOUN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("harness-noun pattern should compile")
 });
 
-/// Per-repo override file, read from `<git-root>/.claude/redaction.json`.
-/// Missing, unreadable, or invalid JSON all deserialize to the default (empty)
-/// config — the check never errors on it (fail-open, ADR-0001).
+/// Per-repo override, read from the `redaction` section of
+/// `<git-root>/.claude/cadence.json` (cadence-hooks#153). Missing file,
+/// unreadable, invalid JSON, or an absent section all deserialize to the
+/// default (empty) config — the check never errors on it (fail-open, ADR-0001).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RedactionConfig {
+    /// Tier of THIS surface, used as the scan destination when `CADENCE_AUDIENCE`
+    /// is unset. `String` (not `AudienceTier`) so a stray/typo'd value resolves
+    /// via [`dest_tier_ord`]'s fail-safe rather than failing the whole config to
+    /// deserialize. Omitted → public (widest, safest).
+    #[serde(default)]
+    origin_audience: Option<String>,
+    /// Per-category ceiling overrides, keyed by the emitted category name
+    /// (`skill-id`, `local-path`, `marketplace`, `harness-noun`). A category
+    /// without an entry uses the default ceiling (`owned-internal`).
+    #[serde(default)]
+    categories: HashMap<String, CategoryOverride>,
     /// Extra literal/regex patterns to flag, each with the replacement to show.
     #[serde(default)]
     additional_patterns: Vec<AdditionalPattern>,
-    /// Tokens that suppress a hit. Two forms, by colon presence:
+    /// Tokens that suppress a hit. Colon presence changes what a colon-free
+    /// entry means per category — see [`is_allowlisted`] for the full rule:
     /// - **full token** (`cadence:writing-skills`) → suppresses only that exact
     ///   matched snippet, in any category;
-    /// - **bare namespace** (`cadence`, `cadence-forge`, `mcp`) → suppresses
-    ///   every skill-id (category 1) hit whose namespace equals it; never
-    ///   touches path/marketplace/harness-noun hits.
+    /// - **bare namespace**, for `skill-id` hits (`cadence`, `cadence-forge`,
+    ///   `mcp`) → suppresses every skill-id hit whose namespace equals it;
+    /// - **bare exact-match**, for any other category (`local-path`,
+    ///   `marketplace`, `harness-noun`, `custom`) → suppresses a hit whose
+    ///   snippet equals the entry exactly (#318).
     ///
     /// The bare-namespace form lets a repo that legitimately discusses a whole
     /// namespace (the meta-repo dogfooding all cadence skills, say) allow-list it
     /// wholesale instead of enumerating every skill ID.
     #[serde(default)]
     allowlist: Vec<String>,
+    /// Deserialized but inert in Phase 2. Reserved for Phase-2b, when it will
+    /// gate the `--repo` owner-vs-origin visibility resolution.
+    #[serde(default)]
+    #[allow(dead_code)]
+    resolve_visibility: bool,
+}
+
+/// One `categories[<name>]` entry: a per-category ceiling override.
+#[derive(Debug, Deserialize)]
+struct CategoryOverride {
+    /// Ceiling tier for this category; absent resolves to `owned-internal` at
+    /// use via [`category_ceiling`].
+    #[serde(default)]
+    ceiling: Option<String>,
 }
 
 /// One `additionalPatterns[]` entry: a project-specific string to flag and the
@@ -149,6 +240,11 @@ struct AdditionalPattern {
     pattern: String,
     #[serde(default)]
     replacement: String,
+    /// Per-entry ceiling tier; absent resolves to `owned-internal` at use. Opt
+    /// into `always` for PII / secrets-adjacent patterns that must redact at
+    /// every destination.
+    #[serde(default)]
+    ceiling: Option<String>,
 }
 
 /// A single blocklist hit within one body. `offset` is the match start within
@@ -189,13 +285,18 @@ impl Check for RedactExternalContent {
             return CheckResult::allow();
         }
 
-        // Phase 3 — config (per-repo additional patterns + allowlist).
+        // Phase 3 — config (per-repo additional patterns + allowlist + tiers).
         let config = load_redaction_config(&base_dir);
 
-        // Phase 4 — scan each body, collect hits.
+        // Phase 3.5 — resolve the destination-tier ordinal once. `CADENCE_AUDIENCE`
+        // wins over the config's `originAudience`; both fall back to public.
+        let env_audience = std::env::var("CADENCE_AUDIENCE").ok();
+        let d = resolve_dest_tier(env_audience.as_deref(), &config);
+
+        // Phase 4 — scan each body, collect hits (gated on d > ceiling).
         let mut hits: Vec<Hit> = Vec::new();
         for body in &bodies {
-            hits.extend(scan_body(body, &config));
+            hits.extend(scan_body(body, &config, d));
         }
 
         if hits.is_empty() {
@@ -206,7 +307,7 @@ impl Check for RedactExternalContent {
     }
 }
 
-/// Resolve the directory to read `.claude/redaction.json` from and to resolve a
+/// Resolve the directory to read `.claude/cadence.json` from and to resolve a
 /// relative `--body-file` path against: the hook's `cwd`, falling back to the
 /// process working directory, then `.`.
 fn resolve_base_dir(input: &HookInput) -> String {
@@ -293,8 +394,12 @@ fn extract_bodies(command: &str, base_dir: &str) -> Vec<String> {
 }
 
 /// Read a `--body-file` value from disk, resolving a relative path against
-/// `base_dir`. `None` on any error (missing, non-UTF-8, `-` for stdin) so the
-/// caller fails open.
+/// `base_dir`. `None` on any error (missing, non-UTF-8, `-` for stdin,
+/// non-regular file, oversized) so the caller fails open.
+///
+/// #194: shares the #157 unbounded-read DoS shape — a symlink to an endless
+/// special file (`/dev/zero`, a FIFO) or a multi-GB file could hang or OOM the
+/// hook — so this routes through the same bounded, regular-file-only reader.
 fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
     let p = Path::new(path);
     let full = if p.is_absolute() {
@@ -302,59 +407,106 @@ fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
     } else {
         Path::new(base_dir).join(p)
     };
-    std::fs::read_to_string(full).ok()
+    cadence_hooks_core::paths::read_untrusted_config(&full)
 }
 
-/// Load `<git-root>/.claude/redaction.json`, walking up from `base_dir` to the
-/// first ancestor containing a `.git` entry (dir or worktree file). Any failure
-/// — no git root, missing/unreadable file, invalid JSON — yields the default
-/// (empty) config.
+/// Load this guard's `redaction` section from `<git-root>/.claude/cadence.json`
+/// (cadence-hooks#153), walking up from `base_dir` to the first ancestor
+/// containing a `.git` entry (dir or worktree file). Any failure — no git root,
+/// missing/unreadable file, invalid JSON, or an absent section — yields the
+/// default (empty) config. The legacy `.claude/redaction.json` is no longer
+/// read (hard cut); `cadence-hooks migrate-config` converts a repo and
+/// `cadence-hooks doctor` warns on an orphaned legacy file.
 fn load_redaction_config(base_dir: &str) -> RedactionConfig {
     let Some(root) = cadence_hooks_core::paths::find_git_root(base_dir) else {
         return RedactionConfig::default();
     };
-    let path = root.join(".claude/redaction.json");
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return RedactionConfig::default();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
+    cadence_hooks_core::config::load_cadence_section(&root, "redaction")
+}
+
+/// Resolve the destination-tier ordinal (PURE — env passed as an argument, never
+/// read from `std::env` here, so the audience seam is fixture-testable).
+/// Resolution order: `CADENCE_AUDIENCE` (via `env_audience`) → config
+/// `originAudience` → public(3, widest/safest). Awareness only relaxes on proof.
+fn resolve_dest_tier(env_audience: Option<&str>, config: &RedactionConfig) -> u8 {
+    // Phase-2b: derive tier from --repo owner vs origin remote owner (local
+    // .git/config, no network) as a lower-priority source below env/config.
+    if let Some(a) = env_audience {
+        dest_tier_ord(a)
+    } else if let Some(a) = config.origin_audience.as_deref() {
+        dest_tier_ord(a)
+    } else {
+        3
+    }
+}
+
+/// Ceiling string for a universal category: the config `.categories` override or
+/// the default `owned-internal`. Returned as `&str` for a direct
+/// [`ceiling_ord`] call.
+fn category_ceiling<'a>(config: &'a RedactionConfig, category: &str) -> &'a str {
+    config
+        .categories
+        .get(category)
+        .and_then(|c| c.ceiling.as_deref())
+        .unwrap_or("owned-internal")
 }
 
 /// Scan one body for blocklist hits, deduped by start offset across categories,
-/// then drop any hit whose exact snippet is allowlisted.
+/// gating each hit on the audience rule: retain iff `d > c` (destination tier
+/// wider than the hit's ceiling).
 ///
-/// Categories are scanned skill → marketplace → local-path → harness →
+/// Categories are scanned skill-id → marketplace → local-path → harness →
 /// additional; the first to claim a start offset reports it (so a single
-/// `~/.claude/plugins/…` offset is reported once, as `marketplace`).
-fn scan_body(body: &str, config: &RedactionConfig) -> Vec<Hit> {
+/// `~/.claude/plugins/…` offset is reported once, as `marketplace`). An
+/// allowlisted hit pins its ceiling to public (never redacted here).
+fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut claimed: HashSet<usize> = HashSet::new();
 
     let universal: [(&'static str, &Regex); 4] = [
-        ("skill/plugin", &SKILL_ID),
+        ("skill-id", &SKILL_ID),
         ("marketplace", &MARKETPLACE_PATH),
         ("local-path", &LOCAL_PATH),
         ("harness-noun", &HARNESS_NOUN),
     ];
     for (category, regex) in universal {
         for m in regex.find_iter(body) {
+            // Claim the offset when first seen (so a lower-priority category
+            // never re-reports it), then decide whether the audience gate keeps
+            // it.
             if claimed.insert(m.start()) {
-                hits.push(Hit {
+                let hit = Hit {
                     category,
                     snippet: m.as_str().to_string(),
                     offset: m.start(),
                     replacement: None,
-                });
+                };
+                // Allowlisted → ceiling public (never redacts); else the
+                // category's configured/default ceiling. Retain iff d > c.
+                let ceiling = if is_allowlisted(&hit, &config.allowlist) {
+                    "public"
+                } else {
+                    category_ceiling(config, category)
+                };
+                if d > ceiling_ord(ceiling) {
+                    hits.push(hit);
+                }
             }
         }
     }
 
     // Per-repo additional patterns — each `pattern` is treated as a regex; one
-    // that fails to compile is skipped (fail-open).
+    // that fails to compile is skipped (fail-open). The ceiling is computed once
+    // per entry (default owned-internal); a whole pattern is skipped when the
+    // gate closes (d <= c).
     for ap in &config.additional_patterns {
         let Ok(re) = Regex::new(&ap.pattern) else {
             continue;
         };
+        let c = ceiling_ord(ap.ceiling.as_deref().unwrap_or("owned-internal"));
+        if d <= c {
+            continue;
+        }
         for m in re.find_iter(body) {
             if claimed.insert(m.start()) {
                 hits.push(Hit {
@@ -367,25 +519,30 @@ fn scan_body(body: &str, config: &RedactionConfig) -> Vec<Hit> {
         }
     }
 
-    // Allowlist suppression (two forms — see [`is_allowlisted`]).
-    hits.retain(|h| !is_allowlisted(h, &config.allowlist));
-
     hits.sort_by_key(|h| h.offset);
     hits
 }
 
 /// Is `hit` suppressed by the allowlist? An entry with a colon is a **full
 /// token** — it suppresses only a hit whose exact snippet equals it (any
-/// category). An entry without a colon is a **bare namespace** — it suppresses
-/// only skill-id hits whose namespace equals it (matched via the `<ns>:` prefix,
-/// so `cadence` never swallows `cadence-forge:…`); it never touches
-/// path/marketplace/harness-noun hits.
+/// category). A colon-free entry's meaning depends on the hit's category:
+/// for `skill-id` it's a **bare namespace** — suppresses only a hit whose
+/// namespace equals it (matched via the `<ns>:` prefix, so `cadence` never
+/// swallows `cadence-forge:…`); for every other category (`local-path`,
+/// `marketplace`, `harness-noun`, `custom`) a colon-free entry has no
+/// namespace structure to prefix-match, so it suppresses a hit whose exact
+/// snippet equals it (#318: a repo whose own subject matter uses a harness
+/// noun as domain vocabulary — e.g. a transcript-viewer tool discussing
+/// "transcript" — can allowlist that literal term without suppressing the
+/// whole `harness-noun` category or a differently-worded hit like "harness").
 fn is_allowlisted(hit: &Hit, allowlist: &[String]) -> bool {
     allowlist.iter().any(|entry| {
         if entry.contains(':') {
             entry == &hit.snippet
+        } else if hit.category == "skill-id" {
+            hit.snippet.starts_with(&format!("{entry}:"))
         } else {
-            hit.category == "skill/plugin" && hit.snippet.starts_with(&format!("{entry}:"))
+            entry == &hit.snippet
         }
     })
 }
@@ -541,13 +698,69 @@ mod tests {
         );
     }
 
+    // --- #194: read_body_file shares the #157 unbounded-read DoS shape ---
+
+    #[cfg(unix)]
+    #[test]
+    fn body_file_symlink_to_dev_zero_fails_open_and_does_not_hang() {
+        // The headline DoS: a `--body-file` symlinked to an endless special
+        // file. read_untrusted_config rejects it on stat (not a regular
+        // file), before any blocking read — this test must NOT hang.
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("evil.md");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        let cmd = format!("gh pr create --body-file {}", link.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn body_file_fifo_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo.md");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let cmd = format!("gh pr create --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn body_file_oversized_fails_open() {
+        // One byte over the 1 MiB cap → rejected, same as read_untrusted_config.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.md");
+        std::fs::write(&path, vec![b'x'; (1024 * 1024) + 1]).unwrap();
+        let cmd = format!("gh pr create --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn body_file_normal_input_unchanged() {
+        // Ordinary body-file content still reads and still gets scanned —
+        // the bounded reader doesn't change happy-path behavior.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup mentioning cadence:polish here").unwrap();
+        let cmd = format!("gh pr create --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
     // --- One test per universal category ---
 
     #[test]
     fn category_skill_id() {
-        assert_eq!(
-            run("gh issue create --body \"calls cadence-forge:polish\"").outcome,
-            Outcome::Nudge
+        let result = run("gh issue create --body \"calls cadence-forge:polish\"");
+        assert_eq!(result.outcome, Outcome::Nudge);
+        // Category tag is `skill-id` (lockstep with the `redaction` section of
+        // the unified cadence config schema, schemas/cadence.json in the
+        // cadence monorepo).
+        assert!(
+            result.message.as_deref().unwrap().contains("[skill-id]"),
+            "expected the [skill-id] category tag in: {:?}",
+            result.message
         );
     }
 
@@ -580,13 +793,18 @@ mod tests {
         // `cadence-mcp:` must be caught as cadence-mcp, not bare cadence/mcp.
         let result = run("gh pr create --body \"see cadence-mcp:server\"");
         assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.as_deref().unwrap();
         assert!(
-            result
-                .message
-                .as_deref()
-                .unwrap()
-                .contains("cadence-mcp:server"),
+            msg.contains("cadence-mcp:server"),
             "expected the full cadence-mcp:server snippet in: {:?}",
+            result.message
+        );
+        // Emitted under the `skill-id` category (lockstep with the
+        // `redaction` section of the unified cadence config schema,
+        // schemas/cadence.json in the cadence monorepo).
+        assert!(
+            msg.contains("[skill-id]"),
+            "expected the [skill-id] category tag in: {:?}",
             result.message
         );
     }
@@ -619,14 +837,23 @@ mod tests {
         );
     }
 
-    // --- Per-repo .claude/redaction.json ---
+    // --- Per-repo .claude/cadence.json `redaction` section ---
 
-    /// Build a temp git root with a `.claude/redaction.json`, returning the root.
-    fn temp_repo_with_config(json: &str) -> tempfile::TempDir {
+    /// Build a temp git root whose `.claude/cadence.json` carries `section_json`
+    /// as its `redaction` section (cadence-hooks#153). `section_json` is the same
+    /// object the legacy `redaction.json` held; it is nested under the
+    /// `redaction` key of the unified file. A malformed `section_json` stays
+    /// malformed once wrapped, so fail-open cases still exercise a broken
+    /// document.
+    fn temp_repo_with_config(section_json: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(dir.path().join(".claude/redaction.json"), json).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/cadence.json"),
+            format!(r#"{{"version":1,"redaction":{section_json}}}"#),
+        )
+        .unwrap();
         dir
     }
 
@@ -684,13 +911,36 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_bare_namespace_only_touches_skill_ids() {
-        // Bare entries apply ONLY to category 1 — a harness noun matching the
-        // entry text is NOT suppressed.
+    fn allowlist_bare_term_suppresses_matching_harness_noun() {
+        // #318: a bare (non-namespace) allowlist entry that exactly matches a
+        // harness-noun hit's own text suppresses that literal term — the
+        // repo's own domain vocabulary (e.g. a transcript-viewer tool
+        // discussing "transcript") shouldn't read as harness leakage.
         let repo = temp_repo_with_config(r#"{"allowlist":["transcript"]}"#);
         let cmd = "gh pr create --body \"parse the transcript correctly\"";
         let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn allowlist_bare_term_does_not_suppress_a_different_harness_noun() {
+        // Allowlisting "transcript" must not blanket-suppress the whole
+        // harness-noun category — "harness" itself still flags.
+        let repo = temp_repo_with_config(r#"{"allowlist":["transcript"]}"#);
+        let cmd = "gh pr create --body \"the test harness needs work\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn allowlist_bare_term_suppresses_matching_local_path() {
+        // The exact-match rule isn't skill-id/harness-noun-specific — it
+        // applies to any non-skill-id category, e.g. a repo-specific path
+        // fragment repeatedly flagged as a local-path hit.
+        let repo = temp_repo_with_config(r#"{"allowlist":["/Users/alice/x"]}"#);
+        let cmd = "gh pr create --body \"edit /Users/alice/x\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
     }
 
     #[test]
@@ -709,7 +959,7 @@ mod tests {
 
     #[test]
     fn missing_config_is_fail_open() {
-        // A git root with no redaction.json → no custom patterns, universal
+        // A git root with no cadence.json → no custom patterns, universal
         // categories still apply.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
@@ -727,6 +977,22 @@ mod tests {
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn special_file_config_fails_open_and_does_not_hang() {
+        // #157: a `.claude/cadence.json` symlinked to an endless special file
+        // (`/dev/zero`) is rejected on stat — the loader falls open to the
+        // default config and the universal scan still nudges a skill id, without
+        // an unbounded read hanging the hook.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join(".claude/cadence.json")).unwrap();
+        let cmd = "gh pr create --body \"see cadence:attune\"";
+        let input = make_bash_with_cwd(cmd, dir.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
+    }
+
     // --- Never blocks ---
 
     #[test]
@@ -735,5 +1001,219 @@ mod tests {
         let cmd = "gh pr create --body \"cadence:attune /Users/x ~/.claude/plugins/y transcript\"";
         assert_ne!(run(cmd).outcome, Outcome::Block);
         assert_eq!(run(cmd).outcome, Outcome::Nudge);
+    }
+
+    // --- Audience gate (#159): d > c, driven through the pure scan_body /
+    // resolve_dest_tier seam rather than process env, mirroring the reference
+    // script `redact-check.sh` cases a–i. Ordinals: owned-internal=1,
+    // private-external=2, public=3. Cases inlined as Rust tests (rather than a
+    // shared JSON/TSV fixture) — the fixture would add setup scope with no
+    // parity win here, since Rust and the bash port are separately validated.
+    // A cheaper, different property — that the two sides' namespace LISTS
+    // (not their full scan behavior) agree — is audited cross-sibling by
+    // `tests/hook_registration_audit.rs::namespace_list_matches_redact_check_sh`. ---
+
+    /// Parse a `redaction`-section body into a [`RedactionConfig`].
+    fn cfg(json: &str) -> RedactionConfig {
+        serde_json::from_str(json).expect("test config should deserialize")
+    }
+
+    /// Categories emitted by a scan at destination ordinal `d`, offset-sorted.
+    fn cats(body: &str, config: &RedactionConfig, d: u8) -> Vec<&'static str> {
+        scan_body(body, config, d)
+            .into_iter()
+            .map(|h| h.category)
+            .collect()
+    }
+
+    // One line per universal category, each firing exactly once.
+    const BODY_ALL: &str = "Use cadence-forge:polish. File /Users/alice/x. \
+         Installed ~/.claude/plugins/cadence-forge/skill.json. The transcript records.";
+    const BODY_SKILL: &str = "Use cadence-forge:polish here.";
+    const BODY_SKILL_PATH: &str = "Run cadence-forge:polish on /Users/alice/secret.txt now.";
+    const BODY_ACME: &str = "Deploy for ACME-INC today.";
+    const BODY_WIDGET: &str = "Partner WIDGET-CO ships it.";
+
+    // --- The two fail-direction traps, asserted directly ---
+
+    #[test]
+    fn dest_tier_ord_fail_safe() {
+        assert_eq!(dest_tier_ord("owned-internal"), 1);
+        assert_eq!(dest_tier_ord("private-external"), 2);
+        assert_eq!(dest_tier_ord("public"), 3);
+        // `always` is config-only — never a destination — and any unknown string
+        // must resolve to public(3, over-redact), never 0.
+        assert_eq!(dest_tier_ord("always"), 3, "always must NOT be 0 as a dest");
+        assert_eq!(dest_tier_ord("owned_internal"), 3, "typo → public");
+        assert_eq!(dest_tier_ord("bogus"), 3);
+    }
+
+    #[test]
+    fn ceiling_ord_fail_safe() {
+        assert_eq!(ceiling_ord("always"), 0);
+        assert_eq!(ceiling_ord("owned-internal"), 1);
+        assert_eq!(ceiling_ord("private-external"), 2);
+        assert_eq!(ceiling_ord("public"), 3);
+        // Unknown/typo → owned-internal(1), NOT public — a bad ceiling must not
+        // silently widen and suppress a hit.
+        assert_eq!(ceiling_ord("owned_internal"), 1, "typo → owned-internal");
+        assert_eq!(ceiling_ord("bogus"), 1);
+    }
+
+    // === (a) no audience → public → every universal category fires ===========
+    #[test]
+    fn gate_a_public_flags_all() {
+        let config = RedactionConfig::default();
+        assert_eq!(
+            resolve_dest_tier(None, &config),
+            3,
+            "no env, no originAudience → public"
+        );
+        let got = cats(BODY_ALL, &config, 3);
+        assert_eq!(
+            got,
+            vec!["skill-id", "local-path", "marketplace", "harness-noun"]
+        );
+    }
+
+    // === (b) owned-internal → universal categories suppressed ================
+    #[test]
+    fn gate_b_owned_internal_suppresses_universal() {
+        let config = RedactionConfig::default();
+        assert!(
+            cats(BODY_ALL, &config, 1).is_empty(),
+            "default owned-internal ceiling suppresses every universal hit at d=1"
+        );
+    }
+
+    // === (c) allowlisted skill-id suppressed at every tier (ceiling public) ==
+    #[test]
+    fn gate_c_allowlist_suppresses_at_every_tier() {
+        let config = cfg(r#"{"allowlist":["cadence-forge"]}"#);
+        assert!(cats(BODY_SKILL, &config, 3).is_empty(), "public suppressed");
+        assert!(
+            cats(BODY_SKILL, &config, 1).is_empty(),
+            "owned-internal suppressed"
+        );
+        // Contrast: without the allowlist, the same skill-id fires at public.
+        let bare = RedactionConfig::default();
+        assert_eq!(cats(BODY_SKILL, &bare, 3), vec!["skill-id"]);
+    }
+
+    // === (d) per-category ceiling: local-path → always fires at owned-internal
+    #[test]
+    fn gate_d_per_category_ceiling_always() {
+        let config = cfg(r#"{"categories":{"local-path":{"ceiling":"always"}}}"#);
+        let got = cats(BODY_SKILL_PATH, &config, 1);
+        // local-path (ceiling always, 0) fires at d=1; skill-id (default
+        // owned-internal, 1) stays suppressed — the override is category-scoped.
+        assert_eq!(got, vec!["local-path"]);
+    }
+
+    // === (e) custom pattern ceiling ==========================================
+    #[test]
+    fn gate_e_custom_pattern_ceiling() {
+        let always = cfg(
+            r#"{"additionalPatterns":[{"pattern":"ACME-INC","replacement":"[x]","ceiling":"always"}]}"#,
+        );
+        assert_eq!(
+            cats(BODY_ACME, &always, 1),
+            vec!["custom"],
+            "always-ceiling custom fires at owned-internal"
+        );
+        let default_ceiling = cfg(r#"{"additionalPatterns":[{"pattern":"WIDGET-CO"}]}"#);
+        assert_eq!(
+            cats(BODY_WIDGET, &default_ceiling, 3),
+            vec!["custom"],
+            "default-ceiling custom fires at public"
+        );
+        assert!(
+            cats(BODY_WIDGET, &default_ceiling, 1).is_empty(),
+            "default-ceiling custom quiet at owned-internal"
+        );
+    }
+
+    // === (g) private-external (middle tier) ==================================
+    #[test]
+    fn gate_g_private_external_middle_tier() {
+        let bare = RedactionConfig::default();
+        assert_eq!(
+            cats(BODY_ALL, &bare, 2),
+            vec!["skill-id", "local-path", "marketplace", "harness-noun"],
+            "universal categories fire at private-external"
+        );
+        let custom = cfg(r#"{"additionalPatterns":[{"pattern":"WIDGET-CO"}]}"#);
+        assert_eq!(
+            cats(BODY_WIDGET, &custom, 2),
+            vec!["custom"],
+            "default-ceiling custom fires at private-external"
+        );
+        assert!(
+            cats(BODY_WIDGET, &custom, 1).is_empty(),
+            "same custom stays quiet at owned-internal"
+        );
+    }
+
+    // === (h) invalid ceiling → owned-internal (not public), both call sites ==
+    #[test]
+    fn gate_h_invalid_ceiling_falls_to_owned_internal() {
+        // Category call site: a typo'd ceiling must still flag at public.
+        let cat = cfg(r#"{"categories":{"local-path":{"ceiling":"owned_internal"}}}"#);
+        assert!(
+            cats(BODY_SKILL_PATH, &cat, 3).contains(&"local-path"),
+            "invalid category ceiling must not silently suppress at public"
+        );
+        // Custom call site: same fail-safe.
+        let custom =
+            cfg(r#"{"additionalPatterns":[{"pattern":"WIDGET-CO","ceiling":"nonsense"}]}"#);
+        assert_eq!(
+            cats(BODY_WIDGET, &custom, 3),
+            vec!["custom"],
+            "invalid custom ceiling must not silently suppress at public"
+        );
+    }
+
+    // === (i) destination from config originAudience; "always" → public =======
+    #[test]
+    fn gate_i_origin_audience_resolution() {
+        let internal = cfg(r#"{"originAudience":"owned-internal"}"#);
+        assert_eq!(resolve_dest_tier(None, &internal), 1);
+        assert!(
+            cats(BODY_ALL, &internal, resolve_dest_tier(None, &internal)).is_empty(),
+            "originAudience owned-internal suppresses the universal categories"
+        );
+        // The config-only `always` sentinel is NOT a destination — it must fall
+        // through to public(3), never suppress every hit (the total-bypass trap).
+        let always = cfg(r#"{"originAudience":"always"}"#);
+        assert_eq!(
+            resolve_dest_tier(None, &always),
+            3,
+            "originAudience=always resolves to public, not 0"
+        );
+        assert_eq!(
+            cats(BODY_SKILL, &always, resolve_dest_tier(None, &always)),
+            vec!["skill-id"]
+        );
+    }
+
+    // === CADENCE_AUDIENCE env path: gated through the pure helper with an
+    // explicit Some(...) arg — no std::env::set_var (process-global, flaky). ===
+    #[test]
+    fn gate_env_audience_wins_over_config() {
+        // env owned-internal overrides a config originAudience of public.
+        let config = cfg(r#"{"originAudience":"public"}"#);
+        assert_eq!(
+            resolve_dest_tier(Some("owned-internal"), &config),
+            1,
+            "CADENCE_AUDIENCE wins over config originAudience"
+        );
+        assert!(
+            cats(
+                BODY_ALL,
+                &config,
+                resolve_dest_tier(Some("owned-internal"), &config)
+            )
+            .is_empty()
+        );
     }
 }

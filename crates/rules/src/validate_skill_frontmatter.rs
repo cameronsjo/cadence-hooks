@@ -15,24 +15,59 @@ const VALID_FIELDS: &[&str] = &[
     "metadata",
     "allowed-tools",
     "argument-hint",
+    "arguments",
+    "disallowed-tools",
     "disable-model-invocation",
     "user-invocable",
     "model",
     "context",
+    "background",
     "agent",
     "hooks",
     "paths",
+    "when_to_use",
+    "effort",
+    "shell",
 ];
 
-// Kebab-case name, optionally prefixed by a kebab `namespace:` (the
-// `plugin:directory` invocation id, e.g. `cadence:attune`). Both sides are
-// independently multi-segment kebab; the optional trailing group rejects a
-// dangling colon (`cadence:`), a leading colon (`:attune`), and a double
-// colon (`a::b`) for free.
-static NAME_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*(:[a-z0-9]+(-[a-z0-9]+)*)?$")
-        .expect("pattern should compile")
-});
+// House strictness: boolean fields take exactly `true` or `false`. The
+// platform (Claude Code >= 2.1.218) also accepts yes/no/on/off/1/0 —
+// cadence deliberately does not: one spelling keeps the corpus greppable.
+const BOOLEAN_FIELDS: &[&str] = &["background", "disable-model-invocation", "user-invocable"];
+
+// Enum fields: value must be exactly one of the listed options (same
+// unquoted-only house strictness as BOOLEAN_FIELDS). Sets verified against
+// the raw Claude Code docs (code.claude.com/docs/en/skills), not assumed.
+const ENUM_FIELDS: &[(&str, &[&str])] = &[
+    ("effort", &["low", "medium", "high", "xhigh", "max"]),
+    ("shell", &["bash", "powershell"]),
+];
+
+// Kebab-case name with NO namespace prefix — a colon is rejected outright.
+//
+// Claude Code owns the prefix: it builds a skill's invocation id from
+// `<plugin>:<directory>` and prepends the prefix itself, so a declared
+// `cadence:attune` renders as `/cadence:cadence:attune`. Release 2.1.216
+// ("fixed plugin skills with a `name` frontmatter field losing their plugin
+// prefix in slash-command autocomplete") is what made the prefix doubling;
+// 2.1.218 then made agent markdown reject `:` in a name for the same reason,
+// reserving the character for plugin namespacing.
+//
+// This pattern previously allowed an optional `namespace:` prefix (0.19.0),
+// because 2.1.94 had made plugin skills use the frontmatter `name` as the
+// invocation name — which made the prefixed form render correctly. That is the
+// convention this reverses.
+//
+// IF THE PLATFORM FLIPS BACK — de-duplication is requested upstream in
+// anthropics/claude-code#80631; watch that issue — the order matters:
+// relax this pattern and SHIP A RELEASE FIRST, then
+// sweep the corpus with `cadence/scripts/skill-names.py --prefixed`. Tightened
+// as it stands, this check blocks every edit to a prefixed SKILL.md — including
+// the sweep that would undo it. Restoring the old form means re-adding the
+// optional trailing group `(:[a-z0-9]+(-[a-z0-9]+)*)?` and the `rsplit_once`
+// suffix comparison in `run` below.
+static NAME_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*$").expect("pattern should compile"));
 
 #[derive(Debug, PartialEq)]
 enum FileType {
@@ -86,6 +121,19 @@ fn skill_dir_name(path: &str) -> Option<&str> {
     parent.rsplit('/').next()
 }
 
+/// Strip a trailing inline YAML comment from a scalar value. Per YAML, `#`
+/// opens a comment only when preceded by whitespace — `true  # why` yields
+/// `true`, while `true#x` stays intact (it is the value, not a comment).
+fn strip_inline_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i] == b'#' && bytes[i - 1].is_ascii_whitespace() {
+            return value[..i].trim_end();
+        }
+    }
+    value
+}
+
 /// Validates YAML frontmatter in skill and command markdown files.
 pub struct ValidateSkillFrontmatter;
 
@@ -125,6 +173,31 @@ impl Check for ValidateSkillFrontmatter {
             }
         }
 
+        // Boolean fields: exactly `true` or `false` — house strictness, one
+        // rule for all three (the platform accepts yes/no/on/off/1/0). A
+        // trailing inline comment is not part of the value; quoted values
+        // (`"true"`) stay blocked — unquoted is the house spelling.
+        for (key, value) in &fields {
+            let bare = strip_inline_comment(value);
+            if BOOLEAN_FIELDS.contains(&key.as_str()) && bare != "true" && bare != "false" {
+                errors.push(format!(
+                    "'{key}' must be exactly 'true' or 'false' (got: '{bare}') — the platform accepts yes/no/on/off/1/0, cadence house style does not"
+                ));
+            }
+        }
+
+        // Enum fields: value must exactly match one of the allowed options.
+        for (key, value) in &fields {
+            let bare = strip_inline_comment(value);
+            if let Some((_, allowed)) = ENUM_FIELDS.iter().find(|(k, _)| *k == key.as_str())
+                && !allowed.contains(&bare)
+            {
+                errors.push(format!(
+                    "'{key}' must be one of {allowed:?} (got: '{bare}')"
+                ));
+            }
+        }
+
         match file_type {
             FileType::Skill => {
                 let has_name = fields.iter().any(|(k, _)| k == "name");
@@ -138,24 +211,20 @@ impl Check for ValidateSkillFrontmatter {
                 }
 
                 if let Some((_, name_value)) = fields.iter().find(|(k, _)| k == "name") {
-                    // Check name format
+                    // Check name format. A colon fails here, which is the whole
+                    // point: Claude Code prepends `<plugin>:` itself, so a
+                    // declared prefix doubles in the slash menu.
                     if !NAME_PATTERN.is_match(name_value) {
                         errors.push(format!(
-                            "name must use only lowercase letters, numbers, and hyphens, with an optional 'namespace:' prefix (got: '{name_value}')"
+                            "name must be the bare skill directory — only lowercase letters, numbers, and hyphens, no 'plugin:' prefix (got: '{name_value}')"
                         ));
                     }
 
-                    // Check the skill part matches the directory. The optional
-                    // `namespace:` prefix is permitted but not required, and the
-                    // namespace itself is not verified against the plugin name —
-                    // deriving the plugin from the path is fragile (source vs
-                    // cache) and cadence-hooks must not force the prefix on
-                    // non-cadence users. Only the post-colon suffix must match.
-                    let skill_part = name_value
-                        .rsplit_once(':')
-                        .map_or(name_value.as_str(), |(_, s)| s);
+                    // Check the name matches the directory. With colons rejected
+                    // above, the declared name IS the skill part, so this is a
+                    // direct comparison.
                     if let Some(dir_name) = skill_dir_name(&path)
-                        && skill_part != dir_name
+                        && name_value.as_str() != dir_name
                     {
                         errors.push(format!(
                             "name '{name_value}' must match directory '{dir_name}'"
@@ -207,15 +276,17 @@ mod tests {
     fn valid_name_format() {
         assert!(NAME_PATTERN.is_match("my-skill"));
         assert!(NAME_PATTERN.is_match("skill123"));
-        // Optional `namespace:` prefix (the plugin:directory invocation id).
-        assert!(NAME_PATTERN.is_match("cadence:attune"));
-        assert!(NAME_PATTERN.is_match("cadence-forge:add-narrative-logging"));
-        assert!(NAME_PATTERN.is_match("cadence-rules:init-all"));
+        assert!(NAME_PATTERN.is_match("add-narrative-logging"));
         assert!(!NAME_PATTERN.is_match("My-Skill"));
         assert!(!NAME_PATTERN.is_match("-leading"));
         assert!(!NAME_PATTERN.is_match("trailing-"));
         assert!(!NAME_PATTERN.is_match("double--hyphen"));
-        // Colon edge cases the optional trailing group must reject.
+        // A `plugin:` prefix is rejected outright — Claude Code prepends it
+        // itself (2.1.216), so declaring it renders `/cadence:cadence:attune`.
+        assert!(!NAME_PATTERN.is_match("cadence:attune"));
+        assert!(!NAME_PATTERN.is_match("cadence-forge:add-narrative-logging"));
+        assert!(!NAME_PATTERN.is_match("cadence-rules:init-all"));
+        // Colon edge cases stay rejected for the same reason.
         assert!(!NAME_PATTERN.is_match("cadence:")); // dangling colon
         assert!(!NAME_PATTERN.is_match(":attune")); // leading colon
         assert!(!NAME_PATTERN.is_match("a::b")); // double colon
@@ -339,21 +410,23 @@ mod tests {
     }
 
     #[test]
-    fn run_skill_namespaced_name_matching_dir_passes() {
-        // The plugin:directory form is allowed: the post-colon suffix matches
-        // the directory, so the prefix is accepted.
+    fn run_skill_namespaced_name_blocks_even_when_suffix_matches() {
+        // The plugin:directory form is rejected even though the post-colon
+        // suffix equals the directory — this is the form 0.19.0 through
+        // 0.63.0 accepted, and the one that renders `/cadence:cadence:my-skill`.
         let input = make_write_input(
             "/plugins/cadence/skills/my-skill/SKILL.md",
             "---\nname: cadence:my-skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("bare skill directory"));
     }
 
     #[test]
     fn run_skill_namespaced_name_suffix_mismatch_blocks() {
-        // A prefix does not excuse a mismatched skill part: suffix `wrong`
-        // still has to equal the directory `my-skill`.
+        // Still blocks, now for two reasons rather than one: the colon fails
+        // the format check AND `cadence:wrong` is not the directory `my-skill`.
         let input = make_write_input(
             "/plugins/cadence/skills/my-skill/SKILL.md",
             "---\nname: cadence:wrong\ndescription: test\n---\n# Content",
@@ -361,6 +434,17 @@ mod tests {
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         assert!(result.message.unwrap().contains("must match directory"));
+    }
+
+    #[test]
+    fn run_skill_bare_name_matching_dir_passes() {
+        // The correct form as of Claude Code 2.1.216.
+        let input = make_write_input(
+            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
@@ -595,6 +679,130 @@ mod tests {
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
+    // --- Background fork skills (Claude Code 2.1.218) + strict booleans ---
+
+    #[test]
+    fn run_skill_with_background_true_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_with_background_false_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: false\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_background_yes_blocks() {
+        // The platform loosened boolean parsing (yes/no/on/off/1/0) in
+        // 2.1.218; cadence house style stays strict true/false.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: yes\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("must be exactly 'true' or 'false'")
+        );
+    }
+
+    #[test]
+    fn run_skill_user_invocable_yes_blocks() {
+        // One rule for all boolean fields — pre-existing booleans get the
+        // same strictness as the new `background` field.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\nuser-invocable: yes\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("'user-invocable' must be exactly 'true' or 'false'")
+        );
+    }
+
+    #[test]
+    fn run_skill_disable_model_invocation_numeric_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ndisable-model-invocation: 1\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("'disable-model-invocation' must be exactly 'true' or 'false'")
+        );
+    }
+
+    #[test]
+    fn run_skill_boolean_true_false_still_pass() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\nuser-invocable: false\ndisable-model-invocation: true\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_boolean_with_inline_comment_passes() {
+        // A trailing YAML comment is not part of the value — `true  # why`
+        // is the boolean true, not a malformed spelling.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true  # opt out later\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_quoted_boolean_blocks() {
+        // Deliberate: `"true"` is a string spelling, not the house boolean.
+        // Unquoted true/false is the one greppable form.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: \"true\"\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("must be exactly 'true' or 'false'")
+        );
+    }
+
+    #[test]
+    fn strip_inline_comment_edges() {
+        assert_eq!(strip_inline_comment("true  # opt out later"), "true");
+        assert_eq!(strip_inline_comment("true"), "true");
+        // `#` without preceding whitespace is part of the value, not a comment.
+        assert_eq!(strip_inline_comment("true#x"), "true#x");
+        assert_eq!(strip_inline_comment("#leading"), "#leading");
+        assert_eq!(strip_inline_comment(""), "");
+    }
+
     #[test]
     fn command_valid_with_description_only() {
         let input = make_write_input(
@@ -625,5 +833,107 @@ mod tests {
         let content = "---\nname: my-skill\nbroken line\ndescription: test\n---\n";
         let fields = extract_frontmatter(content).unwrap();
         assert_eq!(fields.len(), 2); // broken line is skipped
+    }
+
+    // --- Platform sweep: when_to_use, arguments, disallowed-tools, effort, shell ---
+
+    #[test]
+    fn run_skill_with_when_to_use_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\nwhen_to_use: Use when doing X\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_with_arguments_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\narguments: issue branch\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_with_disallowed_tools_passes() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\ndisallowed-tools: AskUserQuestion\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn run_skill_with_valid_effort_passes() {
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            let content =
+                format!("---\nname: my-skill\ndescription: test\neffort: {level}\n---\n# Content");
+            let input = make_write_input("/plugins/skills/my-skill/SKILL.md", &content);
+            let result = ValidateSkillFrontmatter.run(&input);
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "effort: {level} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn run_skill_with_invalid_effort_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\neffort: extreme\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("'effort' must be one of"));
+    }
+
+    #[test]
+    fn run_skill_with_valid_shell_passes() {
+        for shell in ["bash", "powershell"] {
+            let content =
+                format!("---\nname: my-skill\ndescription: test\nshell: {shell}\n---\n# Content");
+            let input = make_write_input("/plugins/skills/my-skill/SKILL.md", &content);
+            let result = ValidateSkillFrontmatter.run(&input);
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "shell: {shell} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn run_skill_with_invalid_shell_blocks() {
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\nshell: zsh\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(result.message.unwrap().contains("'shell' must be one of"));
+    }
+
+    #[test]
+    fn run_skill_unknown_field_still_rejected_alongside_new_fields() {
+        // The new fields don't loosen the allowlist — an unrelated unknown
+        // key is still rejected.
+        let input = make_write_input(
+            "/plugins/skills/my-skill/SKILL.md",
+            "---\nname: my-skill\ndescription: test\neffort: high\ntotally-made-up: value\n---\n# Content",
+        );
+        let result = ValidateSkillFrontmatter.run(&input);
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        assert!(
+            result
+                .message
+                .unwrap()
+                .contains("Unknown frontmatter field: 'totally-made-up'")
+        );
     }
 }

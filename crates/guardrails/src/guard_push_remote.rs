@@ -7,7 +7,7 @@
 use cadence_hooks_core::config::{self, AllowEntry, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::loop_analysis::{self, ChainAnalysis, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
+    LOOP_PATTERN, host_and_repo_from_url, parse_work_dir, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -34,17 +34,49 @@ fn check_owner(
     )
 }
 
+/// Push-URL resolution outcome. `Failed` (git answered; no remote/branch to
+/// resolve) keeps the fail-closed block downstream — that guard against real
+/// ambiguity is deliberate. `TimedOut` (a probe hit the #271 subprocess
+/// deadline) is the guard's own infrastructure failing and must degrade to
+/// fail-open, never a false block on a slow host.
+enum PushUrlResolution {
+    Url(String),
+    Failed,
+    TimedOut,
+}
+
 /// Resolve the push URL for a git repo.
-fn resolve_push_url(work_dir: &str, explicit_remote: Option<&str>) -> Option<String> {
+fn resolve_push_url(work_dir: &str, explicit_remote: Option<&str>) -> PushUrlResolution {
+    use cadence_hooks_core::shell::{GitQuery, git_command_detailed};
+
+    let get_url = |remote: &str| match git_command_detailed(
+        work_dir,
+        &["remote", "get-url", "--push", remote],
+    ) {
+        GitQuery::Value(url) => PushUrlResolution::Url(url),
+        GitQuery::Failed => PushUrlResolution::Failed,
+        GitQuery::TimedOut => PushUrlResolution::TimedOut,
+    };
+
     if let Some(remote) = explicit_remote {
-        return git_command(work_dir, &["remote", "get-url", "--push", remote]);
+        return get_url(remote);
     }
 
     // No explicit remote — find where bare push would go
-    let branch = git_command(work_dir, &["branch", "--show-current"])?;
-    let tracking = git_command(work_dir, &["config", &format!("branch.{branch}.remote")])
-        .unwrap_or_else(|| "origin".to_string());
-    git_command(work_dir, &["remote", "get-url", "--push", &tracking])
+    let branch = match git_command_detailed(work_dir, &["branch", "--show-current"]) {
+        GitQuery::Value(branch) => branch,
+        GitQuery::Failed => return PushUrlResolution::Failed,
+        GitQuery::TimedOut => return PushUrlResolution::TimedOut,
+    };
+    let tracking =
+        match git_command_detailed(work_dir, &["config", &format!("branch.{branch}.remote")]) {
+            GitQuery::Value(tracking) => tracking,
+            // No per-branch remote configured is a normal git state — same
+            // "origin" fallback as before.
+            GitQuery::Failed => "origin".to_string(),
+            GitQuery::TimedOut => return PushUrlResolution::TimedOut,
+        };
+    get_url(&tracking)
 }
 
 /// Classification of the explicit push target in `git push [flags] <target>`.
@@ -85,10 +117,20 @@ fn extract_push_target(command: &str, work_dir: &str) -> PushTarget {
     };
 
     // A configured remote name routes through git's resolution (unchanged).
-    if let Some(remotes) = git_command(work_dir, &["remote"])
-        && remotes.lines().any(|r| r == candidate)
-    {
-        return PushTarget::Named(candidate.to_string());
+    // A timed-out remote listing (#271) would silently reclassify a named
+    // remote as "no target", shifting *which* remote gets ownership-validated
+    // — record the suppressed fail-closed block so the seam is loud, not
+    // silent (idempotent with the resolve arm the shared budget funnels into).
+    match cadence_hooks_core::shell::git_command_detailed(work_dir, &["remote"]) {
+        cadence_hooks_core::shell::GitQuery::Value(remotes)
+            if remotes.lines().any(|r| r == candidate) =>
+        {
+            return PushTarget::Named(candidate.to_string());
+        }
+        cadence_hooks_core::shell::GitQuery::TimedOut => {
+            cadence_hooks_core::deadline::note_suppressed_block();
+        }
+        _ => {}
     }
 
     // An explicit URL the owner-parser understands must be validated directly.
@@ -200,10 +242,7 @@ impl Check for PushRemoteGuard {
         let extra_hosts = env_extra_hosts();
 
         if allowed_owners.is_empty() {
-            return CheckResult::block(
-                "🚫 git-guardrails: Not configured — run /guardrails-init to set up\n   \
-                 CADENCE_ALLOWED_OWNERS is not set.",
-            );
+            return CheckResult::block(crate::messages::NOT_CONFIGURED_MSG);
         }
 
         // Validate ownership of explicit remotes in loops
@@ -215,16 +254,48 @@ impl Check for PushRemoteGuard {
             let cwd_loop = input.cwd.as_deref().unwrap_or(&cwd_fallback_loop);
             let work_dir_loop = parse_work_dir(command, cwd_loop);
 
+            // This loop is the one guard path that spawns a *command-controlled*
+            // number of git probes (one per looped push), so it is the induced-
+            // budget-exhaustion vector (#271 security follow-up): a flood of
+            // bogus-remote pushes drains the shared deadline, then the real
+            // ownership-deciding probe times out. A push loop is rare and
+            // batchable, so the safe answer to *any* resolution timeout here is
+            // to fail CLOSED — "run pushes individually so each remote is
+            // validated" (a single push has budget for its one resolution). This
+            // is deliberately stricter than the single-command arm below (which
+            // fails open on a slow host, the common path that must not
+            // false-block): failing open in the loop would let an unvalidated,
+            // possibly-unowned push through, and no timing/count heuristic can
+            // separate that flood from a slow host — a slow host inflates each
+            // probe, keeping any completion-count discriminator under its bar.
             for cmd in cmds {
-                if let Some(remote) = &cmd.explicit_repo
-                    && let Some(url) = resolve_push_url(&work_dir_loop, Some(remote))
-                    && !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts)
-                {
-                    return CheckResult::block(format!(
-                        "🚫 git-guardrails: Push loop targets remote you don't own\n   \
-                         Found: remote `{remote}` → {url}\n   \
-                         Fix: push to an owned remote instead, or run each push individually"
-                    ));
+                let Some(remote) = &cmd.explicit_repo else {
+                    continue;
+                };
+                match resolve_push_url(&work_dir_loop, Some(remote)) {
+                    PushUrlResolution::Url(url) => {
+                        if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
+                            return CheckResult::block(format!(
+                                "🚫 git-guardrails: Push loop targets remote you don't own\n   \
+                                 Found: remote `{remote}` → {url}\n   \
+                                 Fix: push to an owned remote instead, or run each push \
+                                 individually"
+                            ));
+                        }
+                    }
+                    PushUrlResolution::TimedOut => {
+                        return CheckResult::block(
+                            "🚫 git-guardrails: Push-loop ownership check timed out\n   \
+                             The git-probe deadline expired before a looped push's remote \
+                             could be ownership-validated — failing closed so an unowned \
+                             remote can't slip through.\n   \
+                             Fix: run pushes individually so each remote is validated.",
+                        );
+                    }
+                    // Failed (git answered, remote unresolvable): unchanged
+                    // fail-open skip — an unresolvable remote was fail-open
+                    // pre-#271, and the trailing single-command arm still runs.
+                    PushUrlResolution::Failed => {}
                 }
             }
         }
@@ -237,9 +308,23 @@ impl Check for PushRemoteGuard {
         let cwd = input.cwd.as_deref().unwrap_or(&cwd_fallback);
         let work_dir = parse_work_dir(command, cwd);
 
-        // Not a git repo — let git fail naturally
-        if git_command(&work_dir, &["rev-parse", "--git-dir"]).is_none() {
-            return CheckResult::allow();
+        // Not a git repo — let git fail naturally. A timed-out repo gate (#271)
+        // on this single-command path is the accepted common-path degradation:
+        // a normal `git push` on a slow host must not false-block (ADR-0001), so
+        // fail open and record the suppressed fail-closed block (the sharp
+        // telemetry reason) rather than the soft `deadline` the runner logs on
+        // its own. (Unlike the loop arm above, there is no command-controlled
+        // spawn count here to inflate — the probe count is fixed.)
+        match cadence_hooks_core::shell::git_command_detailed(
+            &work_dir,
+            &["rev-parse", "--git-dir"],
+        ) {
+            cadence_hooks_core::shell::GitQuery::Value(_) => {}
+            cadence_hooks_core::shell::GitQuery::TimedOut => {
+                cadence_hooks_core::deadline::note_suppressed_block();
+                return CheckResult::allow();
+            }
+            cadence_hooks_core::shell::GitQuery::Failed => return CheckResult::allow(),
         }
 
         // Classify the push target. An explicit URL is validated directly —
@@ -255,14 +340,24 @@ impl Check for PushRemoteGuard {
             } else {
                 None
             };
-            let Some(url) = resolve_push_url(&work_dir, explicit) else {
-                return CheckResult::block(format!(
-                    "⚠️  git-guardrails: Cannot resolve push target\n   \
-                     Directory: {work_dir}\n   \
-                     Push explicitly: git push origin main"
-                ));
-            };
-            url
+            match resolve_push_url(&work_dir, explicit) {
+                PushUrlResolution::Url(url) => url,
+                // The probe hit the #271 subprocess deadline: the guard's own
+                // infrastructure failed, which never blocks (ADR-0001). Record
+                // the suppressed fail-closed block so telemetry can distinguish
+                // "slow git" from "an ownership block was bypassed".
+                PushUrlResolution::TimedOut => {
+                    cadence_hooks_core::deadline::note_suppressed_block();
+                    return CheckResult::allow();
+                }
+                PushUrlResolution::Failed => {
+                    return CheckResult::block(format!(
+                        "⚠️  git-guardrails: Cannot resolve push target\n   \
+                         Directory: {work_dir}\n   \
+                         Push explicitly: git push origin main"
+                    ));
+                }
+            }
         };
 
         if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {

@@ -167,4 +167,4 @@ checkout build) — line numbers and behavior can differ between them.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the [BSL-1.1](LICENSE).
+By contributing, you agree that your contributions will be licensed under [Apache-2.0 with the Commons Clause](LICENSE).

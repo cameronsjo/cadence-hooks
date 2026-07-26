@@ -76,11 +76,16 @@ fn has_recommended(questions: &[AskQuestion]) -> bool {
     questions
         .iter()
         .flat_map(|q| q.options.iter().flatten())
-        .any(|o| {
-            o.label
-                .as_deref()
-                .is_some_and(|l| l.contains(RECOMMENDED_MARKER))
-        })
+        .any(|o| o.label.as_deref().is_some_and(is_recommended_label))
+}
+
+/// True when a single option label carries the `(Recommended)` marker.
+/// Exposes [`RECOMMENDED_MARKER`] as a predicate for consumers outside this
+/// module (e.g. the `log-ask-user-question` metrics logger classifying a
+/// selected answer) that need to test one label rather than a whole
+/// `[AskQuestion]` slice, without duplicating the marker literal.
+pub fn is_recommended_label(label: &str) -> bool {
+    label.contains(RECOMMENDED_MARKER)
 }
 
 /// True when any question text declares no clear recommendation.
@@ -113,18 +118,17 @@ impl Check for WarnRecommendedOption {
         if questions.is_empty() {
             return CheckResult::allow();
         }
-        // Stage 1 (diagnose): behavior unchanged — still nudge whenever no option
-        // is labeled "(Recommended)". Stage 2 will gate this on `stance(...) ==
-        // Silent` so a declared "no clear recommendation" stops tripping it.
-        if has_recommended(questions) {
-            CheckResult::allow()
-        } else {
+        // Stage 2: nudge only on true silence. A declared "no clear
+        // recommendation" (DeclaredNoRec) is a legible stance, so it no longer trips.
+        if stance(questions) == Stance::Silent {
             CheckResult::nudge(
                 "None of these AskUserQuestion options is labeled \"(Recommended)\". \
                  If one option is your clear recommendation, label it \"(Recommended)\" \
                  and list it first so the user can decide faster. If the options are \
                  genuinely equivalent, no change is needed.",
             )
+        } else {
+            CheckResult::allow()
         }
     }
 }
@@ -301,6 +305,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pre_declared_no_rec_allows() {
+        // A declared "no clear recommendation" is a legible stance (DeclaredNoRec),
+        // not silence — the nudge should not trip even with no labeled option.
+        let input = HookInput {
+            tool_name: Some("AskUserQuestion".into()),
+            tool_input: Some(ToolInput {
+                questions: Some(vec![q(
+                    "Which approach? — no clear recommendation",
+                    &["A", "B"],
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            WarnRecommendedOption.run(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
     // --- Stance classifier ---
 
     fn q(text: &str, labels: &[&str]) -> AskQuestion {
@@ -377,6 +402,12 @@ mod tests {
         // The bare prose "recommend" must not count, nor a near-miss phrase.
         assert!(!contains_no_rec_marker("I recommend option A clearly"));
         assert!(!contains_no_rec_marker("no recommendation given"));
+    }
+
+    #[test]
+    fn is_recommended_label_matches_marker() {
+        assert!(is_recommended_label("Option A (Recommended)"));
+        assert!(!is_recommended_label("Option B"));
     }
 
     #[test]

@@ -115,10 +115,9 @@ fn try_nudge_renders_context_as_readable_text() {
 
 #[test]
 fn try_runs_a_logger() {
+    // No CADENCE_METRICS_DIR override needed — try_hook.rs sandboxes every
+    // logger invocation to its own scratch dir internally (#269).
     let mut cmd = cadence_hooks();
-    // Point metrics at a temp dir so the logger's side effect lands nowhere real.
-    let tmp = std::env::temp_dir().join("cadence-hooks-try-test");
-    cmd.env("CADENCE_METRICS_DIR", &tmp);
     cmd.args(["try", "metrics", "snapshot"]);
 
     let output = cmd.output().expect("failed to execute binary");
@@ -291,9 +290,10 @@ fn session_cli_actions_remain_bypass_exempt() {
 
 #[test]
 fn try_log_subagent_uses_subagent_event_sample() {
+    // No CADENCE_METRICS_DIR override needed here anymore — try_hook.rs now
+    // sandboxes every logger invocation to a scratch dir internally (#269),
+    // so this test no longer needs (or leaks into) a fixed-path tempdir.
     let mut cmd = cadence_hooks();
-    let tmp = std::env::temp_dir().join("cadence-hooks-try-test");
-    cmd.env("CADENCE_METRICS_DIR", &tmp);
     cmd.args(["try", "metrics", "log-subagent"]);
 
     let output = cmd.output().expect("failed to execute binary");
@@ -305,6 +305,72 @@ fn try_log_subagent_uses_subagent_event_sample() {
     assert!(
         stdout.contains("SubagentStop"),
         "log-subagent sample must use a Subagent event: {stdout}"
+    );
+}
+
+#[test]
+fn try_metrics_logger_never_writes_into_the_configured_metrics_dir() {
+    // #269: `try metrics log-skill` (the issue's exact repro) appended a real
+    // row to production `skills.jsonl`. Stand in for "the configured metrics
+    // dir" with an isolated tempdir — this test must never observe (or
+    // pollute) the real per-user directory on the machine running it — and
+    // confirm no override is supplied by the caller, matching the real-world
+    // repro where the driver agent set none either.
+    let fake_config_dir = tempfile::tempdir().unwrap();
+
+    let mut cmd = cadence_hooks();
+    cmd.env("CLAUDE_CONFIG_DIR", fake_config_dir.path());
+    cmd.env_remove("CADENCE_METRICS_DIR");
+    cmd.args(["try", "metrics", "log-skill"]);
+
+    let output = cmd.output().expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+
+    let would_be_metrics_dir = fake_config_dir.path().join("metrics");
+    assert!(
+        !would_be_metrics_dir.join("skills.jsonl").exists(),
+        "log-skill must not write into the configured metrics dir under try: {}",
+        would_be_metrics_dir.display()
+    );
+}
+
+#[test]
+fn try_persist_plan_never_writes_a_real_plan_doc() {
+    // Regression (cameronsjo/cadence-hooks#396 review): `try`'s normal cwd
+    // injection (the real current_dir(), so most checks exercise real repo
+    // detection) let a bare `cadence-hooks try session persist-plan` (or
+    // `persist-plan-approval`) actually create a plan doc in whatever repo
+    // the user was standing in — verified end to end during review, a real
+    // file landed and had to be manually removed. Stand explicitly inside a
+    // REAL git repo (the worst case: the check's `repo_root` resolution
+    // would otherwise succeed) and confirm neither subcommand writes
+    // anything, regardless of the process's actual OS-level cwd.
+    let repo = tempfile::tempdir().unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(repo.path())
+        .status()
+        .expect("git init");
+    assert!(init.success());
+
+    for subcommand in ["persist-plan", "persist-plan-approval"] {
+        let mut cmd = cadence_hooks();
+        cmd.args(["try", "session", subcommand]);
+        cmd.current_dir(repo.path());
+
+        let output = cmd.output().expect("failed to execute binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{subcommand} stdout: {stdout}"
+        );
+    }
+
+    assert!(
+        !repo.path().join("docs").exists(),
+        "try must never write a real plan doc, even standing inside a real git repo"
     );
 }
 
@@ -328,9 +394,13 @@ fn piped_stdin_does_not_trigger_interactive_guard() {
 
 #[test]
 fn piped_stdin_logger_does_not_trigger_interactive_guard() {
+    // This calls the logger directly (no `try` wrapper, so try_hook.rs's
+    // internal scratch-dir override doesn't apply here) — point metrics at
+    // an isolated per-test tempdir so the logger's side effect lands nowhere
+    // real and never accumulates residue across runs (#269).
+    let scratch = tempfile::tempdir().unwrap();
     let mut cmd = cadence_hooks();
-    let tmp = std::env::temp_dir().join("cadence-hooks-try-test");
-    cmd.env("CADENCE_METRICS_DIR", &tmp);
+    cmd.env("CADENCE_METRICS_DIR", scratch.path());
     cmd.args(["metrics", "snapshot"]);
 
     let output = run_with_stdin(cmd, "{}");

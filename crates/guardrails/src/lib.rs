@@ -3,10 +3,20 @@
 //! Ownership-aware guards that prevent Claude Code from pushing to repos
 //! you don't own, writing to upstream issues, or running irreversible operations.
 
-/// Nudge after idle periods between edits to re-check context.
-pub mod check_idle_return;
+/// Shared test lock serializing every test that mutates the process-global
+/// `CADENCE_ALLOW_MAIN` env var — read by `warn_main_branch::is_main_allowed`
+/// and `warn_branch_base`'s `would_block_here`. Module-local locks in separate
+/// files provide no mutual exclusion under cargo's parallel test runner, so
+/// they race (cadence-hooks#298); one crate-shared lock serializes them all.
+#[cfg(test)]
+pub(crate) static CADENCE_ALLOW_MAIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Per-repo snooze command + helper consumed by `enforce_worktree`.
+pub mod dismiss_enforce_worktree;
 /// Per-repo snooze command + helper consumed by `warn_main_branch`.
 pub mod dismiss_main_branch_warn;
+/// Block mutations in a primary checkout of a branch-mode repo.
+pub mod enforce_worktree;
 /// Block the first Claude-in-Chrome action per session until the device is confirmed.
 pub mod guard_browser_device;
 /// Block direct edits to production dotfiles; redirect to chezmoi source.
@@ -21,12 +31,20 @@ pub mod guard_git_init;
 pub mod guard_op_vault_scan;
 /// Block `git push` to remotes owned by others.
 pub mod guard_push_remote;
+/// Opt-in per-model Read/Grep guard; block reads by the resolved session model.
+pub mod guard_read_model;
+/// Path-aware triage of rm-family delete commands (allow/ask/block).
+pub mod guard_rm;
 /// Inject the gh-write allowlist + `-R` rule on SessionStart.
 pub mod inject_gh_context;
 /// Shared closing-keyword detection for GitHub issue references.
 pub mod issue_refs;
+/// Shared message text duplicated across guardrails call sites (cadence-hooks#327).
+pub mod messages;
 /// Nudge to schedule a brew upgrade after pushing cadence-hooks to main.
 pub mod nudge_upgrade_after_push;
+/// Shared provenance sidecar for the `dismiss-*` snooze markers.
+pub mod snooze_meta;
 /// Warn about broken issue refs on PR create; close straggler issues on PR merge.
 pub mod verify_pr_autoclose;
 /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers.
@@ -41,12 +59,16 @@ pub mod warn_cron_datetime;
 pub mod warn_curl_alias;
 /// Pre-flight checklist nudge before `gh pr merge` (draft, worktree, verify).
 pub mod warn_gh_merge_preflight;
+/// Warn when creating/publicizing a repo whose name or description telegraphs sensitive content.
+pub mod warn_going_public;
 /// Nudge when `gh issue create` targets an owned repo other than the canonical issue tracker.
 pub mod warn_issue_tracker;
 /// Warn when editing files directly on main/master branch.
 pub mod warn_main_branch;
 /// Remind on `gh pr create` when the PR body has no closing keyword linking to an issue.
 pub mod warn_pr_issue_link;
+/// Nudge when the live subagent count is at or over the configured cap.
+pub mod warn_subagent_concurrency;
 /// Warn when dispatching a subagent from main while a sibling worktree exists.
 pub mod warn_subagent_worktree;
 /// Warn about untracked files during git commit operations.

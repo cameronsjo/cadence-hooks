@@ -28,32 +28,49 @@ Each hook is a subcommand; `cadence-hooks list` shows every hook with its event
 and disable status, and `cadence-hooks <namespace> --help` lists a namespace's
 subcommands.
 
-## Per-repo terminology exemptions
+## Per-repo guard config: `.claude/cadence.json`
+
+Per-repo guard softening lives in a single `<git-root>/.claude/cadence.json`,
+each guard reading its own top-level section (`terminology`, `redaction`) under a
+`version: 1` envelope. Unknown top-level keys are ignored, so the file tolerates
+sections a newer binary hasn't shipped yet.
+
+> **Migrating from the pre-unification files.** Earlier versions read separate
+> `.claude/terminology.json` and `.claude/redaction.json` files. Those are **no
+> longer read** — run `cadence-hooks migrate-config` in the repo to merge them
+> into `cadence.json` (it renames each consumed file to `*.json.migrated`), or
+> hand-author `cadence.json`. `cadence-hooks doctor` warns when an orphaned
+> legacy file is still present or when `cadence.json` fails to parse.
+
+### `terminology` — soften the inclusive-terminology block
 
 The `terminology` guard hard-**blocks** a small set of dated terms on every
 `Write`/`Edit` (`whitelist`, `blacklist`, `master branch`/`master node`,
 `slave`, `sanity check`, `dummy value`; `grandfathered` is a softer nudge). That
 block is the right default everywhere. But some files legitimately carry these
 words — a vendor ACL format named `whitelist`, an existing API field, a config
-schema whose key *is* the dated term. A per-repo `<git-root>/.claude/terminology.json`
-softens the block for named files and terms.
+schema whose key *is* the dated term. The `terminology` section softens the
+block for named files and terms.
 
 It can only ever **remove or demote** a violation — never add one. It cannot
 introduce new blocked terms, and it cannot turn the block on for a path the
 built-in baseline already exempts (this repo's own source, `CLAUDE.md`,
-`.claude/hooks`/`rules`). Missing, unreadable, or invalid JSON is ignored and the
-block stands (fail-open, ADR-0001).
+`.claude/hooks`/`rules`). A missing file, unreadable/oversized/special file, or
+invalid JSON is ignored and the block stands (fail-open, ADR-0001).
 
 ```jsonc
 {
-  "exemptions": [
-    {
-      "paths": ["config/acl.yml", "**/firewall-*.yaml", "vendor-list.yml"],
-      "terms": ["whitelist", "blacklist"],
-      "mode": "allow"
-    },
-    { "paths": ["vendor/**"] }
-  ]
+  "version": 1,
+  "terminology": {
+    "exemptions": [
+      {
+        "paths": ["config/acl.yml", "**/firewall-*.yaml", "vendor-list.yml"],
+        "terms": ["whitelist", "blacklist"],
+        "mode": "allow"
+      },
+      { "paths": ["vendor/**"] }
+    ]
+  }
 }
 ```
 
@@ -81,14 +98,19 @@ kept unprefixed because it's a cross-tool convention.
 | `CADENCE_ALLOWED_REPOS` | `guard-gh-write` | Space- or comma-separated `owner/repo` pairs |
 | `CADENCE_EXTRA_HOSTS` | `guard-push-remote`, `guard-gh-write` | Self-hosted forge hosts that bare entries (`cameron`) should match in addition to the default host |
 | `CADENCE_GH_STRICT_LOOPS` | `guard-gh-write` | Set to `1` to block all looped gh writes lacking `-R`, even provably deterministic ones |
-| `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Override the canonical issue-tracker repo (`owner/repo`) the nudge steers `gh issue create` toward (default `cameronsjo/claude-configurations`) |
+| `CADENCE_ISSUE_TRACKERS` | `warn-issue-tracker` | Comma-separated set of known ecosystem trackers (`owner/repo`) — replaces the default set (`cameronsjo/cadence`, `cameronsjo/cadence-hooks`, `cameronsjo/forgectl`, `cameronsjo/claude-configurations`); the nudge fires only when an owned target is none of them |
+| `CADENCE_ISSUE_TRACKER` | `warn-issue-tracker` | Legacy singular override — sets a single known tracker (`owner/repo`), replacing the default set. Superseded by `CADENCE_ISSUE_TRACKERS`; still honored when the plural is unset |
 | `CADENCE_GUARD_DOTFILES` | `guard-dotfiles` | Set to `1` to block direct edits to production dotfiles (clean no-op otherwise) |
-| `CADENCE_ALLOW_MAIN` | `warn-main-branch` | Set truthy (`1`/`true`/`yes`) in a repo's `.claude/settings.json` `env` block to permanently silence the main-branch warning where `main` is the working branch by design (dotfiles, vaults, scratchpads) |
+| `CADENCE_ALLOW_MAIN` | `warn-main-branch`, `enforce-worktree` | Set truthy (`1`/`true`/`yes`) in a repo's `.claude/settings.json` `env` block to mark a repo where `main` is the working branch by design (dotfiles, vaults, scratchpads) — silences the main-branch warning and exempts the repo from worktree enforcement. `enforce-worktree` resolves this from process env OR the *target* repo's own tracked `.claude/settings.json`/`settings.local.json` (`settings.local` overriding `settings`) — so a cross-repo mutation into a by-design-main repo is exempt even when that repo isn't the session root |
+| `CADENCE_NO_ENFORCE_WORKTREE` | `enforce-worktree` | Set truthy (`1`/`true`/`yes`) to disable the primary-checkout block everywhere — the kill switch for the proving period; prefer `CADENCE_ALLOW_MAIN` per repo |
 | `CADENCE_SKIP_OVERSHARE_AUDIT` | `warn-overshare` | Set to `1` for a session-scoped bypass in repos that legitimately hold personal context |
 | `CADENCE_METRICS_PRICES` | `log-commit` | Path to a model price-table JSON; takes precedence over the `--prices` flag and the embedded default |
 | `CADENCE_METRICS_DIR` | metrics loggers | When set non-empty, the metrics root (JSONL files and the `state/` subdir live directly inside it); otherwise `<config_dir>/metrics` (honoring `CLAUDE_CONFIG_DIR`) |
 | `CADENCE_METRICS_DEBUG` | `log-subagent` | Set to `1` to append a `_keys` array of the raw payload's top-level keys to subagent records — surfaces schema additions across Claude Code releases |
+| `CADENCE_LOG_NUDGES` | denial log | Nudge-fire rows in `denials.jsonl` are ON by default (#420); set `0`/`false`/`off` (case-insensitive) or set-but-empty to opt out. Any other value, including the legacy opt-in `1`, keeps them on. Deny/Ask rows are unconditional either way |
+| `CADENCE_METRICS_STALE_DAYS` | `warn-stale` | Days of metrics-write silence before the SessionStart alarm fires and `doctor` reports staleness (default 4); zero or unparseable falls back to the default |
 | `CADENCE_SESSION_STALE_MINUTES` | `session` hooks | Minutes of heartbeat silence before a session is presumed dead (default 10) |
+| `CADENCE_DOCTOR_PRUNE_FORCE` | `doctor --prune` | Set to `1` or `true` to bypass the live-session gate and let `doctor --prune --apply` delete orphaned plugin-cache version dirs even while peer sessions are running. The gate's refusal message names this override; otherwise run `/reload-plugins` in the live session first to release the retired dirs |
 | `GH_AUTOCLOSE_WAIT_SECONDS` | `verify-pr-autoclose` | Seconds to wait after `gh pr merge` before checking for straggler issues (default 10) |
 | `OBSIDIAN_VAULT` | `trash-guard`, `warn-overshare` | Absolute path to Obsidian vault — the trash guard scopes `rm` blocking to it, and the overshare audit treats it as the safe destination for personal context |
 
@@ -181,8 +203,40 @@ cadence-hooks guardrails dismiss-main-branch-warn
 
 # Explicit duration: 2h, 1d, 45s, etc. Capped at 24h.
 cadence-hooks guardrails dismiss-main-branch-warn --for 2h
+
+# Longer dismissals must say why (recorded in the bypass log):
+cadence-hooks guardrails dismiss-main-branch-warn --for 4h --reason "wrap-up edits on dotfiles"
 ```
 
 The snooze marker lives at `<repo>/.git/cadence-hooks/main-branch-snoozed-until`, so it's per-repo and ignored by default (`.git/` is never committed). The hook's own warn output also points at the command, so it's discoverable when the warning fires.
 
+`--reason` is **required for a dismissal longer than 1h** and nudged (but optional) at or under it. The reason, the arming session, and the expiry are written to a provenance sidecar next to the marker and recorded in the bypass log (see [Bypass provenance](#bypass-provenance) below).
+
 For a repo where `main` is the working branch by design, set `CADENCE_ALLOW_MAIN=true` in `.claude/settings.json` to silence the warning permanently instead.
+
+## Snoozing enforce-worktree
+
+`enforce-worktree` hard-blocks mutations in a primary checkout of a branch-mode repo — but only the **session's own** checkout. A file write (`Edit`/`Write`/`MultiEdit`) into a *different* repo than the session's cwd is a foreign artifact-drop (a note into an Obsidian vault, a field report into `~/Documents`, a file in a sibling repo) and is out of scope — allowed (#238). The `git commit` arm is not so scoped: committing into a foreign primary still blocks (#224), so you can drop a file into another repo but not persist it to that repo's `main` without an escape hatch. For the legitimate one-off in your own checkout — committing an approved plan doc on the default branch, a hotfix the user explicitly wants in the primary tree — snooze it per-repo:
+
+```bash
+# Default: 30 minutes
+cadence-hooks guardrails dismiss-enforce-worktree
+
+# Explicit duration: 2h, 1d, 45s, etc. Capped at 24h.
+cadence-hooks guardrails dismiss-enforce-worktree --for 2h
+
+# Longer dismissals must say why (recorded in the repo-visible bypass log):
+cadence-hooks guardrails dismiss-enforce-worktree --for 4h --reason "committing approved plan doc on main"
+```
+
+The marker lives at `<repo>/.git/cadence-hooks/enforce-worktree-snoozed-until` — independent of the `warn-main-branch` snooze, so unblocking the guard doesn't also silence the nudge. For a repo where `main` is the working branch by design, `CADENCE_ALLOW_MAIN=true` exempts it permanently; `CADENCE_NO_ENFORCE_WORKTREE=1` (user-global) disables the guard everywhere. The guard reads `CADENCE_ALLOW_MAIN` from the *target* repo's own tracked settings directly (`settings.local.json` overriding `settings.json`), so it applies even when the mutation crosses in from another session's repo.
+
+This dismissal is **repo-scoped** — on a shared checkout it lowers the guard for every session, not just yours — so `--reason` is **required over 1h** (nudged at or under). The reason, arming session, and expiry land in a provenance sidecar (`enforce-worktree-snoozed-meta.json`, next to the marker) and in the bypass log below.
+
+## Bypass provenance
+
+Every guard bypass — a `dismiss-*` snooze being **armed**, and an operation later **riding through** an active dismissal or env switch — is recorded to `<metrics_dir>/bypasses.jsonl`, one JSON line per event. This answers *who / why / how long / which guard* for the times a guardrail was stepped outside of, which the denial log (`denials.jsonl`) can't see because a bypass is an allow.
+
+Each line carries `event` (`armed` | `used`), the `hook` (guard) and `mechanism` (`dismiss-enforce-worktree`, `CADENCE_ALLOW_MAIN`, …), the `kind` (`dismissal` | `env_switch`), the `sessionId`, the repo **basename**, the user-authored `reason`, and the expiry. Following the denial log's **privacy-by-construction** contract, it never records a command, file path, or edited content — only which guard was bypassed, how, and why.
+
+Writes are fully fail-open (ADR-0001): an unwritable metrics dir degrades to a no-op and never perturbs the operation or its exit code. The log lives under the metrics directory (`CADENCE_METRICS_DIR`, else `<config_dir>/metrics`).

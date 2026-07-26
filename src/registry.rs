@@ -9,7 +9,7 @@ use cadence_hooks_core::HookEvent;
 pub struct HookEntry {
     pub name: &'static str,
     pub description: &'static str,
-    /// CLI namespace: cadence | guardrails | rules | obsidian | metrics | lab | session
+    /// CLI namespace: cadence | guardrails | rules | obsidian | metrics | session
     pub plugin: &'static str,
     /// Hook event this command serves — drives `try`'s sample-payload shape.
     /// `None` for fire-and-forget loggers, which react to `hook_event_name`
@@ -100,6 +100,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "cadence",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "platform-drift",
+        description: "Nudge when cadence-hooks or Claude Code has drifted behind the plugin-shipped platform baseline",
+        plugin: "cadence",
+        event: Some(HookEvent::SessionStart),
+    },
     // guardrails
     HookEntry {
         name: "guard-push-remote",
@@ -132,14 +138,20 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "enforce-worktree",
+        description: "Block mutations in a primary checkout of a branch-mode repo",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "warn-subagent-worktree",
         description: "Warn when dispatching a subagent from main while a sibling worktree exists",
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
-        name: "check-idle-return",
-        description: "Nudge after idle periods between edits",
+        name: "warn-subagent-concurrency",
+        description: "Nudge when live subagents reach the concurrency cap on an Agent/Task spawn",
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
@@ -174,6 +186,18 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "guard-rm",
+        description: "Path-aware rm triage: allow temp/managed, block home/vault/repo, ask the rest",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "guard-read-model",
+        description: "Block Read/Grep by resolved session model (opt-in)",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "warn-pr-issue-link",
         description: "Nudge when gh pr create has no closing issue keyword",
         plugin: "guardrails",
@@ -182,6 +206,12 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "warn-issue-tracker",
         description: "Nudge when gh issue create targets a repo other than the canonical tracker",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-going-public",
+        description: "Nudge on repo create/publicize when name or description telegraphs sensitive content",
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
@@ -285,6 +315,18 @@ pub const HOOKS: &[HookEntry] = &[
         event: None,
     },
     HookEntry {
+        name: "log-session",
+        description: "Log per-session cost at SessionEnd (SessionEnd)",
+        plugin: "metrics",
+        event: None,
+    },
+    HookEntry {
+        name: "log-session-start",
+        description: "Capture session start timestamp (SessionStart)",
+        plugin: "metrics",
+        event: None,
+    },
+    HookEntry {
         name: "log-polish-nudge",
         description: "Log polish-nudge skips: gh pr create + whether /polish ran (PostToolUse)",
         plugin: "metrics",
@@ -292,27 +334,26 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "log-ask-user-question",
-        description: "Log AskUserQuestion stance + shape on every call (PreToolUse)",
+        description: "Log AskUserQuestion asked (PreToolUse) + answered (PostToolUse) events",
         plugin: "metrics",
         event: None,
     },
-    // lab
     HookEntry {
-        name: "persona-nudge",
-        description: "Inject the self-representation contract on session start",
-        plugin: "lab",
-        event: Some(HookEvent::SessionStart),
+        name: "log-skill",
+        description: "Log skill invocations (PostToolUse:Skill)",
+        plugin: "metrics",
+        event: None,
     },
     HookEntry {
-        name: "persona-gate",
-        description: "Validate and promote a self-representation candidate",
-        plugin: "lab",
-        event: Some(HookEvent::PostToolUse),
+        name: "warn-stale",
+        description: "Warn at SessionStart when metrics telemetry has gone stale",
+        plugin: "metrics",
+        event: Some(HookEvent::SessionStart),
     },
     // session (cadence-canon)
     HookEntry {
         name: "start",
-        description: "Register this session in the repo registry and disclose live peers",
+        description: "Register this session, disclose live peers, and surface in-flight plans",
         plugin: "session",
         event: Some(HookEvent::SessionStart),
     },
@@ -335,6 +376,18 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-branch-intent",
+        description: "Nudge when new work starts on a stale, unrelated feature branch",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "warn-commit-provenance",
+        description: "Nudge toward a Session-Id: trailer on a Claude-composed commit message",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "end",
         description: "Deregister this session's registry file when it ends (SessionEnd)",
         plugin: "session",
@@ -352,6 +405,18 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: Some(HookEvent::SessionStart),
     },
+    HookEntry {
+        name: "persist-plan",
+        description: "Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)",
+        plugin: "session",
+        event: Some(HookEvent::UserPromptSubmit),
+    },
+    HookEntry {
+        name: "persist-plan-approval",
+        description: "Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)",
+        plugin: "session",
+        event: Some(HookEvent::PostToolUse),
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
@@ -359,6 +424,12 @@ pub fn entry(namespace: &str, subcommand: &str) -> Option<&'static HookEntry> {
     HOOKS
         .iter()
         .find(|h| h.plugin == namespace && h.name == subcommand)
+}
+
+/// The plugin namespace for a canonical hook `name`, if it is registered.
+/// Used by the dispatch self-timing write to tag which plugin owns a slow hook.
+pub fn plugin_for(name: &str) -> Option<&'static str> {
+    HOOKS.iter().find(|h| h.name == name).map(|h| h.plugin)
 }
 
 /// Per-hook sample payload overrides for `try` and the interactive-terminal
@@ -386,6 +457,17 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("metrics", "log-subagent") => Some(
             r#"{"session_id":"test","hook_event_name":"SubagentStop","agent_id":"agent-1","agent_type":"Explore","duration_ms":1234}"#,
         ),
+        // log-session gates on hook_event_name == "SessionEnd" and scans the
+        // transcript; the generic logger sample carries a different event and
+        // no transcript, so it would no-op before writing a row.
+        ("metrics", "log-session") => Some(
+            r#"{"session_id":"test","hook_event_name":"SessionEnd","transcript_path":"/tmp/transcript.jsonl","cwd":"/tmp","reason":"prompt_input_exit"}"#,
+        ),
+        // log-session-start gates on hook_event_name == "SessionStart"; the
+        // generic logger sample carries a different event and would no-op.
+        ("metrics", "log-session-start") => {
+            Some(r#"{"session_id":"test","hook_event_name":"SessionStart","cwd":"/tmp"}"#)
+        }
         // log-polish-nudge gates on a `gh pr create` command (the nudge denominator)
         ("metrics", "log-polish-nudge") => Some(
             r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_input":{"command":"gh pr create --title test"},"transcript_path":"/tmp/transcript.jsonl"}"#,
@@ -395,10 +477,28 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("metrics", "log-ask-user-question") => Some(
             r#"{"session_id":"test","hook_event_name":"PreToolUse","model":"claude-opus-4-8","tool_input":{"questions":[{"question":"Which approach?","header":"Approach","multiSelect":false,"options":[{"label":"Option A","description":"first"},{"label":"Option B","description":"second"}]}]}}"#,
         ),
+        // log-skill gates on tool_name == "Skill"; the generic PostToolUse
+        // logger sample carries no tool_name and would no-op.
+        ("metrics", "log-skill") => Some(
+            r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_name":"Skill","cwd":"/tmp","tool_input":{"skill":"cadence:attune","args":"execute C8"}}"#,
+        ),
         // warn-branch-drift early-exits unless the command is a git commit —
         // the generic PreToolUse sample (`git status`) would never reach the
         // drift comparison.
         ("session", "warn-branch-drift") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}"#,
+        ),
+        // warn-branch-intent gates on an Edit/Write mutation; the generic
+        // PreToolUse sample carries no cwd, so it would fail open before the
+        // registry/git evaluation. This Edit payload exercises the guard path
+        // and fail-opens cleanly (cwd not a registered session).
+        ("session", "warn-branch-intent") => Some(
+            r#"{"session_id":"test","tool_name":"Edit","cwd":"/tmp","tool_input":{"file_path":"/tmp/x.rs"}}"#,
+        ),
+        // warn-commit-provenance early-exits unless the command is a git
+        // commit carrying an extractable message — the generic PreToolUse
+        // sample (`git status`) would never reach the Session-Id: check.
+        ("session", "warn-commit-provenance") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}"#,
         ),
         // end gates on hook_event_name == "SessionEnd"; the generic logger
@@ -424,11 +524,65 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "backstop-warn") => {
             Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#)
         }
+        // persist-plan gates on an exact "Implement the following plan:"
+        // prefix; the generic UserPromptSubmit sample carries no cwd/session_id
+        // so `try` would fail open before ever reaching the write path.
+        //
+        // `cwd` is a deliberately NONEXISTENT path, and `try_hook`'s
+        // `CWD_OVERRIDE_REFUSED` list keeps it that way — this hook has a
+        // genuine filesystem WRITE side effect, and `try`'s normal behavior
+        // (inject the REAL current_dir(), so most checks exercise real repo
+        // detection) would otherwise let a bare `cadence-hooks try session
+        // persist-plan` actually create a plan doc in whatever repo the user
+        // ran it from (cameronsjo/cadence-hooks#396 review: verified end to
+        // end — a real plan doc landed in a real repo during review). A
+        // nonexistent directory makes `repo_root`'s `git -C <cwd> …` spawn
+        // fail deterministically, so the check reaches (and exercises) its
+        // "not a git repo" fail-open arm instead of ever writing.
+        ("session", "persist-plan") => Some(
+            r#"{"session_id":"test","prompt":"Implement the following plan:\n\n# Try Sample\n\nbody text","cwd":"/nonexistent-cadence-hooks-try-sandbox","transcript_path":"/tmp/test.jsonl"}"#,
+        ),
+        // persist-plan-approval gates on tool_name == "ExitPlanMode" and a
+        // non-empty tool_response.plan; the generic PostToolUse sample carries
+        // neither, so `try` would fail open before ever reaching the write
+        // path. Same nonexistent-`cwd` discipline as `persist-plan` above —
+        // see that entry's comment.
+        ("session", "persist-plan-approval") => Some(
+            // Extra `#` in the raw-string delimiter: the payload's own plan
+            // text embeds a literal `"#` (a quote immediately followed by an
+            // ATX heading marker), which would otherwise close a `r#"..."#`
+            // raw string early.
+            r##"{"session_id":"test","tool_name":"ExitPlanMode","cwd":"/nonexistent-cadence-hooks-try-sandbox","transcript_path":"/tmp/test.jsonl","tool_response":{"plan":"# Try Sample\n\nbody text","isAgent":false}}"##,
+        ),
         // warn-subagent-worktree only engages on an Agent/Task spawn; the generic
         // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a
         // directory to resolve against.
         ("guardrails", "warn-subagent-worktree") => Some(
             r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
+        ),
+        // warn-subagent-concurrency only engages on an Agent/Task spawn; the
+        // generic Bash PreToolUse sample would no-op before the log read.
+        ("guardrails", "warn-subagent-concurrency") => Some(
+            r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
+        ),
+        // enforce-worktree only engages on a file mutation or git commit; the
+        // generic Bash sample would no-op. Note `try` substitutes the process
+        // cwd, so from a real primary checkout this smoke-tests live state.
+        ("guardrails", "enforce-worktree") => Some(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"/tmp/sample/file.txt"},"cwd":"/tmp"}"#,
+        ),
+        // guard-read-model only gates Read/Grep; the generic Bash PreToolUse
+        // sample would no-op. Carry a Read payload so `try`/list fail-open cleanly
+        // (no MODELS env in a smoke run → disabled → allow).
+        ("guardrails", "guard-read-model") => {
+            Some(r#"{"tool_name":"Read","tool_input":{"file_path":"/tmp/x"},"cwd":"/tmp"}"#)
+        }
+        // guard-rm only engages on an rm-family Bash command; the generic
+        // `git status` sample would find no delete target and no-op. Carry an
+        // absolute /tmp target so the smoke run resolves ALLOW independent of
+        // the process cwd `try` substitutes.
+        ("guardrails", "guard-rm") => Some(
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/scratch/foo"},"cwd":"/tmp"}"#,
         ),
         _ => None,
     }
@@ -480,7 +634,7 @@ mod tests {
 
     #[test]
     fn entry_returns_event_for_sample_payload_selection() {
-        let e = entry("lab", "persona-nudge").expect("persona-nudge registered");
+        let e = entry("session", "start").expect("start registered");
         assert_eq!(e.event, Some(HookEvent::SessionStart));
     }
 
@@ -491,9 +645,9 @@ mod tests {
 
     #[test]
     fn sample_overrides_exist_for_event_gated_loggers() {
-        // These three loggers gate on specific hook_event_name values or
-        // command shapes — the generic fallback would no-op them.
-        for name in ["snapshot", "log-commit", "log-subagent"] {
+        // These loggers gate on specific hook_event_name values or command
+        // shapes — the generic fallback would no-op them.
+        for name in ["snapshot", "log-commit", "log-subagent", "log-session"] {
             assert!(
                 sample_for("metrics", name).is_some(),
                 "{name} needs a sample override"
@@ -535,8 +689,11 @@ mod tests {
             "snapshot",
             "log-commit",
             "log-subagent",
+            "log-session",
+            "log-session-start",
             "log-polish-nudge",
             "log-ask-user-question",
+            "log-skill",
             "heartbeat",
             "end",
             "backstop-record",

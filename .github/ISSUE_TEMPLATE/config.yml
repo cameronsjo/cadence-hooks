@@ -3,6 +3,12 @@ contact_links:
   - name: Documentation
     url: https://github.com/cameronsjo/cadence-hooks#readme
     about: Hook reference, environment variables, and architecture overview.
-  - name: Plugin distribution issues
+  - name: Plugin / methodology issues (cadence)
+    url: https://github.com/cameronsjo/cadence/issues
+    about: A skill, command, or plugin's wiring — not the binary's behavior.
+  - name: forgectl / claunch CLI
+    url: https://github.com/cameronsjo/forgectl/issues
+    about: The forgectl binary.
+  - name: Meta / epics / orchestration
     url: https://github.com/cameronsjo/claude-configurations/issues
-    about: Marketplace, plugin metadata, or hooks.json wiring (not binary behavior).
+    about: Cross-repo epics, tooling, dotfiles (private tracker).

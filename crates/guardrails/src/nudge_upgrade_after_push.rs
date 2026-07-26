@@ -6,8 +6,10 @@
 //! `brew upgrade` via CronCreate (one-shot, ~4 minutes out) to allow CI
 //! time to build and publish the new beta release.
 
+use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{git_command, host_and_repo_from_url, parse_work_dir};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+use std::path::Path;
 
 const TARGET_REPO: &str = "cameronsjo/cadence-hooks";
 
@@ -30,8 +32,11 @@ fn is_push_to_main(command: &str, work_dir: &str) -> bool {
         }
     }
 
-    // Bare `git push` — check current branch
-    git_command(work_dir, &["branch", "--show-current"])
+    // Bare `git push` — check the current branch via the shared GitState
+    // (pure-filesystem HEAD read, not a `git branch --show-current` spawn;
+    // cadence-hooks#164). A detached HEAD resolves to `None` → not main.
+    GitState::resolve(Path::new(work_dir))
+        .and_then(|s| s.branch)
         .map(|b| b == "main" || b == "master")
         .unwrap_or(false)
 }

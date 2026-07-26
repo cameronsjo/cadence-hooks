@@ -293,7 +293,15 @@ pub fn touch_own(
 /// (`session start` and the PostToolUse heartbeat) refresh their own mtime
 /// first, so the exclusion is defense-in-depth against a self-sweep. Pass
 /// `""` to sweep everything (CLI/tests with no own session).
-pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
+///
+/// `trigger` names the call site (`"heartbeat"` | `"start"`) and is threaded
+/// through to [`cadence_hooks_metrics::log_sweep`] for every reaped file, so
+/// cross-machine/cross-session liveness sweeps become observable (#259). Each
+/// reaped file is best-effort re-parsed as a [`SessionRecord`] to recover its
+/// `name`/`session_id` for the log row — this parse is ONLY for telemetry and
+/// never gates or blocks the delete; an unparsable file still logs (with
+/// `None`/`None`) and still gets reaped.
+pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str, trigger: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -315,40 +323,122 @@ pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str) {
         if let Some(age) = mtime_age_secs(&path)
             && age > stale_secs
         {
+            let record = fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<SessionRecord>(&t).ok());
+            cadence_hooks_metrics::log_sweep(
+                trigger,
+                record.as_ref().map(|r| r.session_id.as_str()),
+                record.as_ref().map(|r| r.name.as_str()),
+                age,
+            );
             let _ = fs::remove_file(&path);
         }
     }
 }
 
-/// Ensure `.claude/sessions/` is listed in the repo's `.git/info/exclude` so
-/// registry files never appear in `git status`.
+/// Ensure `.claude/sessions/` is listed in the repo's `info/exclude` so registry
+/// files never appear in `git status`.
 ///
-/// `.git/info/exclude` is per-checkout git plumbing — never committed, never
-/// shared — so this keeps the user's `.gitignore` untouched while preventing
-/// registry noise in every other guard that inspects untracked files.
+/// `info/exclude` is per-repo git plumbing — never committed, never shared — so
+/// this keeps the user's `.gitignore` untouched while preventing registry noise
+/// in every other guard that inspects untracked files.
+///
+/// The exclude lives in the git **common directory**, which is *shared* by the
+/// primary checkout and every linked worktree. Resolving it via
+/// [`cadence_hooks_core::paths::resolve_git_common_dir`] means a session running
+/// inside a linked worktree still writes the exclude to the primary `.git` (#130,
+/// previously an early-return no-op that left worktree registries noisy). One
+/// write covers all checkouts and is idempotent with the dedupe below.
+///
+/// **Symlink safety.** The resolved common dir's contents are attacker-influenced:
+/// a crafted `.git` *file* can redirect resolution to any directory (bounded only
+/// by the resolver's HEAD-exists gate, which `exists()` satisfies *through*
+/// symlinks). Without care a planted `info/exclude` symlink would make us append
+/// the exclusion line to a victim-writable file. Two layers defend the write:
+/// (1) a pre-check refuses when `info` or `info/exclude` is a symlink (silent
+/// no-op, fail-open per ADR-0001 — a *nonexistent* exclude is the normal case and
+/// gets created); (2) the write goes through [`atomic_write`]'s O_EXCL-staged
+/// rename, so even a symlink re-planted at the leaf between check and write is
+/// replaced, never followed.
 pub fn ensure_git_excluded(repo_root: &Path) {
     const EXCLUDE_LINE: &str = ".claude/sessions/";
-    let exclude_path = repo_root.join(".git").join("info").join("exclude");
-    // Only act inside a real checkout (a .git *directory* — skip worktrees and
-    // submodules whose .git is a file pointing elsewhere; their exclude file
-    // lives in the common dir and editing it is the user's call).
-    if !repo_root.join(".git").is_dir() {
+    let Some(common) = cadence_hooks_core::paths::resolve_git_common_dir(repo_root) else {
+        return;
+    };
+    let info_dir = common.join("info");
+    let exclude_path = info_dir.join("exclude");
+
+    // Refuse a symlinked info dir or exclude leaf — either would redirect the
+    // write to an attacker-chosen file. Fail open (no-op), never block.
+    if is_symlink(&info_dir) || is_symlink(&exclude_path) {
         return;
     }
+
     let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == EXCLUDE_LINE) {
         return;
     }
-    if let Some(parent) = exclude_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
+    let _ = fs::create_dir_all(&info_dir);
     let mut updated = existing;
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
     updated.push_str(EXCLUDE_LINE);
     updated.push('\n');
-    let _ = fs::write(&exclude_path, updated);
+    // O_EXCL-staged rename (never follows a symlink at the target), so a TOCTOU
+    // re-plant of the leaf between the check above and here can't be written
+    // through to a victim.
+    let _ = atomic_write(&exclude_path, updated.as_bytes());
+}
+
+/// True when `path` exists and is a symlink (`symlink_metadata` does not follow).
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Shared test support for `CADENCE_METRICS_DIR`, the process-global env var
+/// [`cadence_hooks_metrics::log_sweep`] reads. `sweep_stale` now fires that
+/// logger on every real reap (#259), so ANY test in this crate that ages a
+/// file past its staleness threshold — not just the sweep-telemetry tests
+/// below — touches this var and must serialize against every other one, or
+/// race and either pollute the real `~/.claude/metrics` dir or write into a
+/// sibling test's tempdir. `pub(crate)` so `heartbeat` and `start`'s test
+/// modules (separate files) can reuse the same lock instance — a second,
+/// unrelated `Mutex` would not actually serialize anything.
+#[cfg(test)]
+pub(crate) mod test_metrics_env {
+    use std::sync::Mutex;
+
+    pub(crate) static METRICS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with `CADENCE_METRICS_DIR` pinned to `dir` for its duration.
+    pub(crate) fn with_metrics_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = METRICS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized against every other env-mutating test via
+        // METRICS_ENV_LOCK.
+        unsafe {
+            std::env::set_var("CADENCE_METRICS_DIR", dir);
+        }
+        let result = f();
+        // SAFETY: serialized against every other env-mutating test via
+        // METRICS_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("CADENCE_METRICS_DIR");
+        }
+        result
+    }
+
+    /// Convenience for a test that doesn't inspect `sweeps.jsonl` itself but
+    /// still reaps a real file (and so fires `log_sweep`) — a throwaway
+    /// tempdir keeps the write off the real metrics dir and off the lock
+    /// window without the caller needing to build its own `TempDir`.
+    pub(crate) fn with_scratch_metrics_dir<T>(f: impl FnOnce() -> T) -> T {
+        let tmp = tempfile::TempDir::new().unwrap();
+        with_metrics_dir(tmp.path(), f)
+    }
 }
 
 #[cfg(test)]
@@ -662,7 +752,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         write_record(&dir, &record("fresh-face", "new-session")).unwrap();
         // stale_secs = 0: the old file (age ≥ 1s) is stale, the fresh one (age 0) is not.
-        sweep_stale(&dir, 0, "");
+        // Reaping fires log_sweep (#259) — scratch-dir-scoped so this doesn't
+        // race the sweep-telemetry tests below over CADENCE_METRICS_DIR.
+        test_metrics_env::with_scratch_metrics_dir(|| sweep_stale(&dir, 0, "", "test"));
         assert!(find_own(&dir, "old-session").is_none(), "stale swept");
         assert!(find_own(&dir, "new-session").is_some(), "fresh kept");
     }
@@ -677,7 +769,7 @@ mod tests {
         write_record(&dir, &record("the-peer", "peer-session")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // stale_secs = 0: both files have aged ≥ 1s, but own is excluded by sid.
-        sweep_stale(&dir, 0, "own-session");
+        test_metrics_env::with_scratch_metrics_dir(|| sweep_stale(&dir, 0, "own-session", "test"));
         assert!(
             find_own(&dir, "own-session").is_some(),
             "own aged file is NOT swept"
@@ -701,7 +793,7 @@ mod tests {
         let peer_file = dir.join("beta-anvil.session-.json");
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // stale_secs = 0: both files have aged ≥ 1s; own is spared by session_id.
-        sweep_stale(&dir, 0, "session-1");
+        test_metrics_env::with_scratch_metrics_dir(|| sweep_stale(&dir, 0, "session-1", "test"));
         assert!(
             own_file.exists(),
             "own file kept (spared by exact session_id)"
@@ -714,7 +806,95 @@ mod tests {
 
     #[test]
     fn sweep_missing_directory_is_noop() {
-        sweep_stale(Path::new("/nonexistent/sessions"), 0, "");
+        sweep_stale(Path::new("/nonexistent/sessions"), 0, "", "test");
+    }
+
+    // --- sweep telemetry (#259) ---
+    //
+    // `CADENCE_METRICS_DIR` is process-global. These tests use the shared
+    // `test_metrics_env::with_metrics_dir` (rather than a module-local lock)
+    // because it's the SAME lock every other test in this crate that reaps a
+    // real file serializes against — a second, independent `Mutex` here would
+    // not actually prevent a concurrent unrelated reap from racing these
+    // assertions (see `test_metrics_env`'s doc comment).
+
+    use test_metrics_env::with_metrics_dir;
+
+    fn read_sweep_lines(metrics_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = metrics_dir.join("sweeps.jsonl");
+        match fs::read_to_string(&path) {
+            Ok(contents) => contents
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str(l).expect("each line is valid JSON"))
+                .collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    #[test]
+    fn sweep_logs_reaped_file_identity_and_trigger() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        write_record(&dir, &record("old-timer", "old-session")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let metrics_dir = tmp.path().join("metrics");
+        with_metrics_dir(&metrics_dir, || {
+            sweep_stale(&dir, 0, "", "heartbeat");
+        });
+
+        assert!(find_own(&dir, "old-session").is_none(), "stale file reaped");
+        let rows = read_sweep_lines(&metrics_dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["trigger"], "heartbeat");
+        assert_eq!(rows[0]["sessionId"], "old-session");
+        assert_eq!(rows[0]["name"], "old-timer");
+    }
+
+    #[test]
+    fn sweep_reaps_file_even_when_metrics_dir_uncreatable() {
+        // A pre-existing FILE at the metrics-dir path makes `create_dir_all`
+        // fail inside `log_sweep`. The reap itself must be entirely unaffected
+        // by that failure — log_sweep's fail-open contract (ADR-0001).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        write_record(&dir, &record("old-timer", "old-session")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let blocked_metrics_path = tmp.path().join("metrics-blocked");
+        fs::write(&blocked_metrics_path, b"not a directory").unwrap();
+
+        with_metrics_dir(&blocked_metrics_path, || {
+            sweep_stale(&dir, 0, "", "heartbeat");
+        });
+
+        assert!(
+            find_own(&dir, "old-session").is_none(),
+            "stale file reaped even though the metrics dir write failed"
+        );
+    }
+
+    #[test]
+    fn sweep_reaps_and_logs_null_identity_for_unparsable_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let garbage_path = dir.join("garbage.deadbeef.json");
+        fs::write(&garbage_path, "not json {{").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let metrics_dir = tmp.path().join("metrics");
+        with_metrics_dir(&metrics_dir, || {
+            sweep_stale(&dir, 0, "", "start");
+        });
+
+        assert!(!garbage_path.exists(), "unparsable file still reaped");
+        let rows = read_sweep_lines(&metrics_dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["trigger"], "start");
+        assert!(rows[0]["sessionId"].is_null());
+        assert!(rows[0]["name"].is_null());
     }
 
     // --- deregister (remove_own, #97) ---
@@ -791,6 +971,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".git/info")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         ensure_git_excluded(root);
         ensure_git_excluded(root);
         let contents = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
@@ -806,6 +987,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join(".git/info")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(root.join(".git/info/exclude"), "*.swp\n").unwrap();
         ensure_git_excluded(root);
         let contents = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
@@ -821,8 +1003,9 @@ mod tests {
     }
 
     #[test]
-    fn ensure_git_excluded_skips_worktree_git_file() {
-        // In a linked worktree, .git is a *file* pointing at the common dir.
+    fn ensure_git_excluded_noop_when_gitdir_unresolvable() {
+        // A linked worktree's .git file that points at a nonexistent gitdir
+        // (no HEAD reachable) must resolve to no common dir → no write, no panic.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join(".git"),
@@ -831,6 +1014,96 @@ mod tests {
         .unwrap();
         ensure_git_excluded(tmp.path());
         assert!(tmp.path().join(".git").is_file(), ".git file untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_git_excluded_refuses_symlinked_exclude() {
+        // A crafted checkout: a `.git` FILE redirects to an `evil` dir with a
+        // planted HEAD (passing the resolver's HEAD gate) and an `info/exclude`
+        // symlinked at a victim file. Following that symlink on write would append
+        // the exclusion line to the victim; ensure_git_excluded must refuse.
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, "victim-original\n").unwrap();
+
+        let evil = tmp.path().join("evil");
+        fs::create_dir_all(evil.join("info")).unwrap();
+        fs::write(evil.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        symlink(&victim, evil.join("info").join("exclude")).unwrap();
+
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
+
+        ensure_git_excluded(&repo);
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "victim-original\n",
+            "a symlinked exclude must not be followed — victim untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_git_excluded_refuses_symlinked_info_dir() {
+        // The dir-level variant: `info` itself is a symlink into a victim dir.
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let victim_dir = tmp.path().join("victim_dir");
+        fs::create_dir_all(&victim_dir).unwrap();
+
+        let evil = tmp.path().join("evil");
+        fs::create_dir_all(&evil).unwrap();
+        fs::write(evil.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        symlink(&victim_dir, evil.join("info")).unwrap();
+
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(".git"), format!("gitdir: {}\n", evil.display())).unwrap();
+
+        ensure_git_excluded(&repo);
+
+        assert!(
+            !victim_dir.join("exclude").exists(),
+            "a symlinked info dir must not be written through"
+        );
+    }
+
+    #[test]
+    fn ensure_git_excluded_writes_common_dir_for_linked_worktree() {
+        // A linked worktree's exclude line must land in the PRIMARY checkout's
+        // shared .git/info/exclude (resolved via the worktree's commondir), so a
+        // session running inside the worktree still silences registry noise
+        // repo-wide (#130). Pure-fs fixture — no git spawn.
+        let tmp = TempDir::new().unwrap();
+        let primary_git = tmp.path().join("primary").join(".git");
+        fs::create_dir_all(primary_git.join("info")).unwrap();
+        fs::write(primary_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let wt_admin = primary_git.join("worktrees").join("wt");
+        fs::create_dir_all(&wt_admin).unwrap();
+        // commondir is relative to the worktree admin dir: ../.. → primary/.git
+        fs::write(wt_admin.join("commondir"), "../..\n").unwrap();
+        fs::write(wt_admin.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
+
+        let linked = tmp.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", wt_admin.display()),
+        )
+        .unwrap();
+
+        ensure_git_excluded(&linked);
+
+        let exclude = fs::read_to_string(primary_git.join("info").join("exclude"))
+            .expect("exclude written under the primary common dir");
+        assert!(
+            exclude.lines().any(|l| l.trim() == ".claude/sessions/"),
+            "exclude line lands in the primary .git/info/exclude: {exclude}"
+        );
     }
 
     // --- env config ---

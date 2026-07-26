@@ -1,5 +1,11 @@
 //! Configuration parsing utilities for environment variables.
 
+use std::path::Path;
+
+use serde::de::DeserializeOwned;
+
+use crate::paths::read_untrusted_config;
+
 /// Parse a space-or-comma-separated environment variable into a list of values.
 ///
 /// Accepts any combination of whitespace and commas as delimiters.
@@ -200,6 +206,203 @@ impl std::fmt::Display for AllowEntry {
         }
         Ok(())
     }
+}
+
+/// Read `env.<key>` from a repo's tracked Claude settings, honoring Claude
+/// Code's precedence: `.claude/settings.local.json` overrides
+/// `.claude/settings.json`. Returns the value of the first file where the key
+/// is *present as a scalar* (string/bool/number, coerced to string). Missing
+/// files, absent keys, malformed JSON, and non-scalar values (null/array/
+/// object) all declare nothing and fall through — a settings-read failure can
+/// only ever yield `None`, never an error, never a panic (ADR-0001).
+///
+/// Reads via [`crate::paths::read_untrusted_config`] (regular-file check + 1
+/// MiB cap, #157/#194) so a settings path that is a symlink to `/dev/zero` or
+/// a FIFO cannot hang the hook.
+///
+/// Seed primitive for the guard-family settings-resolution generalization
+/// tracked in cameronsjo/cadence-hooks#164; `src/configure.rs`'s
+/// `read_disabled_hooks` is a candidate for later consolidation onto it — NOT
+/// done here.
+pub fn repo_env_flag(repo_root: &Path, key: &str) -> Option<String> {
+    let claude_dir = repo_root.join(".claude");
+    for name in ["settings.local.json", "settings.json"] {
+        let Some(content) = read_untrusted_config(&claude_dir.join(name)) else {
+            continue;
+        };
+        // Tolerate a leading UTF-8 BOM and JSONC (comments, trailing commas).
+        // Editors and hand-authoring often prepend a BOM or leave `//` comments;
+        // strict serde_json rejects both, which would silently drop a *declared*
+        // CADENCE_ALLOW_MAIN and false-block a by-design-main repo
+        // (cadence-hooks#239 F10, #246). parse_jsonc strips them before parsing;
+        // still-malformed input yields None and falls through.
+        let Some(json) = parse_jsonc(&content) else {
+            continue;
+        };
+        let Some(val) = json.get("env").and_then(|env| env.get(key)) else {
+            continue;
+        };
+        match val {
+            serde_json::Value::String(s) => return Some(s.clone()),
+            serde_json::Value::Bool(b) => return Some(b.to_string()),
+            serde_json::Value::Number(n) => return Some(n.to_string()),
+            _ => continue, // null/array/object — not a declared scalar
+        }
+    }
+    None
+}
+
+/// Parse settings/config content as JSONC: tolerate a leading UTF-8 BOM plus
+/// `//`/`/* */` comments and trailing commas before strict JSON parsing.
+///
+/// Editors and hand-authoring routinely produce these, and strict serde_json
+/// rejects them outright — which for a fail-open guard means a *declared*
+/// setting silently vanishes (cadence-hooks#246). Stripping favors clarity over
+/// cleverness: two string-aware passes rather than one dense one, and no new
+/// parser dependency. Genuinely malformed input still returns `None`, so every
+/// caller keeps its existing fail-open fall-through.
+fn parse_jsonc(content: &str) -> Option<serde_json::Value> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let cleaned = strip_jsonc(content);
+    serde_json::from_str(&cleaned).ok()
+}
+
+/// Strip JSONC comments and trailing commas via two string-aware passes.
+fn strip_jsonc(content: &str) -> String {
+    strip_trailing_commas(&strip_comments(content))
+}
+
+/// Pass 1: remove `//` line comments and `/* */` block comments while leaving
+/// string literals untouched. A `//` inside `"http://example"` or a `/*` inside
+/// a value must survive verbatim, so we track string state and `\`-escapes.
+fn strip_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next(); // consume the second '/'
+                while let Some(&next) = chars.peek() {
+                    if next == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next(); // consume the '*'
+                let mut prev_star = false;
+                for next in chars.by_ref() {
+                    if prev_star && next == '/' {
+                        break;
+                    }
+                    prev_star = next == '*';
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Pass 2: drop a comma whose next non-whitespace character is `}` or `]`,
+/// again skipping string interiors so a comma inside `"a,]"` is preserved.
+fn strip_trailing_commas(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                i += 1; // drop the trailing comma
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// The single per-repo guard config file, relative to the git root.
+///
+/// One namespaced `.claude/cadence.json` replaces the family of per-guard
+/// `.claude/*.json` files (cadence-hooks#153). Each guard reads its own
+/// top-level section via [`load_cadence_section`]; unknown sections are
+/// ignored (permissive, fail-open), so a `version` envelope plus reserved
+/// keys (`nudges`, #216) can be hand-authored ahead of the loader that reads
+/// them.
+pub const CADENCE_CONFIG_REL: &str = ".claude/cadence.json";
+
+/// Load one guard's section from `<root>/.claude/cadence.json`, deserialized
+/// into the guard's own `T` (each guard keeps its existing `*Config` struct —
+/// no type moves across crates).
+///
+/// Fail-open at every step, mirroring the per-guard loaders it replaces: a
+/// missing file, an unreadable/oversized/special file (via
+/// [`read_untrusted_config`]'s 1 MiB cap + regular-file check), non-UTF-8, a
+/// top-level JSON parse failure, an absent `section`, or a section that does
+/// not shape-match `T` all yield `T::default()` (ADR-0001 — a guard's own
+/// config-read failure must never block the user).
+///
+/// The file is read and parsed once per call. Each guard invokes this with its
+/// own `section` name (`"terminology"`, `"redaction"`), so a repo that reads N
+/// sections re-reads the file N times per tool event — acceptable at N≈2 with a
+/// 1 MiB cap, and it keeps each guard's read independent and fail-open.
+pub fn load_cadence_section<T: Default + DeserializeOwned>(root: &Path, section: &str) -> T {
+    let path = root.join(CADENCE_CONFIG_REL);
+    let Some(content) = read_untrusted_config(&path) else {
+        return T::default();
+    };
+    let Some(value) = parse_jsonc(&content) else {
+        return T::default();
+    };
+    value
+        .get(section)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -636,5 +839,548 @@ mod tests {
             parse_allow_entry("gitea.internal/cameron/cadence").to_string(),
             "gitea.internal/cameron/cadence"
         );
+    }
+
+    // --- repo_env_flag ---
+
+    fn write_settings(dir: &std::path::Path, name: &str, body: &str) {
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn repo_env_flag_shared_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_local_overrides_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.local.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_local_overrides_shared_reverse() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.local.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"false"}}"#,
+        );
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("false".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_local_present_but_key_absent_falls_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(tmp.path(), "settings.local.json", r#"{"env":{}}"#);
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_malformed_local_falls_through_to_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(tmp.path(), "settings.local.json", "{not valid json");
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_neither_file_exists_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_env_absent_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(tmp.path(), "settings.json", r#"{"other":"stuff"}"#);
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_null_value_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":null}}"#,
+        );
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_null_in_local_falls_through_to_shared() {
+        // An explicit `null` in local is a non-scalar, so it declares nothing
+        // and falls through to shared — it is NOT treated as "locally cleared,
+        // stop here" (which would wrongly return None despite a truthy shared
+        // value).
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.local.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":null}}"#,
+        );
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"true"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_bool_value_coerces_to_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":true}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_tolerates_leading_bom() {
+        // A settings.json saved with a leading UTF-8 BOM (EF BB BF) must not
+        // silently drop a declared exemption (cadence-hooks#239 F10).
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "\u{feff}{\"env\":{\"CADENCE_ALLOW_MAIN\":\"true\"}}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_directory_at_settings_path_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(claude_dir.join("settings.json")).unwrap();
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_tolerates_line_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  // exempt this repo\n  \"env\": {\n    \"CADENCE_ALLOW_MAIN\": \"true\" // trailing note\n  }\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_tolerates_block_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  /* why this repo is exempt\n     spans lines */\n  \"env\": { \"CADENCE_ALLOW_MAIN\": \"true\" }\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_tolerates_trailing_comma() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  \"env\": {\n    \"CADENCE_ALLOW_MAIN\": \"true\",\n  },\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_jsonc_and_bom_combined() {
+        // A BOM-prefixed file that also carries comments and a trailing comma —
+        // all tolerations must compose.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "\u{feff}{\n  // exemption\n  \"env\": { \"CADENCE_ALLOW_MAIN\": \"true\", },\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_slashes_inside_string_value_preserved() {
+        // A `//` inside a string value must never be mistaken for a comment.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"http://example"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("http://example".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_comma_and_braces_inside_string_preserved() {
+        // A comma-then-brace sequence inside a string is not a trailing comma.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"a,] b,} c"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("a,] b,} c".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_escaped_quote_in_string() {
+        // An escaped quote must not prematurely end the string, or the stripper
+        // would treat the value interior as structural JSON.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"env":{"CADENCE_ALLOW_MAIN":"a\"//b"}}"#,
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("a\"//b".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_adjacent_block_comments() {
+        // Two non-overlapping block comments back to back must both strip
+        // cleanly, without the second being mistaken for a continuation of
+        // the first.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{ /* first */ /* second */ \"env\": {\"CADENCE_ALLOW_MAIN\":\"true\"} }",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_line_comment_no_trailing_newline_at_eof() {
+        // A `//` comment that runs to end-of-file with no trailing newline
+        // must not hang or panic — chars.peek() returning None ends the scan.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\"env\":{\"CADENCE_ALLOW_MAIN\":\"true\"}} // trailing note",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_unterminated_block_comment_falls_through() {
+        // An unterminated `/*` swallows the rest of the file, including the
+        // closing braces — the result is malformed JSON, so this must
+        // fail-open to None (no panic, no hang) rather than propagate an
+        // error.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\"env\":{\"CADENCE_ALLOW_MAIN\":\"true\" /* unterminated",
+        );
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_comment_token_inside_block_comment() {
+        // A `//` sequence inside an open `/* */` block is just comment text,
+        // not a nested line-comment start.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  /* this looks like // a line comment inside a block */\n  \"env\": {\"CADENCE_ALLOW_MAIN\":\"true\"}\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_crlf_line_comments() {
+        // CRLF line endings (common on Windows-authored files) must not
+        // defeat `//` comment stripping — the scan breaks on '\n', so a
+        // preceding '\r' is consumed as part of the comment.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\r\n  // note\r\n  \"env\": {\"CADENCE_ALLOW_MAIN\": \"true\"}\r\n}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_entirely_comment_file_is_none() {
+        // A file that is nothing but a comment strips down to an empty
+        // string, which strict serde_json rejects — falls open to None
+        // rather than panicking on an empty parse.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(tmp.path(), "settings.json", "// just a comment, no JSON");
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    #[test]
+    fn repo_env_flag_trailing_comma_then_comment_then_brace() {
+        // Comments are stripped in pass 1, trailing commas in pass 2 — a
+        // comma followed by a comment followed by the closing brace must
+        // still be recognized as trailing once the comment is gone.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\"env\":{\"CADENCE_ALLOW_MAIN\":\"true\", // trailing note\n}}",
+        );
+        assert_eq!(
+            repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"),
+            Some("true".to_string())
+        );
+    }
+
+    #[test]
+    fn repo_env_flag_nested_block_comment_not_supported_falls_through() {
+        // JSONC block comments don't nest (matches the VS Code / JS spec):
+        // the first `*/` closes the comment, leaving the inner comment's own
+        // trailing text as stray JSON tokens. This documents the resulting
+        // fail-open None rather than a fixable bug — nesting was never a
+        // stated requirement.
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            "{\n  /* outer /* inner */ still comment */\n  \"env\": {\"CADENCE_ALLOW_MAIN\":\"true\"}\n}",
+        );
+        assert_eq!(repo_env_flag(tmp.path(), "CADENCE_ALLOW_MAIN"), None);
+    }
+
+    // --- load_cadence_section ---
+
+    #[derive(Debug, Default, PartialEq, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SampleSection {
+        #[serde(default)]
+        exemptions: Vec<String>,
+        #[serde(default)]
+        origin_audience: Option<String>,
+    }
+
+    /// Write `body` to `<root>/.claude/cadence.json`.
+    fn write_cadence_config(dir: &std::path::Path, body: &str) {
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(claude_dir.join("cadence.json"), body).unwrap();
+    }
+
+    #[test]
+    fn load_cadence_section_missing_file_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_reads_present_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            r#"{"version":1,"terminology":{"exemptions":["a.yml","b.yml"]}}"#,
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got.exemptions, vec!["a.yml", "b.yml"]);
+    }
+
+    #[test]
+    fn load_cadence_section_reads_only_its_own_section() {
+        // Two guards share the file; each reads only its slice.
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            r#"{"terminology":{"exemptions":["t.yml"]},"redaction":{"originAudience":"public"}}"#,
+        );
+        let term: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        let redact: SampleSection = load_cadence_section(tmp.path(), "redaction");
+        assert_eq!(term.exemptions, vec!["t.yml"]);
+        assert!(term.origin_audience.is_none());
+        assert_eq!(redact.origin_audience.as_deref(), Some("public"));
+        assert!(redact.exemptions.is_empty());
+    }
+
+    #[test]
+    fn load_cadence_section_absent_section_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(tmp.path(), r#"{"version":1,"redaction":{}}"#);
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_unknown_top_level_keys_ignored() {
+        // The reserved #216 `nudges` key may be hand-authored early; a guard
+        // reading its own section must tolerate keys it doesn't understand.
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            r#"{"version":1,"nudges":{"backstop-warn":{"suppress":true}},"terminology":{"exemptions":["x.yml"]}}"#,
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got.exemptions, vec!["x.yml"]);
+    }
+
+    #[test]
+    fn load_cadence_section_malformed_json_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(tmp.path(), "{not valid json");
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_wrong_shape_is_default() {
+        // The section is present but not the shape `T` expects — fail-open to
+        // default rather than propagating a deserialize error.
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            r#"{"terminology":{"exemptions":"not-an-array"}}"#,
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_directory_at_config_path_is_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(claude_dir.join("cadence.json")).unwrap();
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_cadence_section_special_file_is_default() {
+        // A cadence.json symlinked to an endless special file is rejected on
+        // stat by read_untrusted_config — no unbounded read, fail-open.
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", claude_dir.join("cadence.json")).unwrap();
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got, SampleSection::default());
+    }
+
+    #[test]
+    fn load_cadence_section_tolerates_jsonc() {
+        // Comments and a trailing comma must not defeat a hand-authored section.
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            "{\n  // guard config\n  \"terminology\": {\n    \"exemptions\": [\"a.yml\", \"b.yml\",],\n  },\n}",
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got.exemptions, vec!["a.yml", "b.yml"]);
+    }
+
+    #[test]
+    fn load_cadence_section_tolerates_leading_bom() {
+        // A BOM-prefixed cadence.json must still parse (mirrors repo_env_flag).
+        let tmp = tempfile::tempdir().unwrap();
+        write_cadence_config(
+            tmp.path(),
+            "\u{feff}{\"terminology\":{\"exemptions\":[\"x.yml\"]}}",
+        );
+        let got: SampleSection = load_cadence_section(tmp.path(), "terminology");
+        assert_eq!(got.exemptions, vec!["x.yml"]);
     }
 }

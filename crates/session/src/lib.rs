@@ -23,16 +23,22 @@
 //! | `heartbeat`         | PostToolUse  | [`heartbeat`]   |
 //! | `guard`             | PreToolUse   | [`guard`]       |
 //! | `warn-branch-drift` | PreToolUse   | [`branch_drift`]|
+//! | `warn-branch-intent`| PreToolUse   | [`branch_intent`]|
+//! | `warn-commit-provenance` | PreToolUse | [`warn_commit_provenance`] |
 //! | `declare`           | CLI action   | [`cli`]         |
 //! | `status`            | CLI action   | [`cli`]         |
 //! | `end`               | SessionEnd   | [`end`]         |
 //! | `backstop-record`   | SessionEnd   | [`backstop`]    |
 //! | `backstop-warn`     | SessionStart | [`backstop`]    |
+//! | `persist-plan`      | UserPromptSubmit | [`persist_plan`] |
+//! | `persist-plan-approval` | PostToolUse | [`persist_plan`] |
 
 /// Outro "no loose ends" backstop: SessionEnd records loose ends, SessionStart warns (#123).
 pub mod backstop;
 /// PreToolUse commit-time branch-drift warning — never blocks.
 pub mod branch_drift;
+/// PreToolUse stale-branch nudge: new work on an old, unrelated branch (#155).
+pub mod branch_intent;
 /// CLI actions: `declare` (lane declaration) and `status` (registry listing).
 pub mod cli;
 /// SessionEnd logger: deregister this session's registry file (#97).
@@ -43,7 +49,22 @@ pub mod guard;
 pub mod heartbeat;
 /// Pure domain logic: deterministic naming, record schema, relative ages.
 pub mod identity;
+/// UserPromptSubmit + PostToolUse hooks: persist an approved plan whose
+/// approving turn leaves no durable trace — the approve-and-clear wipe
+/// (cadence#505) and same-session approval (cadence-hooks#396) respectively.
+pub mod persist_plan;
+/// `docs/plans/*.md` frontmatter scan consumed by [`start`]'s SessionStart
+/// disclosure — surfaces in-flight/blocked plans without a GitHub call
+/// (cadence-hooks#429). Not `pub`: its one consumer, [`start`], lives in this
+/// same crate.
+mod plan_scan;
+/// Salted machine digest for committed provenance blocks (cadence#248) —
+/// shared with a future commit-message provenance check.
+pub mod provenance;
 /// Registry I/O: the `.claude/sessions/` directory and peer discovery.
 pub mod registry;
 /// SessionStart hook: register self, sweep stale, disclose live peers.
 pub mod start;
+/// PreToolUse commit-time provenance nudge: warn when a Claude-composed
+/// commit message lacks a `Session-Id:` trailer (cadence#473).
+pub mod warn_commit_provenance;

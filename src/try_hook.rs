@@ -81,13 +81,33 @@ pub fn run(
     );
     println!();
 
-    let mut child = match Command::new(&exe)
+    // A metrics logger writes unconditionally and silently (no stdout on
+    // success), so without this override `try` appends a real row to the
+    // live production metrics stream every time it exercises one (#269).
+    // Scratch dir is best-effort: if it can't be created, the child falls
+    // back to the real metrics dir rather than failing the `try` run — the
+    // pre-existing (buggy) behavior, not a new failure mode — but this must
+    // never be a *silent* fallback, or the exact bug being fixed recurs
+    // invisibly.
+    let metrics_scratch = tempfile::tempdir().ok();
+    if metrics_scratch.is_none() {
+        eprintln!(
+            "cadence-hooks: could not create a scratch metrics dir — this run \
+             may write a real row into the production metrics directory."
+        );
+    }
+
+    let mut command = Command::new(&exe);
+    command
         .args([namespace, subcommand])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    if let Some(scratch) = &metrics_scratch {
+        command.env("CADENCE_METRICS_DIR", scratch.path());
+    }
+
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("cadence-hooks: failed to spawn {}: {e}", exe.display());
@@ -221,8 +241,34 @@ fn payload_preview(payload: &str, user_supplied: bool, show_payload: bool) -> St
     )
 }
 
+/// `(namespace, subcommand)` pairs whose sample payload's `cwd` `try` must
+/// NEVER override with the real `current_dir()`.
+///
+/// `sample_payload_with_cwd`'s normal behavior — inject the real cwd, so most
+/// checks exercise real repo/git-state detection — is correct for the
+/// overwhelming majority of hooks, which only ever READ state. It is actively
+/// dangerous for a hook with a genuine filesystem WRITE side effect: injecting
+/// a real repo path let a bare `cadence-hooks try session persist-plan` (or
+/// `persist-plan-approval`) actually create a plan doc in whatever repo the
+/// user happened to be standing in when they ran `try` — reachable endpoints
+/// included `~/.claude/rules/`. Verified end to end (cameronsjo/cadence-hooks#396
+/// review): a real plan doc landed in a real repo during review, then had to
+/// be manually removed.
+///
+/// Every entry here MUST carry its own `cwd` in its `registry::sample_for`
+/// override (see `session persist-plan`/`persist-plan-approval`'s overrides),
+/// pointed at a path that cannot resolve as a git repo — never left absent,
+/// since an absent `cwd` degrades most Checks to a no-op fail-open, not a
+/// demonstration of the hook's real behavior.
+const CWD_OVERRIDE_REFUSED: &[(&str, &str)] = &[
+    ("session", "persist-plan"),
+    ("session", "persist-plan-approval"),
+];
+
 /// The sample payload for a hook, with the real working directory injected
-/// so hooks that resolve git state see the repo `try` was run from.
+/// so hooks that resolve git state see the repo `try` was run from — EXCEPT
+/// for [`CWD_OVERRIDE_REFUSED`] entries, whose own sample `cwd` is left
+/// exactly as the registry declared it.
 ///
 /// Per-hook registry overrides (`registry::sample_for`) win over event-based
 /// samples — loggers gate on `hook_event_name` and command shapes, so the
@@ -235,6 +281,9 @@ fn sample_payload_with_cwd(namespace: &str, subcommand: &str, event: Option<Hook
             None => LOGGER_SAMPLE_PAYLOAD,
         },
     };
+    if CWD_OVERRIDE_REFUSED.contains(&(namespace, subcommand)) {
+        return base.to_string();
+    }
     match serde_json::from_str::<serde_json::Value>(base) {
         Ok(mut v) => {
             if let Some(obj) = v.as_object_mut()
@@ -280,6 +329,24 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert!(v.get("cwd").is_some(), "cwd should be injected: {payload}");
         assert_eq!(v["tool_name"], "Bash");
+    }
+
+    #[test]
+    fn cwd_override_refused_never_injects_the_real_cwd() {
+        // Regression (cameronsjo/cadence-hooks#396 review): these two hooks
+        // have a genuine filesystem WRITE side effect — injecting the real
+        // current_dir() let a bare `try` actually write a plan doc into
+        // whatever repo the user was standing in. The sample's own
+        // deliberately-nonexistent `cwd` must survive untouched.
+        for (namespace, subcommand) in CWD_OVERRIDE_REFUSED {
+            let payload =
+                sample_payload_with_cwd(namespace, subcommand, Some(HookEvent::PostToolUse));
+            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(
+                v["cwd"], "/nonexistent-cadence-hooks-try-sandbox",
+                "{namespace} {subcommand} must keep its sentinel cwd, not the real current_dir(): {payload}"
+            );
+        }
     }
 
     #[test]

@@ -9,8 +9,11 @@
 //!   that legitimately hold personal context.
 //! - Write/Edit under `$OBSIDIAN_VAULT` — the vault is the safe destination
 //!   for personal context, not a public repo.
-//! - Write/Edit to retro paths (`docs/blog/*retro*`) — retros are blog
-//!   source material and intentionally personal.
+//!
+//! The prior retro-path exemption (`docs/blog/*retro*`) was removed in
+//! cadence-hooks#329: `cadence:retro` relocated its output out of the repo
+//! (vault primary, gitignored fallback), so retro paths no longer have a
+//! sanctioned repo destination to exempt.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
@@ -25,8 +28,6 @@ const BASH_THREE_TOKEN_TRIGGERS: &[[&str; 3]] = &[
 ];
 
 const FIELD_REPORTS_MARKER: &str = "/docs/field-reports/";
-const BLOG_MARKER: &str = "/docs/blog/";
-const RETRO_TOKEN: &str = "retro";
 
 /// Nudges the model to audit about-to-ship content for overshare before
 /// commits, pushes, PRs/issues, or field-report writes ship.
@@ -108,40 +109,19 @@ fn is_bash_overshare_trigger(command: &str) -> bool {
     })
 }
 
-/// True when `path` is under the Obsidian vault or matches a retro path.
+/// True when `path` is under the Obsidian vault.
 ///
-/// Vault paths are the safe destination for personal context; retros
-/// (docs/blog/*retro*) feed blog articles and are intentionally personal.
+/// Vault paths are the safe destination for personal context.
 fn path_is_exempt(path: &str, vault: Option<&str>) -> bool {
-    if let Some(v) = vault
-        && !v.is_empty()
-        && path.starts_with(v)
-    {
-        return true;
-    }
-    is_retro_path(path)
-}
-
-fn is_retro_path(path: &str) -> bool {
-    if !path.contains(BLOG_MARKER) {
-        return false;
-    }
-    let filename = path.rsplit('/').next().unwrap_or(path);
-    filename.contains(RETRO_TOKEN)
+    matches!(vault, Some(v) if !v.is_empty() && path.starts_with(v))
 }
 
 fn nudge_text() -> String {
-    "Before this commit/push/PR/issue ships, audit the about-to-ship content \
-     (commit message, PR/issue body, changed files) for overshare:\n\n  \
-     - disabilities, neurodivergence, health\n  \
-     - relationships, family, personal life\n  \
-     - non-technical biographical detail\n\n\
-     Keep the technical why/when/how. If anything is ambiguous, surface it \
-     to the user before continuing.\n\n\
-     If personal context is needed, route it to the Obsidian vault \
-     ($OBSIDIAN_VAULT) instead of a public repo.\n\n\
-     Exempt from audit: retros (docs/blog/*retrospective*) and vault paths.\n\n\
-     Silence for this session: CADENCE_SKIP_OVERSHARE_AUDIT=1"
+    "Pre-ship audit: scan the outgoing content (commit message, PR/issue body, changed files) \
+     for personal overshare — health/neurodivergence, relationships/family, non-technical \
+     biography. Keep the technical why/how; anything ambiguous, surface to the user first. \
+     Personal context routes to the Obsidian vault ($OBSIDIAN_VAULT), never a public repo. \
+     Exempt: vault paths. Silence for this session: CADENCE_SKIP_OVERSHARE_AUDIT=1"
         .to_string()
 }
 
@@ -324,7 +304,10 @@ mod tests {
     }
 
     #[test]
-    fn retrospective_blog_path_skips_audit() {
+    fn retrospective_blog_path_allows_via_default_fallthrough() {
+        // No longer an exemption (cadence-hooks#329) — this allows because
+        // it isn't a field-report path, same as any other non-field-report,
+        // non-vault Write/Edit target.
         let result = run(&make_write(
             "/Users/c/proj/docs/blog/2026-06-02-foo-retrospective.md",
             "blog post",
@@ -333,7 +316,10 @@ mod tests {
     }
 
     #[test]
-    fn retro_blog_path_skips_audit() {
+    fn retro_blog_path_allows_via_default_fallthrough() {
+        // No longer an exemption (cadence-hooks#329) — this allows because
+        // it isn't a field-report path, same as any other non-field-report,
+        // non-vault Write/Edit target.
         let result = run(&make_write(
             "/Users/c/proj/docs/blog/2026-06-05-foo-retro.md",
             "blog post",
@@ -350,6 +336,19 @@ mod tests {
             "blog post",
         ));
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn retro_named_path_under_field_reports_marker_nudges() {
+        // Highest-signal case: a path that would have matched the (now
+        // removed) retro exemption AND the field-reports marker. With the
+        // exemption gone this must fall through to the field-report check
+        // and nudge, not exempt-allow. (cadence-hooks#329)
+        let result = run(&make_write(
+            "/Users/c/proj/docs/blog/notes/docs/field-reports/foo-retro.md",
+            "report content",
+        ));
+        assert_eq!(result.outcome, Outcome::Nudge);
     }
 
     // --- Edge cases ---
@@ -394,29 +393,5 @@ mod tests {
         // `cd foo && git commit ...` should still trigger.
         let result = run(&make_bash("cd foo && git commit -m bar"));
         assert_eq!(result.outcome, Outcome::Nudge);
-    }
-
-    // --- Helpers ---
-
-    #[test]
-    fn is_retro_path_matches_retrospective() {
-        assert!(is_retro_path(
-            "/a/docs/blog/2026-01-01-foo-retrospective.md"
-        ));
-    }
-
-    #[test]
-    fn is_retro_path_matches_retro() {
-        assert!(is_retro_path("/a/docs/blog/2026-01-01-retro.md"));
-    }
-
-    #[test]
-    fn is_retro_path_requires_blog_dir() {
-        assert!(!is_retro_path("/a/docs/notes/2026-01-01-retro.md"));
-    }
-
-    #[test]
-    fn is_retro_path_requires_token_in_filename() {
-        assert!(!is_retro_path("/a/docs/blog/2026-01-01-announcement.md"));
     }
 }

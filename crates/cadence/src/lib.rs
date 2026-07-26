@@ -13,10 +13,15 @@ pub mod markdown_lint;
 pub mod memory_guard;
 /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR.
 pub mod nudge_polish_before_pr;
+/// Nudge when the installed cadence-hooks binary or Claude Code has drifted
+/// behind the plugin-shipped platform baseline (SessionStart).
+pub mod platform_drift;
 /// Block reading secrets (.env, credentials, private keys) into context.
 pub mod prevent_secret_leaks;
 /// Block writing or deleting secrets (.env, credentials, private keys).
 pub mod prevent_secret_writes;
+/// Record that `/polish` ran on this branch (writes a branch-scoped marker). CLI action.
+pub mod record_polish;
 /// Nudge before internal harness vocabulary leaks into an external post.
 pub mod redact_external_content;
 /// Shared secret file patterns for both secret guards.
@@ -31,3 +36,7 @@ pub mod validate_line_endings;
 pub mod warn_docs_update;
 /// Nudge to audit about-to-ship content for personal-context overshare.
 pub mod warn_overshare;
+
+/// Shared test-only helpers for tests that write real marker files (#302).
+#[cfg(test)]
+pub(crate) mod test_support;

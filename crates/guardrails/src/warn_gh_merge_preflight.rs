@@ -52,14 +52,12 @@ impl Check for WarnGhMergePreflight {
         }
 
         CheckResult::nudge(
-            "gh pr merge pre-flight checklist:\n\
-             1. Draft check: `gh pr view <n> --json isDraft` — drafts report MERGEABLE/CLEAN \
-             but fail to merge with a GraphQL error. Run `gh pr ready <n>` first if needed.\n\
-             2. Worktree check: if the PR branch (or main) is checked out in another worktree, \
-             `--delete-branch` fails locally after the server-side merge succeeds — expect to \
-             delete the remote branch manually with `git push origin --delete <branch>`.\n\
-             3. On any merge error: verify with `gh pr view <n> --json mergedAt,mergeCommit` \
-             before retrying — the merge may have landed server-side despite the error.",
+            "gh pr merge preflight: (1) drafts report MERGEABLE but fail with a GraphQL error — \
+             check `gh pr view <n> --json isDraft`, run `gh pr ready <n>` first; (2) a branch \
+             checked out in any worktree makes `--delete-branch` fail locally after the \
+             server-side merge — delete remotely instead: `git push origin --delete <branch>`; \
+             (3) on any merge error, verify `gh pr view <n> --json mergedAt,mergeCommit` before \
+             retrying — the merge may have landed.",
         )
     }
 }
