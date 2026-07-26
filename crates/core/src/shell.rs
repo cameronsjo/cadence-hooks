@@ -116,6 +116,79 @@ pub fn looks_absolute(p: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
+/// Strip shell grouping (`(`/`{` … `)`/`}`) from a segment so `(git commit)`,
+/// `{ git commit; }`, and `( gh pr create )` surface their real command word
+/// rather than a bare `(`/`{` token. [`tokenize`] treats the punctuation as
+/// part of the adjacent word (`(gh` is one token), so a caller that gates on
+/// the leading word MUST strip first or the gate never fires (#239 F4).
+pub fn strip_group_wrappers(segment: &str) -> &str {
+    segment
+        .trim()
+        .trim_start_matches(['(', '{', ' ', '\t'])
+        .trim_end_matches([')', '}', ';', ' ', '\t'])
+}
+
+/// Words that stand in front of a real command without being the command.
+///
+/// Shared by `enforce_worktree`, `guard_rm`, and the polish ship anchor, so the
+/// set cannot drift between the code that skips these and the code that asks
+/// whether a word is one. **It is not the repo's only prefix set, and is not
+/// meant to become one** — three others answer adjacent questions with
+/// deliberately different membership, and each admits words this set excludes:
+///
+/// - `warn_alias_parsing::WRAPPERS` — `xargs`/`sudo`/`env`/`nice`/`timeout`
+/// - `prevent_secret_writes::COMMAND_WRAPPERS` — `sudo`/`command`/`nohup`/
+///   `time`/`xargs` (a **blocking** check)
+/// - `doctor`'s stale-wiring scan — adds `sudo`/`stdbuf` and parses each
+///   prefix's own flags; it reads plugin hook command lines, not what this
+///   shell is about to run
+///
+/// So `sudo` and `xargs` ARE transparent to some checks and deliberately not to
+/// these. Unifying them would widen two gates that can block, on the strength
+/// of a question neither was asked — see this constant's consumers before
+/// adding a word to it.
+pub const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
+
+/// Skip transparent command prefixes that run their argument as the command, so
+/// `command git commit` / `time git commit` still surface `git` as the leading
+/// word. Only skips a prefix when the following token is not an option, so a
+/// prefix's own flags are never misparsed (`nice -n 10 git commit` and
+/// `env -i git commit` stay documented misses rather than risking a wrong
+/// resolution). Leading `VAR=value` assignment words are skipped too — bash
+/// runs `VAR=value git commit` (and `env VAR=value git commit`) with the rest
+/// as the command, so an assignment word must not eat the leading-word gate
+/// (issue #228).
+pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < tokens.len() {
+        let tok = tokens[start].as_str();
+        if (TRANSPARENT.contains(&tok) && !tokens[start + 1].starts_with('-'))
+            || is_assignment_word(tok)
+        {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    &tokens[start..]
+}
+
+/// A leading `NAME=value` shell assignment word: a valid variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
+/// `==` comparisons — is not skipped, so this can only widen the leading-word
+/// gate past words the shell itself treats as environment prefixes.
+fn is_assignment_word(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) if !name.is_empty() => {
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
 /// True when `command` is about to expose branch work for review: `gh pr ready`
 /// (leaves draft) or a NON-draft `gh pr create`. A `--draft`/`-d` create is NOT
 /// an anchor — an entry-posture draft opens at zero diff, where polish is
@@ -149,8 +222,13 @@ pub fn is_polish_ship_anchor(command: &str) -> bool {
 /// draft-flag scan to one segment is what keeps an unrelated sibling command's
 /// `-d` from suppressing a real ship (the reason [`is_polish_ship_anchor`]
 /// splits first rather than scanning the whole token stream).
+///
+/// Group wrappers are stripped before tokenizing, the same order the guards use
+/// (`enforce_worktree`, `guard_rm`), because [`tokenize`] fuses the punctuation
+/// to the adjacent word — without it `{ gh pr create; }` presents `{` as the
+/// command word and the index-0 gate never fires.
 fn segment_is_ship_anchor(segment: &str) -> bool {
-    let tokens = tokenize(segment);
+    let tokens = tokenize(strip_group_wrappers(segment));
     match gh_pr_subcommand(&tokens) {
         Some("ready") => true,
         Some("create") => !tokens.iter().any(|t| t == "--draft" || t == "-d"),
@@ -160,50 +238,82 @@ fn segment_is_ship_anchor(segment: &str) -> bool {
 
 /// The subcommand of a `gh pr <sub>` invocation in `tokens`, or `None`.
 ///
-/// Walks forward from a `gh` command word, skipping gh's GLOBAL flags before
-/// requiring the literal `pr` token — so `gh --repo owner/r pr create` is seen
-/// where a strict `[gh, pr, <sub>]` adjacency window missed it
-/// (cadence-hooks#303 L2). `--repo`/`-R` is gh's only global flag that takes a
-/// SEPARATE value, so it consumes one extra token; the self-contained
-/// `--repo=owner/r` form consumes nothing extra.
+/// `gh` must be the segment's **command word** — index 0 after
+/// [`skip_transparent_prefixes`] — not merely present somewhere in the token
+/// stream (cadence-hooks#419). A `gh` in argument position is a word the shell
+/// hands to some other program, and treating it as an invocation misreads two
+/// real shapes: `git commit -m "$(echo gh pr create)"`, whose substitution body
+/// expands to `[echo, gh, pr, create]`, and any wrapper that passes the phrase
+/// along. Both fired the anchor under a positional scan; both are now rejected
+/// because their command word is `echo`, not `gh`.
+///
+/// The ordinary spellings survive: `sh -c 'gh pr create'` matches, because
+/// [`command_segments`] expands the wrapper and the inner segment has `gh` at
+/// index 0; `exec gh pr create` matches because the transparent prefix is
+/// skipped; `{ gh pr create; }` matches because [`strip_group_wrappers`] runs
+/// first.
+///
+/// Four families are **missed by construction**, all of them nudge-only, so
+/// each costs one un-nudged ship and never a wrong block:
+///
+/// 1. A transparent prefix carrying its own flag — `env -i gh pr create`,
+///    `nice -n 10 gh pr ready`. [`skip_transparent_prefixes`] stops there
+///    deliberately: each prefix has its own flag grammar, and guessing wrong
+///    would skip past the real command word.
+/// 2. A prefix outside [`TRANSPARENT`] — `sudo`, `timeout`, `xargs`, `stdbuf`,
+///    and `eval` (which `guard_rm` special-cases separately). Widening that set
+///    to catch them would widen `enforce_worktree` and `guard_rm` too, which
+///    share it; a nudge is not worth touching a block-capable gate's model of
+///    what runs a command.
+/// 3. A shell keyword in command position — `if ! gh pr create; then …`,
+///    `for r in a b; do gh pr create; done`. The keyword is the segment's
+///    leading word and nothing strips it.
+/// 4. A path-qualified command word — `/opt/homebrew/bin/gh pr create`,
+///    `./gh pr create`. The comparison is against the literal token `gh`, as
+///    the positional scan's was, so this is pre-existing rather than new.
+///    [`basename`] would close it in one call — `guard_rm` applies it to its
+///    delete verb — but it is left alone here because it would ADD nudges
+///    rather than restore them, which is past what #419 asked for. Note
+///    `enforce_worktree`'s own commit gate compares the literal `git` the
+///    same way, so this spelling is unmodeled there too.
+///
+/// Each of these shrinks the `log-polish-nudge` denominator rather than
+/// inflating it (#409) — the opposite error from the one this change fixes,
+/// and the reason they are enumerated here rather than left implicit.
+///
+/// From that command word the walk skips gh's GLOBAL flags before requiring the
+/// literal `pr` token — so `gh --repo owner/r pr create` is seen where a strict
+/// `[gh, pr, <sub>]` adjacency window missed it (cadence-hooks#303 L2).
+/// `--repo`/`-R` is gh's only global flag that takes a SEPARATE value, so it
+/// consumes one extra token; the self-contained `--repo=owner/r` form consumes
+/// nothing extra.
 ///
 /// Demanding a literal `pr` token is what preserves every existing negative:
 /// `gh issue create` stops at `issue`, and a quoted `'gh pr create'` collapses
-/// to a single token that is never the `gh` command word.
+/// to a single token that is never the command word.
 ///
-/// The scan RESUMES from where each walk stopped rather than restarting at the
-/// next token. A `--repo` skip can hop over a later `gh`, so restarting made
-/// the walk unamortized: `gh --repo` repeated M times is O(n^2), and at command
-/// sizes this tool actually composes that is enough to push the check past its
-/// deadline. Resuming keeps the whole scan linear, and cannot lose a match — a
-/// `gh` the walk hopped over was, by construction, being consumed as a flag's
-/// value (security review, PR #414).
+/// Anchoring at index 0 also retires the positional scan's quadratic hazard
+/// outright — there is one walk, not one per `gh` token, so a crafted
+/// `gh --repo` flood is linear by construction rather than by the resume
+/// bookkeeping it previously needed (security review, PR #414).
 fn gh_pr_subcommand(tokens: &[String]) -> Option<&str> {
-    let mut scan = 0;
-    while scan < tokens.len() {
-        if tokens[scan] != "gh" {
-            scan += 1;
-            continue;
+    let argv = skip_transparent_prefixes(tokens);
+    if argv.first().map(String::as_str) != Some("gh") {
+        return None;
+    }
+    let mut i = 1;
+    while let Some(flag) = argv.get(i) {
+        if !flag.starts_with('-') {
+            break;
         }
-        let mut i = scan + 1;
-        while let Some(flag) = tokens.get(i) {
-            if !flag.starts_with('-') {
-                break;
-            }
-            i += if flag == "--repo" || flag == "-R" {
-                2
-            } else {
-                1
-            };
-        }
-        if tokens.get(i).map(String::as_str) == Some("pr")
-            && let Some(sub) = tokens.get(i + 1)
-        {
-            return Some(sub.as_str());
-        }
-        // Always advance: `i` can equal `scan + 1` when the very next token is
-        // not a flag, so `scan = i` alone would not terminate.
-        scan = i.max(scan + 1);
+        i += if flag == "--repo" || flag == "-R" {
+            2
+        } else {
+            1
+        };
+    }
+    if argv.get(i).map(String::as_str) == Some("pr") {
+        return argv.get(i + 1).map(String::as_str);
     }
     None
 }
@@ -1448,16 +1558,104 @@ mod tests {
     }
 
     #[test]
-    fn gh_pr_subcommand_scan_is_linear_and_still_finds_a_later_gh() {
-        // The `--repo` skip can hop over a later `gh`. Resuming from where the
-        // walk stopped keeps the scan linear, and this pins that it does not
-        // cost a match: the second `gh` here is a real ship and must be found.
+    fn gh_pr_subcommand_walk_is_linear_from_the_command_word() {
+        // `--repo` consumes the next token, so a `gh` sitting in that slot is
+        // this invocation's repo VALUE, not a second invocation — the walk from
+        // the command word steps over it and still reads the real subcommand.
         assert!(is_polish_ship_anchor("gh --repo gh pr create --title x"));
+        // A later segment gets its own walk, because segments are split first.
         assert!(is_polish_ship_anchor("gh auth status && gh pr ready 12"));
-        // A crafted `gh --repo` flood was quadratic before; it must terminate
-        // promptly and reject. 5k pairs finishes instantly when linear.
+        // A crafted `gh --repo` flood must terminate promptly and reject. This
+        // asserts the VERDICT, not the complexity class — 5k pairs completes
+        // fast either way, so linearity rides on the code shape (one walk per
+        // segment, no outer scan to resume) and not on this assertion. The
+        // shipped positional scan was already linear via `i.max(scan + 1)`;
+        // quadratic was the pre-review form PR #414 fixed.
         let flood = "gh --repo ".repeat(5000);
         assert!(!is_polish_ship_anchor(&flood));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_requires_gh_as_the_command_word() {
+        // #419 item 2: `expand_segments` extracts `$(…)` bodies in executed
+        // context, and DOUBLE quotes do not suppress expansion — so this
+        // commit contributes a segment tokenizing as [echo, gh, pr, create].
+        // The old positional scan matched `gh` there and fired a spurious
+        // nudge, which also inflated the `log-polish-nudge` denominator the
+        // polish gate's efficacy is measured against (#409).
+        assert!(!is_polish_ship_anchor(
+            r#"git commit -m "$(echo gh pr create)""#
+        ));
+        // The general shape: `gh` handed to another program as an argument.
+        assert!(!is_polish_ship_anchor("echo gh pr create"));
+        assert!(!is_polish_ship_anchor("printf '%s\\n' gh pr ready"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_sees_through_transparent_prefixes() {
+        // Requiring the command word must not lose a real ship behind a prefix
+        // that runs its argument as the command.
+        assert!(is_polish_ship_anchor("exec gh pr create --title x"));
+        assert!(is_polish_ship_anchor("command gh pr ready 12"));
+        assert!(is_polish_ship_anchor("FOO=1 gh pr create --fill"));
+        // Per-segment draft scoping survives prefix skipping.
+        assert!(!is_polish_ship_anchor("exec gh pr create --draft"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_sees_through_group_wrappers() {
+        // `tokenize` fuses grouping punctuation to the ADJACENT word, so the
+        // spelling decides everything: unspaced `(gh` is one token, while
+        // spaced `( gh` is two. The strip therefore does two different jobs,
+        // measured against a binary built from `origin/main`:
+        //
+        //   (gh pr create)      main SILENT -> now NUDGE   (a pre-existing miss)
+        //   { gh pr create; }   main NUDGE  -> now NUDGE   (would have REGRESSED)
+        //
+        // The spaced forms shipped as anchors because the old positional scan
+        // found `gh` at index 1; under an index-0 gate they see `(` as the
+        // command word, so without the strip this change would have taken a
+        // working anchor away. Preventing that regression is the stronger of
+        // the two reasons, and the easier one to overlook.
+        assert!(is_polish_ship_anchor("(gh pr create --title x)"));
+        assert!(is_polish_ship_anchor("{gh pr create --fill;}"));
+        assert!(is_polish_ship_anchor("( gh pr create --title x )"));
+        assert!(is_polish_ship_anchor("{ gh pr create --title x; }"));
+        assert!(is_polish_ship_anchor("ok && { gh pr ready 12; }"));
+        // Draft scoping still applies inside a group.
+        assert!(!is_polish_ship_anchor("(gh pr create --draft)"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_misses_a_flag_carrying_prefix() {
+        // `skip_transparent_prefixes` stops at a prefix whose next token is an
+        // option, because each prefix has its own flag grammar and guessing
+        // wrong would skip past the real command word. That makes this a
+        // DOCUMENTED miss, not an oversight — and on a nudge-only check the
+        // cost is one un-nudged ship, never a wrong block (ADR-0001).
+        assert!(!is_polish_ship_anchor("env -i gh pr create --title x"));
+        assert!(!is_polish_ship_anchor("nice -n 10 gh pr ready 12"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_misses_non_transparent_prefixes_and_keywords() {
+        // Pinned as KNOWN MISSES, not as desired behavior, so a future widening
+        // has to delete an assertion and explain itself. Catching these means
+        // either widening `TRANSPARENT` — which `enforce_worktree` and
+        // `guard_rm` share, so a nudge would be buying a change to a
+        // block-capable gate's model of what runs a command — or teaching the
+        // anchor about shell keywords. Neither is worth it for a nudge; each
+        // costs one un-nudged ship and shrinks the #409 denominator.
+        assert!(!is_polish_ship_anchor("sudo gh pr create --title x"));
+        assert!(!is_polish_ship_anchor("timeout 300 gh pr create --fill"));
+        assert!(!is_polish_ship_anchor("xargs gh pr create"));
+        assert!(!is_polish_ship_anchor("stdbuf -o0 gh pr create --title x"));
+        assert!(!is_polish_ship_anchor(
+            "if ! gh pr create --fill; then echo x; fi"
+        ));
+        assert!(!is_polish_ship_anchor(
+            "for r in a b; do gh pr create; done"
+        ));
     }
 
     #[test]
