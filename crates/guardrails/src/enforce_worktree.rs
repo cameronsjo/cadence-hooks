@@ -380,7 +380,6 @@ pub(crate) fn strip_group_wrappers(segment: &str) -> &str {
 /// as the command, so an assignment word must not eat the leading-word gate
 /// (issue #228).
 pub(crate) fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
-    const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
     let mut start = 0;
     while start + 1 < tokens.len() {
         let tok = tokens[start].as_str();
@@ -394,6 +393,14 @@ pub(crate) fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
     }
     &tokens[start..]
 }
+
+/// Words that stand in front of a real command without being the command.
+///
+/// Module-level and `pub(crate)` so `guard_rm` can ask whether a leading word
+/// is one of these without keeping a second copy that could drift out of sync
+/// with the skipping logic itself.
+pub(crate) const TRANSPARENT: &[&str] =
+    &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
 
 /// A leading `NAME=value` shell assignment word: a valid variable name
 /// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,

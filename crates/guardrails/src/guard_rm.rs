@@ -71,7 +71,7 @@
 //! #228). Rolling no new recursion keeps the adversarially-reviewed primitives
 //! the single source of truth.
 
-use crate::enforce_worktree::{skip_transparent_prefixes, strip_group_wrappers};
+use crate::enforce_worktree::{TRANSPARENT, skip_transparent_prefixes, strip_group_wrappers};
 use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, child_scripts, looks_absolute, resolve_cd_target,
@@ -289,10 +289,18 @@ fn collect_targets(
             }
         }
 
+        // Directory tracking — assume success (equal-precedence `&&`/`||`,
+        // left-assoc), skip the verb's own flags, and treat a bare `-`, a
+        // `$VAR`, or a missing target as unresolvable. Mirrors
+        // `collect_commit_targets`.
         // `cd` tracking — assume success (equal-precedence `&&`/`||`,
         // left-assoc), skip cd's own flags, and treat a bare `-`, a `$VAR`, or a
         // missing target as unresolvable (keep the pre-cd dir). Mirrors
         // `collect_commit_targets`.
+        //
+        // Deliberately still the LITERAL first token, not a normalized spelling.
+        // Widening it to `\cd` / `FOO=1 cd` / `pushd` was built three ways and
+        // withdrawn all three times — see the note above `judge_rm` and #428.
         if tokens.first().map(String::as_str) == Some("cd") {
             let mut idx = 1;
             while tokens
@@ -311,6 +319,34 @@ fn collect_targets(
                 }
                 _ => dir_known = false,
             }
+            continue;
+        }
+
+        // `skip_transparent_prefixes` stops at a prefix whose NEXT token is an
+        // option (`env -i`, `env -u FOO`, `nice -n 10`), so `argv` still leads
+        // with the prefix, the delete verb behind it is never seen, and an empty
+        // target list reads as "not a deletion" — a silent ALLOW on a recursive
+        // delete of a protected path (#426).
+        //
+        // Fixed guard_rm-locally rather than in the shared primitive: that one
+        // is also `enforce_worktree`'s and carries its own adversarial-review
+        // history, where the same clause is a deliberate, documented miss whose
+        // cost is only a missed commit block.
+        //
+        // Unresolvable, not a parse of what follows: each prefix has its own
+        // flag grammar (`env -u` and `nice -n` take a value, `env -i` does not),
+        // and guessing wrong would skip past the delete verb itself. Gated on a
+        // delete verb actually appearing, so `env -i ls` stays silent.
+        // `eval` joins the prefix set here: it is in neither `TRANSPARENT` nor
+        // the shell-preserving list, so `eval rm -rf ~/Documents` matched no
+        // delete verb in command position and collected nothing — the same
+        // silent ALLOW, and an explicit row in #426's table.
+        if argv.first().is_some_and(|first| {
+            let word = command_word(first);
+            TRANSPARENT.contains(&word) || word == "eval"
+        }) && tokens.iter().any(|t| is_delete_verb(t))
+        {
+            out.push(TargetToken::Unresolvable);
             continue;
         }
 
@@ -523,13 +559,23 @@ fn resolve_target(
     if operand.contains('{') || operand.contains('}') {
         return TargetToken::Unresolvable;
     }
+    // A `..` ANYWHERE in the operand, checked against the WHOLE token before it
+    // is reduced to a literal prefix. The reduction below truncates at the
+    // first `*`/`?`/`[`, so checking only the prefix let every `..` *behind* a
+    // metachar sail past: `rm -rf /private/tmp/*/../../..` expands — for every
+    // match — to `/`, and classified as a clean glob under `/private/tmp` it
+    // was a silent ALLOW (#427).
+    //
+    // Same reasoning as the brace check above: one token naming a path this
+    // parser cannot enumerate. The brace guard sat three lines above the very
+    // truncation that defeated it for globs.
+    if has_parent_segment(operand) {
+        return TargetToken::Unresolvable;
+    }
     // Reduce a glob to the literal directory it lives in: `rm -rf /tmp/x/*`
     // classifies `/tmp/x`, `rm -rf *` classifies the cwd, `rm -rf /*`
     // classifies `/`.
     let literal = glob_literal_prefix(operand);
-    if has_parent_segment(literal) {
-        return TargetToken::Unresolvable;
-    }
     // A relative target only means something against a known directory. After a
     // `cd` this parser could not follow, the shell is somewhere else entirely,
     // so carrying the stale directory's verdict would describe the wrong path.
@@ -849,6 +895,87 @@ mod tests {
     /// Common case: no git roots on disk.
     fn judge(command: &str, cwd: &str) -> Outcome {
         judge_with(command, cwd, &[])
+    }
+
+    // --- #426: a transparent prefix carrying a flag ---
+
+    /// `skip_transparent_prefixes` stops at a prefix whose next token is an
+    /// option, so `argv` still led with the prefix, the delete verb behind it
+    /// was never seen, and an empty target list read as "not a deletion".
+    #[test]
+    fn transparent_prefix_with_a_flag_is_unresolvable_not_allowed() {
+        for command in [
+            "env -i rm -rf ~/Documents",
+            "env -u FOO rm -rf ~/Documents",
+            "nice -n 10 rm -rf ~/Documents",
+            "nohup -x rm -rf ~/Documents",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "a delete behind a flagged prefix must not be a silent allow: {command}"
+            );
+        }
+    }
+
+    /// The unflagged forms still resolve fully, so this stayed a coverage gap
+    /// rather than becoming a blanket "prefix means unknown".
+    #[test]
+    fn unflagged_transparent_prefix_still_resolves() {
+        assert_eq!(
+            judge("env rm -rf ~/Documents", "/private/tmp"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("command rm -rf ~/Documents", "/private/tmp"),
+            Outcome::Block
+        );
+    }
+
+    /// Gated on a delete verb actually appearing — otherwise every flagged
+    /// prefix in the session would start prompting.
+    #[test]
+    fn flagged_prefix_without_a_delete_verb_stays_silent() {
+        assert_eq!(judge("env -i ls -la", "/private/tmp"), Outcome::Allow);
+        assert_eq!(
+            judge("nice -n 10 cargo build", "/private/tmp"),
+            Outcome::Allow
+        );
+    }
+
+    // --- #427: a `..` behind a glob metachar ---
+
+    /// `glob_literal_prefix` truncates at the first metachar, so a `..` behind
+    /// one was never inspected. Every match of `/private/tmp/*/../../..`
+    /// expands to `/`, and it classified as a clean glob under `/private/tmp`.
+    #[test]
+    fn parent_segment_behind_a_glob_is_unresolvable() {
+        assert_eq!(
+            judge("rm -rf /private/tmp/*/../../..", "/anywhere"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm -f /private/tmp/*/../../../Users/me/.zshrc", "/anywhere"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm -rf /tmp/[abc]/../../etc", "/anywhere"),
+            Outcome::Ask,
+            "a bracket class is a metachar too"
+        );
+    }
+
+    /// The glob-free control still behaves, and an ordinary glob with no `..`
+    /// must not start prompting — that would nag on every routine sweep.
+    #[test]
+    fn ordinary_globs_are_unaffected_by_the_parent_check() {
+        assert_eq!(judge("rm -rf /tmp/scratch/*", "/home"), Outcome::Allow);
+        assert_eq!(
+            judge("rm -rf /private/tmp/build/*", "/home"),
+            Outcome::Allow
+        );
+        // A `..`-looking substring that is not a path segment stays resolvable.
+        assert_eq!(judge("rm -rf /tmp/foo..bar/*", "/home"), Outcome::Allow);
     }
 
     // --- ALLOW: temp roots ---
