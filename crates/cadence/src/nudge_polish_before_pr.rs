@@ -1,12 +1,34 @@
 //! Gate `/polish` before branch work ships for review.
 //!
-//! Fires on the **ship moment** — `gh pr ready` (leaving draft) or a **non-draft**
-//! `gh pr create` (the legacy direct flow). A `--draft` create is deliberately
-//! NOT an anchor: entry posture (cadence#278) opens a draft PR at worktree entry,
-//! at zero diff, where polish is meaningless — nudging there fires once per branch
-//! with nothing to polish, then never again (#297). `gh pr merge` is also excluded
-//! (an orchestrator often runs it from `main`/another cwd, so the branch
-//! mis-resolves and false-nudges).
+//! Fires on the **ship moment** — `gh pr ready` (leaving draft), a **non-draft**
+//! `gh pr create` (the legacy direct flow), or a **bare** `gh pr merge`. A
+//! `--draft` create is deliberately NOT an anchor: entry posture (cadence#278)
+//! opens a draft PR at worktree entry, at zero diff, where polish is meaningless
+//! — nudging there fires once per branch with nothing to polish, then never
+//! again (#297).
+//!
+//! Merge is the anchor set's **last resort**, added because a draft-first branch
+//! could go draft → ready → merged with nothing ever firing when the ready-flip
+//! happened in the web UI, which no Bash hook can see (#325). It is admitted
+//! only in the spelling whose target this check can actually resolve: gh selects
+//! "the pull request that belongs to the current branch" when given no argument,
+//! so a bare merge is about the cwd's branch. A merge naming a number, URL, or
+//! branch — or retargeted at another repository by any of `--repo`/`-R` in
+//! either position, the attached `-Rowner/r` form, or an inline `GH_REPO=`
+//! assignment — stays excluded. That is the orchestrator shape merge was
+//! excluded for originally: merging from `main` or another cwd requires naming
+//! the PR.
+//!
+//! Two routes still hide a selector from the check, both nudge-only: an
+//! *exported* `GH_REPO` leaves no token in the command string, and a token
+//! written after a `&`-bearing redirect lands in a different segment
+//! (`gh pr merge 2>&1 12`). Enumerated at
+//! [`cadence_hooks_core::shell::is_polish_ship_anchor`] rather than papered
+//! over — the anchor is the best reading of the command text, not a proof about
+//! what gh will do.
+//!
+//! The web-UI ready-flip remains unclosable here by construction — a browser
+//! click passes through no hooked Bash call at all.
 //!
 //! Polish is mandatory before a PR ships, so this check reads a **branch-scoped
 //! marker** the polish skill records when it completes (`cadence-hooks cadence
@@ -54,9 +76,9 @@ impl Check for NudgePolishBeforePr {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
-        // Only a ship anchor (`gh pr ready` / non-draft `gh pr create`) pays the
-        // git-resolution cost; every other command short-circuits to allow
-        // inside `decide`.
+        // Only a ship anchor (`gh pr ready`, a non-draft `gh pr create`, or a
+        // bare `gh pr merge`) pays the git-resolution cost; every other command
+        // short-circuits to allow inside `decide`.
         let marker_present =
             is_polish_ship_anchor(command) && polish_marker_present(command, input.cwd.as_deref());
         decide(command, marker_present)
@@ -66,7 +88,8 @@ impl Check for NudgePolishBeforePr {
 /// The pure 2-way conditional — no I/O, so the gate logic is unit-tested without
 /// the filesystem. `run()` resolves the marker and hands the boolean in.
 ///
-/// - non-ship-anchor (incl. a `--draft` create and `gh pr merge`) → allow.
+/// - non-ship-anchor (incl. a `--draft` create, and a `gh pr merge` that names
+///   a PR or overrides the repo) → allow.
 /// - ship anchor + a branch-scoped polish marker present → allow (silent).
 /// - ship anchor + no marker (or unresolved repo/branch/cwd) → nudge
 ///   (fail-open floor, ADR-0001 — CP1 never blocks).
@@ -173,8 +196,20 @@ mod tests {
         // against a non-anchor gh command slipping through.
         assert_eq!(decide("gh pr list", false).outcome, Outcome::Allow);
         assert_eq!(decide("git commit -m x", true).outcome, Outcome::Allow);
-        // `gh pr merge` is excluded — it must not nudge even without a marker.
+        // A merge that NAMES a PR is excluded — it is the orchestrator shape,
+        // run from another cwd, where the branch would mis-resolve (#325). A
+        // bare merge is a ship anchor and nudges; pinned just below.
         assert_eq!(decide("gh pr merge 12", false).outcome, Outcome::Allow);
+        assert_eq!(
+            decide("gh --repo owner/r pr merge", false).outcome,
+            Outcome::Allow
+        );
+        assert_eq!(
+            decide("gh pr merge --squash", false).outcome,
+            Outcome::Nudge
+        );
+        // ...and stays silent once the branch carries a marker.
+        assert_eq!(decide("gh pr merge --squash", true).outcome, Outcome::Allow);
     }
 
     #[test]

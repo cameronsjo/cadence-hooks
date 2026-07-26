@@ -605,7 +605,13 @@ fn strip_leading_frontmatter(doc: &str) -> &str {
 /// exclusive), or `None` when the document doesn't open with one. Thin
 /// wrapper over [`frontmatter_extent`] sharing its single scan implementation
 /// with [`strip_leading_frontmatter`].
-fn leading_frontmatter_block(doc: &str) -> Option<&str> {
+///
+/// `pub(crate)`: [`crate::plan_scan`] reuses this exact bounded scan to read
+/// `docs/plans/*.md` frontmatter at `session start` — the same
+/// first-fence/[`FRONTMATTER_SCAN_MAX_LINES`]-window discipline this hook
+/// already relies on for idempotency, so the two readers can never disagree
+/// on where a plan's frontmatter ends (Design 2's "one schema, one scanner").
+pub(crate) fn leading_frontmatter_block(doc: &str) -> Option<&str> {
     frontmatter_extent(doc).map(|(start, end, _)| &doc[start..end])
 }
 
@@ -903,7 +909,12 @@ fn yaml_quote(s: &str) -> String {
 /// fold started quoting) passes through unchanged — this hook always emits
 /// quoted values now, but the idempotency reader must not choke on an older
 /// or hand-edited file.
-fn yaml_unquote(s: &str) -> String {
+///
+/// `pub(crate)`: [`crate::plan_scan`] reuses this exact unescaper for the
+/// same double-quoted values at `session start` — one implementation of
+/// `yaml_quote`'s reader half, not two that could drift apart on escaping
+/// order.
+pub(crate) fn yaml_unquote(s: &str) -> String {
     let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
         return s.to_string();
     };
@@ -2184,24 +2195,25 @@ mod tests {
         git(&["config", "user.name", "t"]);
     }
 
-    /// Crate-wide serialization lock for the `CADENCE_METRICS_DIR` env-mutating
-    /// tests, mirroring `cadence_hooks_metrics::common::ENV_LOCK`'s pattern —
-    /// this crate has its own env-mutating tests, so its own lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_metrics_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized against every other test in this module via ENV_LOCK.
-        unsafe {
-            std::env::set_var("CADENCE_METRICS_DIR", dir);
-        }
-        let result = f();
-        // SAFETY: serialized against every other test in this module via ENV_LOCK.
-        unsafe {
-            std::env::remove_var("CADENCE_METRICS_DIR");
-        }
-        result
-    }
+    /// Reuse [`crate::registry::test_metrics_env::with_metrics_dir`] rather
+    /// than a second, independently-locked `CADENCE_METRICS_DIR` mutator.
+    ///
+    /// This module used to define its own `ENV_LOCK`/`with_metrics_dir` pair
+    /// under the premise "this crate has its own env-mutating tests, so its
+    /// own lock" — true, but `registry.rs`'s `test_metrics_env` module (used
+    /// by `start.rs`'s tests, e.g. `stale_peer_does_not_trigger_disclosure`
+    /// via `with_scratch_metrics_dir`) ALSO mutates this exact process-global
+    /// env var, through a *different* mutex. Two uncoordinated locks over one
+    /// global is a race regardless of how careful either lock's own critical
+    /// section is: `cargo test`'s default parallelism can run a test from
+    /// each module on separate threads at once, and one thread's
+    /// `set_var`/`remove_var` can interleave with the other's window. Rare
+    /// enough not to fire locally, but real — it surfaced as this test's
+    /// `plan-links.jsonl` read hitting `NotFound` on Windows CI once this
+    /// crate's test count grew (cadence-hooks#437). One shared lock closes it
+    /// by construction; both modules' tests now serialize against the same
+    /// mutex.
+    use crate::registry::test_metrics_env::with_metrics_dir;
 
     #[test]
     fn end_to_end_fresh_write_produces_nudge_and_linkage_row() {

@@ -204,10 +204,15 @@ enum CadenceCommands {
     },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
     RecordPolish {
+        /// Repository to record against (default: the current directory's).
+        /// Resolved to the repo's shared git dir, so any worktree of it works
+        /// and the marker stays readable by the pre-PR gate
         #[arg(long, value_name = "PATH")]
         repo_root: Option<String>,
+        /// Branch to record against (default: the checked-out branch)
         #[arg(long, value_name = "NAME")]
         branch: Option<String>,
+        /// What the pass covered — `full`, `code`, or `docs` (default: full)
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
     },
