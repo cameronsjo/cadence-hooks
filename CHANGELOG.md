@@ -30,6 +30,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`doctor`'s `version_mismatch` finding names the invocations, not just a count** (cameronsjo/cadence-hooks#183). The stale-binary breadcrumb the issue asked for already ships — the plugin wrapper's `notify_inert` names the missing subcommand once per day — but `doctor` knew only that *a* skew existed, leaving the operator to audit every installed plugin by hand. The finding now names the distinct `namespace subcommand` pairs behind it (deduped, sorted, capped at four, bounded per half) and renders a runnable `grep -rlF -e … -e …` over the **resolved** plugin cache, honoring `CLAUDE_CONFIG_DIR` rather than assuming `~/.claude` — a remediation that greps the wrong tree returns zero hits and reads as "no stale wiring". Naming them immediately paid off on a real machine: a 96-row skew that read as an unresolved production problem turned out to be this repo's own integration-test fixture names, historical residue in the live ledger.
 - **Nudge-fire telemetry is ON by default** (cameronsjo/cadence-hooks#420). `log_denial` now writes a `decision: "nudge"` row to `denials.jsonl` for every `Nudge`/`LoopBlock` outcome unless `CADENCE_LOG_NUDGES` explicitly opts out (`0` / `false` / `off`, case-insensitive, or set-but-empty — the old semantics' OFF state, preserved as a value-free kill switch); unset — the common case — means on, and the legacy opt-in `1` keeps working unchanged. Rationale: nudge-fire rates are the denominator for every adherence measurement, and the 2026-07-25 third-pass adherence review found the dark-by-default layer had left every nudge-tier verdict unverifiable for the subsystem's entire life. `Block`/`Ask` logging and the Allow hot path are untouched; rows are privacy-safe by the existing construction (guard + tool + repo, never content).
+- **Codex CLI is now a first-class hook and metrics harness.** `cadence-hooks
+  manifest --format json` exposes the binary registry for compatibility audits;
+  Codex shell, unified-exec, patch, MCP, subagent, and lifecycle inputs normalize
+  into the shared hook model; multi-target decisions use the strictest outcome;
+  and security-critical Codex parse failures deny without persisting raw input.
+  A generated compatibility report joins the registry, plugin matchers, route
+  coverage, and paired Claude/Codex fixtures. Metrics schema v2 preserves harness
+  provenance, reads legacy Claude ledgers without duplication, scans supported
+  Codex rollout metadata without transcript content, and keeps Codex pricing
+  nullable and explicitly estimated.
 
 ### Fixed
 

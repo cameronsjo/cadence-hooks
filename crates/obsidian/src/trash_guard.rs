@@ -1,4 +1,5 @@
-//! Redirect destructive commands inside an Obsidian vault to `.trash/`.
+//! Redirect destructive commands and file-tool deletions inside an Obsidian
+//! vault to `.trash/`.
 //!
 //! Obsidian has a built-in `.trash/` recycle bin. Deleting or truncating vault
 //! files with `rm`, `unlink`, `shred`, `truncate`, or `find … -delete` bypasses
@@ -189,6 +190,20 @@ fn check_destructive_in_vault(
     CheckResult::allow()
 }
 
+fn check_delete_in_vault(path: &str, cwd: &str, vault: &str) -> CheckResult {
+    let vault = normalize_path(vault);
+    let cwd = normalize_path(cwd);
+    let vault_prefix = format!("{vault}/");
+    if let Some(resolved) = resolve_in_vault(path, &cwd, &vault, &vault_prefix) {
+        return CheckResult::block(format!(
+            "🚫 Obsidian vault detected. This file operation deletes a vault file, \
+             bypassing recoverability.\n\n\
+             Move it into {vault}/.trash/ instead of deleting {resolved}."
+        ));
+    }
+    CheckResult::allow()
+}
+
 /// Blocks destructive commands (rm, unlink, shred, truncate, or find -delete)
 /// inside an Obsidian vault and suggests `.trash/` instead.
 pub struct ObsidianTrashGuard;
@@ -199,17 +214,24 @@ impl Check for ObsidianTrashGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let Some(command) = input.command() else {
-            return CheckResult::allow();
-        };
-
         let vault = match std::env::var("OBSIDIAN_VAULT") {
             Ok(v) if !v.is_empty() => v,
             _ => return CheckResult::allow(),
         };
 
         let cwd = input.cwd.as_deref().unwrap_or("/");
-        check_destructive_in_vault(command, cwd, &vault, &RealFs)
+        if input.operation() == Some("delete")
+            && let Some(path) = input.file_path()
+        {
+            let result = check_delete_in_vault(&path, cwd, &vault);
+            if result.outcome == cadence_hooks_core::Outcome::Block {
+                return result;
+            }
+        }
+
+        input.command().map_or_else(CheckResult::allow, |command| {
+            check_destructive_in_vault(command, cwd, &vault, &RealFs)
+        })
     }
 }
 
@@ -252,6 +274,12 @@ mod tests {
     fn rm_inside_vault_blocked() {
         let result =
             check_destructive_in_vault("rm note.md", "/vault/notes", "/vault", &FakeFs::default());
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn normalized_patch_delete_inside_vault_is_blocked() {
+        let result = check_delete_in_vault("note.md", "/vault", "/vault");
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 

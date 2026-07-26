@@ -25,8 +25,8 @@
 //! guard — it is the unlogged path, with no telemetry tail to protect.
 
 use cadence_hooks_core::{
-    Check, HookEvent, HookInput, Logger, MetricsInput, Outcome, decide_check, emit_and_exit,
-    guard_interactive_terminal,
+    Check, CheckResult, HookEvent, HookInput, Logger, MetricsInput, Outcome, decide_check,
+    emit_and_exit, guard_interactive_terminal,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
@@ -121,7 +121,37 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                 env!("CARGO_PKG_VERSION"),
                 Some(&e),
             );
-            process::exit(0); // Fail open on parse errors (ADR-0001)
+            if codex_fail_closed(hook_name) {
+                eprintln!(
+                    "cadence-hooks: security-critical hook input could not be parsed; \
+                     blocking because the guard cannot prove the operation safe. \
+                     Fix the hook payload/schema or run the reviewed operation yourself."
+                );
+                process::exit(2);
+            }
+            process::exit(0);
+        }
+    };
+    let normalized_inputs = match input.normalized_inputs() {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            cadence_hooks_metrics::log_failopen(
+                "parse",
+                crate::registry::plugin_for(hook_name),
+                Some(hook_name),
+                env!("CARGO_PKG_VERSION"),
+                Some(&error),
+            );
+            if codex_fail_closed(hook_name) {
+                eprintln!(
+                    "cadence-hooks: {error}; blocked because security-critical patch \
+                     targets could not be enumerated. Review the patch and retry with \
+                     a parseable operation or apply it yourself."
+                );
+                process::exit(2);
+            }
+            eprintln!("cadence-hooks: {error}");
+            process::exit(0);
         }
     };
     // A panicking check must not skip the telemetry writes or reach the user as
@@ -150,7 +180,25 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
         let _guard = PanicGuard::arm();
         catch_unwind(AssertUnwindSafe(|| {
             test_panic_trigger();
-            decide_check(check, &input)
+            let mut aggregate = CheckResult::allow();
+            let mut messages = Vec::new();
+            for target in &normalized_inputs {
+                let Some(result) = decide_check(check, target) else {
+                    continue;
+                };
+                cadence_hooks_metrics::log_denial(hook_name, event, target, result.outcome);
+                if let Some(prov) = &result.bypass {
+                    cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::used(
+                        hook_name, target, prov,
+                    ));
+                }
+                aggregate.outcome = aggregate.outcome.merge(result.outcome);
+                if let Some(message) = result.message {
+                    messages.push(message);
+                }
+            }
+            aggregate.message = (!messages.is_empty()).then(|| messages.join("\n\n"));
+            Some(aggregate)
         }))
     };
     let decided = match decided {
@@ -180,18 +228,6 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
         // Effort-skipped → silent Allow, nothing to record.
         None => process::exit(Outcome::Allow.code()),
         Some(result) => {
-            // Record before emitting. Both writes are fully fail-open, so neither
-            // can perturb the block message or the exit code that follows.
-            cadence_hooks_metrics::log_denial(hook_name, event, &input, result.outcome);
-            // A bypass-allow rode through an active dismissal / env switch. Record
-            // *that a guard was stepped outside of* — the one event the denial log
-            // can't see (it drops Allow). Fully fail-open, same as log_denial: a
-            // failed write never perturbs the allow or its exit code (ADR-0001).
-            if let Some(prov) = &result.bypass {
-                cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::used(
-                    hook_name, &input, prov,
-                ));
-            }
             // A Block/Ask outcome stopped the operation, so a timed-out probe
             // did not degrade to fail-open — don't emit the plain deadline row
             // (Allow/Nudge let the tool proceed, so those still do).
@@ -200,6 +236,11 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             emit_and_exit(&result, event);
         }
     }
+}
+
+fn codex_fail_closed(hook_name: &str) -> bool {
+    std::env::var("CADENCE_HARNESS").as_deref() == Ok("codex")
+        && crate::registry::is_security_critical(hook_name)
 }
 
 /// Run a fire-and-forget logger from stdin, record its wall-clock time to

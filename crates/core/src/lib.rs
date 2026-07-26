@@ -14,6 +14,7 @@ pub mod deadline;
 pub mod gitstate;
 pub mod loop_analysis;
 pub mod markers;
+pub mod patch;
 pub mod pathclass;
 pub mod paths;
 pub mod shell;
@@ -170,7 +171,7 @@ pub fn normalize_path(path: &str) -> String {
 /// deserialize to `None` when absent, so existing Pre/Post hooks are unaffected.
 /// `Default` is derived so call sites can construct partial inputs via
 /// `..Default::default()`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct HookInput {
     pub tool_name: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
@@ -205,11 +206,23 @@ pub struct HookInput {
 }
 
 /// Tool-specific fields from the hook input.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ToolInput {
     pub file_path: Option<String>,
     pub path: Option<String>,
+    #[serde(alias = "sourcePath", alias = "from")]
+    pub source: Option<String>,
+    #[serde(alias = "destinationPath", alias = "to")]
+    pub destination: Option<String>,
     pub command: Option<String>,
+    /// Codex unified-exec/function form; normalized to `command` at parse time.
+    pub cmd: Option<String>,
+    /// Codex `apply_patch` freeform body; expanded into per-target HookInputs
+    /// by [`HookInput::normalized_inputs`].
+    pub patch: Option<String>,
+    /// Harness-neutral operation kind for adapters that need deletion or
+    /// rename semantics beyond the legacy Write/Edit tool name.
+    pub operation: Option<String>,
     pub content: Option<String>,
     pub new_string: Option<String>,
     pub old_string: Option<String>,
@@ -235,7 +248,7 @@ pub struct ToolInput {
 }
 
 /// A single edit operation within a MultiEdit tool call.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct EditOperation {
     pub old_string: Option<String>,
     pub new_string: Option<String>,
@@ -243,7 +256,7 @@ pub struct EditOperation {
 }
 
 /// A single AskUserQuestion question and its answer options.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskQuestion {
     pub question: Option<String>,
@@ -253,7 +266,7 @@ pub struct AskQuestion {
 }
 
 /// A single answer option within an AskUserQuestion question.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct AskOption {
     pub label: Option<String>,
     pub description: Option<String>,
@@ -273,7 +286,7 @@ fn apply_edit(doc: &str, old: &str, new: &str, replace_all: bool) -> String {
 /// Claude Code sends the tool's stdout (and optionally stderr) back in the
 /// hook payload so post-processing hooks can inspect the result without
 /// re-running the command.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ToolResponse {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
@@ -333,7 +346,189 @@ impl HookInput {
         std::io::stdin()
             .read_to_string(&mut buf)
             .map_err(|e| format!("Failed to read stdin: {e}"))?;
-        serde_json::from_str(&buf).map_err(|e| format!("Failed to parse hook JSON: {e}"))
+        Self::from_json(&buf)
+    }
+
+    /// Parse a Claude or Codex hook payload and normalize harness aliases.
+    ///
+    /// Raw inputs are never retained beyond this value. In particular, a patch
+    /// body is parsed in memory and is not included in parse diagnostics.
+    pub fn from_json(raw: &str) -> Result<Self, String> {
+        let mut value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        let tool_name = value
+            .get("tool_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if tool_name == "apply_patch" {
+            let patch = value
+                .get("tool_input")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("input").and_then(serde_json::Value::as_str))
+                .map(str::to_string);
+            if let Some(patch) = patch {
+                value["tool_input"] = serde_json::json!({"patch": patch});
+            }
+        }
+        let mut input: HookInput =
+            serde_json::from_value(value).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        if let Some(tool_input) = input.tool_input.as_mut()
+            && tool_input.command.is_none()
+        {
+            tool_input.command = tool_input.cmd.take();
+        }
+        if matches!(
+            input.tool_name.as_deref(),
+            Some("exec_command" | "unified_exec" | "shell")
+        ) {
+            input.tool_name = Some("Bash".to_string());
+        }
+        if matches!(
+            input.tool_name.as_deref(),
+            Some("spawn_agent" | "spawn_agents_on_csv" | "multi_agents")
+        ) {
+            input.tool_name = Some("Agent".to_string());
+        }
+        if let Some(name) = input.tool_name.as_deref()
+            && name.starts_with("mcp__")
+        {
+            let lower = name.to_ascii_lowercase();
+            let operation = if lower.contains("delete") || lower.contains("remove") {
+                Some(("Edit", "delete"))
+            } else if lower.contains("write") || lower.contains("create") {
+                Some(("Write", "create"))
+            } else if lower.contains("edit") || lower.contains("update") {
+                Some(("Edit", "update"))
+            } else if lower.contains("move") || lower.contains("rename") {
+                Some(("Edit", "rename"))
+            } else if lower.contains("read")
+                || lower.contains("get_file")
+                || lower.contains("fetch_file")
+                || lower.contains("load_file")
+            {
+                Some(("Read", "read"))
+            } else if lower.contains("grep")
+                || lower.contains("search")
+                || lower.contains("find_file")
+            {
+                Some(("Grep", "search"))
+            } else {
+                None
+            };
+            if let Some((tool, operation)) = operation {
+                input.tool_name = Some(tool.to_string());
+                if let Some(tool_input) = input.tool_input.as_mut() {
+                    tool_input.operation = Some(operation.to_string());
+                }
+            }
+        }
+        Ok(input)
+    }
+
+    /// Expand a Codex `apply_patch` payload into one Claude-shaped input per
+    /// target operation. Non-patch payloads return a single clone.
+    pub fn normalized_inputs(&self) -> Result<Vec<Self>, String> {
+        if self.tool_name() != Some("apply_patch") {
+            if self.operation() == Some("rename")
+                && let Some(tool_input) = self.tool_input.as_ref()
+                && let (Some(source), Some(destination)) =
+                    (tool_input.source.clone(), tool_input.destination.clone())
+            {
+                return Ok(vec![
+                    self.file_operation("Edit", "rename-source", source, None, None),
+                    self.file_operation(
+                        "Write",
+                        "rename-destination",
+                        destination,
+                        None,
+                        tool_input.content.clone(),
+                    ),
+                ]);
+            }
+            return Ok(vec![self.clone()]);
+        }
+        let patch = self
+            .tool_input
+            .as_ref()
+            .and_then(|tool_input| tool_input.patch.as_deref())
+            .ok_or_else(|| "apply_patch payload omitted patch body".to_string())?;
+        let operations =
+            patch::parse(patch).map_err(|error| format!("apply_patch schema rejected: {error}"))?;
+        let mut inputs = Vec::new();
+        for operation in operations {
+            match operation {
+                patch::Operation::Create { path, content } => {
+                    inputs.push(self.file_operation("Write", "create", path, None, Some(content)));
+                }
+                patch::Operation::Update {
+                    path,
+                    old,
+                    new,
+                    move_to,
+                } => {
+                    let operation = if move_to.is_some() {
+                        "rename-source"
+                    } else {
+                        "update"
+                    };
+                    inputs.push(self.file_operation(
+                        "Edit",
+                        operation,
+                        path.clone(),
+                        old,
+                        new.clone(),
+                    ));
+                    if let Some(destination) = move_to {
+                        inputs.push(self.file_operation(
+                            "Write",
+                            "rename-destination",
+                            destination,
+                            None,
+                            new,
+                        ));
+                    }
+                }
+                patch::Operation::Delete { path } => {
+                    inputs.push(self.file_operation(
+                        "Edit",
+                        "delete",
+                        path,
+                        None,
+                        Some(String::new()),
+                    ));
+                }
+            }
+        }
+        if inputs.is_empty() {
+            return Err("apply_patch contained no file operations".to_string());
+        }
+        Ok(inputs)
+    }
+
+    fn file_operation(
+        &self,
+        tool_name: &str,
+        operation: &str,
+        path: String,
+        old: Option<String>,
+        new: Option<String>,
+    ) -> Self {
+        let mut result = self.clone();
+        result.tool_name = Some(tool_name.to_string());
+        result.tool_input = Some(ToolInput {
+            file_path: Some(path),
+            operation: Some(operation.to_string()),
+            old_string: old,
+            new_string: if tool_name == "Edit" {
+                new.clone()
+            } else {
+                None
+            },
+            content: if tool_name == "Write" { new } else { None },
+            ..ToolInput::default()
+        });
+        result
     }
 
     /// Resolved file path — checks file_path first, then path.
@@ -343,6 +538,11 @@ impl HookInput {
             .as_ref()
             .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()))
             .map(normalize_path)
+    }
+
+    /// Harness-neutral operation kind supplied by Codex adapters.
+    pub fn operation(&self) -> Option<&str> {
+        self.tool_input.as_ref()?.operation.as_deref()
     }
 
     /// The bash command, if this is a Bash tool invocation.
@@ -1007,6 +1207,16 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
+    if result.outcome == Outcome::Ask && std::env::var("CADENCE_HARNESS").as_deref() == Ok("codex")
+    {
+        let reason = result.message.as_deref().unwrap_or("confirmation required");
+        eprintln!(
+            "{reason}\n\nBlocked because Codex hooks cannot hand an Ask decision to the user. \
+             Review the target, then use the documented scoped bypass or run the operation \
+             yourself outside the agent session."
+        );
+        process::exit(Outcome::Block.code());
+    }
     let rendered = render_output(
         result.outcome,
         result.message.as_deref(),
@@ -1168,6 +1378,83 @@ mod tests {
         assert_eq!(Outcome::Nudge.code(), 0);
         assert_eq!(Outcome::LoopBlock.code(), 0);
         assert_eq!(Outcome::Block.code(), 2);
+    }
+
+    #[test]
+    fn codex_shell_and_subagent_aliases_normalize() {
+        let shell = HookInput::from_json(
+            r#"{"tool_name":"exec_command","tool_input":{"cmd":"git status"}}"#,
+        )
+        .unwrap();
+        assert_eq!(shell.tool_name(), Some("Bash"));
+        assert_eq!(shell.command(), Some("git status"));
+
+        let agent = HookInput::from_json(r#"{"tool_name":"spawn_agent","tool_input":{}}"#).unwrap();
+        assert_eq!(agent.tool_name(), Some("Agent"));
+    }
+
+    #[test]
+    fn codex_filesystem_mcp_operations_normalize() {
+        let write = HookInput::from_json(
+            r#"{"tool_name":"mcp__filesystem__write_file","tool_input":{"path":"a","content":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(write.tool_name(), Some("Write"));
+        assert_eq!(write.operation(), Some("create"));
+        assert_eq!(write.file_path().as_deref(), Some("a"));
+
+        let delete = HookInput::from_json(
+            r#"{"tool_name":"mcp__filesystem__delete_file","tool_input":{"path":"a"}}"#,
+        )
+        .unwrap();
+        assert_eq!(delete.tool_name(), Some("Edit"));
+        assert_eq!(delete.operation(), Some("delete"));
+
+        let read = HookInput::from_json(
+            r#"{"tool_name":"mcp__filesystem__read_file","tool_input":{"path":".env"}}"#,
+        )
+        .unwrap();
+        assert_eq!(read.tool_name(), Some("Read"));
+        assert_eq!(read.operation(), Some("read"));
+
+        let rename = HookInput::from_json(
+            r#"{"tool_name":"mcp__filesystem__move_file","tool_input":{"source":"a","destination":"b"}}"#,
+        )
+        .unwrap()
+        .normalized_inputs()
+        .unwrap();
+        assert_eq!(rename.len(), 2);
+        assert_eq!(rename[0].file_path().as_deref(), Some("a"));
+        assert_eq!(rename[1].file_path().as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn codex_patch_expands_every_target_and_rename_destination() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\n*** Add File: a\n+x\n*** Update File: b\n*** Move to: c\n@@\n-old\n+new\n*** Delete File: d\n*** End Patch"}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        let paths = targets
+            .iter()
+            .filter_map(HookInput::file_path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["a", "b", "c", "d"]);
+        assert_eq!(
+            targets.iter().map(HookInput::tool_name).collect::<Vec<_>>(),
+            [Some("Write"), Some("Edit"), Some("Write"), Some("Edit")]
+        );
+    }
+
+    #[test]
+    fn malformed_codex_patch_diagnostic_does_not_echo_body() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\nTOP_SECRET\n*** End Patch"}"#,
+        )
+        .unwrap();
+        let error = input.normalized_inputs().unwrap_err();
+        assert!(error.contains("schema rejected"));
+        assert!(!error.contains("TOP_SECRET"));
     }
 
     // --- feedback footer ---

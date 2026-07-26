@@ -432,6 +432,26 @@ pub fn plugin_for(name: &str) -> Option<&'static str> {
     HOOKS.iter().find(|h| h.name == name).map(|h| h.plugin)
 }
 
+/// True for guards whose inability to parse a relevant operation must block.
+pub fn is_security_critical(name: &str) -> bool {
+    matches!(
+        name,
+        "prevent-secret-leaks"
+            | "prevent-secret-writes"
+            | "git-safety"
+            | "guard-push-remote"
+            | "guard-gh-dangerous"
+            | "guard-gh-write"
+            | "guard-op-vault-scan"
+            | "guard-browser-device"
+            | "guard-dotfiles"
+            | "guard-rm"
+            | "enforce-worktree"
+            | "guard-read-model"
+            | "trash-guard"
+    )
+}
+
 /// Per-hook sample payload overrides for `try` and the interactive-terminal
 /// guidance.
 ///
@@ -629,6 +649,13 @@ mod tests {
     #[test]
     fn entry_returns_none_for_unknown_pair() {
         assert!(entry("cadence", "guard-push-remote").is_none());
+    }
+
+    #[test]
+    fn security_critical_registry_covers_protected_guards() {
+        assert!(is_security_critical("guard-push-remote"));
+        assert!(is_security_critical("prevent-secret-writes"));
+        assert!(!is_security_critical("warn-main-branch"));
     }
 
     #[test]

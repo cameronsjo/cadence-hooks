@@ -47,6 +47,8 @@ pub mod prices;
 pub mod scan_tokens;
 /// Snapshot HEAD before a `git commit`.
 pub mod snapshot;
+/// Versioned Claude and Codex transcript usage scanners.
+pub mod transcript;
 /// Warn at SessionStart when metrics telemetry has gone stale.
 pub mod warn_stale;
 

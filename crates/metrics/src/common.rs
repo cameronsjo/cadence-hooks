@@ -2,6 +2,8 @@
 //! metrics directory resolution, and timestamps.
 
 use regex::Regex;
+use serde_json::json;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -25,25 +27,104 @@ pub fn is_git_commit(command: &str) -> bool {
 /// The metrics root directory.
 ///
 /// Resolution order:
-/// 1. `CADENCE_METRICS_DIR` — when set and non-empty, the value **is** the
-///    metrics dir (JSONL files and the `state/` subdir live directly inside it).
-/// 2. `<config_dir>/metrics` — where `<config_dir>` honors `CLAUDE_CONFIG_DIR`
-///    (else `~/.claude`).
+/// 1. `CADENCE_METRICS_DIR` — backwards-compatible explicit override.
+/// 2. `<CADENCE_STATE_HOME>/metrics`.
+/// 3. `<XDG_STATE_HOME>/cadence/metrics`.
+/// 4. `~/.local/state/cadence/metrics`.
+///
+/// New writes no longer depend on a harness-specific config directory.
 pub fn metrics_dir() -> PathBuf {
-    metrics_dir_from(std::env::var("CADENCE_METRICS_DIR").ok())
+    metrics_dir_from(
+        std::env::var("CADENCE_METRICS_DIR").ok(),
+        std::env::var("CADENCE_STATE_HOME").ok(),
+        std::env::var("XDG_STATE_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )
 }
 
-/// Pure resolver behind [`metrics_dir`]: takes the `CADENCE_METRICS_DIR` value
-/// explicitly (rather than reading process-global env) so the resolution order
-/// is unit-testable without `set_var`/`remove_var`. `None` or an empty string
-/// falls through to the `<config_dir>/metrics` default.
-fn metrics_dir_from(override_dir: Option<String>) -> PathBuf {
+fn metrics_dir_from(
+    override_dir: Option<String>,
+    cadence_state_home: Option<String>,
+    xdg_state_home: Option<String>,
+    home: Option<String>,
+) -> PathBuf {
     if let Some(dir) = override_dir
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
+    if let Some(dir) = cadence_state_home
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("metrics");
+    }
+    if let Some(dir) = xdg_state_home
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("cadence").join("metrics");
+    }
+    PathBuf::from(home.unwrap_or_else(|| ".".to_string()))
+        .join(".local")
+        .join("state")
+        .join("cadence")
+        .join("metrics")
+}
+
+/// Legacy Claude metrics directory, read-only after schema v2.
+pub fn legacy_metrics_dir() -> PathBuf {
     cadence_hooks_core::paths::claude_config_dir().join("metrics")
+}
+
+/// Read a stream from the state home, falling back to legacy Claude state.
+///
+/// The fallback is selected only when the new stream does not exist, so a
+/// migration or copy cannot be counted twice.
+pub fn read_stream_with_legacy(filename: &str) -> Option<String> {
+    let current = metrics_dir().join(filename);
+    if current.is_file() {
+        return std::fs::read_to_string(current).ok();
+    }
+    let legacy = legacy_metrics_dir().join(filename);
+    if legacy != current && legacy.is_file() {
+        return std::fs::read_to_string(legacy).ok();
+    }
+    None
+}
+
+/// Harness stamped on schema-v2 rows.
+pub fn harness() -> &'static str {
+    if std::env::var("CADENCE_HARNESS").is_ok_and(|value| value.eq_ignore_ascii_case("codex")) {
+        "codex"
+    } else {
+        "claude"
+    }
+}
+
+/// Append a schema-only transcript diagnostic. No transcript text, tool input,
+/// prompt, patch, or output is accepted by this API.
+pub fn append_transcript_diagnostic(harness: &str, source_format: &str, code: &str, stream: &str) {
+    let dir = metrics_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let record = json!({
+        "schemaVersion": TOKEN_RECORD_SCHEMA_VERSION,
+        "ts": utc_timestamp(),
+        "harness": harness,
+        "sourceFormat": source_format,
+        "code": code,
+        "stream": stream,
+        "priced": false,
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("diagnostics.jsonl"))
+    {
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 /// The per-session state directory: `<metrics_dir>/state`.
@@ -292,6 +373,9 @@ pub const SKILL_SCHEMA_VERSION: u32 = 1;
 /// `asked` and `answered` phases).
 pub const ASKUSERQUESTION_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version for cross-harness commit and session token records.
+pub const TOKEN_RECORD_SCHEMA_VERSION: u32 = 2;
+
 /// Crate-wide serialization lock for env-mutating tests.
 ///
 /// `CADENCE_METRICS_DIR` and its siblings are process-global, so every test that
@@ -313,29 +397,56 @@ mod tests {
     fn metrics_dir_override_via_cadence_metrics_dir() {
         // A non-empty override value becomes the metrics dir verbatim.
         assert_eq!(
-            metrics_dir_from(Some("/tmp/cadence-test-metrics".to_string())),
+            metrics_dir_from(
+                Some("/tmp/cadence-test-metrics".to_string()),
+                None,
+                None,
+                None,
+            ),
             std::path::PathBuf::from("/tmp/cadence-test-metrics")
         );
     }
 
     #[test]
-    fn metrics_dir_fallback_contains_metrics() {
-        // No override → the `<config_dir>/metrics` default.
-        let dir = metrics_dir_from(None);
-        assert!(
-            dir.to_string_lossy().contains("metrics"),
-            "fallback metrics_dir should contain 'metrics': {dir:?}"
+    fn metrics_dir_uses_cadence_state_home() {
+        assert_eq!(
+            metrics_dir_from(
+                None,
+                Some("/state/cadence".to_string()),
+                Some("/ignored".to_string()),
+                Some("/home/me".to_string()),
+            ),
+            PathBuf::from("/state/cadence/metrics")
         );
     }
 
     #[test]
-    fn metrics_dir_empty_override_falls_through() {
-        // An empty CADENCE_METRICS_DIR must not shadow the default (guards the
-        // `!dir.is_empty()` branch).
-        let dir = metrics_dir_from(Some(String::new()));
-        assert!(
-            dir.to_string_lossy().contains("metrics"),
-            "empty override should fall through to default: {dir:?}"
+    fn metrics_dir_uses_xdg_then_local_state() {
+        assert_eq!(
+            metrics_dir_from(
+                None,
+                None,
+                Some("/xdg".to_string()),
+                Some("/home/me".to_string())
+            ),
+            PathBuf::from("/xdg/cadence/metrics")
+        );
+        assert_eq!(
+            metrics_dir_from(None, None, None, Some("/home/me".to_string())),
+            PathBuf::from("/home/me/.local/state/cadence/metrics")
+        );
+    }
+
+    #[test]
+    fn empty_overrides_fall_through() {
+        assert_eq!(
+            metrics_dir_from(
+                Some(String::new()),
+                Some(String::new()),
+                Some(String::new()),
+                Some("/home/me".to_string())
+            ),
+            PathBuf::from("/home/me/.local/state/cadence/metrics")
         );
     }
 
