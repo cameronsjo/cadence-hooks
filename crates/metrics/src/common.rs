@@ -65,7 +65,23 @@ pub fn harness() -> &'static str {
 /// prompt, patch, or output is accepted by this API.
 pub fn append_transcript_diagnostic(harness: &str, source_format: &str, code: &str, stream: &str) {
     let dir = metrics_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+    append_transcript_diagnostic_to(&dir, harness, source_format, code, stream);
+}
+
+const MAX_DIAGNOSTICS_BYTES: u64 = 1_048_576;
+
+fn append_transcript_diagnostic_to(
+    dir: &Path,
+    harness: &str,
+    source_format: &str,
+    code: &str,
+    stream: &str,
+) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = dir.join("diagnostics.jsonl");
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= MAX_DIAGNOSTICS_BYTES) {
         return;
     }
     let record = json!({
@@ -80,7 +96,7 @@ pub fn append_transcript_diagnostic(harness: &str, source_format: &str, code: &s
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("diagnostics.jsonl"))
+        .open(path)
     {
         let mut line = record.to_string();
         line.push('\n');
@@ -381,6 +397,20 @@ mod tests {
         assert!(
             dir.to_string_lossy().contains("metrics"),
             "empty override should fall through to the default: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_diagnostics_stop_at_the_size_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("diagnostics.jsonl");
+        std::fs::write(&path, vec![b'x'; MAX_DIAGNOSTICS_BYTES as usize]).unwrap();
+
+        append_transcript_diagnostic_to(temp.path(), "codex", "unknown", "schema", "session");
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_DIAGNOSTICS_BYTES
         );
     }
 

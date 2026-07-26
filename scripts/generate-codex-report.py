@@ -55,14 +55,26 @@ def plugin_wiring(workspace: Path) -> dict[tuple[str, str], list[dict]]:
 
 
 def build(binary: Path, workspace: Path) -> dict:
-    registry = json.loads(
-        subprocess.run(
+    if not binary.is_file():
+        raise SystemExit(
+            f"cadence-hooks binary not found at {binary}; run `cargo build` first"
+        )
+    try:
+        completed = subprocess.run(
             [str(binary), "manifest", "--format", "json"],
             check=True,
             text=True,
             stdout=subprocess.PIPE,
-        ).stdout
-    )
+        )
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(
+            f"`{binary} manifest --format json` failed with status {error.returncode}"
+        ) from error
+    except OSError as error:
+        raise SystemExit(
+            f"could not execute cadence-hooks binary at {binary}: {error}"
+        ) from error
+    registry = json.loads(completed.stdout)
     policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
     wiring = plugin_wiring(workspace)
     hooks = []

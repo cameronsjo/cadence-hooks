@@ -180,8 +180,7 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
         let _guard = PanicGuard::arm();
         catch_unwind(AssertUnwindSafe(|| {
             test_panic_trigger();
-            let mut aggregate = CheckResult::allow();
-            let mut messages = Vec::new();
+            let mut results = Vec::new();
             for target in &normalized_inputs {
                 let Some(result) = decide_check(check, target) else {
                     continue;
@@ -192,13 +191,9 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                         hook_name, target, prov,
                     ));
                 }
-                aggregate.outcome = aggregate.outcome.merge(result.outcome);
-                if let Some(message) = result.message {
-                    messages.push(message);
-                }
+                results.push(result);
             }
-            aggregate.message = (!messages.is_empty()).then(|| messages.join("\n\n"));
-            Some(aggregate)
+            aggregate_results(results)
         }))
     };
     let decided = match decided {
@@ -236,6 +231,38 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             emit_and_exit(&result, event);
         }
     }
+}
+
+fn aggregate_results(mut results: Vec<CheckResult>) -> Option<CheckResult> {
+    if results.is_empty() {
+        return None;
+    }
+    let outcome = results.iter().fold(Outcome::Allow, |merged, result| {
+        merged.merge(result.outcome)
+    });
+    let mut messages = Vec::new();
+    let mut block_metadata = None;
+    let mut bypass = None;
+    for result in &mut results {
+        if result.outcome != outcome {
+            continue;
+        }
+        if let Some(message) = result.message.take() {
+            messages.push(message);
+        }
+        if block_metadata.is_none() {
+            block_metadata = result.block_metadata.take();
+        }
+        if bypass.is_none() {
+            bypass = result.bypass.take();
+        }
+    }
+    Some(CheckResult {
+        outcome,
+        message: (!messages.is_empty()).then(|| messages.join("\n\n")),
+        block_metadata,
+        bypass,
+    })
 }
 
 fn codex_fail_closed(hook_name: &str) -> bool {
@@ -365,5 +392,43 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
         eprintln!(
             "cadence-hooks: {hook_name}: git probe deadline exceeded; git-backed checks degraded to fail-open"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadence_hooks_core::BlockMetadata;
+
+    #[test]
+    fn aggregate_keeps_the_winning_blocks_message_and_metadata() {
+        let result = aggregate_results(vec![
+            CheckResult::nudge("advisory"),
+            CheckResult::block_structured(
+                "blocked",
+                BlockMetadata {
+                    rule_id: "test-rule".to_string(),
+                    fix: "--safe".to_string(),
+                    allowed_owners: Vec::new(),
+                    severity: "error",
+                },
+            ),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(result.outcome, Outcome::Block);
+        assert_eq!(result.message.as_deref(), Some("blocked"));
+        assert_eq!(
+            result
+                .block_metadata
+                .as_ref()
+                .map(|metadata| metadata.fix.as_str()),
+            Some("--safe")
+        );
+    }
+
+    #[test]
+    fn aggregate_returns_none_when_every_target_is_effort_skipped() {
+        assert!(aggregate_results(Vec::new()).is_none());
     }
 }

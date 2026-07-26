@@ -160,6 +160,7 @@ fn sandbox_fixture_identifies_symlink_and_traversal_escape_targets() {
     fs::write(&outside, "protected").unwrap();
     let workspace = temp.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();

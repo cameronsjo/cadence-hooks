@@ -3,7 +3,9 @@ use std::process::Command;
 
 #[test]
 fn manifest_json_exports_complete_registry_and_criticality() {
+    let metrics = tempfile::tempdir().expect("temp metrics dir");
     let output = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+        .env("CADENCE_METRICS_DIR", metrics.path())
         .args(["manifest", "--format", "json"])
         .output()
         .expect("run cadence-hooks manifest");
