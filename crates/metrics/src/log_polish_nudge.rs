@@ -1,13 +1,16 @@
-//! `PostToolUse:Bash` — when a polish **ship anchor** runs (`gh pr ready`, or a
-//! non-draft `gh pr create`), append one line to
+//! `PostToolUse:Bash` — when a polish **ship anchor** runs (`gh pr ready`, a
+//! non-draft `gh pr create`, or a bare `gh pr merge`), append one line to
 //! `<metrics_dir>/polish_nudges.jsonl` recording the nudge-fire and whether
 //! `/polish` ran earlier this session.
 //!
 //! This is the deterministic denominator for the polish-nudge efficacy
 //! measurement (claude-configurations#151): every ship anchor *is* a nudged PR
-//! (it fires `nudge-polish-before-pr`), so the same [`is_polish_ship_anchor`]
+//! (it fires `nudge-polish-before-pr`), so the same [`polish_ship_anchor`]
 //! predicate gates both — a draft create nudges nowhere, so it is logged
-//! nowhere either (#297). `polished` is a best-effort transcript scan for a
+//! nowhere either (#297). Each row carries the anchor **kind**, because a
+//! draft-first branch now trips `ready` and again at `merge` (#325) and the two
+//! rows would otherwise read as two separate ships; dedup on `(repo, branch)`
+//! or split by `anchor` before computing a rate. `polished` is a best-effort transcript scan for a
 //! `cadence-forge:polish` Skill invocation earlier in the session — a row with
 //! `polished: false` is a deterministic *skip candidate*. Distinguishing a
 //! rationalized skip from a legitimate one stays a transcript/prose judgment;
@@ -17,7 +20,7 @@
 
 use crate::common;
 use cadence_hooks_core::markers::polish_marker_present;
-use cadence_hooks_core::shell::is_polish_ship_anchor;
+use cadence_hooks_core::shell::polish_ship_anchor;
 use cadence_hooks_core::transcript::{
     subagent_transcripts_have_polish_run, transcript_has_polish_run,
 };
@@ -38,10 +41,13 @@ impl Logger for LogPolishNudge {
             return;
         };
         // The denominator is defined as "every PR that fired the nudge", so the
-        // gate MUST be the same predicate the nudge uses.
-        if !is_polish_ship_anchor(command) {
+        // gate MUST be the same predicate the nudge uses. The anchor KIND rides
+        // along on the row: a draft-first branch now trips `ready` and again at
+        // `merge` (#325), and without the kind those two rows read as two
+        // separate ships of the same branch.
+        let Some(anchor) = polish_ship_anchor(command) else {
             return;
-        }
+        };
         // Skip malformed payloads (mirrors the other loggers); session_id is
         // recorded as a JSON value, never used in a path, so this is hygiene.
         if !input
@@ -88,6 +94,7 @@ impl Logger for LogPolishNudge {
             &common::repo_basename(input.cwd.as_deref()),
             polished,
             marker_present,
+            anchor,
         );
 
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -112,9 +119,11 @@ fn build_polish_nudge_record(
     repo: &str,
     polished: bool,
     marker_present: bool,
+    anchor: &str,
 ) -> Value {
     json!({
         "ts": ts,
+        "anchor": anchor,
         "sessionId": input.session_id,
         "transcriptPath": input.transcript_path,
         "branch": branch,
@@ -153,8 +162,13 @@ mod tests {
             "myrepo",
             false,
             false,
+            "ready",
         );
         assert_eq!(rec["ts"], "2026-06-21T00:00:00Z");
+        // The anchor kind is what keeps the ledger interpretable once one
+        // branch can trip two anchors (#325) — a row without it cannot be told
+        // apart from a second genuine ship of the same branch.
+        assert_eq!(rec["anchor"], "ready");
         assert_eq!(rec["sessionId"], "s1");
         assert_eq!(rec["transcriptPath"], "/tmp/t.jsonl");
         assert_eq!(rec["branch"], "feat/x");
@@ -169,7 +183,15 @@ mod tests {
 
     #[test]
     fn record_marks_polished_true() {
-        let rec = build_polish_nudge_record("ts", &sample_input(), "feat/x", "myrepo", true, false);
+        let rec = build_polish_nudge_record(
+            "ts",
+            &sample_input(),
+            "feat/x",
+            "myrepo",
+            true,
+            false,
+            "create",
+        );
         assert_eq!(rec["polished"], true);
         assert_eq!(rec["markerPresent"], false);
     }
@@ -177,7 +199,15 @@ mod tests {
     #[test]
     fn record_marks_marker_present_true() {
         // `markerPresent` serializes both signals independently of `polished`.
-        let rec = build_polish_nudge_record("ts", &sample_input(), "feat/x", "myrepo", false, true);
+        let rec = build_polish_nudge_record(
+            "ts",
+            &sample_input(),
+            "feat/x",
+            "myrepo",
+            false,
+            true,
+            "create",
+        );
         assert_eq!(rec["markerPresent"], true);
         assert_eq!(rec["polished"], false);
     }
