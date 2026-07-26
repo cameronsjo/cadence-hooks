@@ -130,16 +130,14 @@ const TRANSCRIPT_READ_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Schema version stamped on every `plan-links.jsonl` row. A new stream
 /// (cadence#238 convention) — does not share `cadence_hooks_metrics::common`'s
-/// existing version constants; this one lives with its own writer.
-///
-/// A v2 bump (raw `host` → the salted machine digest, `repo` dropped) rode
-/// this PR briefly (#432 review) but was descoped: a second security pass
-/// established `host`/`repo` are PRE-EXISTING fields on the `main`-tracked
-/// writer, not introduced by this change — this PR only adds a SECOND writer
-/// to the same stream. Changing an existing stream's privacy posture is a
-/// standalone fix with its own review, not something that should ride an
-/// unrelated PR; tracked separately by the reviewer rather than folded here.
-const PLAN_LINKS_SCHEMA_VERSION: u32 = 1;
+/// existing version constants; this one lives with its own writer. Bumped to
+/// 2 (cameronsjo/cadence-hooks#396 review): `host` now carries the salted
+/// [`crate::provenance::machine_digest`] instead of the raw hostname (matching
+/// the committed frontmatter's own field two functions up), and `repo` is
+/// dropped — `plan_path` is already repo-relative, so `repo` was a second,
+/// separately-drifting way to say the same thing; confirmed no consumer
+/// (`reconstruct-journey.py`) reads either field before dropping it.
+const PLAN_LINKS_SCHEMA_VERSION: u32 = 2;
 
 /// Persist an approved plan whose post-approval turn was wiped
 /// (approve-and-clear, cross-session).
@@ -284,7 +282,7 @@ pub fn run_persist_plan(
         utc_now,
         parent_session_id,
         session_id,
-        host,
+        &machine_digest,
         &repo_root,
         approved_label,
     )
@@ -383,7 +381,7 @@ pub fn run_persist_plan_approval(
         utc_now,
         Some(session_id),
         session_id,
-        host,
+        &machine_digest,
         &repo_root,
         &own_name,
     )
@@ -1005,7 +1003,7 @@ fn persist_and_nudge(
     utc_now: &str,
     parent_session_id: Option<&str>,
     child_session_id: &str,
-    host: &str,
+    machine_digest: &str,
     repo_root: &Path,
     approved_label: &str,
 ) -> CheckResult {
@@ -1029,8 +1027,7 @@ fn persist_and_nudge(
         utc_now,
         parent_session_id,
         child_session_id,
-        host,
-        &repo_root.to_string_lossy(),
+        machine_digest,
         &plan_path_rel,
         body_hash,
     ));
@@ -1046,12 +1043,21 @@ fn persist_and_nudge(
 // Linkage row (Approach step 5)
 // ---------------------------------------------------------------------------
 
+/// Schema v2 (cameronsjo/cadence-hooks#396 review; v1 carried a raw `host`
+/// hostname and a separate `repo` field). `machine` is the salted
+/// [`crate::provenance::machine_digest`] — the same doctrine fix (cadence#248)
+/// the committed frontmatter already applies, now consistent across BOTH the
+/// committed artifact and this local-only telemetry stream. `repo` is
+/// dropped: `plan_path` is already repo-relative, so `repo` was a second,
+/// independently-drifting way to say the same thing. Confirmed no consumer
+/// (`reconstruct-journey.py`, which reads only `parent_session_id`,
+/// `body_sha256`, and `plan_path`) depends on either the old `host` or `repo`
+/// fields before making this change.
 fn plan_links_row(
     utc_now: &str,
     parent_session_id: Option<&str>,
     child_session_id: &str,
-    host: &str,
-    repo: &str,
+    machine_digest: &str,
     plan_path: &str,
     body_hash: &str,
 ) -> Value {
@@ -1060,8 +1066,7 @@ fn plan_links_row(
         "ts": utc_now,
         "parent_session_id": parent_session_id,
         "child_session_id": child_session_id,
-        "host": host,
-        "repo": repo,
+        "machine": machine_digest,
         "plan_path": plan_path,
         "body_sha256": body_hash,
     })
@@ -2132,19 +2137,21 @@ mod tests {
             "2026-07-20T00:00:00Z",
             Some("parent-sid"),
             "child-sid",
-            "host",
-            "/repo",
+            "digest",
             "docs/plans/2026-07-20-x.md",
             "hash",
         );
-        assert_eq!(row["schemaVersion"], 1);
+        assert_eq!(row["schemaVersion"], 2);
         assert_eq!(row["ts"], "2026-07-20T00:00:00Z");
         assert_eq!(row["parent_session_id"], "parent-sid");
         assert_eq!(row["child_session_id"], "child-sid");
-        assert_eq!(row["host"], "host");
-        assert_eq!(row["repo"], "/repo");
+        assert_eq!(row["machine"], "digest");
         assert_eq!(row["plan_path"], "docs/plans/2026-07-20-x.md");
         assert_eq!(row["body_sha256"], "hash");
+        assert!(
+            row.get("host").is_none() && row.get("repo").is_none(),
+            "v2 drops both the raw host and the repo field: {row}"
+        );
     }
 
     #[test]
@@ -2153,8 +2160,7 @@ mod tests {
             "2026-07-20T00:00:00Z",
             None,
             "child-sid",
-            "host",
-            "/repo",
+            "digest",
             "docs/plans/2026-07-20-x.md",
             "hash",
         );
@@ -2251,12 +2257,17 @@ mod tests {
         // plan_path is forward-slash-normalized regardless of platform — a
         // stable schema value for consumers, not the native separator.
         assert!(links.contains("\"plan_path\":\"docs/plans/2026-07-20-fix-the-widget.md\""));
-        // Local-only metrics KEEP the bare hostname — only the committed doc
-        // block is salted (cadence#248). Schema v1: unchanged by this PR — a
-        // v2 bump (digest instead of raw host, repo dropped) rode this PR
-        // briefly but was descoped as a standalone privacy fix, since both
-        // fields are pre-existing on this stream, not introduced here.
-        assert!(links.contains("\"host\":\"test-host\""));
+        // Schema v2 (cameronsjo/cadence-hooks#396 review): the local-only
+        // linkage row now ALSO carries the salted digest — matching the
+        // committed frontmatter's own `machine` field — never the raw
+        // hostname, and no separate `repo` field.
+        assert!(links.contains(&format!(
+            "\"machine\":\"{}\"",
+            crate::provenance::machine_digest("test-host")
+        )));
+        assert!(!links.contains("test-host"));
+        assert!(!links.contains("\"host\""));
+        assert!(!links.contains("\"repo\""));
     }
 
     #[test]
@@ -2636,7 +2647,10 @@ mod tests {
         let links = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
         assert!(links.contains("\"parent_session_id\":\"own-session-id\""));
         assert!(links.contains("\"child_session_id\":\"own-session-id\""));
-        assert!(links.contains("\"host\":\"test-host\""));
+        assert!(links.contains(&format!(
+            "\"machine\":\"{}\"",
+            crate::provenance::machine_digest("test-host")
+        )));
     }
 
     #[test]
