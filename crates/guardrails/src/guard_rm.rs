@@ -129,12 +129,22 @@ use DirectoryVerb::{Cd, PopDirectory, PushDirectory};
 /// Leading words that keep a following builtin in **this** shell, so a `cd`
 /// behind them still moves the caller's directory.
 ///
-/// Deliberately narrower than [`TRANSPARENT`]: `env`, `nice`, `nohup` and
-/// `time` run their argument as a child process, and a `cd` in a child cannot
-/// move the parent's `$PWD` at all. Treating those as directory changes would
-/// invent a move the shell never made and resolve later relative targets
-/// against the wrong directory.
-const CD_PRESERVING_PREFIXES: &[&str] = &["command", "builtin"];
+/// Deliberately narrower than [`TRANSPARENT`]: `env`, `nice` and `nohup` are
+/// programs that run their argument as a **child process**, and a `cd` in a
+/// child cannot move the parent's `$PWD` at all. Treating those as directory
+/// changes would invent a move the shell never made.
+///
+/// `time` is here precisely because that reasoning does **not** apply to it: it
+/// is a shell **reserved word**, not a program, so `time cd ~` runs `cd` in the
+/// current shell and does move `$PWD` (verified in both `bash` and `zsh`). The
+/// external `/usr/bin/time` does fork — but reaching it requires `command time`
+/// or `\time`, and those spellings put a *different* word in this position, so
+/// the raw-name match here correctly declines them.
+///
+/// `eval` likewise runs its argument in the current shell: `eval cd ~` moves
+/// `$PWD`. Only the unquoted form is caught — `eval "cd ~"` arrives as a single
+/// token that no basename match can see into.
+const CD_PRESERVING_PREFIXES: &[&str] = &["command", "builtin", "time", "eval"];
 
 /// The directory-changing verb this segment starts with, plus the index of its
 /// first argument. `None` when the segment does not change the directory.
@@ -149,7 +159,10 @@ const CD_PRESERVING_PREFIXES: &[&str] = &["command", "builtin"];
 fn directory_change(tokens: &[String]) -> Option<(DirectoryVerb, usize)> {
     let mut idx = 0;
     while let Some(tok) = tokens.get(idx) {
-        if is_assignment_word(tok) || CD_PRESERVING_PREFIXES.contains(&tok.as_str()) {
+        // `command_word`, not the raw token — the whole premise of #428 is that
+        // `\cd` was a missed spelling, and comparing the prefix raw would leave
+        // `\command cd` as the identical escape one token to the left.
+        if is_assignment_word(tok) || CD_PRESERVING_PREFIXES.contains(&command_word(tok)) {
             idx += 1;
         } else {
             break;
@@ -335,6 +348,10 @@ fn collect_targets(
     // "unknown" so a matched push/pop pair returns to a directory this parser
     // can still name.
     let mut dir_stack: Vec<(String, bool)> = Vec::new();
+    // False once the shell's stack and this model diverge — a `-n` or `+N`
+    // argument edits the stack in a way not tracked here, after which a later
+    // `popd` would restore a directory that is a guess rather than a record.
+    let mut stack_reliable = true;
 
     for (segment, _next_op) in split_segments_with_ops(script) {
         let segment = strip_group_wrappers(&segment);
@@ -356,15 +373,52 @@ fn collect_targets(
         // `$VAR`, or a missing target as unresolvable. Mirrors
         // `collect_commit_targets`.
         if let Some((verb, arg_start)) = directory_change(&tokens) {
+            // `pushd`/`popd` OPTIONS change what the builtin DOES, so they have
+            // to be read rather than stepped over as noise. `-n` suppresses the
+            // directory change outright — `pushd -n <dir>` pushes and STAYS —
+            // and skipping it consumed `<dir>` as a `cd` target, which moved
+            // the tracked directory where the shell had not. From `$HOME`,
+            // `pushd -n /tmp; rm -rf Documents` then read as a temp delete
+            // while bash removed `~/Documents`: a BLOCK turned into a silent
+            // ALLOW by this very change.
+            let args = tokens.get(arg_start..).unwrap_or_default();
+            let suppressed = args.iter().any(|a| a == "-n");
+            // `+N` / `-N` rotate to a stack entry this parser never named.
+            let rotation = args.iter().any(|a| {
+                a.len() > 1
+                    && (a.starts_with('+') || a.starts_with('-'))
+                    && a[1..].chars().all(|c| c.is_ascii_digit())
+            });
+
             if verb == PopDirectory {
-                // Restore what `pushd` saved. An empty stack means the shell
-                // errored and stayed put, so the directory is UNCHANGED — not
-                // unknown. Treating it as unknown would prompt about a file in
-                // a directory this parser can name perfectly well.
-                if let Some((dir, known)) = dir_stack.pop() {
+                if suppressed || rotation {
+                    // The directory does NOT move; only the stack changes, in a
+                    // way this parser no longer mirrors.
+                    stack_reliable = false;
+                } else if !stack_reliable {
+                    // A prior unmodeled stack edit means whatever this would
+                    // restore is a guess.
+                    dir_known = false;
+                } else if let Some((dir, known)) = dir_stack.pop() {
                     effective_dir = dir;
                     dir_known = known;
                 }
+                // An empty stack with nothing unmodeled means the shell errored
+                // and stayed put — UNCHANGED, not unknown. Treating it as
+                // unknown would prompt about a file in a directory this parser
+                // can name perfectly well.
+                continue;
+            }
+
+            if suppressed {
+                // Pushes onto the stack and stays. The directory is unchanged;
+                // the stack gains an entry this parser is not tracking.
+                stack_reliable = false;
+                continue;
+            }
+            if rotation {
+                stack_reliable = false;
+                dir_known = false;
                 continue;
             }
 
@@ -422,10 +476,14 @@ fn collect_targets(
         // flag grammar (`env -u` and `nice -n` take a value, `env -i` does not),
         // and guessing wrong would skip past the delete verb itself. Gated on a
         // delete verb actually appearing, so `env -i ls` stays silent.
-        if argv
-            .first()
-            .is_some_and(|first| TRANSPARENT.contains(&command_word(first)))
-            && tokens.iter().any(|t| is_delete_verb(t))
+        // `eval` joins the prefix set here: it is in neither `TRANSPARENT` nor
+        // the shell-preserving list, so `eval rm -rf ~/Documents` matched no
+        // delete verb in command position and collected nothing — the same
+        // silent ALLOW, and an explicit row in #426's table.
+        if argv.first().is_some_and(|first| {
+            let word = command_word(first);
+            TRANSPARENT.contains(&word) || word == "eval"
+        }) && tokens.iter().any(|t| is_delete_verb(t))
         {
             out.push(TargetToken::Unresolvable);
             continue;
@@ -1008,11 +1066,53 @@ mod tests {
     /// would invent a change the shell never made and misjudge later targets.
     #[test]
     fn subprocess_prefixed_cd_does_not_move_the_shell() {
-        // `env cd` runs (or fails to run) a `cd` binary in a child; the parent
-        // stays in /private/tmp, where `Documents` is an ordinary temp path.
+        // `env`/`nice`/`nohup` are PROGRAMS: they run their argument in a child,
+        // where a `cd` cannot move the parent's `$PWD`. The parent stays in
+        // /private/tmp, where `Documents` is an ordinary temp path.
+        for command in [
+            "env cd ~; rm -rf Documents",
+            "nice cd ~; rm -rf Documents",
+            "nohup cd ~; rm -rf Documents",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Allow,
+                "a child's cd must not be modeled as a move: {command}"
+            );
+        }
+    }
+
+    /// `time` and `eval` are the counter-examples, and the reason the prefix
+    /// list is a list rather than "everything transparent". `time` is a shell
+    /// RESERVED WORD, not a program — `time cd ~` runs `cd` in the current
+    /// shell and moves `$PWD` (verified in bash and zsh). `eval` likewise.
+    /// Excluding them on a child-process premise was factually wrong.
+    #[test]
+    fn shell_word_prefixed_cd_does_move_the_shell() {
+        for command in [
+            "time cd ~; rm -rf Documents",
+            "eval cd ~; rm -rf Documents",
+            // And the backslash form of a prefix, which the raw-token compare
+            // missed — the same escape #428 closed for `\cd`, one token left.
+            r"\command cd ~; rm -rf Documents",
+            r"\builtin cd ~; rm -rf Documents",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Block,
+                "this spelling moves the shell: {command}"
+            );
+        }
+    }
+
+    /// `eval rm -rf ~/Documents` is an explicit row in #426's table: `eval` is
+    /// in neither the transparent set nor the shell-preserving one, so no
+    /// delete verb sat in command position and nothing was collected.
+    #[test]
+    fn eval_wrapped_delete_is_unresolvable() {
         assert_eq!(
-            judge("env cd ~; rm -rf Documents", "/private/tmp"),
-            Outcome::Allow
+            judge("eval rm -rf ~/Documents", "/private/tmp"),
+            Outcome::Ask
         );
     }
 
@@ -1031,6 +1131,97 @@ mod tests {
             judge("pushd; rm notes.txt", "/private/tmp"),
             Outcome::Allow,
             "a bare pushd on an empty stack errors and stays"
+        );
+    }
+
+    /// The assertion with real differential power: `popd` must restore a
+    /// DIFFERENT directory than the one in effect.
+    ///
+    /// The three cases above all resolve to the cwd whether or not the stack
+    /// exists, so every one of them passes with `pushd`/`popd` unrecognized —
+    /// they pin the absence of a false prompt, not the presence of the stack.
+    /// This one returns `Allow` against the unfixed code and `Block` with it.
+    #[test]
+    fn popd_restores_a_different_directory() {
+        assert_eq!(
+            judge(
+                "cd /private/tmp; pushd /private/tmp/build; popd; rm -rf Documents",
+                &home()
+            ),
+            Outcome::Allow,
+            "popd returns to /private/tmp, where Documents is a temp path"
+        );
+        assert_eq!(
+            judge(
+                "cd ~; pushd /private/tmp; popd; rm -rf Documents",
+                "/private/tmp"
+            ),
+            Outcome::Block,
+            "popd returns to HOME, where Documents is a protected child"
+        );
+    }
+
+    /// `pushd -n <dir>` pushes and STAYS. Skipping `-n` as noise consumed
+    /// `<dir>` as a `cd` target and moved the tracked directory where the shell
+    /// had not — from `$HOME`, `pushd -n /tmp; rm -rf Documents` read as a temp
+    /// delete while bash removed `~/Documents`. A BLOCK turned into a silent
+    /// ALLOW by the stack model itself, which is the sharpest way this change
+    /// could have gone wrong.
+    #[test]
+    fn pushd_dash_n_does_not_move_the_directory() {
+        assert_eq!(
+            judge("pushd -n /private/tmp; rm -rf Documents", &home()),
+            Outcome::Block,
+            "-n suppresses the move; Documents is still a home child"
+        );
+        assert_eq!(
+            judge(
+                "cd ~; pushd -n /private/tmp; rm -rf Documents",
+                "/private/tmp"
+            ),
+            Outcome::Block
+        );
+    }
+
+    /// `popd -n` and `popd +N` drop a stack entry without moving. Restoring as
+    /// if they had moved would hand a later relative target the wrong directory.
+    #[test]
+    fn popd_options_do_not_restore() {
+        // Both directions, because a model that is wrong one way is usually
+        // wrong the other too. bash ground truth, from /private/tmp:
+        //   pushd ~; popd -n  -> PWD=~             (drops an entry, STAYS)
+        //   pushd ~; popd     -> PWD=/private/tmp  (restores)
+        assert_eq!(
+            judge("pushd ~; popd -n; rm -rf Documents", "/private/tmp"),
+            Outcome::Block,
+            "popd -n does not move: still in ~, where Documents is protected"
+        );
+        assert_eq!(
+            judge("pushd ~; popd +1; rm -rf Documents", "/private/tmp"),
+            Outcome::Block,
+            "popd +N drops a non-top entry without moving"
+        );
+        // The complement: staying put is only correct when the shell is
+        // genuinely somewhere harmless.
+        assert_eq!(
+            judge(
+                "cd ~; pushd /private/tmp; popd -n; rm -rf Documents",
+                "/private/tmp"
+            ),
+            Outcome::Allow,
+            "here staying put leaves the shell in /private/tmp, a temp path"
+        );
+    }
+
+    /// A stack rotation moves to an entry this parser never named.
+    #[test]
+    fn pushd_rotation_marks_the_directory_unknown() {
+        assert_eq!(
+            judge(
+                "cd ~; pushd /private/tmp; pushd -1; rm -rf build",
+                "/private/tmp"
+            ),
+            Outcome::Ask
         );
     }
 
