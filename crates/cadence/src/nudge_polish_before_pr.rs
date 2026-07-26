@@ -12,11 +12,20 @@
 //! happened in the web UI, which no Bash hook can see (#325). It is admitted
 //! only in the spelling whose target this check can actually resolve: gh selects
 //! "the pull request that belongs to the current branch" when given no argument,
-//! so a bare merge is about the cwd's branch by construction. A merge naming a
-//! number, URL, or branch — or carrying a `--repo` override — stays excluded,
-//! which is exactly the orchestrator shape that got merge excluded originally:
-//! merging from `main` or another cwd REQUIRES naming the PR, so the shapes that
-//! would mis-resolve cannot reach the anchor.
+//! so a bare merge is about the cwd's branch. A merge naming a number, URL, or
+//! branch — or retargeted at another repository by any of `--repo`/`-R` in
+//! either position, the attached `-Rowner/r` form, or an inline `GH_REPO=`
+//! assignment — stays excluded. That is the orchestrator shape merge was
+//! excluded for originally: merging from `main` or another cwd requires naming
+//! the PR.
+//!
+//! Two routes still hide a selector from the check, both nudge-only: an
+//! *exported* `GH_REPO` leaves no token in the command string, and a token
+//! written after a `&`-bearing redirect lands in a different segment
+//! (`gh pr merge 2>&1 12`). Enumerated at
+//! [`cadence_hooks_core::shell::is_polish_ship_anchor`] rather than papered
+//! over — the anchor is the best reading of the command text, not a proof about
+//! what gh will do.
 //!
 //! The web-UI ready-flip remains unclosable here by construction — a browser
 //! click passes through no hooked Bash call at all.

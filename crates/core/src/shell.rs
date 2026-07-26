@@ -298,15 +298,23 @@ impl GhPrInvocation<'_> {
     /// `--repo`/`-R` after the subcommand as readily as before it, and the
     /// attached spellings (`--repo=owner/r`, `-Rowner/r`) start with `-`, so
     /// the operand rule alone would wave them through while gh merged a PR in
-    /// a different repository entirely (security review). Checking both halves
-    /// is what makes "targets the current branch" true rather than merely
-    /// probable.
+    /// a different repository entirely (security review).
     ///
-    /// **Not detectable, by construction:** an *exported* `GH_REPO`/`GH_HOST`.
-    /// This reads the command string, and an environment variable set in an
-    /// earlier shell leaves no token behind. The inline assignment form is
-    /// caught (see [`gh_pr_invocation`]); the exported form is a residual
-    /// false-nudge route, bounded by being nudge-only.
+    /// The honest scope of the result: **every retargeting spelling and every
+    /// operand this segment can see.** Two routes hide a selector from it
+    /// anyway, both nudge-only, and neither closable here:
+    ///
+    /// - An *exported* `GH_REPO`/`GH_HOST`. This reads the command string, and
+    ///   a variable set in an earlier shell leaves no token behind. The inline
+    ///   assignment form IS caught — see [`gh_pr_invocation`].
+    /// - A selector written after a `&`-bearing redirect: [`split_segments`]
+    ///   cuts at the `&` of `2>&1`, so `gh pr merge 2>&1 12` puts the `12` in a
+    ///   different segment entirely. That is the segmenter's reach, shared
+    ///   repo-wide, not this rule's — and unlike `ready`/`create`, which never
+    ///   inspect operands, `merge` is the only anchor that loses anything to it.
+    ///
+    /// So this returns "targets the current branch" as the best available
+    /// reading of the command text, not as a proof about what gh will do.
     fn targets_the_current_branch(&self) -> bool {
         !self.retargeted && operands_are_flags_only(self.operands)
     }
@@ -326,8 +334,13 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
     let mut i = 0;
     while let Some(token) = operands.get(i) {
         let token = token.as_str();
-        // A comment ends the command; nothing after it reaches gh.
-        if token.starts_with('#') {
+        // A comment ends the command; nothing after it reaches gh. The test is
+        // EQUALITY, not a prefix: `tokenize` emits a real comment marker as its
+        // own `#` token, while a quoted flag value can merely begin with one
+        // (`-t '#123'`). Treating that value as a comment stopped the scan and
+        // let a PR number *after* it through unexamined — a selector smuggled
+        // past the gate, which is the unsafe direction (security review).
+        if token == "#" {
             return true;
         }
         if is_redirect_token(token) {
@@ -1859,19 +1872,28 @@ mod tests {
             "gh pr merge --squash &> /tmp/out.log"
         ));
         assert!(is_polish_ship_anchor("gh pr merge --squash # ship it"));
-        // Skipping redirections must not smuggle a PR selector past the gate:
-        // a number is still a number wherever it sits.
+        // Skipping a redirection must not smuggle a PR selector past the gate.
+        // This holds for every redirect the skip itself governs — the operand
+        // test still runs on what follows.
         assert!(!is_polish_ship_anchor("gh pr merge 12 > /tmp/out.log"));
         assert!(!is_polish_ship_anchor("gh pr merge > /tmp/out.log 12"));
+        assert!(!is_polish_ship_anchor("gh pr merge >log 12"));
+        assert!(!is_polish_ship_anchor("gh pr merge >>log 12"));
         assert!(!is_polish_ship_anchor(
             "gh pr merge -Rowner/other --squash 2>&1 | tail"
         ));
-        // Note the limit this pins around: `split_segments` treats the `&` of
-        // `2>&1` as a separator, so a flag written AFTER that redirect lands in
-        // a different segment and no anchor can see it. That is the segmenter's
-        // reach, shared by `ready` and `create`, not this rule's — which is why
-        // the repo-override case above is written in the ordering a shell user
-        // actually types.
+        // A `#` INSIDE a flag value is not a comment marker — stopping there
+        // would leave the `12` after it unexamined, smuggling a selector past
+        // the gate. Only a standalone `#` ends the command.
+        assert!(!is_polish_ship_anchor("gh pr merge -t '#123' 12"));
+        // The limit this does NOT reach, stated rather than implied:
+        // `split_segments` cuts at the `&` of `2>&1`, so a token written after
+        // that redirect lands in a different segment — `gh pr merge 2>&1 12`
+        // anchors despite naming a PR. That is `command_segments`' reach,
+        // shared repo-wide; `merge` is simply the only anchor that inspects
+        // operands, so it is the only one that loses anything to it. Pinned
+        // here as a KNOWN hole so a future segmenter fix has a test to flip.
+        assert!(is_polish_ship_anchor("gh pr merge 2>&1 12"));
     }
 
     #[test]
