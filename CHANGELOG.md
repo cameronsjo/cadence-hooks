@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.68.0] - 2026-07-25
 
 ### Added
 
@@ -25,6 +25,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **Same-command variable expansion was built for this release and withdrawn.** `SP=/tmp/x; rm -rf "$SP"` still asks. Three adversarial review rounds found sixteen silent-ALLOW misses in it; the third round found four *categorically* new routes rather than variations — `printf -v` re-binding through argument position, a transparent prefix defeating the variable-mutating-builtin gate, `IFS` redefining what a separator is, and subshell scoping erased by `strip_group_wrappers`. The gate was also shown to create a new evasion of an existing hard block: appending `; unset FOO` downgraded a `$HOME` BLOCK to an approvable prompt. The shell moves a variable through more routes than a parser at this altitude can enumerate, and each round of enumeration found the next one. Nothing regressed by withdrawing it — every affected shape returns to the verdict it has today.
   **Not fixed here, filed instead**, all three present before this change and each requiring a primitive shared with `enforce_worktree`: a transparent prefix carrying a flag collects zero targets and reads as "not a deletion" (`env -i rm -rf ~/Documents` allows — cameronsjo/cadence-hooks#426); a `..` behind a glob metachar escapes the parent-segment check (`rm -rf /private/tmp/*/../../..` allows — #427); and `cd` tracking misses `command cd`, `builtin cd`, `\cd`, a prefix-assigned `cd`, and `pushd` (#428).
 
+- **`session persist-plan-approval` fires plan persistence on same-session `ExitPlanMode` approval, not just the approve-and-clear wipe (cameronsjo/cadence-hooks#396).** The existing `persist-plan` UserPromptSubmit trigger only ever saw the harness's re-injected `Implement the following plan:` prompt — a plan approved without leaving the session (no `/clear`, no injected prompt) left no durable trace. A live probe confirmed `PostToolUse:ExitPlanMode` fires on that path and carries the plan text in `tool_response.plan` (`tool_input.plan` is empty there). Both triggers now share one persist core and emit frontmatter (`status: in-flight`, `body_sha256`, `approved_in`/`approved_session_id`, ...) in place of the old plain-text provenance trailer; idempotency anchors on the parsed `body_sha256` frontmatter key, so a plan body that grows after persist (ticked checkboxes, appended `## Deviations`/`## Learnings`) is still recognized as the same plan on a re-fire. Closes #396.
+
+- **`session start` now discloses in-flight/blocked plans from `docs/plans/*.md` frontmatter (cameronsjo/cadence-hooks#429).** A resuming session (an auth-swap restart, `/clear`) had no memory of what plan was open — this reads it back from the plan's own frontmatter (`status`/`next`/`branch`/`pr`) at `SessionStart`, with no GitHub call. Reuses `persist-plan`'s existing bounded frontmatter scan (`leading_frontmatter_block`) rather than a new YAML dependency or a second scan implementation, and extends the existing `session start` disclosure — joined alongside the worktree-posture line and peer disclosure — rather than adding an 8th SessionStart hook row. Opt-out by absence: a plan with no frontmatter, or frontmatter carrying no `status:` key (every plan predating #396, and the 2026-07-24 retrofit batch that only added provenance keys), is silently skipped; this never bulk-adopts the legacy corpus.
 
 ### Changed
 

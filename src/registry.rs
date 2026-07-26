@@ -353,7 +353,7 @@ pub const HOOKS: &[HookEntry] = &[
     // session (cadence-canon)
     HookEntry {
         name: "start",
-        description: "Register this session in the repo registry and disclose live peers",
+        description: "Register this session, disclose live peers, and surface in-flight plans",
         plugin: "session",
         event: Some(HookEvent::SessionStart),
     },
