@@ -110,11 +110,11 @@ fn is_delete_verb(token: &str) -> bool {
 
 /// A directory-changing builtin, as [`directory_change`] classifies it.
 ///
-/// `pushd`/`popd` are modeled with a real stack rather than collapsed into
-/// "directory unknown". Declaring defeat on `popd` is safe but noisy: a bare
-/// `popd` with no prior `pushd` leaves the shell exactly where it was, so
-/// treating it as unknown turns `popd; rm notes.txt` into a prompt about a
-/// file in the directory the parser already knows.
+/// `popd` is deliberately collapsed to "directory unknown" rather than modeled
+/// with a stack. The stack version was built, produced a silent-ALLOW
+/// regression in two consecutive review rounds, and was withdrawn — see the
+/// note at its call site. The cost is a prompt on `popd; rm notes.txt`, which
+/// is the honest price of not modeling a structure this parser cannot see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryVerb {
     /// `cd` — moves, keeps no stack entry.
@@ -368,15 +368,6 @@ fn collect_targets(
     // target after that resolves against a directory the shell has already
     // left, so it must not carry the old directory's verdict.
     let mut dir_known = cwd_known;
-    // The `pushd`/`popd` directory stack, each entry carrying whether that
-    // directory was itself resolvable. Modeled rather than collapsed to
-    // "unknown" so a matched push/pop pair returns to a directory this parser
-    // can still name.
-    let mut dir_stack: Vec<(String, bool)> = Vec::new();
-    // False once the shell's stack and this model diverge — a `-n` or `+N`
-    // argument edits the stack in a way not tracked here, after which a later
-    // `popd` would restore a directory that is a guess rather than a record.
-    let mut stack_reliable = true;
 
     for (segment, _next_op) in split_segments_with_ops(script) {
         let segment = strip_group_wrappers(&segment);
@@ -398,78 +389,48 @@ fn collect_targets(
         // `$VAR`, or a missing target as unresolvable. Mirrors
         // `collect_commit_targets`.
         if let Some((verb, arg_start)) = directory_change(&tokens) {
-            // `pushd`/`popd` OPTIONS change what the builtin DOES, so they have
-            // to be read rather than stepped over as noise. `-n` suppresses the
-            // directory change outright — `pushd -n <dir>` pushes and STAYS —
-            // and skipping it consumed `<dir>` as a `cd` target, which moved
-            // the tracked directory where the shell had not. From `$HOME`,
-            // `pushd -n /tmp; rm -rf Documents` then read as a temp delete
-            // while bash removed `~/Documents`: a BLOCK turned into a silent
-            // ALLOW by this very change.
-            // Scanned LEADING-ONLY, stopping at the first operand. bash parses
-            // these before the directory, and a `-n` that comes AFTER it does
-            // not suppress anything — `pushd <dir> -n` still moves (verified).
-            // Matching `-n` anywhere would invert the model for that shape,
-            // and would also read `pushd -- -n` (a real directory named `-n`)
-            // as suppressed.
-            let mut idx = arg_start;
-            let mut suppressed = false;
-            let mut rotation = false;
-            if verb != Cd {
-                while let Some(a) = tokens.get(idx) {
-                    if a == "--" {
-                        idx += 1;
-                        break;
-                    }
-                    let is_rotation = a.len() > 1
-                        && (a.starts_with('+') || a.starts_with('-'))
-                        && a[1..].chars().all(|c| c.is_ascii_digit());
-                    if a == "-n" {
-                        suppressed = true;
-                    } else if is_rotation {
-                        // `+N` / `-N` move to a stack entry never named here.
-                        rotation = true;
-                    } else if !(a.starts_with('-') && a.len() > 1) {
-                        break;
-                    }
-                    idx += 1;
-                }
-            }
-
+            // No stack. `popd` returns to an entry this parser does not model,
+            // so it marks the directory unknown — which is exactly what #428's
+            // own body proposed.
+            //
+            // A real `pushd`/`popd` stack WAS built here and withdrawn. It
+            // existed only to spare a prompt on `popd; rm notes.txt`, and it
+            // produced a BLOCK-to-silent-ALLOW regression in two consecutive
+            // review rounds: first `pushd -n` consuming its operand as a `cd`
+            // target, then the option scan inverting for a trailing `-n`. The
+            // plain-spelling fixes beside it stayed clean throughout. Same call
+            // this repo already made on same-command variable expansion — when
+            // each round of enumeration finds the next route rather than a
+            // variation of the last, the feature is the defect, and nothing
+            // regresses by removing it.
             if verb == PopDirectory {
-                if suppressed || rotation {
-                    // The directory does NOT move; only the stack changes, in a
-                    // way this parser no longer mirrors.
-                    stack_reliable = false;
-                } else if !stack_reliable {
-                    // A prior unmodeled stack edit means whatever this would
-                    // restore is a guess.
-                    dir_known = false;
-                } else if let Some((dir, known)) = dir_stack.pop() {
-                    effective_dir = dir;
-                    dir_known = known;
-                }
-                // An empty stack with nothing unmodeled means the shell errored
-                // and stayed put — UNCHANGED, not unknown. Treating it as
-                // unknown would prompt about a file in a directory this parser
-                // can name perfectly well.
-                continue;
-            }
-
-            if suppressed {
-                // Pushes onto the stack and stays. The directory is unchanged;
-                // the stack gains an entry this parser is not tracking.
-                stack_reliable = false;
-                continue;
-            }
-            if rotation {
-                stack_reliable = false;
                 dir_known = false;
                 continue;
             }
 
+            let mut idx = arg_start;
+
+            // `pushd`'s options are read off the FIRST argument only — no
+            // positional scan, because distinguishing a leading `-n` from a
+            // trailing one is the subtlety that broke twice.
+            if verb == PushDirectory
+                && let Some(first) = tokens.get(idx)
+            {
+                if first == "-n" {
+                    // Suppresses the move outright: `pushd -n <dir>` pushes and
+                    // STAYS, so the directory is UNCHANGED — not unknown.
+                    continue;
+                }
+                if first.starts_with('-') || first.starts_with('+') {
+                    // A `+N`/`-N` rotation, a `--`, or any option not modeled
+                    // here: the shell moves somewhere this parser cannot name.
+                    dir_known = false;
+                    continue;
+                }
+            }
+
             // `cd`'s own flags (`-L`, `-P`, `--`) carry no directory meaning, so
-            // they are still plain noise. A bare `-` is cd's previous-directory
+            // they are plain noise. A bare `-` is cd's previous-directory
             // operand, not a flag.
             if verb == Cd {
                 while tokens
@@ -480,38 +441,14 @@ fn collect_targets(
                 }
             }
 
-            // `pushd` saves the current directory before moving, so a later
-            // `popd` can restore it.
-            if verb == PushDirectory {
-                // A bare `pushd` swaps the top stack entry with the current
-                // directory; with an empty stack the shell errors and stays.
-                //
-                // Gated on `stack_reliable` like `popd`: a bare `pushd` is a
-                // move TO a stack entry, which is exactly the operation the
-                // flag exists to distrust. `pushd -n ~; pushd` lands the shell
-                // in `~` while an ungated swap left this parser in the cwd —
-                // a wrong ALLOW inside the stack model itself.
-                if tokens.get(idx).is_none() {
-                    if !stack_reliable {
-                        dir_known = false;
-                    } else if let Some(top) = dir_stack.last_mut() {
-                        std::mem::swap(&mut top.0, &mut effective_dir);
-                        std::mem::swap(&mut top.1, &mut dir_known);
-                    }
-                    continue;
-                }
-                dir_stack.push((effective_dir.clone(), dir_known));
-            }
-
-            // A bare `-`, a `+N`/`-N` stack rotation, a missing target, or an
-            // unexpanded variable makes the new directory UNKNOWN. Keeping the
-            // pre-cd directory was a silent ALLOW: `cd $HOME; rm -rf Documents`
-            // from a `/tmp` cwd resolved `Documents` under `/tmp` and allowed a
-            // delete of `~/Documents`.
+            // A bare `-`, a missing target (including a bare `pushd`, which
+            // swaps against a stack this no longer models), or an unexpanded
+            // variable makes the new directory UNKNOWN. Keeping the pre-cd
+            // directory was a silent ALLOW: `cd $HOME; rm -rf Documents` from a
+            // `/tmp` cwd resolved `Documents` under `/tmp` and allowed a delete
+            // of `~/Documents`.
             match tokens.get(idx) {
-                Some(target)
-                    if target != "-" && !target.starts_with('$') && !target.starts_with('+') =>
-                {
+                Some(target) if target != "-" && !target.starts_with('$') => {
                     effective_dir = resolve_cd_target(target, &effective_dir);
                 }
                 _ => dir_known = false,
@@ -1209,17 +1146,6 @@ mod tests {
         );
     }
 
-    /// A bare `pushd` is a move TO a stack entry, so it must distrust an
-    /// unmodeled stack the same way `popd` does. `pushd -n ~; pushd` lands the
-    /// shell in `~`, where an ungated swap left this parser in the cwd.
-    #[test]
-    fn bare_pushd_respects_an_unreliable_stack() {
-        assert_eq!(
-            judge("pushd -n ~; pushd; rm -rf Documents", "/private/tmp"),
-            Outcome::Ask
-        );
-    }
-
     /// `eval rm -rf ~/Documents` is an explicit row in #426's table: `eval` is
     /// in neither the transparent set nor the shell-preserving one, so no
     /// delete verb sat in command position and nothing was collected.
@@ -1231,57 +1157,25 @@ mod tests {
         );
     }
 
-    /// `popd` restores what `pushd` saved. With an empty stack the shell errors
-    /// and stays put, so the directory is UNCHANGED — not unknown. Collapsing it
-    /// to unknown would prompt about a file in a directory the parser can name.
+    /// With no stack, every `popd` marks the directory unknown. That is the
+    /// accepted cost of the withdrawal: these prompt rather than allow.
     #[test]
-    fn pushd_popd_stack_is_modeled_not_collapsed() {
-        assert_eq!(judge("popd; rm notes.txt", "/private/tmp"), Outcome::Allow);
+    fn popd_marks_the_directory_unknown() {
+        assert_eq!(judge("popd; rm notes.txt", "/private/tmp"), Outcome::Ask);
         assert_eq!(
             judge("pushd ~; popd; rm notes.txt", "/private/tmp"),
-            Outcome::Allow,
-            "a matched pair returns to a known directory"
+            Outcome::Ask
         );
+        // And it never carries a stale directory forward, which is the point.
         assert_eq!(
-            judge("pushd; rm notes.txt", "/private/tmp"),
-            Outcome::Allow,
-            "a bare pushd on an empty stack errors and stays"
+            judge("cd /private/tmp; popd; rm -rf Documents", &home()),
+            Outcome::Ask
         );
     }
 
-    /// The assertion with real differential power: `popd` must restore a
-    /// DIFFERENT directory than the one in effect.
-    ///
-    /// The three cases above all resolve to the cwd whether or not the stack
-    /// exists, so every one of them passes with `pushd`/`popd` unrecognized —
-    /// they pin the absence of a false prompt, not the presence of the stack.
-    /// This one returns `Allow` against the unfixed code and `Block` with it.
-    #[test]
-    fn popd_restores_a_different_directory() {
-        assert_eq!(
-            judge(
-                "cd /private/tmp; pushd /private/tmp/build; popd; rm -rf Documents",
-                &home()
-            ),
-            Outcome::Allow,
-            "popd returns to /private/tmp, where Documents is a temp path"
-        );
-        assert_eq!(
-            judge(
-                "cd ~; pushd /private/tmp; popd; rm -rf Documents",
-                "/private/tmp"
-            ),
-            Outcome::Block,
-            "popd returns to HOME, where Documents is a protected child"
-        );
-    }
-
-    /// `pushd -n <dir>` pushes and STAYS. Skipping `-n` as noise consumed
-    /// `<dir>` as a `cd` target and moved the tracked directory where the shell
-    /// had not — from `$HOME`, `pushd -n /tmp; rm -rf Documents` read as a temp
-    /// delete while bash removed `~/Documents`. A BLOCK turned into a silent
-    /// ALLOW by the stack model itself, which is the sharpest way this change
-    /// could have gone wrong.
+    /// `pushd -n <dir>` pushes and STAYS, so the directory is UNCHANGED — the
+    /// shape that turned a BLOCK into a silent ALLOW when `-n` was skipped as
+    /// noise and `<dir>` was consumed as a `cd` target.
     #[test]
     fn pushd_dash_n_does_not_move_the_directory() {
         assert_eq!(
@@ -1298,46 +1192,39 @@ mod tests {
         );
     }
 
-    /// `popd -n` and `popd +N` drop a stack entry without moving. Restoring as
-    /// if they had moved would hand a later relative target the wrong directory.
+    /// Options are read off the FIRST argument only. bash parses them before
+    /// the operand, so `pushd <dir> -n` still moves — and reading `-n`
+    /// positionally is the subtlety that broke twice.
     #[test]
-    fn popd_options_do_not_restore() {
-        // Both directions, because a model that is wrong one way is usually
-        // wrong the other too. bash ground truth, from /private/tmp:
-        //   pushd ~; popd -n  -> PWD=~             (drops an entry, STAYS)
-        //   pushd ~; popd     -> PWD=/private/tmp  (restores)
+    fn pushd_options_are_first_argument_only() {
         assert_eq!(
-            judge("pushd ~; popd -n; rm -rf Documents", "/private/tmp"),
+            judge("pushd ~ -n; rm -rf Documents", "/private/tmp"),
             Outcome::Block,
-            "popd -n does not move: still in ~, where Documents is protected"
+            "a trailing -n does not suppress: bash moves to ~"
         );
         assert_eq!(
-            judge("pushd ~; popd +1; rm -rf Documents", "/private/tmp"),
-            Outcome::Block,
-            "popd +N drops a non-top entry without moving"
-        );
-        // The complement: staying put is only correct when the shell is
-        // genuinely somewhere harmless.
-        assert_eq!(
-            judge(
-                "cd ~; pushd /private/tmp; popd -n; rm -rf Documents",
-                "/private/tmp"
-            ),
+            judge("pushd -n ~; rm -rf Documents", "/private/tmp"),
             Outcome::Allow,
-            "here staying put leaves the shell in /private/tmp, a temp path"
+            "a leading -n does suppress: the shell stays in /private/tmp"
         );
     }
 
-    /// A stack rotation moves to an entry this parser never named.
+    /// A rotation, a `--`, or a bare `pushd` all move somewhere this parser
+    /// cannot name.
     #[test]
-    fn pushd_rotation_marks_the_directory_unknown() {
-        assert_eq!(
-            judge(
-                "cd ~; pushd /private/tmp; pushd -1; rm -rf build",
-                "/private/tmp"
-            ),
-            Outcome::Ask
-        );
+    fn unmodeled_pushd_forms_mark_the_directory_unknown() {
+        for command in [
+            "pushd +1; rm -rf build",
+            "pushd -1; rm -rf build",
+            "pushd -- -n; rm -rf build",
+            "pushd; rm -rf build",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "unmodeled directory move must not carry the old dir: {command}"
+            );
+        }
     }
 
     /// A `pushd` whose target this parser cannot name must not carry the old
