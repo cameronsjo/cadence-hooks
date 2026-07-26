@@ -22,8 +22,11 @@
 //! Both triggers normalize to the same body-hash-idempotent write through
 //! [`persist_and_nudge`]: `claim_target`'s `O_EXCL` collision ladder, a shared
 //! frontmatter render ([`render_document`]), and one `plan-links.jsonl` row
-//! format. `PersistPlan` alone keeps the PLAN_PREFIX/suffix-strip extraction —
-//! that pipeline is specific to the harness's re-injected prompt shape.
+//! format. Both also run the plan text through
+//! [`strip_trailing_suffix_lines_and_trim`] before hashing (Design 18's
+//! cross-trigger normalization) — only [`PLAN_PREFIX`] stripping is
+//! UserPromptSubmit-exclusive, since `PersistPlanApproval` never sees an
+//! injected prompt to strip a prefix from in the first place.
 //!
 //! Never blocks (ADR-0001): every failure path — no prompt/no plan text, no
 //! match, no `cwd`, not a git repo, unsafe session id, exhausted suffix ladder,
@@ -119,10 +122,22 @@ const PARENT_SCAN_MAX_FILES: usize = 20;
 /// (this scan is a plain `Check`, not a git-spawning probe).
 const PARENT_SCAN_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Cap on the EXECUTING session's own transcript before resolving its
+/// model/harness from it — same defensive posture and size as
+/// [`PARENT_SCAN_MAX_FILE_BYTES`]'s sibling-scan cap. Real transcripts run
+/// single-digit MB; this is generous headroom against a pathological file.
+const TRANSCRIPT_READ_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Schema version stamped on every `plan-links.jsonl` row. A new stream
 /// (cadence#238 convention) — does not share `cadence_hooks_metrics::common`'s
-/// existing version constants; this one lives with its own writer.
-const PLAN_LINKS_SCHEMA_VERSION: u32 = 1;
+/// existing version constants; this one lives with its own writer. Bumped to
+/// 2 (cameronsjo/cadence-hooks#396 review): `host` now carries the salted
+/// [`crate::provenance::machine_digest`] instead of the raw hostname (matching
+/// the committed frontmatter's own field two functions up), and `repo` is
+/// dropped — `plan_path` is already repo-relative, so `repo` was a second,
+/// separately-drifting way to say the same thing; confirmed no consumer
+/// (`reconstruct-journey.py`) reads either field before dropping it.
+const PLAN_LINKS_SCHEMA_VERSION: u32 = 2;
 
 /// Persist an approved plan whose post-approval turn was wiped
 /// (approve-and-clear, cross-session).
@@ -210,28 +225,37 @@ pub fn run_persist_plan(
 
     let body_hash = sha256_hex(body.as_bytes());
     let slug = slugify(&body);
-    let plans_dir = repo_root.join("docs").join("plans");
-    if fs::create_dir_all(&plans_dir).is_err() {
+    let Some((repo_root, plans_dir)) = canonical_plans_dir(&repo_root) else {
         return CheckResult::allow();
-    }
+    };
     let stem = format!("{local_date}-{slug}");
 
-    let parent_session_id = input
+    let parent = input
         .transcript_path()
         .and_then(|tp| find_parent(Path::new(tp), &body_hash, SystemTime::now()));
-    let parent_name = parent_session_id.as_deref().map(identity::generate_name);
+    let parent_session_id = parent.as_ref().map(|p| p.session_id.as_str());
+    let parent_name = parent_session_id.map(identity::generate_name);
     let own_name = identity::generate_name(session_id);
     let machine_digest = crate::provenance::machine_digest(host);
 
+    // The EXECUTING session's own transcript is structurally empty at this
+    // point on a cross-session approve-and-clear wipe: the wipe IS a new
+    // session, so its transcript has no assistant turn yet — `resolve_model`/
+    // `resolve_harness` against it return `None`. Fall back to the APPROVING
+    // parent's already-resolved model/harness (from the same scan that
+    // resolved `approved_in`) rather than leaving the frontmatter fields
+    // permanently unresolved on this trigger's most common path
+    // (cameronsjo/cadence-hooks#396 review).
     let transcript_content = input
         .transcript_path()
-        .and_then(|tp| fs::read_to_string(tp).ok());
-    let model = crate::warn_commit_provenance::resolve_model(transcript_content.as_deref());
-    let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref());
+        .and_then(|tp| read_capped(Path::new(tp), TRANSCRIPT_READ_MAX_BYTES));
+    let model = crate::warn_commit_provenance::resolve_model(transcript_content.as_deref())
+        .or_else(|| parent.as_ref().and_then(|p| p.model.clone()));
+    let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref())
+        .or_else(|| parent.as_ref().and_then(|p| p.harness_version.clone()));
     let branch = current_branch(cwd);
 
     let approved_in = parent_session_id
-        .as_deref()
         .zip(parent_name.as_deref())
         .map(|(sid, name)| (name, sid));
 
@@ -256,9 +280,9 @@ pub fn run_persist_plan(
         &body_hash,
         &document,
         utc_now,
-        parent_session_id.as_deref(),
+        parent_session_id,
         session_id,
-        host,
+        &machine_digest,
         &repo_root,
         approved_label,
     )
@@ -276,14 +300,18 @@ pub fn run_persist_plan_approval(
         return CheckResult::allow();
     }
     // A subagent's own plan approval doesn't persist — only a top-level
-    // session's approval does (the plan doc's Task 1 step 2). `is_agent`
-    // rides `tool_response`, alongside `plan`.
-    if input
-        .tool_response
-        .as_ref()
-        .and_then(|tr| tr.is_agent)
-        .unwrap_or(false)
-    {
+    // session's approval does (the plan doc's Task 1 step 2). Deliberately
+    // fail-CLOSED here, the opposite of this hook's usual fail-open posture:
+    // persist only when `is_agent` is the EXPLICIT `Some(false)` AND
+    // `agent_id` is absent. An absent/unrecognized `is_agent` (a future
+    // payload-shape drift, or a stripped-down fixture) must not persist —
+    // treating it as "not a subagent" would forge `approved_in` attribution
+    // for a plan the top-level session never actually saw approved
+    // (cameronsjo/cadence-hooks#396 review).
+    let is_top_level_approval = input.tool_response.as_ref().and_then(|tr| tr.is_agent)
+        == Some(false)
+        && input.agent_id().is_none();
+    if !is_top_level_approval {
         return CheckResult::allow();
     }
     let Some(raw_plan) = input.tool_response_plan() else {
@@ -311,17 +339,20 @@ pub fn run_persist_plan_approval(
 
     let body_hash = sha256_hex(body.as_bytes());
     let slug = slugify(&body);
-    let plans_dir = repo_root.join("docs").join("plans");
-    if fs::create_dir_all(&plans_dir).is_err() {
+    let Some((repo_root, plans_dir)) = canonical_plans_dir(&repo_root) else {
         return CheckResult::allow();
-    }
+    };
     let stem = format!("{local_date}-{slug}");
 
     let own_name = identity::generate_name(session_id);
     let machine_digest = crate::provenance::machine_digest(host);
+    // Same-session approval: unlike `run_persist_plan`'s cross-session wipe,
+    // the executing transcript here HAS just recorded the approving turn (no
+    // wipe occurred), so it's a reliable model/harness source with no
+    // sibling-transcript fallback needed.
     let transcript_content = input
         .transcript_path()
-        .and_then(|tp| fs::read_to_string(tp).ok());
+        .and_then(|tp| read_capped(Path::new(tp), TRANSCRIPT_READ_MAX_BYTES));
     let model = crate::warn_commit_provenance::resolve_model(transcript_content.as_deref());
     let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref());
     let branch = current_branch(cwd);
@@ -350,7 +381,7 @@ pub fn run_persist_plan_approval(
         utc_now,
         Some(session_id),
         session_id,
-        host,
+        &machine_digest,
         &repo_root,
         &own_name,
     )
@@ -362,6 +393,38 @@ pub fn run_persist_plan_approval(
 /// subprocess spawn on this every-turn/every-approval hot path.
 fn current_branch(cwd: &str) -> Option<String> {
     cadence_hooks_core::gitstate::GitState::resolve(Path::new(cwd)).and_then(|gs| gs.branch)
+}
+
+/// Resolve `<repo_root>/docs/plans`, creating it if needed, and return its
+/// canonical path alongside the canonical `repo_root` — but only when the
+/// canonical plans dir actually nests under the canonical repo root. `None`
+/// on any I/O failure, or when it DOESN'T nest: a `docs/plans` (or an
+/// ancestor, e.g. a symlinked `docs/`) pointing outside the checkout would
+/// otherwise let a plan write escape the repo entirely (cameronsjo/cadence-hooks#396
+/// review) — the same "never trust a path without checking where it actually
+/// resolves" discipline `GitState::resolve` applies to `.git`. Both returned
+/// paths are canonical, so a caller using them for the write target and the
+/// `plan_path` prefix-strip stays internally consistent.
+fn canonical_plans_dir(repo_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let plans_dir = repo_root.join("docs").join("plans");
+    fs::create_dir_all(&plans_dir).ok()?;
+    let canonical_repo_root = repo_root.canonicalize().ok()?;
+    let canonical_plans_dir = plans_dir.canonicalize().ok()?;
+    canonical_plans_dir
+        .starts_with(&canonical_repo_root)
+        .then_some((canonical_repo_root, canonical_plans_dir))
+}
+
+/// Read `path` capped at `max_bytes`: `None` when it can't be opened/read, or
+/// when its content exceeds the cap — the same take-then-check discipline
+/// [`file_matches_body`] uses, so a pathological transcript can't turn this
+/// hook's model/harness resolution into an unbounded read.
+fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read as _;
+    let file = fs::File::open(path).ok()?;
+    let mut content = String::new();
+    file.take(max_bytes + 1).read_to_string(&mut content).ok()?;
+    (content.len() as u64 <= max_bytes).then_some(content)
 }
 
 // ---------------------------------------------------------------------------
@@ -593,7 +656,7 @@ fn file_matches_body(path: &Path, body_hash: &str) -> bool {
         fm.lines()
             .find_map(|l| l.strip_prefix(FRONTMATTER_HASH_KEY))
     }) {
-        return recorded.trim() == body_hash;
+        return yaml_unquote(recorded.trim()) == body_hash;
     }
 
     if let Some(recorded) = content
@@ -651,14 +714,32 @@ fn claim_target(
 // Provenance: parent resolution (Approach step 4)
 // ---------------------------------------------------------------------------
 
-/// The `ExitPlanMode` plan text on one transcript line, if `line` is an
-/// assistant message carrying that tool call. Mirrors
-/// `cadence_hooks_core::transcript::line_is_polish_skill_use`'s traversal.
-fn exit_plan_mode_match(line: &str) -> Option<String> {
+/// The `ExitPlanMode` plan text on one transcript line, plus the approving
+/// turn's model (`message.model`) and harness version (top-level `version`),
+/// if `line` is an assistant message carrying that tool call. `model`/
+/// `harness_version` are `None` when the matched line doesn't carry them.
+/// Mirrors `cadence_hooks_core::transcript::line_is_polish_skill_use`'s
+/// traversal.
+///
+/// Restored (cameronsjo/cadence-hooks#396 review): the executing session's
+/// own transcript is structurally empty at the moment `run_persist_plan`
+/// runs on a cross-session approve-and-clear wipe (the wipe IS a new,
+/// just-started session — its transcript has no assistant turn yet), so
+/// `crate::warn_commit_provenance::resolve_model`/`resolve_harness` against
+/// it always return `None` there. The APPROVING parent's transcript — the one
+/// this scan already walks to resolve `approved_in` — is the only source that
+/// reliably carries a populated `model`/`version` for that path.
+struct ExitPlanModeMatch {
+    plan_text: String,
+    model: Option<String>,
+    harness_version: Option<String>,
+}
+
+fn exit_plan_mode_match(line: &str) -> Option<ExitPlanModeMatch> {
     let value: Value = serde_json::from_str(line).ok()?;
     let message = value.get("message")?;
     let content = message.get("content")?.as_array()?;
-    content.iter().find_map(|block| {
+    let plan_text = content.iter().find_map(|block| {
         if block.get("type").and_then(Value::as_str) != Some("tool_use") {
             return None;
         }
@@ -670,7 +751,32 @@ fn exit_plan_mode_match(line: &str) -> Option<String> {
             .get("plan")?
             .as_str()
             .map(str::to_string)
+    })?;
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let harness_version = value
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(ExitPlanModeMatch {
+        plan_text,
+        model,
+        harness_version,
     })
+}
+
+/// The approving sibling transcript [`find_parent`] resolves: its session id,
+/// plus the approving turn's model/harness version — the fallback source for
+/// [`FrontmatterFields::model`]/`harness` on a cross-session wipe (see
+/// [`ExitPlanModeMatch`]'s doc for why the executing transcript can't supply
+/// them there).
+#[derive(Debug, PartialEq, Eq)]
+struct ParentMatch {
+    session_id: String,
+    model: Option<String>,
+    harness_version: Option<String>,
 }
 
 /// Scan `transcript_path`'s sibling directory for the transcript whose
@@ -686,7 +792,7 @@ fn exit_plan_mode_match(line: &str) -> Option<String> {
 /// [`identity::is_safe_session_id`]; a match against a hostile-named sibling
 /// is treated as no-match (`unknown`), since the returned id flows raw into
 /// the provenance text and the linkage row.
-fn find_parent(transcript_path: &Path, target_hash: &str, now: SystemTime) -> Option<String> {
+fn find_parent(transcript_path: &Path, target_hash: &str, now: SystemTime) -> Option<ParentMatch> {
     let dir = transcript_path.parent()?;
     let mut candidates: Vec<(SystemTime, PathBuf)> = fs::read_dir(dir)
         .ok()?
@@ -725,15 +831,20 @@ fn find_parent(transcript_path: &Path, target_hash: &str, now: SystemTime) -> Op
             if !line.contains("ExitPlanMode") {
                 continue;
             }
-            let Some(plan_text) = exit_plan_mode_match(&line) else {
+            let Some(exit_plan) = exit_plan_mode_match(&line) else {
                 continue;
             };
-            let normalized = strip_trailing_suffix_lines_and_trim(&plan_text);
+            let normalized = strip_trailing_suffix_lines_and_trim(&exit_plan.plan_text);
             if sha256_hex(normalized.as_bytes()) == target_hash {
-                return path
+                let session_id = path
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
-                    .filter(|s| identity::is_safe_session_id(s));
+                    .filter(|s| identity::is_safe_session_id(s))?;
+                return Some(ParentMatch {
+                    session_id,
+                    model: exit_plan.model,
+                    harness_version: exit_plan.harness_version,
+                });
             }
         }
     }
@@ -774,10 +885,52 @@ struct FrontmatterFields<'a> {
     approved_in: Option<(&'a str, &'a str)>,
 }
 
+/// Render `s` as a double-quoted YAML scalar: `\` escaped first, then `"` —
+/// order matters, so quote-escaping never re-escapes a backslash the first
+/// pass just introduced. Every frontmatter value goes through this
+/// (cameronsjo/cadence-hooks#396 review): uniform quoting means a reader never
+/// needs per-field heuristics for which lines are quoted, and it defuses any
+/// transcript-sourced free-text value (model, harness, branch) that happens
+/// to embed a literal `"` or `\` from breaking the block's YAML shape.
+fn yaml_quote(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Reverse of [`yaml_quote`]: strip a well-formed double-quoted YAML scalar's
+/// surrounding quotes and unescape `\"`/`\\`. A value that ISN'T
+/// double-quoted (a hand-edited frontmatter line, or a doc from before this
+/// fold started quoting) passes through unchanged — this hook always emits
+/// quoted values now, but the idempotency reader must not choke on an older
+/// or hand-edited file.
+fn yaml_unquote(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return s.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Render the frontmatter block for a newly persisted plan.
 ///
-/// `status: in-flight` is a fixed constant: this hook only ever fires at the
-/// moment a plan is approved, so a freshly persisted document is never
+/// `status: "in-flight"` is a fixed constant: this hook only ever fires at
+/// the moment a plan is approved, so a freshly persisted document is never
 /// anything else. Reserved keys the living-plan lifecycle owns for a later
 /// consumer — `next`, `pr`, `card`, `blocked` — are never emitted here (Task 1
 /// step 3 of the plan-as-living-document lifecycle plan); a session or the
@@ -787,38 +940,45 @@ struct FrontmatterFields<'a> {
 /// filesystem (`branch`) are passed through [`identity::sanitize_field`] —
 /// the same discipline `warn_commit_provenance`'s nudge applies to the same
 /// two fields — before interpolation, since none of the three come from a
-/// value this crate itself generated or validated.
+/// value this crate itself generated or validated. Every value, sanitized or
+/// not, is then [`yaml_quote`]d.
 fn render_frontmatter(f: &FrontmatterFields) -> String {
     let mut lines = vec![
         "---".to_string(),
-        "status: in-flight".to_string(),
-        format!("updated: {}", f.updated),
+        format!("status: {}", yaml_quote("in-flight")),
+        format!("updated: {}", yaml_quote(f.updated)),
     ];
     if let Some(b) = f.branch {
         lines.push(format!(
             "branch: {}",
-            identity::sanitize_field(b, identity::MAX_FIELD_DISPLAY)
+            yaml_quote(&identity::sanitize_field(b, identity::MAX_FIELD_DISPLAY))
         ));
     }
-    lines.push(format!("{FRONTMATTER_HASH_KEY} {}", f.body_hash));
-    lines.push(format!("session: {}", f.own_name));
-    lines.push(format!("session_id: {}", f.own_session_id));
+    lines.push(format!(
+        "{FRONTMATTER_HASH_KEY} {}",
+        yaml_quote(f.body_hash)
+    ));
+    lines.push(format!("session: {}", yaml_quote(f.own_name)));
+    lines.push(format!("session_id: {}", yaml_quote(f.own_session_id)));
     if let Some(m) = f.model {
         lines.push(format!(
             "model: {}",
-            identity::sanitize_field(m, identity::MAX_FIELD_DISPLAY)
+            yaml_quote(&identity::sanitize_field(m, identity::MAX_FIELD_DISPLAY))
         ));
     }
     if let Some(h) = f.harness {
         lines.push(format!(
-            "harness: claude-code {}",
-            identity::sanitize_field(h, identity::MAX_FIELD_DISPLAY)
+            "harness: {}",
+            yaml_quote(&format!(
+                "claude-code {}",
+                identity::sanitize_field(h, identity::MAX_FIELD_DISPLAY)
+            ))
         ));
     }
-    lines.push(format!("machine: {}", f.machine_digest));
+    lines.push(format!("machine: {}", yaml_quote(f.machine_digest)));
     if let Some((name, sid)) = f.approved_in {
-        lines.push(format!("approved_in: {name}"));
-        lines.push(format!("approved_session_id: {sid}"));
+        lines.push(format!("approved_in: {}", yaml_quote(name)));
+        lines.push(format!("approved_session_id: {}", yaml_quote(sid)));
     }
     lines.push("---".to_string());
     lines.join("\n")
@@ -843,7 +1003,7 @@ fn persist_and_nudge(
     utc_now: &str,
     parent_session_id: Option<&str>,
     child_session_id: &str,
-    host: &str,
+    machine_digest: &str,
     repo_root: &Path,
     approved_label: &str,
 ) -> CheckResult {
@@ -867,8 +1027,7 @@ fn persist_and_nudge(
         utc_now,
         parent_session_id,
         child_session_id,
-        host,
-        &repo_root.to_string_lossy(),
+        machine_digest,
         &plan_path_rel,
         body_hash,
     ));
@@ -884,12 +1043,21 @@ fn persist_and_nudge(
 // Linkage row (Approach step 5)
 // ---------------------------------------------------------------------------
 
+/// Schema v2 (cameronsjo/cadence-hooks#396 review; v1 carried a raw `host`
+/// hostname and a separate `repo` field). `machine` is the salted
+/// [`crate::provenance::machine_digest`] — the same doctrine fix (cadence#248)
+/// the committed frontmatter already applies, now consistent across BOTH the
+/// committed artifact and this local-only telemetry stream. `repo` is
+/// dropped: `plan_path` is already repo-relative, so `repo` was a second,
+/// independently-drifting way to say the same thing. Confirmed no consumer
+/// (`reconstruct-journey.py`, which reads only `parent_session_id`,
+/// `body_sha256`, and `plan_path`) depends on either the old `host` or `repo`
+/// fields before making this change.
 fn plan_links_row(
     utc_now: &str,
     parent_session_id: Option<&str>,
     child_session_id: &str,
-    host: &str,
-    repo: &str,
+    machine_digest: &str,
     plan_path: &str,
     body_hash: &str,
 ) -> Value {
@@ -898,8 +1066,7 @@ fn plan_links_row(
         "ts": utc_now,
         "parent_session_id": parent_session_id,
         "child_session_id": child_session_id,
-        "host": host,
-        "repo": repo,
+        "machine": machine_digest,
         "plan_path": plan_path,
         "body_sha256": body_hash,
     })
@@ -1454,6 +1621,54 @@ mod tests {
     }
 
     #[test]
+    fn file_matches_body_frontmatter_key_matches_the_actual_quoted_emission() {
+        // `frontmatter_doc_with_hash` above uses a bare (unquoted) value —
+        // proving backward-compat with hand-edited/pre-quoting frontmatter.
+        // This test uses the value shape `render_frontmatter` ACTUALLY emits
+        // (double-quoted, cameronsjo/cadence-hooks#396 review) end to end.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        let body = "# Title\n\nbody text";
+        let hash = sha256_hex(body.as_bytes());
+        let doc = format!(
+            "---\nstatus: \"in-flight\"\nbody_sha256: {}\n---\n\n{body}\n",
+            yaml_quote(&hash)
+        );
+        fs::write(&path, doc).unwrap();
+        assert!(file_matches_body(&path, &hash));
+    }
+
+    #[test]
+    fn file_matches_body_frontmatter_tier_wins_over_a_differing_legacy_trailer() {
+        // A file carrying BOTH a frontmatter `body_sha256` key AND a
+        // differing legacy `Plan-body-SHA256:` trailer line — the frontmatter
+        // tier must win unconditionally, never fall through to consider the
+        // trailer (cameronsjo/cadence-hooks#396 review). This shape shouldn't
+        // arise from either trigger's own writes, but the precedence must
+        // hold regardless of how such a file came to exist (hand-edit, a
+        // future migration script, etc.).
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plan.md");
+        let body = "# Title\n\nbody text";
+        let frontmatter_hash = sha256_hex(body.as_bytes());
+        let legacy_hash = "a-completely-different-legacy-hash";
+        let doc = format!(
+            "---\nstatus: \"in-flight\"\nbody_sha256: {}\n---\n\n{body}\n\n---\n\nPlan-body-SHA256: {legacy_hash}\n",
+            yaml_quote(&frontmatter_hash)
+        );
+        fs::write(&path, doc).unwrap();
+
+        assert!(
+            file_matches_body(&path, &frontmatter_hash),
+            "the frontmatter hash must match despite the differing trailer"
+        );
+        assert!(
+            !file_matches_body(&path, legacy_hash),
+            "the legacy trailer's hash must NOT match — tier 1 wins unconditionally, tier 2 is never consulted"
+        );
+    }
+
+    #[test]
     fn file_matches_body_recognizes_mutated_body_via_frontmatter_key() {
         // The exact Design-18 scenario: a plan persisted once, then its BODY
         // is mutated in place (checkbox ticked, a `## Deviations` entry
@@ -1504,6 +1719,65 @@ mod tests {
         assert_eq!(leading_frontmatter_block("# Title\n\nbody"), None);
     }
 
+    // --- canonical_plans_dir: symlink-escape guard ---
+
+    #[test]
+    fn canonical_plans_dir_resolves_normally_when_nested() {
+        let repo = TempDir::new().unwrap();
+        let (canonical_repo, canonical_plans) =
+            canonical_plans_dir(repo.path()).expect("plans dir resolves under a plain repo root");
+        assert!(canonical_plans.starts_with(&canonical_repo));
+        assert!(
+            canonical_plans.ends_with("docs/plans") || canonical_plans.ends_with("docs\\plans")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_plans_dir_refuses_a_symlinked_docs_escaping_the_repo() {
+        // A `docs/` symlink pointing outside the checkout (planted by a
+        // malicious commit, or a stray dev-machine symlink) must not let a
+        // plan write escape the repo root entirely (cameronsjo/cadence-hooks#396
+        // review).
+        let repo = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("docs")).unwrap();
+
+        assert!(
+            canonical_plans_dir(repo.path()).is_none(),
+            "a docs/ symlink escaping the repo root must be refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_persist_plan_never_writes_through_a_symlinked_docs_escaping_the_repo() {
+        // End-to-end: the same escape attempt must never reach a write, not
+        // just fail the unit-level helper in isolation.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("docs")).unwrap();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        let input = make_user_prompt_submit(
+            "sid12345",
+            "Implement the following plan:\n\n# X\n\nbody",
+            &cwd,
+            &tmp.path().join("sid12345.jsonl").to_string_lossy(),
+        );
+        let r = run_persist_plan(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(
+            !outside
+                .path()
+                .join("plans")
+                .join("2026-07-20-x.md")
+                .exists(),
+            "nothing must be written outside the repo via the symlinked docs/"
+        );
+    }
+
     // --- cross-trigger hash normalization (Design 18) ---
 
     #[test]
@@ -1551,11 +1825,11 @@ mod tests {
     fn render_frontmatter_omits_unresolved_optional_fields() {
         let fields = base_fields("hash", "digest");
         let fm = render_frontmatter(&fields);
-        assert!(fm.starts_with("---\nstatus: in-flight\nupdated: 2026-07-25\n"));
-        assert!(fm.contains("body_sha256: hash"));
-        assert!(fm.contains("session: own-name"));
-        assert!(fm.contains("session_id: own-sid"));
-        assert!(fm.contains("machine: digest"));
+        assert!(fm.starts_with("---\nstatus: \"in-flight\"\nupdated: \"2026-07-25\"\n"));
+        assert!(fm.contains("body_sha256: \"hash\""));
+        assert!(fm.contains("session: \"own-name\""));
+        assert!(fm.contains("session_id: \"own-sid\""));
+        assert!(fm.contains("machine: \"digest\""));
         assert!(fm.ends_with("---"));
         assert!(
             !fm.contains("branch:"),
@@ -1587,11 +1861,26 @@ mod tests {
         fields.harness = Some("2.1.220");
         fields.approved_in = Some(("parent-name", "parent-sid"));
         let fm = render_frontmatter(&fields);
-        assert!(fm.contains("branch: feat/x"));
-        assert!(fm.contains("model: claude-fable-5"));
-        assert!(fm.contains("harness: claude-code 2.1.220"));
-        assert!(fm.contains("approved_in: parent-name"));
-        assert!(fm.contains("approved_session_id: parent-sid"));
+        assert!(fm.contains("branch: \"feat/x\""));
+        assert!(fm.contains("model: \"claude-fable-5\""));
+        assert!(fm.contains("harness: \"claude-code 2.1.220\""));
+        assert!(fm.contains("approved_in: \"parent-name\""));
+        assert!(fm.contains("approved_session_id: \"parent-sid\""));
+    }
+
+    #[test]
+    fn render_frontmatter_escapes_quotes_and_backslashes_in_free_text_fields() {
+        // Transcript-sourced free text (model/harness/branch) is not
+        // validated by this hook — a value embedding a literal `"` or `\`
+        // must not break the block's YAML shape (cameronsjo/cadence-hooks#396
+        // review).
+        let mut fields = base_fields("hash", "digest");
+        fields.model = Some(r#"weird"model\name"#);
+        let fm = render_frontmatter(&fields);
+        assert!(
+            fm.contains(r#"model: "weird\"model\\name""#),
+            "quotes and backslashes escaped in emission: {fm}"
+        );
     }
 
     #[test]
@@ -1601,20 +1890,46 @@ mod tests {
         let (frontmatter, body) = doc
             .split_once("---\n\n")
             .expect("closing fence + blank line");
-        assert!(frontmatter.starts_with("---\nstatus: in-flight"));
+        assert!(frontmatter.starts_with("---\nstatus: \"in-flight\""));
         assert_eq!(body, "# Title\n\nbody text\n");
+    }
+
+    #[test]
+    fn yaml_quote_and_unquote_round_trip() {
+        for value in ["plain", r#"has "quotes""#, r"has\backslash", ""] {
+            assert_eq!(yaml_unquote(&yaml_quote(value)), value);
+        }
+    }
+
+    #[test]
+    fn yaml_unquote_passes_through_an_unquoted_value() {
+        // Backward compatibility: a hand-edited or pre-quoting-era
+        // frontmatter value isn't wrapped in quotes at all.
+        assert_eq!(yaml_unquote("bare-value"), "bare-value");
     }
 
     // --- provenance: parent resolution ---
 
-    fn exit_plan_mode_line(plan: &str) -> String {
-        serde_json::json!({
-            "message": {
-                "role": "assistant",
-                "content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": plan}}],
-            }
-        })
-        .to_string()
+    /// `model`/`harness_version` model the assistant line's `message.model`
+    /// and top-level `version` — both `None` reproduces an older transcript
+    /// shape carrying neither.
+    fn exit_plan_mode_line(
+        plan: &str,
+        model: Option<&str>,
+        harness_version: Option<&str>,
+    ) -> String {
+        let mut message = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "ExitPlanMode", "input": {"plan": plan}}],
+        });
+        if let Some(m) = model {
+            message["model"] = serde_json::json!(m);
+        }
+        let mut line = serde_json::json!({ "message": message });
+        if let Some(v) = harness_version {
+            line["version"] = serde_json::json!(v);
+        }
+        line.to_string()
     }
 
     #[test]
@@ -1623,13 +1938,67 @@ mod tests {
         let plan_text = "# Title\n\nbody text";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
 
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
         let found = find_parent(&own, &hash, SystemTime::now());
-        assert_eq!(found.as_deref(), Some("parent-session-id"));
+        assert_eq!(
+            found,
+            Some(ParentMatch {
+                session_id: "parent-session-id".to_string(),
+                model: None,
+                harness_version: None,
+            })
+        );
+    }
+
+    #[test]
+    fn find_parent_extracts_model_and_harness_version_from_matched_line() {
+        // Real transcripts stamp the approving assistant line with both
+        // `message.model` and a top-level `version` — this is the sole
+        // source `run_persist_plan` falls back to when the EXECUTING
+        // session's own (structurally empty, on a cross-session wipe)
+        // transcript resolves neither (cameronsjo/cadence-hooks#396 review).
+        let tmp = TempDir::new().unwrap();
+        let plan_text = "# Title\n\nbody text";
+        let hash = sha256_hex(plan_text.as_bytes());
+        let sibling = tmp.path().join("parent-session-id.jsonl");
+        fs::write(
+            &sibling,
+            exit_plan_mode_line(plan_text, Some("claude-fable-5"), Some("2.1.214")),
+        )
+        .unwrap();
+        let own = tmp.path().join("own-session-id.jsonl");
+        fs::write(&own, "{}").unwrap();
+
+        let found = find_parent(&own, &hash, SystemTime::now());
+        assert_eq!(
+            found,
+            Some(ParentMatch {
+                session_id: "parent-session-id".to_string(),
+                model: Some("claude-fable-5".to_string()),
+                harness_version: Some("2.1.214".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn find_parent_missing_model_and_harness_version_is_gracefully_none() {
+        // Older transcript lines (or a stripped-down fixture) may carry
+        // neither field — the match must still resolve, with both absent.
+        let tmp = TempDir::new().unwrap();
+        let plan_text = "# Title\n\nbody text";
+        let hash = sha256_hex(plan_text.as_bytes());
+        let sibling = tmp.path().join("parent-session-id.jsonl");
+        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
+        let own = tmp.path().join("own-session-id.jsonl");
+        fs::write(&own, "{}").unwrap();
+
+        let found = find_parent(&own, &hash, SystemTime::now()).expect("parent must be found");
+        assert_eq!(found.model, None);
+        assert_eq!(found.harness_version, None);
     }
 
     #[test]
@@ -1638,11 +2007,11 @@ mod tests {
         let plan_text = "# Title\n\nbody text";
         let hash = sha256_hex(plan_text.as_bytes());
         let own = tmp.path().join("own-session-id.jsonl");
-        fs::write(&own, exit_plan_mode_line(plan_text)).unwrap();
+        fs::write(&own, exit_plan_mode_line(plan_text, None, None)).unwrap();
 
         let found = find_parent(&own, &hash, SystemTime::now());
         assert_eq!(
-            found.as_deref(),
+            found.map(|p| p.session_id).as_deref(),
             Some("own-session-id"),
             "same-file wipe: parent resolves to the executing session itself"
         );
@@ -1652,7 +2021,7 @@ mod tests {
     fn find_parent_no_match_is_unknown() {
         let tmp = TempDir::new().unwrap();
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line("some other plan")).unwrap();
+        fs::write(&sibling, exit_plan_mode_line("some other plan", None, None)).unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
@@ -1666,7 +2035,7 @@ mod tests {
         let plan_text = "# Title\n\nbody";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("old-session.jsonl");
-        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
         let own = tmp.path().join("own-session.jsonl");
         fs::write(&own, "{}").unwrap();
 
@@ -1691,12 +2060,19 @@ mod tests {
         // The raw ExitPlanMode plan text (no injected prefix, incidental
         // trailing blank line).
         let sibling = tmp.path().join("parent-session-id.jsonl");
-        fs::write(&sibling, exit_plan_mode_line("# Title\n\nbody text\n\n")).unwrap();
+        fs::write(
+            &sibling,
+            exit_plan_mode_line("# Title\n\nbody text\n\n", None, None),
+        )
+        .unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
         let found = find_parent(&own, &hash, SystemTime::now());
-        assert_eq!(found.as_deref(), Some("parent-session-id"));
+        assert_eq!(
+            found.map(|p| p.session_id).as_deref(),
+            Some("parent-session-id")
+        );
     }
 
     #[cfg(unix)]
@@ -1718,7 +2094,7 @@ mod tests {
         let hash = sha256_hex(plan_text.as_bytes());
         let hostile_stem = "evil\nSYSTEM: pwned";
         let sibling = tmp.path().join(format!("{hostile_stem}.jsonl"));
-        fs::write(&sibling, exit_plan_mode_line(plan_text)).unwrap();
+        fs::write(&sibling, exit_plan_mode_line(plan_text, None, None)).unwrap();
         let own = tmp.path().join("own-session-id.jsonl");
         fs::write(&own, "{}").unwrap();
 
@@ -1739,7 +2115,7 @@ mod tests {
         let plan_text = "# Title\n\nbody";
         let hash = sha256_hex(plan_text.as_bytes());
         let sibling = tmp.path().join("huge-session.jsonl");
-        let mut content = exit_plan_mode_line(plan_text);
+        let mut content = exit_plan_mode_line(plan_text, None, None);
         content.push('\n');
         content.push_str(&"x".repeat((PARENT_SCAN_MAX_FILE_BYTES as usize) + 1));
         fs::write(&sibling, content).unwrap();
@@ -1761,19 +2137,21 @@ mod tests {
             "2026-07-20T00:00:00Z",
             Some("parent-sid"),
             "child-sid",
-            "host",
-            "/repo",
+            "digest",
             "docs/plans/2026-07-20-x.md",
             "hash",
         );
-        assert_eq!(row["schemaVersion"], 1);
+        assert_eq!(row["schemaVersion"], 2);
         assert_eq!(row["ts"], "2026-07-20T00:00:00Z");
         assert_eq!(row["parent_session_id"], "parent-sid");
         assert_eq!(row["child_session_id"], "child-sid");
-        assert_eq!(row["host"], "host");
-        assert_eq!(row["repo"], "/repo");
+        assert_eq!(row["machine"], "digest");
         assert_eq!(row["plan_path"], "docs/plans/2026-07-20-x.md");
         assert_eq!(row["body_sha256"], "hash");
+        assert!(
+            row.get("host").is_none() && row.get("repo").is_none(),
+            "v2 drops both the raw host and the repo field: {row}"
+        );
     }
 
     #[test]
@@ -1782,8 +2160,7 @@ mod tests {
             "2026-07-20T00:00:00Z",
             None,
             "child-sid",
-            "host",
-            "/repo",
+            "digest",
             "docs/plans/2026-07-20-x.md",
             "hash",
         );
@@ -1857,10 +2234,10 @@ mod tests {
 
         let written =
             fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
-        assert!(written.starts_with("---\nstatus: in-flight\n"));
+        assert!(written.starts_with("---\nstatus: \"in-flight\"\n"));
         assert!(written.contains("# Fix the Widget"));
         assert!(!written.contains("If this plan can be broken down"));
-        assert!(written.contains("session_id: child-session-id"));
+        assert!(written.contains("session_id: \"child-session-id\""));
         assert!(written.contains("body_sha256:"));
         assert!(
             !written.contains("approved_in:"),
@@ -1880,9 +2257,17 @@ mod tests {
         // plan_path is forward-slash-normalized regardless of platform — a
         // stable schema value for consumers, not the native separator.
         assert!(links.contains("\"plan_path\":\"docs/plans/2026-07-20-fix-the-widget.md\""));
-        // Local-only metrics KEEP the bare hostname — only the committed doc
-        // block is salted (cadence#248).
-        assert!(links.contains("\"host\":\"test-host\""));
+        // Schema v2 (cameronsjo/cadence-hooks#396 review): the local-only
+        // linkage row now ALSO carries the salted digest — matching the
+        // committed frontmatter's own `machine` field — never the raw
+        // hostname, and no separate `repo` field.
+        assert!(links.contains(&format!(
+            "\"machine\":\"{}\"",
+            crate::provenance::machine_digest("test-host")
+        )));
+        assert!(!links.contains("test-host"));
+        assert!(!links.contains("\"host\""));
+        assert!(!links.contains("\"repo\""));
     }
 
     #[test]
@@ -1917,6 +2302,70 @@ mod tests {
             first_write, second_write,
             "the file must never be rewritten"
         );
+    }
+
+    #[test]
+    fn end_to_end_model_and_harness_fall_back_to_the_approving_parent_transcript() {
+        // The regression this fold fixes (cameronsjo/cadence-hooks#396
+        // review): on approve-and-clear, the EXECUTING session's own
+        // transcript is structurally empty at this point — no assistant turn
+        // has landed there yet — so resolving model/harness against it always
+        // returns `None`. The APPROVING parent's transcript (the one
+        // `find_parent` already walks to resolve `approved_in`) is the
+        // fallback source, and it DOES carry a populated `model`/`version`.
+        //
+        // `resolve_harness` has ITS OWN internal `AI_AGENT` env fallback
+        // (legitimate in production — Claude Code sets it for every hook
+        // subprocess), which would otherwise mask the parent-fallback this
+        // test targets with whatever value happens to be ambient on the
+        // machine running `cargo test`. Pin it to `None` for the duration so
+        // only the parent-transcript fallback can supply a value, via the
+        // SAME lock `warn_commit_provenance`'s own AI_AGENT tests use (a
+        // second, independently-locked mutator of this process-global var
+        // would itself be a race, not an isolation fix).
+        crate::warn_commit_provenance::with_ai_agent_env(None, || {
+            let tmp = TempDir::new().unwrap();
+            init_repo(tmp.path());
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let metrics_dir = TempDir::new().unwrap();
+
+            let plan_text = "# Fix the Widget\n\nDo the thing.";
+            let parent_transcript = tmp.path().join("parent-session-id.jsonl");
+            fs::write(
+                &parent_transcript,
+                exit_plan_mode_line(plan_text, Some("claude-fable-5"), Some("2.1.214")),
+            )
+            .unwrap();
+
+            // Realistic shape: a fresh, just-started child session's
+            // transcript has no assistant turn yet at UserPromptSubmit time.
+            let child_transcript = tmp.path().join("child-session-id.jsonl");
+            fs::write(&child_transcript, "").unwrap();
+
+            let prompt = format!("Implement the following plan:\n\n{plan_text}");
+            let input = make_user_prompt_submit(
+                "child-session-id",
+                &prompt,
+                &cwd,
+                &child_transcript.to_string_lossy(),
+            );
+
+            with_metrics_dir(metrics_dir.path(), || {
+                run_persist_plan(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host");
+            });
+
+            let written =
+                fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md"))
+                    .unwrap();
+            assert!(
+                written.contains("model: \"claude-fable-5\""),
+                "model falls back to the approving parent's transcript: {written}"
+            );
+            assert!(
+                written.contains("harness: \"claude-code 2.1.214\""),
+                "harness falls back to the approving parent's transcript: {written}"
+            );
+        });
     }
 
     #[test]
@@ -2027,6 +2476,74 @@ mod tests {
     }
 
     #[test]
+    fn approval_absent_is_agent_does_not_persist() {
+        // Fail-CLOSED (cameronsjo/cadence-hooks#396 review): an ABSENT
+        // `is_agent` — a future payload-shape drift, or a stripped-down
+        // fixture — must not be read as "not a subagent". Only the EXPLICIT
+        // `Some(false)` clears the gate.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let input = exit_plan_mode_post_tool_use(
+            "sid",
+            "# X\n\nbody",
+            &cwd,
+            &tmp.path().join("t.jsonl").to_string_lossy(),
+            None,
+        );
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(
+            !tmp.path().join("docs").exists(),
+            "an absent is_agent must not be treated as a top-level approval"
+        );
+    }
+
+    #[test]
+    fn approval_agent_id_present_does_not_persist_even_with_is_agent_false() {
+        // The gate is `is_agent == Some(false) AND agent_id.is_none()` — both
+        // conditions, not either. A payload carrying `isAgent: false` but
+        // also an `agent_id` (a shape this hook has never observed, but must
+        // not trust blindly) must still skip.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let mut input = exit_plan_mode_post_tool_use(
+            "sid",
+            "# X\n\nbody",
+            &cwd,
+            &tmp.path().join("t.jsonl").to_string_lossy(),
+            Some(false),
+        );
+        input.agent_id = Some("agent-1".into());
+        let r = run_persist_plan_approval(&input, "ts", "2026-07-20", "host");
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(!tmp.path().join("docs").exists());
+    }
+
+    #[test]
+    fn approval_gate_pins_the_is_agent_wire_field_name() {
+        // Regression pin: `isAgent` (camelCase) is the exact field name
+        // Claude Code's payload uses — live-verified on cadence-hooks#396. A
+        // rename in either direction (this struct's `#[serde(rename)]`, or a
+        // hypothetical future payload-shape change) would silently break the
+        // fail-closed gate above without this test noticing via the
+        // Rust-struct-literal tests alone.
+        // Extra `#` in the raw-string delimiter: the payload's plan text
+        // embeds a literal `"#` (a quote immediately followed by an ATX
+        // heading marker), which would otherwise close a `r#"..."#` raw
+        // string early.
+        let json = r##"{"tool_name":"ExitPlanMode","session_id":"sid","cwd":"/tmp",
+            "tool_response":{"plan":"# X\n\nbody","isAgent":false}}"##;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            input.tool_response.as_ref().and_then(|tr| tr.is_agent),
+            Some(false),
+            "isAgent must deserialize into ToolResponse::is_agent"
+        );
+    }
+
+    #[test]
     fn approval_no_cwd_allows() {
         let input = HookInput {
             tool_name: Some("ExitPlanMode".into()),
@@ -2117,19 +2634,23 @@ mod tests {
 
         let written =
             fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
-        assert!(written.starts_with("---\nstatus: in-flight\n"));
+        assert!(written.starts_with("---\nstatus: \"in-flight\"\n"));
         assert!(written.contains("# Fix the Widget"));
-        assert!(written.contains("session_id: own-session-id"));
+        assert!(written.contains("session_id: \"own-session-id\""));
         assert!(written.contains(&format!(
-            "approved_in: {}",
+            "approved_in: \"{}\"",
             identity::generate_name("own-session-id")
         )));
-        assert!(written.contains("approved_session_id: own-session-id"));
+        assert!(written.contains("approved_session_id: \"own-session-id\""));
         assert!(written.contains(&crate::provenance::machine_digest("test-host")));
 
         let links = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
         assert!(links.contains("\"parent_session_id\":\"own-session-id\""));
         assert!(links.contains("\"child_session_id\":\"own-session-id\""));
+        assert!(links.contains(&format!(
+            "\"machine\":\"{}\"",
+            crate::provenance::machine_digest("test-host")
+        )));
     }
 
     #[test]
