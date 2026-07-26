@@ -120,6 +120,12 @@ pub struct FailopenCounts {
 /// operator has enough to grep with either way.
 const MAX_SUBCOMMANDS: usize = 4;
 
+/// Ceiling, in characters, on each half of a `namespace subcommand` pair.
+/// Unlike `error`, these fields are written to the ledger uncapped, and a
+/// plugin can invoke this binary with argv-sized tokens — so the read side
+/// bounds them before they reach a printed line or a paste-me command.
+const MAX_PAIR_HALF_CHARS: usize = 48;
+
 /// Recency + version context for one `reason`'s windowed rows — the fields
 /// doctor needs to tell a *fixed* fail-open burst from a *live* one. Counting
 /// stays window-wide (a wiring problem is not version-specific, so filtering
@@ -279,61 +285,12 @@ pub fn recent_failopen_report(
     (counts, recency)
 }
 
-/// Strip display-affecting characters from a file-sourced string before it is
-/// interpolated into terminal-printed `doctor` output.
-///
-/// Two families, not one. `char::is_control` covers only **Cc** — C0, DEL, C1 —
-/// which handles ANSI escapes and newlines. It passes **Cf** (format)
-/// characters, and those reorder rendered text without being "control"
-/// characters at all: U+202E RIGHT-TO-LEFT OVERRIDE and the U+2066–U+2069
-/// directional isolates are the Trojan-Source primitives, and they would
-/// otherwise survive both this filter and [`sanitize_error`] to scramble the
-/// rest of a `doctor` finding line. U+2028/U+2029 are line/paragraph separators
-/// that some renderers break on. Strip all of them.
-fn display_safe(s: &str) -> String {
-    s.chars().filter(|c| !is_display_unsafe(*c)).collect()
-}
-
-/// Whether `c` can alter how the rest of a terminal line renders: any Cc
-/// control, any Cf format character (bidi overrides/isolates, zero-width
-/// joiners), or the Unicode line/paragraph separators.
-///
-/// Cf is matched by explicit ranges rather than a Unicode-property crate — this
-/// stays dependency-free, and these are the blocks that carry the reordering
-/// primitives. `is_control` already covers Cc.
-fn is_display_unsafe(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            '\u{2028}' | '\u{2029}'          // line / paragraph separator
-            | '\u{00AD}'                      // soft hyphen
-            | '\u{0600}'..='\u{0605}'         // Arabic number signs
-            | '\u{061C}'                      // Arabic letter mark
-            | '\u{06DD}' | '\u{070F}' | '\u{08E2}'
-            | '\u{180E}'                      // Mongolian vowel separator
-            | '\u{200B}'..='\u{200F}'         // zero-width space … RTL mark
-            | '\u{202A}'..='\u{202E}'         // bidi embeddings + OVERRIDE
-            | '\u{2060}'..='\u{2064}'         // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}'         // directional isolates
-            | '\u{FEFF}'                      // zero-width no-break space (BOM)
-            | '\u{FFF9}'..='\u{FFFB}'         // interlinear annotation
-        )
-}
-
-/// [`display_safe`] plus a length ceiling — the write-side sanitizer for the
-/// `error` field. Applied when the record is *built*, so an oversized or
-/// escape-bearing message never reaches the ledger; the read side still runs
-/// `display_safe` over it, since a hand-edited file can hold anything.
-///
-/// Truncation counts **characters, not bytes**, and slices at the boundary
-/// `char_indices` reports — a byte slice at a fixed offset would panic
-/// mid-codepoint on a multi-byte message, which in a fail-open writer would be
-/// a panic inside the panic path.
+/// The write-side sanitizer for the `error` field: [`common::display_safe`]
+/// plus a length ceiling. Applied when the record is *built*, so an oversized
+/// or escape-bearing message never reaches the ledger; the read side still
+/// sanitizes, since a hand-edited file can hold anything.
 fn sanitize_error(s: &str) -> String {
-    let cleaned = display_safe(s);
-    match cleaned.char_indices().nth(MAX_ERROR_CHARS) {
-        Some((boundary, _)) => format!("{}…", &cleaned[..boundary]),
-        None => cleaned,
-    }
+    common::display_safe_bounded(s, MAX_ERROR_CHARS)
 }
 
 /// Pure recency computation over `failopen.jsonl` contents. Reads the same
@@ -363,8 +320,8 @@ fn recency_from(
     // The values are this binary's own `ts`/`binaryVersion`, so only a
     // hand-tampered failopen.jsonl could smuggle ANSI/control bytes through —
     // strip them as defense-in-depth against escape-sequence injection.
-    let last_ts = display_safe(last.get("ts").and_then(Value::as_str)?);
-    let last_version = display_safe(
+    let last_ts = common::display_safe(last.get("ts").and_then(Value::as_str)?);
+    let last_version = common::display_safe(
         last.get("binaryVersion")
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
@@ -374,7 +331,7 @@ fn recency_from(
     let last_error = last
         .get("error")
         .and_then(Value::as_str)
-        .map(display_safe)
+        .map(common::display_safe)
         .filter(|e| !e.is_empty());
     let on_current_version = rows
         .iter()
@@ -393,28 +350,45 @@ fn recency_from(
         .collect::<std::collections::BTreeSet<_>>()
         .len() as u64;
     // A `BTreeSet` both dedups and sorts: a skew that fires 96 times names the
-    // two or three invocations behind it, not 96 lines. `display_safe` for the
-    // same defense-in-depth reason as `last_ts` — these are printed verbatim.
-    let subcommands: Vec<String> = rows
+    // two or three invocations behind it, not 96 lines.
+    //
+    // BOUNDED DURING INSERTION, not after. Collecting every distinct pair and
+    // then `take`-ing four lets a ledger with attacker-chosen cardinality (a
+    // unique subcommand per invocation) size the set — and `failopen.jsonl` is
+    // never rotated. Popping the largest once over capacity keeps the same
+    // alphabetically-first four at O(MAX_SUBCOMMANDS) resident.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in rows
         .iter()
         .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
-        .filter_map(|v| {
-            // Both halves are validated INDEPENDENTLY. A combined-string
-            // emptiness test passes `namespace: ""` with `subcommand: "hook"`,
-            // which renders as a leading-space " hook" — a malformed row
-            // dressed up as an actionable invocation.
-            let ns = display_safe(v.get("namespace").and_then(Value::as_str)?);
-            let sub = display_safe(v.get("subcommand").and_then(Value::as_str)?);
-            let (ns, sub) = (ns.trim(), sub.trim());
-            if ns.is_empty() || sub.is_empty() {
-                return None;
-            }
-            Some(format!("{ns} {sub}"))
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .take(MAX_SUBCOMMANDS)
-        .collect();
+    {
+        // Both halves are validated INDEPENDENTLY. A combined-string emptiness
+        // test passes `namespace: ""` with `subcommand: "hook"`, which renders
+        // as a leading-space " hook" — a malformed row dressed up as an
+        // actionable invocation.
+        //
+        // Bounded, not just filtered: `display_safe` constrains the character
+        // SET but not the length, and these fields are written uncapped (unlike
+        // `error`), so an argv-sized token would otherwise flood the printed
+        // line and the paste-me command built from it.
+        let Some(ns) = row.get("namespace").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(sub) = row.get("subcommand").and_then(Value::as_str) else {
+            continue;
+        };
+        let ns = common::display_safe_bounded(ns, MAX_PAIR_HALF_CHARS);
+        let sub = common::display_safe_bounded(sub, MAX_PAIR_HALF_CHARS);
+        let (ns, sub) = (ns.trim(), sub.trim());
+        if ns.is_empty() || sub.is_empty() {
+            continue;
+        }
+        seen.insert(format!("{ns} {sub}"));
+        if seen.len() > MAX_SUBCOMMANDS {
+            seen.pop_last();
+        }
+    }
+    let subcommands: Vec<String> = seen.into_iter().collect();
 
     Some(FailopenRecency {
         last_ts,
@@ -571,7 +545,10 @@ mod tests {
     fn display_safe_strips_the_same_families_on_read() {
         // The read side shares the filter, so a hand-edited ledger written
         // before this landed is neutralized at render time too.
-        assert_eq!(display_safe("0.61.0\u{202E}X\u{1b}[31m"), "0.61.0X[31m");
+        assert_eq!(
+            common::display_safe("0.61.0\u{202E}X\u{1b}[31m"),
+            "0.61.0X[31m"
+        );
     }
 
     #[test]

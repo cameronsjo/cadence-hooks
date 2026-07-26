@@ -411,13 +411,23 @@ fn manifest_install_paths(manifest: &Path) -> Option<Vec<(String, PathBuf)>> {
 /// same key shape `installed_plugins.json` uses, so the two join directly).
 /// A local entry wins, matching Claude Code's own settings precedence.
 ///
-/// Returns `None` when **neither** file yields an `enabledPlugins` object.
-/// That distinction is load-bearing: an empty map would read as "nothing is
-/// enabled" and warn about every installed plugin at once, so a missing or
-/// unparseable settings file must mean *cannot judge*, not *all broken*.
+/// Returns `None` when no file yields a **non-empty** `enabledPlugins` object.
+/// That distinction is load-bearing: an empty map reads as "nothing is enabled"
+/// and would warn about every installed hook-shipping plugin at once, so a
+/// missing, unparseable, *or empty* settings file must mean *cannot judge*, not
+/// *all broken*. An operator with plugins installed and a literally empty
+/// `enabledPlugins` is indistinguishable from one whose config has not been
+/// written yet, and the second reading is the safe one.
 ///
-/// Read through `read_untrusted_config` — a project-adjacent settings file is
-/// not this binary's own output.
+/// Membership is keyed on **presence, not value**. The boolean is recorded for
+/// callers that want it, but a non-bool value (`{"p@m": "true"}`) still counts
+/// as an entry: the question this answers is *did the operator make a decision
+/// about this plugin*, and a malformed value is still a decision. Dropping it
+/// would make the key read as **absent** and produce exactly the false warning
+/// the absent-vs-`false` rule exists to avoid.
+///
+/// Read through `read_untrusted_config` — a settings file is not this binary's
+/// own output, and that reader caps the read and refuses a non-regular file.
 fn enabled_plugin_map(config_dir: &Path) -> Option<std::collections::HashMap<String, bool>> {
     let mut map: Option<std::collections::HashMap<String, bool>> = None;
     // Base first, then local — a later insert overwrites, so local wins.
@@ -433,11 +443,12 @@ fn enabled_plugin_map(config_dir: &Path) -> Option<std::collections::HashMap<Str
         let Some(entries) = json.get("enabledPlugins").and_then(|v| v.as_object()) else {
             continue;
         };
+        if entries.is_empty() {
+            continue;
+        }
         let target = map.get_or_insert_with(std::collections::HashMap::new);
         for (key, value) in entries {
-            if let Some(flag) = value.as_bool() {
-                target.insert(key.clone(), flag);
-            }
+            target.insert(key.clone(), value.as_bool().unwrap_or(false));
         }
     }
     map
@@ -483,20 +494,30 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
         .filter(|(label, _)| seen.insert(label.as_str()))
         .map(|(label, hooks)| Finding {
             severity: Severity::Warning,
-            plugin: label.clone(),
+            // The label is an `installed_plugins.json` key — third-party
+            // influenced, and every `Finding` field prints verbatim. Sanitizing
+            // at construction is the narrow fix; the broader one (sanitize once
+            // at the `Finding` display boundary, covering the pre-existing raw
+            // hooks.json snippets too) is filed rather than smuggled in here.
+            plugin: cadence_hooks_metrics::common::display_safe(label),
             file: hooks,
             line: None,
-            snippet: format!("{label}: no enabledPlugins entry"),
+            snippet: format!(
+                "{}: no enabledPlugins entry",
+                cadence_hooks_metrics::common::display_safe(label)
+            ),
             diagnosis: format!(
-                "{label} is installed and ships hooks, but has no entry in \
+                "{} is installed and ships hooks, but has no entry in \
                  enabledPlugins — none of its hooks can fire. Any logger or \
                  guard it wires is silently inert, including a staleness \
-                 canary wired inside the plugin it watches (#397)"
+                 canary wired inside the plugin it watches (#397)",
+                cadence_hooks_metrics::common::display_safe(label)
             ),
             remediation: format!(
-                "enable it (`/plugin` → enable {label}) if its hooks should be \
+                "enable it (`/plugin` → enable {}) if its hooks should be \
                  running, or set it to false in {} to record the choice — an \
                  explicit false is silent here, a missing key is not",
+                cadence_hooks_metrics::common::display_safe(label),
                 config_dir.join("settings.json").display()
             ),
         })
@@ -1100,12 +1121,22 @@ fn failopen_findings(
                 .map(|pair| format!("-e {}", shell_single_quote(pair)))
                 .collect::<Vec<_>>()
                 .join(" ");
+            // The RESOLVED cache dir, never a `~/.claude/...` literal.
+            // `plugins_dir` honors CLAUDE_CONFIG_DIR precisely because the
+            // config dir moves (the `claude-as` profile pattern), and a
+            // remediation that greps the wrong tree returns zero hits and reads
+            // as "no stale wiring" — a silent false negative inside the one
+            // command #183 exists to hand the operator.
+            let cache = plugins_dir()
+                .map(|p| p.join("cache").display().to_string())
+                .unwrap_or_else(|| "~/.claude/plugins/cache".to_string());
             format!(
                 "grep the installed plugins for the named invocation(s) — \
-                 `grep -rlF {needles} ~/.claude/plugins/cache` finds every \
-                 hooks.json that is inert; either upgrade this binary or drop \
-                 the stale wiring. `cadence-hooks list` shows what this build \
-                 accepts"
+                 `grep -rlF {needles} {}` finds every hooks.json carrying a \
+                 named invocation; either upgrade this binary or drop the \
+                 stale wiring. `cadence-hooks list` shows what this build \
+                 accepts",
+                shell_single_quote(&cache)
             )
         };
         findings.push(Finding {
@@ -2317,7 +2348,7 @@ mod tests {
     fn duplicate_installs_report_once() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("config");
-        write_settings(&config, r#"{"enabledPlugins":{}}"#);
+        write_settings(&config, r#"{"enabledPlugins":{"unrelated@m":true}}"#);
         let a = plugin_with_hooks(tmp.path(), "v1");
         let b = plugin_with_hooks(tmp.path(), "v2");
         let installs = vec![
@@ -2334,7 +2365,7 @@ mod tests {
     fn hookless_install_does_not_mask_its_hooked_sibling() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("config");
-        write_settings(&config, r#"{"enabledPlugins":{}}"#);
+        write_settings(&config, r#"{"enabledPlugins":{"unrelated@m":true}}"#);
         let hookless = tmp.path().join("no-hooks");
         fs::create_dir_all(&hookless).unwrap();
         let hooked = plugin_with_hooks(tmp.path(), "has-hooks");
@@ -2354,7 +2385,7 @@ mod tests {
     fn plugin_without_hooks_is_not_reported() {
         let tmp = tempfile::tempdir().unwrap();
         let config = tmp.path().join("config");
-        write_settings(&config, r#"{"enabledPlugins":{}}"#);
+        write_settings(&config, r#"{"enabledPlugins":{"unrelated@m":true}}"#);
         let dir = tmp.path().join("skills-only");
         fs::create_dir_all(dir.join("skills")).unwrap();
         let installs = vec![("skills-only@workbench".to_string(), dir)];
@@ -2373,6 +2404,42 @@ mod tests {
 
         assert!(unenabled_plugin_findings(&installs, &config).is_empty());
         assert!(enabled_plugin_map(&config).is_none());
+    }
+
+    // Cannot-judge covers EMPTY too, not just missing. A literally empty
+    // enabledPlugins is indistinguishable from a config not yet written, and
+    // reading it as "nothing is enabled" warns about every hook-shipping plugin
+    // at once — the exact failure the None guard exists to prevent.
+    #[test]
+    fn empty_enabled_plugins_object_is_cannot_judge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(&config, r#"{"enabledPlugins":{}}"#);
+        let dir = plugin_with_hooks(tmp.path(), "some-install");
+        let installs = vec![("some@workbench".to_string(), dir)];
+
+        assert!(enabled_plugin_map(&config).is_none());
+        assert!(unenabled_plugin_findings(&installs, &config).is_empty());
+    }
+
+    // Presence, not value: a malformed entry is still a decision the operator
+    // made. Dropping it would make the key read as ABSENT and fire the very
+    // warning the absent-vs-false rule exists to avoid.
+    #[test]
+    fn non_bool_entry_still_counts_as_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        write_settings(
+            &config,
+            r#"{"enabledPlugins":{"p@m":"true","other@m":true}}"#,
+        );
+        let dir = plugin_with_hooks(tmp.path(), "p-install");
+        let installs = vec![("p@m".to_string(), dir)];
+
+        assert!(
+            unenabled_plugin_findings(&installs, &config).is_empty(),
+            "a string-valued entry is present, not absent"
+        );
     }
 
     #[test]

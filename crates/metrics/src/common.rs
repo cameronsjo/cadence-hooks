@@ -126,6 +126,66 @@ pub fn utc_timestamp() -> String {
     cadence_hooks_core::time::utc_timestamp()
 }
 
+/// Strip display-affecting characters from a file-sourced string before it is
+/// interpolated into terminal output or into the `additionalContext` blob a
+/// nudge injects into the agent's context.
+///
+/// Two families, not one. `char::is_control` covers only **Cc** — C0, DEL, C1 —
+/// which handles ANSI escapes and newlines. It passes **Cf** (format)
+/// characters, and those reorder rendered text without being "control"
+/// characters at all: U+202E RIGHT-TO-LEFT OVERRIDE and the U+2066–U+2069
+/// directional isolates are the Trojan-Source primitives. U+2028/U+2029 are
+/// line/paragraph separators that some renderers break on. Strip all of them.
+///
+/// **The agent-context sink is the strict one.** A terminal reader sees a
+/// mangled line; an injected newline in `additionalContext` starts what reads
+/// as a new instruction. Anything file-sourced — a ledger field, a filename —
+/// must pass through here before it reaches either sink.
+pub fn display_safe(s: &str) -> String {
+    s.chars().filter(|c| !is_display_unsafe(*c)).collect()
+}
+
+/// Whether `c` can alter how the rest of a line renders: any Cc control, any Cf
+/// format character (bidi overrides/isolates, zero-width joiners), or the
+/// Unicode line/paragraph separators.
+///
+/// Cf is matched by explicit ranges rather than a Unicode-property crate — this
+/// stays dependency-free, and these are the blocks that carry the reordering
+/// primitives. `is_control` already covers Cc.
+fn is_display_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{2028}' | '\u{2029}'          // line / paragraph separator
+            | '\u{00AD}'                      // soft hyphen
+            | '\u{0600}'..='\u{0605}'         // Arabic number signs
+            | '\u{061C}'                      // Arabic letter mark
+            | '\u{06DD}' | '\u{070F}' | '\u{08E2}'
+            | '\u{180E}'                      // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}'         // zero-width space … RTL mark
+            | '\u{202A}'..='\u{202E}'         // bidi embeddings + OVERRIDE
+            | '\u{2060}'..='\u{2064}'         // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}'         // directional isolates
+            | '\u{FEFF}'                      // zero-width no-break space (BOM)
+            | '\u{FFF9}'..='\u{FFFB}'         // interlinear annotation
+        )
+}
+
+/// [`display_safe`] plus a character ceiling — filtering alone bounds the
+/// *character set* but not the *length*, and an unbounded file-sourced string
+/// can still flood a terminal line or a nudge.
+///
+/// Truncation counts **characters, not bytes**, and slices at the boundary
+/// `char_indices` reports — a byte slice at a fixed offset would panic
+/// mid-codepoint on a multi-byte value, which inside a fail-open writer would
+/// be a panic on the panic path.
+pub fn display_safe_bounded(s: &str, max_chars: usize) -> String {
+    let cleaned = display_safe(s);
+    match cleaned.char_indices().nth(max_chars) {
+        Some((boundary, _)) => format!("{}…", &cleaned[..boundary]),
+        None => cleaned,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Schema versioning (the metrics data contract)
 // ---------------------------------------------------------------------------
