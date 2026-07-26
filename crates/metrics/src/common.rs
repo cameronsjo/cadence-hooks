@@ -93,7 +93,7 @@ pub fn read_stream_with_legacy(filename: &str) -> Option<String> {
 
 /// Harness stamped on schema-v2 rows.
 pub fn harness() -> &'static str {
-    if std::env::var("CADENCE_HARNESS").is_ok_and(|value| value.eq_ignore_ascii_case("codex")) {
+    if cadence_hooks_core::is_codex_harness() {
         "codex"
     } else {
         "claude"

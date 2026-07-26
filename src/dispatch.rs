@@ -239,8 +239,7 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
 }
 
 fn codex_fail_closed(hook_name: &str) -> bool {
-    std::env::var("CADENCE_HARNESS").as_deref() == Ok("codex")
-        && crate::registry::is_security_critical(hook_name)
+    cadence_hooks_core::is_codex_harness() && crate::registry::is_security_critical(hook_name)
 }
 
 /// Run a fire-and-forget logger from stdin, record its wall-clock time to

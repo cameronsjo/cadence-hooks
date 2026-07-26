@@ -14,8 +14,21 @@ fn report() -> Value {
     .expect("report json")
 }
 
+/// Spawn the built binary with its metrics root pinned to a throwaway dir.
+///
+/// Every spawned subcommand may append telemetry, and an unpinned run resolves
+/// `metrics_dir()` to the *operator's real* ledger — creating it and writing
+/// production-shaped rows there just for running the suite. Every other
+/// integration test in this directory pins it; these must too.
+fn isolated_cadence_hooks(metrics_dir: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
+    cmd.env("CADENCE_METRICS_DIR", metrics_dir);
+    cmd
+}
+
 fn live_manifest() -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let metrics = tempfile::tempdir().expect("temp metrics dir");
+    let output = isolated_cadence_hooks(metrics.path())
         .args(["manifest", "--format", "json"])
         .output()
         .expect("generate live hook manifest");
@@ -100,7 +113,8 @@ fn every_security_route_has_native_hook_or_sandbox_control() {
 #[test]
 fn security_critical_malformed_patch_blocks_without_echoing_patch() {
     let payload = r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\nSECRET_VALUE\n*** End Patch"}"#;
-    let output = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"))
+    let metrics = tempfile::tempdir().expect("temp metrics dir");
+    let output = isolated_cadence_hooks(metrics.path())
         .args(["cadence", "prevent-secret-writes"])
         .env("CADENCE_HARNESS", "codex")
         .env("CADENCE_NO_FEEDBACK_FOOTER", "1")

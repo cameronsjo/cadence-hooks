@@ -145,6 +145,29 @@ impl Outcome {
     }
 }
 
+/// Whether this process is running under the Codex harness.
+///
+/// The single source of truth for the `CADENCE_HARNESS` check. Security
+/// behaviour keys off this (fail-closed parse denial, the `Ask` → `Block`
+/// conversion) and so does metrics tagging, so all callers must agree — a
+/// site that compared case-sensitively while another compared
+/// case-insensitively would fail **open** on `CADENCE_HARNESS=Codex` at
+/// exactly the moment metrics recorded the run as Codex.
+///
+/// Matching is case-insensitive: the value is set by shell wrappers, and a
+/// harness that announces itself at all should be honoured however it cased it.
+#[must_use]
+pub fn is_codex_harness() -> bool {
+    is_codex_harness_value(std::env::var("CADENCE_HARNESS").ok().as_deref())
+}
+
+/// Pure resolver behind [`is_codex_harness`], so the matching rule is testable
+/// without mutating process environment shared by every parallel test.
+#[must_use]
+pub fn is_codex_harness_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("codex"))
+}
+
 /// Normalize a file path for consistent matching:
 /// - Replace backslashes with forward slashes (Windows compatibility)
 /// - Strip null bytes (C string truncation attack prevention)
@@ -1207,8 +1230,7 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
-    if result.outcome == Outcome::Ask && std::env::var("CADENCE_HARNESS").as_deref() == Ok("codex")
-    {
+    if result.outcome == Outcome::Ask && is_codex_harness() {
         let reason = result.message.as_deref().unwrap_or("confirmation required");
         eprintln!(
             "{reason}\n\nBlocked because Codex hooks cannot hand an Ask decision to the user. \
@@ -1882,6 +1904,32 @@ mod tests {
         // synthetic test inputs) deserialize to None, never an error.
         let input: HookInput = serde_json::from_str(r#"{"tool_name":"Bash"}"#).unwrap();
         assert_eq!(input.transcript_path(), None);
+    }
+
+    #[test]
+    fn codex_harness_match_is_case_insensitive() {
+        // The security paths (fail-closed parse denial, Ask -> Block) and the
+        // metrics harness tag all read this one rule. When they disagreed, a
+        // non-lowercase value tagged the run "codex" in metrics while both
+        // security paths silently treated it as Claude — failing open exactly
+        // when the ledger said Codex was driving.
+        for value in ["codex", "Codex", "CODEX", "cOdEx"] {
+            assert!(
+                is_codex_harness_value(Some(value)),
+                "{value} should be recognized as the Codex harness"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_harness_match_rejects_non_codex_values() {
+        for value in ["claude", "", "codexx", "co dex", "codex-cli"] {
+            assert!(
+                !is_codex_harness_value(Some(value)),
+                "{value} should not be recognized as the Codex harness"
+            );
+        }
+        assert!(!is_codex_harness_value(None));
     }
 
     #[test]
