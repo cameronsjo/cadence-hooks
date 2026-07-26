@@ -125,7 +125,7 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
 /// set cannot drift between the code that skips these and the code that asks
 /// whether a word is one. **It is not the repo's only prefix set, and is not
 /// meant to become one** — three others answer adjacent questions with
-/// deliberately different membership, and each is wider here:
+/// deliberately different membership, and each admits words this set excludes:
 ///
 /// - `warn_alias_parsing::WRAPPERS` — `xargs`/`sudo`/`env`/`nice`/`timeout`
 /// - `prevent_secret_writes::COMMAND_WRAPPERS` — `sudo`/`command`/`nohup`/
@@ -262,9 +262,11 @@ fn segment_is_ship_anchor(segment: &str) -> bool {
 /// 4. A path-qualified command word — `/opt/homebrew/bin/gh pr create`,
 ///    `./gh pr create`. The comparison is against the literal token `gh`, as
 ///    the positional scan's was, so this is pre-existing rather than new.
-///    [`basename`] would close it in one call, which both guards apply to
-///    their own command word; left alone here because it would ADD nudges
-///    rather than restore them, which is past what #419 asked for.
+///    [`basename`] would close it in one call — `guard_rm` applies it to its
+///    delete verb — but it is left alone here because it would ADD nudges
+///    rather than restore them, which is past what #419 asked for. Note
+///    `enforce_worktree`'s own commit gate compares the literal `git` the
+///    same way, so this spelling is unmodeled there too.
 ///
 /// Each of these shrinks the `log-polish-nudge` denominator rather than
 /// inflating it (#409) — the opposite error from the one this change fixes,
