@@ -55,8 +55,9 @@ pub mod identity;
 pub mod persist_plan;
 /// `docs/plans/*.md` frontmatter scan consumed by [`start`]'s SessionStart
 /// disclosure — surfaces in-flight/blocked plans without a GitHub call
-/// (cadence-hooks#429).
-pub mod plan_scan;
+/// (cadence-hooks#429). Not `pub`: its one consumer, [`start`], lives in this
+/// same crate.
+mod plan_scan;
 /// Salted machine digest for committed provenance blocks (cadence#248) —
 /// shared with a future commit-message provenance check.
 pub mod provenance;
