@@ -114,6 +114,12 @@ pub struct FailopenCounts {
     pub deadline_block_suppressed: u64,
 }
 
+/// How many distinct `namespace subcommand` pairs a recency clause names before
+/// it stops. A skew is nearly always one or two invocations repeated; past a
+/// handful the line stops being a diagnosis and starts being a dump, and the
+/// operator has enough to grep with either way.
+const MAX_SUBCOMMANDS: usize = 4;
+
 /// Recency + version context for one `reason`'s windowed rows — the fields
 /// doctor needs to tell a *fixed* fail-open burst from a *live* one. Counting
 /// stays window-wide (a wiring problem is not version-specific, so filtering
@@ -143,6 +149,20 @@ pub struct FailopenRecency {
     /// explicit JSON null — all three are the same "no diagnostic here" to a
     /// reader, so they collapse deliberately.
     pub last_error: Option<String>,
+    /// Distinct `"<namespace> <subcommand>"` pairs among the windowed rows
+    /// **on the current version**, sorted, capped at [`MAX_SUBCOMMANDS`].
+    ///
+    /// This is what turns a `version_mismatch` count into an actionable
+    /// finding (#183): the count says a plugin expects something this binary
+    /// lacks, and this says *which invocation*, so the operator greps one
+    /// hooks.json instead of auditing every installed plugin by hand. The
+    /// current-version filter matches [`Self::on_current_version`] — a pair
+    /// that only ever failed on an older binary is the sanctioned
+    /// release-transition case, not a live wiring problem.
+    ///
+    /// Empty when no windowed row on the current version records a pair (a
+    /// bare `cadence-hooks` invocation logs neither).
+    pub subcommands: Vec<String>,
 }
 
 /// The `failopen.jsonl` rows matching `reason` within the window — the single
@@ -370,6 +390,22 @@ fn recency_from(
         .filter_map(|ts| ts.get(..10))
         .collect::<std::collections::BTreeSet<_>>()
         .len() as u64;
+    // A `BTreeSet` both dedups and sorts: a skew that fires 96 times names the
+    // two or three invocations behind it, not 96 lines. `display_safe` for the
+    // same defense-in-depth reason as `last_ts` — these are printed verbatim.
+    let subcommands: Vec<String> = rows
+        .iter()
+        .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
+        .filter_map(|v| {
+            let ns = v.get("namespace").and_then(Value::as_str)?;
+            let sub = v.get("subcommand").and_then(Value::as_str)?;
+            Some(display_safe(&format!("{ns} {sub}")))
+        })
+        .filter(|pair| !pair.trim().is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .take(MAX_SUBCOMMANDS)
+        .collect();
 
     Some(FailopenRecency {
         last_ts,
@@ -377,6 +413,7 @@ fn recency_from(
         on_current_version,
         distinct_days,
         last_error,
+        subcommands,
     })
 }
 
@@ -725,6 +762,62 @@ mod tests {
     }
 
     // --- recency (pure + end-to-end) ---
+
+    #[test]
+    fn recency_subcommands_dedup_sort_and_cap() {
+        // Six distinct pairs, each repeated — the shape a live skew produces.
+        // The clause must dedup, sort, and stop at MAX_SUBCOMMANDS rather than
+        // dumping every pair into a terminal line.
+        let rows: String = (0..6)
+            .flat_map(|i| {
+                (0..3).map(move |_| {
+                    format!(
+                        r#"{{"reason":"version_mismatch","namespace":"ns","subcommand":"sub{i}","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:0{i}Z"}}"#
+                    )
+                })
+            })
+            .map(|r| r + "\n")
+            .collect();
+
+        let r = recency_from(&rows, "2026-07-01T00:00:00Z", "version_mismatch", "1.0.0")
+            .expect("rows are in window");
+        assert_eq!(
+            r.subcommands,
+            vec!["ns sub0", "ns sub1", "ns sub2", "ns sub3"],
+            "deduped, sorted, capped at {MAX_SUBCOMMANDS}"
+        );
+    }
+
+    #[test]
+    fn recency_subcommands_exclude_other_versions() {
+        // The current-version filter matches `on_current_version`: a pair that
+        // only ever failed on an older binary is the sanctioned
+        // release-transition case, not a live wiring problem.
+        let rows = concat!(
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"old","binaryVersion":"0.9.0","ts":"2026-07-25T00:00:00Z"}"#,
+            "\n",
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"live","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:01Z"}"#,
+            "\n",
+        );
+
+        let r = recency_from(rows, "2026-07-01T00:00:00Z", "version_mismatch", "1.0.0")
+            .expect("rows are in window");
+        assert_eq!(r.subcommands, vec!["ns live"]);
+    }
+
+    #[test]
+    fn recency_subcommands_empty_without_pairs() {
+        // A bare `cadence-hooks` invocation logs neither field — the clause
+        // must degrade to empty, not to a half-rendered pair.
+        let rows = concat!(
+            r#"{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"2026-07-25T00:00:00Z"}"#,
+            "\n",
+        );
+
+        let r =
+            recency_from(rows, "2026-07-01T00:00:00Z", "parse", "1.0.0").expect("row is in window");
+        assert!(r.subcommands.is_empty());
+    }
 
     #[test]
     fn recency_from_counts_distinct_days_not_rows() {
