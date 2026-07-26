@@ -189,7 +189,7 @@ fn is_assignment_word(token: &str) -> bool {
     }
 }
 
-/// True when `command` is about to expose branch work for review: `gh pr ready`
+/// True when `command` is about to ship branch work: `gh pr ready`
 /// (leaves draft) or a NON-draft `gh pr create`. A `--draft`/`-d` create is NOT
 /// an anchor — an entry-posture draft opens at zero diff, where polish is
 /// meaningless (#297). Shared by the `nudge-polish-before-pr` Check and the
@@ -212,9 +212,24 @@ fn is_assignment_word(token: &str) -> bool {
 /// expanded inner segment can match — and per-segment draft scoping survives
 /// the expansion, leaving `sh -c 'gh pr create --draft'` correctly skipped.
 pub fn is_polish_ship_anchor(command: &str) -> bool {
+    polish_ship_anchor(command).is_some()
+}
+
+/// Which anchor `command` trips — `"create"`, `"ready"`, or `"merge"` — or
+/// `None` when it is not a ship.
+///
+/// The kind is recorded on every `polish_nudges.jsonl` row so the ledger stays
+/// interpretable now that one branch can trip two anchors: a draft-first branch
+/// fires at `gh pr ready` and again at `gh pr merge`. Without the kind those two
+/// rows are indistinguishable from two genuine ships of the same branch, and the
+/// double-count is *directionally biased* — a merge-time row is more likely to
+/// carry `markerPresent: true`, because a polish may have happened in between,
+/// so a naive rate reads better than reality (security review, #325). Anything
+/// measuring adherence should dedup on `(repo, branch)` or split by this field.
+pub fn polish_ship_anchor(command: &str) -> Option<&'static str> {
     command_segments(command)
         .iter()
-        .any(|segment| segment_is_ship_anchor(segment))
+        .find_map(|segment| segment_ship_anchor(segment))
 }
 
 /// Ship-anchor test for a single shell segment: `gh pr ready`, or a `gh pr
@@ -227,16 +242,137 @@ pub fn is_polish_ship_anchor(command: &str) -> bool {
 /// (`enforce_worktree`, `guard_rm`), because [`tokenize`] fuses the punctuation
 /// to the adjacent word — without it `{ gh pr create; }` presents `{` as the
 /// command word and the index-0 gate never fires.
-fn segment_is_ship_anchor(segment: &str) -> bool {
+fn segment_ship_anchor(segment: &str) -> Option<&'static str> {
     let tokens = tokenize(strip_group_wrappers(segment));
-    match gh_pr_subcommand(&tokens) {
-        Some("ready") => true,
-        Some("create") => !tokens.iter().any(|t| t == "--draft" || t == "-d"),
-        _ => false,
+    let invocation = gh_pr_invocation(&tokens)?;
+    match invocation.subcommand {
+        "ready" => Some("ready"),
+        "create" if !tokens.iter().any(|t| t == "--draft" || t == "-d") => Some("create"),
+        "merge" if invocation.targets_the_current_branch() => Some("merge"),
+        _ => None,
     }
 }
 
-/// The subcommand of a `gh pr <sub>` invocation in `tokens`, or `None`.
+/// A `gh pr <sub>` invocation: the subcommand, the tokens after it, and whether
+/// anything retargeted it away from the repository the cwd sits in.
+struct GhPrInvocation<'a> {
+    subcommand: &'a str,
+    /// Tokens following the subcommand — its own flags and operands.
+    operands: &'a [String],
+    /// The command was pointed at another repository: a `--repo`/`-R` flag in
+    /// global position, or a `GH_REPO=`/`GH_HOST=` assignment prefix.
+    retargeted: bool,
+}
+
+/// True for every spelling of gh's repo override. gh accepts the value
+/// separated (`--repo owner/r`), attached with `=` (`--repo=owner/r`), and —
+/// for the shorthand — attached bare (`-Rowner/r`). A token starting with `-R`
+/// can only be that flag: no other gh flag on `pr merge` begins with a capital
+/// `R`, and the separated form is `-R` exactly.
+fn is_repo_flag(token: &str) -> bool {
+    token.starts_with("--repo") || token.starts_with("-R")
+}
+
+impl GhPrInvocation<'_> {
+    /// True when this invocation acts on **the PR of the branch checked out in
+    /// the current directory** — the only case where resolving the branch from
+    /// the cwd is correct.
+    ///
+    /// `gh pr merge` takes an optional `[<number> | <url> | <branch>]` and,
+    /// per gh's own help, "without an argument, the pull request that belongs
+    /// to the current branch is selected". So the test is simply: no positional
+    /// operand, and no repo override pointing the command at a different
+    /// repository than the one the cwd sits in.
+    ///
+    /// **Any** non-flag operand disqualifies, including a flag's *value* —
+    /// `gh pr merge --squash -b "some message"` reads as argument-bearing and
+    /// does not anchor. That is deliberate: the two error directions are not
+    /// symmetric. Wrongly seeing an argument costs one un-nudged ship; wrongly
+    /// seeing none anchors a merge whose branch was resolved from the wrong
+    /// cwd, which is a false nudge on someone else's work — the precise failure
+    /// that got `gh pr merge` excluded from the anchor set in the first place
+    /// (cadence-hooks#325). Enumerating gh's value-taking flags would trade a
+    /// safe miss for an unsafe guess every time gh adds one.
+    ///
+    /// A repo override disqualifies **in either position**. `gh` accepts
+    /// `--repo`/`-R` after the subcommand as readily as before it, and the
+    /// attached spellings (`--repo=owner/r`, `-Rowner/r`) start with `-`, so
+    /// the operand rule alone would wave them through while gh merged a PR in
+    /// a different repository entirely (security review).
+    ///
+    /// The honest scope of the result: **every retargeting spelling and every
+    /// operand this segment can see.** Two routes hide a selector from it
+    /// anyway, both nudge-only, and neither closable here:
+    ///
+    /// - An *exported* `GH_REPO`/`GH_HOST`. This reads the command string, and
+    ///   a variable set in an earlier shell leaves no token behind. The inline
+    ///   assignment form IS caught — see [`gh_pr_invocation`].
+    /// - A selector written after a `&`-bearing redirect: [`split_segments`]
+    ///   cuts at the `&` of `2>&1`, so `gh pr merge 2>&1 12` puts the `12` in a
+    ///   different segment entirely. That is the segmenter's reach, shared
+    ///   repo-wide, not this rule's — and unlike `ready`/`create`, which never
+    ///   inspect operands, `merge` is the only anchor that loses anything to it.
+    ///
+    /// So this returns "targets the current branch" as the best available
+    /// reading of the command text, not as a proof about what gh will do.
+    fn targets_the_current_branch(&self) -> bool {
+        !self.retargeted && operands_are_flags_only(self.operands)
+    }
+}
+
+/// True when nothing in `operands` selects a PR — only flags, shell
+/// redirections, and a trailing comment.
+///
+/// Redirections have to be skipped rather than counted, and the reason is
+/// concrete: this ecosystem's own rule for gating a merge on a command's exit
+/// code is `cmd > log 2>&1; echo $?`. Counting `2>&1` and `/tmp/log` as PR
+/// selectors would mean the documented merge idiom never anchors — reopening,
+/// for the most careful spelling, exactly the un-nudged-ship hole #325 exists
+/// to close (security review). `ready` and `create` never had this asymmetry,
+/// because neither inspects its operands at all.
+fn operands_are_flags_only(operands: &[String]) -> bool {
+    let mut i = 0;
+    while let Some(token) = operands.get(i) {
+        let token = token.as_str();
+        // A comment ends the command; nothing after it reaches gh. The test is
+        // EQUALITY, not a prefix: `tokenize` emits a real comment marker as its
+        // own `#` token, while a quoted flag value can merely begin with one
+        // (`-t '#123'`). Treating that value as a comment stopped the scan and
+        // let a PR number *after* it through unexamined — a selector smuggled
+        // past the gate, which is the unsafe direction (security review).
+        if token == "#" {
+            return true;
+        }
+        if is_redirect_token(token) {
+            // A bare operator (`>`, `2>`, `&>`) takes the NEXT token as its
+            // target; an attached one (`>log`, `2>&1`) carries its own.
+            if token.ends_with('>') || token.ends_with('<') {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // A positional operand selects a PR; a repo flag retargets the command.
+        // Either way the cwd's branch is not what gh will act on.
+        if !token.starts_with('-') || is_repo_flag(token) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// True for a shell redirection token in any spelling `tokenize` can produce:
+/// `>`, `>>`, `<`, `2>`, `2>&1`, `&>`, and the attached-target forms (`>log`,
+/// `2>/dev/null`). Leading `&` and file-descriptor digits are stripped before
+/// the test, which is what distinguishes these from an ordinary operand.
+fn is_redirect_token(token: &str) -> bool {
+    let rest = token.strip_prefix('&').unwrap_or(token);
+    let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.starts_with('>') || rest.starts_with('<')
+}
+
+/// The `gh pr <sub>` invocation in `tokens`, or `None`.
 ///
 /// `gh` must be the segment's **command word** — index 0 after
 /// [`skip_transparent_prefixes`] — not merely present somewhere in the token
@@ -296,26 +432,54 @@ fn segment_is_ship_anchor(segment: &str) -> bool {
 /// outright — there is one walk, not one per `gh` token, so a crafted
 /// `gh --repo` flood is linear by construction rather than by the resume
 /// bookkeeping it previously needed (security review, PR #414).
-fn gh_pr_subcommand(tokens: &[String]) -> Option<&str> {
+///
+/// The same walk records whether anything **retargeted** the command away from
+/// the cwd's repository, since `gh pr merge` can only be resolved against the
+/// cwd's branch when the command is also pointed at the cwd's repo (see
+/// [`GhPrInvocation::targets_the_current_branch`]).
+///
+/// Two channels do that without a positional operand. A `--repo`/`-R` flag is
+/// the visible one. The other is an inline environment assignment:
+/// `GH_REPO=other/repo gh pr merge` and `GH_HOST=example.com gh pr merge` both
+/// retarget, and [`skip_transparent_prefixes`] skips assignment words to find
+/// the command word — so without this check the tokens vanish before anything
+/// looks at them. That is why the scan reads the *skipped* prefix region rather
+/// than only `argv`.
+fn gh_pr_invocation(tokens: &[String]) -> Option<GhPrInvocation<'_>> {
     let argv = skip_transparent_prefixes(tokens);
     if argv.first().map(String::as_str) != Some("gh") {
         return None;
     }
+    // The prefix region `skip_transparent_prefixes` consumed — assignment words
+    // and transparent prefixes both live here.
+    let prefix = &tokens[..tokens.len() - argv.len()];
+    let mut retargeted = prefix
+        .iter()
+        .any(|t| t.starts_with("GH_REPO=") || t.starts_with("GH_HOST="));
     let mut i = 1;
     while let Some(flag) = argv.get(i) {
         if !flag.starts_with('-') {
             break;
         }
-        i += if flag == "--repo" || flag == "-R" {
-            2
+        // The separate form consumes an extra token; every attached spelling
+        // (`--repo=owner/r`, `-Rowner/r`) consumes only itself.
+        if flag == "--repo" || flag == "-R" {
+            retargeted = true;
+            i += 2;
         } else {
-            1
-        };
+            retargeted |= is_repo_flag(flag);
+            i += 1;
+        }
     }
-    if argv.get(i).map(String::as_str) == Some("pr") {
-        return argv.get(i + 1).map(String::as_str);
+    if argv.get(i).map(String::as_str) != Some("pr") {
+        return None;
     }
-    None
+    let subcommand = argv.get(i + 1)?;
+    Some(GhPrInvocation {
+        subcommand: subcommand.as_str(),
+        operands: argv.get(i + 2..).unwrap_or(&[]),
+        retargeted,
+    })
 }
 
 /// Extract `(host, "owner/repo")` from any git remote URL format.
@@ -1495,8 +1659,10 @@ mod tests {
     fn is_polish_ship_anchor_rejects_other_gh_and_substrings() {
         assert!(!is_polish_ship_anchor("gh pr list"));
         assert!(!is_polish_ship_anchor("gh pr view 123"));
-        // `gh pr merge` is deliberately excluded — often run from main/another
-        // cwd by an orchestrator, so the branch mis-resolves and false-nudges.
+        // An ARGUMENT-BEARING `gh pr merge` stays excluded — that is the
+        // orchestrator shape, run from main or another cwd, where the branch
+        // mis-resolves and false-nudges. A bare merge is a separate case and
+        // anchors; see `is_polish_ship_anchor_matches_a_bare_merge`.
         assert!(!is_polish_ship_anchor("gh pr merge 12"));
         assert!(!is_polish_ship_anchor("gh issue create --title x"));
         // A branch name containing the literal substring must not match.
@@ -1600,6 +1766,134 @@ mod tests {
         assert!(is_polish_ship_anchor("FOO=1 gh pr create --fill"));
         // Per-segment draft scoping survives prefix skipping.
         assert!(!is_polish_ship_anchor("exec gh pr create --draft"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_matches_a_bare_merge() {
+        // #325: a draft-first branch can go draft -> ready (web UI) -> merged
+        // with no anchor ever firing. Merge is the last hook-visible moment,
+        // and gh's own help settles when the cwd resolves it: "without an
+        // argument, the pull request that belongs to the current branch is
+        // selected". So a bare merge targets THIS branch, and resolving from
+        // the cwd is correct by construction.
+        assert!(is_polish_ship_anchor("gh pr merge"));
+        assert!(is_polish_ship_anchor("gh pr merge --squash"));
+        assert!(is_polish_ship_anchor(
+            "gh pr merge --squash --delete-branch"
+        ));
+        assert!(is_polish_ship_anchor("gh pr merge --auto --merge"));
+        // The ordinary compound spellings behave like the other subcommands.
+        assert!(is_polish_ship_anchor("cd repo && gh pr merge --squash"));
+        assert!(is_polish_ship_anchor("sh -c 'gh pr merge --squash'"));
+        assert!(is_polish_ship_anchor("{ gh pr merge --squash; }"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_skips_a_targeted_merge() {
+        // The exclusion #325 questioned survives exactly where it was earned.
+        // An orchestrator merging from `main` or another cwd must NAME the PR —
+        // you cannot merge another branch's PR without an argument — so every
+        // shape whose branch would mis-resolve is still rejected, and the two
+        // rules never overlap.
+        assert!(!is_polish_ship_anchor("gh pr merge 12"));
+        assert!(!is_polish_ship_anchor("gh pr merge some-branch"));
+        assert!(!is_polish_ship_anchor(
+            "gh pr merge https://github.com/o/r/pull/12"
+        ));
+        assert!(!is_polish_ship_anchor("gh pr merge 12 --squash"));
+        assert!(!is_polish_ship_anchor("gh pr merge --squash 12"));
+        // A repo override points the command at a different repository than
+        // the cwd sits in, so the cwd's branch is not the merge target either.
+        assert!(!is_polish_ship_anchor("gh --repo owner/r pr merge"));
+        assert!(!is_polish_ship_anchor("gh -R owner/r pr merge --squash"));
+        assert!(!is_polish_ship_anchor("gh --repo=owner/r pr merge"));
+        assert!(!is_polish_ship_anchor("gh pr merge --repo owner/r"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_skips_every_retargeting_spelling() {
+        // Security review of #325: the separate-value form is only one of four
+        // ways to point the command at another repository, and the other three
+        // all slip an operands-only rule — the attached spellings begin with
+        // `-`, and the assignment prefix is consumed by
+        // `skip_transparent_prefixes` before `argv` is even formed. Each of
+        // these merges a PR somewhere the cwd's branch has nothing to do with,
+        // so anchoring would nudge about someone else's work.
+        assert!(!is_polish_ship_anchor("gh pr merge --repo=owner/r"));
+        assert!(!is_polish_ship_anchor("gh pr merge -Rowner/r"));
+        assert!(!is_polish_ship_anchor("gh -Rowner/r pr merge"));
+        assert!(!is_polish_ship_anchor("gh pr merge --squash -Rowner/r"));
+        assert!(!is_polish_ship_anchor("GH_REPO=other/repo gh pr merge"));
+        assert!(!is_polish_ship_anchor("GH_HOST=example.com gh pr merge"));
+        assert!(!is_polish_ship_anchor(
+            "GH_REPO=other/repo env gh pr merge --squash"
+        ));
+        // The control: same shapes minus the retarget still anchor, so these
+        // assertions are pinning the override and not some unrelated rejection.
+        assert!(is_polish_ship_anchor("gh pr merge --squash"));
+        assert!(is_polish_ship_anchor("env gh pr merge --squash"));
+        // An UNRELATED assignment prefix must not disqualify.
+        assert!(is_polish_ship_anchor("FOO=1 gh pr merge --squash"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_reads_a_flag_value_as_an_operand() {
+        // A KNOWN MISS, pinned deliberately. Any non-flag token after the
+        // subcommand disqualifies, including a flag's own value, so a bare
+        // merge carrying a commit body does not anchor. The two error
+        // directions are not symmetric: wrongly seeing an operand costs one
+        // un-nudged ship, while wrongly seeing none nudges about a branch
+        // resolved from the wrong cwd — the failure that excluded merge in the
+        // first place. Enumerating gh's value-taking flags would trade a safe
+        // miss for an unsafe guess every time gh adds one.
+        assert!(!is_polish_ship_anchor(
+            "gh pr merge --squash -b 'some message'"
+        ));
+        assert!(!is_polish_ship_anchor("gh pr merge --body-file notes.md"));
+        // `--flag=value` is self-contained and still anchors.
+        assert!(is_polish_ship_anchor("gh pr merge --squash --body=done"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_matches_a_redirected_merge() {
+        // Security review of #325: `2>&1`, `>`, and a log path are not PR
+        // selectors, but they ARE non-flag tokens — so an operands-only rule
+        // silently dropped the anchor on the one merge spelling this
+        // ecosystem's rules actually prescribe (`cmd > log 2>&1; echo $?`
+        // before gating a merge on the exit code). Missing the careful
+        // spelling while catching the careless one is the wrong way round.
+        assert!(is_polish_ship_anchor("gh pr merge --squash 2>&1 | tail -5"));
+        assert!(is_polish_ship_anchor("gh pr merge --squash > /tmp/out.log"));
+        assert!(is_polish_ship_anchor(
+            "gh pr merge --squash > /tmp/out.log 2>&1"
+        ));
+        assert!(is_polish_ship_anchor("gh pr merge --squash 2>/dev/null"));
+        assert!(is_polish_ship_anchor(
+            "gh pr merge --squash &> /tmp/out.log"
+        ));
+        assert!(is_polish_ship_anchor("gh pr merge --squash # ship it"));
+        // Skipping a redirection must not smuggle a PR selector past the gate.
+        // This holds for every redirect the skip itself governs — the operand
+        // test still runs on what follows.
+        assert!(!is_polish_ship_anchor("gh pr merge 12 > /tmp/out.log"));
+        assert!(!is_polish_ship_anchor("gh pr merge > /tmp/out.log 12"));
+        assert!(!is_polish_ship_anchor("gh pr merge >log 12"));
+        assert!(!is_polish_ship_anchor("gh pr merge >>log 12"));
+        assert!(!is_polish_ship_anchor(
+            "gh pr merge -Rowner/other --squash 2>&1 | tail"
+        ));
+        // A `#` INSIDE a flag value is not a comment marker — stopping there
+        // would leave the `12` after it unexamined, smuggling a selector past
+        // the gate. Only a standalone `#` ends the command.
+        assert!(!is_polish_ship_anchor("gh pr merge -t '#123' 12"));
+        // The limit this does NOT reach, stated rather than implied:
+        // `split_segments` cuts at the `&` of `2>&1`, so a token written after
+        // that redirect lands in a different segment — `gh pr merge 2>&1 12`
+        // anchors despite naming a PR. That is `command_segments`' reach,
+        // shared repo-wide; `merge` is simply the only anchor that inspects
+        // operands, so it is the only one that loses anything to it. Pinned
+        // here as a KNOWN hole so a future segmenter fix has a test to flip.
+        assert!(is_polish_ship_anchor("gh pr merge 2>&1 12"));
     }
 
     #[test]
