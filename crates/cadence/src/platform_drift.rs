@@ -67,6 +67,23 @@ fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
+/// Escape a version string for use as a term in the daily-gate token.
+///
+/// The token grammar is `component:running>expected`, comma-joined, and both
+/// version strings reaching it are file-supplied: [`parse_semver`] accepts
+/// arbitrary trailing bytes past the patch digits, so a crafted
+/// `current_version` containing `>` or `,` could otherwise forge the grammar and
+/// alias a different drift state's token — suppressing a nudge that should have
+/// fired. Percent-escaping the two separators (and the escape character first,
+/// so the mapping is injective) makes a forged term impossible to confuse with a
+/// real one.
+fn token_component(version: &str) -> String {
+    version
+        .replace('%', "%25")
+        .replace(',', "%2C")
+        .replace('>', "%3E")
+}
+
 /// Gap semantics: nudge when major or minor differ at all, or when the patch
 /// delta is >= 5 within the same major.minor. Malformed/unparseable versions
 /// never nudge — a parse failure is silence, not a false positive.
@@ -122,8 +139,9 @@ impl Check for PlatformDrift {
         ) {
             findings.push((
                 format!(
-                    "hooks:{installed_hooks_version}>{}",
-                    baseline.cadence_hooks.current_version
+                    "hooks:{}>{}",
+                    token_component(installed_hooks_version),
+                    token_component(&baseline.cadence_hooks.current_version)
                 ),
                 format!(
                     "cadence-hooks is behind: installed {installed_hooks_version}, plugin baseline expects {} — upgrade with your install method (e.g. `brew upgrade cadence-hooks`)",
@@ -140,8 +158,9 @@ impl Check for PlatformDrift {
         {
             findings.push((
                 format!(
-                    "cc:{harness_version}>{}",
-                    baseline.claude_code.last_swept_version
+                    "cc:{}>{}",
+                    token_component(&harness_version),
+                    token_component(&baseline.claude_code.last_swept_version)
                 ),
                 format!(
                     "Claude Code has moved since the last platform sweep: running {harness_version}, last swept {} — consider a platform-adoption sweep",
@@ -253,6 +272,38 @@ mod tests {
     #[test]
     fn version_gap_silent_when_baseline_malformed() {
         assert!(!version_gap("0.66.0", "bogus"));
+    }
+
+    // --- token_component (gate-token escaping) ---
+
+    #[test]
+    fn token_component_passes_ordinary_versions_through() {
+        assert_eq!(token_component("0.69.0"), "0.69.0");
+        assert_eq!(token_component("2.1.218-beta.1"), "2.1.218-beta.1");
+    }
+
+    #[test]
+    fn token_component_escapes_the_token_separators() {
+        assert_eq!(token_component("1.2.3>x"), "1.2.3%3Ex");
+        assert_eq!(token_component("1.2.3,x"), "1.2.3%2Cx");
+    }
+
+    #[test]
+    fn token_component_cannot_forge_another_terms_token() {
+        // `parse_semver` tolerates trailing bytes, so a crafted baseline version
+        // can carry the grammar's own separators. Escaped, the forgery is
+        // distinguishable from the real term it imitates.
+        let forged = format!("hooks:0.69.0>{}", token_component("9.9.9,cc:1.0.0>1.0.0"));
+        let genuine = "hooks:0.69.0>9.9.9,cc:1.0.0>1.0.0";
+        assert_ne!(forged, genuine);
+    }
+
+    #[test]
+    fn token_component_escaping_is_injective() {
+        // The escape character is escaped first, so no two distinct inputs can
+        // collide on one output — the property that makes aliasing impossible
+        // rather than merely unlikely.
+        assert_ne!(token_component("%3E"), token_component(">"));
     }
 
     // --- Check::run ---

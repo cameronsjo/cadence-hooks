@@ -62,10 +62,7 @@ pub fn marker_dir() -> PathBuf {
 /// under — [`harden_marker_dir`] still runs on the derived path, so an override
 /// never bypasses the `0700` lockdown.
 fn marker_dir_from(override_dir: Option<String>) -> PathBuf {
-    let base = match override_dir {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => paths::marker_temp_dir(),
-    };
+    let base = marker_base_from(override_dir);
     let mut hasher = DefaultHasher::new();
     paths::user_home_lossy_or_default().hash(&mut hasher);
     let dir = base.join(format!("cadence-hooks-{:x}", hasher.finish()));
@@ -74,6 +71,33 @@ fn marker_dir_from(override_dir: Option<String>) -> PathBuf {
     } else {
         base
     }
+}
+
+/// The base directory the per-user hashed subdir is created under: the
+/// `CADENCE_MARKER_DIR` override when set non-empty, else the shared
+/// [`paths::marker_temp_dir`].
+///
+/// Split out so [`marker_dir_is_private`] can recognize the fail-open result
+/// (which *is* this base) without re-deriving the naming scheme.
+fn marker_base_from(override_dir: Option<String>) -> PathBuf {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => paths::marker_temp_dir(),
+    }
+}
+
+/// True when [`marker_dir`] resolved to its hardened `0700` per-user directory,
+/// false when it failed open to the shared base.
+///
+/// The shared base is world-writable on a multi-user host, so a marker there is
+/// pre-plantable by a co-tenant. Presence-only markers tolerate that (the
+/// family's documented posture — [`write_marker`] still refuses to follow a
+/// symlink). A marker whose *content* decides whether a nudge is suppressed does
+/// not: a planted file with a guessable stamp would mute the nudge, and on a
+/// sticky `/tmp` the corrective rename fails, so the mute persists. Consumers
+/// that read marker content to gate output check this first and skip the gate.
+pub fn marker_dir_is_private() -> bool {
+    marker_dir() != marker_base_from(std::env::var("CADENCE_MARKER_DIR").ok())
 }
 
 /// Create the marker dir and lock it to `0700`, refusing a pre-planted symlink.
@@ -201,6 +225,13 @@ pub fn polish_marker_present(command: &str, cwd: Option<&str>) -> bool {
 /// name is still reduced to `[A-Za-z0-9_-]` so the primitive cannot escape
 /// [`marker_dir`] whatever a future call site passes.
 pub fn daily_marker(kind: &str) -> PathBuf {
+    marker_dir().join(daily_marker_name(kind))
+}
+
+/// The bare filename half of [`daily_marker`], so a caller that already resolved
+/// [`marker_dir`] can join it without resolving (and re-hardening) the directory
+/// a second time.
+fn daily_marker_name(kind: &str) -> String {
     let safe: String = kind
         .chars()
         .map(|c| {
@@ -211,7 +242,7 @@ pub fn daily_marker(kind: &str) -> PathBuf {
             }
         })
         .collect();
-    marker_dir().join(format!("daily-{safe}"))
+    format!("daily-{safe}")
 }
 
 /// True on the first sighting of `token` for `kind` today — the once-per-day
@@ -237,11 +268,23 @@ pub fn daily_marker(kind: &str) -> PathBuf {
 /// `CADENCE_NO_DAILY_GATE` (any non-empty value) disables the gate: every call
 /// fires and nothing is stamped, so a session debugging a nudge sees it every
 /// time.
+///
+/// The gate is also skipped whenever [`marker_dir_is_private`] is false. This is
+/// the first marker in the family whose *content* decides whether output is
+/// suppressed, so unlike the presence-only markers it cannot ride the shared
+/// fail-open base: a co-tenant could pre-plant the (fully static) filename with a
+/// guessable stamp and mute the nudge for the day. Degraded hardening therefore
+/// degrades toward nudging, which is the same direction every other failure path
+/// here takes.
 pub fn claim_today(kind: &str, token: &str) -> bool {
     if std::env::var("CADENCE_NO_DAILY_GATE").is_ok_and(|v| !v.is_empty()) {
         return true;
     }
-    let path = daily_marker(kind);
+    let dir = marker_dir();
+    if dir == marker_base_from(std::env::var("CADENCE_MARKER_DIR").ok()) {
+        return true;
+    }
+    let path = dir.join(daily_marker_name(kind));
     let stamp = format!("{} {token}", crate::time::local_date());
     if std::fs::read_to_string(&path).is_ok_and(|existing| existing.trim() == stamp) {
         return false;
@@ -741,6 +784,41 @@ mod tests {
                 !name.contains('/') && !name.contains(".."),
                 "filename must carry no traversal: {name}"
             );
+        });
+    }
+
+    #[test]
+    fn claim_today_never_suppresses_from_the_shared_fail_open_base() {
+        // The shared base is pre-plantable by a co-tenant, and this marker's
+        // CONTENT decides suppression — so a planted stamp there must not be
+        // able to mute the nudge. Modelled by pointing CADENCE_MARKER_DIR at a
+        // path where the hashed subdir cannot be created (a regular FILE, so
+        // `create_dir_all` fails), which is exactly what makes `marker_dir()`
+        // fail open to the base.
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("occupied");
+        std::fs::write(&not_a_dir, "").unwrap();
+        with_marker_dir(&not_a_dir, || {
+            assert!(
+                !marker_dir_is_private(),
+                "precondition: this must be the fail-open path, or the test proves nothing"
+            );
+            assert!(claim_today("test-gate", "tok"));
+            assert!(
+                claim_today("test-gate", "tok"),
+                "a degraded marker dir must never suppress, however many times it is asked"
+            );
+        });
+    }
+
+    #[test]
+    fn marker_dir_is_private_when_hardening_succeeds() {
+        // The positive control for the test above: the same assertion against a
+        // usable base must report private, or `marker_dir_is_private` could be
+        // returning false unconditionally.
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            assert!(marker_dir_is_private());
         });
     }
 

@@ -129,10 +129,9 @@ fn nudge_message() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::with_marker_dir;
     use cadence_hooks_core::gitstate::GitState;
     use cadence_hooks_core::markers::{polish_marker, write_marker};
-    use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd};
+    use cadence_hooks_core::test_builders::{make_bash, make_bash_with_cwd, with_marker_dir};
     use cadence_hooks_core::{Outcome, ToolInput};
     use std::process::Command;
 
