@@ -1991,10 +1991,15 @@ mod tests {
         // A native Windows drive path is absolute via `Path::is_absolute`'s own
         // arm of `is_shell_absolute` (no leading `/` needed) — proves the
         // `#[cfg(unix)]`-gated fixtures above aren't the only Windows coverage
-        // for this branch (issue #235).
+        // for this branch (issue #235). The target is normalized (lowercased,
+        // forward-slash-joined) rather than passed through verbatim — every
+        // emitted target goes through `normalize_target`, and on a Windows
+        // build that now folds a drive-absolute path the same way
+        // `lexical_normalize_folds_windows_drive_paths` proves on every
+        // platform (cadence-hooks#377/#378).
         assert_eq!(
             git_commit_targets(r"git -C C:\repo\wt commit -m x", r"C:\cwd"),
-            vec![r"C:\repo\wt".to_string()]
+            vec!["c:/repo/wt".to_string()]
         );
     }
 
