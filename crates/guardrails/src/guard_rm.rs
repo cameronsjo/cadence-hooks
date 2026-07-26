@@ -134,17 +134,42 @@ use DirectoryVerb::{Cd, PopDirectory, PushDirectory};
 /// child cannot move the parent's `$PWD` at all. Treating those as directory
 /// changes would invent a move the shell never made.
 ///
-/// `time` is here precisely because that reasoning does **not** apply to it: it
-/// is a shell **reserved word**, not a program, so `time cd ~` runs `cd` in the
-/// current shell and does move `$PWD` (verified in both `bash` and `zsh`). The
-/// external `/usr/bin/time` does fork — but reaching it requires `command time`
-/// or `\time`, and those spellings put a *different* word in this position, so
-/// the raw-name match here correctly declines them.
+/// Matched by **basename** (after a `\`-strip), because a builtin reached by
+/// any spelling still runs in this shell: `\command cd` and `command cd` both
+/// move `$PWD`.
 ///
-/// `eval` likewise runs its argument in the current shell: `eval cd ~` moves
-/// `$PWD`. Only the unquoted form is caught — `eval "cd ~"` arrives as a single
-/// token that no basename match can see into.
-const CD_PRESERVING_PREFIXES: &[&str] = &["command", "builtin", "time", "eval"];
+/// `eval` belongs here for the same reason — `eval cd ~` runs in the current
+/// shell. Only the unquoted form is caught; `eval "cd ~"` arrives as a single
+/// token no basename match can see into.
+///
+/// `time` is deliberately **not** in this list — see
+/// [`bare_reserved_word_offset`]. It is the one prefix whose in-shell property
+/// depends on the exact spelling, so a basename match would be wrong for it.
+const CD_PRESERVING_PREFIXES: &[&str] = &["command", "builtin", "eval"];
+
+/// How many leading tokens are a bare shell **reserved word** that keeps the
+/// following command in this shell — currently `time`, and only in its bare,
+/// leading form.
+///
+/// This exists because `time` is the one case where the *spelling* decides,
+/// and getting it wrong is a silent ALLOW in both directions. Verified in bash,
+/// running `<form> cd /private/tmp` from `$HOME` and printing `$PWD`:
+///
+/// | form | `$PWD` after | in-shell? |
+/// |---|---|---|
+/// | `time` | `/private/tmp` | **yes** — reserved word |
+/// | `\time` | `$HOME` | no — external binary |
+/// | `command time` | `$HOME` | no |
+/// | `/usr/bin/time` | `$HOME` | no |
+/// | `FOO=1 time` | `$HOME` | **no** — an assignment prefix defeats it too |
+/// | `command command time` | `$HOME` | no |
+///
+/// So it is matched raw, at position zero only. Matching it by basename — or
+/// allowing an assignment word in front — models a directory move the shell
+/// never made, which hands every later relative target the wrong directory.
+fn bare_reserved_word_offset(tokens: &[String]) -> usize {
+    usize::from(tokens.first().is_some_and(|t| t == "time"))
+}
 
 /// The directory-changing verb this segment starts with, plus the index of its
 /// first argument. `None` when the segment does not change the directory.
@@ -157,7 +182,7 @@ const CD_PRESERVING_PREFIXES: &[&str] = &["command", "builtin", "time", "eval"];
 /// same basename + `\`-strip the delete-verb check uses — after stepping over
 /// assignment words and the shell-preserving prefixes.
 fn directory_change(tokens: &[String]) -> Option<(DirectoryVerb, usize)> {
-    let mut idx = 0;
+    let mut idx = bare_reserved_word_offset(tokens);
     while let Some(tok) = tokens.get(idx) {
         // `command_word`, not the raw token — the whole premise of #428 is that
         // `\cd` was a missed spelling, and comparing the prefix raw would leave
@@ -381,14 +406,35 @@ fn collect_targets(
             // `pushd -n /tmp; rm -rf Documents` then read as a temp delete
             // while bash removed `~/Documents`: a BLOCK turned into a silent
             // ALLOW by this very change.
-            let args = tokens.get(arg_start..).unwrap_or_default();
-            let suppressed = args.iter().any(|a| a == "-n");
-            // `+N` / `-N` rotate to a stack entry this parser never named.
-            let rotation = args.iter().any(|a| {
-                a.len() > 1
-                    && (a.starts_with('+') || a.starts_with('-'))
-                    && a[1..].chars().all(|c| c.is_ascii_digit())
-            });
+            // Scanned LEADING-ONLY, stopping at the first operand. bash parses
+            // these before the directory, and a `-n` that comes AFTER it does
+            // not suppress anything — `pushd <dir> -n` still moves (verified).
+            // Matching `-n` anywhere would invert the model for that shape,
+            // and would also read `pushd -- -n` (a real directory named `-n`)
+            // as suppressed.
+            let mut idx = arg_start;
+            let mut suppressed = false;
+            let mut rotation = false;
+            if verb != Cd {
+                while let Some(a) = tokens.get(idx) {
+                    if a == "--" {
+                        idx += 1;
+                        break;
+                    }
+                    let is_rotation = a.len() > 1
+                        && (a.starts_with('+') || a.starts_with('-'))
+                        && a[1..].chars().all(|c| c.is_ascii_digit());
+                    if a == "-n" {
+                        suppressed = true;
+                    } else if is_rotation {
+                        // `+N` / `-N` move to a stack entry never named here.
+                        rotation = true;
+                    } else if !(a.starts_with('-') && a.len() > 1) {
+                        break;
+                    }
+                    idx += 1;
+                }
+            }
 
             if verb == PopDirectory {
                 if suppressed || rotation {
@@ -422,12 +468,16 @@ fn collect_targets(
                 continue;
             }
 
-            let mut idx = arg_start;
-            while tokens
-                .get(idx)
-                .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
-            {
-                idx += 1;
+            // `cd`'s own flags (`-L`, `-P`, `--`) carry no directory meaning, so
+            // they are still plain noise. A bare `-` is cd's previous-directory
+            // operand, not a flag.
+            if verb == Cd {
+                while tokens
+                    .get(idx)
+                    .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
+                {
+                    idx += 1;
+                }
             }
 
             // `pushd` saves the current directory before moving, so a later
@@ -435,8 +485,16 @@ fn collect_targets(
             if verb == PushDirectory {
                 // A bare `pushd` swaps the top stack entry with the current
                 // directory; with an empty stack the shell errors and stays.
+                //
+                // Gated on `stack_reliable` like `popd`: a bare `pushd` is a
+                // move TO a stack entry, which is exactly the operation the
+                // flag exists to distrust. `pushd -n ~; pushd` lands the shell
+                // in `~` while an ungated swap left this parser in the cwd —
+                // a wrong ALLOW inside the stack model itself.
                 if tokens.get(idx).is_none() {
-                    if let Some(top) = dir_stack.last_mut() {
+                    if !stack_reliable {
+                        dir_known = false;
+                    } else if let Some(top) = dir_stack.last_mut() {
                         std::mem::swap(&mut top.0, &mut effective_dir);
                         std::mem::swap(&mut top.1, &mut dir_known);
                     }
@@ -1083,10 +1141,9 @@ mod tests {
     }
 
     /// `time` and `eval` are the counter-examples, and the reason the prefix
-    /// list is a list rather than "everything transparent". `time` is a shell
-    /// RESERVED WORD, not a program — `time cd ~` runs `cd` in the current
-    /// shell and moves `$PWD` (verified in bash and zsh). `eval` likewise.
-    /// Excluding them on a child-process premise was factually wrong.
+    /// list is a list rather than "everything transparent". Bare `time` is a
+    /// shell RESERVED WORD, not a program — `time cd ~` runs `cd` in the
+    /// current shell and moves `$PWD`. `eval` likewise.
     #[test]
     fn shell_word_prefixed_cd_does_move_the_shell() {
         for command in [
@@ -1096,6 +1153,7 @@ mod tests {
             // missed — the same escape #428 closed for `\cd`, one token left.
             r"\command cd ~; rm -rf Documents",
             r"\builtin cd ~; rm -rf Documents",
+            "command builtin cd ~; rm -rf Documents",
         ] {
             assert_eq!(
                 judge(command, "/private/tmp"),
@@ -1103,6 +1161,63 @@ mod tests {
                 "this spelling moves the shell: {command}"
             );
         }
+    }
+
+    /// The counter-example to the counter-example. `time`'s in-shell property
+    /// depends on the exact spelling: ANY decoration reaches the external
+    /// `/usr/bin/time`, which forks and cannot move the parent's `$PWD`.
+    /// Verified in bash — `\time`, `command time`, `/usr/bin/time` and even
+    /// `FOO=1 time` all leave the shell where it stood.
+    ///
+    /// Modeling those as moves is a silent ALLOW in the sharpest direction:
+    /// the guard tracks a temp root while the shell stands in home, so
+    /// `rm -rf Documents` reads as a scratch delete and removes `~/Documents`.
+    /// Matching `time` by basename introduced exactly that, in the same commit
+    /// whose comment argued a raw match was required.
+    #[test]
+    fn decorated_time_is_the_external_binary_and_does_not_move() {
+        for command in [
+            r"\time cd /private/tmp; rm -rf Documents",
+            "command time cd /private/tmp; rm -rf Documents",
+            "/usr/bin/time cd /private/tmp; rm -rf Documents",
+            "FOO=1 time cd /private/tmp; rm -rf Documents",
+            "command command time cd /private/tmp; rm -rf Documents",
+            r"\time pushd /private/tmp; rm -rf Documents",
+        ] {
+            assert_eq!(
+                judge(command, &home()),
+                Outcome::Block,
+                "the shell never left home, so Documents is protected: {command}"
+            );
+        }
+    }
+
+    /// `pushd`/`popd` options are LEADING-only. bash parses them before the
+    /// operand, so a `-n` after the directory does not suppress the move —
+    /// matching it anywhere inverted the model for that shape.
+    #[test]
+    fn pushd_options_are_leading_only() {
+        assert_eq!(
+            judge("pushd ~ -n; rm -rf Documents", "/private/tmp"),
+            Outcome::Block,
+            "a trailing -n does not suppress: bash moves to ~"
+        );
+        assert_eq!(
+            judge("pushd -n ~; rm -rf Documents", "/private/tmp"),
+            Outcome::Allow,
+            "a leading -n does suppress: the shell stays in /private/tmp"
+        );
+    }
+
+    /// A bare `pushd` is a move TO a stack entry, so it must distrust an
+    /// unmodeled stack the same way `popd` does. `pushd -n ~; pushd` lands the
+    /// shell in `~`, where an ungated swap left this parser in the cwd.
+    #[test]
+    fn bare_pushd_respects_an_unreliable_stack() {
+        assert_eq!(
+            judge("pushd -n ~; pushd; rm -rf Documents", "/private/tmp"),
+            Outcome::Ask
+        );
     }
 
     /// `eval rm -rf ~/Documents` is an explicit row in #426's table: `eval` is
