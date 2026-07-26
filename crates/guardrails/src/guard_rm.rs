@@ -71,9 +71,7 @@
 //! #228). Rolling no new recursion keeps the adversarially-reviewed primitives
 //! the single source of truth.
 
-use crate::enforce_worktree::{
-    TRANSPARENT, is_assignment_word, skip_transparent_prefixes, strip_group_wrappers,
-};
+use crate::enforce_worktree::{TRANSPARENT, skip_transparent_prefixes, strip_group_wrappers};
 use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, child_scripts, looks_absolute, resolve_cd_target,
@@ -106,98 +104,6 @@ fn command_word(token: &str) -> &str {
 /// forgetting it at a new call site would silently re-open the alias bypass.
 fn is_delete_verb(token: &str) -> bool {
     DELETE_VERBS.contains(&command_word(token))
-}
-
-/// A directory-changing builtin, as [`directory_change`] classifies it.
-///
-/// **Three features were built here and withdrawn**, each after adversarial
-/// review found it turning a BLOCK into a silent ALLOW: a `pushd`/`popd` stack,
-/// then a prefix layer, then `pushd` operand resolution. Four review passes
-/// found four rounds of defects in two mechanisms, and the pattern held every
-/// time — a new *route*, not a variation of the last.
-///
-/// What is left models one thing: a bare `cd` after assignment words. That is
-/// the only directory change every shell agrees about.
-///
-/// `pushd`/`popd` are **not resolved at all**. Their grammar diverges across
-/// shells in both dimensions — options (`pushd <dir> -n` stays under zsh and
-/// bash 5, moves under bash 3.2) and operands (`pushd <old> <new>` is a
-/// directory-name substitution in zsh, an error in bash 5, a move in bash 3.2)
-/// — and `strip_group_wrappers` additionally erases the subshell, background
-/// and pipeline contexts where a `pushd` cannot move the parent at all. Every
-/// one of those produced a silent ALLOW when the operand was resolved. They are
-/// recognized only so the position can be marked unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectoryVerb {
-    /// `cd` — the one form modeled: resolve its target.
-    Cd,
-    /// A directory change this parser does not model — `pushd`, `popd`, or a
-    /// verb reached through a prefix whose behavior is shell-dependent. The
-    /// position becomes unknown, which asks; it can never carry a stale
-    /// directory forward.
-    Unmodeled,
-}
-use DirectoryVerb::{Cd, Unmodeled};
-
-/// Words that may stand in front of a directory verb and change whether it runs
-/// in this shell. Membership does not assert that they preserve the shell — it
-/// asserts the opposite, that the answer is not knowable from the name.
-const SHELL_WORD_PREFIXES: &[&str] = &["command", "builtin", "eval", "time"];
-
-/// Directory verbs this parser recognizes, whether or not it resolves them.
-const DIRECTORY_VERBS: &[&str] = &["cd", "pushd", "popd"];
-
-/// The directory-verb name a token spells, with **at most one** leading `\`
-/// removed and nothing else.
-///
-/// `strip_prefix`, never `trim_start_matches`: the latter is repeating, so
-/// `\\cd` — two literal backslashes — reduced to `cd` and modeled a move. The
-/// shell removes one backslash and looks up a command *named* `\cd`, which does
-/// not exist, so nothing moves in any shell.
-///
-/// Never `basename` either. A path-spelled `/usr/bin/cd` or `./cd` is a
-/// *program*: macOS ships `/usr/bin/cd` as a `#!/bin/sh` wrapper running
-/// `builtin cd` in a child, so no shell's parent moves for it. Both the
-/// over-matching and the over-stripping form of this helper shipped a silent
-/// ALLOW; it is deliberately the narrowest rule that still catches `\cd`.
-fn directory_verb_word(token: &str) -> &str {
-    token.strip_prefix('\\').unwrap_or(token)
-}
-
-/// Does the token run starting at `idx` eventually name a directory verb, after
-/// any further prefixes and assignment words?
-fn names_a_directory_verb(tokens: &[String], mut idx: usize) -> bool {
-    while let Some(tok) = tokens.get(idx) {
-        let word = directory_verb_word(tok);
-        if is_assignment_word(tok) || SHELL_WORD_PREFIXES.contains(&word) {
-            idx += 1;
-        } else {
-            return DIRECTORY_VERBS.contains(&word);
-        }
-    }
-    false
-}
-
-/// The directory-changing verb this segment starts with, plus the index of its
-/// first argument. `None` when the segment does not change the directory.
-///
-/// Assignment words are stepped over because that much *is* shell-independent:
-/// every shell treats a leading `NAME=value` as an environment prefix, and none
-/// of them changes what the following word is.
-fn directory_change(tokens: &[String]) -> Option<(DirectoryVerb, usize)> {
-    let mut idx = 0;
-    while tokens.get(idx).is_some_and(|t| is_assignment_word(t)) {
-        idx += 1;
-    }
-    let word = directory_verb_word(tokens.get(idx)?);
-    match word {
-        "cd" => Some((Cd, idx + 1)),
-        "pushd" | "popd" => Some((Unmodeled, idx + 1)),
-        w if SHELL_WORD_PREFIXES.contains(&w) && names_a_directory_verb(tokens, idx + 1) => {
-            Some((Unmodeled, idx + 1))
-        }
-        _ => None,
-    }
 }
 
 /// Does `flag` (in separate-token form) consume the following token as a value
@@ -387,26 +293,22 @@ fn collect_targets(
         // left-assoc), skip the verb's own flags, and treat a bare `-`, a
         // `$VAR`, or a missing target as unresolvable. Mirrors
         // `collect_commit_targets`.
-        if let Some((verb, arg_start)) = directory_change(&tokens) {
-            // Anything but a bare `cd` marks the position unknown, which asks.
-            // No operand of an unmodeled verb is ever resolved — that
-            // resolution is what produced a silent ALLOW in four consecutive
-            // review passes.
-            if verb == Unmodeled {
-                dir_known = false;
-                continue;
-            }
-
-            // `cd`'s own flags (`-L`, `-P`, `--`) carry no directory meaning.
-            // A bare `-` is cd's previous-directory operand, not a flag.
-            let mut idx = arg_start;
+        // `cd` tracking — assume success (equal-precedence `&&`/`||`,
+        // left-assoc), skip cd's own flags, and treat a bare `-`, a `$VAR`, or a
+        // missing target as unresolvable (keep the pre-cd dir). Mirrors
+        // `collect_commit_targets`.
+        //
+        // Deliberately still the LITERAL first token, not a normalized spelling.
+        // Widening it to `\cd` / `FOO=1 cd` / `pushd` was built three ways and
+        // withdrawn all three times — see the note above `judge_rm` and #428.
+        if tokens.first().map(String::as_str) == Some("cd") {
+            let mut idx = 1;
             while tokens
                 .get(idx)
                 .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
             {
                 idx += 1;
             }
-
             // A bare `-`, a missing target, or an unexpanded variable makes the
             // new directory UNKNOWN. Keeping the pre-cd directory was a silent
             // ALLOW: `cd $HOME; rm -rf Documents` from a `/tmp` cwd resolved
@@ -993,120 +895,6 @@ mod tests {
     /// Common case: no git roots on disk.
     fn judge(command: &str, cwd: &str) -> Outcome {
         judge_with(command, cwd, &[])
-    }
-
-    // --- #428: directory tracking, after three withdrawals ---
-
-    /// The one form modeled, and the spellings of it every shell agrees on.
-    #[test]
-    fn bare_cd_spellings_move_the_directory() {
-        for command in [
-            "cd ~; rm -rf Documents",
-            r"\cd ~; rm -rf Documents",
-            "FOO=1 cd ~; rm -rf Documents",
-            "FOO=1 BAR=2 cd ~; rm -rf Documents",
-        ] {
-            assert_eq!(
-                judge(command, "/private/tmp"),
-                Outcome::Block,
-                "every shell moves for this: {command}"
-            );
-        }
-    }
-
-    /// THE DIRECTION THAT COSTS A FILE — home cwd, temp target. If the model
-    /// invents a move here, a relative delete resolves under `/private/tmp`
-    /// and a real `~/Documents` is removed silently. A wrong verdict the other
-    /// way costs only a prompt, which is why three review passes with no
-    /// coverage here coexisted with live silent-ALLOW routes.
-    #[test]
-    fn no_unmodeled_form_ever_invents_a_move() {
-        for command in [
-            // Prefixes: shell-dependent (`command cd` moves under bash, stays
-            // under zsh, which forces an external lookup).
-            "command cd /private/tmp; rm -rf Documents",
-            r"\command cd /private/tmp; rm -rf Documents",
-            "builtin cd /private/tmp; rm -rf Documents",
-            "eval cd /private/tmp; rm -rf Documents",
-            "time cd /private/tmp; rm -rf Documents",
-            "FOO=1 command cd /private/tmp; rm -rf Documents",
-            // `pushd` options: `<dir> -n` stays under zsh and bash 5, moves
-            // under bash 3.2.
-            "pushd /private/tmp -n; rm -rf Documents",
-            "pushd -n /private/tmp; rm -rf Documents",
-            // `pushd` operands: `<old> <new>` is a name substitution in zsh,
-            // an error in bash 5, a move in bash 3.2.
-            "pushd /private/tmp x; rm -rf Documents",
-            "pushd /private/tmp /var; rm -rf Documents",
-            // Forking contexts, where a `pushd` cannot move the parent at all
-            // but `strip_group_wrappers` erases the boundary.
-            "(pushd /private/tmp); rm -rf Documents",
-            "pushd /private/tmp | cat; rm -rf Documents",
-            // And the plain form.
-            "pushd /private/tmp; rm -rf Documents",
-            "popd; rm -rf Documents",
-        ] {
-            assert_ne!(
-                judge(command, &home()),
-                Outcome::Allow,
-                "must not model a move the shell may not have made: {command}"
-            );
-        }
-    }
-
-    /// A path-spelled directory verb is a PROGRAM, not the builtin — macOS
-    /// ships `/usr/bin/cd` as a `#!/bin/sh` wrapper running `builtin cd` in a
-    /// child, so no shell's parent moves. And `\\cd` is two literal
-    /// backslashes: the shell removes one and looks up a command named `\cd`,
-    /// which does not exist. Both spellings must leave the directory alone —
-    /// the over-matching (`basename`) and over-stripping (`trim_start_matches`)
-    /// forms of that helper each shipped a silent ALLOW.
-    #[test]
-    fn non_builtin_verb_spellings_do_not_move_the_directory() {
-        for command in [
-            "/usr/bin/cd /private/tmp; rm -rf Documents",
-            "./cd /private/tmp; rm -rf Documents",
-            "x/cd /private/tmp; rm -rf Documents",
-            r"\\cd /private/tmp; rm -rf Documents",
-            r"\\\cd /private/tmp; rm -rf Documents",
-            r"FOO=1 \\cd /private/tmp; rm -rf Documents",
-            r"\\pushd /private/tmp; rm -rf Documents",
-        ] {
-            assert_eq!(
-                judge(command, &home()),
-                Outcome::Block,
-                "the shell never left home: {command}"
-            );
-        }
-    }
-
-    /// Every unmodeled form asks rather than guessing.
-    #[test]
-    fn unmodeled_directory_forms_ask() {
-        for command in [
-            "popd; rm -rf build",
-            "pushd ~; rm -rf build",
-            "pushd ~; popd; rm -rf build",
-            "pushd -n ~; rm -rf build",
-            "command cd ~; rm -rf build",
-            "time cd ~; rm -rf build",
-        ] {
-            assert_eq!(
-                judge(command, "/private/tmp"),
-                Outcome::Ask,
-                "unmodeled move must ask: {command}"
-            );
-        }
-    }
-
-    /// `dir_known` is never restored to true, so a later `cd` cannot launder an
-    /// unknown position back into a confident verdict.
-    #[test]
-    fn unknown_position_is_not_laundered_by_a_later_cd() {
-        assert_eq!(
-            judge("popd; cd /private/tmp; rm -rf Documents", &home()),
-            Outcome::Ask
-        );
     }
 
     // --- #426: a transparent prefix carrying a flag ---

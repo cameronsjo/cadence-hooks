@@ -406,7 +406,7 @@ pub(crate) const TRANSPARENT: &[&str] =
 /// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
 /// `==` comparisons — is not skipped, so this can only widen the leading-word
 /// gate past words the shell itself treats as environment prefixes.
-pub(crate) fn is_assignment_word(token: &str) -> bool {
+fn is_assignment_word(token: &str) -> bool {
     match token.split_once('=') {
         Some((name, _)) if !name.is_empty() => {
             name.chars()
