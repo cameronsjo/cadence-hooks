@@ -2,7 +2,7 @@
 name = "cadence-hooks-session"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Multi-session coordination hooks: identity registry, disclosure, and lane warnings"
 
 [dependencies]

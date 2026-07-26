@@ -2,7 +2,7 @@
 name = "cadence-hooks-core"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Shared protocol for Claude Code hook binaries"
 
 [features]

@@ -2,7 +2,7 @@
 name = "cadence-hooks-lab"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Experimental lab hooks — currently empty, kept as a landing pad for the next experiment"
 
 [dependencies]
