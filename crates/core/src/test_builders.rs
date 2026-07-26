@@ -5,8 +5,41 @@
 //! [dev-dependencies]
 //! cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 //! ```
+//!
+//! Also compiled for this crate's own `#[cfg(test)]` modules without the
+//! feature, so [`with_marker_dir`] can be the single marker-dir env helper
+//! everywhere — including `markers.rs`'s own tests (#446).
 
 use crate::{EditOperation, HookInput, ToolInput, ToolResponse};
+use std::path::Path;
+
+/// The single mutex serializing every test that mutates a process-global env
+/// var read by the marker family.
+///
+/// Test helpers that lock a process-global must be the *only* helper locking it
+/// — two uncoordinated mutexes over one global are a race no critical section
+/// can fix (#446). Every crate's marker-dir sandboxing goes through
+/// [`with_marker_dir`], never a locally-minted sibling lock.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` with `CADENCE_MARKER_DIR` set to `dir`, serialized against every
+/// other marker-dir-mutating test in the same test binary via [`ENV_LOCK`] —
+/// keeps marker-writing tests out of the real per-user production marker
+/// directory (#302) and off each other's state (#369).
+pub fn with_marker_dir<F: FnOnce()>(dir: &Path, f: F) {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // SAFETY: serialized against every other env-mutating test in this binary
+    // via ENV_LOCK.
+    unsafe {
+        std::env::set_var("CADENCE_MARKER_DIR", dir);
+    }
+    f();
+    // SAFETY: serialized against every other env-mutating test in this binary
+    // via ENV_LOCK.
+    unsafe {
+        std::env::remove_var("CADENCE_MARKER_DIR");
+    }
+}
 
 /// Build a `HookInput` for a `Bash` tool invocation.
 pub fn make_bash(cmd: &str) -> HookInput {
