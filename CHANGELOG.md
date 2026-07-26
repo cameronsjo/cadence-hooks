@@ -40,9 +40,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
   **Every spelling of a directory change is now followed (#428).** The check compared the raw first token against the literal `cd`, so `command cd`, `builtin cd`, `\cd`, `FOO=1 cd` and `pushd` all left the effective directory stale and a later relative target was judged against a directory the shell had already left — `command cd ~; rm -rf Documents` from a temp cwd read as a temp delete and was approved. It now routes through `command_word`, the same basename and `\`-strip the delete-verb check uses, after stepping over assignment words and the shell-preserving prefixes.
 
-  `env`, `nice` and `nohup` are deliberately **not** stepped over: they are programs that run their argument as a child process, where a `cd` cannot move the parent's `$PWD` at all, so treating them as directory changes would invent a move the shell never made. `eval` and bare `time` are the counter-examples: both run the following command in the current shell, so `eval cd ~` and `time cd ~` do move `$PWD`.
+  **Only the spellings every shell agrees on are modeled** — a bare `cd`/`pushd` after assignment words, backslash-stripped, plus a leading `pushd -n`, which stays everywhere. A directory verb reached through a prefix (`command`, `builtin`, `eval`, `time`), spelled as a path, or carrying a trailing `-n` is **unknown**, and unknown asks.
 
-  **`time` is matched raw and only in leading position, because it is the one prefix whose in-shell property depends on the exact spelling.** Bare `time` is a shell *reserved word*; `\time`, `command time`, `/usr/bin/time` and even `FOO=1 time` all reach the **external** binary, which forks and cannot move the parent — verified in bash for each form. Matching it by basename modeled a move the shell never made, so the guard tracked a temp root while the shell stood in home and `rm -rf Documents` read as a scratch delete. Every other prefix is matched by basename after a `\`-strip, which is what catches `\command cd` and `\builtin cd` — the same escape this fix closes for `\cd`, one token to the left.
+  **A prefix layer was built here and withdrawn**, after a stack model was withdrawn before it, for the same reason. The layer judged from a word's *name* whether it keeps the following builtin in this shell — and that question has no name-shaped answer, because it depends on the exact spelling *and* on which shell is running:
+
+  | form | zsh 5.9 | bash 5.3 | bash 3.2 |
+  |---|---|---|---|
+  | `command cd <dir>` | **stays** | moves | moves |
+  | `pushd <dir> -n` | **stays** | **stays** | moves |
+  | `/usr/bin/cd <dir>` | stays | stays | stays |
+
+  `command` forces an *external* lookup in zsh, so it reaches `/usr/bin/cd` — which macOS really ships, as a `#!/bin/sh` wrapper running `builtin cd` in a child where the parent never moves. Three review rounds each answered the question for one shell and were wrong in another; the third round's answer was verified against `/bin/bash`, which on macOS is 3.2 — the one shell where the trailing-`-n` case moves.
+
+  The cost is stated rather than hidden: a prefixed form that `main` blocked (because it tracked no directory change at all) now **asks**. That is a weakening on those shapes and it is deliberate — retaining the old directory is only safe when no shell moves, and for a prefixed verb the shells disagree. Nothing became an ALLOW.
 
   `pushd <dir>` resolves like `cd`. Everything else about the directory stack marks the position **unknown**: every `popd`, a bare `pushd`, a rotation, and any option other than `-n` — which suppresses the move outright, so there the directory is unchanged. Options are read off the first argument only, because bash parses them before the operand and `pushd <dir> -n` still moves.
 
