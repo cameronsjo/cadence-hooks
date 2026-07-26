@@ -94,17 +94,26 @@ pub fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
-/// True when a (forward-slash-normalized) path is absolute — POSIX (`/foo`) or a
-/// Windows drive-absolute path (`C:/foo`, after `\`→`/` normalization). Lets a
-/// guard distinguish an explicit path argument from a flag (`-rf`) or a bare
+/// True when `p` is absolute — POSIX (`/foo`) or a Windows drive-absolute path
+/// spelled with EITHER separator (`C:/foo` or `C:\foo`). Lets a guard
+/// distinguish an explicit path argument from a flag (`-rf`) or a bare
 /// relative name, and recognize a drive path as absolute (which a leading-`/`
-/// test alone would miss). Shared by the destructive-command guards.
+/// test alone would miss).
+///
+/// Both drive-path spellings are checked directly rather than assuming a
+/// caller pre-normalizes `\` to `/` first — a real Windows input (a hook's
+/// native `cwd`, or a `-C`/`--git-dir` value typed at a native shell) is not
+/// guaranteed to arrive forward-slash-only, and treating a `C:\`-spelled
+/// target as non-absolute lets it be misjudged as relative and corrupted by
+/// joining it onto a base directory (the Windows fail-open behind
+/// cadence-hooks#377/#378). Shared by the destructive-command guards and by
+/// [`resolve_cd_target`].
 pub fn looks_absolute(p: &str) -> bool {
     if p.starts_with('/') {
         return true;
     }
     let b = p.as_bytes();
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
 /// Strip shell grouping (`(`/`{` … `)`/`}`) from a segment so `(git commit)`,
@@ -613,7 +622,14 @@ pub fn parse_work_dir(command: &str, cwd: &str) -> String {
 
 /// Resolve a single cd target against the current effective directory.
 pub fn resolve_cd_target(target: &str, effective: &str) -> String {
-    if target.starts_with('/') {
+    if looks_absolute(target) {
+        // POSIX `/foo` or a Windows drive path (`C:/foo` or `C:\foo`) stands
+        // alone. A bare leading-`/` test alone would miss the drive-path
+        // spellings and fall through to the join below, silently prefixing an
+        // already-absolute Windows target with `effective` — the guard's own
+        // Windows fail-open (cadence-hooks#377/#378): a `cd C:\primary && …`
+        // resolved to `<worktree>/C:\primary`, a path that names no repo, so
+        // the commit that followed was judged against nothing and allowed.
         target.to_string()
     } else if target.starts_with('~') {
         // Shell `~` expansion. `effective`/`target` are shell paths (forward
@@ -1327,6 +1343,49 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- looks_absolute / resolve_cd_target (Windows path handling) ---
+    // Platform-INDEPENDENT: `looks_absolute` decides absoluteness from the
+    // string alone (no `Path::is_absolute`), so these assert the same result
+    // on macOS/Linux as on a real Windows runner — the guard's Windows
+    // fail-open (cadence-hooks#377/#378) was a `C:\…` target read absolute
+    // only when compiled for Windows, which is exactly what made it
+    // untestable anywhere else.
+
+    #[test]
+    fn looks_absolute_recognizes_both_windows_drive_spellings() {
+        assert!(looks_absolute("C:/Users/x"));
+        assert!(looks_absolute("C:\\Users\\x"));
+        assert!(looks_absolute("d:\\a\\repo"));
+        assert!(looks_absolute("/posix/path"));
+        assert!(!looks_absolute("relative/path"));
+        assert!(!looks_absolute("relative\\path"));
+        // A single letter + colon with nothing after it is too short to be a
+        // drive-absolute path (matches the `b.len() >= 3` guard).
+        assert!(!looks_absolute("C:"));
+    }
+
+    #[test]
+    fn resolve_cd_target_keeps_a_windows_drive_path_standalone() {
+        // The bug: `target.starts_with('/')` alone missed `C:\…`, so this fell
+        // through to the relative-join branch and produced
+        // `<effective>/C:\other` — a path naming no real directory, which is
+        // exactly how a `cd C:\other && git commit` from a Windows worktree
+        // failed to resolve to the primary and fell open to Allow.
+        assert_eq!(
+            resolve_cd_target("C:\\other", "C:\\primary"),
+            "C:\\other",
+            "an absolute Windows target must stand alone, not join onto effective"
+        );
+        assert_eq!(
+            resolve_cd_target("D:/other", "C:\\primary"),
+            "D:/other",
+            "the forward-slash drive spelling must stand alone too"
+        );
+        // A relative target still joins normally — no regression on the
+        // existing POSIX-relative behavior.
+        assert_eq!(resolve_cd_target("sub", "/cwd"), "/cwd/sub");
+    }
 
     // --- run_bounded_with (the #271 bounded subprocess runner) ---
     // Driven with the explicit-timeout entry point so the process-global

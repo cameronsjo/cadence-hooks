@@ -72,6 +72,15 @@
 //! are no longer a silent miss — but the nudge's own coverage is a curated
 //! floor, not a fence. Named v1 misses of the mutation-nudge channel, each
 //! degrading to the pre-#234 silent-allow (never a weakened block):
+//! - **Any file target that does not yet exist on disk** — the gate that stops
+//!   `git diff > report.txt` from claiming to mutate tracked content (#377)
+//!   cannot tell a scratch report from a brand-new SOURCE file, because both are
+//!   equally absent at hook time. So a first write of `src/newmod/lib.rs` (or
+//!   `tee src/new_config.toml`) into the primary is silent, even though that is
+//!   exactly the "writes accumulate unseen until commit" case the nudge names.
+//!   Separating them needs a git query per target, which the #271 probe budget
+//!   rules out. Existing files — including dangling symlinks, hence
+//!   `symlink_metadata` rather than `exists` — still nudge.
 //! - **Non-enumerated mutator verbs** — `cp`/`mv`/`install` into a tracked path,
 //!   `dd of=…`, `truncate`, `patch`, `ed`/`ex`, `perl -i`, `awk -i inplace`,
 //!   `python -c 'open(p,"w")'`, and the git tree-mutators `git apply|restore|
@@ -105,34 +114,59 @@
 //!   in the command) — the bypass-log record takes precedence, and the same
 //!   exemption suppresses the mutation in that repo anyway.
 //!
-//! Commit-channel (block) misses, unchanged: `git --work-tree=…` /
-//! `--git-dir=…` commit forms skip the check (the target tree cannot be cheaply
-//! resolved — ambiguity fails open). Commits inside `sh -c '…'` wrappers,
-//! `$(…)`/backtick substitutions, and behind `env`/`VAR=value` prefixes ARE
-//! seen (#228) — any run of transparent-prefix or assignment words ahead of a
-//! wrapper (`env exec sh -c '…'`) is stripped before the wrapper detection
-//! runs, but a prefix's own *option flags* are never parsed, so `nice -n 10 …`
-//! / `env -i …` in front of a wrapper or commit remain misses (a flag could
-//! bind a value we'd misread).
-//! A `GIT_DIR=`/`GIT_WORK_TREE=` env prefix can invert the target (a rare false
-//! block when committing into a worktree *from* the primary via env); accepted
-//! as exotic. A
-//! `git -C <path> commit` IS resolved against `<path>`, so committing into the
-//! primary from elsewhere still blocks, and committing into a worktree from
-//! the primary does not — and so is a leading `cd <path> && git commit` (or a
-//! chain of `cd`s), resolved with `~` expansion, quoted paths, and multiple
-//! `cd`s accumulating, always assuming a `cd` succeeds even when followed by
-//! `||` (a hard security boundary cannot reuse `parse_work_dir`'s nudge-only
-//! `cd` heuristic, which treats a `cd` before `||` as a no-op — see
-//! [`git_commit_targets`] for why that heuristic is unsafe here; issues #213,
-//! #224).
+//! Commit-channel (block) targets, and what still misses. Every form that
+//! *names* a tree is now resolved rather than skipped (#378): `--work-tree=…` /
+//! `--git-dir=…` and their separate-value spellings, a `GIT_WORK_TREE=` /
+//! `GIT_DIR=` env prefix, and `git -C <path>` — including repeated `-C`s, which
+//! accumulate the way git documents them. Precedence runs `--work-tree` →
+//! `--git-dir` → `-C` → the segment's dir, with an explicit flag outranking its
+//! own env var. So committing into the primary from elsewhere blocks by every
+//! one of those spellings, committing into a worktree *from* the primary does
+//! not (the env-prefix inversion that used to be an accepted false block is
+//! gone), and an unresolvable value still fails open in [`assess_dir`].
+//! A leading `cd <path> && git commit` (or a chain of `cd`s) resolves the same,
+//! with `~` expansion, quoted paths, and multiple `cd`s accumulating, always
+//! assuming a `cd` succeeds even when followed by `||` (a hard security boundary
+//! cannot reuse `parse_work_dir`'s nudge-only `cd` heuristic, which treats a `cd`
+//! before `||` as a no-op — see [`git_commit_targets`] for why that heuristic is
+//! unsafe here; issues #213, #224).
+//!
+//! Commits inside `sh -c '…'` wrappers, `$(…)`/backtick substitutions, and
+//! behind `env`/`VAR=value` prefixes ARE seen (#228) — any run of
+//! transparent-prefix or assignment words ahead of a wrapper
+//! (`env exec sh -c '…'`) is stripped before the wrapper detection runs, and a
+//! `GIT_WORK_TREE=`/`GIT_DIR=` prefix is inherited by the wrapper's child the
+//! way the shell exports it. Four commit-channel misses remain, all deliberate:
+//! a prefix's own *option flags* are never parsed, so `nice -n 10 …` /
+//! `env -i …` in front of a wrapper or commit stay misses (a flag could bind a
+//! value we'd misread); `xargs`-fed commits are not reconstructed; wrappers past
+//! [`MAX_WRAPPER_DEPTH`] are not descended; and a git env var set by a standalone
+//! `export` in an earlier segment (`export GIT_DIR=… && git commit`) is not
+//! tracked — only an assignment word prefixed to the command itself is, since
+//! tracking `export` means modelling shell variable scope across segments.
+//!
+//! Two deliberate divergences from the shell, both erring toward *seeing more*
+//! of a command rather than less, since a miss is the dangerous direction here:
+//! a git env prefix is inherited into `$(…)`/backtick substitution bodies even
+//! though bash applies an assignment prefix only *after* expansion (so a real
+//! substitution does not see it); and `..` is folded lexically by
+//! [`lexical_normalize`], which differs from real resolution when a path
+//! component is a symlink — that only ever keeps a target the exclusion would
+//! have dropped, never the reverse.
+//!
+//! Every target above is resolved SOLELY from the payload `cwd` — the guard
+//! reads no session state and no process cwd. A dispatched subagent inherits the
+//! orchestrator's cwd, so a verdict naming the orchestrator's repo when the work
+//! "feels" like it is happening elsewhere is correct attribution of where the
+//! command would actually run, not misattribution (#377).
 
 use crate::dismiss_enforce_worktree;
 use crate::messages::WORKTREE_CREATE_RECIPE;
+use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, basename, child_scripts, redirect_targets, resolve_cd_target,
-    skip_transparent_prefixes, split_segments_with_ops, tokenize,
+    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, looks_absolute, redirect_targets,
+    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops, tokenize,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -363,23 +397,257 @@ enum MutationTarget {
 /// (`command`/`exec`/`time`/…) so `(git commit)`, `{ git commit; }`, and
 /// `command git commit` are detected rather than slipping past the leading-word
 /// gate (#239 F4).
+/// True when `tokens[idx]` is a leading word the real command runs *through* —
+/// a transparent prefix whose next token is not the prefix's own flag, or an
+/// assignment word.
 ///
-/// The helper itself, along with `skip_transparent_prefixes`, `TRANSPARENT`,
-/// and the assignment-word test they share, now lives in
-/// [`cadence_hooks_core::shell`] (cadence-hooks#419) — the polish ship anchor
-/// needs the same command-word resolution these guards do, and core is the only
-/// crate both sides can reach. Re-exported here rather than merged into the
-/// import list above so this contract stays attached to the name it describes.
+/// Extracted because TWO walks cross this same leading region:
+/// [`skip_transparent_prefixes`], which skips it, and [`git_env_overrides`],
+/// which reads the git vars out of it first. Duplicating the predicate would let
+/// them disagree about where the region ends, and a walk that stopped early
+/// would silently miss an override — so they share one definition.
+///
+/// Total over any index: an out-of-range `idx` is `false`, and a trailing prefix
+/// with nothing after it is not a prefix word (there is no command for it to run
+/// through). Both callers already bound `idx + 1`, so this is belt-and-braces —
+/// but a panic in a guard is a hard block by another name, which ADR-0001's
+/// fail-open posture forbids.
+fn is_prefix_word(tokens: &[String], idx: usize) -> bool {
+    let Some(tok) = tokens.get(idx).map(String::as_str) else {
+        return false;
+    };
+    let runs_the_next_word = tokens.get(idx + 1).is_some_and(|n| !n.starts_with('-'));
+    (TRANSPARENT.contains(&tok) && runs_the_next_word) || is_assignment_word(tok)
+}
+
+/// Read `GIT_WORK_TREE=`/`GIT_DIR=` out of the leading assignment words that
+/// [`skip_transparent_prefixes`] otherwise discards, returning the values
+/// **RAW** as `(work_tree, git_dir)`.
+///
+/// `GIT_DIR=… GIT_WORK_TREE=… git commit` names a target tree just as plainly as
+/// `--work-tree` does, and the walk was throwing that away — a bypass from a
+/// worktree into the primary, and the mirror-image false block the module header
+/// used to accept as exotic (#378). Walks the same leading region as
+/// [`skip_transparent_prefixes`], over the shared [`is_prefix_word`] predicate
+/// (assignment words and transparent prefixes may interleave:
+/// `env GIT_DIR=… command git commit`), and stops at the command word.
+///
+/// **Raw, not resolved, and that is load-bearing.** This walk runs over the raw
+/// token stream, before the global-flag walk has seen `-C` — and git applies the
+/// `-C` chdir BEFORE repository setup, so a relative env value is relative to
+/// the POST-`-C` directory. Resolving here against the pre-`-C` dir while the
+/// env value outranks the `-C` redirect turned `GIT_WORK_TREE=. git -C <primary>
+/// commit` into an Allow: the guard resolved the session's own worktree while
+/// git committed into the primary. [`commit_targets_of`] resolves these against
+/// the same post-`-C` base the explicit flags use, which also keeps both call
+/// sites in sync by construction (security review, #378).
+fn git_env_overrides(tokens: &[String]) -> (Option<&str>, Option<&str>) {
+    let (mut work_tree, mut git_dir) = (None, None);
+    let mut idx = 0;
+    while idx + 1 < tokens.len() && is_prefix_word(tokens, idx) {
+        let tok = tokens[idx].as_str();
+        if let Some(v) = tok.strip_prefix("GIT_WORK_TREE=") {
+            work_tree = Some(v);
+        } else if let Some(v) = tok.strip_prefix("GIT_DIR=") {
+            git_dir = Some(v);
+        }
+        idx += 1;
+    }
+    (work_tree, git_dir)
+}
+
+/// Fold `.`, `..`, `//`, and a trailing slash out of a path **lexically** — no
+/// filesystem access, so it is safe on paths that do not exist and cannot
+/// surprise a caller by resolving `/var` to `/private/var`.
+///
+/// This is the fix for the whole class of raw-string decisions in this module.
+/// `GitState::resolve` canonicalizes, so **assessment** was always immune to
+/// spelling; every decision made on the raw target string — the linked-worktree
+/// exclusion below, the in-chain dismiss-map key, the dedup key — was not. That
+/// asymmetry is the defect. `<primary>/.git/worktrees/..` IS `<primary>/.git`,
+/// but `Path::components()` preserves `..`, so the exclusion matched it and
+/// dropped the primary's own git dir — the guard's headline control evaded by
+/// appending two characters (security review, #378).
+///
+/// Folding `..` lexically differs from real resolution when a component is a
+/// symlink. That is the safe direction here: it only ever causes a target to be
+/// KEPT rather than excluded, and the kept target is then assessed by
+/// [`GitState`], which canonicalizes properly.
+///
+/// A Windows drive-absolute prefix (`C:/…` or `C:\…`) is folded too, and is
+/// what closes the guard's Windows fail-open (cadence-hooks#377/#378): every
+/// commit target this module emits is run through this fold via
+/// [`normalize_target`], and on Windows those raw targets are real native
+/// paths (a hook's `cwd`, or a `-C`/`--git-dir` value carrying the drive
+/// letter), not the pure forward-slash "shell path" the fold used to assume.
+/// Splitting on `/` alone left a `C:\…` prefix as ONE opaque segment — not
+/// recognized as absolute, and not decomposed into its real components — so a
+/// literal `..` elsewhere in the same string (this crate's own test fixture
+/// paths carry one, joined via `Path::join("../../target/…")`) popped that
+/// whole opaque prefix instead of its last real component, discarding the
+/// drive letter entirely and turning an absolute target into a relative
+/// fragment that resolved to no repo. [`GitState`] then found nothing at the
+/// corrupted path and the guard failed open (`Allow`) on a commit that landed
+/// in the primary checkout.
+fn lexical_normalize(path: &str) -> String {
+    // A pure STRING fold — deliberately NOT a `Path`/`PathBuf` round-trip,
+    // which would re-join with the PLATFORM separator and normalize a target
+    // to a spelling the rest of the module (and the dismiss map keyed on
+    // these strings) doesn't produce. `resolve_cd_target` carries the same
+    // warning about `PathBuf::join` for the same reason.
+    //
+    // The Windows drive prefix, if any, is captured separately from the body:
+    // folding must never let a `..` pop past it (`C:\foo\..\bar` is `C:\bar`,
+    // never a bare `\bar` that silently drops the drive), and it is lowercased
+    // on the way out — NTFS/ReFS are case-insensitive, so `C:\Primary` and
+    // `c:\primary` must fold to the same string or the in-chain dismiss map's
+    // string-equality lookup stops matching one of the two spellings.
+    let bytes = path.as_bytes();
+    // Borrowed, not lowercased here — the whole result is lowercased once on
+    // the way out below, so lowercasing this slice too would just be a
+    // discarded allocation.
+    let windows_drive = (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\'))
+        .then(|| &path[..1]);
+    let body_src = windows_drive.map_or(path, |_| &path[3..]);
+    let absolute = windows_drive.is_some() || body_src.starts_with('/');
+    // Backslash is only ever a separator once a Windows drive prefix has
+    // already identified the string as a native Windows path — a bare POSIX
+    // path may legally contain a literal `\` in a filename, so splitting on
+    // it unconditionally would corrupt that spelling instead of folding it.
+    let separators: &[char] = if windows_drive.is_some() {
+        &['/', '\\']
+    } else {
+        &['/']
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for segment in body_src.split(separators) {
+        match segment {
+            // An empty segment is a `//` collapse or a trailing slash.
+            "" | "." => {}
+            ".." => match out.last() {
+                // Only a real name can be popped. A leading run of `..` in a
+                // relative path must survive, so `..` never pops a `..`.
+                Some(&last) if last != ".." => {
+                    out.pop();
+                }
+                // `/..` (or a drive root's `..`) is the root itself.
+                _ if absolute => {}
+                _ => out.push(".."),
+            },
+            name => out.push(name),
+        }
+    }
+    let body = out.join("/");
+    let folded = match (absolute, body.is_empty()) {
+        (true, _) => format!("/{body}"),
+        // Nothing survived a relative fold (`a/..`) — leave the caller's
+        // spelling alone rather than inventing a `.`; `GitState` resolves it.
+        (false, true) => return path.to_string(),
+        (false, false) => body,
+    };
+    match windows_drive {
+        // Lowercase the WHOLE path, not just the drive letter: NTFS/ReFS is
+        // case-insensitive throughout, not only on the drive, so `C:\Primary`
+        // and `c:\primary` must fold to one identical key.
+        Some(drive) => format!("{drive}:{folded}").to_ascii_lowercase(),
+        None => folded,
+    }
+}
+
+/// Normalize a commit or dismiss target so every spelling of one repository
+/// produces ONE key.
+///
+/// Applied **symmetrically** to both sides of the in-chain dismiss map. That
+/// symmetry is what matters: the map is keyed by string, so a `--repo <p>/`
+/// dismissing a `--work-tree=<p>` commit only matches if both go through here.
+/// A `<repo>/.git` value collapses to `<repo>` for the same reason; a bare
+/// repository's own directory (`/srv/thing.git`) is not `.git` and survives.
+fn normalize_target(path: &str) -> String {
+    let normalized = lexical_normalize(path);
+    match Path::new(&normalized) {
+        p if p.file_name().is_some_and(|n| n == ".git") => p
+            .parent()
+            .filter(|q| !q.as_os_str().is_empty())
+            .map(|q| q.to_string_lossy().into_owned())
+            .unwrap_or(normalized),
+        _ => normalized,
+    }
+}
+
+/// True when a `--git-dir`/`GIT_DIR` value names a LINKED worktree's admin
+/// directory (`<primary>/.git/worktrees/<name>`) rather than a repository's own
+/// git dir.
+///
+/// Such a path must not be emitted as a commit target: git resolves it to the
+/// linked worktree, but a naive walk up from it lands on the primary checkout
+/// and would false-block the legitimate spelling for committing into a worktree
+/// (security review, #378).
+///
+/// The check is lexical, so it runs on a [`lexical_normalize`]d path — see there
+/// for the `..` evasion that motivated it.
+fn is_linked_worktree_admin_dir(path: &str) -> bool {
+    let normalized = lexical_normalize(path);
+    let names: Vec<&str> = Path::new(&normalized)
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    names
+        .windows(2)
+        .any(|w| w[0] == ".git" && w[1] == "worktrees")
+}
+
+/// A leading `NAME=value` shell assignment word: a valid variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
+/// `==` comparisons — is not skipped, so this can only widen the leading-word
+/// gate past words the shell itself treats as environment prefixes.
+///
+/// Kept local rather than imported: `cadence_hooks_core::shell` has its own
+/// copy, but it is private there — only that crate's `skip_transparent_prefixes`
+/// needs it. This guard's [`is_prefix_word`] needs the identical predicate for
+/// [`git_env_overrides`]'s shared prefix region (see there), and duplicating a
+/// four-line predicate is cheaper than widening core's visibility for one
+/// extra caller.
+fn is_assignment_word(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) if !name.is_empty() => {
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// `strip_group_wrappers`, along with `skip_transparent_prefixes` and
+/// `TRANSPARENT`, now lives in [`cadence_hooks_core::shell`] (cadence-hooks#419)
+/// — the polish ship anchor needs the same command-word resolution these
+/// guards do, and core is the only crate both sides can reach. Re-exported
+/// here rather than merged into the import list above so this contract stays
+/// attached to the name it describes. `is_prefix_word`/`git_env_overrides`
+/// and their local `is_assignment_word` above stay guard-local — core's
+/// refactor only extracted what its own `skip_transparent_prefixes` needed.
 pub(crate) use cadence_hooks_core::shell::strip_group_wrappers;
 
 /// A shell path is absolute if git will treat it as absolute: a leading `/`
-/// (POSIX / WSL / Git-Bash shell paths — `Path::is_absolute` is false for these
-/// on Windows, no drive letter) OR a platform-absolute path (native `C:\…`).
-/// These are shell paths a command string carries, not OS paths, so the
-/// decision is made on the string first, falling back to the platform's own
-/// notion of absolute for native-Windows drive paths (issue #235).
+/// (POSIX / WSL / Git-Bash shell paths) OR a Windows drive path, spelled with
+/// either separator (`C:/…` or `C:\…` — issue #235).
+///
+/// [`looks_absolute`] makes this decision from the STRING alone, so it agrees
+/// on a `C:\…` target whether this binary is compiled for Windows or not — the
+/// prior form relied on `Path::is_absolute`, which is only drive-letter-aware
+/// when compiled for Windows, so the same `C:\…` target read absolute on a
+/// Windows build and relative everywhere else. That platform split is exactly
+/// what let a Windows-native target fall through to a relative join and
+/// resolve to nowhere (the guard's Windows fail-open, cadence-hooks#377/#378);
+/// it also meant this decision could only be tested on a Windows runner.
+/// `Path::is_absolute` stays as a belt-and-braces fallback for a native
+/// Windows form the string check doesn't cover (e.g. a UNC `\\server\share`).
 fn is_shell_absolute(path: &str) -> bool {
-    path.starts_with('/') || Path::new(path).is_absolute()
+    looks_absolute(path) || Path::new(path).is_absolute()
 }
 
 /// Walk `command` once, returning both output channels: the `git commit`
@@ -390,7 +658,7 @@ fn is_shell_absolute(path: &str) -> bool {
 fn scan_targets(command: &str, cwd: &str) -> (Vec<CommitTarget>, Vec<MutationTarget>) {
     let mut commits = Vec::new();
     let mut mutations = Vec::new();
-    collect_targets(command, cwd, 0, &mut commits, &mut mutations);
+    collect_targets(command, cwd, 0, &mut commits, &mut mutations, (None, None));
     (commits, mutations)
 }
 
@@ -555,12 +823,19 @@ fn detect_mutations(
 /// nudge inherits the #228-safe cd-scoping rather than reintroducing the flat
 /// primitive. Depth shares [`MAX_WRAPPER_DEPTH`] with `command_segments`'s own
 /// expansion budget.
+///
+/// `inherited_env` carries a `GIT_WORK_TREE=`/`GIT_DIR=` prefix down into child
+/// scripts, because the shell really does export it: `GIT_WORK_TREE=<primary>
+/// sh -c 'git commit'` runs the child with that variable set, so the child's
+/// commit lands in `<primary>` (security review, #378). A segment's own prefix
+/// wins over an inherited one, as a nearer assignment does in the shell.
 fn collect_targets(
     script: &str,
     cwd: &str,
     depth: usize,
     targets: &mut Vec<CommitTarget>,
     mutations: &mut Vec<MutationTarget>,
+    inherited_env: (Option<&str>, Option<&str>),
 ) {
     let mut effective_dir = cwd.to_string();
 
@@ -579,12 +854,35 @@ fn collect_targets(
         // `env`/`exec`.
         let argv = skip_transparent_prefixes(&tokens);
 
+        // The git env prefix comes from the RAW tokens — `skip_transparent_prefixes`
+        // has already dropped it from `argv` — and a nearer assignment wins over
+        // one inherited from a parent script, as in the shell. Computed before
+        // the child recursion so a wrapper's child inherits it (#378).
+        //
+        // DELIBERATE over-reach: `child_scripts` yields `$(…)`/backtick bodies
+        // as well as `sh -c` wrappers, and bash applies an assignment prefix
+        // AFTER expansion, so a real substitution would NOT see this variable.
+        // Inheriting it there anyway errs toward seeing more of the command,
+        // which is the safe direction for a block channel — a miss lets a
+        // commit through, an over-reach at worst blocks a commit into the
+        // primary that was going there regardless (security review, #378).
+        let (seg_work_tree, seg_git_dir) = git_env_overrides(&tokens);
+        let env_work_tree = seg_work_tree.or(inherited_env.0);
+        let env_git_dir = seg_git_dir.or(inherited_env.1);
+
         // Child scripts execute with the directory in effect HERE — a
         // substitution is evaluated before its own segment runs, and a
         // wrapper inherits the cwd accumulated so far — in their own scope.
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, segment) {
-                collect_targets(&child, &effective_dir, depth + 1, targets, mutations);
+                collect_targets(
+                    &child,
+                    &effective_dir,
+                    depth + 1,
+                    targets,
+                    mutations,
+                    (env_work_tree, env_git_dir),
+                );
             }
         }
 
@@ -626,29 +924,73 @@ fn collect_targets(
 
         // `argv` is the prefix-/assignment-stripped view computed above
         // (`command`/`env`/`VAR=x git commit` → leading `git`); the commit
-        // detection (leading-word gate, git-global walk, `-C` redirect,
-        // ambiguity skip) lives in [`commit_target_of`] so the #323 in-chain
-        // scan resolves a commit target identically (#239 F4, #228).
-        if let Some(target) = commit_target_of(argv, &effective_dir) {
-            targets.push(target);
-        }
+        // detection (leading-word gate, git-global walk, `-C`/`--work-tree`/
+        // `--git-dir` redirects) lives in [`commit_targets_of`] so the #323
+        // in-chain scan resolves commit targets identically (#239 F4, #228) —
+        // both call sites must resolve the same way or the in-chain dismiss map
+        // stops matching (#378).
+        targets.extend(commit_targets_of(
+            argv,
+            &effective_dir,
+            env_work_tree,
+            env_git_dir,
+        ));
+    }
+}
+
+/// Resolve a git path operand against a base directory, with the same shell
+/// semantics the `cd` arm uses: an absolute path stands alone (including a
+/// native `C:\…`), `~` expands, anything else joins onto `base`.
+fn resolve_git_path(path: &str, base: &str) -> String {
+    if is_shell_absolute(path) {
+        path.to_string()
+    } else {
+        resolve_cd_target(path, base)
     }
 }
 
 /// If `argv` (already prefix-/assignment-stripped) is a `git … commit …`
-/// invocation, return the directory the commit lands in — the `effective_dir`,
-/// or a `-C <path>` redirect resolved against it. `None` when the segment is
-/// not a git-commit, or its target tree is ambiguous (`--work-tree`/`--git-dir`,
-/// which fails open).
+/// invocation, return every directory the commit lands in — the `effective_dir`,
+/// or the trees named by `--work-tree`, `--git-dir`, and a `-C <path>` redirect
+/// resolved against it. Empty when the segment is not a git-commit.
 ///
-/// Walks git's own global flags to find the subcommand, capturing a `-C <path>`
-/// redirect on the way. Indices are into the quote-aware token stream, so a
-/// spaced quoted `-C`/`-c` value stays one token. git globals that take a
-/// SEPARATE value token must be consumed or the walk stops on the value and
-/// never reaches `commit`, failing open (CodeRabbit, PR #241).
-fn commit_target_of(argv: &[String], effective_dir: &str) -> Option<CommitTarget> {
+/// Walks git's own global flags to find the subcommand, capturing the redirects
+/// on the way. Indices are into the quote-aware token stream, so a spaced quoted
+/// `-C`/`-c` value stays one token. git globals that take a SEPARATE value token
+/// must be consumed or the walk stops on the value and never reaches `commit`,
+/// failing open (CodeRabbit, PR #241) — which is why `--work-tree`/`--git-dir`
+/// are listed there too, both spellings landing in the same capture.
+///
+/// Three resolution rules, all matching git's own:
+///
+/// - **`-C` accumulates.** git documents each subsequent non-absolute
+///   `-C <path>` as relative to the preceding one, so the running redirect is
+///   the base for the next.
+/// - **`--work-tree` and `--git-dir` are BOTH emitted; `-C` or `effective_dir`
+///   is the fallback when neither is named.** They are not ranked against each
+///   other, because they name two different things a commit mutates — the tree
+///   it reads and the repository whose HEAD and index it advances — and either
+///   one landing in a primary checkout is the harm. A `<repo>/.git` value is
+///   normalized to `<repo>` — not because [`GitState`] needs it (it resolves
+///   either) but because the in-chain dismiss map is keyed by the raw target
+///   string, so the two spellings of one repo must converge or a dismissed
+///   chain half-matches and blocks. One naming a linked worktree's admin dir is
+///   dropped by [`is_linked_worktree_admin_dir`] to avoid a false block.
+/// - **An explicit flag outranks the `GIT_WORK_TREE=`/`GIT_DIR=` env prefix**
+///   (`env_work_tree`/`env_git_dir`, already resolved by the caller), as it does
+///   in git.
+///
+/// These were previously an `ambiguous` early return — a MISS dressed as a
+/// fail-open, since the targets resolve fine (#378). An unresolvable value still
+/// fails open downstream: [`assess_dir`] Allows when [`GitState`] finds no repo.
+fn commit_targets_of(
+    argv: &[String],
+    effective_dir: &str,
+    env_work_tree: Option<&str>,
+    env_git_dir: Option<&str>,
+) -> Vec<CommitTarget> {
     if argv.first().map(String::as_str) != Some("git") {
-        return None;
+        return Vec::new();
     }
     const VALUE_GLOBALS: &[&str] = &[
         "-C",
@@ -657,37 +999,84 @@ fn commit_target_of(argv: &[String], effective_dir: &str) -> Option<CommitTarget
         "--super-prefix",
         "--config-env",
         "--attr-source",
+        "--work-tree",
+        "--git-dir",
     ];
-    let mut redirect: Option<&str> = None;
-    let mut ambiguous = false;
+    let mut redirect: Option<String> = None;
+    let mut work_tree: Option<&str> = None;
+    let mut git_dir: Option<&str> = None;
     let mut idx = 1;
     while idx < argv.len()
         && (argv[idx].starts_with('-') || VALUE_GLOBALS.contains(&argv[idx - 1].as_str()))
     {
         let t = argv[idx].as_str();
-        if argv[idx - 1] == "-C" {
-            redirect = Some(t);
-        } else if t == "--work-tree"
-            || t == "--git-dir"
-            || t.starts_with("--work-tree=")
-            || t.starts_with("--git-dir=")
-        {
-            ambiguous = true;
+        let prev = argv[idx - 1].as_str();
+        // A token that is the VALUE of the preceding global is never re-read as
+        // a flag: `git -c --work-tree=/x commit` passes that string to `-c`, so
+        // treating it as a redirect would resolve a tree git never touches.
+        if VALUE_GLOBALS.contains(&prev) {
+            match prev {
+                // `-C` compounds: resolve this hop against the previous one.
+                "-C" => {
+                    let base = redirect.as_deref().unwrap_or(effective_dir);
+                    redirect = Some(resolve_git_path(t, base));
+                }
+                "--work-tree" => work_tree = Some(t),
+                "--git-dir" => git_dir = Some(t),
+                _ => {}
+            }
+        } else if let Some(v) = t.strip_prefix("--work-tree=") {
+            work_tree = Some(v);
+        } else if let Some(v) = t.strip_prefix("--git-dir=") {
+            git_dir = Some(v);
         }
         idx += 1;
     }
-    if ambiguous {
-        return None;
+    if argv.get(idx).map(String::as_str) != Some("commit") {
+        return Vec::new();
     }
-    if argv.get(idx).map(String::as_str) == Some("commit") {
-        Some(match redirect {
-            Some(path) if is_shell_absolute(path) => path.to_string(),
-            Some(path) => format!("{effective_dir}/{path}"),
-            None => effective_dir.to_string(),
-        })
-    } else {
-        None
+    // Every relative value — flag OR env — resolves against the cwd git is
+    // already standing in: the accumulated `-C` when there was one, else the
+    // segment's dir. git applies the `-C` chdir before repository setup, so
+    // resolving the env values anywhere else is the bypass described on
+    // [`git_env_overrides`].
+    let base = redirect.as_deref().unwrap_or(effective_dir);
+    // Per-flag precedence: each explicit flag overrides only its OWN env var,
+    // exactly as git does, so `--git-dir=X` with `GIT_WORK_TREE=Y` still reads
+    // its tree from Y.
+    let resolved_work_tree = work_tree
+        .or(env_work_tree)
+        .map(|p| resolve_git_path(p, base));
+    let resolved_git_dir = git_dir.or(env_git_dir).map(|p| resolve_git_path(p, base));
+
+    // BOTH are emitted, because they name two different things git mutates and
+    // either one landing in a primary checkout is the harm this guard exists to
+    // stop. `--git-dir=<primary>/.git --work-tree=<elsewhere> commit` writes the
+    // tree read from `<elsewhere>` but advances the PRIMARY's HEAD and index —
+    // collapsing to a single work-tree-wins target allowed exactly that
+    // (security review, #378). The caller assesses each target independently and
+    // dedups, so two targets cost at most one extra probe.
+    //
+    // EVERY emitted target goes through [`normalize_target`], including the
+    // fallback — the in-chain dismiss map is keyed by these strings, so one
+    // un-normalized path is enough to make a licensed chain half-match and
+    // block (security review, #378).
+    let mut targets: Vec<CommitTarget> = Vec::new();
+    if let Some(wt) = resolved_work_tree {
+        targets.push(normalize_target(&wt));
     }
+    if let Some(gd) = resolved_git_dir.filter(|p| !is_linked_worktree_admin_dir(p)) {
+        let gd = normalize_target(&gd);
+        if !targets.contains(&gd) {
+            targets.push(gd);
+        }
+    }
+    if targets.is_empty() {
+        targets.push(normalize_target(
+            &redirect.unwrap_or_else(|| effective_dir.to_string()),
+        ));
+    }
+    targets
 }
 
 /// Scan `command`'s **top-level** segments for a leading in-chain
@@ -742,10 +1131,37 @@ fn inchain_dismissed_commits(command: &str, cwd: &str) -> HashMap<CommitTarget, 
                 dismiss_target_dir(argv, &effective_dir),
                 crate::snooze_meta::normalize_reason(flag_value(argv, "--reason").as_deref()),
             );
-        } else if let Some(target) = commit_target_of(argv, &effective_dir)
-            && let Some(reason) = active.get(&target)
-        {
-            dismissed.entry(target).or_insert_with(|| reason.clone());
+        } else {
+            // Commit targets come from [`collect_targets`] ITSELF, not a
+            // parallel re-implementation. The dismiss map is keyed by target
+            // string, so any divergence silently stops a `dismiss && commit`
+            // chain from matching — and a hand-kept copy diverged the moment
+            // `collect_targets` learned to inherit a git env prefix into child
+            // scripts, leaving `dismiss && GIT_WORK_TREE=<p> sh -c 'git commit'`
+            // blocked despite the user's own dismiss (security review, #378).
+            // Calling the real walk makes that parity structural.
+            //
+            // This is a per-SEGMENT call, which keeps the top-level-only rule
+            // for the DISMISS side intact: a dismiss buried in a wrapper is
+            // still not honored, because only `is_dismiss_enforce_segment` above
+            // — which sees the segment's own leading token — can arm one. What
+            // recurses here is commit DETECTION, which must see everything the
+            // block channel sees.
+            let mut seg_targets: Vec<CommitTarget> = Vec::new();
+            let mut discarded: Vec<MutationTarget> = Vec::new();
+            collect_targets(
+                segment,
+                &effective_dir,
+                0,
+                &mut seg_targets,
+                &mut discarded,
+                (None, None),
+            );
+            for target in seg_targets {
+                if let Some(reason) = active.get(&target) {
+                    dismissed.entry(target).or_insert_with(|| reason.clone());
+                }
+            }
         }
 
         // GATE RIDER: only an `&&` connector preserves the active dismiss set
@@ -774,11 +1190,17 @@ fn is_dismiss_enforce_segment(argv: &[String]) -> bool {
 /// [`commit_target_of`]'s `-C` resolution so the two produce matching target
 /// strings for the same repo), else `effective_dir` itself.
 fn dismiss_target_dir(argv: &[String], effective_dir: &str) -> CommitTarget {
-    match flag_value(argv, "--repo") {
+    // Through the SAME [`normalize_target`] the commit side uses. This is the
+    // other half of the dismiss map's key: a `--repo <p>/` or `--repo <p>/.git`
+    // must land on the same string a `--work-tree=<p>` commit produces, or the
+    // user's own dismiss stops licensing the commit it was run for — and the
+    // block then points at the dismiss they already ran (security review, #378).
+    let raw = match flag_value(argv, "--repo") {
         Some(repo) if is_shell_absolute(&repo) => repo,
         Some(repo) => format!("{effective_dir}/{repo}"),
         None => effective_dir.to_string(),
-    }
+    };
+    normalize_target(&raw)
 }
 
 /// Value of a `--flag <value>` or `--flag=<value>` option in `argv`, if present.
@@ -1009,6 +1431,27 @@ fn mutation_nudge(
         // for an already-existing tracked file (security-review FIX 1). A `Dir`
         // target (a package-manager verb's cwd) is already a directory — taking
         // its parent would wrongly hop to the enclosing dir, so it is used as-is.
+        // A `File` target that does not exist yet is not a mutation of tracked
+        // tree content — it is a brand-new scratch file, report, or log, and
+        // nudging on it told the reporter their command "mutates tracked files"
+        // when it created one (#377). Gated BEFORE the `.parent()` ascent, which
+        // would otherwise hand a nonexistent path to the containing directory and
+        // nudge identically to an existing tracked file. A pure metadata probe —
+        // no git spawn, honoring the #271 probe discipline. `Dir` targets (a
+        // package-manager verb's cwd) keep nudging: the install mutates whatever
+        // is already there.
+        //
+        // `symlink_metadata`, not `exists()`: the latter follows the link and
+        // reports false for a DANGLING symlink, so a redirect onto a tracked but
+        // broken symlink would be silenced (security review). This gate cannot
+        // separate a scratch `report.txt` from a brand-new SOURCE file — both are
+        // equally absent — so a first write of `src/newmod/lib.rs` in the primary
+        // is now silent too; that widened miss is enumerated in the module header.
+        if let MutationTarget::File(f) = target
+            && std::fs::symlink_metadata(f).is_err()
+        {
+            continue;
+        }
         let assess_path: PathBuf = match target {
             MutationTarget::Dir(d) => PathBuf::from(d),
             MutationTarget::File(f) => Path::new(f)
@@ -1046,18 +1489,35 @@ fn mutation_nudge(
             let repo = probe
                 .repo_root(&dir)
                 .unwrap_or_else(|| dir.to_string_lossy().into_owned());
-            return Some(CheckResult::nudge(mutation_nudge_message(&repo)));
+            // The path comes out of the user's command, so it goes through the
+            // same display sanitizer every other untrusted field in this binary
+            // uses — a filename carrying a newline must not be able to forge an
+            // extra line in the guard's own advisory (security review).
+            let path = match target {
+                MutationTarget::Dir(d) => d,
+                MutationTarget::File(f) => f,
+            };
+            let path = sanitize_field(path, MAX_PATH_DISPLAY);
+            return Some(CheckResult::nudge(mutation_nudge_message(&repo, &path)));
         }
     }
     None
 }
 
-/// The nudge message: names the checkout, the accumulate-before-tripwire
-/// rationale, the worktree fix, and the shared-snooze escape (the nudge reuses
-/// the enforce-worktree snooze — no separate dismiss key, per D2).
-fn mutation_nudge_message(repo_root: &str) -> String {
+/// The nudge message: names the PATH it resolved and the checkout that path
+/// lands in, then the accumulate-before-tripwire rationale, the worktree fix,
+/// and the shared-snooze escape (the nudge reuses the enforce-worktree snooze —
+/// no separate dismiss key, per D2).
+///
+/// Naming the path is load-bearing. The message used to assert "mutates tracked
+/// files in the primary checkout `<repo>`" and name only the repo, so a reader
+/// who could not see which path the walk had picked read it as the guard
+/// misidentifying their cwd (#377). It also no longer claims the target is
+/// *tracked* — the walk never asks git that, and the nudge fires on untracked
+/// paths in a tracked tree too.
+fn mutation_nudge_message(repo_root: &str, path: &str) -> String {
     format!(
-        "enforce-worktree: this command mutates tracked files in the primary checkout \
+        "enforce-worktree: this command mutates `{path}` in the primary checkout \
          `{repo_root}` via a subprocess (package install, `sed -i`, or a redirect) — writes \
          accumulate unseen until commit. Prefer a worktree: {WORKTREE_CREATE_RECIPE}. \
          Silence for 30m: `cadence-hooks guardrails dismiss-enforce-worktree --for 30m`"
@@ -1434,10 +1894,87 @@ mod tests {
     }
 
     #[test]
-    fn work_tree_form_is_skipped() {
-        // Ambiguous target tree → fail open, documented miss.
-        assert!(git_commit_targets("git --work-tree=/other commit -m 'x'", "/cwd").is_empty());
-        assert!(git_commit_targets("git --git-dir=/o/.git commit -m 'x'", "/cwd").is_empty());
+    fn work_tree_form_resolves_its_named_tree() {
+        // Was `work_tree_form_is_skipped`, asserting the empty result the
+        // `ambiguous` early return produced. That was never real ambiguity —
+        // both flags name a resolvable tree, and skipping them was a bypass
+        // (#378). They now resolve; a value naming no repo still fails open
+        // downstream in `assess_dir`, not here.
+        assert_eq!(
+            git_commit_targets("git --work-tree=/other commit -m 'x'", "/cwd"),
+            vec!["/other".to_string()]
+        );
+        assert_eq!(
+            git_commit_targets("git --git-dir=/o/.git commit -m 'x'", "/cwd"),
+            vec!["/o".to_string()],
+            "a `<repo>/.git` value normalizes to `<repo>` so the two spellings of \
+             one repo share a dismiss-map key"
+        );
+        // Relative values resolve against the segment's dir, like `-C` does.
+        assert_eq!(
+            git_commit_targets("git --work-tree=sub commit -m 'x'", "/cwd"),
+            vec!["/cwd/sub".to_string()]
+        );
+        // BOTH are emitted when both are named — they are two different things
+        // the commit mutates (the tree it reads, the repo whose HEAD advances),
+        // and collapsing to one let a git-dir naming the primary slip through.
+        // The git-dir is normalized `<repo>/.git` → `<repo>`.
+        assert_eq!(
+            git_commit_targets(
+                "git --git-dir=/o/.git --work-tree=/other commit -m 'x'",
+                "/cwd"
+            ),
+            vec!["/other".to_string(), "/o".to_string()]
+        );
+        // Two spellings of the SAME repo collapse to one target, so an in-chain
+        // dismiss keyed on that repo matches every target the commit produces.
+        assert_eq!(
+            git_commit_targets(
+                "git --git-dir=/other/.git --work-tree=/other commit -m 'x'",
+                "/cwd"
+            ),
+            vec!["/other".to_string()]
+        );
+        // A bare repo's dir is not `<repo>/.git` and must not be stripped.
+        assert_eq!(
+            git_commit_targets("git --git-dir=/srv/thing.git commit -m 'x'", "/cwd"),
+            vec!["/srv/thing.git".to_string()]
+        );
+        // A git-dir naming a LINKED worktree's admin dir is dropped, not
+        // emitted: walking up from it lands on the primary and would false-block
+        // the legitimate spelling.
+        assert_eq!(
+            git_commit_targets(
+                "git --git-dir=/p/.git/worktrees/a --work-tree=/wt commit -m 'x'",
+                "/cwd"
+            ),
+            vec!["/wt".to_string()]
+        );
+        // ...but a path that merely PASSES THROUGH `.git/worktrees` and resolves
+        // back to the primary's own git dir must NOT be dropped. This exclusion
+        // is a lexical check, and `Path::components()` preserves `..`, so every
+        // spelling below matched it and dropped the primary — the guard's
+        // headline control evaded by appending two characters. Each of these IS
+        // `/p/.git`, hence `/p` (security review, #378).
+        for cmd in [
+            "git --git-dir=/p/.git/worktrees/.. commit -m 'x'",
+            "git --git-dir=/p/.git/worktrees/a/../.. commit -m 'x'",
+            "git --git-dir=/p/.git/worktrees/./.. commit -m 'x'",
+            "git --git-dir=/p/.git//worktrees/.. commit -m 'x'",
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/p".to_string()],
+                "a path through .git/worktrees that resolves to the primary is not excluded: {cmd}"
+            );
+        }
+        // Code-review finding: a token that is the VALUE of a preceding global
+        // must not be re-read as a flag. `-c` consumes the next token as its
+        // config string, so this names no tree and resolves to the cwd.
+        assert_eq!(
+            git_commit_targets("git -c --work-tree=/other commit -m 'x'", "/cwd"),
+            vec!["/cwd".to_string()]
+        );
     }
 
     #[test]
@@ -1454,10 +1991,15 @@ mod tests {
         // A native Windows drive path is absolute via `Path::is_absolute`'s own
         // arm of `is_shell_absolute` (no leading `/` needed) — proves the
         // `#[cfg(unix)]`-gated fixtures above aren't the only Windows coverage
-        // for this branch (issue #235).
+        // for this branch (issue #235). The target is normalized (lowercased,
+        // forward-slash-joined) rather than passed through verbatim — every
+        // emitted target goes through `normalize_target`, and on a Windows
+        // build that now folds a drive-absolute path the same way
+        // `lexical_normalize_folds_windows_drive_paths` proves on every
+        // platform (cadence-hooks#377/#378).
         assert_eq!(
             git_commit_targets(r"git -C C:\repo\wt commit -m x", r"C:\cwd"),
-            vec![r"C:\repo\wt".to_string()]
+            vec!["c:/repo/wt".to_string()]
         );
     }
 
@@ -1787,7 +2329,7 @@ mod tests {
         // never reaching the commit (the `|| exit` idiom fires instead).
         assert_eq!(
             git_commit_targets("cd ./does-not-exist-xyz || exit; git commit -m 'x'", "/cwd"),
-            vec!["/cwd/./does-not-exist-xyz".to_string()]
+            vec!["/cwd/does-not-exist-xyz".to_string()]
         );
     }
 
@@ -1802,14 +2344,15 @@ mod tests {
     #[test]
     fn cd_flag_tokens_skipped_to_find_real_target() {
         // Issue-review finding on this fix: `cd`'s own option flags must not
-        // be misread as the path argument.
+        // be misread as the path argument. (The trailing `.` folds away in
+        // `normalize_target` — same directory, one spelling.)
         assert_eq!(
             git_commit_targets("cd -P . && git commit -m 'x'", "/cwd"),
-            vec!["/cwd/.".to_string()]
+            vec!["/cwd".to_string()]
         );
         assert_eq!(
             git_commit_targets("cd -- . && git commit -m 'x'", "/cwd"),
-            vec!["/cwd/.".to_string()]
+            vec!["/cwd".to_string()]
         );
     }
 
@@ -3278,6 +3821,14 @@ mod tests {
     fn sed_in_place_in_primary_nudges() {
         let scratch = Scratch::new("mut-sed");
         let (primary, _wt) = primary_and_worktree(&scratch);
+        // Same fixture gap as `redirect_into_primary_nudges_clobber_and_append`:
+        // `src/foo.rs` was never created, so this asserted a nudge on a path
+        // `sed -i` could not have edited. The #377 exists-gate flips that to
+        // Allow. Create the file the test is about.
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        std::fs::write(primary.join("src/foo.rs"), "fn main() {}\n").unwrap();
+        git_in(&primary, &["add", "src/foo.rs"]);
+        git_in(&primary, &["commit", "-q", "-m", "add src/foo.rs"]);
         let mut input = make_bash("sed -i s/a/b/ src/foo.rs");
         input.cwd = Some(primary.to_string_lossy().into_owned());
         let r = run_enforce(&input, &cfg(false, false));
@@ -3357,6 +3908,16 @@ mod tests {
     fn redirect_into_primary_nudges_clobber_and_append() {
         let scratch = Scratch::new("mut-redirect");
         let (primary, _wt) = primary_and_worktree(&scratch);
+        // The fixture must match the test's NAME: `src/tracked.txt` has to
+        // actually be a tracked file. It never was, so the assertions below
+        // passed on a nonexistent path — and the #377 exists-gate flips exactly
+        // that case to Allow. Creating the file restores the test's intent
+        // (a redirect clobbering real tree content nudges) instead of weakening
+        // the assertion to match the bug.
+        std::fs::create_dir_all(primary.join("src")).unwrap();
+        std::fs::write(primary.join("src/tracked.txt"), "orig\n").unwrap();
+        git_in(&primary, &["add", "src/tracked.txt"]);
+        git_in(&primary, &["commit", "-q", "-m", "add src/tracked.txt"]);
 
         let mut input = make_bash("echo x > src/tracked.txt");
         input.cwd = Some(primary.to_string_lossy().into_owned());
@@ -3371,6 +3932,581 @@ mod tests {
             Outcome::Nudge,
             "append redirect nudges too (>> covered in v1)"
         );
+    }
+
+    #[test]
+    fn brand_new_redirect_target_does_not_nudge() {
+        // #377: a redirect that CREATES a file — a scratch report, a log, a
+        // JSON dump — mutates no tracked tree content, so the advisory channel
+        // must stay silent. Pre-fix it nudged identically to a clobber of a
+        // tracked file, and the message's "mutates tracked files in the primary
+        // checkout `<repo>`" (naming only the repo) read as the guard having
+        // misidentified the cwd. The `existing_tracked_file_mutations_in_primary_nudge`
+        // test above is the other half of this contract: the loosening stops here.
+        let scratch = Scratch::new("mut-brand-new");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("git diff > report.txt");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a redirect creating a brand-new file mutates nothing tracked → silent"
+        );
+    }
+
+    #[test]
+    fn mutation_nudge_message_names_the_path() {
+        // #377's second defect: the message named only the repo, so a reader
+        // could not tell WHICH path the walk had resolved — the whole reason the
+        // reporter inferred a wrong-cwd bug. It must name the path, and it must
+        // not claim the target is "tracked" (the walk never asks git that).
+        let scratch = Scratch::new("mut-msg-path");
+        let (primary, _wt) = primary_and_worktree(&scratch);
+        let mut input = make_bash("echo x >> f.txt");
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("f.txt"), "message names the path: {msg}");
+        assert!(
+            !msg.contains("tracked files"),
+            "message drops the unverified `tracked` claim: {msg}"
+        );
+    }
+
+    #[test]
+    fn work_tree_flag_commit_into_primary_blocks() {
+        // #378: `--work-tree` names the checkout being mutated as plainly as a
+        // `-C` does. It used to set the `ambiguous` flag and skip the check —
+        // a MISS dressed as a fail-open, and a real bypass from a worktree.
+        let scratch = Scratch::new("cw-work-tree");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        for cmd in [
+            format!("git --work-tree={p} commit -m x"),
+            format!("git --work-tree {p} commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "--work-tree into the primary must block: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_dir_flag_commit_into_primary_blocks() {
+        // Same bypass via `--git-dir`. No `.git`-stripping is needed: GitState
+        // resolves `<repo>/.git` back to `<repo>`.
+        let scratch = Scratch::new("cw-git-dir");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        for cmd in [
+            format!("git --git-dir={p}/.git commit -m x"),
+            format!("git --git-dir {p}/.git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "--git-dir into the primary must block: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_env_prefix_commit_into_primary_blocks() {
+        // The env spelling of the same redirect. `skip_transparent_prefixes`
+        // discards assignment words so the leading-word gate sees `git` (#228);
+        // `git_env_overrides` now reads the two that name a tree before they go.
+        let scratch = Scratch::new("cw-git-env");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        for cmd in [
+            format!("GIT_DIR={p}/.git GIT_WORK_TREE={p} git commit -m x"),
+            format!("GIT_WORK_TREE={p} git commit -m x"),
+            format!("GIT_DIR={p}/.git git commit -m x"),
+            // Interleaved with a transparent prefix and an unrelated assignment.
+            format!("env FOO=1 GIT_WORK_TREE={p} command git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a git env prefix naming the primary must block: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_flags_outrank_git_env_prefix() {
+        // git's own precedence: an explicit flag overrides its OWN env var.
+        // Pins that ordering AND proves the tightening did not create a false
+        // block — GIT_WORK_TREE names the primary, but the explicit flag wins
+        // and the commit really lands in the worktree, so it must be allowed.
+        //
+        // Deliberately no `GIT_DIR` here. An earlier version of this test set
+        // GIT_DIR=<primary>/.git alongside and still asserted Allow, which was
+        // wrong: with the repo dir pointed at the primary, that commit advances
+        // the PRIMARY's HEAD and index. `git_dir_naming_primary_blocks_even_with_a_work_tree`
+        // below now pins that case as a Block (security review, #378).
+        let scratch = Scratch::new("cw-env-precedence");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
+        let cmd = format!("GIT_WORK_TREE={p} git --work-tree={w} commit -m x");
+        let mut input = make_bash(&cmd);
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "an explicit --work-tree outranks GIT_WORK_TREE: {cmd}"
+        );
+    }
+
+    #[test]
+    fn git_dir_naming_primary_blocks_even_with_a_work_tree() {
+        // A commit reads its tree from --work-tree but advances HEAD and the
+        // index in --git-dir's repository. Ranking work-tree above git-dir and
+        // returning ONE target dropped the git-dir entirely, so this mutated the
+        // primary and Allowed. Both targets are emitted now.
+        let scratch = Scratch::new("cw-gitdir-both");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
+        for cmd in [
+            format!("git --git-dir={p}/.git --work-tree={w} commit -m x"),
+            format!("GIT_DIR={p}/.git git --work-tree={w} commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a git-dir naming the primary must block regardless of work-tree: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_git_env_resolves_after_the_dash_c_chdir() {
+        // THE regression this pass exists to catch. git applies the `-C` chdir
+        // BEFORE repository setup, so a relative env value is relative to the
+        // POST-`-C` directory. Resolving it against the pre-`-C` dir while it
+        // outranked the `-C` redirect made this Allow while git committed into
+        // the primary — a bypass the branch itself introduced, and one every
+        // absolute-path env test missed (security review, #378).
+        let scratch = Scratch::new("cw-rel-env");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
+
+        for cmd in [
+            format!("GIT_WORK_TREE=. git -C {p} commit -m x"),
+            format!("GIT_DIR=.git git -C {p} commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a relative git env var resolves against the -C target: {cmd}"
+            );
+        }
+
+        // Mirror direction — the false block. From the primary, `-C <worktree>`
+        // with a relative env value lands in the worktree, so it must allow.
+        for cmd in [
+            format!("GIT_WORK_TREE=. git -C {w} commit -m x"),
+            format!("GIT_DIR=.git git -C {w} commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "a relative env value under -C <worktree> is not a primary commit: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn inchain_dismiss_covers_every_target_a_commit_emits() {
+        // Emitting BOTH a work-tree and a git-dir target reopened the parity
+        // hazard from the other side: the dismiss map is keyed by target string,
+        // so a chain dismissing `<repo>` matched the work-tree target and missed
+        // the `<repo>/.git` one, and the undismissed half blocked a chain the
+        // user had explicitly licensed. Normalizing `<repo>/.git` → `<repo>`
+        // collapses them; this pins that a dismiss still covers the commit.
+        let scratch = Scratch::new("cw-dismiss-parity");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        let dismiss =
+            format!("cadence-hooks guardrails dismiss-enforce-worktree --for 30m --repo {p}");
+
+        for tail in [
+            format!("GIT_WORK_TREE={p} GIT_DIR={p}/.git git commit -m x"),
+            format!("git --git-dir={p}/.git --work-tree={p} commit -m x"),
+        ] {
+            let mut input = make_bash(&format!("{dismiss} && {tail}"));
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "an in-chain dismiss must cover every target the commit emits: {tail}"
+            );
+
+            // GATE RIDER intact: a `;` breaks the chain and it blocks again.
+            let mut input = make_bash(&format!("{dismiss} ; {tail}"));
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a non-&& connector still fails closed: {tail}"
+            );
+        }
+    }
+
+    #[test]
+    fn dot_dot_through_worktrees_admin_dir_still_blocks() {
+        // End-to-end form of the exclusion evasion: `<primary>/.git/worktrees/..`
+        // IS `<primary>/.git`, and with no --work-tree git takes the cwd as the
+        // tree — so this commits the worktree's files onto the PRIMARY's branch.
+        // The exclusion dropped the git-dir target and the walk fell through to
+        // the session's own worktree, yielding Allow.
+        let scratch = Scratch::new("cw-dotdot-evade");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        for cmd in [
+            format!("git --git-dir={p}/.git/worktrees/.. commit -m x"),
+            format!("git --git-dir={p}/.git/worktrees/./.. commit -m x"),
+            format!("GIT_DIR={p}/.git/worktrees/.. git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a `..` through the worktrees dir resolves to the primary: {cmd}"
+            );
+        }
+
+        // The exclusion itself still works — a REAL linked-worktree admin dir
+        // must stay dropped, or this fix trades a bypass for a false block.
+        let admin = format!("{p}/.git/worktrees/feat-x");
+        let cmd = format!(
+            "git --git-dir={admin} --work-tree={} commit -m x",
+            wt.to_string_lossy()
+        );
+        let mut input = make_bash(&cmd);
+        input.cwd = Some(primary.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "a genuine linked-worktree admin dir is still not the primary: {cmd}"
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_folds_without_touching_the_filesystem() {
+        assert_eq!(lexical_normalize("/p/.git/worktrees/.."), "/p/.git");
+        assert_eq!(lexical_normalize("/p/.git//worktrees/../.."), "/p");
+        assert_eq!(lexical_normalize("/p/./sub/"), "/p/sub");
+        assert_eq!(lexical_normalize("/p/"), "/p");
+        // `/..` is `/`, not an escape above the root.
+        assert_eq!(lexical_normalize("/.."), "/");
+        // A leading run of `..` in a RELATIVE path has nothing to pop and must
+        // survive, or the path would silently change meaning.
+        assert_eq!(lexical_normalize("../sibling"), "../sibling");
+        // `..` never pops a `..`.
+        assert_eq!(lexical_normalize("../../x"), "../../x");
+        // Nothing survives a relative fold — the caller's spelling is kept
+        // rather than invented into a `.`.
+        assert_eq!(lexical_normalize("a/.."), "a/..");
+        // `<repo>/.git` collapses; a bare repo's own dir does not.
+        assert_eq!(normalize_target("/p/.git"), "/p");
+        assert_eq!(normalize_target("/p/.git/"), "/p");
+        assert_eq!(normalize_target("/srv/thing.git"), "/srv/thing.git");
+        // SEPARATOR INVARIANT. Every target here is a shell path, so the fold
+        // must emit `/` on every platform. Collecting into a `PathBuf` re-joins
+        // with the platform separator and returned `\p\.git` on Windows, which
+        // silently stopped every normalized target matching the un-normalized
+        // ones — the dismiss map is keyed on these strings. Asserted rather
+        // than left to a doc comment, because the failure is invisible on the
+        // developer's own machine.
+        for spelling in [
+            "/p/.git/worktrees/..",
+            "/p/./sub/",
+            "/p//q/../r",
+            "../sibling",
+        ] {
+            let folded = lexical_normalize(spelling);
+            assert!(
+                !folded.contains('\\'),
+                "fold must stay a shell path on every platform: {spelling} -> {folded}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_normalize_folds_windows_drive_paths() {
+        // Platform-INDEPENDENT: the fold decides absoluteness and splits
+        // segments from the STRING alone, so these assert the same result on
+        // macOS/Linux CI as on a real Windows runner — the Windows fail-open
+        // (cadence-hooks#377/#378) was only reproducible on Windows before
+        // this fix, because `absolute` used to be a bare `path.starts_with('/')`
+        // and splitting ran on `/` alone, both blind to a `C:\…` prefix.
+        assert_eq!(
+            lexical_normalize("C:\\p\\.git\\worktrees\\.."),
+            "c:/p/.git",
+            "a `..` through the worktrees dir must fold on a Windows path too"
+        );
+        // Drive letter is lowercased — NTFS/ReFS is case-insensitive, so two
+        // spellings of the same path must fold to the same string or the
+        // in-chain dismiss map's equality lookup silently stops matching one.
+        assert_eq!(
+            lexical_normalize("C:\\Primary\\.git"),
+            lexical_normalize("c:\\primary\\.git"),
+        );
+        // A `..` right after the drive root stays at the root, mirroring
+        // POSIX `/..` == `/`.
+        assert_eq!(lexical_normalize("C:\\.."), "c:/");
+        // The exact shape this crate's own Windows CI fixture produces:
+        // `Path::join("../../target/…")` on `CARGO_MANIFEST_DIR` embeds a
+        // real `..` inside an otherwise backslash-separated native path. The
+        // drive letter must survive the fold — the pre-fix code treated the
+        // whole `D:\a\...\guardrails\..` prefix as ONE opaque segment (no `/`
+        // in it), so the following literal `..` popped that entire prefix,
+        // including the drive letter, producing a relative fragment that
+        // resolved to no repo and let every enforce-worktree test on Windows
+        // read Allow instead of Block.
+        assert_eq!(
+            lexical_normalize(
+                "D:\\a\\cadence-hooks\\cadence-hooks\\crates\\guardrails\\../../target/enforce-worktree-scratch\\commit-1\\repo"
+            ),
+            "d:/a/cadence-hooks/cadence-hooks/target/enforce-worktree-scratch/commit-1/repo",
+        );
+        // A POSIX path carrying a literal backslash in a filename (legal on
+        // POSIX filesystems) must NOT be treated as a separator — that
+        // splitting is scoped to paths a Windows drive prefix already
+        // identified as native Windows.
+        assert_eq!(lexical_normalize("/tmp/weird\\name"), "/tmp/weird\\name");
+    }
+
+    #[test]
+    fn is_shell_absolute_recognizes_windows_drive_paths_on_every_platform() {
+        // Was `Path::new(path).is_absolute()` on the fallback branch, which is
+        // only drive-letter-aware when this binary is compiled for Windows —
+        // so the same assertion passed on a Windows runner and failed
+        // everywhere else. `looks_absolute` makes the primary check
+        // string-based, so it holds on every platform.
+        assert!(is_shell_absolute("C:\\Users\\x"));
+        assert!(is_shell_absolute("C:/Users/x"));
+        assert!(is_shell_absolute("/posix/path"));
+        assert!(!is_shell_absolute("relative\\path"));
+    }
+
+    #[test]
+    fn git_commit_targets_folds_a_windows_dash_c_redirect() {
+        // End-to-end through the real parsing chain (`commit_targets_of` ->
+        // `resolve_git_path` -> `normalize_target` -> `lexical_normalize`) with
+        // a Windows-native `-C` value, mirroring what a `-C D:\…` typed at a
+        // native (non-Git-Bash) Windows shell looks like on the wire.
+        assert_eq!(
+            git_commit_targets("git -C D:\\wt commit -m 'x'", "/cwd"),
+            vec!["d:/wt".to_string()]
+        );
+        // The commit fallback target (no explicit flag) is the raw `cwd` —
+        // exactly the shape of the FIRST assertion in
+        // `commit_in_primary_blocks_and_in_worktree_allows`, the simplest of
+        // the 26 tests the Windows fail-open broke.
+        assert_eq!(
+            git_commit_targets("git commit -m 'x'", "C:\\primary"),
+            vec!["c:/primary".to_string()]
+        );
+    }
+
+    #[test]
+    fn dismiss_reaches_targets_only_the_full_walk_can_see() {
+        // The dismiss walk used to re-implement commit detection, so it stopped
+        // matching the moment `collect_targets` learned something it hadn't —
+        // here, inheriting a git env prefix into a wrapper's child. The user's
+        // own dismiss then failed to license the commit it was run for, and the
+        // block pointed at the dismiss they had just executed.
+        let scratch = Scratch::new("cw-dismiss-reach");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        let dismiss =
+            format!("cadence-hooks guardrails dismiss-enforce-worktree --for 30m --repo {p}");
+
+        for tail in [
+            format!("GIT_WORK_TREE={p} sh -c 'git commit -m x'"),
+            format!("git --work-tree={p}/ commit -m x"),
+            format!("git --git-dir={p}/.git commit -m x"),
+        ] {
+            let mut input = make_bash(&format!("{dismiss} && {tail}"));
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "a dismiss must license every target the commit walk can see: {tail}"
+            );
+        }
+
+        // A `--repo` spelled as the repo's git dir keys the same repository.
+        let cmd = format!(
+            "cadence-hooks guardrails dismiss-enforce-worktree --for 30m --repo {p}/.git \
+             && git --git-dir={p}/.git commit -m x"
+        );
+        let mut input = make_bash(&cmd);
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Allow, "--repo <p>/.git keys <p>: {cmd}");
+
+        // A dismiss buried in a WRAPPER is still not honored — commit detection
+        // recurses, dismiss detection deliberately does not.
+        let cmd = format!("sh -c '{dismiss}' && git --work-tree={p} commit -m x");
+        let mut input = make_bash(&cmd);
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "a dismiss inside a wrapper does not arm the snooze: {cmd}"
+        );
+
+        // And a dismiss for a DIFFERENT repo must not license this one.
+        let other = scratch.0.join("other");
+        std::fs::create_dir(&other).unwrap();
+        init_repo(&other);
+        let cmd = format!(
+            "cadence-hooks guardrails dismiss-enforce-worktree --for 30m --repo {} \
+             && git --work-tree={p} commit -m x",
+            other.to_string_lossy()
+        );
+        let mut input = make_bash(&cmd);
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(
+            r.outcome,
+            Outcome::Block,
+            "a dismiss for another repo does not over-license: {cmd}"
+        );
+    }
+
+    #[test]
+    fn git_env_prefix_is_inherited_by_a_wrapper_child() {
+        // The shell exports an assignment-word prefix into the child, so
+        // `GIT_WORK_TREE=<primary> sh -c 'git commit'` really does commit into
+        // the primary. The per-segment capture never reached the child script
+        // recursion (security review, #378).
+        let scratch = Scratch::new("cw-env-child");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+        for cmd in [
+            format!("GIT_WORK_TREE={p} sh -c 'git commit -m x'"),
+            format!("GIT_DIR={p}/.git bash -c 'git commit -m x'"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Block,
+                "a git env prefix reaches the wrapper's child: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_dash_c_accumulates_like_git() {
+        // git documents each subsequent non-absolute `-C <path>` as relative to
+        // the preceding one. The walk used to OVERWRITE, so `-C <primary> -C .`
+        // resolved against the session cwd (the worktree) and allowed.
+        let scratch = Scratch::new("cw-multi-c");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let p = primary.to_string_lossy();
+
+        let targets = git_commit_targets(
+            &format!("git -C {p} -C . commit -m x"),
+            &wt.to_string_lossy(),
+        );
+        assert_eq!(
+            targets,
+            vec![lexical_normalize(&p)],
+            "the second -C resolves against the first, not the session cwd"
+        );
+        assert_ne!(
+            targets,
+            vec![lexical_normalize(&wt.to_string_lossy())],
+            "and specifically NOT against the session cwd"
+        );
+
+        let mut input = make_bash(&format!("git -C {p} -C . commit -m x"));
+        input.cwd = Some(wt.to_string_lossy().into_owned());
+        let r = run_enforce(&input, &cfg(false, false));
+        assert_eq!(r.outcome, Outcome::Block, "accumulated -C lands in primary");
+    }
+
+    #[test]
+    fn work_tree_pointing_at_a_worktree_from_primary_allows() {
+        // THE false-block guard on this tightening. Sitting in the primary and
+        // committing into a linked worktree by flag is exactly what the guard
+        // wants people to do — it must not block, by any of the four spellings.
+        let scratch = Scratch::new("cw-false-block");
+        let (primary, wt) = primary_and_worktree(&scratch);
+        let w = wt.to_string_lossy();
+        for cmd in [
+            format!("git --work-tree={w} commit -m x"),
+            format!("git --work-tree {w} commit -m x"),
+            format!("git --git-dir={w}/.git commit -m x"),
+            format!("GIT_WORK_TREE={w} git commit -m x"),
+        ] {
+            let mut input = make_bash(&cmd);
+            input.cwd = Some(primary.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "committing into a worktree FROM the primary must not block: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolvable_work_tree_fails_open() {
+        // ADR-0001: the guard resolves the named tree instead of skipping, but a
+        // value that names no repo still Allows — `assess_dir` fails open when
+        // GitState finds nothing there. Resolving is not the same as guessing.
+        let scratch = Scratch::new("cw-unresolvable");
+        let (_primary, wt) = primary_and_worktree(&scratch);
+        for cmd in [
+            "git --work-tree=/nonexistent/x commit -m x",
+            "git --git-dir=/nonexistent/x/.git commit -m x",
+        ] {
+            let mut input = make_bash(cmd);
+            input.cwd = Some(wt.to_string_lossy().into_owned());
+            let r = run_enforce(&input, &cfg(false, false));
+            assert_eq!(
+                r.outcome,
+                Outcome::Allow,
+                "an unresolvable target fails open: {cmd}"
+            );
+        }
     }
 
     #[test]
