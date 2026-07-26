@@ -395,9 +395,10 @@ fn resolve_target(operand: &str, effective_dir: &str, recursive: bool) -> Target
     let resolved = if literal.is_empty() || literal == "." {
         effective_dir.to_string()
     } else if looks_absolute(literal) {
-        // Absolute — POSIX `/…` or a Windows drive path `C:/…`. Use as-is;
-        // `resolve_cd_target` only recognizes leading `/` (and `~`), so a drive
-        // path would otherwise be joined onto the cwd and misclassified.
+        // Absolute — POSIX `/…` or a Windows drive path (`C:/…` or `C:\…`).
+        // Use as-is. `resolve_cd_target` now recognizes both drive-path
+        // spellings itself, so this early return is a belt-and-braces
+        // short-circuit rather than a required workaround.
         literal.to_string()
     } else {
         resolve_cd_target(literal, effective_dir)

@@ -165,8 +165,8 @@ use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, basename, child_scripts, redirect_targets, resolve_cd_target,
-    split_segments_with_ops, tokenize,
+    MAX_WRAPPER_DEPTH, basename, child_scripts, looks_absolute, redirect_targets,
+    resolve_cd_target, split_segments_with_ops, tokenize,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -498,18 +498,54 @@ fn git_env_overrides(tokens: &[String]) -> (Option<&str>, Option<&str>) {
 /// symlink. That is the safe direction here: it only ever causes a target to be
 /// KEPT rather than excluded, and the kept target is then assessed by
 /// [`GitState`], which canonicalizes properly.
+///
+/// A Windows drive-absolute prefix (`C:/…` or `C:\…`) is folded too, and is
+/// what closes the guard's Windows fail-open (cadence-hooks#377/#378): every
+/// commit target this module emits is run through this fold via
+/// [`normalize_target`], and on Windows those raw targets are real native
+/// paths (a hook's `cwd`, or a `-C`/`--git-dir` value carrying the drive
+/// letter), not the pure forward-slash "shell path" the fold used to assume.
+/// Splitting on `/` alone left a `C:\…` prefix as ONE opaque segment — not
+/// recognized as absolute, and not decomposed into its real components — so a
+/// literal `..` elsewhere in the same string (this crate's own test fixture
+/// paths carry one, joined via `Path::join("../../target/…")`) popped that
+/// whole opaque prefix instead of its last real component, discarding the
+/// drive letter entirely and turning an absolute target into a relative
+/// fragment that resolved to no repo. [`GitState`] then found nothing at the
+/// corrupted path and the guard failed open (`Allow`) on a commit that landed
+/// in the primary checkout.
 fn lexical_normalize(path: &str) -> String {
-    // A pure STRING fold over `/`-separated segments — deliberately NOT a
-    // `Path`/`PathBuf` round-trip. Every target in this module is a SHELL path
-    // (forward slash, even under Git Bash on Windows), and collecting into a
-    // `PathBuf` re-joins with the PLATFORM separator: on Windows `/p/.git`
-    // comes back as `\p\.git`, so a normalized target stops matching the
-    // un-normalized ones the rest of the module produces and the dismiss map
-    // keyed on them never hits. `resolve_cd_target` carries the same warning
-    // about `PathBuf::join` for the same reason.
-    let absolute = path.starts_with('/');
+    // A pure STRING fold — deliberately NOT a `Path`/`PathBuf` round-trip,
+    // which would re-join with the PLATFORM separator and normalize a target
+    // to a spelling the rest of the module (and the dismiss map keyed on
+    // these strings) doesn't produce. `resolve_cd_target` carries the same
+    // warning about `PathBuf::join` for the same reason.
+    //
+    // The Windows drive prefix, if any, is captured separately from the body:
+    // folding must never let a `..` pop past it (`C:\foo\..\bar` is `C:\bar`,
+    // never a bare `\bar` that silently drops the drive), and it is lowercased
+    // on the way out — NTFS/ReFS are case-insensitive, so `C:\Primary` and
+    // `c:\primary` must fold to the same string or the in-chain dismiss map's
+    // string-equality lookup stops matching one of the two spellings.
+    let bytes = path.as_bytes();
+    let windows_drive = (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\'))
+        .then(|| path[..1].to_ascii_lowercase());
+    let body_src = windows_drive.as_ref().map_or(path, |_| &path[3..]);
+    let absolute = windows_drive.is_some() || body_src.starts_with('/');
+    // Backslash is only ever a separator once a Windows drive prefix has
+    // already identified the string as a native Windows path — a bare POSIX
+    // path may legally contain a literal `\` in a filename, so splitting on
+    // it unconditionally would corrupt that spelling instead of folding it.
+    let separators: &[char] = if windows_drive.is_some() {
+        &['/', '\\']
+    } else {
+        &['/']
+    };
     let mut out: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
+    for segment in body_src.split(separators) {
         match segment {
             // An empty segment is a `//` collapse or a trailing slash.
             "" | "." => {}
@@ -519,7 +555,7 @@ fn lexical_normalize(path: &str) -> String {
                 Some(&last) if last != ".." => {
                     out.pop();
                 }
-                // `/..` is `/`.
+                // `/..` (or a drive root's `..`) is the root itself.
                 _ if absolute => {}
                 _ => out.push(".."),
             },
@@ -527,12 +563,19 @@ fn lexical_normalize(path: &str) -> String {
         }
     }
     let body = out.join("/");
-    match (absolute, body.is_empty()) {
+    let folded = match (absolute, body.is_empty()) {
         (true, _) => format!("/{body}"),
         // Nothing survived a relative fold (`a/..`) — leave the caller's
         // spelling alone rather than inventing a `.`; `GitState` resolves it.
-        (false, true) => path.to_string(),
+        (false, true) => return path.to_string(),
         (false, false) => body,
+    };
+    match windows_drive {
+        // Lowercase the WHOLE path, not just the drive letter: NTFS/ReFS is
+        // case-insensitive throughout, not only on the drive, so `C:\Primary`
+        // and `c:\primary` must fold to one identical key.
+        Some(drive) => format!("{drive}:{folded}").to_ascii_lowercase(),
+        None => folded,
     }
 }
 
@@ -595,13 +638,21 @@ fn is_assignment_word(token: &str) -> bool {
 }
 
 /// A shell path is absolute if git will treat it as absolute: a leading `/`
-/// (POSIX / WSL / Git-Bash shell paths — `Path::is_absolute` is false for these
-/// on Windows, no drive letter) OR a platform-absolute path (native `C:\…`).
-/// These are shell paths a command string carries, not OS paths, so the
-/// decision is made on the string first, falling back to the platform's own
-/// notion of absolute for native-Windows drive paths (issue #235).
+/// (POSIX / WSL / Git-Bash shell paths) OR a Windows drive path, spelled with
+/// either separator (`C:/…` or `C:\…` — issue #235).
+///
+/// [`looks_absolute`] makes this decision from the STRING alone, so it agrees
+/// on a `C:\…` target whether this binary is compiled for Windows or not — the
+/// prior form relied on `Path::is_absolute`, which is only drive-letter-aware
+/// when compiled for Windows, so the same `C:\…` target read absolute on a
+/// Windows build and relative everywhere else. That platform split is exactly
+/// what let a Windows-native target fall through to a relative join and
+/// resolve to nowhere (the guard's Windows fail-open, cadence-hooks#377/#378);
+/// it also meant this decision could only be tested on a Windows runner.
+/// `Path::is_absolute` stays as a belt-and-braces fallback for a native
+/// Windows form the string check doesn't cover (e.g. a UNC `\\server\share`).
 fn is_shell_absolute(path: &str) -> bool {
-    path.starts_with('/') || Path::new(path).is_absolute()
+    looks_absolute(path) || Path::new(path).is_absolute()
 }
 
 /// Walk `command` once, returning both output channels: the `git commit`
@@ -4208,6 +4259,84 @@ mod tests {
                 "fold must stay a shell path on every platform: {spelling} -> {folded}"
             );
         }
+    }
+
+    #[test]
+    fn lexical_normalize_folds_windows_drive_paths() {
+        // Platform-INDEPENDENT: the fold decides absoluteness and splits
+        // segments from the STRING alone, so these assert the same result on
+        // macOS/Linux CI as on a real Windows runner — the Windows fail-open
+        // (cadence-hooks#377/#378) was only reproducible on Windows before
+        // this fix, because `absolute` used to be a bare `path.starts_with('/')`
+        // and splitting ran on `/` alone, both blind to a `C:\…` prefix.
+        assert_eq!(
+            lexical_normalize("C:\\p\\.git\\worktrees\\.."),
+            "c:/p/.git",
+            "a `..` through the worktrees dir must fold on a Windows path too"
+        );
+        // Drive letter is lowercased — NTFS/ReFS is case-insensitive, so two
+        // spellings of the same path must fold to the same string or the
+        // in-chain dismiss map's equality lookup silently stops matching one.
+        assert_eq!(
+            lexical_normalize("C:\\Primary\\.git"),
+            lexical_normalize("c:\\primary\\.git"),
+        );
+        // A `..` right after the drive root stays at the root, mirroring
+        // POSIX `/..` == `/`.
+        assert_eq!(lexical_normalize("C:\\.."), "c:/");
+        // The exact shape this crate's own Windows CI fixture produces:
+        // `Path::join("../../target/…")` on `CARGO_MANIFEST_DIR` embeds a
+        // real `..` inside an otherwise backslash-separated native path. The
+        // drive letter must survive the fold — the pre-fix code treated the
+        // whole `D:\a\...\guardrails\..` prefix as ONE opaque segment (no `/`
+        // in it), so the following literal `..` popped that entire prefix,
+        // including the drive letter, producing a relative fragment that
+        // resolved to no repo and let every enforce-worktree test on Windows
+        // read Allow instead of Block.
+        assert_eq!(
+            lexical_normalize(
+                "D:\\a\\cadence-hooks\\cadence-hooks\\crates\\guardrails\\../../target/enforce-worktree-scratch\\commit-1\\repo"
+            ),
+            "d:/a/cadence-hooks/cadence-hooks/target/enforce-worktree-scratch/commit-1/repo",
+        );
+        // A POSIX path carrying a literal backslash in a filename (legal on
+        // POSIX filesystems) must NOT be treated as a separator — that
+        // splitting is scoped to paths a Windows drive prefix already
+        // identified as native Windows.
+        assert_eq!(lexical_normalize("/tmp/weird\\name"), "/tmp/weird\\name");
+    }
+
+    #[test]
+    fn is_shell_absolute_recognizes_windows_drive_paths_on_every_platform() {
+        // Was `Path::new(path).is_absolute()` on the fallback branch, which is
+        // only drive-letter-aware when this binary is compiled for Windows —
+        // so the same assertion passed on a Windows runner and failed
+        // everywhere else. `looks_absolute` makes the primary check
+        // string-based, so it holds on every platform.
+        assert!(is_shell_absolute("C:\\Users\\x"));
+        assert!(is_shell_absolute("C:/Users/x"));
+        assert!(is_shell_absolute("/posix/path"));
+        assert!(!is_shell_absolute("relative\\path"));
+    }
+
+    #[test]
+    fn git_commit_targets_folds_a_windows_dash_c_redirect() {
+        // End-to-end through the real parsing chain (`commit_targets_of` ->
+        // `resolve_git_path` -> `normalize_target` -> `lexical_normalize`) with
+        // a Windows-native `-C` value, mirroring what a `-C D:\…` typed at a
+        // native (non-Git-Bash) Windows shell looks like on the wire.
+        assert_eq!(
+            git_commit_targets("git -C D:\\wt commit -m 'x'", "/cwd"),
+            vec!["d:/wt".to_string()]
+        );
+        // The commit fallback target (no explicit flag) is the raw `cwd` —
+        // exactly the shape of the FIRST assertion in
+        // `commit_in_primary_blocks_and_in_worktree_allows`, the simplest of
+        // the 26 tests the Windows fail-open broke.
+        assert_eq!(
+            git_commit_targets("git commit -m 'x'", "C:\\primary"),
+            vec!["c:/primary".to_string()]
+        );
     }
 
     #[test]
