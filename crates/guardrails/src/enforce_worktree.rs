@@ -132,7 +132,7 @@ use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, child_scripts, redirect_targets, resolve_cd_target,
-    split_segments_with_ops, tokenize,
+    skip_transparent_prefixes, split_segments_with_ops, tokenize,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -363,60 +363,14 @@ enum MutationTarget {
 /// (`command`/`exec`/`time`/…) so `(git commit)`, `{ git commit; }`, and
 /// `command git commit` are detected rather than slipping past the leading-word
 /// gate (#239 F4).
-pub(crate) fn strip_group_wrappers(segment: &str) -> &str {
-    segment
-        .trim()
-        .trim_start_matches(['(', '{', ' ', '\t'])
-        .trim_end_matches([')', '}', ';', ' ', '\t'])
-}
-
-/// Skip transparent command prefixes that run their argument as the command, so
-/// `command git commit` / `time git commit` still surface `git` as the leading
-/// word. Only skips a prefix when the following token is not an option, so a
-/// prefix's own flags are never misparsed (`nice -n 10 git commit` and
-/// `env -i git commit` stay documented misses rather than risking a wrong
-/// resolution). Leading `VAR=value` assignment words are skipped too — bash
-/// runs `VAR=value git commit` (and `env VAR=value git commit`) with the rest
-/// as the command, so an assignment word must not eat the leading-word gate
-/// (issue #228).
-pub(crate) fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
-    let mut start = 0;
-    while start + 1 < tokens.len() {
-        let tok = tokens[start].as_str();
-        if (TRANSPARENT.contains(&tok) && !tokens[start + 1].starts_with('-'))
-            || is_assignment_word(tok)
-        {
-            start += 1;
-        } else {
-            break;
-        }
-    }
-    &tokens[start..]
-}
-
-/// Words that stand in front of a real command without being the command.
 ///
-/// Module-level and `pub(crate)` so `guard_rm` can ask whether a leading word
-/// is one of these without keeping a second copy that could drift out of sync
-/// with the skipping logic itself.
-pub(crate) const TRANSPARENT: &[&str] =
-    &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
-
-/// A leading `NAME=value` shell assignment word: a valid variable name
-/// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
-/// `==` comparisons — is not skipped, so this can only widen the leading-word
-/// gate past words the shell itself treats as environment prefixes.
-fn is_assignment_word(token: &str) -> bool {
-    match token.split_once('=') {
-        Some((name, _)) if !name.is_empty() => {
-            name.chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        _ => false,
-    }
-}
+/// The helper itself, along with `skip_transparent_prefixes`, `TRANSPARENT`,
+/// and the assignment-word test they share, now lives in
+/// [`cadence_hooks_core::shell`] (cadence-hooks#419) — the polish ship anchor
+/// needs the same command-word resolution these guards do, and core is the only
+/// crate both sides can reach. Re-exported here rather than merged into the
+/// import list above so this contract stays attached to the name it describes.
+pub(crate) use cadence_hooks_core::shell::strip_group_wrappers;
 
 /// A shell path is absolute if git will treat it as absolute: a leading `/`
 /// (POSIX / WSL / Git-Bash shell paths — `Path::is_absolute` is false for these
