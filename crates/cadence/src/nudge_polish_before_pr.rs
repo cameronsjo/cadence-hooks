@@ -490,6 +490,63 @@ mod tests {
         });
     }
 
+    #[test]
+    fn run_newline_separated_cd_to_worktree_satisfies_gate() {
+        // #394/#368 regression. The filed hypothesis blamed writer/reader key
+        // divergence; the real defect was the READER's cwd resolver swallowing
+        // the newline into the `cd` target, so the ship command resolved to a
+        // nonexistent directory and never found the (correct) marker.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        init_primary_with_commit(&primary);
+        let wt = tmp.path().join("wt");
+        git_in(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feat/newline",
+            ],
+        );
+
+        let wt_state = GitState::resolve(&wt).expect("worktree resolves");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&wt_state.git_common_dir.to_string_lossy(), "feat/newline"),
+                "{}",
+            )
+            .unwrap();
+
+            // cwd is the PRIMARY (still on `main`) — only the `cd` redirects to
+            // the worktree, so the newline handling is the whole test.
+            //
+            // The `cd` target is spelled RELATIVE deliberately, so this test
+            // pins the newline handling on every platform.
+            //
+            // `resolve_cd_target` treats a target as absolute only when it
+            // starts with `/` — it never consults `looks_absolute`, so a
+            // Windows drive path (`C:\…` or `C:/…`, either slash) takes the
+            // relative branch and gets joined onto cwd. An absolute-path
+            // fixture would therefore resolve to nothing on Windows and the
+            // gate would nudge, failing for a reason that has nothing to do
+            // with the newline. A relative target goes down the same code path
+            // on both platforms, and the bare-path class still has to stop at
+            // the newline for it to resolve — which is the property under test.
+            let command = "cd ../wt\ngh pr create --title x";
+            let input = make_bash_with_cwd(command, primary.to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(
+                result.outcome,
+                Outcome::Allow,
+                "a newline-separated `cd` into a marked worktree must satisfy the gate"
+            );
+        });
+    }
+
     // --- preserved matcher tests (is_polish_ship_anchor) ---
 
     #[test]

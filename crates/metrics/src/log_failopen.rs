@@ -114,6 +114,18 @@ pub struct FailopenCounts {
     pub deadline_block_suppressed: u64,
 }
 
+/// How many distinct `namespace subcommand` pairs a recency clause names before
+/// it stops. A skew is nearly always one or two invocations repeated; past a
+/// handful the line stops being a diagnosis and starts being a dump, and the
+/// operator has enough to grep with either way.
+const MAX_SUBCOMMANDS: usize = 4;
+
+/// Ceiling, in characters, on each half of a `namespace subcommand` pair.
+/// Unlike `error`, these fields are written to the ledger uncapped, and a
+/// plugin can invoke this binary with argv-sized tokens — so the read side
+/// bounds them before they reach a printed line or a paste-me command.
+const MAX_PAIR_HALF_CHARS: usize = 48;
+
 /// Recency + version context for one `reason`'s windowed rows — the fields
 /// doctor needs to tell a *fixed* fail-open burst from a *live* one. Counting
 /// stays window-wide (a wiring problem is not version-specific, so filtering
@@ -132,12 +144,33 @@ pub struct FailopenRecency {
     pub last_version: String,
     /// How many of this reason's windowed rows carry `current_version`.
     pub on_current_version: u64,
+    /// How many DISTINCT calendar days this reason fired on, within the window.
+    /// The shape signal a total cannot carry: at the same count, `1` is a burst
+    /// to correlate with a release or config change, and a number approaching
+    /// the window length is a sustained feed problem (#404).
+    pub distinct_days: u64,
     /// The `error` string on that most recent row, when it has one. `None` for
     /// a v1 row (written before the field existed), for a reason that records
     /// no error text (the deadline pair), and for a row whose `error` is an
     /// explicit JSON null — all three are the same "no diagnostic here" to a
     /// reader, so they collapse deliberately.
     pub last_error: Option<String>,
+    /// Distinct `"<namespace> <subcommand>"` pairs among the windowed rows
+    /// **on the current version**, sorted, capped at `MAX_SUBCOMMANDS` (a
+    /// private constant, so it is named rather than intra-doc linked — the
+    /// link would not resolve in published docs).
+    ///
+    /// This is what turns a `version_mismatch` count into an actionable
+    /// finding (#183): the count says a plugin expects something this binary
+    /// lacks, and this says *which invocation*, so the operator greps one
+    /// hooks.json instead of auditing every installed plugin by hand. The
+    /// current-version filter matches [`Self::on_current_version`] — a pair
+    /// that only ever failed on an older binary is the sanctioned
+    /// release-transition case, not a live wiring problem.
+    ///
+    /// Empty when no windowed row on the current version records a pair (a
+    /// bare `cadence-hooks` invocation logs neither).
+    pub subcommands: Vec<String>,
 }
 
 /// The `failopen.jsonl` rows matching `reason` within the window — the single
@@ -252,61 +285,12 @@ pub fn recent_failopen_report(
     (counts, recency)
 }
 
-/// Strip display-affecting characters from a file-sourced string before it is
-/// interpolated into terminal-printed `doctor` output.
-///
-/// Two families, not one. `char::is_control` covers only **Cc** — C0, DEL, C1 —
-/// which handles ANSI escapes and newlines. It passes **Cf** (format)
-/// characters, and those reorder rendered text without being "control"
-/// characters at all: U+202E RIGHT-TO-LEFT OVERRIDE and the U+2066–U+2069
-/// directional isolates are the Trojan-Source primitives, and they would
-/// otherwise survive both this filter and [`sanitize_error`] to scramble the
-/// rest of a `doctor` finding line. U+2028/U+2029 are line/paragraph separators
-/// that some renderers break on. Strip all of them.
-fn display_safe(s: &str) -> String {
-    s.chars().filter(|c| !is_display_unsafe(*c)).collect()
-}
-
-/// Whether `c` can alter how the rest of a terminal line renders: any Cc
-/// control, any Cf format character (bidi overrides/isolates, zero-width
-/// joiners), or the Unicode line/paragraph separators.
-///
-/// Cf is matched by explicit ranges rather than a Unicode-property crate — this
-/// stays dependency-free, and these are the blocks that carry the reordering
-/// primitives. `is_control` already covers Cc.
-fn is_display_unsafe(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            '\u{2028}' | '\u{2029}'          // line / paragraph separator
-            | '\u{00AD}'                      // soft hyphen
-            | '\u{0600}'..='\u{0605}'         // Arabic number signs
-            | '\u{061C}'                      // Arabic letter mark
-            | '\u{06DD}' | '\u{070F}' | '\u{08E2}'
-            | '\u{180E}'                      // Mongolian vowel separator
-            | '\u{200B}'..='\u{200F}'         // zero-width space … RTL mark
-            | '\u{202A}'..='\u{202E}'         // bidi embeddings + OVERRIDE
-            | '\u{2060}'..='\u{2064}'         // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}'         // directional isolates
-            | '\u{FEFF}'                      // zero-width no-break space (BOM)
-            | '\u{FFF9}'..='\u{FFFB}'         // interlinear annotation
-        )
-}
-
-/// [`display_safe`] plus a length ceiling — the write-side sanitizer for the
-/// `error` field. Applied when the record is *built*, so an oversized or
-/// escape-bearing message never reaches the ledger; the read side still runs
-/// `display_safe` over it, since a hand-edited file can hold anything.
-///
-/// Truncation counts **characters, not bytes**, and slices at the boundary
-/// `char_indices` reports — a byte slice at a fixed offset would panic
-/// mid-codepoint on a multi-byte message, which in a fail-open writer would be
-/// a panic inside the panic path.
+/// The write-side sanitizer for the `error` field: [`common::display_safe`]
+/// plus a length ceiling. Applied when the record is *built*, so an oversized
+/// or escape-bearing message never reaches the ledger; the read side still
+/// sanitizes, since a hand-edited file can hold anything.
 fn sanitize_error(s: &str) -> String {
-    let cleaned = display_safe(s);
-    match cleaned.char_indices().nth(MAX_ERROR_CHARS) {
-        Some((boundary, _)) => format!("{}…", &cleaned[..boundary]),
-        None => cleaned,
-    }
+    common::display_safe_bounded(s, MAX_ERROR_CHARS)
 }
 
 /// Pure recency computation over `failopen.jsonl` contents. Reads the same
@@ -336,8 +320,8 @@ fn recency_from(
     // The values are this binary's own `ts`/`binaryVersion`, so only a
     // hand-tampered failopen.jsonl could smuggle ANSI/control bytes through —
     // strip them as defense-in-depth against escape-sequence injection.
-    let last_ts = display_safe(last.get("ts").and_then(Value::as_str)?);
-    let last_version = display_safe(
+    let last_ts = common::display_safe(last.get("ts").and_then(Value::as_str)?);
+    let last_version = common::display_safe(
         last.get("binaryVersion")
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
@@ -347,18 +331,72 @@ fn recency_from(
     let last_error = last
         .get("error")
         .and_then(Value::as_str)
-        .map(display_safe)
+        .map(common::display_safe)
         .filter(|e| !e.is_empty());
     let on_current_version = rows
         .iter()
         .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
         .count() as u64;
+    // The DATE prefix of the fixed-width `%Y-%m-%dT%H:%M:%SZ` stamp. A count of
+    // distinct days is the shape signal a bare total cannot carry: 120 rows on
+    // one day is an episode to correlate with a release or a config change,
+    // 120 across seven is the sustained wiring problem the remediation text
+    // used to assert unconditionally (#404). Rows whose `ts` is missing or too
+    // short are skipped rather than folded into a bogus day.
+    let distinct_days = rows
+        .iter()
+        .filter_map(|v| v.get("ts").and_then(Value::as_str))
+        .filter_map(|ts| ts.get(..10))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64;
+    // A `BTreeSet` both dedups and sorts: a skew that fires 96 times names the
+    // two or three invocations behind it, not 96 lines.
+    //
+    // BOUNDED DURING INSERTION, not after. Collecting every distinct pair and
+    // then `take`-ing four lets a ledger with attacker-chosen cardinality (a
+    // unique subcommand per invocation) size the set — and `failopen.jsonl` is
+    // never rotated. Popping the largest once over capacity keeps the same
+    // alphabetically-first four at O(MAX_SUBCOMMANDS) resident.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in rows
+        .iter()
+        .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
+    {
+        // Both halves are validated INDEPENDENTLY. A combined-string emptiness
+        // test passes `namespace: ""` with `subcommand: "hook"`, which renders
+        // as a leading-space " hook" — a malformed row dressed up as an
+        // actionable invocation.
+        //
+        // Bounded, not just filtered: `display_safe` constrains the character
+        // SET but not the length, and these fields are written uncapped (unlike
+        // `error`), so an argv-sized token would otherwise flood the printed
+        // line and the paste-me command built from it.
+        let Some(ns) = row.get("namespace").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(sub) = row.get("subcommand").and_then(Value::as_str) else {
+            continue;
+        };
+        let ns = common::display_safe_bounded(ns, MAX_PAIR_HALF_CHARS);
+        let sub = common::display_safe_bounded(sub, MAX_PAIR_HALF_CHARS);
+        let (ns, sub) = (ns.trim(), sub.trim());
+        if ns.is_empty() || sub.is_empty() {
+            continue;
+        }
+        seen.insert(format!("{ns} {sub}"));
+        if seen.len() > MAX_SUBCOMMANDS {
+            seen.pop_last();
+        }
+    }
+    let subcommands: Vec<String> = seen.into_iter().collect();
 
     Some(FailopenRecency {
         last_ts,
         last_version,
         on_current_version,
+        distinct_days,
         last_error,
+        subcommands,
     })
 }
 
@@ -507,7 +545,55 @@ mod tests {
     fn display_safe_strips_the_same_families_on_read() {
         // The read side shares the filter, so a hand-edited ledger written
         // before this landed is neutralized at render time too.
-        assert_eq!(display_safe("0.61.0\u{202E}X\u{1b}[31m"), "0.61.0X[31m");
+        assert_eq!(
+            common::display_safe("0.61.0\u{202E}X\u{1b}[31m"),
+            "0.61.0X[31m"
+        );
+    }
+
+    #[test]
+    fn display_safe_strips_the_tags_block() {
+        // The Unicode Tags block is the primitive that matters for the
+        // agent-context sink specifically: U+E0001 plus U+E0020–U+E007F encode
+        // arbitrary ASCII that renders as NOTHING yet survives into
+        // additionalContext and through most tokenizers. It is Cf, so
+        // `is_control` passes it and no bidi-shaped range catches it — a filter
+        // that stops at the famous bidi overrides protects a terminal and
+        // leaves the agent wide open.
+        //
+        // "hi" smuggled as tag characters, wrapped in a visible carrier.
+        let smuggled = "ok\u{E0001}\u{E0068}\u{E0069}\u{E007F}!";
+        assert_eq!(common::display_safe(smuggled), "ok!");
+    }
+
+    #[test]
+    fn display_safe_strips_the_remaining_cf_blocks() {
+        // The enumeration is maintained against the whole Cf category, not just
+        // the blocks that happen to be notorious.
+        for c in [
+            '\u{0890}',  // Arabic pound mark
+            '\u{206A}',  // deprecated: inhibit symmetric swapping
+            '\u{110BD}', // Kaithi number sign
+            '\u{13430}', // Egyptian hieroglyph vertical joiner
+            '\u{1BCA0}', // shorthand format letter overlap
+            '\u{1D173}', // musical symbol begin beam
+        ] {
+            assert_eq!(
+                common::display_safe(&format!("a{c}b")),
+                "ab",
+                "U+{:04X} must be stripped",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn display_safe_keeps_ordinary_text_intact() {
+        // The filter must not become so broad it mangles a real diagnostic.
+        assert_eq!(
+            common::display_safe("cadence log-commit — naïve 日本語 ✓"),
+            "cadence log-commit — naïve 日本語 ✓"
+        );
     }
 
     #[test]
@@ -707,6 +793,125 @@ mod tests {
     }
 
     // --- recency (pure + end-to-end) ---
+
+    #[test]
+    fn recency_subcommands_dedup_sort_and_cap() {
+        // Six distinct pairs, each repeated — the shape a live skew produces.
+        // The clause must dedup, sort, and stop at MAX_SUBCOMMANDS rather than
+        // dumping every pair into a terminal line.
+        let rows: String = (0..6)
+            .flat_map(|i| {
+                (0..3).map(move |_| {
+                    format!(
+                        r#"{{"reason":"version_mismatch","namespace":"ns","subcommand":"sub{i}","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:0{i}Z"}}"#
+                    )
+                })
+            })
+            .map(|r| r + "\n")
+            .collect();
+
+        let r = recency_from(&rows, "2026-07-01T00:00:00Z", "version_mismatch", "1.0.0")
+            .expect("rows are in window");
+        assert_eq!(
+            r.subcommands,
+            vec!["ns sub0", "ns sub1", "ns sub2", "ns sub3"],
+            "deduped, sorted, capped at {MAX_SUBCOMMANDS}"
+        );
+    }
+
+    #[test]
+    fn recency_subcommands_exclude_other_versions() {
+        // The current-version filter matches `on_current_version`: a pair that
+        // only ever failed on an older binary is the sanctioned
+        // release-transition case, not a live wiring problem.
+        let rows = concat!(
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"old","binaryVersion":"0.9.0","ts":"2026-07-25T00:00:00Z"}"#,
+            "\n",
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"live","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:01Z"}"#,
+            "\n",
+        );
+
+        let r = recency_from(rows, "2026-07-01T00:00:00Z", "version_mismatch", "1.0.0")
+            .expect("rows are in window");
+        assert_eq!(r.subcommands, vec!["ns live"]);
+    }
+
+    #[test]
+    fn recency_subcommands_reject_half_empty_pairs() {
+        // An empty namespace with a real subcommand renders as " hook" — a
+        // malformed row dressed up as an actionable invocation. Each half is
+        // validated on its own, so neither shape survives.
+        let rows = concat!(
+            r#"{"reason":"version_mismatch","namespace":"","subcommand":"hook","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:00Z"}"#,
+            "\n",
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"   ","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:01Z"}"#,
+            "\n",
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"real","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:02Z"}"#,
+            "\n",
+        );
+
+        let r = recency_from(rows, "2026-07-01T00:00:00Z", "version_mismatch", "1.0.0")
+            .expect("rows are in window");
+        assert_eq!(r.subcommands, vec!["ns real"]);
+    }
+
+    #[test]
+    fn recency_subcommands_empty_without_pairs() {
+        // A bare `cadence-hooks` invocation logs neither field — the clause
+        // must degrade to empty, not to a half-rendered pair.
+        let rows = concat!(
+            r#"{"reason":"parse","namespace":null,"subcommand":null,"binaryVersion":"1.0.0","ts":"2026-07-25T00:00:00Z"}"#,
+            "\n",
+        );
+
+        let r =
+            recency_from(rows, "2026-07-01T00:00:00Z", "parse", "1.0.0").expect("row is in window");
+        assert!(r.subcommands.is_empty());
+    }
+
+    #[test]
+    fn recency_from_counts_distinct_days_not_rows() {
+        // The whole point of #404: an identical TOTAL must read differently
+        // depending on how it is distributed. Same count, same last_ts — only
+        // the day spread separates a burst from a drip.
+        let burst: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    r#"{{"reason":"parse","binaryVersion":"0.67.0","ts":"2026-07-19T{i:02}:00:00Z"}}"#
+                )
+            })
+            .collect();
+        let drip: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    r#"{{"reason":"parse","binaryVersion":"0.67.0","ts":"2026-07-{:02}T00:00:00Z"}}"#,
+                    14 + i % 6
+                )
+            })
+            .collect();
+
+        let b = recency_from(&burst.join("\n"), "2026-07-01T00:00:00Z", "parse", "0.67.0").unwrap();
+        let d = recency_from(&drip.join("\n"), "2026-07-01T00:00:00Z", "parse", "0.67.0").unwrap();
+
+        assert_eq!(b.on_current_version, 12, "same total");
+        assert_eq!(d.on_current_version, 12, "same total");
+        assert_eq!(b.distinct_days, 1, "twelve rows, all on 2026-07-19");
+        assert_eq!(d.distinct_days, 6, "twelve rows across six dates");
+    }
+
+    #[test]
+    fn recency_from_skips_rows_whose_ts_cannot_carry_a_date() {
+        // A malformed `ts` must not fold into a bogus day and inflate the
+        // spread — that would read as a drip and send the operator chasing
+        // live wiring.
+        let jsonl = [
+            r#"{"reason":"parse","binaryVersion":"0.67.0","ts":"2026-07-19T00:00:00Z"}"#,
+            r#"{"reason":"parse","binaryVersion":"0.67.0","ts":"2026-07-19T01:00:00Z"}"#,
+        ]
+        .join("\n");
+        let r = recency_from(&jsonl, "2026-07-01T00:00:00Z", "parse", "0.67.0").unwrap();
+        assert_eq!(r.distinct_days, 1);
+    }
 
     #[test]
     fn recency_from_reports_last_row_and_current_version_count() {

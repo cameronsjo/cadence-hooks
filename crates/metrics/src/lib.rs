@@ -6,7 +6,12 @@
 //! never block a tool call. Pure helpers ([`scan_tokens`], [`compute_cost`]) are
 //! unit-tested in isolation; the loggers wire filesystem and git I/O around them.
 
-mod common;
+/// Shared logger helpers: git-commit detection, metrics-dir resolution,
+/// timestamps, and the `display_safe` family — the sanitizers every
+/// file-sourced string passes through before it reaches a terminal line or an
+/// agent-facing nudge. Public so `doctor` shares one implementation rather than
+/// growing a second that can drift.
+pub mod common;
 
 /// USD cost from token totals and a model name.
 pub mod compute_cost;

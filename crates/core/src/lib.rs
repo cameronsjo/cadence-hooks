@@ -282,6 +282,26 @@ pub struct ToolResponse {
     /// (multiSelect = comma-joined) or null when unanswered. Present only on the
     /// PostToolUse payload for AskUserQuestion.
     pub answers: Option<HashMap<String, serde_json::Value>>,
+    /// ExitPlanMode tool: the approved plan's full markdown body. Present on
+    /// same-session plan approval (`PostToolUse:ExitPlanMode`) — live-verified
+    /// 2026-07-25 (cadence-hooks#396) that on this path `tool_input.plan` is
+    /// EMPTY and this is the only field carrying the plan text.
+    pub plan: Option<String>,
+    /// ExitPlanMode tool: the app's own plans-store copy path, when the client
+    /// wrote one. Carried for parity with the documented payload shape; not
+    /// consulted by any check today.
+    #[serde(rename = "filePath")]
+    pub file_path: Option<String>,
+    /// ExitPlanMode tool: true when the approving turn ran inside a subagent
+    /// rather than the top-level session. `persist-plan-approval` skips these —
+    /// only a top-level session's own approval persists a plan doc.
+    #[serde(rename = "isAgent")]
+    pub is_agent: Option<bool>,
+    /// ExitPlanMode tool: true when the approving turn's tool set included the
+    /// Agent/Task tool. Carried for parity with the documented payload shape;
+    /// not consulted by any check today.
+    #[serde(rename = "hasTaskTool")]
+    pub has_task_tool: Option<bool>,
 }
 
 /// Deserialize an optional typed field leniently: a present value whose JSON
@@ -498,6 +518,15 @@ impl HookInput {
         self.tool_response
             .as_ref()
             .and_then(|tr| tr.stdout.as_deref())
+    }
+
+    /// The `ExitPlanMode` plan text from a `PostToolUse` `tool_response.plan`
+    /// payload — present on same-session plan approval, where `tool_input.plan`
+    /// is empty (cadence-hooks#396).
+    pub fn tool_response_plan(&self) -> Option<&str> {
+        self.tool_response
+            .as_ref()
+            .and_then(|tr| tr.plan.as_deref())
     }
 
     /// The AskUserQuestion questions carried by this tool call, if any.

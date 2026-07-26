@@ -437,7 +437,6 @@ pub(crate) fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
 /// but a panic in a guard is a hard block by another name, which ADR-0001's
 /// fail-open posture forbids.
 fn is_prefix_word(tokens: &[String], idx: usize) -> bool {
-    const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
     let Some(tok) = tokens.get(idx).map(String::as_str) else {
         return false;
     };
@@ -620,6 +619,14 @@ fn is_linked_worktree_admin_dir(path: &str) -> bool {
         .windows(2)
         .any(|w| w[0] == ".git" && w[1] == "worktrees")
 }
+
+/// Words that stand in front of a real command without being the command.
+///
+/// Module-level and `pub(crate)` so `guard_rm` can ask whether a leading word
+/// is one of these without keeping a second copy that could drift out of sync
+/// with the skipping logic itself.
+pub(crate) const TRANSPARENT: &[&str] =
+    &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
 
 /// A leading `NAME=value` shell assignment word: a valid variable name
 /// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
