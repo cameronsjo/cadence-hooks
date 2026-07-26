@@ -1137,9 +1137,19 @@ fn failopen_findings(
             // silent "reads as no stale wiring" false negative this branch
             // exists to prevent, just wearing the other face. Double quotes
             // let `$HOME` expand while still surviving a spaced home dir.
+            // The fallback is a BARE tilde, not `'~/…'` and not `"$HOME/…"`.
+            // Single quotes suppress tilde expansion, so the paste would search
+            // a nonexistent relative dir and read as "no stale wiring" — the
+            // same false negative this branch exists to prevent. `$HOME` is no
+            // better: this branch is reached only when `user_home()` fails,
+            // which is precisely when `$HOME` is likely unset in the operator's
+            // shell too, expanding to `/.claude/…`. A bare `~` falls back to the
+            // passwd entry when `$HOME` is missing, so it is the one form that
+            // still resolves here. Safe unquoted: a hardcoded literal with no
+            // spaces and no metacharacters.
             let cache = match plugins_dir() {
                 Some(dir) => shell_single_quote(&dir.join("cache").display().to_string()),
-                None => "\"$HOME/.claude/plugins/cache\"".to_string(),
+                None => "~/.claude/plugins/cache".to_string(),
             };
             format!(
                 "grep the installed plugins for the named invocation(s) — \

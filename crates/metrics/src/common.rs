@@ -204,6 +204,63 @@ pub fn display_safe_bounded(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// The character a run of disallowed bytes collapses to in [`filename_safe`].
+/// Deliberately not something a real ledger name contains, so a sanitized name
+/// can never be mistaken for — or collide with — a legitimate one.
+const FILENAME_REPLACEMENT: char = '?';
+
+/// An **allowlist** sanitizer for a value that is a *name*, not prose: keeps
+/// `[A-Za-z0-9._-]`, collapses every run of anything else to a single
+/// [`FILENAME_REPLACEMENT`], and bounds the result.
+///
+/// **Why a second sanitizer rather than reusing [`display_safe`].** That one is
+/// a denylist over the Cc and Cf categories, and a denylist cannot close this
+/// class for two structural reasons:
+///
+/// 1. **The invisible-smuggling primitive is not confined to Cf.** Variation
+///    selectors — U+FE00–U+FE0F and U+E0100–U+E01EF — are category **Mn**, so a
+///    Cf-complete enumeration misses them *by construction*. They encode
+///    invisible bytes exactly the way the Tags block does. Chasing that with
+///    more denied ranges is a race against Unicode itself.
+/// 2. **Stripping invisibles does not stop visible prose.** A name is
+///    attacker-chosen text landing inside a sentence in the agent's context;
+///    removing newlines demotes a fake system turn to an inline instruction, it
+///    does not remove it. The allowlist excludes the SPACE character, so smuggled
+///    prose arrives as `Disregard?the?above` — visibly mangled rather than
+///    fluent.
+///
+/// Real ledger names (`commits.jsonl`, `askuserquestion.jsonl`) satisfy the
+/// allowlist exactly, so the constraint costs nothing on every legitimate input.
+///
+/// Runs collapse rather than delete, which also keeps the result **injective
+/// enough**: deleting would map `commits\u{200B}.jsonl` onto the real
+/// `commits.jsonl`, merging a hostile entry with a live one and letting a dead
+/// stream read as alive. Replacement keeps them distinct.
+///
+/// Use [`display_safe`] instead for diagnostic *prose* (an error message), where
+/// spaces and punctuation are legitimate content.
+pub fn filename_safe(s: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max_chars));
+    let mut chars = 0usize;
+    let mut in_run = false;
+    for c in s.chars() {
+        if chars >= max_chars {
+            out.push('…');
+            break;
+        }
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            out.push(c);
+            chars += 1;
+            in_run = false;
+        } else if !in_run {
+            out.push(FILENAME_REPLACEMENT);
+            chars += 1;
+            in_run = true;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Schema versioning (the metrics data contract)
 // ---------------------------------------------------------------------------
