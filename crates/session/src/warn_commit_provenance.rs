@@ -323,7 +323,11 @@ fn resolve_session_name_and_id(input: &HookInput) -> Option<(String, String)> {
 /// pattern as `guardrails::guard_read_model::GuardReadModel::run`. Takes the
 /// already-read transcript content rather than re-reading the file, so a
 /// single run resolves both `Model:` and `Harness:` off one read.
-fn resolve_model(transcript_content: Option<&str>) -> Option<String> {
+///
+/// `pub(crate)`: `persist_plan`'s frontmatter emitter reuses this rather than
+/// re-deriving model resolution a second way (cadence-hooks#396's "reuse the
+/// existing provenance machinery" design point).
+pub(crate) fn resolve_model(transcript_content: Option<&str>) -> Option<String> {
     transcript::last_assistant_model(transcript_content?)
 }
 
@@ -332,7 +336,9 @@ fn resolve_model(transcript_content: Option<&str>) -> Option<String> {
 /// (`claude-code_2-1-215_agent` → `2.1.215`) when the transcript doesn't
 /// resolve it. `None` when neither source yields a version — the `Harness:`
 /// line is then omitted entirely rather than rendered from a guess.
-fn resolve_harness(transcript_content: Option<&str>) -> Option<String> {
+///
+/// `pub(crate)`: shared with `persist_plan` — see [`resolve_model`].
+pub(crate) fn resolve_harness(transcript_content: Option<&str>) -> Option<String> {
     if let Some(content) = transcript_content
         && let Some(version) = transcript::last_assistant_harness_version(content)
     {
@@ -350,6 +356,43 @@ fn resolve_harness(transcript_content: Option<&str>) -> Option<String> {
 fn parse_ai_agent_version(value: &str) -> Option<String> {
     let version_part = value.strip_prefix("claude-code_")?.strip_suffix("_agent")?;
     (!version_part.is_empty()).then(|| version_part.replace('-', "."))
+}
+
+/// Serializes tests that mutate the process-global `AI_AGENT` env var,
+/// mirroring `guardrails::guard_read_model`'s `ENV_LOCK`/`with_env` pattern.
+///
+/// `pub(crate)` and hoisted OUT of this module's own `mod tests` (rather than
+/// each test module defining its own private lock) so `persist_plan`'s tests
+/// — which exercise the SAME `resolve_harness` AI_AGENT fallback via a
+/// different call path — serialize against this exact lock. Both modules
+/// compile into one `cadence-hooks-session` test binary, and `cargo test`
+/// runs its tests multi-threaded by default: two independently-locked env
+/// mutators would not actually be mutually exclusive, just each internally
+/// consistent — a real flakiness risk for a process-global var, not a
+/// theoretical one (cameronsjo/cadence-hooks#396 review).
+#[cfg(test)]
+pub(crate) static AI_AGENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn with_ai_agent_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _guard = AI_AGENT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let prior = std::env::var("AI_AGENT").ok();
+    // SAFETY: serialized via AI_AGENT_ENV_LOCK; restored below.
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var("AI_AGENT", v),
+            None => std::env::remove_var("AI_AGENT"),
+        }
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    // SAFETY: same lock still held; restoring prior state.
+    unsafe {
+        match prior {
+            Some(v) => std::env::set_var("AI_AGENT", v),
+            None => std::env::remove_var("AI_AGENT"),
+        }
+    }
+    result.unwrap_or_else(|e| std::panic::resume_unwind(e))
 }
 
 #[cfg(test)]
@@ -683,31 +726,12 @@ mod tests {
     }
 
     // --- AI_AGENT env fallback (process-global — serialized + restored) ---
-
-    /// Serializes tests that mutate the `AI_AGENT` env var, mirroring
-    /// `guardrails::guard_read_model`'s `ENV_LOCK`/`with_env` pattern.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_ai_agent_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prior = std::env::var("AI_AGENT").ok();
-        // SAFETY: serialized via ENV_LOCK; restored below.
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var("AI_AGENT", v),
-                None => std::env::remove_var("AI_AGENT"),
-            }
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        // SAFETY: same lock still held; restoring prior state.
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("AI_AGENT", v),
-                None => std::env::remove_var("AI_AGENT"),
-            }
-        }
-        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
-    }
+    //
+    // `with_ai_agent_env`/`AI_AGENT_ENV_LOCK` now live at the module level
+    // (above `mod tests`), `pub(crate)`, so `persist_plan`'s tests share the
+    // exact same lock — see that definition's doc for why a second,
+    // independently-locked copy here would be a real cross-module race, not
+    // just a duplicate. `use super::*` brings both into scope in this module.
 
     // --- CADENCE_MARKER_DIR (process-global — serialized + restored) ---
 

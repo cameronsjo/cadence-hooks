@@ -31,6 +31,7 @@
 //! | `backstop-record`   | SessionEnd   | [`backstop`]    |
 //! | `backstop-warn`     | SessionStart | [`backstop`]    |
 //! | `persist-plan`      | UserPromptSubmit | [`persist_plan`] |
+//! | `persist-plan-approval` | PostToolUse | [`persist_plan`] |
 
 /// Outro "no loose ends" backstop: SessionEnd records loose ends, SessionStart warns (#123).
 pub mod backstop;
@@ -48,9 +49,15 @@ pub mod guard;
 pub mod heartbeat;
 /// Pure domain logic: deterministic naming, record schema, relative ages.
 pub mod identity;
-/// UserPromptSubmit hook: persist an approved plan whose post-approval turn
-/// was wiped (approve-and-clear), so it survives on disk (cadence#505).
+/// UserPromptSubmit + PostToolUse hooks: persist an approved plan whose
+/// approving turn leaves no durable trace — the approve-and-clear wipe
+/// (cadence#505) and same-session approval (cadence-hooks#396) respectively.
 pub mod persist_plan;
+/// `docs/plans/*.md` frontmatter scan consumed by [`start`]'s SessionStart
+/// disclosure — surfaces in-flight/blocked plans without a GitHub call
+/// (cadence-hooks#429). Not `pub`: its one consumer, [`start`], lives in this
+/// same crate.
+mod plan_scan;
 /// Salted machine digest for committed provenance blocks (cadence#248) —
 /// shared with a future commit-message provenance check.
 pub mod provenance;
