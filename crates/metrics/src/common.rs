@@ -145,13 +145,23 @@ pub fn display_safe(s: &str) -> String {
     s.chars().filter(|c| !is_display_unsafe(*c)).collect()
 }
 
-/// Whether `c` can alter how the rest of a line renders: any Cc control, any Cf
-/// format character (bidi overrides/isolates, zero-width joiners), or the
+/// Whether `c` can alter how the rest of a line renders, or ride into an
+/// agent's context invisibly: any Cc control, any Cf format character, or the
 /// Unicode line/paragraph separators.
 ///
 /// Cf is matched by explicit ranges rather than a Unicode-property crate — this
-/// stays dependency-free, and these are the blocks that carry the reordering
-/// primitives. `is_control` already covers Cc.
+/// stays dependency-free — but the enumeration is deliberately the **whole**
+/// category, not just the famous blocks. Partial coverage is the trap: the
+/// obvious primitives (U+202E, the isolates) protect a *terminal*, while the
+/// primitive that matters for the agent-context sink is the **Tags** block
+/// (U+E0000–U+E007F). `U+E0001` plus `U+E0020`–`U+E007F` encodes arbitrary
+/// ASCII that renders as nothing at all yet survives into `additionalContext`
+/// and through most tokenizers — invisible text smuggling, and it is Cf, so
+/// `is_control` passes it and no bidi-shaped range catches it.
+///
+/// So the list below is maintained against the Unicode Cf category as a whole.
+/// If a future Unicode release adds a Cf block, it belongs here. `is_control`
+/// already covers Cc.
 fn is_display_unsafe(c: char) -> bool {
     c.is_control()
         || matches!(c,
@@ -159,14 +169,22 @@ fn is_display_unsafe(c: char) -> bool {
             | '\u{00AD}'                      // soft hyphen
             | '\u{0600}'..='\u{0605}'         // Arabic number signs
             | '\u{061C}'                      // Arabic letter mark
-            | '\u{06DD}' | '\u{070F}' | '\u{08E2}'
+            | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'         // Arabic pound / piastre marks
+            | '\u{08E2}'
             | '\u{180E}'                      // Mongolian vowel separator
             | '\u{200B}'..='\u{200F}'         // zero-width space … RTL mark
             | '\u{202A}'..='\u{202E}'         // bidi embeddings + OVERRIDE
             | '\u{2060}'..='\u{2064}'         // word joiner, invisible operators
             | '\u{2066}'..='\u{2069}'         // directional isolates
+            | '\u{206A}'..='\u{206F}'         // deprecated format controls
             | '\u{FEFF}'                      // zero-width no-break space (BOM)
             | '\u{FFF9}'..='\u{FFFB}'         // interlinear annotation
+            | '\u{110BD}' | '\u{110CD}'       // Kaithi number sign
+            | '\u{13430}'..='\u{1343F}'       // Egyptian hieroglyph format
+            | '\u{1BCA0}'..='\u{1BCA3}'       // shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}'       // musical beam / phrase controls
+            | '\u{E0000}'..='\u{E007F}'       // TAGS — invisible text smuggling
         )
 }
 

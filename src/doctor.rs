@@ -1127,16 +1127,26 @@ fn failopen_findings(
             // remediation that greps the wrong tree returns zero hits and reads
             // as "no stale wiring" — a silent false negative inside the one
             // command #183 exists to hand the operator.
-            let cache = plugins_dir()
-                .map(|p| p.join("cache").display().to_string())
-                .unwrap_or_else(|| "~/.claude/plugins/cache".to_string());
+            //
+            // The two branches quote DIFFERENTLY, on purpose. A resolved path
+            // is data, so it is single-quoted. The fallback is a literal
+            // authored here whose whole job is to expand — single-quoting it
+            // would emit `'~/.claude/plugins/cache'`, and the shell does not
+            // expand `~` inside single quotes, so the paste would search a
+            // nonexistent relative directory and return zero hits: the same
+            // silent "reads as no stale wiring" false negative this branch
+            // exists to prevent, just wearing the other face. Double quotes
+            // let `$HOME` expand while still surviving a spaced home dir.
+            let cache = match plugins_dir() {
+                Some(dir) => shell_single_quote(&dir.join("cache").display().to_string()),
+                None => "\"$HOME/.claude/plugins/cache\"".to_string(),
+            };
             format!(
                 "grep the installed plugins for the named invocation(s) — \
-                 `grep -rlF {needles} {}` finds every hooks.json carrying a \
-                 named invocation; either upgrade this binary or drop the \
+                 `grep -rlF {needles} {cache}` finds every hooks.json carrying \
+                 a named invocation; either upgrade this binary or drop the \
                  stale wiring. `cadence-hooks list` shows what this build \
-                 accepts",
-                shell_single_quote(&cache)
+                 accepts"
             )
         };
         findings.push(Finding {

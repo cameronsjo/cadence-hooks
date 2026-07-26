@@ -552,6 +552,51 @@ mod tests {
     }
 
     #[test]
+    fn display_safe_strips_the_tags_block() {
+        // The Unicode Tags block is the primitive that matters for the
+        // agent-context sink specifically: U+E0001 plus U+E0020–U+E007F encode
+        // arbitrary ASCII that renders as NOTHING yet survives into
+        // additionalContext and through most tokenizers. It is Cf, so
+        // `is_control` passes it and no bidi-shaped range catches it — a filter
+        // that stops at the famous bidi overrides protects a terminal and
+        // leaves the agent wide open.
+        //
+        // "hi" smuggled as tag characters, wrapped in a visible carrier.
+        let smuggled = "ok\u{E0001}\u{E0068}\u{E0069}\u{E007F}!";
+        assert_eq!(common::display_safe(smuggled), "ok!");
+    }
+
+    #[test]
+    fn display_safe_strips_the_remaining_cf_blocks() {
+        // The enumeration is maintained against the whole Cf category, not just
+        // the blocks that happen to be notorious.
+        for c in [
+            '\u{0890}',  // Arabic pound mark
+            '\u{206A}',  // deprecated: inhibit symmetric swapping
+            '\u{110BD}', // Kaithi number sign
+            '\u{13430}', // Egyptian hieroglyph vertical joiner
+            '\u{1BCA0}', // shorthand format letter overlap
+            '\u{1D173}', // musical symbol begin beam
+        ] {
+            assert_eq!(
+                common::display_safe(&format!("a{c}b")),
+                "ab",
+                "U+{:04X} must be stripped",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn display_safe_keeps_ordinary_text_intact() {
+        // The filter must not become so broad it mangles a real diagnostic.
+        assert_eq!(
+            common::display_safe("cadence log-commit — naïve 日本語 ✓"),
+            "cadence log-commit — naïve 日本語 ✓"
+        );
+    }
+
+    #[test]
     fn sanitize_error_keeps_ordinary_non_ascii() {
         // The filter targets display-affecting characters, not non-ASCII —
         // an accented or CJK panic message must survive intact.
