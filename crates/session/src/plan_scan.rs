@@ -238,17 +238,24 @@ fn frontmatter_value<'a>(block: &'a str, key: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-/// Strip one layer of matching double or single quotes from a frontmatter
-/// scalar (`"a value"` / `'a value'` → `a value`). Values that aren't quoted
-/// pass through unchanged — this is a plain scalar unquote, not a YAML
-/// escape decoder (no key this scanner reads embeds an escaped quote).
+/// Strip a frontmatter scalar's surrounding quotes. A double-quoted value
+/// (`"a value"`) is the shape `persist_plan::yaml_quote` emits for every
+/// frontmatter field it writes (cadence-hooks#396's fold), so it's unescaped
+/// via [`crate::persist_plan::yaml_unquote`] — reusing that exact reader
+/// rather than a second hand-rolled unescaper keeps the emit/read sides of
+/// the quoting scheme linked to one implementation instead of two that could
+/// drift apart on escaping order. A single-quoted value (`'a value'`) is
+/// only unwrapped, never unescaped: the emitter never produces this shape —
+/// only a hand-authored frontmatter line does — so there is no escape
+/// convention to reverse. An unquoted value passes through unchanged.
 fn unquote(value: &str) -> String {
     let v = value.trim();
+    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+        return crate::persist_plan::yaml_unquote(v);
+    }
     let mut chars = v.chars();
     match (chars.next(), chars.next_back()) {
-        (Some('"'), Some('"')) | (Some('\''), Some('\'')) if v.len() >= 2 => {
-            chars.as_str().to_string()
-        }
+        (Some('\''), Some('\'')) if v.len() >= 2 => chars.as_str().to_string(),
         _ => v.to_string(),
     }
 }
@@ -441,6 +448,19 @@ mod tests {
         let doc = "---\nstatus: in-flight\nnext: 'ship it'\n---\n\nbody\n";
         let facts = parse_frontmatter_facts(doc).unwrap();
         assert_eq!(facts.next.as_deref(), Some("ship it"));
+    }
+
+    #[test]
+    fn unquote_reverses_persist_plans_yaml_quote_emission() {
+        // persist_plan::yaml_quote (the emitter, cadence-hooks#396's fold)
+        // escapes backslash then quote, in that order, and wraps the result
+        // in double quotes. This hand-builds that exact emission shape
+        // (rather than calling yaml_quote) so a drift in either side's
+        // escaping order shows up as a test failure instead of being masked
+        // by round-tripping through the same code on both ends.
+        let original = "value with a \"quote\" and a \\backslash";
+        let emitted = "\"value with a \\\"quote\\\" and a \\\\backslash\"";
+        assert_eq!(unquote(emitted), original);
     }
 
     #[test]

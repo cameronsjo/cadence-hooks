@@ -909,7 +909,12 @@ fn yaml_quote(s: &str) -> String {
 /// fold started quoting) passes through unchanged — this hook always emits
 /// quoted values now, but the idempotency reader must not choke on an older
 /// or hand-edited file.
-fn yaml_unquote(s: &str) -> String {
+///
+/// `pub(crate)`: [`crate::plan_scan`] reuses this exact unescaper for the
+/// same double-quoted values at `session start` — one implementation of
+/// `yaml_quote`'s reader half, not two that could drift apart on escaping
+/// order.
+pub(crate) fn yaml_unquote(s: &str) -> String {
     let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
         return s.to_string();
     };
