@@ -71,11 +71,10 @@
 //! #228). Rolling no new recursion keeps the adversarially-reviewed primitives
 //! the single source of truth.
 
-use crate::enforce_worktree::{TRANSPARENT, skip_transparent_prefixes, strip_group_wrappers};
 use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, basename, child_scripts, looks_absolute, resolve_cd_target,
-    split_segments_with_ops, tokenize,
+    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, looks_absolute, resolve_cd_target,
+    skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome, normalize_path};
 use std::path::Path;

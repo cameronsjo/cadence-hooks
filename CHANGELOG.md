@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The polish ship anchor now requires `gh` to be the segment's command word** (cameronsjo/cadence-hooks#419). `is_polish_ship_anchor` matched a `gh pr create`/`gh pr ready` *anywhere* in a segment's token stream, so a `gh` sitting in argument position — a word the shell hands to some other program — read as an invocation. `git commit -m "$(echo gh pr create)"` fired the gate: `expand_segments` extracts `$(…)` bodies in executed context and double quotes do not suppress expansion, so the commit contributes a segment tokenizing as `[echo, gh, pr, create]`. Under the previous `split_segments`, the `-m` argument collapsed to one token and correctly rejected; PR #414's move to `command_segments` is what made the shape reachable.
+
+  Cost was a spurious nudge on an ordinary commit **plus an inflated `log-polish-nudge` denominator** — and that ledger is the polish gate's own efficacy measurement (#409), so the noise landed directly in the numbers used to judge whether the gate is worth keeping.
+
+  Anchoring at index 0 keeps every ordinary ship: `sh -c 'gh pr create'` matches because the wrapper expands and the inner segment leads with `gh`; `exec gh pr create` and `FOO=1 gh pr ready` match because the transparent prefix is skipped; `{ gh pr create; }` matches because group wrappers are stripped first; `gh --repo owner/r pr create` matches because the global-flag walk is unchanged. It also retires the positional scan's quadratic hazard outright — one walk per segment instead of one per `gh` token, so the `gh --repo` flood is linear by construction rather than by the resume bookkeeping it previously needed.
+
+  **Three families are missed by construction, and the doc comment now enumerates all three** rather than naming only the first: a transparent prefix carrying its own flag (`env -i`, `nice -n`); a prefix outside `TRANSPARENT` (`sudo`, `timeout`, `xargs`, `stdbuf`); and a shell keyword in command position (`if ! gh pr create; then …`, `for … do gh pr create; done`). Every one is nudge-only, so each costs an un-nudged ship and never a wrong block — but each also *shrinks* the `log-polish-nudge` denominator, the opposite error from the inflation being fixed, which is why they are pinned by test as known misses rather than left implicit. Catching the second family would mean widening `TRANSPARENT`, which `enforce_worktree` and `guard_rm` share; a nudge is not worth buying a change to a block-capable gate's model of what runs a command.
+
+  `strip_group_wrappers`, `TRANSPARENT`, and `skip_transparent_prefixes` moved from `guardrails::enforce_worktree` to `core::shell` to make this possible — core is the only crate both the guards and the anchor can reach. One copy for the guards and the anchor, not a second that could drift; `doctor`'s stale-wiring scan keeps its own, wider prefix set, which answers a different question (plugin hook command lines, not what this shell is running) and would widen the guards if folded in. Guard behavior is unchanged: the move is byte-identical logic under a new path, verified by a differential against a binary built from `origin/main` across guard-rm's 45 probe cases and enforce-worktree's 12, all identical.
+
+  Including `strip_group_wrappers` in that move is what makes `( gh pr create )` an anchor for the first time — it was silently missed before this change, because `tokenize` fuses the punctuation to the adjacent word and `(gh` is one token. The guards have stripped groups since #239 F4 for exactly that reason; the anchor never did.
+
+  **Not fixed here:** the anchor and the resolver still disagree about *where* a wrapped ship happens. `parse_work_dir` is a raw-string scan that does not descend into `sh -c '…'`, so `sh -c 'cd /other/worktree && gh pr create'` is detected as a ship but judged against the unchanged starting cwd. That needs the resolver to descend into wrappers — a much larger change to a primitive several block-capable guards consume — and is tracked as cameronsjo/cadence-hooks#448.
+
+- **`record-polish --repo-root` no longer writes a marker the ship gate cannot read** (cameronsjo/cadence-hooks#417). The flag's value was used **verbatim** as the marker key while the default path resolved through the canonicalized `git_common_dir`, so the two disagreed and the flag was the one that lost. The natural value to pass is the linked worktree you are standing in, and that is exactly the value that broke: recorded from one worktree, the marker keyed on the worktree's own path, and `nudge-polish-before-pr` — keyed on the common dir — could never find it.
+
+  The failure was silent and delayed. `record-polish` printed a success verdict naming a plausible path, and the cost landed later as a polish nudge on a branch that genuinely had been polished, which reads as the gate being broken rather than the record being mis-keyed. This is the *actual* writer/reader divergence #394 and #368 hypothesized — their diagnosis was refuted for the default path, where both sides have keyed on `git_common_dir` since 0.60.0, but it was real on the flag path, and anything scripting `record-polish` with an explicit root (an orchestrator recording on a worker's behalf) hit it.
+
+  An explicit `--repo-root` is now resolved through the same canonicalization, so the flag can only ever *locate* the repo, never *redefine* the key — a worktree path, its primary checkout, and no flag at all all produce one key. When the path resolves to no repository the literal value stands, which keeps the test override (a bogus dir plus an explicit branch, resolving without touching git) working — the affordance the flag existed for in the first place — and that fallback now prints one stderr line naming what it did, because a success verdict over a key nothing will read is the exact failure this issue exists to kill.
+
+  **The flag re-bases the whole resolution, not just the repo half.** `branch` and `head_sha` are read from the same checkout the root names, rather than from the caller's cwd. Splitting them was inert before this fix — an explicit root produced a key nothing read — and would have become live with it: an orchestrator recording on a worker's behalf (`record-polish --repo-root <worker worktree>`, no `--branch`, run from a checkout sitting on `main`) would have written a marker keyed to the worker's repo but the *orchestrator's* branch, silently crediting `main` with a polish it never had while the branch that was actually polished kept getting nudged. That is precisely the case the flag exists for, so closing the repo half alone would have traded a dead marker for a wrong one.
+
+  `--repo-root`, `--branch`, and `--scope` also gained `--help` descriptions; all three previously rendered with none.
+
 ## [0.68.0] - 2026-07-25
 
 ### Added
