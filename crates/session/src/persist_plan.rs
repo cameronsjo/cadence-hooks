@@ -2195,24 +2195,25 @@ mod tests {
         git(&["config", "user.name", "t"]);
     }
 
-    /// Crate-wide serialization lock for the `CADENCE_METRICS_DIR` env-mutating
-    /// tests, mirroring `cadence_hooks_metrics::common::ENV_LOCK`'s pattern —
-    /// this crate has its own env-mutating tests, so its own lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_metrics_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized against every other test in this module via ENV_LOCK.
-        unsafe {
-            std::env::set_var("CADENCE_METRICS_DIR", dir);
-        }
-        let result = f();
-        // SAFETY: serialized against every other test in this module via ENV_LOCK.
-        unsafe {
-            std::env::remove_var("CADENCE_METRICS_DIR");
-        }
-        result
-    }
+    /// Reuse [`crate::registry::test_metrics_env::with_metrics_dir`] rather
+    /// than a second, independently-locked `CADENCE_METRICS_DIR` mutator.
+    ///
+    /// This module used to define its own `ENV_LOCK`/`with_metrics_dir` pair
+    /// under the premise "this crate has its own env-mutating tests, so its
+    /// own lock" — true, but `registry.rs`'s `test_metrics_env` module (used
+    /// by `start.rs`'s tests, e.g. `stale_peer_does_not_trigger_disclosure`
+    /// via `with_scratch_metrics_dir`) ALSO mutates this exact process-global
+    /// env var, through a *different* mutex. Two uncoordinated locks over one
+    /// global is a race regardless of how careful either lock's own critical
+    /// section is: `cargo test`'s default parallelism can run a test from
+    /// each module on separate threads at once, and one thread's
+    /// `set_var`/`remove_var` can interleave with the other's window. Rare
+    /// enough not to fire locally, but real — it surfaced as this test's
+    /// `plan-links.jsonl` read hitting `NotFound` on Windows CI once this
+    /// crate's test count grew (cadence-hooks#437). One shared lock closes it
+    /// by construction; both modules' tests now serialize against the same
+    /// mutex.
+    use crate::registry::test_metrics_env::with_metrics_dir;
 
     #[test]
     fn end_to_end_fresh_write_produces_nudge_and_linkage_row() {

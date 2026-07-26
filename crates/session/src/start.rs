@@ -436,7 +436,21 @@ mod tests {
         init_repo(&scratch.0);
         let registry_dir = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
-        let r = with_clean_worktree_env(|| {
+        // CADENCE_ALLOW_MAIN pins the worktree-posture half of `finish()`
+        // silent regardless of environment (the same pattern
+        // `posture_line_silent_when_allow_main_env_set` uses below), so this
+        // test is isolated to the plan-disclosure half it actually exercises.
+        // Without the pin, `with_clean_worktree_env` alone leaves the
+        // OVERALL verdict environment-dependent: locally this `Scratch`
+        // fixture sits under `target/` inside a `/tmp` worktree checkout, so
+        // the `is_temp_root` carve-out already silences posture and the
+        // assertion happens to hold — but a CI checkout is NOT under a temp
+        // root, so posture genuinely fires there on this freshly-`git init`'d
+        // primary checkout, flipping the verdict to Nudge and failing this
+        // assertion (cadence-hooks#437; the inverse of the three
+        // posture_line_* tests below, which fail locally for the identical
+        // environment reason and pass in CI).
+        let r = with_worktree_env(Some("true"), None, || {
             run_start(&input, registry_dir.path(), Some("main".into()), 600)
         });
         assert_eq!(
