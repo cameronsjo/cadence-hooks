@@ -121,12 +121,23 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
 
 /// Words that stand in front of a real command without being the command.
 ///
-/// One copy for the guards' leading-word gates and the polish ship anchor, so
-/// the set cannot drift between the code that skips these and the code that asks
-/// whether a word is one. `doctor`'s stale-wiring scan keeps its own, wider set
-/// (it adds `sudo`/`stdbuf` and parses each prefix's flags) — that one answers a
-/// different question, about plugin hook command lines rather than about what
-/// this shell is running, and folding the two would widen the guards.
+/// Shared by `enforce_worktree`, `guard_rm`, and the polish ship anchor, so the
+/// set cannot drift between the code that skips these and the code that asks
+/// whether a word is one. **It is not the repo's only prefix set, and is not
+/// meant to become one** — three others answer adjacent questions with
+/// deliberately different membership, and each is wider here:
+///
+/// - `warn_alias_parsing::WRAPPERS` — `xargs`/`sudo`/`env`/`nice`/`timeout`
+/// - `prevent_secret_writes::COMMAND_WRAPPERS` — `sudo`/`command`/`nohup`/
+///   `time`/`xargs` (a **blocking** check)
+/// - `doctor`'s stale-wiring scan — adds `sudo`/`stdbuf` and parses each
+///   prefix's own flags; it reads plugin hook command lines, not what this
+///   shell is about to run
+///
+/// So `sudo` and `xargs` ARE transparent to some checks and deliberately not to
+/// these. Unifying them would widen two gates that can block, on the strength
+/// of a question neither was asked — see this constant's consumers before
+/// adding a word to it.
 pub const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
 
 /// Skip transparent command prefixes that run their argument as the command, so
@@ -233,20 +244,27 @@ fn segment_is_ship_anchor(segment: &str) -> bool {
 /// skipped; `{ gh pr create; }` matches because [`strip_group_wrappers`] runs
 /// first.
 ///
-/// Three families are **missed by construction**, all of them nudge-only, so
+/// Four families are **missed by construction**, all of them nudge-only, so
 /// each costs one un-nudged ship and never a wrong block:
 ///
 /// 1. A transparent prefix carrying its own flag — `env -i gh pr create`,
 ///    `nice -n 10 gh pr ready`. [`skip_transparent_prefixes`] stops there
 ///    deliberately: each prefix has its own flag grammar, and guessing wrong
 ///    would skip past the real command word.
-/// 2. A prefix outside [`TRANSPARENT`] — `sudo`, `timeout`, `xargs`, `stdbuf`.
-///    Widening that set to catch them would widen `enforce_worktree` and
-///    `guard_rm` too, which share it; a nudge is not worth touching a
-///    block-capable gate's model of what runs a command.
+/// 2. A prefix outside [`TRANSPARENT`] — `sudo`, `timeout`, `xargs`, `stdbuf`,
+///    and `eval` (which `guard_rm` special-cases separately). Widening that set
+///    to catch them would widen `enforce_worktree` and `guard_rm` too, which
+///    share it; a nudge is not worth touching a block-capable gate's model of
+///    what runs a command.
 /// 3. A shell keyword in command position — `if ! gh pr create; then …`,
 ///    `for r in a b; do gh pr create; done`. The keyword is the segment's
 ///    leading word and nothing strips it.
+/// 4. A path-qualified command word — `/opt/homebrew/bin/gh pr create`,
+///    `./gh pr create`. The comparison is against the literal token `gh`, as
+///    the positional scan's was, so this is pre-existing rather than new.
+///    [`basename`] would close it in one call, which both guards apply to
+///    their own command word; left alone here because it would ADD nudges
+///    rather than restore them, which is past what #419 asked for.
 ///
 /// Each of these shrinks the `log-polish-nudge` denominator rather than
 /// inflating it (#409) — the opposite error from the one this change fixes,
@@ -1525,13 +1543,21 @@ mod tests {
 
     #[test]
     fn is_polish_ship_anchor_sees_through_group_wrappers() {
-        // `tokenize` fuses grouping punctuation to the adjacent word — `(gh`
-        // is ONE token — so an index-0 gate sees `(`/`{` as the command word
-        // unless the segment is group-stripped first, the same order the
-        // guards use. Without the strip, requiring the command word would have
-        // LOST these; `( gh pr create )` was already missed before this change,
-        // and `{ gh pr create; }` would have become newly missed.
+        // `tokenize` fuses grouping punctuation to the ADJACENT word, so the
+        // spelling decides everything: unspaced `(gh` is one token, while
+        // spaced `( gh` is two. The strip therefore does two different jobs,
+        // measured against a binary built from `origin/main`:
+        //
+        //   (gh pr create)      main SILENT -> now NUDGE   (a pre-existing miss)
+        //   { gh pr create; }   main NUDGE  -> now NUDGE   (would have REGRESSED)
+        //
+        // The spaced forms shipped as anchors because the old positional scan
+        // found `gh` at index 1; under an index-0 gate they see `(` as the
+        // command word, so without the strip this change would have taken a
+        // working anchor away. Preventing that regression is the stronger of
+        // the two reasons, and the easier one to overlook.
         assert!(is_polish_ship_anchor("(gh pr create --title x)"));
+        assert!(is_polish_ship_anchor("{gh pr create --fill;}"));
         assert!(is_polish_ship_anchor("( gh pr create --title x )"));
         assert!(is_polish_ship_anchor("{ gh pr create --title x; }"));
         assert!(is_polish_ship_anchor("ok && { gh pr ready 12; }"));

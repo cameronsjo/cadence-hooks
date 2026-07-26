@@ -91,8 +91,8 @@ fn resolve(
                 // the bare string, which collides across repos.
                 eprintln!(
                     "cadence-hooks record-polish: --repo-root {explicit} is not a git \
-                     repository — recording under that literal key, which the pre-PR \
-                     gate will not match unless it was given the same literal."
+                     repository — any marker will use that literal key, which the \
+                     pre-PR gate will not match unless it was given the same literal."
                 );
                 explicit
             })
@@ -185,10 +185,13 @@ mod tests {
 
     #[test]
     fn resolve_uses_explicit_overrides_without_touching_git() {
-        // Explicit repo_root + branch bypass the git shell-out, so a bogus dir
-        // still resolves — the property the write test below relies on. A
-        // non-repo `repo_root` is NOT a path #417 canonicalizes: there is no
-        // repo to resolve it against, so the literal value stands.
+        // Explicit repo_root + branch supply both halves of the KEY without a
+        // repository, so a bogus dir still resolves — the property the write
+        // test below relies on. (`head_sha` still shells out, now against the
+        // flag's value rather than `dir`; it is provenance, not key material,
+        // and fails to empty here.) A non-repo `repo_root` is NOT a path #417
+        // canonicalizes: there is no repo to resolve it against, so the literal
+        // value stands.
         let resolved = resolve(
             "/nonexistent/not-a-repo",
             Some("/tmp/repo".into()),
