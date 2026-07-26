@@ -71,7 +71,9 @@
 //! #228). Rolling no new recursion keeps the adversarially-reviewed primitives
 //! the single source of truth.
 
-use crate::enforce_worktree::{skip_transparent_prefixes, strip_group_wrappers};
+use crate::enforce_worktree::{
+    TRANSPARENT, is_assignment_word, skip_transparent_prefixes, strip_group_wrappers,
+};
 use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
     MAX_WRAPPER_DEPTH, basename, child_scripts, looks_absolute, resolve_cd_target,
@@ -104,6 +106,61 @@ fn command_word(token: &str) -> &str {
 /// forgetting it at a new call site would silently re-open the alias bypass.
 fn is_delete_verb(token: &str) -> bool {
     DELETE_VERBS.contains(&command_word(token))
+}
+
+/// A directory-changing builtin, as [`directory_change`] classifies it.
+///
+/// `pushd`/`popd` are modeled with a real stack rather than collapsed into
+/// "directory unknown". Declaring defeat on `popd` is safe but noisy: a bare
+/// `popd` with no prior `pushd` leaves the shell exactly where it was, so
+/// treating it as unknown turns `popd; rm notes.txt` into a prompt about a
+/// file in the directory the parser already knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryVerb {
+    /// `cd` — moves, keeps no stack entry.
+    Cd,
+    /// `pushd` — saves the current directory, then moves.
+    PushDirectory,
+    /// `popd` — restores the entry `pushd` saved.
+    PopDirectory,
+}
+use DirectoryVerb::{Cd, PopDirectory, PushDirectory};
+
+/// Leading words that keep a following builtin in **this** shell, so a `cd`
+/// behind them still moves the caller's directory.
+///
+/// Deliberately narrower than [`TRANSPARENT`]: `env`, `nice`, `nohup` and
+/// `time` run their argument as a child process, and a `cd` in a child cannot
+/// move the parent's `$PWD` at all. Treating those as directory changes would
+/// invent a move the shell never made and resolve later relative targets
+/// against the wrong directory.
+const CD_PRESERVING_PREFIXES: &[&str] = &["command", "builtin"];
+
+/// The directory-changing verb this segment starts with, plus the index of its
+/// first argument. `None` when the segment does not change the directory.
+///
+/// The old check compared the raw first token against the literal `"cd"`, so
+/// every other spelling left the effective directory stale and a later relative
+/// target was judged against a directory the shell had already left (#428).
+/// `bash` confirms all of `command cd`, `builtin cd`, `\cd`, `FOO=1 cd` and
+/// `pushd` move `$PWD`. This routes the check through [`command_word`] — the
+/// same basename + `\`-strip the delete-verb check uses — after stepping over
+/// assignment words and the shell-preserving prefixes.
+fn directory_change(tokens: &[String]) -> Option<(DirectoryVerb, usize)> {
+    let mut idx = 0;
+    while let Some(tok) = tokens.get(idx) {
+        if is_assignment_word(tok) || CD_PRESERVING_PREFIXES.contains(&tok.as_str()) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    match command_word(tokens.get(idx)?) {
+        "cd" => Some((Cd, idx + 1)),
+        "pushd" => Some((PushDirectory, idx + 1)),
+        "popd" => Some((PopDirectory, idx + 1)),
+        _ => None,
+    }
 }
 
 /// Does `flag` (in separate-token form) consume the following token as a value
@@ -273,6 +330,11 @@ fn collect_targets(
     // target after that resolves against a directory the shell has already
     // left, so it must not carry the old directory's verdict.
     let mut dir_known = cwd_known;
+    // The `pushd`/`popd` directory stack, each entry carrying whether that
+    // directory was itself resolvable. Modeled rather than collapsed to
+    // "unknown" so a matched push/pop pair returns to a directory this parser
+    // can still name.
+    let mut dir_stack: Vec<(String, bool)> = Vec::new();
 
     for (segment, _next_op) in split_segments_with_ops(script) {
         let segment = strip_group_wrappers(&segment);
@@ -289,28 +351,83 @@ fn collect_targets(
             }
         }
 
-        // `cd` tracking — assume success (equal-precedence `&&`/`||`,
-        // left-assoc), skip cd's own flags, and treat a bare `-`, a `$VAR`, or a
-        // missing target as unresolvable (keep the pre-cd dir). Mirrors
+        // Directory tracking — assume success (equal-precedence `&&`/`||`,
+        // left-assoc), skip the verb's own flags, and treat a bare `-`, a
+        // `$VAR`, or a missing target as unresolvable. Mirrors
         // `collect_commit_targets`.
-        if tokens.first().map(String::as_str) == Some("cd") {
-            let mut idx = 1;
+        if let Some((verb, arg_start)) = directory_change(&tokens) {
+            if verb == PopDirectory {
+                // Restore what `pushd` saved. An empty stack means the shell
+                // errored and stayed put, so the directory is UNCHANGED — not
+                // unknown. Treating it as unknown would prompt about a file in
+                // a directory this parser can name perfectly well.
+                if let Some((dir, known)) = dir_stack.pop() {
+                    effective_dir = dir;
+                    dir_known = known;
+                }
+                continue;
+            }
+
+            let mut idx = arg_start;
             while tokens
                 .get(idx)
                 .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
             {
                 idx += 1;
             }
-            // A bare `-`, a missing target, or an unexpanded variable makes the
-            // new directory UNKNOWN. Keeping the pre-cd directory was a silent
-            // ALLOW: `cd $HOME; rm -rf Documents` from a `/tmp` cwd resolved
-            // `Documents` under `/tmp` and allowed a delete of `~/Documents`.
+
+            // `pushd` saves the current directory before moving, so a later
+            // `popd` can restore it.
+            if verb == PushDirectory {
+                // A bare `pushd` swaps the top stack entry with the current
+                // directory; with an empty stack the shell errors and stays.
+                if tokens.get(idx).is_none() {
+                    if let Some(top) = dir_stack.last_mut() {
+                        std::mem::swap(&mut top.0, &mut effective_dir);
+                        std::mem::swap(&mut top.1, &mut dir_known);
+                    }
+                    continue;
+                }
+                dir_stack.push((effective_dir.clone(), dir_known));
+            }
+
+            // A bare `-`, a `+N`/`-N` stack rotation, a missing target, or an
+            // unexpanded variable makes the new directory UNKNOWN. Keeping the
+            // pre-cd directory was a silent ALLOW: `cd $HOME; rm -rf Documents`
+            // from a `/tmp` cwd resolved `Documents` under `/tmp` and allowed a
+            // delete of `~/Documents`.
             match tokens.get(idx) {
-                Some(target) if target != "-" && !target.starts_with('$') => {
+                Some(target)
+                    if target != "-" && !target.starts_with('$') && !target.starts_with('+') =>
+                {
                     effective_dir = resolve_cd_target(target, &effective_dir);
                 }
                 _ => dir_known = false,
             }
+            continue;
+        }
+
+        // `skip_transparent_prefixes` stops at a prefix whose NEXT token is an
+        // option (`env -i`, `env -u FOO`, `nice -n 10`), so `argv` still leads
+        // with the prefix, the delete verb behind it is never seen, and an empty
+        // target list reads as "not a deletion" — a silent ALLOW on a recursive
+        // delete of a protected path (#426).
+        //
+        // Fixed guard_rm-locally rather than in the shared primitive: that one
+        // is also `enforce_worktree`'s and carries its own adversarial-review
+        // history, where the same clause is a deliberate, documented miss whose
+        // cost is only a missed commit block.
+        //
+        // Unresolvable, not a parse of what follows: each prefix has its own
+        // flag grammar (`env -u` and `nice -n` take a value, `env -i` does not),
+        // and guessing wrong would skip past the delete verb itself. Gated on a
+        // delete verb actually appearing, so `env -i ls` stays silent.
+        if argv
+            .first()
+            .is_some_and(|first| TRANSPARENT.contains(&command_word(first)))
+            && tokens.iter().any(|t| is_delete_verb(t))
+        {
+            out.push(TargetToken::Unresolvable);
             continue;
         }
 
@@ -523,13 +640,23 @@ fn resolve_target(
     if operand.contains('{') || operand.contains('}') {
         return TargetToken::Unresolvable;
     }
+    // A `..` ANYWHERE in the operand, checked against the WHOLE token before it
+    // is reduced to a literal prefix. The reduction below truncates at the
+    // first `*`/`?`/`[`, so checking only the prefix let every `..` *behind* a
+    // metachar sail past: `rm -rf /private/tmp/*/../../..` expands — for every
+    // match — to `/`, and classified as a clean glob under `/private/tmp` it
+    // was a silent ALLOW (#427).
+    //
+    // Same reasoning as the brace check above: one token naming a path this
+    // parser cannot enumerate. The brace guard sat three lines above the very
+    // truncation that defeated it for globs.
+    if has_parent_segment(operand) {
+        return TargetToken::Unresolvable;
+    }
     // Reduce a glob to the literal directory it lives in: `rm -rf /tmp/x/*`
     // classifies `/tmp/x`, `rm -rf *` classifies the cwd, `rm -rf /*`
     // classifies `/`.
     let literal = glob_literal_prefix(operand);
-    if has_parent_segment(literal) {
-        return TargetToken::Unresolvable;
-    }
     // A relative target only means something against a known directory. After a
     // `cd` this parser could not follow, the shell is somewhere else entirely,
     // so carrying the stale directory's verdict would describe the wrong path.
@@ -849,6 +976,158 @@ mod tests {
     /// Common case: no git roots on disk.
     fn judge(command: &str, cwd: &str) -> Outcome {
         judge_with(command, cwd, &[])
+    }
+
+    // --- #428: every spelling that moves the shell's directory ---
+
+    /// `cd ~; rm -rf Documents` already blocked; these are the spellings that
+    /// did not. `bash` confirms all five move `$PWD`, so a relative target after
+    /// one of them was being judged against a directory the shell had left —
+    /// a silent ALLOW on a recursive delete of a home child.
+    #[test]
+    fn every_cd_spelling_moves_the_effective_directory() {
+        for command in [
+            "cd ~; rm -rf Documents",
+            "command cd ~; rm -rf Documents",
+            "builtin cd ~; rm -rf Documents",
+            r"\cd ~; rm -rf Documents",
+            "FOO=1 cd ~; rm -rf Documents",
+            "BAR=x command cd ~; rm -rf Documents",
+            "pushd ~; rm -rf Documents",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Block,
+                "must follow the directory change: {command}"
+            );
+        }
+    }
+
+    /// A `cd` behind a prefix that runs it in a CHILD process does not move the
+    /// parent's `$PWD`, so the directory is unchanged — modeling it as a move
+    /// would invent a change the shell never made and misjudge later targets.
+    #[test]
+    fn subprocess_prefixed_cd_does_not_move_the_shell() {
+        // `env cd` runs (or fails to run) a `cd` binary in a child; the parent
+        // stays in /private/tmp, where `Documents` is an ordinary temp path.
+        assert_eq!(
+            judge("env cd ~; rm -rf Documents", "/private/tmp"),
+            Outcome::Allow
+        );
+    }
+
+    /// `popd` restores what `pushd` saved. With an empty stack the shell errors
+    /// and stays put, so the directory is UNCHANGED — not unknown. Collapsing it
+    /// to unknown would prompt about a file in a directory the parser can name.
+    #[test]
+    fn pushd_popd_stack_is_modeled_not_collapsed() {
+        assert_eq!(judge("popd; rm notes.txt", "/private/tmp"), Outcome::Allow);
+        assert_eq!(
+            judge("pushd ~; popd; rm notes.txt", "/private/tmp"),
+            Outcome::Allow,
+            "a matched pair returns to a known directory"
+        );
+        assert_eq!(
+            judge("pushd; rm notes.txt", "/private/tmp"),
+            Outcome::Allow,
+            "a bare pushd on an empty stack errors and stays"
+        );
+    }
+
+    /// A `pushd` whose target this parser cannot name must not carry the old
+    /// directory's verdict forward.
+    #[test]
+    fn unresolvable_pushd_target_marks_the_directory_unknown() {
+        assert_eq!(
+            judge("pushd $SOMEWHERE; rm -rf build", "/private/tmp"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("pushd +1; rm -rf build", "/private/tmp"),
+            Outcome::Ask,
+            "a stack rotation is not a directory this parser can name"
+        );
+    }
+
+    // --- #426: a transparent prefix carrying a flag ---
+
+    /// `skip_transparent_prefixes` stops at a prefix whose next token is an
+    /// option, so `argv` still led with the prefix, the delete verb behind it
+    /// was never seen, and an empty target list read as "not a deletion".
+    #[test]
+    fn transparent_prefix_with_a_flag_is_unresolvable_not_allowed() {
+        for command in [
+            "env -i rm -rf ~/Documents",
+            "env -u FOO rm -rf ~/Documents",
+            "nice -n 10 rm -rf ~/Documents",
+            "nohup -x rm -rf ~/Documents",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "a delete behind a flagged prefix must not be a silent allow: {command}"
+            );
+        }
+    }
+
+    /// The unflagged forms still resolve fully, so this stayed a coverage gap
+    /// rather than becoming a blanket "prefix means unknown".
+    #[test]
+    fn unflagged_transparent_prefix_still_resolves() {
+        assert_eq!(
+            judge("env rm -rf ~/Documents", "/private/tmp"),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge("command rm -rf ~/Documents", "/private/tmp"),
+            Outcome::Block
+        );
+    }
+
+    /// Gated on a delete verb actually appearing — otherwise every flagged
+    /// prefix in the session would start prompting.
+    #[test]
+    fn flagged_prefix_without_a_delete_verb_stays_silent() {
+        assert_eq!(judge("env -i ls -la", "/private/tmp"), Outcome::Allow);
+        assert_eq!(
+            judge("nice -n 10 cargo build", "/private/tmp"),
+            Outcome::Allow
+        );
+    }
+
+    // --- #427: a `..` behind a glob metachar ---
+
+    /// `glob_literal_prefix` truncates at the first metachar, so a `..` behind
+    /// one was never inspected. Every match of `/private/tmp/*/../../..`
+    /// expands to `/`, and it classified as a clean glob under `/private/tmp`.
+    #[test]
+    fn parent_segment_behind_a_glob_is_unresolvable() {
+        assert_eq!(
+            judge("rm -rf /private/tmp/*/../../..", "/anywhere"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm -f /private/tmp/*/../../../Users/me/.zshrc", "/anywhere"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm -rf /tmp/[abc]/../../etc", "/anywhere"),
+            Outcome::Ask,
+            "a bracket class is a metachar too"
+        );
+    }
+
+    /// The glob-free control still behaves, and an ordinary glob with no `..`
+    /// must not start prompting — that would nag on every routine sweep.
+    #[test]
+    fn ordinary_globs_are_unaffected_by_the_parent_check() {
+        assert_eq!(judge("rm -rf /tmp/scratch/*", "/home"), Outcome::Allow);
+        assert_eq!(
+            judge("rm -rf /private/tmp/build/*", "/home"),
+            Outcome::Allow
+        );
+        // A `..`-looking substring that is not a path segment stays resolvable.
+        assert_eq!(judge("rm -rf /tmp/foo..bar/*", "/home"), Outcome::Allow);
     }
 
     // --- ALLOW: temp roots ---
