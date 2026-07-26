@@ -24,6 +24,10 @@ fn cadence_hooks(marker_dir: &std::path::Path) -> Command {
     cmd.env_remove("PPID");
     cmd.env_remove("CADENCE_ALLOW_MAIN");
     cmd.env("CADENCE_MARKER_DIR", marker_dir);
+    // Same reasoning as CADENCE_MARKER_DIR one line up, for the other thing a
+    // spawned hook writes: unpinned, `metrics_dir()` resolves to the operator's
+    // real ledger and the suite appends test rows to production data.
+    cmd.env("CADENCE_METRICS_DIR", marker_dir.join("metrics"));
     cmd
 }
 

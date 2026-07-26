@@ -71,7 +71,8 @@ impl Logger for LogCommit {
         }
         let commits_path = dir.join("commits.jsonl");
 
-        let last_message_id = common::read_stream_with_legacy("commits.jsonl")
+        let last_message_id = std::fs::read_to_string(&commits_path)
+            .ok()
             .and_then(|contents| parse_last_message_id(&contents, session_id));
 
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {

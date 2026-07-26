@@ -89,7 +89,8 @@ impl Logger for LogSession {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let commits = common::read_stream_with_legacy("commits.jsonl")
+        let commits = std::fs::read_to_string(dir.join("commits.jsonl"))
+            .ok()
             .map(|contents| count_commits(&contents, session_id))
             .unwrap_or(0);
 
