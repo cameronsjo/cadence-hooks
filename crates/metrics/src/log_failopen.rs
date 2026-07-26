@@ -150,7 +150,9 @@ pub struct FailopenRecency {
     /// reader, so they collapse deliberately.
     pub last_error: Option<String>,
     /// Distinct `"<namespace> <subcommand>"` pairs among the windowed rows
-    /// **on the current version**, sorted, capped at [`MAX_SUBCOMMANDS`].
+    /// **on the current version**, sorted, capped at `MAX_SUBCOMMANDS` (a
+    /// private constant, so it is named rather than intra-doc linked — the
+    /// link would not resolve in published docs).
     ///
     /// This is what turns a `version_mismatch` count into an actionable
     /// finding (#183): the count says a plugin expects something this binary
@@ -397,11 +399,18 @@ fn recency_from(
         .iter()
         .filter(|v| v.get("binaryVersion").and_then(Value::as_str) == Some(current_version))
         .filter_map(|v| {
-            let ns = v.get("namespace").and_then(Value::as_str)?;
-            let sub = v.get("subcommand").and_then(Value::as_str)?;
-            Some(display_safe(&format!("{ns} {sub}")))
+            // Both halves are validated INDEPENDENTLY. A combined-string
+            // emptiness test passes `namespace: ""` with `subcommand: "hook"`,
+            // which renders as a leading-space " hook" — a malformed row
+            // dressed up as an actionable invocation.
+            let ns = display_safe(v.get("namespace").and_then(Value::as_str)?);
+            let sub = display_safe(v.get("subcommand").and_then(Value::as_str)?);
+            let (ns, sub) = (ns.trim(), sub.trim());
+            if ns.is_empty() || sub.is_empty() {
+                return None;
+            }
+            Some(format!("{ns} {sub}"))
         })
-        .filter(|pair| !pair.trim().is_empty())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .take(MAX_SUBCOMMANDS)
@@ -803,6 +812,25 @@ mod tests {
         let r = recency_from(rows, "2026-07-01T00:00:00Z", "version_mismatch", "1.0.0")
             .expect("rows are in window");
         assert_eq!(r.subcommands, vec!["ns live"]);
+    }
+
+    #[test]
+    fn recency_subcommands_reject_half_empty_pairs() {
+        // An empty namespace with a real subcommand renders as " hook" — a
+        // malformed row dressed up as an actionable invocation. Each half is
+        // validated on its own, so neither shape survives.
+        let rows = concat!(
+            r#"{"reason":"version_mismatch","namespace":"","subcommand":"hook","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:00Z"}"#,
+            "\n",
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"   ","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:01Z"}"#,
+            "\n",
+            r#"{"reason":"version_mismatch","namespace":"ns","subcommand":"real","binaryVersion":"1.0.0","ts":"2026-07-25T00:00:02Z"}"#,
+            "\n",
+        );
+
+        let r = recency_from(rows, "2026-07-01T00:00:00Z", "version_mismatch", "1.0.0")
+            .expect("rows are in window");
+        assert_eq!(r.subcommands, vec!["ns real"]);
     }
 
     #[test]

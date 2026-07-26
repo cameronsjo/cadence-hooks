@@ -1085,12 +1085,27 @@ fn failopen_findings(
              recognize something a plugin expects"
                 .to_string()
         } else {
+            // EVERY pair, not just the first. The diagnosis names up to four,
+            // and an operator following a one-pair grep fixes one inert
+            // hooks.json and leaves the rest inert — the multi-pair case is
+            // precisely the skew #183 exists to resolve.
+            //
+            // `-F` with repeated `-e`: fixed strings, so a subcommand carrying
+            // a regex metacharacter cannot widen the search to everything, and
+            // no alternation needs escaping. The full `namespace subcommand`
+            // pair is the needle because that is how a hooks.json line spells
+            // the invocation.
+            let needles = missing
+                .iter()
+                .map(|pair| format!("-e {}", shell_single_quote(pair)))
+                .collect::<Vec<_>>()
+                .join(" ");
             format!(
                 "grep the installed plugins for the named invocation(s) — \
-                 `grep -rl {} ~/.claude/plugins/cache` finds the hooks.json \
-                 that is inert; either upgrade this binary or drop the stale \
-                 wiring. `cadence-hooks list` shows what this build accepts",
-                shell_single_quote(missing[0].split(' ').next_back().unwrap_or(&missing[0]))
+                 `grep -rlF {needles} ~/.claude/plugins/cache` finds every \
+                 hooks.json that is inert; either upgrade this binary or drop \
+                 the stale wiring. `cadence-hooks list` shows what this build \
+                 accepts"
             )
         };
         findings.push(Finding {
@@ -3030,10 +3045,15 @@ mod tests {
         let d = &findings[0].diagnosis;
         assert!(d.contains("lab persona-gate"), "names the invocation: {d}");
         assert!(d.contains("lab persona-nudge"), "names both: {d}");
+        // The grep must cover EVERY named pair. A one-pair command leaves the
+        // operator fixing one inert hooks.json while the rest stay inert —
+        // the multi-pair case is the whole point of #183.
+        let r = &findings[0].remediation;
+        assert!(r.contains("grep -rlF"), "runnable fixed-string grep: {r}");
+        assert!(r.contains("-e 'lab persona-gate'"), "covers the first: {r}");
         assert!(
-            findings[0].remediation.contains("grep"),
-            "remediation is a runnable grep: {}",
-            findings[0].remediation
+            r.contains("-e 'lab persona-nudge'"),
+            "covers the second: {r}"
         );
     }
 

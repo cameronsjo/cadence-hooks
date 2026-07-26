@@ -721,6 +721,30 @@ mod tests {
         assert!(msg.contains("insights.jsonl"), "names the ledger: {msg}");
     }
 
+    // 17b. The basename-dedup merge path: the SAME file reached by both the dir
+    //      scan and an `extra` entry (what happens when CADENCE_METRICS_DIR is
+    //      pointed at the config dir's `cadence/`). Without the keying, one
+    //      ledger would be named twice in a single flatline verdict.
+    #[test]
+    fn extra_path_inside_scanned_dir_is_not_double_counted() {
+        let tmp = TempDir::new().unwrap();
+        write_jsonl_aged(tmp.path(), "insights.jsonl", 40);
+        write_jsonl_aged(tmp.path(), "sessions.jsonl", 0);
+        // Same file, reached the second way.
+        let extra = vec![tmp.path().join("insights.jsonl")];
+
+        let verdict = telemetry_verdict(tmp.path(), &extra, FOUR_DAYS, SystemTime::now()).unwrap();
+        let Verdict::Flatline(report) = verdict else {
+            panic!("expected Flatline, got {verdict:?}");
+        };
+        let names: Vec<&str> = report.streams.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["insights.jsonl"],
+            "one ledger, named once — not once per route"
+        );
+    }
+
     // 18. A missing extra path is skipped, not fatal — the machine may simply
     //     never have captured an insight.
     #[test]
