@@ -527,12 +527,15 @@ fn lexical_normalize(path: &str) -> String {
     // `c:\primary` must fold to the same string or the in-chain dismiss map's
     // string-equality lookup stops matching one of the two spellings.
     let bytes = path.as_bytes();
+    // Borrowed, not lowercased here — the whole result is lowercased once on
+    // the way out below, so lowercasing this slice too would just be a
+    // discarded allocation.
     let windows_drive = (bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && (bytes[2] == b'/' || bytes[2] == b'\\'))
-        .then(|| path[..1].to_ascii_lowercase());
-    let body_src = windows_drive.as_ref().map_or(path, |_| &path[3..]);
+        .then(|| &path[..1]);
+    let body_src = windows_drive.map_or(path, |_| &path[3..]);
     let absolute = windows_drive.is_some() || body_src.starts_with('/');
     // Backslash is only ever a separator once a Windows drive prefix has
     // already identified the string as a native Windows path — a bare POSIX
