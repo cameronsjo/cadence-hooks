@@ -126,6 +126,141 @@ pub fn utc_timestamp() -> String {
     cadence_hooks_core::time::utc_timestamp()
 }
 
+/// Strip display-affecting characters from a file-sourced string before it is
+/// interpolated into terminal output or into the `additionalContext` blob a
+/// nudge injects into the agent's context.
+///
+/// Two families, not one. `char::is_control` covers only **Cc** — C0, DEL, C1 —
+/// which handles ANSI escapes and newlines. It passes **Cf** (format)
+/// characters, and those reorder rendered text without being "control"
+/// characters at all: U+202E RIGHT-TO-LEFT OVERRIDE and the U+2066–U+2069
+/// directional isolates are the Trojan-Source primitives. U+2028/U+2029 are
+/// line/paragraph separators that some renderers break on. Strip all of them.
+///
+/// **The agent-context sink is the strict one.** A terminal reader sees a
+/// mangled line; an injected newline in `additionalContext` starts what reads
+/// as a new instruction. Anything file-sourced — a ledger field, a filename —
+/// must pass through here before it reaches either sink.
+pub fn display_safe(s: &str) -> String {
+    s.chars().filter(|c| !is_display_unsafe(*c)).collect()
+}
+
+/// Whether `c` can alter how the rest of a line renders, or ride into an
+/// agent's context invisibly: any Cc control, any Cf format character, or the
+/// Unicode line/paragraph separators.
+///
+/// Cf is matched by explicit ranges rather than a Unicode-property crate — this
+/// stays dependency-free — but the enumeration is deliberately the **whole**
+/// category, not just the famous blocks. Partial coverage is the trap: the
+/// obvious primitives (U+202E, the isolates) protect a *terminal*, while the
+/// primitive that matters for the agent-context sink is the **Tags** block
+/// (U+E0000–U+E007F). `U+E0001` plus `U+E0020`–`U+E007F` encodes arbitrary
+/// ASCII that renders as nothing at all yet survives into `additionalContext`
+/// and through most tokenizers — invisible text smuggling, and it is Cf, so
+/// `is_control` passes it and no bidi-shaped range catches it.
+///
+/// So the list below is maintained against the Unicode Cf category as a whole.
+/// If a future Unicode release adds a Cf block, it belongs here. `is_control`
+/// already covers Cc.
+fn is_display_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{2028}' | '\u{2029}'          // line / paragraph separator
+            | '\u{00AD}'                      // soft hyphen
+            | '\u{0600}'..='\u{0605}'         // Arabic number signs
+            | '\u{061C}'                      // Arabic letter mark
+            | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'         // Arabic pound / piastre marks
+            | '\u{08E2}'
+            | '\u{180E}'                      // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}'         // zero-width space … RTL mark
+            | '\u{202A}'..='\u{202E}'         // bidi embeddings + OVERRIDE
+            | '\u{2060}'..='\u{2064}'         // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}'         // directional isolates
+            | '\u{206A}'..='\u{206F}'         // deprecated format controls
+            | '\u{FEFF}'                      // zero-width no-break space (BOM)
+            | '\u{FFF9}'..='\u{FFFB}'         // interlinear annotation
+            | '\u{110BD}' | '\u{110CD}'       // Kaithi number sign
+            | '\u{13430}'..='\u{1343F}'       // Egyptian hieroglyph format
+            | '\u{1BCA0}'..='\u{1BCA3}'       // shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}'       // musical beam / phrase controls
+            | '\u{E0000}'..='\u{E007F}'       // TAGS — invisible text smuggling
+        )
+}
+
+/// [`display_safe`] plus a character ceiling — filtering alone bounds the
+/// *character set* but not the *length*, and an unbounded file-sourced string
+/// can still flood a terminal line or a nudge.
+///
+/// Truncation counts **characters, not bytes**, and slices at the boundary
+/// `char_indices` reports — a byte slice at a fixed offset would panic
+/// mid-codepoint on a multi-byte value, which inside a fail-open writer would
+/// be a panic on the panic path.
+pub fn display_safe_bounded(s: &str, max_chars: usize) -> String {
+    let cleaned = display_safe(s);
+    match cleaned.char_indices().nth(max_chars) {
+        Some((boundary, _)) => format!("{}…", &cleaned[..boundary]),
+        None => cleaned,
+    }
+}
+
+/// The character a run of disallowed bytes collapses to in [`filename_safe`].
+/// Deliberately not something a real ledger name contains, so a sanitized name
+/// can never be mistaken for — or collide with — a legitimate one.
+const FILENAME_REPLACEMENT: char = '?';
+
+/// An **allowlist** sanitizer for a value that is a *name*, not prose: keeps
+/// `[A-Za-z0-9._-]`, collapses every run of anything else to a single
+/// [`FILENAME_REPLACEMENT`], and bounds the result.
+///
+/// **Why a second sanitizer rather than reusing [`display_safe`].** That one is
+/// a denylist over the Cc and Cf categories, and a denylist cannot close this
+/// class for two structural reasons:
+///
+/// 1. **The invisible-smuggling primitive is not confined to Cf.** Variation
+///    selectors — U+FE00–U+FE0F and U+E0100–U+E01EF — are category **Mn**, so a
+///    Cf-complete enumeration misses them *by construction*. They encode
+///    invisible bytes exactly the way the Tags block does. Chasing that with
+///    more denied ranges is a race against Unicode itself.
+/// 2. **Stripping invisibles does not stop visible prose.** A name is
+///    attacker-chosen text landing inside a sentence in the agent's context;
+///    removing newlines demotes a fake system turn to an inline instruction, it
+///    does not remove it. The allowlist excludes the SPACE character, so smuggled
+///    prose arrives as `Disregard?the?above` — visibly mangled rather than
+///    fluent.
+///
+/// Real ledger names (`commits.jsonl`, `askuserquestion.jsonl`) satisfy the
+/// allowlist exactly, so the constraint costs nothing on every legitimate input.
+///
+/// Runs collapse rather than delete, which also keeps the result **injective
+/// enough**: deleting would map `commits\u{200B}.jsonl` onto the real
+/// `commits.jsonl`, merging a hostile entry with a live one and letting a dead
+/// stream read as alive. Replacement keeps them distinct.
+///
+/// Use [`display_safe`] instead for diagnostic *prose* (an error message), where
+/// spaces and punctuation are legitimate content.
+pub fn filename_safe(s: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max_chars));
+    let mut chars = 0usize;
+    let mut in_run = false;
+    for c in s.chars() {
+        if chars >= max_chars {
+            out.push('…');
+            break;
+        }
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            out.push(c);
+            chars += 1;
+            in_run = false;
+        } else if !in_run {
+            out.push(FILENAME_REPLACEMENT);
+            chars += 1;
+            in_run = true;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Schema versioning (the metrics data contract)
 // ---------------------------------------------------------------------------
