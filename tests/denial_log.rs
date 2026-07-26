@@ -116,6 +116,54 @@ fn block_writes_one_privacy_safe_deny_row() {
 }
 
 #[test]
+fn nudge_writes_one_row_by_default() {
+    // The #420 default flip, proven through the built binary: with
+    // CADENCE_LOG_NUDGES unset (the harness strips it), a nudging check must
+    // append one decision:"nudge" row. warn-branch-base nudges deterministically
+    // on this payload — pure command tokenization, no git state required
+    // (verified from a non-git cwd).
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    // Build via serde_json so the cwd is JSON-escaped — a raw format! left
+    // Windows path backslashes unescaped, the binary failed open on the
+    // malformed payload, and the test failed only on Windows CI.
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git checkout -b probe-branch probe-base"},
+        "session_id": "itnudge",
+        "cwd": cwd,
+    })
+    .to_string();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["guardrails", "warn-branch-base"]);
+    cmd.env("CADENCE_METRICS_DIR", tmp.path());
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn binary");
+    if let Some(ref mut stdin) = child.stdin {
+        match stdin.write_all(payload.as_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("failed to write child stdin: {e}"),
+        }
+    }
+    let out = child.wait_with_output().expect("failed to wait on binary");
+
+    assert_eq!(out.status.code(), Some(0), "a nudge is advisory — exit 0");
+    let rows = denial_rows(tmp.path());
+    assert_eq!(
+        rows.len(),
+        1,
+        "default-on must write the nudge row: {rows:?}"
+    );
+    assert_eq!(rows[0]["decision"], "nudge");
+    assert_eq!(rows[0]["hook"], "warn-branch-base");
+}
+
+#[test]
 fn logging_does_not_perturb_the_block_when_write_fails() {
     // Byte-identity: the block's stderr and exit code must be the same whether
     // the denial write succeeds (writable dir) or fail-opens (unwritable dir).
