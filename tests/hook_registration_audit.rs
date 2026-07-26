@@ -240,6 +240,21 @@ const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("cadence-obsidian", "obsidian")];
 /// Currently empty: cadence-canon landed and wires the `session` group.
 const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 
+/// Individual hooks whose plugin group *is* wired but whose own hooks.json entry
+/// lands in a separate, later PR. Unlike [`PENDING_PLUGIN_GROUPS`], the exemption
+/// cannot key off directory existence — the plugin directory is present and
+/// wiring every other hook in the group — so each entry is held by hand and
+/// removed in the wiring PR named beside it.
+///
+/// A hook belongs here only while it is deliberately inert: registered in the
+/// binary so the wiring PR has something to point at, and reaching no event
+/// until that PR lands.
+/// (`<plugin> <subcommand>`, tracking_reference)
+const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[(
+    "guardrails inject-gh-write-context",
+    "cameronsjo/cadence#653",
+)];
+
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
 const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
@@ -621,9 +636,18 @@ fn all_binary_subcommands_are_registered() {
         .map(|(group, _)| *group)
         .collect();
 
+    // Individually exempted hooks awaiting their own wiring PR. Keyed by full
+    // `<plugin> <subcommand>` rather than group, so the rest of a wired group
+    // stays audited while one hook is in flight.
+    let pending_wiring: BTreeSet<&str> = PENDING_WIRING_HOOKS
+        .iter()
+        .map(|(command, _)| *command)
+        .collect();
+
     let unregistered: Vec<&String> = binary_cmds
         .iter()
         .filter(|cmd| !registered.contains(*cmd))
+        .filter(|cmd| !pending_wiring.contains(cmd.as_str()))
         .filter(|cmd| {
             let group = cmd.split_whitespace().next().unwrap_or("");
             !shell_plugin_groups.contains(group) && !pending_groups.contains(group)
@@ -634,6 +658,8 @@ fn all_binary_subcommands_are_registered() {
         unregistered.is_empty(),
         "registered hooks not wired in any hooks.json:\n{}\n\n\
          Note: {} plugin(s) still use shell wrappers and are excluded from this check.\n\
+         A hook whose wiring lands in a later PR goes in PENDING_WIRING_HOOKS with \
+         its tracking reference, and comes back out in that PR.\n\
          {STALE_CHECKOUT_HINT}",
         unregistered
             .iter()
