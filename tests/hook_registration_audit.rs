@@ -275,6 +275,15 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
         "session persist-plan",
         "must ride the always-on cadence plugin; `session` is its clap namespace",
     ),
+    // Same rationale as its sibling above: the approval hook rides the
+    // always-on cadence plugin while `session` owns plan/session state.
+    // Wiring shipped in the cadence monorepo without this entry, leaving the
+    // audit red for any workspace with a current sibling checkout (#460).
+    (
+        "cadence",
+        "session persist-plan-approval",
+        "must ride the always-on cadence plugin; `session` is its clap namespace",
+    ),
     // Predates the monorepo consolidation (present in canon's manifest at the
     // subtree-add commit f61b5f6), canon is its only registrar anywhere, and it
     // sits in canon's SessionStart block beside `session start` and `session
