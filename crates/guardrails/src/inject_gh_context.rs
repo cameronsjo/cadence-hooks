@@ -23,12 +23,23 @@ impl Check for InjectGhContext {
     }
 
     fn run(&self, _input: &HookInput) -> CheckResult {
-        let owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
-        let repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
-        let extras = env_extra_hosts();
-        let default = default_host();
-        CheckResult::nudge(render_context(&owners, &repos, &extras, &default))
+        CheckResult::nudge(render_from_env())
     }
+}
+
+/// Read the allowlist env vars and render the context message.
+///
+/// The one place the renderer's four inputs are assembled, so the SessionStart
+/// injector and its just-in-time twin
+/// ([`inject_gh_write_context`](super::inject_gh_write_context)) cannot drift:
+/// a fifth input added here reaches both, where two hand-copied call sites
+/// would leave the twin quietly rendering a staler message.
+pub fn render_from_env() -> String {
+    let owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
+    let repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
+    let extras = env_extra_hosts();
+    let default = default_host();
+    render_context(&owners, &repos, &extras, &default)
 }
 
 /// Pure renderer: build the SessionStart context message from a parsed

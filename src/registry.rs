@@ -263,6 +263,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "guardrails",
         event: Some(HookEvent::SessionStart),
     },
+    HookEntry {
+        name: "inject-gh-write-context",
+        description: "Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
     // rules
     HookEntry {
         name: "validate-frontmatter",
