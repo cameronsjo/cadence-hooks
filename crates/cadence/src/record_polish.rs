@@ -159,8 +159,8 @@ pub fn run_record(repo_root: Option<String>, branch: Option<String>, scope: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::with_marker_dir;
     use cadence_hooks_core::markers::polish_marker;
+    use cadence_hooks_core::test_builders::with_marker_dir;
 
     #[test]
     fn marker_content_is_parseable_json_with_all_fields() {
