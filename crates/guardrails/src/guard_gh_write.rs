@@ -85,7 +85,12 @@ static GIST_COMMAND: LazyLock<Regex> =
 static REPO_FORK_COMMAND: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+repo\s+fork\b").expect("pattern should compile"));
 
-fn is_write_command(command: &str) -> bool {
+/// True when `command` names a `gh` sub-command that mutates GitHub state.
+///
+/// `pub(crate)` so [`inject_gh_write_context`](super::inject_gh_write_context)
+/// decides "is this a write?" from the same patterns this guard enforces —
+/// a second definition would drift the nudge away from the block.
+pub(crate) fn is_write_command(command: &str) -> bool {
     WRITE_ACTIONS.is_match(command)
         || WRITE_ACTIONS_EXTRA.is_match(command)
         || API_WRITE_METHOD.is_match(command)
@@ -99,7 +104,7 @@ fn is_write_command(command: &str) -> bool {
 /// mirroring `loop_analysis::extract_repo_flag`, which does the same over
 /// parsed AST words. Values keep their quotes trimmed so `--repo "o/r"`
 /// resolves to `o/r`.
-fn extract_repo_flag_str(command: &str) -> Option<String> {
+pub(crate) fn extract_repo_flag_str(command: &str) -> Option<String> {
     let trim_value = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
     let words: Vec<&str> = command.split_whitespace().collect();
     let mut iter = words.iter();
@@ -527,8 +532,23 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
 /// word is `eval`, re-tokenize its argument so the wrapped write is still seen;
 /// a plain `git commit -m "…gh…"` message is not `eval`, so the #212 prose case
 /// stays allowed.
-fn segment_invokes_gh(segment: &str) -> bool {
+pub(crate) fn segment_invokes_gh(segment: &str) -> bool {
     segment_invokes_gh_depth(segment, 0)
+}
+
+/// True when a segment carries no explicit write target — no `-R`/`--repo`
+/// flag, and none of the sub-command shapes that name the repo positionally.
+///
+/// The complement of the first three arms of [`resolve_target_repo`], expressed
+/// as a predicate rather than a resolution: the JIT nudge only needs to know
+/// *whether* a target was spelled out, not what it resolves to. Kept beside the
+/// patterns it reads so a new positional-target shape lands in one file.
+pub(crate) fn segment_lacks_explicit_target(segment: &str) -> bool {
+    extract_repo_flag_str(segment).is_none()
+        && !API_REPOS.is_match(segment)
+        && !REPO_SUBCOMMAND.is_match(segment)
+        && !GIST_COMMAND.is_match(segment)
+        && !REPO_FORK_COMMAND.is_match(segment)
 }
 
 /// `eval` nesting is peeled at most this deep before the argument is treated as

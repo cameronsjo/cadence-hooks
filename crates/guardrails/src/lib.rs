@@ -37,6 +37,8 @@ pub mod guard_read_model;
 pub mod guard_rm;
 /// Inject the gh-write allowlist + `-R` rule on SessionStart.
 pub mod inject_gh_context;
+/// Re-inject the gh-write allowlist + `-R` rule just before an untargeted gh write.
+pub mod inject_gh_write_context;
 /// Shared closing-keyword detection for GitHub issue references.
 pub mod issue_refs;
 /// Shared message text duplicated across guardrails call sites (cadence-hooks#327).
