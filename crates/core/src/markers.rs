@@ -225,13 +225,6 @@ pub fn polish_marker_present(command: &str, cwd: Option<&str>) -> bool {
 /// name is still reduced to `[A-Za-z0-9_-]` so the primitive cannot escape
 /// [`marker_dir`] whatever a future call site passes.
 pub fn daily_marker(kind: &str) -> PathBuf {
-    marker_dir().join(daily_marker_name(kind))
-}
-
-/// The bare filename half of [`daily_marker`], so a caller that already resolved
-/// [`marker_dir`] can join it without resolving (and re-hardening) the directory
-/// a second time.
-fn daily_marker_name(kind: &str) -> String {
     let safe: String = kind
         .chars()
         .map(|c| {
@@ -242,7 +235,7 @@ fn daily_marker_name(kind: &str) -> String {
             }
         })
         .collect();
-    format!("daily-{safe}")
+    marker_dir().join(format!("daily-{safe}"))
 }
 
 /// True on the first sighting of `token` for `kind` today — the once-per-day
@@ -280,11 +273,10 @@ pub fn claim_today(kind: &str, token: &str) -> bool {
     if std::env::var("CADENCE_NO_DAILY_GATE").is_ok_and(|v| !v.is_empty()) {
         return true;
     }
-    let dir = marker_dir();
-    if dir == marker_base_from(std::env::var("CADENCE_MARKER_DIR").ok()) {
+    if !marker_dir_is_private() {
         return true;
     }
-    let path = dir.join(daily_marker_name(kind));
+    let path = daily_marker(kind);
     let stamp = format!("{} {token}", crate::time::local_date());
     if std::fs::read_to_string(&path).is_ok_and(|existing| existing.trim() == stamp) {
         return false;

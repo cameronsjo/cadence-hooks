@@ -26,19 +26,32 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// other marker-dir-mutating test in the same test binary via [`ENV_LOCK`] —
 /// keeps marker-writing tests out of the real per-user production marker
 /// directory (#302) and off each other's state (#369).
-pub fn with_marker_dir<F: FnOnce()>(dir: &Path, f: F) {
+///
+/// **Panic-safe, and restores rather than clears.** A failing wrapped test
+/// unwinds, so a bare `set_var` … `f()` … `remove_var` sequence would skip the
+/// restore and leak `CADENCE_MARKER_DIR` into every test that ran afterward in
+/// the same binary — one red test silently redirecting the rest. `f` therefore
+/// runs under `catch_unwind` with the panic resumed after cleanup, and the
+/// *prior* value is put back (not merely removed), so a nested or outer
+/// override survives. Returning `T` lets a caller pass a value out of the
+/// critical section instead of smuggling it through a captured `Cell`.
+pub fn with_marker_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let prior = std::env::var("CADENCE_MARKER_DIR").ok();
     // SAFETY: serialized against every other env-mutating test in this binary
-    // via ENV_LOCK.
+    // via ENV_LOCK; restored below on both the normal and unwinding exit.
     unsafe {
         std::env::set_var("CADENCE_MARKER_DIR", dir);
     }
-    f();
-    // SAFETY: serialized against every other env-mutating test in this binary
-    // via ENV_LOCK.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    // SAFETY: the same lock is still held; this restores the prior state.
     unsafe {
-        std::env::remove_var("CADENCE_MARKER_DIR");
+        match prior {
+            Some(v) => std::env::set_var("CADENCE_MARKER_DIR", v),
+            None => std::env::remove_var("CADENCE_MARKER_DIR"),
+        }
     }
+    result.unwrap_or_else(|e| std::panic::resume_unwind(e))
 }
 
 /// Build a `HookInput` for a `Bash` tool invocation.

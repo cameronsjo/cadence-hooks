@@ -734,31 +734,18 @@ mod tests {
     // just a duplicate. `use super::*` brings both into scope in this module.
 
     // --- CADENCE_MARKER_DIR (process-global — serialized + restored) ---
-
-    /// Serializes tests that mutate `CADENCE_MARKER_DIR`, a separate lock from
-    /// `ENV_LOCK` above since the two env vars never race each other. Any test
-    /// that reaches the nudge point now also writes a session marker (#370) —
-    /// isolate it to a scratch tempdir so `cargo test` never writes into the
-    /// real per-user marker directory (the exact #302/#269 class of bug).
-    static MARKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_marker_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = MARKER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prior = std::env::var("CADENCE_MARKER_DIR").ok();
-        // SAFETY: serialized via MARKER_ENV_LOCK; restored below.
-        unsafe {
-            std::env::set_var("CADENCE_MARKER_DIR", dir);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        // SAFETY: same lock still held; restoring prior state.
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("CADENCE_MARKER_DIR", v),
-                None => std::env::remove_var("CADENCE_MARKER_DIR"),
-            }
-        }
-        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
-    }
+    //
+    // Any test that reaches the nudge point also writes a session marker
+    // (#370), so it is isolated to a scratch tempdir and `cargo test` never
+    // writes into the real per-user marker directory (the #302/#269 class).
+    //
+    // This module used to carry its own `MARKER_ENV_LOCK` + `with_marker_dir`.
+    // Both are gone: `CADENCE_MARKER_DIR` is one process-global, so it gets ONE
+    // lock and ONE helper workspace-wide (#446) — a private copy here serializes
+    // only against this module and races every other crate's marker tests in the
+    // same binary. The panic-safe catch_unwind + restore-prior shape this copy
+    // pioneered was promoted into the shared helper rather than lost.
+    use cadence_hooks_core::test_builders::with_marker_dir;
 
     #[test]
     fn resolve_harness_falls_back_to_ai_agent_env_when_transcript_absent() {
