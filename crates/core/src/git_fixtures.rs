@@ -459,6 +459,35 @@ mod tests {
     // machine's REAL `$CARGO_HOME` (`Drop` only removes the `{tag}-{pid}`
     // leaf, so the `cadence-hooks-test-scratch` parent accumulates forever).
     // Verified on this machine: it did (cadence-hooks#403 code review).
+    //
+    // The "this candidate must look carved-out" tests below anchor on
+    // `std::env::temp_dir()`, not a hardcoded `/tmp/...` literal — a Unix
+    // literal is meaningless on Windows, twice over (Windows CI red on
+    // PR#507): `path_under_temp_root`'s fixed check hardcodes `/tmp` and
+    // `/private/tmp` only, and `canonicalize_nearest_existing` walks a
+    // non-existent Unix-style literal up to a REAL, drive-qualified Windows
+    // ancestor that doesn't match either — so `escapes_carveout` returned
+    // true for the "carved-out" default on Windows, and the function
+    // short-circuited there without ever reaching the branch under test.
+    // Anchoring on the real temp dir and passing it as `tmpdir` too routes
+    // through the portable `via_env` check on every platform, the same
+    // mechanism that already handles macOS's `/var` vs `/private/var` split.
+
+    /// A directory guaranteed to be recognized as under a carve-out (temp
+    /// root) on ANY platform — see the comment above.
+    fn temp_carveout_root(tag: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join("git-fixtures-carveout-portability-check")
+            .join(tag)
+    }
+
+    /// The `tmpdir` value to pair with [`temp_carveout_root`], so
+    /// `path_under_temp_root_with_canonical`'s `via_env` branch recognizes
+    /// paths built from it — the same real, resolvable directory on every
+    /// platform, unlike a hardcoded `/tmp` literal.
+    fn temp_carveout_tmpdir() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
 
     #[test]
     fn resolve_uses_the_default_when_it_escapes_the_carveout() {
@@ -469,10 +498,11 @@ mod tests {
 
     #[test]
     fn resolve_override_wins_when_default_is_carved_out() {
+        let tmpdir = temp_carveout_tmpdir();
         let dir = resolve_scratch_dir_with(
-            Path::new("/tmp/checkout/target/scratch"),
+            &temp_carveout_root("override-wins"),
             "tag",
-            None,
+            Some(&tmpdir),
             Some(Path::new("/Users/dev/.cargo/cadence-hooks-test-scratch")),
             Some(Path::new("/Users/dev/.cargo/should-not-be-used")),
         );
@@ -485,10 +515,11 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_cargo_home_when_default_is_temp_and_no_override() {
+        let tmpdir = temp_carveout_tmpdir();
         let dir = resolve_scratch_dir_with(
-            Path::new("/tmp/checkout/target/scratch"),
+            &temp_carveout_root("cargo-home-fallback"),
             "tag",
-            None,
+            Some(&tmpdir),
             None,
             Some(Path::new("/Users/dev/.cargo")),
         );
@@ -521,10 +552,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "CADENCE_HOOKS_TEST_SCRATCH_ROOT")]
     fn resolve_panics_when_nothing_escapes_the_carveout() {
+        let tmpdir = temp_carveout_tmpdir();
         let _ = resolve_scratch_dir_with(
-            Path::new("/tmp/checkout/target/scratch"),
+            &temp_carveout_root("nothing-escapes"),
             "tag",
-            None,
+            Some(&tmpdir),
             None,
             None,
         );
@@ -533,11 +565,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "itself sits under a carve-out")]
     fn resolve_panics_when_the_override_itself_is_carved_out() {
+        let tmpdir = temp_carveout_tmpdir();
+        let bad_override = temp_carveout_root("bad-override");
         let _ = resolve_scratch_dir_with(
-            Path::new("/tmp/checkout/target/scratch"),
+            &temp_carveout_root("default"),
             "tag",
-            None,
-            Some(Path::new("/tmp/bad-override")),
+            Some(&tmpdir),
+            Some(&bad_override),
             None,
         );
     }
@@ -550,12 +584,14 @@ mod tests {
         // `None`) — so the "nothing escapes" panic path was pinned only for
         // a missing `$CARGO_HOME`, not a carved-out one. Both must panic;
         // this exercises the other branch (cadence-hooks#403 code review).
+        let tmpdir = temp_carveout_tmpdir();
+        let carved_out_cargo_home = temp_carveout_root("carved-out-cargo-home");
         let _ = resolve_scratch_dir_with(
-            Path::new("/tmp/checkout/target/scratch"),
+            &temp_carveout_root("default"),
             "tag",
+            Some(&tmpdir),
             None,
-            None,
-            Some(Path::new("/tmp/carved-out-cargo-home")),
+            Some(&carved_out_cargo_home),
         );
     }
 
