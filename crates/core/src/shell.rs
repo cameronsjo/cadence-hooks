@@ -1054,11 +1054,19 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
 /// Quote characters are preserved within each segment; segments are trimmed and
 /// empty segments dropped.
 ///
+/// Backslash escapes are honored the same way [`tokenize`] honors them, because
+/// a splitter that disagrees with the tokenizer hands a guard a boundary the
+/// shell does not have (#475). Two consequences: a backslash-newline is a line
+/// continuation, so the command flows across it into ONE segment rather than
+/// being cut in two (`\r\n` too); and an escaped quote is a literal character,
+/// so `-m "he said \" && x"` stays one segment holding one argument instead of
+/// splitting at a `&&` the shell keeps inside the string.
+///
 /// Heredoc bodies are stripped first ([`strip_heredoc_bodies`]) so their prose
 /// does not become fake segments. This is otherwise syntactic splitting, not
-/// shell execution: it does not expand subshells (`$(…)`, backticks) or honor
-/// backslash escapes (consistent with [`tokenize`]). To also see inside
-/// `sh -c '…'` wrappers and command substitutions, use [`command_segments`].
+/// shell execution: it does not expand subshells (`$(…)`, backticks). To also
+/// see inside `sh -c '…'` wrappers and command substitutions, use
+/// [`command_segments`].
 pub fn split_segments(command: &str) -> Vec<String> {
     split_segments_with_ops(command)
         .into_iter()
@@ -1080,6 +1088,18 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
 
     while let Some(c) = chars.next() {
         if let Some(q) = quote {
+            // Inside `"…"`, `\` escapes `"` and `\` — the escaped character is
+            // content and does not close the string. [`tokenize`] already reads
+            // it that way; when this parser disagreed, an escaped quote ended a
+            // value here that the shell keeps open, so a `&&`/`;`/`|` still
+            // inside that one argument became a fake segment boundary and the
+            // text after it was handed to guards as a separate command (#475).
+            // `'…'` takes no escapes at all, so this applies to `"` only.
+            if q == '"' && c == '\\' && matches!(chars.peek(), Some('"' | '\\')) {
+                current.push(c);
+                current.push(chars.next().expect("peeked"));
+                continue;
+            }
             current.push(c);
             if c == q {
                 quote = None;
@@ -1087,6 +1107,33 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
             continue;
         }
         match c {
+            // Outside quotes a backslash escapes the next character: it opens
+            // no string and starts no operator, so both characters are consumed
+            // together. A backslash-newline is the shell's line continuation —
+            // it is removed and the command flows on — so it must not flush the
+            // segment. Cutting there put a posting verb in one segment and its
+            // `--body-file` in the next, which is how a whole class of
+            // multi-line commands escaped per-segment guards (#475).
+            '\\' => match chars.peek() {
+                Some('\n') => {
+                    chars.next();
+                }
+                Some('\r') => {
+                    chars.next();
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    } else {
+                        // A lone `\<CR>` is an ordinary escape, not a join.
+                        current.push('\\');
+                        current.push('\r');
+                    }
+                }
+                Some(_) => {
+                    current.push('\\');
+                    current.push(chars.next().expect("peeked"));
+                }
+                None => current.push('\\'),
+            },
             '\'' | '"' => {
                 quote = Some(c);
                 current.push(c);
@@ -1327,33 +1374,51 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
 ///    counts) are extracted and segmented too, so `echo $(cat .env)` and
 ///    `curl -d "$(cat .env)" …` surface the inner read.
 /// 3. **Visible assignments** — a `VAR=value` / `export VAR=value` assignment
-///    present in the command resolves later `$VAR`/`${VAR}` references, so
+///    resolves `$VAR`/`${VAR}` references in the segments that FOLLOW it, so
 ///    `OP_CMD=op; $OP_CMD item list` is seen as `op item list`. An
 ///    environment-sourced variable stays unresolved (fail open).
+///
+///    Order matters and is honored: an assignment reaches only later segments,
+///    never earlier ones and never its own. `cmd $F || F=/etc/passwd` leaves
+///    `$F` literal, because the shell running that line would too — expanding
+///    it invented an operand for `cmd`, and a guard that opens a file named by
+///    such an operand performs I/O the real command never would.
 ///
 /// The wrapper/substitution source segment is still included, so a guard sees
 /// both the literal invocation and the command(s) it will run. This is the
 /// "every command that will actually execute" view.
 pub fn command_segments(command: &str) -> Vec<String> {
-    let assignments = collect_assignments(command);
     let mut out = Vec::new();
-    expand_segments(command, &assignments, 0, &mut out);
+    let mut assignments: Vec<(String, String)> = Vec::new();
+    expand_segments(command, &mut assignments, 0, &mut out);
     out
 }
 
-/// Recursive worker for [`command_segments`].
+/// Recursive worker for [`command_segments`]. `assignments` accumulates in
+/// execution order as segments are walked, so each segment only ever sees the
+/// assignments that precede it.
 fn expand_segments(
     command: &str,
-    assignments: &[(String, String)],
+    assignments: &mut Vec<(String, String)>,
     depth: usize,
     out: &mut Vec<String>,
 ) {
     for segment in split_segments(command) {
         let segment = apply_assignments(&segment, assignments);
+        // Recorded AFTER this segment is expanded: a shell expands a word
+        // before the assignment on that same line takes effect, so `F=new cmd
+        // $F` passes the OLD `$F`.
+        if let Some(pair) = segment_assignment(&segment) {
+            assignments.push(pair);
+        }
         match shell_c_argument(&segment) {
             Some(inner) if depth < MAX_WRAPPER_DEPTH => {
                 out.push(segment);
-                expand_segments(&inner, assignments, depth + 1, out);
+                // A child shell inherits what is set so far, but its own
+                // assignments die with the subshell — recurse on a snapshot so
+                // they cannot reach the parent's later segments.
+                let mut scope = assignments.clone();
+                expand_segments(&inner, &mut scope, depth + 1, out);
             }
             _ => {
                 // Substitution recursion shares the wrapper-nesting budget, so
@@ -1363,7 +1428,9 @@ fn expand_segments(
                 // wrapper segment, and three levels is already generous.
                 if depth < MAX_WRAPPER_DEPTH {
                     for body in substitution_bodies(&segment) {
-                        expand_segments(&body, assignments, depth + 1, out);
+                        // A substitution is its own subshell too — snapshot.
+                        let mut scope = assignments.clone();
+                        expand_segments(&body, &mut scope, depth + 1, out);
                     }
                 }
                 out.push(segment);
@@ -1484,28 +1551,20 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
     bodies
 }
 
-/// Collect `VAR=value` and `export VAR=value` assignments visible in the
-/// command — both standalone segments and the leading assignment of a command
-/// (`VAR=value cmd …`). The value's surrounding quotes are stripped via
-/// [`tokenize`]. Later [`apply_assignments`] substitutes these.
-fn collect_assignments(command: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for segment in split_segments(command) {
-        let tokens = tokenize(&segment);
-        let mut idx = 0;
-        if tokens.first().map(String::as_str) == Some("export") {
-            idx = 1;
-        }
-        if let Some(tok) = tokens.get(idx)
-            && let Some((name, value)) = tok.split_once('=')
-            && !name.is_empty()
-            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && !value.is_empty()
-        {
-            out.push((name.to_string(), value.to_string()));
-        }
+/// The `VAR=value` / `export VAR=value` assignment ONE segment makes — either a
+/// standalone segment or the leading assignment of a command (`VAR=value cmd
+/// …`). The value's surrounding quotes are stripped via [`tokenize`].
+/// [`expand_segments`] walks segments in order and feeds these to
+/// [`apply_assignments`], so an assignment is visible only downstream of itself.
+fn segment_assignment(segment: &str) -> Option<(String, String)> {
+    let tokens = tokenize(segment);
+    let idx = usize::from(tokens.first().map(String::as_str) == Some("export"));
+    let (name, value) = tokens.get(idx)?.split_once('=')?;
+    if name.is_empty() || value.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
     }
-    out
+    Some((name.to_string(), value.to_string()))
 }
 
 /// Replace `$VAR` / `${VAR}` references with their collected assignment values,
@@ -1538,8 +1597,10 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
             if braced && chars.get(j) == Some(&'}') {
                 j += 1;
             }
+            // Newest wins: `assignments` is append-ordered, so a re-assignment
+            // must be found before the value it replaced.
             if !name.is_empty()
-                && let Some((_, value)) = assignments.iter().find(|(n, _)| *n == name)
+                && let Some((_, value)) = assignments.iter().rev().find(|(n, _)| *n == name)
             {
                 out.push_str(value);
                 i = j;
@@ -2297,6 +2358,99 @@ mod tests {
         assert_eq!(split_segments("echo x | grep y"), vec!["echo x", "grep y"]);
     }
 
+    // --- #475: backslash escapes must agree with `tokenize` ---
+
+    #[test]
+    fn split_segments_joins_backslash_newline_continuation() {
+        // The shell removes a backslash-newline and runs ONE command. Cutting
+        // there split a posting verb away from its own `--body-file` flag.
+        assert_eq!(
+            split_segments("gh issue create --repo o/r \\\n  --body-file /tmp/b.md"),
+            vec!["gh issue create --repo o/r   --body-file /tmp/b.md"]
+        );
+    }
+
+    #[test]
+    fn split_segments_joins_crlf_continuation() {
+        assert_eq!(
+            split_segments("gh pr create \\\r\n  --body hi"),
+            vec!["gh pr create   --body hi"]
+        );
+    }
+
+    #[test]
+    fn split_segments_bare_newline_still_splits() {
+        // Discriminating control for the two above: only a BACKSLASH-newline
+        // joins. A plain newline is still a segment boundary, so the joins are
+        // evidence of continuation handling, not of newline splitting breaking.
+        assert_eq!(
+            split_segments("gh pr create\n  --body hi"),
+            vec!["gh pr create", "--body hi"]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_backslash_before_newline_still_splits() {
+        // `\\` is an escaped backslash, so the newline after it is a real
+        // separator — the escape must be consumed as a pair, not read as the
+        // lead of a continuation.
+        assert_eq!(
+            split_segments("echo a\\\\\ngit status"),
+            vec!["echo a\\\\", "git status"]
+        );
+    }
+
+    #[test]
+    fn split_segments_continuation_inside_single_quotes_is_literal() {
+        // `'…'` takes no escapes: a backslash-newline inside one is literal
+        // text, and the quote already suppresses splitting either way.
+        assert_eq!(
+            split_segments("git commit -m 'a \\\n b'"),
+            vec!["git commit -m 'a \\\n b'"]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_quote_does_not_end_the_value() {
+        // The laundering case: `\"` inside `"…"` is content, so the `&&` is
+        // still inside one argument and creates no boundary. Real bash passes
+        // `he said " && cadence:attune here` as a single `-m` value.
+        assert_eq!(
+            split_segments("git commit -m \"he said \\\" && cadence:attune here\""),
+            vec!["git commit -m \"he said \\\" && cadence:attune here\""]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_quote_hides_no_semicolon_or_pipe() {
+        for op in [";", "|"] {
+            let cmd = format!("git commit -m \"he said \\\" {op} secret\"");
+            assert_eq!(split_segments(&cmd), vec![cmd.clone()], "operator {op}");
+        }
+    }
+
+    #[test]
+    fn split_segments_escaped_backslash_inside_quotes_still_closes() {
+        // `\\` is an escaped backslash, so the `"` after it DOES close the
+        // string and the following `&&` is a real operator. Control proving the
+        // escape handling is selective rather than swallowing every backslash.
+        assert_eq!(
+            split_segments("echo \"a\\\\\" && git status"),
+            vec!["echo \"a\\\\\"", "git status"]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_quote_outside_quotes_opens_nothing() {
+        // Matches `tokenize_escaped_quote_outside_quotes_opens_nothing`: a
+        // `\"` in unquoted context is a literal character, so a later `&&` is
+        // still an operator rather than string content.
+        assert_eq!(
+            split_segments("echo \\\" && git status"),
+            vec!["echo \\\"", "git status"]
+        );
+    }
+
     // --- clobber_redirect_targets ---
 
     #[test]
@@ -2626,6 +2780,48 @@ mod tests {
         // Environment-sourced variable — no visible assignment, stays literal.
         let out = command_segments("$OP_CMD item list");
         assert!(out.contains(&"$OP_CMD item list".to_string()));
+    }
+
+    #[test]
+    fn command_segments_later_assignment_does_not_reach_back() {
+        // The shell expands `$F` before it ever reaches the `||` branch, so
+        // `$F` there is whatever the environment held — never `/etc/passwd`.
+        // Substituting it invented an operand the command never receives.
+        let out = command_segments("cat $F || F=/etc/passwd");
+        assert!(
+            out.contains(&"cat $F".to_string()),
+            "later assignment leaked backwards: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|s| s.contains("cat /etc/passwd")),
+            "later assignment leaked backwards: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_same_segment_assignment_does_not_self_resolve() {
+        // `F=new cmd $F` passes the OLD `$F`: the assignment takes effect for
+        // the command's environment, not for expanding its own words.
+        let out = command_segments("F=/etc/passwd cat $F");
+        assert!(
+            out.contains(&"F=/etc/passwd cat $F".to_string()),
+            "assignment resolved into its own segment: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_reassignment_uses_the_newest_value() {
+        // Append-ordered lookup must find the replacement, not the original.
+        let out = command_segments("F=first; F=second; cat $F");
+        assert!(out.contains(&"cat second".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_subshell_assignment_does_not_leak_out() {
+        // A `sh -c` script's own assignment dies with the subshell, so the
+        // parent's later `$F` stays unresolved.
+        let out = command_segments("sh -c 'F=/etc/passwd'; cat $F");
+        assert!(out.contains(&"cat $F".to_string()), "{out:?}");
     }
 
     #[test]

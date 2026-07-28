@@ -861,6 +861,111 @@ mod tests {
         assert_eq!(run(&cmd).outcome, Outcome::Allow);
     }
 
+    // --- Multi-line posting commands (#475) ---
+    //
+    // Per-segment scoping is only safe if a segment boundary means what the
+    // shell means by it. A backslash-newline is a continuation, not a
+    // boundary — cutting there put the posting verb in one segment and its
+    // `--body`/`--body-file` in the next, so the gate failed on the segment
+    // holding the body and nothing was scanned at all. Every case below is a
+    // shape a person writes by hand.
+
+    #[test]
+    fn continued_body_file_is_scanned() {
+        // The shape `cadence:creating-issue` MANDATES: `--body-file`, flags
+        // spread across continuation lines.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup naming cadence:attune").unwrap();
+        let cmd = format!(
+            "gh issue create --repo cameronsjo/cadence-hooks \\\n  --title \"issue title\" \\\n  --body-file {}",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn continued_literal_body_is_scanned() {
+        assert_eq!(
+            run("gh pr create \\\n  --title t \\\n  --body \"see cadence:attune\"").outcome,
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn continued_heredoc_in_substitution_is_scanned() {
+        // The `--body "$(cat <<'EOF' … EOF)"` form, reached over a
+        // continuation. The heredoc rides inside the quoted value, so
+        // segmentation must neither cut at the continuation nor at the body's
+        // own newlines.
+        let cmd = "gh pr create \\\n  --body \"$(cat <<'EOF'\nRefactored per cadence:attune today.\nEOF\n)\"";
+        assert_eq!(run(cmd).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn continued_body_with_crlf_is_scanned() {
+        assert_eq!(
+            run("gh pr create \\\r\n  --body \"see cadence:attune\"").outcome,
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn bare_newline_between_commands_still_scopes_per_command() {
+        // Discriminating control for the four above: a plain newline IS a
+        // boundary, so the non-posting neighbour's body stays unscanned. Were
+        // continuations handled by simply not splitting on newlines, this
+        // would nudge.
+        assert_eq!(
+            run("gh secret set NAME --body 'cadence:attune'\ngh pr comment 1 -b hello").outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn escaped_quote_cannot_launder_a_body_past_the_gate() {
+        // `\"` inside `"…"` is content, so the operator after it is still
+        // inside the `-m` value and creates no segment boundary. When the
+        // splitter disagreed with the tokenizer, the text after the operator
+        // became its own non-posting segment and went unscanned.
+        for op in ["&&", ";", "|"] {
+            let cmd = format!("git commit -m \"he said \\\" {op} cadence:attune here\"");
+            assert_eq!(run(&cmd).outcome, Outcome::Nudge, "operator {op}");
+        }
+    }
+
+    #[test]
+    fn later_assignment_does_not_make_the_guard_read_a_file() {
+        // The shell expands `$F` before reaching the `||` branch, so this
+        // command never names the canary. The guard must not either. The
+        // fixture holds a hit, so any read flips the outcome and fails loudly;
+        // the discriminating control is the test named below, which reads the
+        // same fixture through an assignment that genuinely precedes its use:
+        //   preceding_assignment_still_resolves_the_body_file
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canary.md");
+        std::fs::write(&path, "tripwire body naming cadence:attune").unwrap();
+        let cmd = format!(
+            "gh pr create --body-file $F || F={}",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn preceding_assignment_still_resolves_the_body_file() {
+        // Positive control: an assignment BEFORE the use is what the shell
+        // would expand, so the guard follows it and reads the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup naming cadence:attune").unwrap();
+        let cmd = format!(
+            "F={} && gh pr create --body-file $F",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
     // --- One test per universal category ---
 
     #[test]
