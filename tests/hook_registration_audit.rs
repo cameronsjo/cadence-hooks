@@ -1049,6 +1049,53 @@ fn namespace_list_matches_redact_check_sh() {
     );
 }
 
+/// Interpreters whose argv[0] is never itself a checkable script path — the
+/// actual script lives at argv[1].
+const SCRIPT_INTERPRETERS: &[&str] = &[
+    "python3", "python", "bash", "sh", "zsh", "node", "ruby", "perl",
+];
+
+/// Pick the token in a settings.json hook `command` that names a script path
+/// to existence-check, or `None` when there isn't one to check.
+///
+/// A quoted interpreter+script command (`"/usr/bin/python3" "/path/hook.py"
+/// args`) naively PathBuf'd as one raw string never exists — quotes and args
+/// never form a real path. Tokenizing (quote-aware, [`cadence_hooks_core::shell::tokenize`])
+/// splits it into argv; when argv[0]'s basename names a known interpreter,
+/// argv[1] is the actual script and that's what gets checked instead
+/// (cadence-hooks#464). A bare command (`bd prime`, no `/` or `~`) still has
+/// nothing to check.
+fn script_check_target(command: &str) -> Option<String> {
+    let tokens = cadence_hooks_core::shell::tokenize(command);
+    let first = tokens.first()?;
+
+    let is_interpreter = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| SCRIPT_INTERPRETERS.contains(&name));
+
+    let candidate = if is_interpreter {
+        tokens.get(1)?
+    } else {
+        first
+    };
+
+    if candidate.contains('/') || candidate.starts_with('~') {
+        Some(candidate.clone())
+    } else {
+        None
+    }
+}
+
+/// Does the script a settings.json hook `command` names exist on disk, after
+/// expanding `~` against `home`? `None` when the command has no checkable
+/// script path (see [`script_check_target`]).
+fn shell_script_exists(command: &str, home: &str) -> Option<bool> {
+    let target = script_check_target(command)?;
+    let expanded = target.replace('~', home);
+    Some(PathBuf::from(&expanded).exists())
+}
+
 #[test]
 fn settings_json_shell_scripts_exist() {
     let (shell_scripts, _) = settings_json_hooks();
@@ -1064,12 +1111,7 @@ fn settings_json_shell_scripts_exist() {
 
     let mut missing = Vec::new();
     for script in &shell_scripts {
-        // Only check paths (contain / or ~), skip bare commands like "bd prime"
-        if !script.contains('/') && !script.starts_with('~') {
-            continue;
-        }
-        let expanded = script.replace('~', &home);
-        if !PathBuf::from(&expanded).exists() {
+        if shell_script_exists(script, &home) == Some(false) {
             missing.push(format!("  {script} (file not found)"));
         }
     }
@@ -1079,6 +1121,44 @@ fn settings_json_shell_scripts_exist() {
         "settings.json references shell scripts that don't exist:\n{}",
         missing.join("\n")
     );
+}
+
+#[test]
+fn shell_script_exists_quoted_interpreter_and_script() {
+    let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
+    let script_path = tmp.path().join("hook.py");
+    std::fs::write(&script_path, "").expect("failed to write fixture script");
+    let cmd = format!(
+        "\"/usr/bin/python3\" \"{}\" --flag value",
+        script_path.display()
+    );
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_bare_path() {
+    let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
+    let script_path = tmp.path().join("hook.sh");
+    std::fs::write(&script_path, "").expect("failed to write fixture script");
+
+    assert_eq!(
+        shell_script_exists(&script_path.display().to_string(), "/home/nobody"),
+        Some(true)
+    );
+}
+
+#[test]
+fn shell_script_exists_interpreter_with_missing_script() {
+    let cmd = "\"/usr/bin/python3\" \"/definitely/does/not/exist/hook.py\" --flag";
+
+    assert_eq!(shell_script_exists(cmd, "/home/nobody"), Some(false));
+}
+
+#[test]
+fn shell_script_exists_none_for_bare_command() {
+    // "bd prime" has no `/` or `~` in either token — nothing to check.
+    assert_eq!(shell_script_exists("bd prime", "/home/nobody"), None);
 }
 
 // ---------- Resolver + parser unit tests ----------
