@@ -1122,6 +1122,16 @@ fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
 /// The text within `$( … )` is shell code the shell will execute, so a `)`
 /// inside a quoted string there does not close the span. Backslash escapes in
 /// both places, so `\$(` is literal and produces no span.
+///
+/// **The backtick form gets no quote tracking, and that is fidelity rather than
+/// an omission.** Bash ends a `` `…` `` substitution at the first UNESCAPED
+/// backtick — quoting does not protect one — so teaching this arm about quotes
+/// would diverge from the shell instead of matching it. Verified directly, not
+/// reasoned: ``echo `echo 'a`b'` `` fails with *unmatched single quote*, which
+/// can only arise if the substitution was truncated at the backtick inside
+/// those quotes, and ``echo `echo abc` 'd`e'`` prints ``abc d`e``, pinning the
+/// truncation point. A backslash still escapes it. Do not "fix" the asymmetry
+/// between this arm and the `$( … )` arm above; it is load-bearing.
 fn substitution_spans(body: &str) -> Vec<String> {
     let chars: Vec<char> = body.chars().collect();
     let mut spans = Vec::new();
@@ -2841,6 +2851,44 @@ mod tests {
             !out.iter()
                 .any(|s| s.contains("$(echo hi") && s.contains("cat .env")),
             "scan ran past the terminator and fabricated a span: {out:?}"
+        );
+    }
+
+    // --- backtick spans end at the first UNESCAPED backtick, quotes included ---
+    //
+    // Bash-verified, not reasoned. `echo `echo 'a`b'`` fails with an unmatched
+    // SINGLE QUOTE, which can only happen if the substitution was truncated at
+    // the backtick inside those quotes. This arm therefore gets no quote
+    // tracking on purpose — adding it would diverge from the shell.
+
+    #[test]
+    fn substitution_spans_backtick_closes_even_inside_single_quotes() {
+        // The span ends at the quoted backtick, so what is carried is the
+        // truncated substitution — matching where bash stops reading.
+        assert_eq!(
+            substitution_spans("x `echo 'a`b'`"),
+            vec!["`echo 'a`".to_string()]
+        );
+    }
+
+    #[test]
+    fn substitution_spans_escaped_backtick_does_not_close() {
+        // A backslash still escapes it, so the span runs to the real closer.
+        assert_eq!(
+            substitution_spans("x `echo a\\`b`"),
+            vec!["`echo a\\`b`".to_string()]
+        );
+    }
+
+    #[test]
+    fn substitution_spans_backtick_without_an_inner_backtick_control() {
+        // CONTROL — do not delete as redundant coverage. It is what makes the
+        // two assertions above attributable: the same shape with no inner
+        // backtick spans the whole quoted region, so their truncation is caused
+        // by the backtick rather than by the quoting or the surrounding text.
+        assert_eq!(
+            substitution_spans("x `echo 'aXb'`"),
+            vec!["`echo 'aXb'`".to_string()]
         );
     }
 
