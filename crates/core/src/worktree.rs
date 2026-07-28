@@ -557,36 +557,22 @@ mod tests {
     //
     // A tempdir-based fixture would trip `is_temp_root`'s own exemption and
     // false-allow every case (the documented Scratch/E2E gotcha) — these
-    // fixtures live under `target/`, a non-temp root, mirroring
-    // `enforce_worktree`'s own `Scratch` test helper.
+    // fixtures live under `target/`, a non-temp root, using the same
+    // `Scratch` fixture `enforce_worktree`'s own tests do (both now the one
+    // promoted into this crate's own `crate::git_fixtures`).
 
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/core-worktree-scratch")
-                .join(format!("{tag}-{}", std::process::id()));
-            // #312: a `.claude/` component or a temp prefix on the fixture root
-            // would silently exempt every case (the guard's own carve-outs) and
-            // make the block paths pass vacuously. Fail loudly instead.
-            assert!(
-                !is_claude_managed_dir(&root)
-                    && !path_under_temp_root(&root, std::env::var("TMPDIR").ok().as_deref()),
-                "fixture root sits under a carve-out (.claude/ or temp) — run the suite \
-                 from a carve-out-free checkout: {}",
-                root.display()
-            );
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
-        }
+    /// This module's own `target/`-relative scratch root — `env!` resolves at
+    /// THIS call site, so `Scratch` still lands fixtures under
+    /// `crates/core/../../target/core-worktree-scratch`, exactly where the
+    /// pre-promotion in-module helper put them.
+    fn scratch_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/core-worktree-scratch")
     }
 
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    /// Thin wrapper binding [`crate::git_fixtures::Scratch::new`] to this
+    /// module's own `scratch_root()`.
+    fn scratch(tag: &str) -> crate::git_fixtures::Scratch {
+        crate::git_fixtures::Scratch::new(&scratch_root(), tag)
     }
 
     fn init_repo_with_commit(dir: &Path) {
@@ -617,8 +603,8 @@ mod tests {
     #[test]
     fn primary_checkout_would_block() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let scratch = Scratch::new("would-block");
-        init_repo_with_commit(&scratch.0);
+        let scratch = scratch("would-block");
+        init_repo_with_commit(scratch.path());
         // SAFETY: serialized via ENV_LOCK; no other test in this module reads
         // these vars concurrently.
         let prev_allow = std::env::var("CADENCE_ALLOW_MAIN").ok();
@@ -627,7 +613,7 @@ mod tests {
             std::env::remove_var("CADENCE_ALLOW_MAIN");
             std::env::remove_var("CADENCE_NO_ENFORCE_WORKTREE");
         }
-        let result = would_block_here(&scratch.0);
+        let result = would_block_here(scratch.path());
         unsafe {
             match prev_allow {
                 Some(v) => std::env::set_var("CADENCE_ALLOW_MAIN", v),
@@ -643,12 +629,12 @@ mod tests {
 
     #[test]
     fn linked_worktree_does_not_block() {
-        let scratch = Scratch::new("would-block-wt");
-        init_repo_with_commit(&scratch.0);
-        let wt = scratch.0.join("wt");
+        let scratch = scratch("would-block-wt");
+        init_repo_with_commit(scratch.path());
+        let wt = scratch.path().join("wt");
         let ok = std::process::Command::new("git")
             .arg("-C")
-            .arg(&scratch.0)
+            .arg(scratch.path())
             .args([
                 "worktree",
                 "add",
@@ -667,32 +653,32 @@ mod tests {
 
     #[test]
     fn claude_managed_subdir_does_not_block() {
-        let scratch = Scratch::new("would-block-claude");
-        init_repo_with_commit(&scratch.0);
-        let claude_dir = scratch.0.join(".claude").join("worktrees").join("x");
+        let scratch = scratch("would-block-claude");
+        init_repo_with_commit(scratch.path());
+        let claude_dir = scratch.path().join(".claude").join("worktrees").join("x");
         std::fs::create_dir_all(&claude_dir).unwrap();
         assert!(!would_block_here(&claude_dir));
     }
 
     #[test]
     fn plan_doc_subdir_does_not_block() {
-        let scratch = Scratch::new("would-block-plans");
-        init_repo_with_commit(&scratch.0);
-        let plans_dir = scratch.0.join("docs").join("plans");
+        let scratch = scratch("would-block-plans");
+        init_repo_with_commit(scratch.path());
+        let plans_dir = scratch.path().join("docs").join("plans");
         std::fs::create_dir_all(&plans_dir).unwrap();
         assert!(!would_block_here(&plans_dir));
     }
 
     #[test]
     fn non_repo_dir_does_not_block() {
-        let scratch = Scratch::new("would-block-non-repo");
+        let scratch = scratch("would-block-non-repo");
         // A bare scratch dir is NOT repo-less: it sits under the crate's own
         // `target/`, so repo resolution walks up to the enclosing checkout —
         // whose `.git` is a dir on a primary clone (CI) but a file in a
         // linked/detached worktree (local verify). Pin the dir to "no repo
         // resolvable" with a dead gitdir pointer so the None branch is what's
         // tested on every platform.
-        std::fs::write(scratch.0.join(".git"), "gitdir: /nonexistent\n").unwrap();
-        assert!(!would_block_here(&scratch.0));
+        std::fs::write(scratch.path().join(".git"), "gitdir: /nonexistent\n").unwrap();
+        assert!(!would_block_here(scratch.path()));
     }
 }
