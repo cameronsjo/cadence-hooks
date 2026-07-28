@@ -105,6 +105,65 @@ fn is_delete_verb(token: &str) -> bool {
     DELETE_VERBS.contains(&command_word(token))
 }
 
+/// Shell command words that take an inline script via `-c`. Mirrors the set
+/// [`child_scripts`] recognizes — the primitive exposes the *extraction* but
+/// not the membership test, and [`wrapper_script_deletes`] needs the latter to
+/// find a wrapper sitting behind a prefix rather than in command position.
+const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash"];
+
+/// These tokens name a deletion the shell will actually perform, in any of the
+/// spellings the flagged-prefix gate has to arm on.
+///
+/// A bare delete verb is the common case, but two spellings name no delete verb
+/// in the token stream at all: `find … -delete` never mentions one, and a
+/// `sh -c '…'` wrapper carries its whole script inside ONE token whose basename
+/// is the script's last path segment (`rm -rf /srv/repo` → `repo`). Behind a
+/// *flagged* transparent prefix neither is reachable any other way —
+/// `skip_transparent_prefixes` stops at the flag, so `collect_targets`'s own
+/// `find` branch never sees the command word and `child_scripts` never sees the
+/// wrapper. Both then collected nothing, which reads as "not a deletion": a
+/// silent ALLOW on `env -i find ~/Documents -delete` (#443).
+///
+/// `depth` bounds the wrapper recursion on the shared [`MAX_WRAPPER_DEPTH`]
+/// budget, so a nested `sh -c 'sh -c "rm -rf ~"'` terminates.
+fn mentions_deletion(tokens: &[String], depth: usize) -> bool {
+    tokens.iter().any(|t| is_delete_verb(t))
+        || destructive_find(tokens)
+        || wrapper_script_deletes(tokens, depth)
+}
+
+/// These tokens run a `find` that deletes. Gated on a `find` command word so a
+/// stray `-delete` in an unrelated command cannot arm the gate on its own, then
+/// delegating the deletion test to [`find_is_destructive`] — the same predicate
+/// `collect_targets` uses when `find` IS in command position.
+///
+/// Scanned across the whole token list rather than from a command word, because
+/// the case this exists for is precisely the one where the command word is
+/// unreachable.
+fn destructive_find(tokens: &[String]) -> bool {
+    tokens.iter().any(|t| command_word(t) == "find") && find_is_destructive(tokens)
+}
+
+/// These tokens spawn a shell wrapper whose `-c` script names a deletion.
+///
+/// The wrapper is located anywhere in the stream, not just at token 0, since
+/// the whole point is a wrapper standing behind a prefix `argv` still leads
+/// with. Extraction reuses [`child_scripts`] (with an empty segment, so only
+/// the `-c` argument comes back and no substitution body is double-counted) —
+/// the `-c` grammar it implements, glued `-ec` forms included, stays in one
+/// place.
+fn wrapper_script_deletes(tokens: &[String], depth: usize) -> bool {
+    if depth >= MAX_WRAPPER_DEPTH {
+        return false;
+    }
+    tokens.iter().enumerate().any(|(i, tok)| {
+        SHELL_WRAPPERS.contains(&command_word(tok))
+            && child_scripts(&tokens[i..], "")
+                .iter()
+                .any(|script| mentions_deletion(&tokenize(script), depth + 1))
+    })
+}
+
 /// Does `flag` (in separate-token form) consume the following token as a value
 /// for `verb`? Prevents a `shred -n 3` iteration count or a `truncate -s 0`
 /// size from being misread as a path operand (which would resolve to a bogus
@@ -340,10 +399,19 @@ fn collect_targets(
         // the shell-preserving list, so `eval rm -rf ~/Documents` matched no
         // delete verb in command position and collected nothing — the same
         // silent ALLOW, and an explicit row in #426's table.
+        //
+        // The deletion test is `mentions_deletion`, not a bare delete-verb
+        // token scan: `find … -delete` and a `sh -c '…'` wrapper name no delete
+        // verb anywhere in the stream, so both sailed through the same hole
+        // (#443). Widening the gate can only add an `Unresolvable` (ASK) to a
+        // segment whose own collection is already empty — reaching here means
+        // `argv` still leads with the prefix, so the delete/xargs/find branches
+        // below all miss — and `Outcome::merge` keeps the most severe verdict,
+        // so a BLOCK from an already-recursed child script still wins.
         if argv.first().is_some_and(|first| {
             let word = command_word(first);
             TRANSPARENT.contains(&word) || word == "eval"
-        }) && tokens.iter().any(|t| is_delete_verb(t))
+        }) && mentions_deletion(&tokens, 0)
         {
             out.push(TargetToken::Unresolvable);
             continue;
@@ -941,6 +1009,96 @@ mod tests {
             judge("nice -n 10 cargo build", "/private/tmp"),
             Outcome::Allow
         );
+    }
+
+    // --- #443: the flagged-prefix gate's deletion test ---
+
+    /// The gate armed on a token whose basename is a delete verb, and a
+    /// `find … -delete` names none — so the destructive `find` behind a flagged
+    /// prefix collected nothing and read as "not a deletion".
+    #[test]
+    fn flagged_prefix_hiding_a_destructive_find_is_unresolvable() {
+        for command in [
+            "env -i find /srv/repo -delete",
+            "nice -n 10 find ~/Documents -name '*.md' -delete",
+            "env -u FOO find /srv/repo -delete",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "a destructive find behind a flagged prefix must not be a silent allow: {command}"
+            );
+        }
+    }
+
+    /// A wrapper carries its whole script in ONE token, whose basename is the
+    /// script's last path segment (`rm -rf /srv/repo` → `repo`) — never a
+    /// delete verb, so the gate stayed silent.
+    #[test]
+    fn flagged_prefix_hiding_a_wrapper_delete_is_unresolvable() {
+        for command in [
+            "env -i sh -c 'rm -rf /srv/repo'",
+            "nice -n 10 bash -c 'rm -rf ~/Documents'",
+            "env -u FOO zsh -c 'find /srv/repo -delete'",
+            "eval sh -c 'rm -rf ~/Documents'",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "a wrapped delete behind a flagged prefix must not be a silent allow: {command}"
+            );
+        }
+    }
+
+    /// The widening may only turn silent-ALLOW into ASK. Every spelling that
+    /// blocked before must still block — a gate that armed too eagerly would
+    /// short-circuit the segment and downgrade a real BLOCK to a prompt.
+    #[test]
+    fn widened_gate_preserves_every_block_spelling() {
+        for command in [
+            "rm -rf /",
+            "rm -rf ~",
+            "rm -rf ~/Documents",
+            "env rm -rf ~/Documents",
+            "command rm -rf ~",
+            "env FOO=1 rm -rf /",
+            "/bin/rm -rf /",
+            "\\rm -rf /",
+            "bash -lc 'rm -rf /'",
+            "sh -c 'rm -rf ~/Documents'",
+            "exec sh -c 'rm -rf ~/Documents'",
+            "(rm -rf /)",
+            "{ rm -rf ~/Desktop; }",
+            "echo $(rm -rf ~)",
+            "find ~/Documents -delete",
+            "find -L ~/Documents -delete",
+            "find ~/Documents -exec rm -rf {} +",
+            "rm -rf /vaults/main",
+            "rm ~/.zshrc",
+            "truncate -s 0 ~/Documents",
+            "rm -rf ~/.claude/.git",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Block,
+                "the widened gate must not downgrade a block: {command}"
+            );
+        }
+    }
+
+    /// Still gated on a deletion actually appearing — a wrapper or a `find`
+    /// that deletes nothing must stay silent, or every flagged prefix in the
+    /// session starts prompting.
+    #[test]
+    fn flagged_prefix_without_a_deletion_stays_silent() {
+        for command in [
+            "env -i sh -c 'ls -la /srv/repo'",
+            "nice -n 10 bash -c 'cargo build'",
+            "env -i find /srv/repo -name '*.md'",
+            "nice -n 10 find /srv/repo -exec cat {} +",
+        ] {
+            assert_eq!(judge(command, "/private/tmp"), Outcome::Allow, "{command}");
+        }
     }
 
     // --- #427: a `..` behind a glob metachar ---

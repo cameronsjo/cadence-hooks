@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`guard-rm`'s flagged-prefix gate now arms on the two deletions that name no delete verb (cameronsjo/cadence-hooks#443).** A transparent prefix carrying its own option (`env -i`, `nice -n 10`) stops `skip_transparent_prefixes`, so `argv` still leads with the prefix and the delete verb behind it is never seen in command position — #426 closed that by re-arming the gate whenever *any* token's basename was a delete verb. Two spellings name one nowhere in the stream. `find … -delete` never mentions a delete verb at all, and a `sh -c '…'` wrapper carries its whole script inside ONE token whose basename is the script's last path segment (`rm -rf /srv/repo` → `repo`). Both collected nothing, and an empty target list reads as "not a deletion" — a silent ALLOW on `env -i find ~/Documents -delete` and on `nice -n 10 bash -c 'rm -rf ~/Documents'`.
+
+  The token scan becomes `mentions_deletion`, which unions the delete-verb test with `destructive_find` (gated on a `find` command word, then delegating to the same `find_is_destructive` the in-command-position branch uses) and `wrapper_script_deletes` (locating a wrapper anywhere in the stream, not just at token 0, and re-tokenizing its `-c` script — extraction reused from `child_scripts` so the `-c` grammar, glued `-ec` forms included, stays in one place). Wrapper recursion rides the shared `MAX_WRAPPER_DEPTH` budget, so a nested `sh -c 'sh -c "…"'` terminates.
+
+  **The widening moves in one direction only: silent-ALLOW becomes ASK, never a BLOCK becoming anything softer.** Reaching the gate means `argv` still leads with the prefix, so the delete/`xargs`/`find` branches below it all miss and the segment's own collection is empty by construction; the added `Unresolvable` therefore replaces nothing. `child_scripts` recursion runs *before* the gate and has already pushed its targets, and `Outcome::merge` keeps the most severe verdict, so a BLOCK found inside an already-recursed child script still wins. Pinned by a twenty-one-spelling regression test asserting every previously-blocking form still blocks, and by a negative control (a wrapper or `find` that deletes nothing) so a flagged prefix does not start prompting across the session.
+
 ## [0.70.0] - 2026-07-27
 
 ### Added
