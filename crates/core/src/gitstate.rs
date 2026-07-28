@@ -24,13 +24,17 @@ use crate::paths::{find_git_root, read_gitdir_file, resolve_git_common_dir};
 use std::path::{Path, PathBuf};
 
 /// Whether a checkout is the repository's **primary** checkout or a **linked**
-/// worktree — decided by whether its `.git` is a directory (primary) or a file
-/// pointing into the primary's `.git/worktrees/` (linked).
+/// worktree — decided by resolved git identity, not by the surface form of
+/// `.git`: primary iff the checkout's own admin dir *is* the shared common dir.
+/// A `.git` directory settles it immediately; a `.git` *file* belongs to either
+/// a linked worktree or a `--separate-git-dir` primary, and only the resolved
+/// comparison tells those apart (cadence-hooks#255, #345).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeKind {
-    /// The primary checkout — `.git` is a directory.
+    /// The primary checkout — its admin dir is the repository's common dir.
     Primary,
-    /// A linked worktree — `.git` is a file.
+    /// A linked worktree — its admin dir is `…/.git/worktrees/<name>`, distinct
+    /// from the shared common dir.
     Linked,
 }
 
@@ -105,12 +109,16 @@ impl GitState {
         })
     }
 
-    /// True for the primary checkout (`.git` is a directory).
+    /// True for the primary checkout. Agrees with
+    /// [`crate::worktree::is_primary_checkout`] on every checkout, including a
+    /// `--separate-git-dir` primary (#345).
     pub fn is_primary(&self) -> bool {
         self.worktree_kind == WorktreeKind::Primary
     }
 
-    /// True for a linked worktree (`.git` is a file).
+    /// True for a linked worktree — one whose admin dir is not the shared
+    /// common dir. A `--separate-git-dir` primary also has a `.git` file and is
+    /// NOT linked (#345).
     pub fn is_linked(&self) -> bool {
         self.worktree_kind == WorktreeKind::Linked
     }
@@ -121,15 +129,33 @@ impl GitState {
 /// `<repo_root>/.git`; for a linked worktree it is the admin dir the `.git`
 /// *file* points at (`…/.git/worktrees/<name>`), which is NOT the shared common
 /// dir. `None` when `.git` is neither a dir nor a parseable file.
+///
+/// The kind comes from [`crate::worktree::git_dir_is_common_dir`] — the same
+/// canonical comparison [`crate::worktree::is_primary_checkout`] uses — rather
+/// than the `.git` surface form. Reading `.git`-is-a-file as Linked was wrong
+/// for a `--separate-git-dir` primary, whose `.git` is a file pointing at the
+/// common dir itself (cadence-hooks#255): `warn-subagent-worktree` consumes
+/// `is_primary()` for its policy decision and so missed its nudge on exactly
+/// those checkouts, while the block-capable `enforce-worktree` path — already
+/// on the canonical helper — called the same repository primary. One
+/// comparison now serves both (cadence-hooks#345).
 fn worktree_git_dir(repo_root: &Path) -> Option<(WorktreeKind, PathBuf)> {
     let dot_git = repo_root.join(".git");
+    // Fast path, shared with `is_primary_checkout`: a real `.git` *directory*
+    // is always a primary checkout, and is itself the admin dir.
     if dot_git.is_dir() {
-        Some((WorktreeKind::Primary, dot_git))
-    } else if dot_git.is_file() {
-        read_gitdir_file(&dot_git, repo_root).map(|d| (WorktreeKind::Linked, d))
-    } else {
-        None
+        return Some((WorktreeKind::Primary, dot_git));
     }
+    if !dot_git.is_file() {
+        return None;
+    }
+    let git_dir = read_gitdir_file(&dot_git, repo_root)?;
+    let kind = if crate::worktree::git_dir_is_common_dir(&git_dir, repo_root) {
+        WorktreeKind::Primary
+    } else {
+        WorktreeKind::Linked
+    };
+    Some((kind, git_dir))
 }
 
 /// Parse `<git_dir>/HEAD` into the branch name, or `None` for a detached HEAD
@@ -261,6 +287,47 @@ mod tests {
         );
         // The common dir resolves back to the primary's .git (holds the HEAD).
         assert!(state.git_common_dir.join("HEAD").exists());
+        // Agreement control for #345: sharing one classifier must not flip a
+        // REAL linked worktree to Primary. Both helpers say linked.
+        assert!(!crate::worktree::is_primary_checkout(
+            linked.to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn separate_git_dir_primary_agrees_with_is_primary_checkout() {
+        // `git init --separate-git-dir` gives a genuine PRIMARY checkout a
+        // `.git` FILE — the same surface form a linked worktree has. While
+        // `worktree_git_dir` classified by that form, this checkout read as
+        // Linked here and Primary via `is_primary_checkout`: one repository,
+        // two answers, and `warn-subagent-worktree` (which consumes
+        // `is_primary()`) silently skipped its nudge on exactly these
+        // checkouts (cadence-hooks#255, #345). Both must now say Primary.
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let gitdir = tmp.path().join("gitdir");
+        std::fs::create_dir_all(&work).unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(format!("--separate-git-dir={}", gitdir.display()))
+            .arg(&work)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git init --separate-git-dir failed");
+        assert!(work.join(".git").is_file(), "sanity: .git is a file");
+
+        let state = GitState::resolve(&work).expect("resolves");
+        assert_eq!(state.worktree_kind, WorktreeKind::Primary);
+        assert!(state.is_primary());
+        assert!(!state.is_linked());
+        assert_eq!(
+            state.is_primary(),
+            crate::worktree::is_primary_checkout(work.to_str().unwrap()),
+            "GitState and is_primary_checkout must agree on one checkout"
+        );
     }
 
     #[test]

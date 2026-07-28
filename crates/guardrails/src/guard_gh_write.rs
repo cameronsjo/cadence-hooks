@@ -9,7 +9,8 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, command_segments, host_and_repo_from_url, parse_work_dir, strip_quotes, tokenize,
+    LOOP_PATTERN, command_segments, command_word, host_and_repo_from_url, parse_work_dir,
+    strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -1231,11 +1232,27 @@ fn segment_invokes_gh_depth(segment: &str, depth: usize) -> bool {
     false
 }
 
-/// True when a single token resolves to `gh` (bare, a `*/gh` path, or a
-/// backslash-escaped `\gh`).
+/// True when a single token resolves to `gh` (bare, a `*/gh` path, a
+/// backslash-escaped `\gh`, or a Windows `gh.exe`).
+///
+/// Through the shared [`command_word`] rather than a local strip-then-split:
+/// the local order missed `/opt/\gh`, so the token was never found, the target
+/// fell back to the cwd remote (owned), and a write to a non-owned repo
+/// silently ALLOWED. Measured ALLOW→BLOCK (cadence-hooks#450 review — one of
+/// four divergent copies of this normalization, now one).
+///
+/// **This alone does not make a `gh.exe` write block, and the reason is a
+/// different mechanism.** Reaching the ownership decision needs
+/// [`is_write_command`] to fire first, and that is a raw-TEXT regex
+/// (`gh\s+<noun>\s+<verb>`) which `gh.exe issue create` does not match — `gh`
+/// is followed by `.exe`, not whitespace. `/opt/\gh issue create` matches only
+/// because the path happens to END in `gh`, leaving `gh issue create` as a
+/// substring. Normalizing the write detection would mean running it over a
+/// reconstructed argv instead of the command text, which is a real change to a
+/// block-capable guard and belongs in its own issue rather than riding along
+/// here. Pinned below so the gap is a recorded choice.
 fn token_is_gh(tok: &str) -> bool {
-    let unescaped = tok.strip_prefix('\\').unwrap_or(tok);
-    unescaped.rsplit('/').next().unwrap_or(unescaped) == "gh"
+    command_word(tok) == "gh"
 }
 
 /// True when any token resolves to `gh`.
@@ -1939,6 +1956,40 @@ mod tests {
     #[test]
     fn detects_pr_create_as_write() {
         assert!(is_write_command("gh pr create --title test"));
+    }
+
+    #[test]
+    fn token_is_gh_uses_the_shared_command_word() {
+        // The spellings the local strip-then-split missed. `/opt/\gh` is the
+        // one that changed a verdict: the token went unfound, the target fell
+        // back to the cwd remote, and an off-owner write silently ALLOWED
+        // (measured ALLOW→BLOCK, #450 review).
+        for tok in [
+            "gh",
+            "/usr/bin/gh",
+            "\\gh",
+            "/opt/\\gh",
+            "gh.exe",
+            "C:\\bin\\gh.exe",
+        ] {
+            assert!(token_is_gh(tok), "should resolve to gh: {tok}");
+        }
+        for tok in ["ghi", "github", "\\\\gh", "/opt/gh/bin/hub", "ghq"] {
+            assert!(!token_is_gh(tok), "should NOT resolve to gh: {tok}");
+        }
+    }
+
+    #[test]
+    fn exe_spelling_is_not_yet_a_detected_write() {
+        // Recorded gap, not an oversight. `token_is_gh` now resolves `gh.exe`,
+        // but reaching the ownership decision needs `is_write_command` first,
+        // and that is a raw-TEXT regex (`gh\s+<noun>\s+<verb>`) which does not
+        // match `gh.exe issue create`. Closing it means running write detection
+        // over a reconstructed argv rather than the command text — a real
+        // change to a block-capable guard, filed separately rather than ridden
+        // in on #450. This test fails the day that lands, which is the point.
+        assert!(!is_write_command("gh.exe issue create --title x"));
+        assert!(is_write_command("gh issue create --title x"));
     }
 
     #[test]

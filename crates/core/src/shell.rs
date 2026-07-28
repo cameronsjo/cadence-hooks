@@ -180,6 +180,55 @@ pub fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
+/// The command word `token` names, normalized to the verb the shell will
+/// actually run: the path segment, one leading alias-bypass backslash removed,
+/// and a Windows `.exe` suffix dropped.
+///
+/// The single normalization for "which verb is this?", so a guard that gates on
+/// a verb cannot miss a spelling because its call site forgot a step. Four
+/// divergent copies existed before (cadence-hooks#450 review) and they
+/// disagreed on both the order of the two operations and whether the backslash
+/// strip repeated — differences that decide real verdicts, not style.
+///
+/// Three steps, and the ORDER is load-bearing:
+///
+/// 1. **Path segment.** Always split on `/`. Split on `\` too, but ONLY for a
+///    drive-prefixed token (`C:\…`): on a POSIX shell a backslash is an escape
+///    character, not a separator, so splitting on it unconditionally would
+///    reduce `\\git` to `git` — see step 2.
+/// 2. **Remove exactly ONE leading backslash** — [`str::strip_prefix`], never
+///    `trim_start_matches`. `\git` is the standard way past a `git` alias and
+///    IS git; `\\git` is a *different* word, because the shell removes one
+///    backslash and looks up `\git`, which is not a command. A repeating strip
+///    collapses the two (the bug caught in cadence-hooks#442's review).
+///    Applied AFTER the path split so `/opt/\git` — which the shell runs as
+///    `/opt/git` — normalizes correctly; strip-then-split would miss it.
+/// 3. **Drop a trailing `.exe`**, case-insensitively, so a Windows spelling
+///    (`…/git.exe`, `C:\Program Files\Git\cmd\git.exe`) matches the same verb
+///    as the POSIX one. No verb any caller gates on legitimately ends in
+///    `.exe`, so this cannot collapse two distinct verbs together.
+///
+/// Deliberate misses, shared by every caller: a command word behind a
+/// substitution (`$(which git)`) or a variable, a mid-path escape
+/// (`/usr/bin/\git`), and a case-folded verb on a case-insensitive volume
+/// (`RM`) — matching case-insensitively would be wrong on Linux.
+pub fn command_word(token: &str) -> &str {
+    let has_drive_prefix = {
+        let mut chars = token.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) && chars.next() == Some(':')
+    };
+    let segment = if has_drive_prefix {
+        token.rsplit(['/', '\\']).next().unwrap_or(token)
+    } else {
+        basename(token)
+    };
+    let segment = segment.strip_prefix('\\').unwrap_or(segment);
+    match segment.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => stem,
+        _ => segment,
+    }
+}
+
 /// True when `p` is absolute — POSIX (`/foo`) or a Windows drive-absolute path
 /// spelled with EITHER separator (`C:/foo` or `C:\foo`). Lets a guard
 /// distinguish an explicit path argument from a flag (`-rf`) or a bare
@@ -263,7 +312,13 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
 /// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
 /// `==` comparisons — is not skipped, so this can only widen the leading-word
 /// gate past words the shell itself treats as environment prefixes.
-fn is_assignment_word(token: &str) -> bool {
+///
+/// Public so guards that peel a prefix themselves agree with
+/// [`skip_transparent_prefixes`] on what counts as an assignment — the
+/// `prevent-secret-leaks` `env`-operand peel (#411) needs the same rule but
+/// cannot reuse that function, which stops at any `-`-leading token and so
+/// refuses exactly the `env -u FOO cmd` shape it must see through.
+pub fn is_assignment_word(token: &str) -> bool {
     match token.split_once('=') {
         Some((name, _)) if !name.is_empty() => {
             name.chars()
@@ -1593,6 +1648,50 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- command_word (the one verb normalization) ---
+
+    #[test]
+    fn command_word_normalizes_path_escape_and_exe() {
+        for (token, want) in [
+            ("git", "git"),
+            ("/usr/bin/git", "git"),
+            ("./git", "git"),
+            // The alias bypass: the shell removes one backslash and runs git.
+            ("\\git", "git"),
+            // A mid-path escape the shell also resolves to `/opt/git` — only
+            // caught because the strip runs AFTER the path split.
+            ("/opt/\\git", "git"),
+            // Windows spellings, both separators, with and without `.exe`.
+            ("/c/Program Files/Git/cmd/git.exe", "git"),
+            ("C:\\Program Files\\Git\\cmd\\git.exe", "git"),
+            ("C:/Program Files/Git/cmd/git.exe", "git"),
+            ("C:\\tools\\git", "git"),
+            ("git.EXE", "git"),
+            ("\\git.exe", "git"),
+        ] {
+            assert_eq!(command_word(token), want, "command_word({token:?})");
+        }
+    }
+
+    #[test]
+    fn command_word_keeps_distinct_verbs_apart() {
+        // `\\git` is NOT git: the shell removes exactly one backslash and looks
+        // up `\git`, which is not a command. A repeating strip would collapse
+        // it (cadence-hooks#442) and invent a verb the shell never runs.
+        assert_ne!(command_word("\\\\git"), "git");
+        assert_eq!(command_word("\\\\git"), "\\git");
+        // Longer names that merely END in the verb, and a DIRECTORY named for
+        // the verb, are not the verb.
+        for token in ["legit", "gitk", "/opt/git/bin/hub", "mygit", "git-lfs"] {
+            assert_ne!(command_word(token), "git", "command_word({token:?})");
+        }
+        // A backslash is not a path separator without a drive prefix — this is
+        // one POSIX filename, not a path ending in `git`.
+        assert_ne!(command_word("a\\b\\git"), "git");
+        // `.exe` stripping must not eat a bare dotfile-shaped name.
+        assert_eq!(command_word(".exe"), ".exe");
+    }
 
     // --- looks_absolute / resolve_cd_target (Windows path handling) ---
     // Platform-INDEPENDENT: `looks_absolute` decides absoluteness from the
