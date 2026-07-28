@@ -11,7 +11,9 @@ use crate::secret_patterns::{
     command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token, is_safe_template, is_secret_shaped_var_name,
 };
-use cadence_hooks_core::shell::{command_segments, is_assignment_word, split_segments, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, command_word, is_assignment_word, split_segments, tokenize,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::path::Path;
@@ -38,41 +40,225 @@ const METADATA_SAFE_COMMANDS: &[&str] = &[
     "printf", "basename", "dirname", "realpath", "test", "[", "direnv", "git",
 ];
 
+/// Wrapper words that run their argument as the command **without reading
+/// anything themselves** — `command ls .env` is an `ls`, not a `command` (#469).
+/// That parenthetical is the entire membership test, and it is narrower than it
+/// looks; see the `xargs` exclusion below for what happens when it is relaxed.
+///
+/// Deliberately a LOCAL set, not `core::shell::TRANSPARENT`. That constant is
+/// shared by `enforce_worktree` and `guard_rm` and says so in its own doc
+/// comment: "Unifying them would widen two gates that can block."
+///
+/// **Before copying a prefix set from anywhere, ask whether the copy feeds a
+/// DETECTOR or an EXEMPTION.** The distinction decides the safety direction and
+/// is invisible at the call site, because the code shape is identical.
+/// `prevent_secret_writes::COMMAND_WRAPPERS` peels in order to *find* a writer
+/// verb, so peeling there can only ever ADD blocks — looking deeper finds more
+/// danger. This set feeds [`METADATA_SAFE_COMMANDS`], an *exemption* lookup, so
+/// peeling here can only ever SUBTRACT blocks. A detector may be over-eager
+/// safely. An exemption may not. Citing the sibling file as precedent was how
+/// `xargs` got in, and neither file's local text said the precedent inverts.
+///
+/// **`xargs` is excluded, and the reason is a measured bypass**, not caution.
+/// `xargs echo < .env` printed real credentials while the guard exited 0, once
+/// `xargs` was peeled and the exemption `echo` had earned was handed to the
+/// pipeline behind it. The control is the point: bare `echo < .env` prints an
+/// EMPTY LINE — ignoring stdin is precisely why `echo` was safe to exempt —
+/// whereas `xargs` turns that stdin into arguments. `xargs printf`, `xargs wc`,
+/// `xargs ls`, `xargs stat`, and `xargs git log` reach the same family, several
+/// of them leaking via stderr. Pre-#469 all of these blocked, because the head
+/// was the literal `xargs`, which is on no allowlist. `core::shell::TRANSPARENT`
+/// had already reached this reading independently — its doc names `xargs` as a
+/// prefix deliberately OUTSIDE the transparent set — and that disagreement was
+/// the available signal.
+///
+/// The four that remain exec their argument and read nothing, which is the
+/// property the first paragraph claims for the whole set — true of the set only
+/// once `xargs` leaves it.
+///
+/// `env` is absent for a different reason: it is the one wrapper whose verdict
+/// depends on its operands (bare `env` DUMPS the environment), so it is
+/// resolved through [`peel_env_options`] instead — see
+/// [`unwrap_command_prefixes`].
+const COMMAND_WRAPPERS: &[&str] = &["sudo", "command", "nohup", "time"];
+
+/// Resolve past wrapper words so a segment presents the verb the shell will
+/// actually run: `command find …` is a `find`, `sudo ls .env` is an `ls`,
+/// `env -u FOO cat .env` is a `cat` (#469).
+///
+/// The allowlist lookup below is a **metadata-only exemption**, so a head the
+/// lookup fails to recognize does not fail open — it falls through to the
+/// dangerous-operand scan and blocks. That is why the pre-#469 behavior was a
+/// false-positive class rather than a leak: `command ls .env` and `sudo stat
+/// .env` blocked, contradicting the block message's own advertised exemptions,
+/// and on a machine that aliases `ls`/`cat` the wrapped spelling is the one the
+/// operator's rules mandate.
+///
+/// Two shapes are peeled, and the asymmetry is the point:
+///
+/// - A [`COMMAND_WRAPPERS`] word is dropped whole. Its own flags are NOT
+///   parsed: `sudo -u root ls .env` lands on `-u`, which no allowlist contains,
+///   so the segment keeps blocking — the same verdict as refusing to peel at
+///   all, reached without teaching this guard five separate flag grammars.
+/// - `env` is peeled by [`peel_env_options`], the grammar #411 already spelled
+///   out in this file, so `env -u FOO find …` resolves to `find` while a bare
+///   `env` (or `env -i`, or `env -S '…'`) stops the walk — those are dumps or
+///   opaque strings, not a transparent prefix, and the dump arm judges them.
+///
+/// Terminates by strict shrink: every hop drops at least the head token, and
+/// neither arm can return an empty slice.
+fn unwrap_command_prefixes(tokens: &[String]) -> &[String] {
+    let mut argv = tokens;
+    loop {
+        let Some(head) = argv.first() else {
+            return argv;
+        };
+        let word = command_word(head);
+        if word == "env" {
+            let Some(skip) = env_prefix_len(&argv[1..]) else {
+                return argv;
+            };
+            argv = &argv[1 + skip..];
+            continue;
+        }
+        if COMMAND_WRAPPERS.contains(&word) && argv.len() > 1 {
+            argv = &argv[1..];
+            continue;
+        }
+        return argv;
+    }
+}
+
+/// How many tokens after a leading `env` belong to `env` itself — its options
+/// and `VAR=value` assignments — or `None` when `env` is not acting as a
+/// transparent prefix at all.
+///
+/// Reuses [`peel_env_options`] rather than re-deriving env's flag grammar: that
+/// grammar is fiddly (clustered short options, `-u`/`-C`/`-P` taking separate
+/// or attached values, `--` ending options but not assignments, `-S` whose
+/// value IS the command line) and a second copy that disagreed with the dump
+/// arm would let one arm see an exec where the other sees a dump. `None`
+/// therefore covers both of that function's non-exec answers: an options-only
+/// segment (`env`, `env -i`, `env -u FOO` — a dump, judged by
+/// [`command_dumps_env`]) and `-S`, whose command line this tokenizer cannot
+/// faithfully re-split.
+fn env_prefix_len(rest: &[String]) -> Option<usize> {
+    let view: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let remainder = peel_env_options(&view)?;
+    if remainder.is_empty() {
+        return None;
+    }
+    Some(view.len() - remainder.len())
+}
+
 /// If a segment hands one or more dangerous `.env`-family files to a
 /// content-emitting command, return every `(command word, offending token)`
 /// pair — NOT just the first (#307: a single-token result let a second
 /// operand in the same segment, e.g. `cat .envrc .env`, slip past the #193
 /// `.envrc` carve-out unexamined).
 ///
-/// The command word is the basename of the segment's first token; segments
-/// whose command word is metadata-safe are skipped. A later token blocks
-/// when it has no internal whitespace AND classifies as dangerous. The
-/// whitespace rule is the false-positive firewall: quoted prose stays glued
-/// into one multi-word token by [`tokenize`] and is skipped, while a quoted
-/// filename (`".env"`) stays a clean single token and is caught. Dot-source
-/// (`. .env`) and `source .env` fall out of the same rule — neither `.` nor
-/// `source` is metadata-safe — and the old dot-source false positive is now
-/// structural: in `grep . .env`, the `.` is an argument, not a command word.
+/// The command word is the segment's head resolved to the verb the shell will
+/// run ([`command_word`] past [`unwrap_command_prefixes`]); segments whose
+/// command word is metadata-safe are skipped. A later token blocks when it has
+/// no internal whitespace AND classifies as dangerous. The whitespace rule is
+/// the false-positive firewall: quoted prose stays glued into one multi-word
+/// token by [`tokenize`] and is skipped, while a quoted filename (`".env"`)
+/// stays a clean single token and is caught. Dot-source (`. .env`) and
+/// `source .env` fall out of the same rule — neither `.` nor `source` is
+/// metadata-safe — and the old dot-source false positive is now structural: in
+/// `grep . .env`, the `.` is an argument, not a command word.
+///
+/// **Head resolution is three steps, and only the first was here before #469.**
+/// The basename split was doing all the work, so a head that was merely SPELLED
+/// differently lost the metadata-only exemption and its operand was read as a
+/// leak — `find` passed while `command find`, `\find`, `sudo find`, `env find`,
+/// `time find`, and `nohup find` all blocked, as did `command ls .env`,
+/// `\ls .env`, and `command wc -l .env`, three exemptions the block message
+/// itself advertises.
+///
+/// 1. A `#`-led head is a COMMENT, and a comment executes nothing — so the
+///    segment contributes no operands at all. Without this, a line like
+///    `# .env — created 0600 before any content lands` tokenized as the command
+///    `#` with `.env` as its operand, and the diagnostic said so literally:
+///    ``Found: `.env` as an operand of `#` ``. The test is on the RAW head
+///    rather than the resolved word because `#` is not a verb to normalize.
+///    [`tokenize`] has already stripped quotes by then, so a QUOTED `'#'` head
+///    — which bash would treat as a command name, not a comment — is dropped
+///    too. Named rather than fixed: the shell then looks up a command literally
+///    called `#`, finds none, and reads nothing, so the segment that goes
+///    unscanned is one that cannot execute.
+///
+///    **This step is only as good as the segmenter**, and today that is a
+///    real bound rather than a theoretical one. [`split_segments`] has no
+///    ANSI-C (`$'…'`) quote mode while [`tokenize`] does, so an escaped quote
+///    inside `$'…'` leaves the splitter's quote state stuck and the following
+///    separator is swallowed — everything merges into ONE segment. When that
+///    segment's head is a `#`, this step drops a merged run that still
+///    contains a genuine read: measured, `# note $'a\'b'` + newline +
+///    `cat .env` exits 0 where the un-merged spelling exits 2. The root cause
+///    is the segmenter, is shared with every guard that segments, and is being
+///    fixed in cadence-hooks#424 — which is why there is no workaround here.
+///    What this step adds is one new suppressing head class: pre-#469 a `#`
+///    head was not on the allowlist, so a merged segment was still scanned.
+///    A metadata-safe head (`ls $'a\'b' ; cat .env`) suppressed the same merged
+///    run before this change and still does.
+/// 2. Wrapper prefixes are peeled ([`unwrap_command_prefixes`]).
+/// 3. [`command_word`] normalizes the survivor — basename, ONE leading
+///    backslash, a `.exe` suffix — rather than another local `rsplit('/')`;
+///    that primitive is what #450 landed for, after four divergent copies
+///    disagreed on the order of those steps.
+///    The single-backslash rule is load-bearing in both directions: `\ls` IS
+///    `ls` (the standard way past an alias, and the spelling this ecosystem's
+///    own rules mandate on a box that aliases `ls`), while `\\ls` is a
+///    different word the shell resolves to `\ls` and fails to find.
+///
+/// Operands are scanned from the RESOLVED argv, so a wrapper's own tokens are
+/// not mistaken for operands. The tokens that drops are exactly: wrapper words,
+/// env's flags, env's `VAR=value` assignments, and the VALUES of env's
+/// value-taking flags (`-u`/`-C`/`-P`). None of those is a file a command
+/// EMITS, which is what this scan is for — an assignment value (`env
+/// DOTENV=.env node app.js`) or a chdir target (`env -C .env ls`) names a file
+/// or directory the wrapper hands onward, and the verb that receives it is
+/// judged on its own.
+///
+/// The scan starts at `argv[0]`, **not** `argv[1..]`, once the resolved word is
+/// known not to be metadata-safe. After a peel the dangerous token can BE the
+/// resolved head: `sudo .env` leaves `argv = [".env"]`, and a scan starting at
+/// index 1 examined nothing at all, turning a pre-#469 BLOCK into an ALLOW.
+/// Every spelling anyone constructed for that shape *executes* `.env` rather
+/// than printing it, so the impact is hardening rather than a demonstrated
+/// leak — but the argument for its harmlessness is "no spelling we could
+/// construct", an absence-of-evidence claim about a space nobody enumerated,
+/// and a BLOCK→ALLOW is the wrong direction to accept one in. Including index 0
+/// costs nothing: a genuine command word (`cat`, `ls`) never classifies as a
+/// dangerous secret token, so the only tokens this adds to the scan are the
+/// ones that should have been there.
 fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
     let tokens = tokenize(segment);
     let Some(first) = tokens.first() else {
         return Vec::new();
     };
-    let cmd_word = first.rsplit('/').next().unwrap_or(first);
+    if first.starts_with('#') {
+        return Vec::new();
+    }
+    let argv = unwrap_command_prefixes(&tokens);
+    let Some(head) = argv.first() else {
+        return Vec::new();
+    };
+    let cmd_word = command_word(head);
     // `find` is metadata-safe on its own (`find . -name .env`), but an
     // exec-family action runs a real command on each hit — judge that
     // command instead of exempting the whole `find` (#118).
     if cmd_word == "find" {
-        return find_exec_leak(&tokens).into_iter().collect();
+        return find_exec_leak(argv).into_iter().collect();
     }
     if cmd_word == "forgectl" {
-        return forgectl_env_leak(&tokens);
+        return forgectl_env_leak(argv);
     }
     if METADATA_SAFE_COMMANDS.contains(&cmd_word) {
         return Vec::new();
     }
-    tokens[1..]
-        .iter()
+    argv.iter()
         .filter(|t| !t.chars().any(char::is_whitespace) && is_dangerous_secret_token(t))
         .map(|t| (cmd_word.to_string(), t.clone()))
         .collect()
@@ -84,13 +270,24 @@ fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
 /// appears among find's arguments (the `-name`/`-path` pattern or a literal
 /// path). A plain `find` with no exec-family action, or one whose action is
 /// metadata-safe (`-exec ls …`), leaks nothing.
+///
+/// The sub-command's head gets the same resolution as the segment's own
+/// (#469) — wrappers peeled, then [`command_word`] — so `-exec command cat {}`
+/// is judged as the `cat` it runs, and `-exec sudo ls {}` keeps the `ls`
+/// exemption it would have had unwrapped. Sharing
+/// [`unwrap_command_prefixes`] is what keeps this arm honest: while `xargs`
+/// was briefly in the wrapper set, `find . -name .env -exec xargs echo {} \;`
+/// resolved to `echo` and exited 0. Nobody built a contents-emitting proof for
+/// that spelling, so it was a lost block rather than a demonstrated leak —
+/// and dropping `xargs` from the one shared set closed it here without a
+/// second edit.
 fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
     const EXEC_FLAGS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
-    let sub = tokens
+    let action = tokens
         .iter()
         .position(|t| EXEC_FLAGS.contains(&t.as_str()))
-        .and_then(|i| tokens.get(i + 1))?;
-    let sub_word = sub.rsplit('/').next().unwrap_or(sub);
+        .and_then(|i| tokens.get(i + 1..))?;
+    let sub_word = command_word(unwrap_command_prefixes(action).first()?);
     if METADATA_SAFE_COMMANDS.contains(&sub_word) {
         return None;
     }
@@ -2725,5 +2922,197 @@ mod tests {
             dir.path().to_str().unwrap(),
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // ---------------------------------------------------------------
+    // #469: head resolution. The allowlist lookup took the segment's first
+    // token verbatim, so a head that was merely SPELLED differently lost the
+    // metadata-only exemption and its operand was reported as a read — the
+    // block message advertising exemptions the guard then refused to honor.
+    //
+    // One case rather than two dozen near-identical fns, because the value is
+    // in the SET: every spelling of one head must reach one verdict, and a
+    // regression that splits them should name which spelling drifted. All
+    // rows are collected before asserting so a failure reports every drifted
+    // spelling at once instead of stopping at the first.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn bash_head_resolution_table() {
+        use cadence_hooks_core::Outcome::{Allow, Block};
+
+        let cases: &[(&str, cadence_hooks_core::Outcome, &str)] = &[
+            // --- the issue's `find`-head table: same command, nine spellings ---
+            ("find . -name '.npmrc'", Allow, "bare head (already passed)"),
+            (
+                "/usr/bin/find . -name '.npmrc'",
+                Allow,
+                "basename split (already passed)",
+            ),
+            (
+                "'find' . -name '.npmrc'",
+                Allow,
+                "tokenize strips quotes (already passed)",
+            ),
+            ("command find . -name '.npmrc'", Allow, "wrapper peeled"),
+            (
+                "\\find . -name '.npmrc'",
+                Allow,
+                "one alias-bypass backslash",
+            ),
+            ("sudo find / -name '.npmrc'", Allow, "wrapper peeled"),
+            (
+                "env find . -name '.npmrc'",
+                Allow,
+                "env as a transparent prefix",
+            ),
+            ("time find . -name '.npmrc'", Allow, "wrapper peeled"),
+            ("nohup find . -name '.npmrc'", Allow, "wrapper peeled"),
+            // --- the exemptions the block message itself advertises ---
+            ("ls -la .env", Allow, "bare head (already passed)"),
+            ("command ls -la .env", Allow, "wrapper peeled"),
+            ("\\ls -la .env", Allow, "one alias-bypass backslash"),
+            ("sudo ls -la .env", Allow, "wrapper peeled"),
+            ("stat .env", Allow, "bare head (already passed)"),
+            ("command stat .env", Allow, "wrapper peeled"),
+            ("wc -l .env", Allow, "bare head (already passed)"),
+            ("command wc -l .env", Allow, "wrapper peeled"),
+            // --- a `#`-led head is a comment and executes nothing ---
+            (
+                "# .env\nls -la",
+                Allow,
+                "comment segment contributes no operand",
+            ),
+            (
+                "# check for .npmrc\nfind . -name '.npmrc'",
+                Allow,
+                "comment segment contributes no operand",
+            ),
+            // --- positive controls: the read detection itself is untouched ---
+            ("cat .env", Block, "POSITIVE CONTROL: bare reader"),
+            (
+                "find . -name '.npmrc' -exec cat {} \\;",
+                Block,
+                "POSITIVE CONTROL: find's exec action is judged",
+            ),
+            ("echo .npmrc", Allow, "metadata-safe head, unchanged"),
+            ("grep -r npmrc .", Allow, "no dangerous operand, unchanged"),
+            // --- peeling must not turn a reader into an exemption ---
+            (
+                "command cat .env",
+                Block,
+                "peels to a reader, not an exemption",
+            ),
+            ("sudo cat .env", Block, "peels to a reader"),
+            ("env cat .env", Block, "peels to a reader"),
+            ("\\cat .env", Block, "peels to a reader"),
+            (
+                "env -u foo cat .env",
+                Block,
+                "env's own options peeled, verb is still a reader",
+            ),
+            ("time cat .env", Block, "peels to a reader"),
+            ("nohup cat .env", Block, "peels to a reader"),
+            (
+                "command find . -name .env -exec cat {} \\;",
+                Block,
+                "peeling to `find` does not blanket-exempt its exec action",
+            ),
+            (
+                "find . -name .env -exec command cat {} \\;",
+                Block,
+                "the exec action's own head is resolved too",
+            ),
+            (
+                "find . -name .env -exec sudo ls {} \\;",
+                Allow,
+                "…and keeps the exemption it would have had unwrapped",
+            ),
+            // --- `xargs` is NOT a wrapper: peeling it handed `echo`'s
+            // exemption to a pipeline that reads stdin. `xargs echo < .env`
+            // printed real credentials at exit 0 while it was in the set. The
+            // `xargsx` row is the differential (only the peel differed) and
+            // `cat < .env` is the positive control that the operand itself
+            // still classifies as dangerous.
+            (
+                "xargs echo < .env",
+                Block,
+                "CRITICAL REGRESSION: peeling xargs leaked credentials",
+            ),
+            (
+                "xargsx echo < .env",
+                Block,
+                "differential: a non-wrapper head always blocked",
+            ),
+            (
+                "cat < .env",
+                Block,
+                "positive control: operand is dangerous",
+            ),
+            (
+                "find . -name .env -exec xargs echo {} \\;",
+                Block,
+                "the exec action reaches the same wrapper set",
+            ),
+            // --- after a peel the dangerous token can BE the resolved head ---
+            (
+                "sudo .env",
+                Block,
+                "scan starts at argv[0]: the peel can leave the operand in head position",
+            ),
+            ("command .env", Block, "same, via a different wrapper"),
+            ("env .env", Block, "same, via the env peel"),
+            // --- negative controls: the peel matches a whole command word ---
+            (
+                "\\\\ls .env",
+                Block,
+                "NEGATIVE CONTROL: `\\\\ls` is not `ls` — the shell drops ONE \
+                 backslash and looks up `\\ls`, which is not a command \
+                 (matches core::shell::command_word's `\\\\git` precedent)",
+            ),
+            (
+                "envoy run --config .env",
+                Block,
+                "NEGATIVE CONTROL: `envoy` merely starts with `env`",
+            ),
+            (
+                "timeout 5 ls .env",
+                Block,
+                "NEGATIVE CONTROL: `timeout` merely starts with `time` — the \
+                 peel compares whole command words, never prefixes. The Block \
+                 pins the absence of prefix matching, NOT a requirement that \
+                 `timeout` block forever: adding it to COMMAND_WRAPPERS is a \
+                 defensible future call, and this row exists to make that call \
+                 deliberate rather than incidental",
+            ),
+            (
+                "gh env list",
+                Allow,
+                "NEGATIVE CONTROL: `env` as a subcommand is neither dump nor read",
+            ),
+            // --- the file's other carve-outs survive a wrapper ---
+            (
+                "sudo forgectl env redact --file .env",
+                Allow,
+                "the forgectl-env carve-out is reached through a wrapper",
+            ),
+        ];
+
+        let drifted: Vec<String> = cases
+            .iter()
+            .filter_map(|(command, expected, why)| {
+                let got = SecretLeaksGuard.run(&make_bash_input(command)).outcome;
+                (&got != expected)
+                    .then(|| format!("  {command:?}\n    want {expected:?}, got {got:?} — {why}"))
+            })
+            .collect();
+
+        assert!(
+            drifted.is_empty(),
+            "head resolution drifted on {} of {} spellings:\n{}",
+            drifted.len(),
+            cases.len(),
+            drifted.join("\n")
+        );
     }
 }
