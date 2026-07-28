@@ -68,20 +68,11 @@ static API_INPUT_FLAG: LazyLock<Regex> =
 /// spells out replaces a GUESS inferred from the cwd — strictly more accurate
 /// on both verdicts.
 ///
-/// **Known gap, pre-existing and shared by every verb here: only the FIRST
-/// positional is read, so a target placed after a flag is still missed.**
-/// [`gh_repo_positional_target`] takes `argv[3]` and declines when it starts
-/// with `-`, but gh (cobra) accepts interspersed arguments — `gh repo edit
-/// --description x evil/repo` is valid and resolves from the cwd remote, which
-/// ALLOWS it from an owned checkout. Closing it needs gh's per-subcommand flag
-/// table, to tell a flag's value from the positional; the same table
-/// [`repo_flag`] refuses to grow, and for the same reason — the near-miss
-/// alternatives both misfire. Skipping the token after every flag swallows a
-/// real positional following a boolean like `--accept-visibility-change-consequences`,
-/// and picking the first `owner/repo`-shaped token instead false-BLOCKS a
-/// perfectly ordinary `gh repo edit --description "some/thing"`, which resolves
-/// a description fragment as the target. Left as a follow-up rather than
-/// guessed at.
+/// A target placed AFTER a flag counts too — see
+/// [`gh_repo_positional_target`], which scans past flags rather than reading
+/// `argv[3]`. That distinction was itself a bypass: `gh repo edit
+/// --enable-issues evil/x` is a valid cobra invocation, and reading only
+/// `argv[3]` let the cwd remote answer for it.
 const REPO_TARGET_VERBS: &[&str] = &[
     "archive",
     "delete",
@@ -142,7 +133,8 @@ pub(crate) fn is_write_command(command: &str) -> bool {
         // this guard already allows. Blocking one and allowing the other
         // punished the more explicit form for being explicit (#454).
         //
-        // Sound because the narrowing is bounded on all four sides:
+        // Sound because the narrowing is bounded on every side, and each bound
+        // exists because its absence was an actual escape, not a hypothetical:
         //
         // * `WRITE_ACTIONS` is tested above and independently, so nothing here
         //   touches a non-`gh api` write.
@@ -154,6 +146,12 @@ pub(crate) fn is_write_command(command: &str) -> bool {
         //   the space-separated spelling — so a first-reading-wins scan would
         //   clear `gh api … -X GET -XPOST -f a=b` as a read while gh POSTs.
         //   Disagreement returns `None` and the command stays a write.
+        // * The scan understands the flag STREAM, not just the flag spellings:
+        //   it walks shorthand clusters with gh api's table (a method hidden in
+        //   `-iXPOST` is a reading) and steps over the values of value-taking
+        //   flags (`--jq "-XGET"` is a jq program, not a method). Reading only
+        //   the spellings made both of those silent ALLOWs. Anything the table
+        //   cannot attribute is ambiguous, which is a write.
         // * It reads parsed argv, so a `-X GET` inside a quoted `--body` or
         //   `-f` value is one token and can never pose as the flag.
         //
@@ -161,6 +159,19 @@ pub(crate) fn is_write_command(command: &str) -> bool {
         // as a GET) — the direction this guard is allowed to err in. `HEAD` is
         // deliberately not included: it is also a read, but no observed command
         // uses it, and every verb added here is one more that must be argued.
+        //
+        // `graphql` is exempt from the narrowing entirely, because on that
+        // endpoint the METHOD does not decide whether the call writes — the
+        // query does, and `gh api graphql -X GET -f query='mutation …'` would
+        // otherwise read as a GET and skip the mutation classifier altogether.
+        // GitHub happens to ignore a query parameter on `GET /graphql` today,
+        // but that is server transport behavior, and a guard must not delegate
+        // its verdict to it: `--hostname` points the same command at a GHES
+        // instance answering on someone else's terms, and an `--input` body
+        // transmits on a GET regardless. Let it fall through to the graphql arm.
+        if gh_api_endpoint(command).as_deref() == Some("graphql") {
+            return true;
+        }
         return api_explicit_method(command).as_deref() != Some("GET");
     }
     false
@@ -206,45 +217,282 @@ pub(crate) fn repo_flag(command: &str) -> RepoFlag {
     let Some(words) = gh_argv(command) else {
         return RepoFlag::Absent;
     };
-    let trim_value = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
+    // No shorthand table: `repo_flag` runs against EVERY gh subcommand, and the
+    // per-subcommand tables disagree (`-t` is `--template` under `gh api` and
+    // `--title` under `gh pr create`). Passing `None` selects the conservative
+    // cluster rule — see [`scan_unanimous_flag`].
+    match scan_unanimous_flag(&words, 'R', "--repo", None) {
+        FlagScan::Absent => RepoFlag::Absent,
+        FlagScan::Single(repo) => RepoFlag::Target(repo),
+        FlagScan::Ambiguous => RepoFlag::Ambiguous,
+    }
+}
+
+/// What scanning an argv for one repeated flag found.
+#[derive(Debug, PartialEq)]
+enum FlagScan {
+    /// No reading of the flag anywhere in the invocation.
+    Absent,
+    /// Every reading agrees on one value.
+    Single(String),
+    /// Readings disagree, or a token could not be attributed. Callers MUST fail
+    /// closed on this — it is the "I cannot tell" answer, not a value.
+    Ambiguous,
+}
+
+/// A subcommand's flag grammar, enough to tell a flag's VALUE from the next
+/// flag. Supplied only where the table is actually known — see
+/// [`scan_unanimous_flag`] for the conservative rule that applies without one.
+struct FlagTable {
+    /// Shorthand letters that consume a value.
+    value_shorts: &'static str,
+    /// Shorthand letters that consume nothing.
+    bool_shorts: &'static str,
+    /// Whether a long flag consumes the FOLLOWING token as its value.
+    long_takes_value: fn(&str) -> bool,
+}
+
+/// gh `api`'s flag grammar, from `gh api --help` (gh 2.96.0): `-i/--include`
+/// is the ONLY boolean shorthand; every other shorthand takes a value.
+const GH_API_FLAGS: FlagTable = FlagTable {
+    value_shorts: "FfHqtpX",
+    bool_shorts: "i",
+    long_takes_value: api_flag_takes_separate_value,
+};
+
+/// Scan a `gh` argv for every reading of one flag, in all of gh's spellings,
+/// and report whether they agree.
+///
+/// `short` is the shorthand letter (`R`, `X`); `long` the long name
+/// (`--repo`, `--method`). Recognized spellings, all of which pflag accepts:
+/// `-R v`, `-Rv`, `-R=v`, `--repo v`, `--repo=v` — plus the same forms reached
+/// through a **shorthand cluster** (`-iXPOST`), which is the case a
+/// four-spelling scan misses.
+///
+/// **Clusters are why this exists.** pflag walks a single-dash token letter by
+/// letter: a boolean letter consumes nothing and the walk continues, while a
+/// value-taking letter consumes the rest of the token (or the next argument)
+/// as its value. So `gh api … -X GET -iXPOST -f a=b` sets the method TWICE and
+/// gh keeps the last — it POSTs — while a scan that only understood `-X POST`
+/// and `-XPOST` saw one lone `-X GET` and called the command a read. Verified
+/// live against gh 2.96.0: `-iXGET` returns 200 while `-iXBOGUS`, `-iX BOGUS`,
+/// and `-iX=BOGUS` all transmit the bogus method.
+///
+/// **Another flag's VALUE is not a flag.** With a [`FlagTable`], a value-taking
+/// flag's value is stepped over — otherwise `--jq "-XGET"` reads as a method
+/// reading, and since `--jq`/`--template` are validated only after the request
+/// fires, they carry arbitrary attacker-chosen text. That one turned a real
+/// org-endpoint POST into a "read" that skipped every gate, needing no
+/// knowledge of the operator's config beyond the literal `GET`.
+///
+/// `table` supplies the subcommand's flag grammar. With one, clusters are
+/// walked precisely and long-flag values are skipped. **Without one the
+/// conservative rule applies: a cluster whose FIRST letter is `short` is read
+/// normally, a cluster containing `short` anywhere else is
+/// [`FlagScan::Ambiguous`], and no value is skipped** — because there is no way
+/// to know whether an earlier letter, or a preceding long flag, consumed it.
+/// Not skipping values is safe in that mode precisely because a stray reading
+/// becomes a disagreement, and disagreement blocks. Fails closed by
+/// construction: every path that cannot be attributed returns `Ambiguous`, and
+/// an unknown letter inside a table-walked cluster does too.
+///
+/// Values are quote-trimmed; a caller wanting more (case folding) applies it to
+/// the returned value.
+///
+/// **A reading carrying whitespace is discarded rather than counted**, and that
+/// holds for both consumers: gh's parser accepts such a value and forwards it,
+/// but neither a repo spec nor an HTTP method survives at the other end —
+/// GitHub resolves no repo from a name carrying whitespace and trims nothing
+/// (verified live across leading, trailing, and tab variants). So the reading
+/// can never become a write that LANDS, while counting it WOULD manufacture a
+/// disagreement that false-blocks a legitimate command whose `--body` merely
+/// quotes `-R owner/repo` as prose.
+fn scan_unanimous_flag(
+    words: &[String],
+    short: char,
+    long: &str,
+    table: Option<&FlagTable>,
+) -> FlagScan {
+    let long_eq = format!("{long}=");
+    let short_flag = format!("-{short}");
+    let trim = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
     let mut seen: Vec<String> = Vec::new();
+    let mut ambiguous = false;
+    let push = |seen: &mut Vec<String>, v: String| {
+        if !v.is_empty() && !v.contains(char::is_whitespace) {
+            seen.push(v);
+        }
+    };
     // Start past argv[0] (`gh` itself).
     let mut i = 1;
     while i < words.len() {
         let word = words[i].as_str();
-        if word == "-R" || word == "--repo" {
+        // `--` ends flag parsing; nothing after it is a flag.
+        if word == "--" {
+            break;
+        }
+        if word == long || word == short_flag {
             if let Some(value) = words.get(i + 1) {
-                seen.push(trim_value(value));
+                push(&mut seen, trim(value));
                 // Skip the value so it cannot also be read as a flag.
                 i += 2;
                 continue;
             }
-        } else if let Some(repo) = word.strip_prefix("--repo=") {
-            seen.push(trim_value(repo));
-        } else if let Some(repo) = word.strip_prefix("-R")
-            // Compact form: -Rowner/repo. Exclude other dash-prefixed flags by
-            // requiring the remainder not start with another dash, and exclude
-            // whitespace. gh's own parser ACCEPTS a spec containing a space and
-            // forwards it — the request dies at GitHub, which resolves no repo
-            // from a name carrying whitespace and trims nothing (verified live
-            // across leading, trailing, and tab variants). So a
-            // `--body "-R some prose"` token can never become a write that
-            // lands, and counting it would only manufacture a disagreement that
-            // false-blocks a legitimate command.
-            && !repo.is_empty()
-            && !repo.starts_with('-')
-            && !repo.contains(char::is_whitespace)
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = word.strip_prefix(long_eq.as_str()) {
+            push(&mut seen, trim(rest));
+            i += 1;
+            continue;
+        }
+        // Long flag we are not looking for: its value, when separate, is data
+        // and must not be scanned as a flag. Only a table can say whether one
+        // follows; without a table nothing is skipped, which is safe because a
+        // stray reading becomes a disagreement and disagreement blocks.
+        if word.starts_with("--") {
+            let takes_value = table.is_some_and(|t| (t.long_takes_value)(word));
+            i += if takes_value && !word.contains('=') {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        // Single-dash token: a shorthand cluster.
+        if let Some(cluster) = word.strip_prefix('-')
+            && !cluster.is_empty()
         {
-            seen.push(trim_value(repo));
+            match scan_cluster(cluster, short, table, words.get(i + 1)) {
+                ClusterScan::None => i += 1,
+                ClusterScan::Value(v, consumed_next) => {
+                    push(&mut seen, trim(&v));
+                    i += if consumed_next { 2 } else { 1 };
+                }
+                ClusterScan::ConsumedNext => i += 2,
+                ClusterScan::Unattributable => {
+                    ambiguous = true;
+                    i += 1;
+                }
+            }
+            continue;
         }
         i += 1;
+    }
+    if ambiguous {
+        return FlagScan::Ambiguous;
     }
     seen.sort();
     seen.dedup();
     match seen.len() {
-        0 => RepoFlag::Absent,
-        1 => RepoFlag::Target(seen.swap_remove(0)),
-        _ => RepoFlag::Ambiguous,
+        0 => FlagScan::Absent,
+        1 => FlagScan::Single(seen.swap_remove(0)),
+        _ => FlagScan::Ambiguous,
+    }
+}
+
+/// What walking one single-dash shorthand cluster yielded.
+enum ClusterScan {
+    /// No reading of the target letter; the cluster consumed no following token.
+    None,
+    /// A reading of the target letter. The flag says whether it also consumed
+    /// the FOLLOWING argv token as the value.
+    Value(String, bool),
+    /// No reading, but some other value-taking letter consumed the next token.
+    ConsumedNext,
+    /// The cluster could not be attributed — caller must fail closed.
+    Unattributable,
+}
+
+/// Whether a shorthand cluster consumes the FOLLOWING argv token as a value.
+///
+/// pflag walks the cluster letter by letter; the first value-taking letter
+/// claims the rest of the cluster as its value, and only when it is the LAST
+/// letter does it reach for the next token. So `-yd desc` consumes `desc`
+/// (`-y` boolean, `-d` last and value-taking) while `-ddesc` does not.
+/// Checking only the final letter would get `-yd` wrong in the dangerous
+/// direction — treating `desc` as the positional target and letting the real
+/// one fall through to the cwd remote.
+fn cluster_consumes_next(cluster: &str, value_shorts: &str) -> bool {
+    let len = cluster.chars().count();
+    for (idx, c) in cluster.chars().enumerate() {
+        if value_shorts.contains(c) {
+            return idx + 1 == len;
+        }
+    }
+    false
+}
+
+/// Walk one shorthand cluster the way pflag does, looking for `short`.
+fn scan_cluster(
+    cluster: &str,
+    short: char,
+    table: Option<&FlagTable>,
+    next: Option<&String>,
+) -> ClusterScan {
+    let chars: Vec<char> = cluster.chars().collect();
+    let Some(FlagTable {
+        value_shorts,
+        bool_shorts,
+        ..
+    }) = table
+    else {
+        // No table. The target letter is readable only in first position,
+        // where no earlier letter can have claimed it as a value. Indexed
+        // through `first()` rather than `[0]`: this is a hook binary, and a
+        // panic here would take the whole check down instead of failing closed.
+        if chars.first() == Some(&short) {
+            return read_short_value(&chars[1..], next);
+        }
+        return if chars.contains(&short) {
+            ClusterScan::Unattributable
+        } else {
+            ClusterScan::None
+        };
+    };
+    let mut idx = 0;
+    while idx < chars.len() {
+        let c = chars[idx];
+        if c == short {
+            return read_short_value(&chars[idx + 1..], next);
+        }
+        if value_shorts.contains(c) {
+            // This letter eats the rest of the cluster, or the next token.
+            return if idx + 1 < chars.len() {
+                ClusterScan::None
+            } else {
+                ClusterScan::ConsumedNext
+            };
+        }
+        if !bool_shorts.contains(c) {
+            // A letter the table does not know: it may or may not have eaten
+            // the target letter. Refuse to guess.
+            return ClusterScan::Unattributable;
+        }
+        idx += 1;
+    }
+    ClusterScan::None
+}
+
+/// Read a shorthand's value from the cluster remainder after its letter,
+/// falling back to the next argv token. Mirrors pflag: `-Xv` and `-X=v` take
+/// the remainder, a bare `-X` takes the following argument.
+fn read_short_value(rest: &[char], next: Option<&String>) -> ClusterScan {
+    if rest.is_empty() {
+        return match next {
+            Some(v) => ClusterScan::Value(v.clone(), true),
+            None => ClusterScan::None,
+        };
+    }
+    let value: String = if rest[0] == '=' {
+        rest[1..].iter().collect()
+    } else {
+        rest.iter().collect()
+    };
+    if value.is_empty() {
+        ClusterScan::None
+    } else {
+        ClusterScan::Value(value, false)
     }
 }
 
@@ -290,10 +538,15 @@ fn resolve_target_repo(
     }
 
     // 2. gh repo <subcommand> <owner/repo> (positional arg)
-    if let Some((subcommand, first_arg)) = gh_repo_positional_target(command) {
+    if let Some((subcommand, spec_host, first_arg)) = gh_repo_positional_target(command) {
         if first_arg.contains('/') {
             return RepoResolution::Resolved {
-                host: dh,
+                // A `HOST/OWNER/REPO` positional names its own host, and it is
+                // judged rather than assumed: `evil-host/cameronsjo/x` carries
+                // an allowed-looking owner to a forge the allowlist never
+                // named. Bare allowlist entries match the default host only, so
+                // the spec blocks unless that host was explicitly allowed.
+                host: spec_host.unwrap_or_else(|| dh.clone()),
                 repo: first_arg,
             };
         }
@@ -659,14 +912,64 @@ fn api_repos_target(endpoint: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-/// The `(verb, target)` of a `gh repo <verb> <target>` invocation whose first
+/// Long flags of the `gh repo` verbs in [`REPO_TARGET_VERBS`] that consume a
+/// SEPARATE value token, which the positional scan must step over.
+///
+/// Union across the verbs (gh 2.96.0). Completeness is not required for
+/// soundness, only for avoiding false blocks, because the unknown case errs
+/// the safe way: an unrecognized long flag is treated as boolean, so the token
+/// after it is read as the positional, resolving a target that then faces the
+/// allowlist. Mistaking a boolean for value-taking is the dangerous direction —
+/// it would step OVER the real positional and fall through to the cwd remote —
+/// so `--template` is deliberately ABSENT: it takes a value under
+/// `gh repo create` but is boolean under `gh repo edit`, and only the boolean
+/// reading is safe when the two disagree.
+const REPO_VERB_VALUE_FLAGS: &[&str] = &[
+    "--add-topic",
+    "--default-branch",
+    "--description",
+    "--fork-name",
+    "--gitignore",
+    "--homepage",
+    "--license",
+    "--org",
+    "--remote",
+    "--remote-name",
+    "--remove-topic",
+    "--source",
+    "--squash-merge-commit-message",
+    "--team",
+    "--upstream-remote-name",
+    "--visibility",
+];
+
+/// Shorthand letters of those verbs that consume a value (`-d` description,
+/// `-h` homepage, `-t` team, `-g` gitignore, `-l` license, `-r` remote,
+/// `-s` source, `-u` upstream-remote-name). `-p` (`--template` on create) is
+/// omitted for the same reason its long form is.
+const REPO_VERB_VALUE_SHORTS: &str = "dhtglrsu";
+
+/// The `(verb, target)` of a `gh repo <verb> … <target>` invocation whose
 /// positional names the repo, per [`REPO_TARGET_VERBS`]. `None` when the
-/// segment isn't that shape, or the positional is absent or a flag.
+/// segment isn't that shape, or no positional follows the verb.
 ///
 /// Shared by [`resolve_target_repo`]'s positional arm and
 /// [`segment_lacks_explicit_target`] so a new target-naming verb lands in one
 /// place and the resolver and the nudge predicate can't drift apart.
-fn gh_repo_positional_target(segment: &str) -> Option<(String, String)> {
+///
+/// **Scans past flags rather than reading `argv[3]`.** cobra parses flags and
+/// positionals interspersed, so `gh repo edit --enable-issues evil/x` names its
+/// target just as surely as `gh repo edit evil/x --enable-issues` does. Reading
+/// only `argv[3]` saw a flag, declined, and let the cwd remote answer — which
+/// ALLOWS the write from any owned checkout. The same held for
+/// `gh repo delete --yes evil/x`, `gh repo archive --yes evil/x`, and the `--`
+/// terminator form.
+///
+/// A leading flag does NOT fail closed here: `gh repo edit --enable-issues`
+/// with no positional legitimately targets the cwd repo, and blocking it would
+/// re-break the case this arm exists to serve. Returning `None` there is
+/// correct — resolution falls through to the git-remote arm, as it should.
+fn gh_repo_positional_target(segment: &str) -> Option<(String, Option<String>, String)> {
     let argv = gh_argv(segment)?;
     if argv.get(1).map(String::as_str) != Some("repo") {
         return None;
@@ -675,11 +978,78 @@ fn gh_repo_positional_target(segment: &str) -> Option<(String, String)> {
     if !REPO_TARGET_VERBS.contains(&verb.as_str()) {
         return None;
     }
-    let target = argv.get(3)?;
-    if target.is_empty() || target.starts_with('-') {
+    let mut i = 3;
+    while i < argv.len() {
+        let word = argv[i].as_str();
+        // `--` ends flag parsing; the next token is the positional.
+        if word == "--" {
+            let target = argv.get(i + 1)?;
+            return non_flag_target(verb, target);
+        }
+        if let Some(name) = word.strip_prefix("--") {
+            // `--flag=value` carries its value inline, so nothing to step over.
+            if name.contains('=') {
+                i += 1;
+                continue;
+            }
+            i += if REPO_VERB_VALUE_FLAGS.contains(&word) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if let Some(cluster) = word.strip_prefix('-')
+            && !cluster.is_empty()
+        {
+            i += if cluster_consumes_next(cluster, REPO_VERB_VALUE_SHORTS) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return non_flag_target(verb, &argv[i]);
+    }
+    None
+}
+
+/// Accept a scanned positional as a target, normalizing the one extra spelling
+/// that would otherwise judge the wrong field.
+///
+/// gh accepts three positional forms (verified against gh 2.96.0, all three
+/// resolving to the same repo): `OWNER/REPO`, `HOST/OWNER/REPO`, and a full
+/// URL. Downstream ownership splits on the FIRST `/`, so a three-part spec had
+/// its HOST judged as the owner — `cameronsjo/evil-corp/x` passed an allowlist
+/// containing `cameronsjo` while gh targeted `evil-corp/x`. Dropping the host
+/// segment puts the real owner in front of the check.
+///
+/// **The host segment travels with the split, and is never assumed.** Dropping
+/// it silently would only move the bug: `evil-host/cameronsjo/x` yields an
+/// allowed-looking OWNER while gh talks to another forge entirely. Returning it
+/// lets the caller judge the target against its real host, where a bare
+/// allowlist entry matches the default host only — so the same spec blocks
+/// unless that host was explicitly allowed.
+///
+/// A URL form is returned UNCHANGED on purpose, rather than rejected or split.
+/// It cannot be normalized safely — the same trap that made the `gh api`
+/// endpoint match anchored — and returning `None` would be worse than useless,
+/// because resolution would fall through to the cwd remote and ALLOW it from
+/// any owned checkout. Handing the raw string to the allowlist fails closed
+/// instead: its "owner" is `https:`, which matches nothing.
+fn non_flag_target(verb: &str, target: &str) -> Option<(String, Option<String>, String)> {
+    if target.is_empty() {
         return None;
     }
-    Some((verb.clone(), target.clone()))
+    let parts: Vec<&str> = target.split('/').collect();
+    if parts.len() == 3 && !target.contains(':') {
+        return Some((
+            verb.to_string(),
+            Some(parts[0].to_string()),
+            format!("{}/{}", parts[1], parts[2]),
+        ));
+    }
+    Some((verb.to_string(), None, target.to_string()))
 }
 
 /// True when `segment`'s gh invocation targets the user's own account
@@ -736,57 +1106,18 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
 /// unanimity — rather than gh's own last-occurrence-wins rule — is the safe
 /// reading here.
 ///
-/// Covers the pflag spellings of a string flag (`-X V`, `-XV`, `-X=V`,
-/// `--method V`, `--method=V`) over parsed argv rather than raw text, so a
-/// method flag quoted inside another flag's value is one token and is not read
-/// as a flag. Only the `gh api` subcommand is inspected — a `-X` belonging to
-/// some other command is not a method.
-///
-/// Deliberately NOT merged with [`repo_flag`], which scans the same four
-/// spellings and applies the same agreement rule: the two normalize their
-/// values differently (this one uppercases and strips a `=`; `repo_flag`
-/// excludes whitespace-bearing specs) and report disagreement differently (a
-/// [`RepoFlag::Ambiguous`] the caller turns into a block, versus a `None` that
-/// falls back to gh's implicit rule). A shared scanner would need both sets of
-/// rules as parameters, which trades a visible parallel for a configurable one
-/// — the wrong trade in a guard. **Edit them as a pair:** a fix to the flag
-/// grammar in one almost certainly applies to the other.
+/// Shares [`scan_unanimous_flag`] with [`repo_flag`] — the flag grammar is the
+/// same on both, and keeping one scanner is what stopped them drifting apart
+/// (the compact-form whitespace rule lived in only one of the two). This side
+/// passes gh `api`'s shorthand table, so a cluster is walked precisely instead
+/// of failing closed; only `gh api` is inspected, since a `-X` belonging to
+/// another subcommand is not a method.
 fn api_explicit_method(segment: &str) -> Option<String> {
     gh_api_endpoint(segment)?;
     let words = gh_argv(segment)?;
-    let clean = |s: &str| {
-        s.trim_matches(|c| c == '"' || c == '\'')
-            .to_ascii_uppercase()
-    };
-    let mut seen: Vec<String> = Vec::new();
-    // Start past argv[0] (`gh` itself).
-    let mut i = 1;
-    while i < words.len() {
-        let word = words[i].as_str();
-        if word == "-X" || word == "--method" {
-            if let Some(value) = words.get(i + 1) {
-                seen.push(clean(value));
-                // Skip the value so it cannot also be read as a flag.
-                i += 2;
-                continue;
-            }
-        } else if let Some(rest) = word
-            .strip_prefix("--method=")
-            .or_else(|| word.strip_prefix("-X"))
-            .filter(|rest| !rest.is_empty() && !rest.starts_with('-'))
-        {
-            // `-X=POST` is a valid pflag shorthand spelling; drop the `=` so it
-            // reads as the method it sets rather than as a distinct value that
-            // would manufacture a disagreement.
-            seen.push(clean(rest.strip_prefix('=').unwrap_or(rest)));
-        }
-        i += 1;
-    }
-    seen.sort();
-    seen.dedup();
-    match seen.len() {
-        1 => Some(seen.swap_remove(0)),
-        _ => None,
+    match scan_unanimous_flag(&words, 'X', "--method", Some(&GH_API_FLAGS)) {
+        FlagScan::Single(method) => Some(method.to_ascii_uppercase()),
+        FlagScan::Absent | FlagScan::Ambiguous => None,
     }
 }
 
@@ -4149,10 +4480,141 @@ mod tests {
             "gh api repos/cameronsjo/x -X GET -XPOST -f a=b",
             "gh api repos/cameronsjo/x -X GET --method=POST -f a=b",
             "gh api repos/cameronsjo/x -X GET -X=DELETE -f a=b",
-            "gh api repos/cameronsjo/x -XGET -X PATCH -f a=b",
+            // Spelled to DODGE `API_WRITE_METHOD`, which matches only a
+            // space-separated `-X PATCH`. The earlier `-XGET -X PATCH` form
+            // was a false witness: the regex caught it before the unanimity
+            // rule was ever consulted, so it passed without exercising the
+            // property it claimed to pin.
+            "gh api repos/cameronsjo/x -XGET -X=PATCH -f a=b",
         ] {
             assert!(is_write_command(cmd), "must stay a write: {cmd}");
         }
+        // The dodge is the point — prove the regex really is silent here, or
+        // the case silently stops testing unanimity again.
+        assert!(!API_WRITE_METHOD.is_match("gh api repos/cameronsjo/x -XGET -X=PATCH -f a=b"));
+    }
+
+    // --- Shorthand clusters: pflag walks a single-dash token letter by letter ---
+
+    #[test]
+    fn a_method_inside_a_shorthand_cluster_is_a_write() {
+        // `-i` is gh api's only boolean shorthand, so pflag keeps walking and
+        // `X` sets the method — gh honors the LAST one and POSTs. Verified
+        // live against gh 2.96.0: `-iXGET` returns 200 while `-iXBOGUS`,
+        // `-iX BOGUS` and `-iX=BOGUS` all transmit the bogus method.
+        for cmd in [
+            "gh api repos/evil-corp/x/issues -X GET -iXPOST -f title=pwned",
+            "gh api repos/evil-corp/x/issues -X GET -iX POST -f title=pwned",
+            "gh api repos/evil-corp/x/issues -X GET -iX=POST -f title=pwned",
+            "gh api repos/evil-corp/x/issues -X GET -iiX POST -f title=pwned",
+            "gh api repos/evil-corp/x/issues -X GET -iXPOST --input body.json",
+        ] {
+            assert!(is_write_command(cmd), "cluster must stay a write: {cmd}");
+        }
+    }
+
+    #[test]
+    fn a_boolean_cluster_without_the_method_letter_still_reads() {
+        // Positive control: `-i` alone must not disturb the GET narrowing, or
+        // the cluster fix would just re-block legitimate reads.
+        assert!(!is_write_command("gh api -i -X GET search/issues -f q=x"));
+        assert!(!is_write_command("gh api -i -XGET search/issues -f q=x"));
+        assert!(!is_write_command("gh api -iXGET search/issues -f q=x"));
+    }
+
+    #[test]
+    fn an_unknown_cluster_letter_fails_closed() {
+        // The table cannot say whether an unknown letter consumed the `X`, so
+        // the scan refuses to call it a read.
+        assert!(is_write_command("gh api repos/cameronsjo/x -zXGET -f a=b"));
+    }
+
+    #[test]
+    fn a_value_flags_value_is_not_read_as_a_method() {
+        // `--jq` and `-t` values are validated only AFTER the request fires, so
+        // they carry arbitrary text. Reading one as a method turned a real org
+        // POST into a "read", which skipped every gate — fail-safe, user-scoped,
+        // unverifiable, and allowlist alike — with no ownership check at all.
+        // This needs no knowledge of the operator's config, just the literal
+        // "GET".
+        for cmd in [
+            r#"gh api orgs/evil-org/repos -f name=pwned --jq "-XGET""#,
+            r#"gh api orgs/evil-org/repos -f name=pwned -q "-XGET""#,
+            r#"gh api orgs/evil-org/repos -f name=pwned -t "-XGET""#,
+            r#"gh api orgs/evil-org/repos -f name=pwned --template "-XGET""#,
+        ] {
+            assert!(is_write_command(cmd), "decoy must stay a write: {cmd}");
+        }
+    }
+
+    #[test]
+    fn the_org_post_decoy_still_blocks_end_to_end() {
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                r#"gh api orgs/evil-org/repos -f name=pwned --jq "-XGET""#,
+                OWNED_DIR,
+            ));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn a_repo_flag_inside_a_shorthand_cluster_does_not_slip_through() {
+        // The same cluster grammar, on the OTHER scanner — and a live bypass
+        // predating this branch. `-d` is `gh pr create`'s `--draft` boolean, so
+        // `-dR evil/x` sets the repo. With no per-subcommand table available
+        // here the scan cannot attribute the letter, so it fails closed rather
+        // than dropping the flag and letting the cwd remote answer.
+        for cmd in [
+            "gh pr create -dR evil-corp/x --title t --body b",
+            "gh pr create -dR=evil-corp/x --title t",
+            "gh pr create -dR evil-corp/x --title t",
+        ] {
+            with_env(&owners_env(), || {
+                let result = GhWriteGuard.run(&input_with(cmd, OWNED_DIR));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "cluster must not resolve away: {cmd}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn an_ordinary_repo_flag_still_resolves() {
+        // Positive control for the cluster rule: the plain spellings, where the
+        // target letter leads, must keep working.
+        assert_allows("gh pr create -R cameronsjo/cadence-hooks --title t");
+        assert_allows("gh pr create -Rcameronsjo/cadence-hooks --title t");
+        assert_allows("gh pr create --repo=cameronsjo/cadence-hooks --title t");
+    }
+
+    // --- graphql is never decided by the method ---
+
+    #[test]
+    fn an_explicit_get_does_not_skip_the_graphql_classifier() {
+        // On graphql the QUERY decides, not the method. Narrowing on `-X GET`
+        // would hand the verdict to server transport behavior — and
+        // `--hostname` repoints the same command at a GHES instance.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                "gh api graphql -X GET -f query='mutation { createRepository(input: {}) { id } }'",
+                OWNED_DIR,
+            ));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn a_graphql_read_with_an_explicit_get_still_allows() {
+        // Positive control: routing graphql past the narrowing must not start
+        // blocking graphql READS, which is #353 all over again.
+        assert_allows("gh api graphql -X GET -f query='query { viewer { login } }'");
+        assert_allows(
+            "gh api graphql -X GET -f query='mutation { resolveReviewThread(input: {}) { thread { id } } }'",
+        );
     }
 
     #[test]
@@ -4231,7 +4693,11 @@ mod tests {
     fn repo_edit_positional_names_the_target() {
         assert_eq!(
             gh_repo_positional_target("gh repo edit cameronsjo/cli-capture --enable-issues"),
-            Some(("edit".to_string(), "cameronsjo/cli-capture".to_string()))
+            Some((
+                "edit".to_string(),
+                None,
+                "cameronsjo/cli-capture".to_string()
+            ))
         );
     }
 
@@ -4290,24 +4756,149 @@ mod tests {
         ));
     }
 
+    /// Assert a command blocks as an unowned target from an OWNED checkout —
+    /// the direction that matters, since the cwd remote would otherwise answer
+    /// and allow it.
+    fn assert_blocks_unowned(command: &str) {
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
+            let meta = result
+                .block_metadata
+                .unwrap_or_else(|| panic!("expected a structured block: {command}"));
+            assert_eq!(
+                meta.rule_id, "gh-write-unauthorized-target",
+                "wrong rule for: {command}"
+            );
+        });
+    }
+
+    /// Assert a command is allowed from an OWNED checkout.
+    fn assert_allows(command: &str) {
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
+            assert!(
+                matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                "expected ALLOW: {command}"
+            );
+        });
+    }
+
     #[test]
-    fn repo_edit_target_after_a_flag_is_a_known_gap() {
-        // CHARACTERIZATION, not an endorsement. gh accepts interspersed
-        // arguments, so this is a valid spelling of the same write — but only
-        // `argv[3]` is read, so the positional is missed and the cwd remote
-        // (an owned repo) answers, allowing a write to a repo the operator
-        // does not own. Pre-existing and shared by every REPO_TARGET_VERBS
-        // entry; see that constant for why closing it needs gh's flag table.
-        //
-        // When the gap IS closed, this assertion must flip to a BLOCK on
-        // `gh-write-unauthorized-target` — do not delete the case.
+    fn repo_verb_target_after_a_flag_still_resolves() {
+        // cobra parses flags and positionals interspersed, so each of these
+        // names its target as surely as the repo-first spelling does. Reading
+        // only argv[3] saw a flag, declined, and let the cwd remote answer —
+        // allowing a write to a repo the operator does not own.
+        for cmd in [
+            "gh repo edit --enable-issues evil-corp/cool-tool",
+            "gh repo delete --yes evil-corp/cool-tool",
+            "gh repo archive --yes evil-corp/cool-tool",
+            "gh repo edit -- evil-corp/cool-tool",
+            "gh repo edit -d desc evil-corp/cool-tool",
+            "gh repo edit --description desc evil-corp/cool-tool",
+        ] {
+            assert_blocks_unowned(cmd);
+        }
+    }
+
+    #[test]
+    fn repo_edit_without_a_positional_still_targets_the_cwd() {
+        // Positive control for the scan above: a LEADING flag must not fail
+        // closed. `gh repo edit --enable-issues` legitimately edits the cwd
+        // repo, and blocking it would re-break the case the arm exists for.
+        assert_allows("gh repo edit --enable-issues");
+        // A value-taking flag's value is stepped over, so a description that
+        // merely looks like a repo spec is not read as the target.
+        assert_allows("gh repo edit --description some/thing");
+        assert_allows("gh repo edit -d some/thing");
+    }
+
+    #[test]
+    fn repo_edit_of_an_owned_target_after_a_flag_allows() {
+        assert_allows("gh repo edit --description x cameronsjo/cli-capture");
+    }
+
+    #[test]
+    fn a_value_short_that_is_not_first_in_a_cluster_still_eats_its_value() {
+        // pflag's first value-taking letter claims the rest of the cluster, and
+        // reaches for the next token only when it is LAST. Checking just the
+        // final letter is not the same rule, and gets `-cd desc` wrong in the
+        // dangerous direction — reading `desc` as the target and letting the
+        // real positional fall through to the cwd remote.
+        assert!(cluster_consumes_next("d", REPO_VERB_VALUE_SHORTS));
+        assert!(cluster_consumes_next("cd", REPO_VERB_VALUE_SHORTS));
+        assert!(!cluster_consumes_next("ddesc", REPO_VERB_VALUE_SHORTS));
+        assert!(!cluster_consumes_next("d=desc", REPO_VERB_VALUE_SHORTS));
+        assert!(!cluster_consumes_next("c", REPO_VERB_VALUE_SHORTS));
+        // End to end: the target after such a cluster is still resolved.
+        assert_blocks_unowned("gh repo create -cd desc evil-corp/cool-tool");
+    }
+
+    #[test]
+    fn repo_positional_host_segment_is_not_judged_as_the_owner() {
+        // gh accepts HOST/OWNER/REPO, but ownership splits on the FIRST slash,
+        // so the host used to be judged as the owner — an allowed-looking host
+        // cleared a write to an unowned repo.
+        assert_blocks_unowned("gh repo edit cameronsjo/evil-corp/cool-tool");
+        assert_allows("gh repo edit github.com/cameronsjo/cli-capture");
+    }
+
+    #[test]
+    fn repo_positional_host_is_judged_not_assumed() {
+        // The other half, and the one a naive "drop the host segment" fix would
+        // open: an allowed OWNER behind an unnamed HOST. Bare allowlist entries
+        // match the default host only, so this must block even though
+        // `cameronsjo` is allowed — gh would be talking to another forge.
         with_env(&owners_env(), || {
             let result = GhWriteGuard.run(&input_with(
-                "gh repo edit --description x evil-corp/cool-tool",
+                "gh repo edit evil-host.example/cameronsjo/cool-tool",
                 OWNED_DIR,
             ));
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
         });
+        // Explicitly allowing that host lets the same spec through, which is
+        // what proves the host is being CHECKED rather than merely rejected.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", Some("evil-host.example")),
+            ],
+            || {
+                let result = GhWriteGuard.run(&input_with(
+                    "gh repo edit evil-host.example/cameronsjo/cool-tool",
+                    OWNED_DIR,
+                ));
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+            },
+        );
+    }
+
+    #[test]
+    fn repo_positional_url_form_fails_closed() {
+        // A URL cannot be normalized safely — a host segment could carry an
+        // allowed-looking owner — so it goes to the allowlist unchanged, where
+        // its "owner" (`https:`) matches nothing.
+        assert_blocks_unowned("gh repo edit https://evil.example/cameronsjo/cool-tool");
+    }
+
+    #[test]
+    fn gh_repo_edit_rejects_a_bare_name() {
+        // Documents a REFUTED concern rather than a fix: `gh repo edit` is not
+        // like `gh repo view`. Verified against gh 2.96.0 — a bare name is
+        // rejected outright ("expected the \"[HOST/]OWNER/REPO\" format"), so
+        // there is no bare-name spelling of `gh repo edit` for the guard to
+        // resolve, and no unsatisfiable shape hiding behind one. Only `create`
+        // infers an owner from a bare name, which the resolver already
+        // special-cases.
+        assert_eq!(
+            gh_repo_positional_target("gh repo edit somename --enable-issues"),
+            Some(("edit".to_string(), None, "somename".to_string()))
+        );
+        // No slash → the resolver declines to invent an owner for `edit` and
+        // falls through to the cwd remote, which is the owned repo here.
+        assert_allows("gh repo edit somename --enable-issues");
     }
 
     #[test]
