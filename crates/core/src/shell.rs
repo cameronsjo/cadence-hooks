@@ -1904,13 +1904,66 @@ fn shell_c_argument(segment: &str) -> Option<String> {
     shell_c_argument_tokens(&tokenize(segment))
 }
 
+/// Prefix words skipped when hunting for a shell wrapper to EXPAND: everything
+/// [`skip_transparent_prefixes`] skips, plus `sudo`.
+///
+/// **This set feeds a DETECTOR, and that is why it may be wider than
+/// [`TRANSPARENT`].** Expanding a wrapper only ADDS segments to the "every
+/// command that will actually execute" view, so an over-eager skip costs an
+/// extra segment to inspect — and, where that segment reaches a block-capable
+/// guard, can manufacture a false block on something the shell would never run
+/// (see the bounded-not-free caveat below); a missed one costs the inner
+/// script's visibility
+/// to every guard that segments. `TRANSPARENT` is the opposite case — it is
+/// consumed by `enforce_worktree` and `guard_rm` to decide *which verb runs*,
+/// where a wrong skip resolves the wrong command word, so it excludes `sudo`
+/// deliberately and must keep excluding it. Same question, different
+/// consequence: ask which one you are in before reusing either set.
+///
+/// The direction is not unconditional, which is why this stays a short list of
+/// words that genuinely exec their argument rather than every prefix-shaped
+/// token. `command_segments` feeds block-capable guards, so expanding a script
+/// the shell would NOT run could manufacture a false block — the cost of
+/// over-eagerness is bounded, not zero.
+///
+/// `sudo`'s own options are not parsed: the skip only fires when the next token
+/// is not a flag, so `sudo -u root bash -c '…'` stays unexpanded rather than
+/// risking a wrong resolution — the same refusal
+/// [`skip_transparent_prefixes`] makes, for the same reason.
+fn skip_expansion_prefixes(tokens: &[String]) -> &[String] {
+    let mut argv = skip_transparent_prefixes(tokens);
+    while argv.len() > 1 && command_word(&argv[0]) == "sudo" && !argv[1].starts_with('-') {
+        argv = skip_transparent_prefixes(&argv[1..]);
+    }
+    argv
+}
+
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
 /// tokenized (and, in the guard's case, stripped transparent prefixes) can
 /// detect a wrapper without re-tokenizing.
+///
+/// **Prefixes are skipped HERE, not left to the caller.** They used to be the
+/// caller's job, and the two entry points disagreed about whether it had been
+/// done: `child_scripts` handed in an already-stripped argv, while
+/// `expand_segments` called [`shell_c_argument`], which tokenizes the RAW
+/// segment. So a prefixed wrapper was expanded down one path and invisible
+/// down the other — `bash -c 'cat .env'` was seen while `sudo bash -c 'cat
+/// .env'` and `command sh -c 'cat .env'` were not, and the script survived as
+/// one whitespace-bearing token that `prevent-secret-leaks`' false-positive
+/// firewall skips by design, so the read inside it reached no guard at all.
+/// Skipping inside the shared function is what makes the two paths agree by
+/// construction. It is idempotent, so a caller that already stripped loses
+/// nothing.
+///
+/// The command word goes through [`command_word`] rather than a local
+/// basename, so `/bin/sh -c` keeps working and `\bash -c` starts working —
+/// same normalization every other verb gate uses.
 fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
-    let first = tokens.first()?;
-    let cmd = first.rsplit('/').next().unwrap_or(first);
-    if !matches!(cmd, "sh" | "bash" | "zsh" | "dash") {
+    let tokens = skip_expansion_prefixes(tokens);
+    if !matches!(
+        command_word(tokens.first()?),
+        "sh" | "bash" | "zsh" | "dash"
+    ) {
         return None;
     }
     for (i, tok) in tokens.iter().enumerate().skip(1) {
@@ -3217,6 +3270,51 @@ mod tests {
     fn command_segments_sh_with_script_file_not_expanded() {
         // `sh script.sh` has no inline `-c` script to surface.
         assert_eq!(command_segments("sh deploy.sh"), vec!["sh deploy.sh"]);
+    }
+
+    /// A wrapper prefix must not hide `sh -c` from the expansion. The inner
+    /// script reached no guard when it did: it survived as ONE
+    /// whitespace-bearing token, which `prevent-secret-leaks`' false-positive
+    /// firewall skips by design, so `sudo bash -c 'cat .env'` was allowed
+    /// while the unprefixed spelling blocked.
+    ///
+    /// Every row asserts the inner script is surfaced as its own segment. The
+    /// unprefixed row is the positive control (it always worked); the
+    /// `sudo -u root` and non-wrapper rows are the negative controls that keep
+    /// this from degenerating into "expand anything".
+    #[test]
+    fn command_segments_expands_prefixed_shell_wrapper() {
+        let inner = "cat .env".to_string();
+        for cmd in [
+            "bash -c 'cat .env'",       // positive control: always worked
+            "sudo bash -c 'cat .env'",  // the reported bypass
+            "command sh -c 'cat .env'", // the reported bypass
+            "env sh -c 'cat .env'",
+            "exec bash -c 'cat .env'",
+            "sudo command bash -c 'cat .env'", // stacked prefixes
+            "sudo /bin/sh -c 'cat .env'",      // path-qualified behind a prefix
+            "sudo \\bash -c 'cat .env'",       // alias-bypass spelling
+        ] {
+            assert!(
+                command_segments(cmd).contains(&inner),
+                "{cmd:?} did not surface the inner script"
+            );
+        }
+
+        // `sudo`'s own flags are not parsed, so this stays unexpanded rather
+        // than risking a wrong resolution — same refusal as
+        // skip_transparent_prefixes.
+        assert!(!command_segments("sudo -u root bash -c 'cat .env'").contains(&inner));
+        // The row above does NOT discriminate: deleting the `starts_with('-')`
+        // guard leaves it passing, because peeling `sudo` lands on `-u`, which
+        // is not a shell either way. This is the shape that kills that mutant —
+        // `command_word` basenames on `/`, so without the guard `-u/bin/bash`
+        // resolves to `bash` and the segment expands into a false block.
+        assert!(!command_segments("sudo -u/bin/bash -c 'cat .env'").contains(&inner));
+        // Still not a wrapper just because a prefix precedes it.
+        assert!(!command_segments("sudo echo 'cat .env'").contains(&inner));
+        // A word that merely starts with `sudo` is not `sudo`.
+        assert!(!command_segments("sudoedit bash -c 'cat .env'").contains(&inner));
     }
 
     // --- heredoc stripping ---
