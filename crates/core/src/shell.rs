@@ -44,16 +44,51 @@ pub fn strip_quotes(s: &str) -> String {
 /// stripped, so `--body "see --flag x"` yields `["--body", "see --flag x"]` —
 /// quoted text can never masquerade as a flag. Unmatched quotes consume the
 /// rest of the string. This is flag/argument extraction, not shell execution:
-/// no escape sequences, expansions, or operator splitting.
+/// no expansions and no operator splitting.
+///
+/// **Backslash handling is deliberately limited to quote boundaries.** A `\`
+/// before a quote character is honored the way `sh` does — outside quoting it
+/// makes the quote a literal that opens nothing, and inside `"…"` it makes the
+/// quote a literal that does not close — because getting either wrong lets a
+/// caller's token stream diverge from the argv the shell will actually build.
+/// That divergence is exploitable, not cosmetic: with `\"` closing a string
+/// early, `--body "see \"… -R owner/allowed\" notes" -R evil/target` exposed a
+/// decoy `-R owner/allowed` *before* the real target, and
+/// `--body x\" -R evil/target` swallowed the real `-R` into a phantom quoted
+/// run — the first resolving an allowed owner and the second resolving none,
+/// both letting `guard_gh_write` clear a write that lands somewhere else
+/// (cameronsjo/cadence-hooks#463 review).
+///
+/// A backslash anywhere else stays a literal character. `\gh` keeps its
+/// backslash for the callers that strip it themselves, and a Windows path
+/// (`C:\Users\x`) survives intact — consuming those would corrupt the very
+/// targets the destructive-command guards compare. Single quotes get no escape
+/// processing at all, matching POSIX: inside `'…'` a backslash is literal and
+/// the first `'` always closes.
 pub fn tokenize(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
     let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
 
-    for c in command.chars() {
+    while let Some(c) = chars.next() {
         match quote {
+            // POSIX: no escapes exist inside single quotes.
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+            }
             Some(q) => {
+                // Inside `"…"`, `\` escapes `"` and `\` — so an escaped quote
+                // is content and must not end the string.
+                if c == '\\' && matches!(chars.peek(), Some('"' | '\\')) {
+                    current.push(chars.next().expect("peeked"));
+                    continue;
+                }
                 if c == q {
                     quote = None;
                 } else {
@@ -61,6 +96,12 @@ pub fn tokenize(command: &str) -> Vec<String> {
                 }
             }
             None => match c {
+                // An escaped quote outside quoting is a literal character; it
+                // opens no string.
+                '\\' if matches!(chars.peek(), Some('"' | '\'')) => {
+                    current.push(chars.next().expect("peeked"));
+                    in_token = true;
+                }
                 '\'' | '"' => {
                     quote = Some(c);
                     in_token = true;
@@ -2024,6 +2065,69 @@ mod tests {
     #[test]
     fn tokenize_preserves_empty_quoted_token() {
         assert_eq!(tokenize(r#"echo "" world"#), vec!["echo", "", "world"]);
+    }
+
+    #[test]
+    fn tokenize_escaped_quote_inside_double_quotes_does_not_close() {
+        // `\"` inside "…" is content. Closing on it split the string and let a
+        // decoy flag surface as its own token (cameronsjo/cadence-hooks#463
+        // review) — the whole body must stay ONE token.
+        assert_eq!(
+            tokenize(
+                r#"gh issue comment --body "see \"quoted -R owner/allowed\" notes" -R evil/target"#
+            ),
+            vec![
+                "gh",
+                "issue",
+                "comment",
+                "--body",
+                r#"see "quoted -R owner/allowed" notes"#,
+                "-R",
+                "evil/target"
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_escaped_quote_outside_quotes_opens_nothing() {
+        // `x\"` is the literal word `x"`. Treating the escaped quote as an
+        // opener swallowed the REST of the command into one phantom quoted
+        // token, hiding the real `-R` entirely.
+        assert_eq!(
+            tokenize(r#"gh issue comment --body x\" -R evil/target"#),
+            vec![
+                "gh",
+                "issue",
+                "comment",
+                "--body",
+                "x\"",
+                "-R",
+                "evil/target"
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_escaped_backslash_inside_double_quotes_still_closes() {
+        // `\\` is an escaped backslash, so the `"` after it DOES close.
+        assert_eq!(tokenize(r#"echo "a\\" b"#), vec!["echo", r"a\", "b"]);
+    }
+
+    #[test]
+    fn tokenize_single_quotes_take_no_escapes() {
+        // POSIX: inside '…' a backslash is literal and the first ' closes.
+        assert_eq!(tokenize(r#"echo 'a\' b"#), vec!["echo", r"a\", "b"]);
+    }
+
+    #[test]
+    fn tokenize_leaves_lone_backslashes_alone() {
+        // Only quote characters are escapable. A Windows path and a
+        // backslash-escaped command word must survive byte-for-byte —
+        // consuming them would corrupt the targets the guards compare.
+        assert_eq!(
+            tokenize(r"cp C:\Users\x\file.txt \gh"),
+            vec!["cp", r"C:\Users\x\file.txt", r"\gh"]
+        );
     }
 
     #[test]

@@ -1294,7 +1294,17 @@ impl Check for GhWriteGuard {
                 }
                 // Non-graphql api write that isn't `repos/<owner>/<repo>`
                 // (graphql is handled above) can't be owner-checked.
-                if !API_REPOS.is_match(&segment) {
+                //
+                // Read the parsed ENDPOINT, not the raw segment, for the same
+                // reason `resolve_target_repo`'s arm 3 does — and this gate is
+                // the one that actually decides. Matching the raw text let a
+                // `repos/<owner>/<repo>` string in any argument value suppress
+                // the block: `gh api orgs/evil/repos -X POST -H "ref:
+                // repos/owner/allowed for docs"` writes to an org endpoint no
+                // owner check can reach, yet the header's path satisfied the
+                // pattern, so the segment fell through to the cwd remote and
+                // was allowed from any owned checkout (#463 review).
+                if !API_REPOS.is_match(&endpoint) {
                     return api_unverifiable_block(
                         &segment,
                         false,
@@ -3471,6 +3481,75 @@ mod tests {
             }
             other => panic!("expected MissingTargets, got {other:?}"),
         }
+    }
+
+    // --- #463 review: quote-escape divergence and the raw-segment api gate ---
+
+    #[test]
+    fn escaped_quote_decoy_flag_does_not_shield_the_real_target() {
+        // A real shell keeps --body as ONE argument and passes `-R evil/target`.
+        // `tokenize` used to close on the `\"`, exposing a decoy
+        // `-R cameronsjo/allowed` BEFORE the real flag; first-match resolution
+        // then cleared the write while gh targeted evil/target.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh issue comment 42 --body "see \"gist for -R cameronsjo/allowed\" notes" -R evil/target"#,
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        });
+    }
+
+    #[test]
+    fn escaped_quote_outside_quoting_does_not_swallow_the_real_target() {
+        // `x\"` is the literal word `x"`. Reading the escaped quote as an
+        // opener swallowed the rest of the command — including the real
+        // `-R evil/target` — into one phantom quoted token, so NO target
+        // resolved and an owned cwd allowed the write.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh issue comment 42 --body x\" -R evil/target"#,
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        });
+    }
+
+    #[test]
+    fn repos_path_in_a_header_value_does_not_suppress_the_api_block() {
+        // The api-unverifiable gate matched API_REPOS against the RAW segment,
+        // so a `repos/<owner>/<repo>` string in ANY argument value satisfied it.
+        // The real endpoint is an org write no owner check can reach.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh api orgs/evil-org/repos -X POST -f name=pwned -H "ref: repos/cameronsjo/allowed for docs""#,
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn legitimate_repos_api_write_still_reaches_the_ownership_check() {
+        // Positive control for the gate above: a real `repos/<owner>/<repo>`
+        // endpoint must still fall through to ownership resolution and pass.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "gh api repos/cameronsjo/cadence-hooks/issues -X POST -f title=x",
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
     }
 
     #[test]
