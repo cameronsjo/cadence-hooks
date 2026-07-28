@@ -343,6 +343,10 @@ pub fn init_repo(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Gated to match its only consumer — the `#[cfg(unix)]` symlink test
+    // below. Unconditional here, it is an unused import on Windows, which
+    // `-D warnings` turns into a build failure (caught by CI, not locally).
+    #[cfg(unix)]
     use crate::worktree::path_under_temp_root;
 
     /// This module's own `target/`-relative scratch root, mirroring the
