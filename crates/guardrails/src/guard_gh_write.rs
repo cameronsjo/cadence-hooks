@@ -67,6 +67,21 @@ static API_INPUT_FLAG: LazyLock<Regex> =
 /// evil/repo` still blocks. What changes is only that a target the command
 /// spells out replaces a GUESS inferred from the cwd — strictly more accurate
 /// on both verdicts.
+///
+/// **Known gap, pre-existing and shared by every verb here: only the FIRST
+/// positional is read, so a target placed after a flag is still missed.**
+/// [`gh_repo_positional_target`] takes `argv[3]` and declines when it starts
+/// with `-`, but gh (cobra) accepts interspersed arguments — `gh repo edit
+/// --description x evil/repo` is valid and resolves from the cwd remote, which
+/// ALLOWS it from an owned checkout. Closing it needs gh's per-subcommand flag
+/// table, to tell a flag's value from the positional; the same table
+/// [`repo_flag`] refuses to grow, and for the same reason — the near-miss
+/// alternatives both misfire. Skipping the token after every flag swallows a
+/// real positional following a boolean like `--accept-visibility-change-consequences`,
+/// and picking the first `owner/repo`-shaped token instead false-BLOCKS a
+/// perfectly ordinary `gh repo edit --description "some/thing"`, which resolves
+/// a description fragment as the target. Left as a follow-up rather than
+/// guessed at.
 const REPO_TARGET_VERBS: &[&str] = &[
     "archive",
     "delete",
@@ -721,11 +736,21 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
 /// unanimity — rather than gh's own last-occurrence-wins rule — is the safe
 /// reading here.
 ///
-/// Covers the four pflag spellings of a string flag (`-X V`, `-XV`, `-X=V`,
+/// Covers the pflag spellings of a string flag (`-X V`, `-XV`, `-X=V`,
 /// `--method V`, `--method=V`) over parsed argv rather than raw text, so a
 /// method flag quoted inside another flag's value is one token and is not read
 /// as a flag. Only the `gh api` subcommand is inspected — a `-X` belonging to
 /// some other command is not a method.
+///
+/// Deliberately NOT merged with [`repo_flag`], which scans the same four
+/// spellings and applies the same agreement rule: the two normalize their
+/// values differently (this one uppercases and strips a `=`; `repo_flag`
+/// excludes whitespace-bearing specs) and report disagreement differently (a
+/// [`RepoFlag::Ambiguous`] the caller turns into a block, versus a `None` that
+/// falls back to gh's implicit rule). A shared scanner would need both sets of
+/// rules as parameters, which trades a visible parallel for a configurable one
+/// — the wrong trade in a guard. **Edit them as a pair:** a fix to the flag
+/// grammar in one almost certainly applies to the other.
 fn api_explicit_method(segment: &str) -> Option<String> {
     gh_api_endpoint(segment)?;
     let words = gh_argv(segment)?;
@@ -4263,6 +4288,26 @@ mod tests {
         assert!(!segment_lacks_explicit_target(
             "gh repo edit cameronsjo/cli-capture --enable-issues"
         ));
+    }
+
+    #[test]
+    fn repo_edit_target_after_a_flag_is_a_known_gap() {
+        // CHARACTERIZATION, not an endorsement. gh accepts interspersed
+        // arguments, so this is a valid spelling of the same write — but only
+        // `argv[3]` is read, so the positional is missed and the cwd remote
+        // (an owned repo) answers, allowing a write to a repo the operator
+        // does not own. Pre-existing and shared by every REPO_TARGET_VERBS
+        // entry; see that constant for why closing it needs gh's flag table.
+        //
+        // When the gap IS closed, this assertion must flip to a BLOCK on
+        // `gh-write-unauthorized-target` — do not delete the case.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                "gh repo edit --description x evil-corp/cool-tool",
+                OWNED_DIR,
+            ));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
     }
 
     #[test]
