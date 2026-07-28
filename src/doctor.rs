@@ -64,6 +64,11 @@ impl Finding {
     /// is the only thing that writes it out, and it is a one-line wrapper,
     /// so no second path can bypass this sanitization.
     ///
+    /// **Scope: this covers `Finding` output only.** Other `doctor` print
+    /// sites outside the `Finding` path (e.g. the `--prune` directory
+    /// listing) are not covered by this guarantee and are tracked
+    /// separately.
+    ///
     /// [`print`]: Finding::print
     fn render(&self) -> String {
         let level = match self.severity {
@@ -321,12 +326,22 @@ fn find_line_number(haystack: &str, needle: &str) -> Option<usize> {
 }
 
 /// Walk a `hooks.json` blob's hook commands and collect findings.
+///
+/// `report_skew` gates Check 2 (subcommand cross-reference) only — Check 0
+/// (missing CLI) and Check 1 (shell-expansion `Error`) always run regardless.
+/// `false` is used for a plugin [`marketplace_status`] reports
+/// [`MarketplaceStatus::RemovedUpstream`] (cameronsjo/cadence-hooks#474): its
+/// stale cached `hooks.json` would otherwise misdiagnose as binary skew, but
+/// a shell-expansion bug or an unresolvable CLI dependency in that same file
+/// is a real, independent defect this scan must still surface — removed
+/// upstream is a reason to suppress the skew warning, not every warning.
 fn scan_hooks_json(
     plugin: &str,
     path: &Path,
     raw: &str,
     json: &serde_json::Value,
     channel: InstallChannel,
+    report_skew: bool,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -374,8 +389,10 @@ fn scan_hooks_json(
                     });
                 }
 
-                // Check 2: subcommand cross-reference (Warning).
-                if let Some((ns, sub)) = extract_invocation(cmd)
+                // Check 2: subcommand cross-reference (Warning). Gated by
+                // `report_skew` — see this function's doc comment.
+                if report_skew
+                    && let Some((ns, sub)) = extract_invocation(cmd)
                     && let Some(diag) = judge_invocation(&ns, &sub, channel)
                 {
                     findings.push(Finding {
@@ -554,7 +571,13 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
 }
 
 /// Scan a single plugin install dir's `hooks/hooks.json`, if present.
-fn scan_plugin_dir(label: &str, plugin_dir: &Path, channel: InstallChannel) -> Vec<Finding> {
+/// `report_skew` is forwarded to [`scan_hooks_json`] — see its doc comment.
+fn scan_plugin_dir(
+    label: &str,
+    plugin_dir: &Path,
+    channel: InstallChannel,
+    report_skew: bool,
+) -> Vec<Finding> {
     let hooks_path = plugin_dir.join("hooks/hooks.json");
     let Ok(content) = std::fs::read_to_string(&hooks_path) else {
         return Vec::new();
@@ -564,7 +587,7 @@ fn scan_plugin_dir(label: &str, plugin_dir: &Path, channel: InstallChannel) -> V
         // to catch. The plugin loader will surface it.
         return Vec::new();
     };
-    scan_hooks_json(label, &hooks_path, &content, &json, channel)
+    scan_hooks_json(label, &hooks_path, &content, &json, channel, report_skew)
 }
 
 /// Marketplace resolution status for one installed-plugin label
@@ -677,10 +700,14 @@ fn removed_upstream_finding(label: &str, install_dir: &Path) -> Finding {
 }
 
 /// Findings from the manifest-driven hooks.json scan across every active
-/// install: the normal skew scan for a plugin that still resolves against
-/// its marketplace, or a single [`removed_upstream_finding`] for one that
-/// doesn't — never both, so an operator is never sent chasing a binary
-/// upgrade for a subcommand only a deleted plugin ever referenced
+/// install. A plugin still resolved against its marketplace gets the normal
+/// scan (skew included). A plugin [`marketplace_status`] reports
+/// [`MarketplaceStatus::RemovedUpstream`] gets [`removed_upstream_finding`]
+/// **plus** the still-scanned Check 0/Check 1 findings (missing CLI,
+/// shell-expansion `Error`s) — only the skew warning is suppressed. Those two
+/// checks are independent defects a removed plugin's stale `hooks.json` can
+/// still carry, and dropping them let a plugin's own publisher silence
+/// doctor's still-firing findings simply by delisting the plugin
 /// (cameronsjo/cadence-hooks#474).
 fn manifest_scan_findings(
     installs: &[(String, PathBuf)],
@@ -691,9 +718,13 @@ fn manifest_scan_findings(
         .iter()
         .flat_map(
             |(label, dir)| match marketplace_status(label, known_marketplaces) {
-                MarketplaceStatus::RemovedUpstream => vec![removed_upstream_finding(label, dir)],
+                MarketplaceStatus::RemovedUpstream => {
+                    let mut findings = scan_plugin_dir(label, dir, channel, false);
+                    findings.push(removed_upstream_finding(label, dir));
+                    findings
+                }
                 MarketplaceStatus::DirectorySourced | MarketplaceStatus::Resolved => {
-                    scan_plugin_dir(label, dir, channel)
+                    scan_plugin_dir(label, dir, channel, true)
                 }
             },
         )
@@ -729,7 +760,7 @@ fn scan_root(root: &Path, channel: InstallChannel) -> Vec<Finding> {
                 .filter(|p| !p.as_os_str().is_empty())
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| dir.display().to_string());
-            findings.extend(scan_plugin_dir(&label, &dir, channel));
+            findings.extend(scan_plugin_dir(&label, &dir, channel, true));
             // A plugin dir doesn't nest further plugins beneath it.
             continue;
         }
@@ -3996,9 +4027,13 @@ mod tests {
         // to misdiagnose as binary skew.
         let plugin_dir = tmp.path().join("cache/cadence-lab/persona/8f4df2542e4a");
         fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
+        // The wrapper form (not a bare `cadence-hooks` command word) so this
+        // fixture's expected finding count doesn't depend on whether the
+        // host running the test happens to have `cadence-hooks` on PATH —
+        // Check 0 (missing-CLI) skips any command word containing `$`.
         fs::write(
             plugin_dir.join("hooks/hooks.json"),
-            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"cadence-hooks lab persona-nudge"}]}]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" lab persona-nudge"}]}]}}"#,
         )
         .unwrap();
 
@@ -4049,9 +4084,11 @@ mod tests {
 
         let plugin_dir = tmp.path().join("cache/cadence-lab/vibes/abc123");
         fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
+        // Wrapper form — see the sibling test's comment on why not a bare
+        // `cadence-hooks` command word.
         fs::write(
             plugin_dir.join("hooks/hooks.json"),
-            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"cadence-hooks lab hook-from-the-future"}]}]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" lab hook-from-the-future"}]}]}}"#,
         )
         .unwrap();
 
@@ -4067,6 +4104,77 @@ mod tests {
             findings[0].diagnosis.contains("not present in this binary"),
             "a still-listed plugin's genuine skew must still be reported: {}",
             findings[0].diagnosis
+        );
+    }
+
+    #[test]
+    fn manifest_scan_findings_removed_upstream_still_reports_other_defects() {
+        // Coverage-regression control: a removed-upstream plugin's stale
+        // hooks.json can carry independent defects (a real shell-expansion
+        // bug, an unresolvable CLI dependency) that have nothing to do with
+        // whether the plugin is still listed upstream. Suppressing the skew
+        // warning must not suppress those too — a plugin's own publisher
+        // must not be able to silence doctor's still-firing findings for
+        // their own plugin simply by delisting it from their marketplace.
+        let tmp = tempfile::tempdir().unwrap();
+        let install_location = tmp.path().join("marketplaces/cadence-lab");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
+        );
+        write_marketplace_plugin_list(&install_location, &["vibes"]);
+
+        // "persona" is absent from the marketplace's plugin list (removed
+        // upstream), and its stale hooks.json carries a real shell-expansion
+        // bug alongside the now-irrelevant skew reference.
+        let plugin_dir = tmp.path().join("cache/cadence-lab/persona/8f4df2542e4a");
+        fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
+        fs::write(
+            plugin_dir.join("hooks/hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"'${CLAUDE_PLUGIN_ROOT}/hooks/run.sh' arg"}]}]}}"#,
+        )
+        .unwrap();
+
+        let installs = vec![("persona@cadence-lab".to_string(), plugin_dir)];
+        let findings = manifest_scan_findings(
+            &installs,
+            InstallChannel::Unknown,
+            &tmp.path().join("known_marketplaces.json"),
+        );
+
+        assert_eq!(
+            findings.len(),
+            2,
+            "expected the removed-upstream finding PLUS the still-independent \
+             shell-expansion Error, found: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.diagnosis.contains("removed upstream")),
+            "must still report the removed-upstream finding: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+        assert!(
+            findings.iter().any(|f| f.severity == Severity::Error
+                && f.diagnosis.contains("won't expand in /bin/sh")),
+            "the shell-expansion Error must survive the removed-upstream exemption \
+             — it is not a skew problem: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.diagnosis.contains("not present in this binary")),
+            "the skew warning is the ONLY thing the removed-upstream exemption \
+             should suppress: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
         );
     }
 
