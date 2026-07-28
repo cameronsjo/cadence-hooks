@@ -1728,7 +1728,7 @@ mod tests {
     /// Thin wrapper binding [`Scratch::new`] to this crate's own
     /// `scratch_root()`, so every call site below reads exactly as it did
     /// before the promotion (`scratch("tag")`) instead of repeating
-    /// `scratch("tag")` at each of them.
+    /// `Scratch::new(&scratch_root(), "tag")` at each of them.
     fn scratch(tag: &str) -> Scratch {
         Scratch::new(&scratch_root(), tag)
     }
@@ -1849,7 +1849,7 @@ mod tests {
         // (`/private/var/…`) while `$TMPDIR` stays `/var/folders/…` — the
         // exemption must fire anyway. Simulated with a symlinked tmpdir under
         // the non-temp scratch root (`Scratch` is imported from
-        // `cadence_hooks_core::test_builders` at the top of this module).
+        // `cadence_hooks_core::git_fixtures` at the top of this module).
         let scratch = scratch("tmpdir-canon");
         let real = scratch.path().join("real");
         let link = scratch.path().join("link");
@@ -2574,7 +2574,7 @@ mod tests {
     // --- end-to-end against real repos ---
     //
     // Fixtures below are built on the promoted `Scratch` (imported above from
-    // `cadence_hooks_core::test_builders`) via this module's own `scratch()`
+    // `cadence_hooks_core::git_fixtures`) via this module's own `scratch()`
     // wrapper — see that type's doc for why it's `target/`-rooted rather than
     // a tempdir.
 
