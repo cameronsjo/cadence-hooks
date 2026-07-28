@@ -151,6 +151,22 @@ fn env_prefix_len(rest: &[String]) -> Option<usize> {
     Some(view.len() - remainder.len())
 }
 
+/// The verb `tokens` will actually run, plus the argv it runs with: wrapper
+/// prefixes peeled ([`unwrap_command_prefixes`]), then the survivor normalized
+/// ([`command_word`]). `None` only when there is no command word at all.
+///
+/// The single head-resolution entry point, deliberately. Two arms ask this
+/// question — a segment's own head and the sub-command behind `find`'s
+/// `-exec` — and the whole #469 defect was those two resolving a head
+/// differently from each other and from the rest of the repo. One function
+/// makes drift between them impossible rather than merely unlikely; the argv
+/// rides along because the caller that scans operands must scan the SAME
+/// resolved slice the head came from.
+fn resolve_command(tokens: &[String]) -> Option<(&str, &[String])> {
+    let argv = unwrap_command_prefixes(tokens);
+    Some((command_word(argv.first()?), argv))
+}
+
 /// If a segment hands one or more dangerous `.env`-family files to a
 /// content-emitting command, return every `(command word, offending token)`
 /// pair — NOT just the first (#307: a single-token result let a second
@@ -241,11 +257,9 @@ fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
     if first.starts_with('#') {
         return Vec::new();
     }
-    let argv = unwrap_command_prefixes(&tokens);
-    let Some(head) = argv.first() else {
+    let Some((cmd_word, argv)) = resolve_command(&tokens) else {
         return Vec::new();
     };
-    let cmd_word = command_word(head);
     // `find` is metadata-safe on its own (`find . -name .env`), but an
     // exec-family action runs a real command on each hit — judge that
     // command instead of exempting the whole `find` (#118).
@@ -287,7 +301,7 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
         .iter()
         .position(|t| EXEC_FLAGS.contains(&t.as_str()))
         .and_then(|i| tokens.get(i + 1..))?;
-    let sub_word = command_word(unwrap_command_prefixes(action).first()?);
+    let (sub_word, _) = resolve_command(action)?;
     if METADATA_SAFE_COMMANDS.contains(&sub_word) {
         return None;
     }
