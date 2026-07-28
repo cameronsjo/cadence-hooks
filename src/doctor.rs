@@ -428,6 +428,23 @@ fn plugins_dir() -> Option<PathBuf> {
     Some(home.join(".claude/plugins"))
 }
 
+/// `<plugins_dir>/cache` — the one place the "cache" join lives. Every
+/// plugin-cache consumer in this file should build the path through here
+/// (or [`plugins_cache_dir`] below) rather than re-deriving `.join("cache")`
+/// independently — a second derivation is how a cache-layout change quietly
+/// stops matching one call site while the rest move on (cadence#667).
+fn plugins_cache_dir_from(plugins_dir: &Path) -> PathBuf {
+    plugins_dir.join("cache")
+}
+
+/// Live-machine wrapper: resolves [`plugins_dir`] then joins `cache` via
+/// [`plugins_cache_dir_from`]. `None` when `plugins_dir()` can't resolve
+/// (`$HOME` unset) — callers report that honestly rather than fabricating
+/// a path.
+fn plugins_cache_dir() -> Option<PathBuf> {
+    Some(plugins_cache_dir_from(&plugins_dir()?))
+}
+
 /// Read active plugin install paths from `installed_plugins.json` (v2 schema).
 ///
 /// Returns `(label, install_path)` pairs, where the label is the manifest key
@@ -1340,8 +1357,8 @@ fn failopen_findings(
             // passwd entry when `$HOME` is missing, so it is the one form that
             // still resolves here. Safe unquoted: a hardcoded literal with no
             // spaces and no metacharacters.
-            let cache = match plugins_dir() {
-                Some(dir) => shell_single_quote(&dir.join("cache").display().to_string()),
+            let cache = match plugins_cache_dir() {
+                Some(dir) => shell_single_quote(&dir.display().to_string()),
                 None => "~/.claude/plugins/cache".to_string(),
             };
             format!(
@@ -1445,20 +1462,36 @@ fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> 
     }
 }
 
-/// Prints an informational (non-blocking, not a `Finding`) count of recent
-/// registry-file reaps when nonzero. No threshold — reaping is normal
-/// operation; this is visibility, not an alarm.
-/// Find the plugin-shipped platform baseline in the marketplace cache.
+/// Shared with [`platform_drift_status_lines`]'s not-found message, so the two
+/// can never independently drift the way two separately-typed literals would
+/// (cadence#667): one names where [`find_baseline_in`] actually looked, the
+/// other only *describes* that search for the operator, and a second
+/// hand-copied literal is exactly how such a description quietly stops
+/// matching the real join.
+const CADENCE_CACHE_SUBDIR: &str = "workbench/cadence";
+/// Shared with [`platform_drift_status_lines`] for the same reason as
+/// [`CADENCE_CACHE_SUBDIR`].
+const PLATFORM_BASELINE_REL: &str = "config/platform-baseline.json";
+
+/// Find the plugin-shipped platform baseline in the marketplace cache, under
+/// `cache_root` (cadence#667, never a hardcoded `~/.claude/plugins/cache`
+/// literal): search `<cache_root>/<CADENCE_CACHE_SUBDIR>/*/<PLATFORM_BASELINE_REL>`.
 /// Newest pin wins when more than one SHA-pinned copy exists (a mid-update
 /// transient, or a stale sibling left behind) — `None` when the cadence
 /// plugin's cache directory, or every pin's baseline file, is missing.
-fn find_baseline_in_cache() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let cadence_dir = PathBuf::from(home).join(".claude/plugins/cache/workbench/cadence");
+/// Pure and testable with a tempdir fixture — no live-machine env dependency;
+/// [`print_platform_drift_status`] is the live-machine caller that resolves
+/// `cache_root` via [`plugins_cache_dir`] — the same resolver every other
+/// plugin-cache consumer in this file goes through (the #183 remediation
+/// grep, `run_prune`, `run`'s scan, orphan/remote-drift), so the
+/// `CLAUDE_CONFIG_DIR`-set-but-plugins-not-relocated fallback (see
+/// [`plugins_dir`]'s own doc comment) stays intact here too.
+fn find_baseline_in(cache_root: &Path) -> Option<PathBuf> {
+    let cadence_dir = cache_root.join(CADENCE_CACHE_SUBDIR);
     let entries = std::fs::read_dir(&cadence_dir).ok()?;
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
-        let candidate = entry.path().join("config/platform-baseline.json");
+        let candidate = entry.path().join(PLATFORM_BASELINE_REL);
         let Ok(meta) = std::fs::metadata(&candidate) else {
             continue;
         };
@@ -1497,17 +1530,32 @@ fn installed_claude_code_version() -> Option<String> {
 /// gap), `doctor` always shows both current-state lines when a baseline is
 /// found, so a `doctor` run never has to guess whether drift-checking ran at
 /// all. Testable with a tempdir baseline fixture and an injected version —
-/// no live-machine dependency (unlike [`find_baseline_in_cache`] and
-/// [`installed_claude_code_version`], which resolve those inputs).
+/// no live-machine dependency (unlike [`installed_claude_code_version`] and
+/// [`print_platform_drift_status`]'s `plugins_cache_dir` resolution, which
+/// resolve those inputs).
+///
+/// `searched_dir` is `Some(cache_root)` — the EXACT same value
+/// [`print_platform_drift_status`] passed to [`find_baseline_in`], not an
+/// independently reconstructed path (cadence#667) — so the message can never
+/// drift from the actual search the way a second copy of the path shape
+/// eventually would. `None` means [`plugins_cache_dir`] itself couldn't
+/// resolve (`$HOME` unset): the message says so honestly rather than
+/// fabricating a path nothing ever searched.
 fn platform_drift_status_lines(
     baseline_path: Option<&Path>,
     cc_version: Option<&str>,
+    searched_dir: Option<&Path>,
 ) -> Vec<String> {
     let Some(baseline_path) = baseline_path else {
-        return vec![
-            "cadence-hooks doctor: platform baseline not found under ~/.claude/plugins/cache/workbench/cadence/*/config/platform-baseline.json"
+        return vec![match searched_dir {
+            Some(dir) => format!(
+                "cadence-hooks doctor: platform baseline not found under {}/{CADENCE_CACHE_SUBDIR}/*/{PLATFORM_BASELINE_REL}",
+                dir.display()
+            ),
+            None => "cadence-hooks doctor: platform baseline not found — could not resolve the \
+                      plugin cache dir (`$HOME` unset?)"
                 .to_string(),
-        ];
+        }];
     };
     let Ok(content) = std::fs::read_to_string(baseline_path) else {
         return vec![format!(
@@ -1542,15 +1590,27 @@ fn platform_drift_status_lines(
 
 /// Report cadence-hooks and Claude Code version status against the
 /// plugin-shipped baseline — the live-machine wrapper around
-/// [`platform_drift_status_lines`].
+/// [`platform_drift_status_lines`]. Resolves the cache root once via
+/// [`plugins_cache_dir`] — the same resolver every other plugin-cache
+/// consumer in this file goes through — and passes that SAME value to both
+/// [`find_baseline_in`] (the actual search) and [`platform_drift_status_lines`]
+/// (the message), so the two can never independently drift (cadence#667).
 fn print_platform_drift_status() {
-    let baseline_path = find_baseline_in_cache();
+    let cache_root = plugins_cache_dir();
+    let baseline_path = cache_root.as_deref().and_then(find_baseline_in);
     let cc_version = installed_claude_code_version();
-    for line in platform_drift_status_lines(baseline_path.as_deref(), cc_version.as_deref()) {
+    for line in platform_drift_status_lines(
+        baseline_path.as_deref(),
+        cc_version.as_deref(),
+        cache_root.as_deref(),
+    ) {
         println!("{line}");
     }
 }
 
+/// Prints an informational (non-blocking, not a `Finding`) count of recent
+/// registry-file reaps when nonzero. No threshold — reaping is normal
+/// operation; this is visibility, not an alarm.
 fn print_sweep_summary(dir: &Path, window: Duration, now: SystemTime) {
     let count = cadence_hooks_metrics::log_sweep::recent_sweep_count(dir, window, now);
     if count == 0 {
@@ -1935,7 +1995,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
             };
             (
                 plugins.join("installed_plugins.json"),
-                plugins.join("cache"),
+                plugins_cache_dir_from(&plugins),
             )
         }
     };
@@ -2255,7 +2315,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
                 }
                 None => {
                     // No readable manifest — recursively scan the cache instead.
-                    let cache = plugins.join("cache");
+                    let cache = plugins_cache_dir_from(&plugins);
                     if !cache.exists() {
                         eprintln!(
                             "cadence-hooks doctor: no installed-plugins manifest and no plugin cache under {}",
@@ -2337,7 +2397,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             findings.extend(orphan_findings(
                 &pinned,
                 quiet,
-                &plugins.join("cache"),
+                &plugins_cache_dir_from(&plugins),
                 &plugins.join("known_marketplaces.json"),
             ));
         }
@@ -4918,6 +4978,96 @@ mod tests {
         assert!(cadence_config_parse_finding(dir.path()).is_none());
     }
 
+    // ── find_baseline_in tests (cadence#667) ────────────────────────────────
+
+    #[test]
+    fn find_baseline_in_finds_baseline_under_the_given_cache_root() {
+        // The bug this closes: the platform-baseline lookup used to hardcode
+        // `$HOME/.claude/plugins/cache/...` regardless of CLAUDE_CONFIG_DIR.
+        // find_baseline_in is the pure core, parameterized on cache_root, so
+        // this proves the lookup honors WHATEVER dir it's given — not a
+        // literal home path.
+        let cache_root = tempfile::tempdir().unwrap();
+        let pin_dir = cache_root.path().join("workbench/cadence/some-sha");
+        fs::create_dir_all(pin_dir.join("config")).unwrap();
+        let baseline_path = write_platform_baseline(&pin_dir.join("config"), "0.70.0", "2.1.218");
+        assert_eq!(find_baseline_in(cache_root.path()), Some(baseline_path));
+    }
+
+    #[test]
+    fn find_baseline_in_a_dir_with_no_cadence_cache_is_none() {
+        // Negative control for the above: an unrelated dir (standing in for
+        // the pre-fix behavior of searching the WRONG config dir) finds
+        // nothing, same as a genuinely absent cache would.
+        let unrelated_dir = tempfile::tempdir().unwrap();
+        assert!(find_baseline_in(unrelated_dir.path()).is_none());
+    }
+
+    #[test]
+    fn find_baseline_in_newest_pin_wins_over_a_stale_sibling() {
+        let cache_root = tempfile::tempdir().unwrap();
+        let cadence_dir = cache_root.path().join("workbench/cadence");
+        let old_pin = cadence_dir.join("old-sha/config");
+        let new_pin = cadence_dir.join("new-sha/config");
+        fs::create_dir_all(&old_pin).unwrap();
+        fs::create_dir_all(&new_pin).unwrap();
+        write_platform_baseline(&old_pin, "0.60.0", "2.1.200");
+        // Ensure a distinguishable mtime ordering regardless of filesystem
+        // timestamp resolution.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newest_path = write_platform_baseline(&new_pin, "0.70.0", "2.1.218");
+        assert_eq!(find_baseline_in(cache_root.path()), Some(newest_path));
+    }
+
+    #[test]
+    fn regression_relocated_config_dir_without_plugins_falls_back_like_plugins_dir_does() {
+        // Differential control for the exact regression three review arms
+        // independently flagged on this branch: on a profile where
+        // CLAUDE_CONFIG_DIR is set but plugins/ was never relocated, the
+        // baseline still lives under $HOME/.claude/plugins/cache. The BUGGY
+        // pattern re-derives `claude_config_dir().join("plugins/cache")`
+        // directly with no existence check and no fallback; the FIXED
+        // pattern is plugins_dir()'s own exists()-check-then-fallback,
+        // mirrored inline below since plugins_dir() reads real env/HOME and
+        // can't be env-mutated safely under a parallel test runner.
+        //
+        // Both branches run against the SAME on-disk fixture in one test, so
+        // this is a true red/green pair rather than two tests that could
+        // drift apart: the buggy resolver must return None while the fixed
+        // resolver, given the identical fixture, must find the baseline.
+        let home_root = tempfile::tempdir().unwrap();
+        let config_root = tempfile::tempdir().unwrap(); // CLAUDE_CONFIG_DIR override — carries no plugins/
+
+        let home_plugins_cache = home_root.path().join(".claude/plugins/cache");
+        let pin_dir = home_plugins_cache.join("workbench/cadence/some-sha");
+        fs::create_dir_all(pin_dir.join("config")).unwrap();
+        let baseline_path = write_platform_baseline(&pin_dir.join("config"), "0.70.0", "2.1.218");
+
+        // BUGGY: re-derive directly — no exists() check, no fallback. This
+        // is the exact shape of the flagged regression.
+        let buggy_cache_root = config_root.path().join("plugins").join("cache");
+        assert_eq!(
+            find_baseline_in(&buggy_cache_root),
+            None,
+            "the regression: reports the baseline missing even though it exists at the default location"
+        );
+
+        // FIXED: plugins_dir()'s own logic — prefer the config-dir variant,
+        // fall back to $HOME/.claude/plugins when that variant doesn't exist.
+        let config_variant = config_root.path().join("plugins");
+        let fixed_plugins_dir = if config_variant.exists() {
+            config_variant
+        } else {
+            home_root.path().join(".claude/plugins")
+        };
+        let fixed_cache_root = plugins_cache_dir_from(&fixed_plugins_dir);
+        assert_eq!(
+            find_baseline_in(&fixed_cache_root),
+            Some(baseline_path),
+            "the fix: falls back to the default location and finds the baseline"
+        );
+    }
+
     // ── platform_drift_status_lines tests ───────────────────────────────────
 
     fn write_platform_baseline(dir: &Path, hooks_version: &str, cc_version: &str) -> PathBuf {
@@ -4934,9 +5084,39 @@ mod tests {
 
     #[test]
     fn platform_drift_status_missing_baseline_is_one_info_line() {
-        let lines = platform_drift_status_lines(None, Some("2.1.218"));
+        let lines = platform_drift_status_lines(
+            None,
+            Some("2.1.218"),
+            Some(Path::new("/y/.claude/plugins/cache")),
+        );
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("baseline not found"));
+    }
+
+    #[test]
+    fn platform_drift_status_missing_baseline_names_the_resolved_search_dir() {
+        // cadence#667: the message must name the dir doctor actually searched
+        // (e.g. a resolved CLAUDE_CONFIG_DIR's cache dir), never a hardcoded
+        // ~/.claude literal that could point somewhere the code never looked.
+        let lines = platform_drift_status_lines(
+            None,
+            Some("2.1.218"),
+            Some(Path::new("/y/.claude-alt/plugins/cache")),
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("/y/.claude-alt/plugins/cache/workbench/cadence"));
+        assert!(!lines[0].contains("~/.claude"));
+    }
+
+    #[test]
+    fn platform_drift_status_unresolvable_cache_dir_is_honest_not_fabricated() {
+        // cadence#667 (team-lead addendum): when plugins_cache_dir() itself
+        // can't resolve, the message must say so rather than construct a
+        // path that was never searched.
+        let lines = platform_drift_status_lines(None, Some("2.1.218"), None);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("could not resolve"));
+        assert!(!lines[0].contains("~/.claude"));
     }
 
     #[test]
@@ -4944,6 +5124,7 @@ mod tests {
         let lines = platform_drift_status_lines(
             Some(Path::new("/nonexistent/baseline.json")),
             Some("2.1.218"),
+            Some(Path::new("/y/.claude/plugins/cache")),
         );
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("unreadable"));
@@ -4954,7 +5135,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("platform-baseline.json");
         fs::write(&path, "not json").unwrap();
-        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        let lines = platform_drift_status_lines(
+            Some(&path),
+            Some("2.1.218"),
+            Some(Path::new("/y/.claude/plugins/cache")),
+        );
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("malformed"));
     }
@@ -4963,7 +5148,11 @@ mod tests {
     fn platform_drift_status_current_baseline_is_two_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_platform_baseline(tmp.path(), env!("CARGO_PKG_VERSION"), "2.1.218");
-        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        let lines = platform_drift_status_lines(
+            Some(&path),
+            Some("2.1.218"),
+            Some(Path::new("/y/.claude/plugins/cache")),
+        );
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("cadence-hooks"));
         assert!(lines[1].contains("Claude Code"));
@@ -4975,7 +5164,11 @@ mod tests {
         // gap size, unlike the SessionStart nudge's >= 5 threshold.
         let tmp = tempfile::tempdir().unwrap();
         let path = write_platform_baseline(tmp.path(), "0.1.0", "2.0.0");
-        let lines = platform_drift_status_lines(Some(&path), Some("2.1.218"));
+        let lines = platform_drift_status_lines(
+            Some(&path),
+            Some("2.1.218"),
+            Some(Path::new("/y/.claude/plugins/cache")),
+        );
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("0.1.0"));
         assert!(lines[1].contains("2.1.218"));
@@ -4986,7 +5179,11 @@ mod tests {
     fn platform_drift_status_missing_cc_version_notes_unavailable() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_platform_baseline(tmp.path(), env!("CARGO_PKG_VERSION"), "2.1.218");
-        let lines = platform_drift_status_lines(Some(&path), None);
+        let lines = platform_drift_status_lines(
+            Some(&path),
+            None,
+            Some(Path::new("/y/.claude/plugins/cache")),
+        );
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("unavailable"));
     }
