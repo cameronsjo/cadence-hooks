@@ -88,6 +88,13 @@ fn disclose_min_from(raw: Option<String>) -> u64 {
 /// sharper row, and a machine with one suppressed block and two deadlines must
 /// report the suppression rather than fall silent under the degraded
 /// threshold.
+///
+/// This fires on an absolute count, not the rate cadence-hooks#277 proposed
+/// ("68% of guard runs hit the deadline"): the telemetry carries no
+/// total-invocation denominator to divide by. The two are not equivalent —
+/// a busy host can pass the count while failing open a small fraction of the
+/// time, and a quiet one can trip it while barely running guards at all. Revisit
+/// if a denominator ever lands.
 fn tier_for(counts: &FailopenCounts, min: u64) -> Option<Tier> {
     if counts.deadline_block_suppressed > 0 {
         Some(Tier::NotEnforcing)
