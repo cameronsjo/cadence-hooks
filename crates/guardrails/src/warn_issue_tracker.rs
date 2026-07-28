@@ -87,6 +87,16 @@ static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
         .expect("pattern should compile")
 });
 
+/// Matches `gh issue create` with only the VERB folded.
+///
+/// A plain `contains_ignoring_ascii_case` here folded the whole phrase, so
+/// `gh ISSUE CREATE` nudged — but gh rejects a capitalized subcommand, so that
+/// fires on text the shell cannot run. `guard_gh_write` refuses to call the
+/// same string a write, and two guards disagreeing about one input is the
+/// defect. Verb-only keeps the #488 invariant this file's other patterns hold.
+static GH_ISSUE_CREATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i:gh)\s+issue\s+create").expect("pattern should compile"));
+
 /// Detects a `gh api` call with `--input` (implies a write).
 static API_INPUT_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i:gh)\s+api.*\s--input\s").expect("pattern should compile"));
@@ -122,7 +132,7 @@ fn extract_repo_flag(command: &str) -> Option<String> {
 /// - `gh issue create` (after quote-stripping, so quoted occurrences are data)
 /// - `gh api .../repos/OWNER/REPO/issues` path with a write method or field flags
 fn is_issue_create(stripped: &str) -> bool {
-    if contains_ignoring_ascii_case(stripped, "gh issue create") {
+    if GH_ISSUE_CREATE.is_match(stripped) {
         return true;
     }
     API_ISSUES_PATH.is_match(stripped)
@@ -383,6 +393,30 @@ mod tests {
                         Some("cameronsjo/workbench".to_string()),
                         "{cmd}"
                     );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn only_the_gh_verb_folds_not_the_subcommand() {
+        // The fold must stop at the verb. `gh` rejects `ISSUE CREATE`, so a
+        // capitalized subcommand names a command the shell cannot run —
+        // matching it fires on text that will never execute, which is the
+        // shape #489 turned into a net weakening. `guard_gh_write` already
+        // refuses to call this string a write; the two guards must agree.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                for cmd in [
+                    "gh ISSUE CREATE -R cameronsjo/workbench --title x",
+                    "gh issue CREATE -R cameronsjo/workbench --title x",
+                    "gh ISSUE create -R cameronsjo/workbench --title x",
+                ] {
+                    assert_eq!(judge_issue_target(cmd, &workdir("/tmp")), None, "{cmd}");
                 }
             },
         );

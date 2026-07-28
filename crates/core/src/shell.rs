@@ -406,7 +406,15 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
     let mut start = 0;
     while start + 1 < tokens.len() {
         let tok = tokens[start].as_str();
-        if (TRANSPARENT.contains(&tok) && !tokens[start + 1].starts_with('-'))
+        // Membership is tested on the FOLDED word (cadence-hooks#488). `guard_rm`
+        // already folded before its own `TRANSPARENT` test, so a raw test here
+        // made the two disagree: `COMMAND rm -rf ~` kept `COMMAND` as the
+        // leading word and the delete verb behind it was never reached.
+        // Detector direction — skipping more prefixes only exposes more verbs
+        // to the gates downstream, so this can add blocks and never subtract.
+        // The flag refusal below is unchanged, so a prefix's own options are
+        // still never parsed.
+        if (TRANSPARENT.contains(&fold_verb(tok).as_ref()) && !tokens[start + 1].starts_with('-'))
             || is_assignment_word(tok)
         {
             start += 1;
@@ -2168,6 +2176,44 @@ mod tests {
         // which WIDENS matching in a way no filesystem does.
         assert_eq!(command_word("GİT"), "gİt");
         assert_eq!(command_word("ⓖⓘⓣ"), "ⓖⓘⓣ");
+    }
+
+    #[test]
+    fn skip_transparent_prefixes_folds_the_prefix_verb() {
+        // `TRANSPARENT` was tested against the RAW token while `guard_rm`
+        // folded before its own `TRANSPARENT` test — the two disagreed, so
+        // `COMMAND rm -rf ~` resolved its leading word to `COMMAND` and the
+        // delete verb behind it was never reached (cadence-hooks#488).
+        // Detector direction: skipping more prefixes only exposes more verbs.
+        let toks = |s: &str| -> Vec<String> { tokenize(s) };
+        for cmd in [
+            "COMMAND git commit",
+            "NICE git commit",
+            "ENV git commit",
+            "EXEC git commit",
+            "Command git commit",
+        ] {
+            let t = toks(cmd);
+            assert_eq!(
+                skip_transparent_prefixes(&t).first().map(String::as_str),
+                Some("git"),
+                "{cmd}"
+            );
+        }
+        // The flag refusal survives the fold: a prefix's own options are still
+        // never parsed, so this stays a documented miss rather than a wrong
+        // resolution.
+        let t = toks("NICE -n 10 git commit");
+        assert_eq!(
+            skip_transparent_prefixes(&t).first().map(String::as_str),
+            Some("NICE")
+        );
+        // Folding changes case, not membership — a non-prefix stays put.
+        let t = toks("SUDO git commit");
+        assert_eq!(
+            skip_transparent_prefixes(&t).first().map(String::as_str),
+            Some("SUDO")
+        );
     }
 
     #[test]
