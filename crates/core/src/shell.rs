@@ -38,6 +38,23 @@ pub fn strip_quotes(s: &str) -> String {
     result
 }
 
+/// How a shell parser reads the quoted run it is currently inside.
+///
+/// Shared by [`tokenize`] and [`split_segments_with_ops`] on purpose. The two
+/// answer different questions — where a WORD ends versus where a COMMAND ends —
+/// but they must agree on where a quoted run ends, because a disagreement is a
+/// boundary the shell does not have and every guard that segments inherits it
+/// (cameronsjo/cadence-hooks#475).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    /// `'…'` — fully literal; the first `'` closes (POSIX).
+    Single,
+    /// `"…"` — `\` escapes `"` and `\`; other backslashes stay literal.
+    Double,
+    /// `$'…'` — bash ANSI-C; `\` escapes whatever follows, including `'`.
+    AnsiC,
+}
+
 /// Split a shell command into whitespace-separated tokens, honoring quotes.
 ///
 /// Content inside matching `'` or `"` pairs stays in one token with the quotes
@@ -64,6 +81,10 @@ pub fn strip_quotes(s: &str) -> String {
 /// (`C:\Users\x`) survives intact — consuming those would corrupt the very
 /// targets the destructive-command guards compare.
 ///
+/// The three modes live in [`Quote`], shared with [`split_segments_with_ops`]
+/// so the tokenizer and the segmenter cannot drift apart on what a quoted run
+/// is — a divergence between them is a boundary the shell does not have.
+///
 /// **Three quoting modes, because `'…'` and `$'…'` are not the same thing.**
 /// Plain single quotes get no escape processing, matching POSIX: a backslash is
 /// literal and the first `'` always closes. But bash's ANSI-C form `$'…'` DOES
@@ -73,17 +94,6 @@ pub fn strip_quotes(s: &str) -> String {
 /// rest of the command, `-R evil/target` included. `$'…'` is therefore its own
 /// mode where a backslash consumes the character after it.
 pub fn tokenize(command: &str) -> Vec<String> {
-    /// How the tokenizer reads the run it is currently inside.
-    #[derive(Clone, Copy)]
-    enum Quote {
-        /// `'…'` — fully literal; the first `'` closes (POSIX).
-        Single,
-        /// `"…"` — `\` escapes `"` and `\`; other backslashes stay literal.
-        Double,
-        /// `$'…'` — bash ANSI-C; `\` escapes whatever follows, including `'`.
-        AnsiC,
-    }
-
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
@@ -1187,14 +1197,13 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
 /// one segment holding one argument instead of splitting at a `&&` the shell
 /// keeps inside the string.
 ///
-/// **The agreement stops at ANSI-C quoting.** [`tokenize`] has a dedicated
-/// `$'…'` mode (hardened by #463 so a `\'` inside one does not close it); this
-/// splitter has none, and reads the `$` as ordinary text before opening a plain
-/// single-quote string at the `'`. A `$'…'` value containing an escaped quote
-/// therefore closes early here and the real trailing `'` reopens a string that
-/// swallows the rest of the line, hiding any operator in it. That predates this
-/// function's escape handling and is tracked separately — do not read the
-/// paragraph above as covering it.
+/// ANSI-C quoting is included, via the same [`Quote`] modes [`tokenize`] uses.
+/// `$'…'` honors `\'`, so it cannot be read as a plain `'…'`: doing that closed
+/// the string on the escaped quote, and the real closing `'` then reopened a
+/// phantom string that swallowed the rest of the line — `$'a\'b' && rm -rf /x`
+/// collapsed into ONE segment with the deletion nowhere in command position.
+/// That is the divergence #463 hardened `tokenize` against, and leaving it here
+/// meant a guard could still be handed the wrong command list.
 ///
 /// Heredoc bodies are stripped first ([`strip_heredoc_bodies`]) so their prose
 /// does not become fake segments. This is otherwise syntactic splitting, not
@@ -1220,25 +1229,35 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
     let command = command.as_str();
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
     let mut current = String::new();
-    let mut quote: Option<char> = None;
+    let mut quote: Option<Quote> = None;
     let mut chars = command.chars().peekable();
 
     while let Some(c) = chars.next() {
         if let Some(q) = quote {
-            // Inside `"…"`, `\` escapes `"` and `\` — the escaped character is
+            // Inside `"…"`, `\` escapes `"` and `\`; inside `$'…'` it escapes
+            // ANYTHING, `'` included. Either way the escaped character is
             // content and does not close the string. [`tokenize`] already reads
-            // it that way; when this parser disagreed, an escaped quote ended a
-            // value here that the shell keeps open, so a `&&`/`;`/`|` still
+            // both that way; when this parser disagreed, an escaped quote ended
+            // a value here that the shell keeps open, so a `&&`/`;`/`|` still
             // inside that one argument became a fake segment boundary and the
             // text after it was handed to guards as a separate command (#475).
-            // `'…'` takes no escapes at all, so this applies to `"` only.
-            if q == '"' && c == '\\' && matches!(chars.peek(), Some('"' | '\\')) {
+            // Plain `'…'` takes no escapes at all, so it is excluded.
+            let escapes = match q {
+                Quote::Double => matches!(chars.peek(), Some('"' | '\\')),
+                Quote::AnsiC => chars.peek().is_some(),
+                Quote::Single => false,
+            };
+            if c == '\\' && escapes {
                 current.push(c);
                 current.push(chars.next().expect("peeked"));
                 continue;
             }
             current.push(c);
-            if c == q {
+            let closes = match q {
+                Quote::Single | Quote::AnsiC => c == '\'',
+                Quote::Double => c == '"',
+            };
+            if closes {
                 quote = None;
             }
             continue;
@@ -1257,8 +1276,21 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
                 current.push('\\');
                 current.push(chars.next().expect("peeked"));
             }
-            '\'' | '"' => {
-                quote = Some(c);
+            // `$'` opens ANSI-C quoting. The `$` is part of the syntax, but
+            // unlike [`tokenize`] — which is building a token VALUE — segments
+            // keep their text verbatim, so both characters are pushed. A `$`
+            // before anything else (`$VAR`, `$(…)`) is ordinary text.
+            '$' if chars.peek() == Some(&'\'') => {
+                current.push(c);
+                current.push(chars.next().expect("peeked"));
+                quote = Some(Quote::AnsiC);
+            }
+            '\'' => {
+                quote = Some(Quote::Single);
+                current.push(c);
+            }
+            '"' => {
+                quote = Some(Quote::Double);
                 current.push(c);
             }
             '&' => {
@@ -2650,6 +2682,56 @@ mod tests {
             "heredoc prose leaked into segments: {out:?}"
         );
         assert!(out.contains(&"rm -rf /tmp/x".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn split_segments_ansi_c_escaped_quote_does_not_hide_the_next_command() {
+        // The #463 divergence, one layer up. `$'…'` honors `\'`, so reading it
+        // as a plain `'…'` closed on the escaped quote and the real closing `'`
+        // reopened a phantom string that swallowed everything after it — the
+        // `rm -rf /tmp/x` here was absent from the segment list entirely, not
+        // merely misfiled, and so invisible to every guard that segments.
+        let out = split_segments(r"git commit -m $'msg with \' quote' && rm -rf /tmp/x");
+        assert_eq!(
+            out,
+            vec![r"git commit -m $'msg with \' quote'", "rm -rf /tmp/x"],
+            "ANSI-C string swallowed the operator"
+        );
+    }
+
+    #[test]
+    fn split_segments_ansi_c_agrees_with_tokenize_on_the_run() {
+        // The two parsers must end the quoted run at the same character. This
+        // asserts agreement directly rather than restating either side: the
+        // tokenizer sees one `-m` value, so the splitter must see one segment
+        // for that command plus the separate one after the operator.
+        let cmd = r"git commit -m $'a\'b' && rm -rf /tmp/x";
+        let tokens = tokenize(cmd);
+        assert_eq!(tokens.iter().filter(|t| *t == "&&").count(), 1);
+        assert_eq!(tokens[3], "a'b");
+        assert_eq!(split_segments(cmd).len(), 2);
+    }
+
+    #[test]
+    fn split_segments_plain_single_quote_still_takes_no_escapes() {
+        // Discriminating control: `'…'` is NOT ANSI-C. A backslash in it is
+        // literal and the first `'` closes, so the `'` after `\` ends the
+        // string and the `&&` that follows is a real operator. Proves the new
+        // mode is scoped to `$'…'` rather than applied to every single quote.
+        assert_eq!(
+            split_segments(r"echo 'a\' && rm -rf /tmp/x"),
+            vec![r"echo 'a\'", "rm -rf /tmp/x"]
+        );
+    }
+
+    #[test]
+    fn split_segments_dollar_outside_ansi_c_is_ordinary_text() {
+        // Mirrors `tokenize_dollar_outside_ansi_c_is_ordinary_text`: only `$'`
+        // opens the mode, so `$VAR` and `$(…)` are untouched.
+        assert_eq!(
+            split_segments("echo $HOME && echo $(id -u)"),
+            vec!["echo $HOME", "echo $(id -u)"]
+        );
     }
 
     #[test]
