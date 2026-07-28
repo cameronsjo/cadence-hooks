@@ -1049,51 +1049,90 @@ fn namespace_list_matches_redact_check_sh() {
     );
 }
 
-/// Interpreters whose argv[0] is never itself a checkable script path — the
-/// actual script lives at argv[1].
+/// Interpreters whose argv[0] — or the command that follows a leading `env`
+/// invocation — is never itself a checkable script path. The actual script is
+/// the interpreter's first NON-FLAG argument, not necessarily argv[1]:
+/// `python3 -u /path/hook.py` has a flag in between.
 const SCRIPT_INTERPRETERS: &[&str] = &[
     "python3", "python", "bash", "sh", "zsh", "node", "ruby", "perl",
 ];
 
+/// Skip a leading `env` invocation — and its own flags / `VAR=value`
+/// assignments — to the command it actually runs.
+///
+/// `/usr/bin/env python3 /path/hook.py` must be judged as a python3
+/// invocation, not as `env` itself: `env` isn't in [`SCRIPT_INTERPRETERS`], so
+/// without unwrapping it, `/usr/bin/env` (which always exists) would be the
+/// checked target and the audit would pass having never looked at the script
+/// at all (cadence-hooks#464 review — the same bug in a different spelling).
+fn skip_env_prefix(tokens: &[String]) -> &[String] {
+    let Some(first) = tokens.first() else {
+        return tokens;
+    };
+    if cadence_hooks_core::shell::basename(first) != "env" {
+        return tokens;
+    }
+    let mut i = 1;
+    while let Some(t) = tokens.get(i) {
+        if t.starts_with('-') || t.contains('=') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    &tokens[i..]
+}
+
 /// Pick the token in a settings.json hook `command` that names a script path
-/// to existence-check, or `None` when there isn't one to check.
+/// to existence-check.
+///
+/// - `Some(Some(path))` — check `path` for existence.
+/// - `Some(None)` — an interpreter-led command (argv[0], or the command after
+///   unwrapping a leading `env`) with no resolvable non-flag script argument
+///   at all (`python3 -u -O`). This must FAIL the audit, not skip it — an
+///   interpreter invocation with nothing to check is cadence-hooks#464's bug
+///   in a different spelling: silently unaudited, not proven safe.
+/// - `None` — a bare, non-interpreter command with no path-shaped token
+///   (`bd prime`) — nothing to check, a legitimate skip.
 ///
 /// A quoted interpreter+script command (`"/usr/bin/python3" "/path/hook.py"
 /// args`) naively PathBuf'd as one raw string never exists — quotes and args
-/// never form a real path. Tokenizing (quote-aware, [`cadence_hooks_core::shell::tokenize`])
-/// splits it into argv; when argv[0]'s basename names a known interpreter,
-/// argv[1] is the actual script and that's what gets checked instead
-/// (cadence-hooks#464). A bare command (`bd prime`, no `/` or `~`) still has
-/// nothing to check.
-fn script_check_target(command: &str) -> Option<String> {
+/// never form a real path. Tokenizing (quote-aware,
+/// [`cadence_hooks_core::shell::tokenize`]) splits it into argv first.
+fn script_check_target(command: &str) -> Option<Option<String>> {
     let tokens = cadence_hooks_core::shell::tokenize(command);
-    let first = tokens.first()?;
+    let rest = skip_env_prefix(&tokens);
+    let first = rest.first()?;
 
-    let is_interpreter = Path::new(first)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|name| SCRIPT_INTERPRETERS.contains(&name));
+    let is_interpreter = SCRIPT_INTERPRETERS.contains(&cadence_hooks_core::shell::basename(first));
 
-    let candidate = if is_interpreter {
-        tokens.get(1)?
-    } else {
-        first
-    };
+    if is_interpreter {
+        let script = rest.iter().skip(1).find(|t| !t.starts_with('-'));
+        return Some(script.cloned());
+    }
 
-    if candidate.contains('/') || candidate.starts_with('~') {
-        Some(candidate.clone())
+    if first.contains('/') || first.starts_with('~') {
+        Some(Some(first.clone()))
     } else {
         None
     }
 }
 
 /// Does the script a settings.json hook `command` names exist on disk, after
-/// expanding `~` against `home`? `None` when the command has no checkable
-/// script path (see [`script_check_target`]).
+/// expanding a LEADING `~` against `home` (via
+/// [`cadence_hooks_core::paths::expand_tilde_with`] — never a blind
+/// `str::replace('~', home)`, which would mangle a real path like
+/// `/opt/a~b/hook.sh` into a false missing-script report)?
+///
+/// `None` — a bare command with no checkable path, a legitimate skip.
+/// `Some(false)` covers both "the script is missing" AND "an interpreter-led
+/// command resolved no script argument at all" — the latter must fail the
+/// audit, not silently pass (see [`script_check_target`]).
 fn shell_script_exists(command: &str, home: &str) -> Option<bool> {
-    let target = script_check_target(command)?;
-    let expanded = target.replace('~', home);
-    Some(PathBuf::from(&expanded).exists())
+    match script_check_target(command)? {
+        Some(target) => Some(cadence_hooks_core::paths::expand_tilde_with(&target, home).exists()),
+        None => Some(false),
+    }
 }
 
 #[test]
@@ -1125,27 +1164,19 @@ fn settings_json_shell_scripts_exist() {
 
 #[test]
 fn shell_script_exists_quoted_interpreter_and_script() {
-    let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
-    let script_path = tmp.path().join("hook.py");
-    std::fs::write(&script_path, "").expect("failed to write fixture script");
-    let cmd = format!(
-        "\"/usr/bin/python3\" \"{}\" --flag value",
-        script_path.display()
-    );
+    // Cargo.toml is a file this test binary already knows exists at compile
+    // time — no tempdir/write needed just to get an existing path.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("\"/usr/bin/python3\" \"{script_path}\" --flag value");
 
     assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
 }
 
 #[test]
 fn shell_script_exists_bare_path() {
-    let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
-    let script_path = tmp.path().join("hook.sh");
-    std::fs::write(&script_path, "").expect("failed to write fixture script");
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 
-    assert_eq!(
-        shell_script_exists(&script_path.display().to_string(), "/home/nobody"),
-        Some(true)
-    );
+    assert_eq!(shell_script_exists(script_path, "/home/nobody"), Some(true));
 }
 
 #[test]
@@ -1159,6 +1190,41 @@ fn shell_script_exists_interpreter_with_missing_script() {
 fn shell_script_exists_none_for_bare_command() {
     // "bd prime" has no `/` or `~` in either token — nothing to check.
     assert_eq!(shell_script_exists("bd prime", "/home/nobody"), None);
+}
+
+#[test]
+fn shell_script_exists_interpreter_flag_before_script() {
+    // `python3 -u /path/hook.py`: the naive "argv[1] is the script" logic
+    // would pick `-u`, a flag, as the "script" and always report missing. The
+    // real script is the interpreter's first NON-FLAG argument.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("python3 -u {script_path}");
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_env_wrapped_interpreter() {
+    // `/usr/bin/env python3 /path/hook.py`: `env` is not in
+    // SCRIPT_INTERPRETERS, so without unwrapping it, `/usr/bin/env` itself —
+    // which always exists — would be the checked target, passing the audit
+    // having never touched the script.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("/usr/bin/env python3 {script_path}");
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_interpreter_no_resolvable_script_fails() {
+    // An interpreter-led command whose every argument is a flag has no
+    // resolvable script at all — this must FAIL the audit (Some(false)), not
+    // silently skip it (None). A skip here is the same #464 bug in a
+    // different spelling: a hook wired to an interpreter with nothing to
+    // check would go unaudited rather than flagged.
+    let cmd = "python3 -u -O";
+
+    assert_eq!(shell_script_exists(cmd, "/home/nobody"), Some(false));
 }
 
 // ---------- Resolver + parser unit tests ----------
