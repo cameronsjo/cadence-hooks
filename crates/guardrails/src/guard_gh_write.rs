@@ -2892,8 +2892,9 @@ mod tests {
 
     // GhWriteGuard.run() reads CADENCE_ALLOWED_OWNERS / CADENCE_ALLOWED_REPOS
     // / CADENCE_EXTRA_HOSTS via process-global env vars. Serialize all
-    // metadata-shape tests so they don't race each other.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // metadata-shape tests via the crate-shared CADENCE_ALLOWLIST_TEST_LOCK so
+    // they don't race each other or the same globals mutated in
+    // guard_push_remote / warn_issue_tracker (#446).
 
     fn input_with(command: &str, cwd: &str) -> HookInput {
         // Build via JSON to avoid private-field gymnastics; the real hook
@@ -2907,13 +2908,15 @@ mod tests {
     }
 
     fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::CADENCE_ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let prior: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
             .collect();
         for (k, v) in vars {
-            // SAFETY: serialized via ENV_LOCK; restored below.
+            // SAFETY: serialized via CADENCE_ALLOWLIST_TEST_LOCK; restored below.
             unsafe {
                 match v {
                     Some(val) => std::env::set_var(k, val),

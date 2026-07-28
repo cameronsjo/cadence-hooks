@@ -246,17 +246,20 @@ mod tests {
     use std::path::PathBuf;
 
     // Serialize tests that mutate CADENCE_ALLOWED_OWNERS / CADENCE_ISSUE_TRACKER(S)
-    // so they don't race each other.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // via the crate-shared CADENCE_ALLOWLIST_TEST_LOCK so they don't race each
+    // other or the same globals mutated in guard_push_remote / guard_gh_write
+    // (#446).
 
     fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::CADENCE_ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let prior: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
             .collect();
         for (k, v) in vars {
-            // SAFETY: serialized via ENV_LOCK; restored in the block below.
+            // SAFETY: serialized via CADENCE_ALLOWLIST_TEST_LOCK; restored in the block below.
             unsafe {
                 match v {
                     Some(val) => std::env::set_var(k, val),
@@ -668,7 +671,8 @@ mod tests {
 
     // ---- nudge message format ----
     // These tests call canonical() which reads CADENCE_ISSUE_TRACKER — serialize
-    // with ENV_LOCK and clear the var so concurrent env-mutating tests don't race.
+    // with CADENCE_ALLOWLIST_TEST_LOCK and clear the var so concurrent
+    // env-mutating tests don't race.
 
     #[test]
     fn nudge_message_names_the_check() {

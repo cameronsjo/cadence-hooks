@@ -11,6 +11,16 @@
 #[cfg(test)]
 pub(crate) static CADENCE_ALLOW_MAIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Shared test lock serializing every test that mutates the process-global
+/// `CADENCE_ALLOWED_OWNERS` / `CADENCE_ALLOWED_REPOS` / `CADENCE_EXTRA_HOSTS`
+/// allowlist env vars — read by `guard_push_remote`, `guard_gh_write`, and
+/// `warn_issue_tracker`. These three modules used to mint separate
+/// module-local `ENV_LOCK`s over the *same* shared globals, which provide no
+/// mutual exclusion under cargo's parallel test runner (cadence-hooks#446,
+/// same root cause as #298); one crate-shared lock serializes them all.
+#[cfg(test)]
+pub(crate) static CADENCE_ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Per-repo snooze command + helper consumed by `enforce_worktree`.
 pub mod dismiss_enforce_worktree;
 /// Per-repo snooze command + helper consumed by `warn_main_branch`.

@@ -799,23 +799,23 @@ mod tests {
     // --- PushRemoteGuard::run(): explicit-URL ownership (#68) ---
     //
     // run() reads CADENCE_ALLOWED_OWNERS from the process-global environment,
-    // so these tests serialize via ENV_LOCK and restore prior values. They run
-    // inside this crate's checkout (a real git repo) so run()'s
-    // `rev-parse --git-dir` gate passes; the explicit URL is validated directly
-    // and never resolves through a remote.
+    // so these tests serialize via the crate-shared CADENCE_ALLOWLIST_TEST_LOCK
+    // and restore prior values (#446). They run inside this crate's checkout
+    // (a real git repo) so run()'s `rev-parse --git-dir` gate passes; the
+    // explicit URL is validated directly and never resolves through a remote.
 
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::CADENCE_ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let prior: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
             .collect();
         for (k, v) in vars {
-            // SAFETY: serialized via ENV_LOCK; restored below.
+            // SAFETY: serialized via CADENCE_ALLOWLIST_TEST_LOCK; restored below.
             unsafe {
                 match v {
                     Some(val) => std::env::set_var(k, val),
