@@ -373,20 +373,10 @@ fn nudge_message(verdict: &Verdict) -> String {
     )
 }
 
-/// The once-per-day marker file: `<dir>/state/stale_warn.date`, holding a UTC
-/// `YYYY-MM-DD` followed by the verdict token. When today's date and the same
-/// verdict already sit there, the check stays silent so the alarm fires at most
-/// once per calendar day *per distinct verdict*. Not a `*.jsonl`, and inside
-/// `state/`, so it can never freshen the staleness signal it gates.
-fn marker_path(dir: &Path) -> PathBuf {
-    dir.join("state").join("stale_warn.date")
-}
-
-/// Today's UTC date, `YYYY-MM-DD` — the marker's freshness token. Sliced from
-/// the canonical jiff-backed timestamp so it shares the ledger's clock.
-fn today_utc() -> String {
-    crate::common::utc_timestamp()[..10].to_string()
-}
+/// Basename of this check's once-per-day marker under `<dir>/state/`. The gate
+/// itself is [`crate::common::claim_daily_alarm`], shared with
+/// [`crate::failopen_disclose`]'s alarm so the two cannot drift apart.
+const MARKER_FILE: &str = "stale_warn.date";
 
 /// Register-time alarm: warn once per day when metrics telemetry has gone stale
 /// or a continuous stream has flatlined.
@@ -408,9 +398,9 @@ impl Check for WarnStale {
 }
 
 /// Testable core: dir, extra paths, threshold, and clock injected. Reads the
-/// verdict, consults the once-per-day marker, and returns `Nudge` (first
-/// sighting of this verdict today) or `Allow` (healthy, already warned, or any
-/// fail-open path). Never blocks — the ADR-0001 lock.
+/// verdict, claims today's slot for it, and returns `Nudge` (first sighting of
+/// this verdict today) or `Allow` (healthy, already warned, or any fail-open
+/// path). Never blocks — the ADR-0001 lock.
 pub fn run_warn_stale(
     dir: &Path,
     extra: &[PathBuf],
@@ -421,21 +411,10 @@ pub fn run_warn_stale(
         return CheckResult::allow();
     };
 
-    let marker = marker_path(dir);
-    let token = format!("{} {}", today_utc(), verdict_token(&verdict));
-    if let Ok(existing) = std::fs::read_to_string(&marker)
-        && existing.trim() == token
-    {
+    if !crate::common::claim_daily_alarm(dir, MARKER_FILE, &verdict_token(&verdict)) {
         // Already warned about this exact verdict today — stay silent.
         return CheckResult::allow();
     }
-
-    // Record today's warning. Fail-open: a marker write error must not suppress
-    // the nudge (a repeat warning beats a missed one) and must never crash.
-    if let Some(parent) = marker.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&marker, &token);
 
     CheckResult::nudge(nudge_message(&verdict))
 }
@@ -473,6 +452,16 @@ mod tests {
 
     /// No extra watched paths — the common case for dir-only fixtures.
     const NO_EXTRA: &[PathBuf] = &[];
+
+    /// Where [`crate::common::claim_daily_alarm`] puts this check's marker.
+    fn marker_path(dir: &Path) -> PathBuf {
+        dir.join("state").join(MARKER_FILE)
+    }
+
+    /// Today's UTC date, the freshness half of the marker token.
+    fn today_utc() -> String {
+        crate::common::today_utc()
+    }
 
     // 1. A dir whose newest .jsonl is older than the threshold warns, names the
     //    file, and points at the doctor.

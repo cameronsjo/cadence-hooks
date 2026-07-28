@@ -117,27 +117,42 @@ pub fn is_within(path: &str, dir: &Path) -> bool {
 /// bounds a pathological/malicious multi-GB blob from OOM-ing the hook.
 const MAX_UNTRUSTED_CONFIG_BYTES: u64 = 1024 * 1024; // 1 MiB
 
-/// Read a per-repo, repo-controlled `.claude/*.json` config safely.
-///
-/// Rejects anything that is not a **regular file** (metadata() follows
-/// symlinks, so a link to /dev/zero or a FIFO resolves to a non-regular
-/// target and is rejected on `stat`, before any blocking read) and caps the
-/// read at [`MAX_UNTRUSTED_CONFIG_BYTES`]. Returns `None` on any rejection or
-/// IO error so callers fail open (ADR-0001): a rejected config == a missing one.
+/// Read a per-repo, repo-controlled `.claude/*.json` config safely — the
+/// [`read_capped`] discipline at [`MAX_UNTRUSTED_CONFIG_BYTES`].
 pub fn read_untrusted_config(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
+    read_capped(path, MAX_UNTRUSTED_CONFIG_BYTES)
+}
+
+/// Read a small untrusted file whole, or reject it: `None` when it is not a
+/// regular file, when its content exceeds `max_bytes`, or on any IO error —
+/// so callers fail open (ADR-0001), a rejected file being the same as a
+/// missing one.
+///
+/// The non-regular check must happen on `stat` **before** the open: a FIFO
+/// blocks on open, so rejecting it afterwards would be too late (`metadata()`
+/// follows symlinks, so a link to `/dev/zero` or to a FIFO resolves to its
+/// non-regular target and is caught here too).
+///
+/// **The size cap is enforced by the read, never by `st_size`.** A
+/// `/proc`-style file on Linux reports a size of 0 and then yields unbounded
+/// content, so a `metadata().len()` pre-check would wave it through — reading
+/// `max_bytes + 1` and rejecting a buffer that fills it holds the cap on an
+/// honest file and a liar identically, with at most one extra byte read. This
+/// is the same take-then-check discipline `session::persist_plan`'s
+/// `file_matches_body` uses.
+///
+/// For a file whose *tail* is what matters — a session transcript — use
+/// `crate::transcript::read_tail` instead: this reads from the front, and
+/// rejects rather than truncates.
+pub fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
+    if !std::fs::metadata(path).ok()?.is_file() {
         return None; // FIFO / device / dir / broken symlink
-    }
-    if meta.len() > MAX_UNTRUSTED_CONFIG_BYTES {
-        return None; // oversized regular file
     }
     let file = std::fs::File::open(path).ok()?;
     let mut buf = String::new();
-    file.take(MAX_UNTRUSTED_CONFIG_BYTES) // TOCTOU belt-and-suspenders
-        .read_to_string(&mut buf)
-        .ok()?; // non-UTF8 → None (same as read_to_string)
-    Some(buf)
+    // non-UTF8 → None (same as read_to_string)
+    file.take(max_bytes + 1).read_to_string(&mut buf).ok()?;
+    (buf.len() as u64 <= max_bytes).then_some(buf)
 }
 
 /// Resolve a checkout's git **common directory** — the shared `.git` that holds
@@ -553,6 +568,42 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
         let read = read_untrusted_config(&path).expect("under-cap file reads");
         assert_eq!(read.len(), body.len());
+    }
+
+    // --- read_capped: the take-then-check gate (#361) ---
+
+    #[test]
+    fn read_capped_accepts_exactly_the_cap() {
+        // The boundary of the take-then-check arithmetic: `take(max + 1)` fills
+        // to max on a file of exactly max, and `len <= max` accepts it. An
+        // off-by-one here silently rejects a legitimate at-cap file.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("exact.txt");
+        std::fs::write(&path, vec![b'z'; 512]).unwrap();
+        assert_eq!(read_capped(&path, 512).map(|s| s.len()), Some(512));
+    }
+
+    #[test]
+    fn read_capped_rejects_one_byte_over_the_cap() {
+        // The other side of the same boundary. This is also the ONLY gate on
+        // size — there is no `st_size` pre-check to fall back on — so passing
+        // here is what proves the cap is enforced by the read itself, which is
+        // what makes it hold on a file that misreports its size (#361).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("over.txt");
+        std::fs::write(&path, vec![b'z'; 513]).unwrap();
+        assert_eq!(read_capped(&path, 512), None);
+    }
+
+    #[test]
+    fn read_capped_reads_a_small_file_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("msg.txt");
+        std::fs::write(&path, "fix: thing\n\nSession-Id: abc\n").unwrap();
+        assert_eq!(
+            read_capped(&path, 64 * 1024).as_deref(),
+            Some("fix: thing\n\nSession-Id: abc\n")
+        );
     }
 
     #[cfg(unix)]
