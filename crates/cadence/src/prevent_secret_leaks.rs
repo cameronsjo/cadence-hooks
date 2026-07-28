@@ -169,6 +169,169 @@ fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
     false
 }
 
+/// Does any segment of `lower` execute an environment **dump**?
+///
+/// `printenv`, `export -p`, and `declare -x` are dumps outright. `env` is the
+/// one whose verdict depends on its operands: bare `env` prints the
+/// environment, but `env … <command>` *execs* that command and prints nothing.
+/// The old check fired on a segment-leading `env` regardless, so
+/// `env FOO=1 make` — and, pointedly,
+/// `env -u CADENCE_ALLOW_MAIN … bash probe.sh`, the form this repository's own
+/// `CLAUDE.md` prescribes for trustworthy guard verification — nudged as a
+/// dump (#411). The cost is not the interruption: the cheapest way to silence
+/// a nudge attached to the correct practice is to drop the `env -u`, which
+/// silently restores the ambient-`CADENCE_ALLOW_MAIN` false-pass that prefix
+/// exists to prevent.
+///
+/// So `env`'s own options are peeled ([`peel_env_options`]) and the dump test
+/// **re-run** on whatever verb remains. The re-run is what keeps the check
+/// honest in both directions: `env -u FOO printenv` still warns because the
+/// surviving verb is itself a dump, and `env env` warns because the surviving
+/// verb is a bare `env` — while `env -u FOO make` stays silent. A naive "an
+/// operand follows, so it is an exec" test would lose both warnings.
+///
+/// Segment handling matches [`is_executed_command`]: the dump must be the
+/// executed command at the start of a segment, never a substring of an
+/// argument, path, or compound name like `direnv`/`envoy`/`gh env`.
+fn command_dumps_env(lower: &str) -> bool {
+    split_segments(lower).iter().any(|segment| {
+        let segment = segment.trim_start_matches(['(', '{', ' ', '\t']);
+        let tokens: Vec<&str> = segment
+            .split_whitespace()
+            .take_while(|t| !is_shell_operator(t))
+            .collect();
+        tokens_dump_env(&tokens)
+    })
+}
+
+/// A token that ends the current simple command's operand list — a redirection
+/// (`>`, `>>`, `2>`, `&>`, `>&2`, `<`, `<<<`, and their attached forms like
+/// `>out.sh`) or a leftover control operator [`split_segments`] did not consume
+/// (`&`, `;`, `|`, and closing group punctuation).
+///
+/// Load-bearing for [`command_dumps_env`]: `env > out.sh` is a dump whose
+/// **output is redirected**, and without this the `>` reads as `env`'s command
+/// operand and the whole thing looks like an exec — silently dropping a warning
+/// the previous leading-word test caught. A command operand cannot follow a
+/// redirection within one simple command, so truncating here is safe. (The rare
+/// leading-redirect spelling `> out.sh env` is an unchanged miss — the old
+/// leading-word test did not see it either.)
+fn is_shell_operator(token: &str) -> bool {
+    if matches!(token, "&" | ";" | "|" | "|&" | ")" | "}") {
+        return true;
+    }
+    // Strip an fd prefix (`2>`, `1>&2`) and an `&` prefix (`&>`), then look for
+    // the redirection character itself.
+    let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('&').unwrap_or(rest);
+    rest.starts_with('>') || rest.starts_with('<')
+}
+
+/// The dump decision for one segment's tokens.
+///
+/// `env` can stack (`env -u FOO env`), so the verb test re-runs on the tokens
+/// surviving each peel. Iterative rather than recursive: every hop drops at
+/// least the leading `env`, so the token slice strictly shrinks and the loop
+/// terminates — but a recursive spelling would grow the stack once per hop, and
+/// a long enough `env env env …` line could exhaust it. A crashed hook is not a
+/// silent miss, it is a non-zero exit that reads as a BLOCK, so the cheap loop
+/// is worth it even though the input is self-authored.
+fn tokens_dump_env<'a>(mut tokens: &'a [&'a str]) -> bool {
+    loop {
+        match tokens.first().copied() {
+            Some("printenv") => return true,
+            Some("export") => return tokens.get(1) == Some(&"-p"),
+            Some("declare") => return tokens.get(1) == Some(&"-x"),
+            Some("env") => match peel_env_options(&tokens[1..]) {
+                // Nothing but options and assignments left: `env`, `env -i`,
+                // `env -u FOO` all print the environment.
+                Some([]) => return true,
+                Some(rest) => tokens = rest,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
+/// Skip `env`'s own options and `VAR=value` assignments, returning the tokens
+/// from the command operand onward — empty when the segment is options only.
+/// `None` means the segment is an exec no matter what follows.
+///
+/// `core::shell::skip_transparent_prefixes` cannot serve here: it refuses to
+/// skip a prefix whose next token starts with `-`, deliberately, because each
+/// transparent prefix has its own flag grammar and guessing wrong would skip
+/// past the real command word. That refusal is exactly the `env -u FOO cmd`
+/// case, so the grammar is spelled out locally instead of widening a helper
+/// two block-capable guards also depend on.
+///
+/// The options that take a value are `-u`/`--unset`, `-C`/`--chdir`, and
+/// `-P`/`--default-path`; `--` ends option parsing. `-S`/`--split-string`
+/// returns `None` rather than consuming a value, because its value *is* the
+/// command line to run — treating it as an ordinary value would leave nothing
+/// behind and warn on a real exec, the very bug being fixed. Unrecognized
+/// options are assumed valueless, which can only leave a *later* token as the
+/// apparent verb; the dump-set test then rejects it and the check stays silent,
+/// the nudge-only fail-open direction.
+fn peel_env_options<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let tok = tokens[idx];
+        if tok == "--" {
+            return Some(&tokens[(idx + 1).min(tokens.len())..]);
+        }
+        if cadence_hooks_core::shell::is_assignment_word(tok) {
+            idx += 1;
+            continue;
+        }
+        let Some(flag) = tok.strip_prefix('-') else {
+            return Some(&tokens[idx..]);
+        };
+        if flag.is_empty() {
+            // A bare `-` is env's shorthand for `-i`, not a value-taker.
+            idx += 1;
+            continue;
+        }
+        if let Some(long) = flag.strip_prefix('-') {
+            let (name, value_attached) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            if name == "split-string" {
+                return None;
+            }
+            if value_attached {
+                idx += 1;
+            } else {
+                idx += usize::from(matches!(name, "unset" | "chdir" | "default-path")) + 1;
+            }
+            continue;
+        }
+        // Short options, possibly clustered (`-iu FOO`). The FIRST value-taking
+        // letter wins: in `-uS` the `S` is `-u`'s value, not a split-string.
+        // That letter consumes the rest of its own token as the value, or the
+        // next token when it ends the cluster (`-uFOO` vs `-u FOO`).
+        //
+        // Matched case-INSENSITIVELY because the caller hands us a fully
+        // lowercased command (`bash_leaks_secrets`), so `-C`/`-P`/`-S` arrive
+        // as `-c`/`-p`/`-s`. Testing the uppercase spelling alone silently
+        // failed to consume the value: `env -C /tmp printenv` peeled to
+        // `[/tmp, printenv]`, read `/tmp` as the verb, and lost a dump warning
+        // the previous leading-word check did catch. `env` has no lowercase
+        // `-c`/`-p`/`-s` option of its own, so accepting both cases collides
+        // with nothing.
+        match flag
+            .char_indices()
+            .find(|(_, c)| matches!(c.to_ascii_uppercase(), 'S' | 'U' | 'C' | 'P'))
+        {
+            Some((_, c)) if c.eq_ignore_ascii_case(&'s') => return None,
+            Some((i, c)) => idx += usize::from(i + c.len_utf8() == flag.len()) + 1,
+            None => idx += 1,
+        }
+    }
+    Some(&tokens[tokens.len()..])
+}
+
 /// Does the command contain an in-command directory change (`cd`, `pushd`,
 /// `popd`) as the executed command of any segment?
 ///
@@ -364,19 +527,11 @@ fn bash_leaks_secrets(command: &str, cwd: Option<&str>) -> Option<CheckResult> {
     // Warn: env dump commands. Must appear as the executed command at the
     // start of a segment (or after a chain operator), not as a substring of
     // an argument, path, or compound binary name like `direnv`/`envoy`/`gh env`.
-    let env_dump_commands: &[&[&str]] = &[
-        &["env"],
-        &["printenv"],
-        &["export", "-p"],
-        &["declare", "-x"],
-    ];
-    for cmd in env_dump_commands {
-        if is_executed_command(&lower, cmd) {
-            return Some(CheckResult::nudge(
-                "⚠️  Command would dump environment variables, which may include secrets. \
-                 Run programs that use env vars directly instead.",
-            ));
-        }
+    if command_dumps_env(&lower) {
+        return Some(CheckResult::nudge(
+            "⚠️  Command would dump environment variables, which may include secrets. \
+             Run programs that use env vars directly instead.",
+        ));
     }
 
     // Warn: echo/printf of a secret-shaped env var. Scoped to the echo/printf
@@ -1324,9 +1479,126 @@ mod tests {
     }
 
     #[test]
-    fn bash_env_with_args_warned() {
-        let result = SecretLeaksGuard.run(&make_bash_input("env -i bash"));
-        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    fn bash_env_options_only_still_warned() {
+        // Options with no command operand still print the environment.
+        // (`env -i bash` used to be asserted here as a Nudge — it is an exec
+        // and the assertion was codifying #411's bug; see the table below.)
+        for cmd in ["env", "env -i", "env -u FOO", "env -0", "env -u FOO -u BAR"] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "options-only env is a dump: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_env_with_command_operand_is_an_exec_not_a_dump() {
+        // #411's table. `env … <command>` execs and prints nothing, so the
+        // dump warning does not apply — and the flagged form was the one
+        // `cadence-hooks/CLAUDE.md` prescribes for trustworthy guard
+        // verification, where the cheapest way to silence the nudge is to drop
+        // the `env -u` and restore the false-pass it exists to prevent.
+        for cmd in [
+            "env -u FOO bash script.sh",
+            "env FOO=bar bash script.sh",
+            "env -i sh -c 'echo hi'",
+            "env -i bash",
+            "env -u CADENCE_ALLOW_MAIN -u CADENCE_NO_ENFORCE_WORKTREE bash probe7.sh",
+            "env --unset=FOO make",
+            "env -C /tmp make",
+            "env -P /opt make",
+            "env --chdir=/tmp make",
+            "env -- make",
+            "env -uFOO make",
+            "env -iu FOO make",
+            "env -S 'make -j4'",
+            "env -s 'make -j4'",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "env with a command operand is an exec: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_env_peel_rewarns_when_the_surviving_verb_is_a_dump() {
+        // The load-bearing half of the fix: peeling env's options is not
+        // enough, the dump test must RE-RUN on whatever verb remains. A naive
+        // "an operand follows, so it is an exec" test would silently lose
+        // every one of these.
+        for cmd in [
+            "env -u FOO printenv",
+            "env printenv",
+            "env env",
+            "env -u FOO env",
+            "env -- printenv",
+            "env FOO=bar printenv",
+            // Value-taking options spelled in UPPERCASE. The caller lowercases
+            // the whole command, so these arrive as `-c`/`-p`/`-s`; matching
+            // only the uppercase letter left the value unconsumed, made `/tmp`
+            // look like the verb, and dropped the warning entirely.
+            "env -C /tmp printenv",
+            "env -C /tmp env",
+            "env -P /opt env",
+            "env --chdir=/tmp printenv",
+            "env --unset=FOO printenv",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "the verb surviving the peel is itself a dump: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_env_dump_with_redirected_output_still_warned() {
+        // A redirection is not a command operand: these are dumps whose output
+        // is being captured, which is the more alarming shape, not less. Naive
+        // operand detection reads the `>` as the exec'd command and loses them.
+        for cmd in [
+            "env > out.sh",
+            "env >out.sh",
+            "env >> out.sh",
+            "env 2> /dev/null",
+            "env &> out.sh",
+            "printenv > /tmp/e",
+            "env -u FOO env > out.sh",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "a redirected dump is still a dump: {cmd}"
+            );
+        }
+        // Control: the redirection must not resurrect a warning on a real exec.
+        assert_eq!(
+            SecretLeaksGuard
+                .run(&make_bash_input("env -u FOO make > build.log"))
+                .outcome,
+            cadence_hooks_core::Outcome::Allow,
+            "redirecting an exec's output does not make it a dump"
+        );
+    }
+
+    #[test]
+    fn bash_env_peel_is_scoped_to_its_own_segment() {
+        // An exec-shaped env in one segment must not launder a real dump in
+        // another, in either order.
+        for cmd in [
+            "env -u FOO make && printenv",
+            "printenv && env -u FOO make",
+            "env -u FOO make | env",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "a dump in a sibling segment still warns: {cmd}"
+            );
+        }
     }
 
     #[test]

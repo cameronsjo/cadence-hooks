@@ -263,7 +263,13 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
 /// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
 /// `==` comparisons — is not skipped, so this can only widen the leading-word
 /// gate past words the shell itself treats as environment prefixes.
-fn is_assignment_word(token: &str) -> bool {
+///
+/// Public so guards that peel a prefix themselves agree with
+/// [`skip_transparent_prefixes`] on what counts as an assignment — the
+/// `prevent-secret-leaks` `env`-operand peel (#411) needs the same rule but
+/// cannot reuse that function, which stops at any `-`-leading token and so
+/// refuses exactly the `env -u FOO cmd` shape it must see through.
+pub fn is_assignment_word(token: &str) -> bool {
     match token.split_once('=') {
         Some((name, _)) if !name.is_empty() => {
             name.chars()
