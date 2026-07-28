@@ -41,23 +41,62 @@ struct Finding {
     remediation: String,
 }
 
+/// Character ceiling applied to every field [`Finding::render`] sanitizes.
+/// `snippet` is a raw `hooks.json` command with no bounded length of its own
+/// (cameronsjo/cadence-hooks#440); `diagnosis`/`remediation` can compose
+/// prose around an already-`display_safe_bounded`-clamped 200-char error
+/// string from `log_failopen` (`MAX_ERROR_CHARS`), so 500 leaves real
+/// content intact while still bounding a pathological one.
+const MAX_FINDING_FIELD_CHARS: usize = 500;
+
 impl Finding {
-    fn print(&self) {
+    /// Render this finding for terminal display. Sanitizes every
+    /// file-sourced field ONCE, here, rather than at each construction site
+    /// (cameronsjo/cadence-hooks#440). A `hooks.json` command snippet, an
+    /// `installed_plugins.json` label, or a directory name any of them
+    /// interpolated into a diagnosis/remediation string, can all carry ANSI
+    /// escapes, C1 controls, or Trojan-Source bidi/Tags primitives — printed
+    /// verbatim, those reorder or overwrite the rest of the terminal line.
+    /// Per-call-site sanitizing is the wrong shape long-term: every future
+    /// check would have to remember, and the one that forgets is invisible
+    /// until someone reads the output closely. Pure and side-effect-free so
+    /// completeness is testable without capturing real stdout — [`print`]
+    /// is the only thing that writes it out, and it is a one-line wrapper,
+    /// so no second path can bypass this sanitization.
+    ///
+    /// **Scope: this covers `Finding` output only.** Other `doctor` print
+    /// sites outside the `Finding` path (e.g. the `--prune` directory
+    /// listing) are not covered by this guarantee and are tracked
+    /// separately.
+    ///
+    /// [`print`]: Finding::print
+    fn render(&self) -> String {
         let level = match self.severity {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
-        let location = match self.line {
+        let location_raw = match self.line {
             Some(n) => format!("{}:{n}", self.file.display()),
             None => self.file.display().to_string(),
         };
+        let sanitize = |s: &str| {
+            cadence_hooks_metrics::common::display_safe_bounded(s, MAX_FINDING_FIELD_CHARS)
+        };
+        let plugin = sanitize(&self.plugin);
+        let location = sanitize(&location_raw);
+        let snippet = sanitize(&self.snippet);
+        let diagnosis = sanitize(&self.diagnosis);
+        let remediation = sanitize(&self.remediation);
         // <level> [<plugin>] <file>[:line]: <diagnosis>
         //   command: <snippet>
         //   fix: <remediation>
-        println!(
-            "{level} [{}] {}: {}\n  command: {}\n  fix: {}",
-            self.plugin, location, self.diagnosis, self.snippet, self.remediation
-        );
+        format!(
+            "{level} [{plugin}] {location}: {diagnosis}\n  command: {snippet}\n  fix: {remediation}"
+        )
+    }
+
+    fn print(&self) {
+        println!("{}", self.render());
     }
 }
 
@@ -287,12 +326,22 @@ fn find_line_number(haystack: &str, needle: &str) -> Option<usize> {
 }
 
 /// Walk a `hooks.json` blob's hook commands and collect findings.
+///
+/// `report_skew` gates Check 2 (subcommand cross-reference) only — Check 0
+/// (missing CLI) and Check 1 (shell-expansion `Error`) always run regardless.
+/// `false` is used for a plugin [`marketplace_status`] reports
+/// [`MarketplaceStatus::RemovedUpstream`] (cameronsjo/cadence-hooks#474): its
+/// stale cached `hooks.json` would otherwise misdiagnose as binary skew, but
+/// a shell-expansion bug or an unresolvable CLI dependency in that same file
+/// is a real, independent defect this scan must still surface — removed
+/// upstream is a reason to suppress the skew warning, not every warning.
 fn scan_hooks_json(
     plugin: &str,
     path: &Path,
     raw: &str,
     json: &serde_json::Value,
     channel: InstallChannel,
+    report_skew: bool,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -340,8 +389,10 @@ fn scan_hooks_json(
                     });
                 }
 
-                // Check 2: subcommand cross-reference (Warning).
-                if let Some((ns, sub)) = extract_invocation(cmd)
+                // Check 2: subcommand cross-reference (Warning). Gated by
+                // `report_skew` — see this function's doc comment.
+                if report_skew
+                    && let Some((ns, sub)) = extract_invocation(cmd)
                     && let Some(diag) = judge_invocation(&ns, &sub, channel)
                 {
                     findings.push(Finding {
@@ -495,29 +546,24 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
         .map(|(label, hooks)| Finding {
             severity: Severity::Warning,
             // The label is an `installed_plugins.json` key — third-party
-            // influenced, and every `Finding` field prints verbatim. Sanitizing
-            // at construction is the narrow fix; the broader one (sanitize once
-            // at the `Finding` display boundary, covering the pre-existing raw
-            // hooks.json snippets too) is filed rather than smuggled in here.
-            plugin: cadence_hooks_metrics::common::display_safe(label),
+            // influenced. Every `Finding` field is sanitized once, at the
+            // display boundary (`Finding::render`, cameronsjo/cadence-hooks#440),
+            // so it is used verbatim here rather than sanitized again at
+            // construction.
+            plugin: label.clone(),
             file: hooks,
             line: None,
-            snippet: format!(
-                "{}: no enabledPlugins entry",
-                cadence_hooks_metrics::common::display_safe(label)
-            ),
+            snippet: format!("{label}: no enabledPlugins entry"),
             diagnosis: format!(
-                "{} is installed and ships hooks, but has no entry in \
+                "{label} is installed and ships hooks, but has no entry in \
                  enabledPlugins — none of its hooks can fire. Any logger or \
                  guard it wires is silently inert, including a staleness \
-                 canary wired inside the plugin it watches (#397)",
-                cadence_hooks_metrics::common::display_safe(label)
+                 canary wired inside the plugin it watches (#397)"
             ),
             remediation: format!(
-                "enable it (`/plugin` → enable {}) if its hooks should be \
+                "enable it (`/plugin` → enable {label}) if its hooks should be \
                  running, or set it to false in {} to record the choice — an \
                  explicit false is silent here, a missing key is not",
-                cadence_hooks_metrics::common::display_safe(label),
                 config_dir.join("settings.json").display()
             ),
         })
@@ -525,7 +571,13 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
 }
 
 /// Scan a single plugin install dir's `hooks/hooks.json`, if present.
-fn scan_plugin_dir(label: &str, plugin_dir: &Path, channel: InstallChannel) -> Vec<Finding> {
+/// `report_skew` is forwarded to [`scan_hooks_json`] — see its doc comment.
+fn scan_plugin_dir(
+    label: &str,
+    plugin_dir: &Path,
+    channel: InstallChannel,
+    report_skew: bool,
+) -> Vec<Finding> {
     let hooks_path = plugin_dir.join("hooks/hooks.json");
     let Ok(content) = std::fs::read_to_string(&hooks_path) else {
         return Vec::new();
@@ -535,7 +587,148 @@ fn scan_plugin_dir(label: &str, plugin_dir: &Path, channel: InstallChannel) -> V
         // to catch. The plugin loader will surface it.
         return Vec::new();
     };
-    scan_hooks_json(label, &hooks_path, &content, &json, channel)
+    scan_hooks_json(label, &hooks_path, &content, &json, channel, report_skew)
+}
+
+/// Marketplace resolution status for one installed-plugin label
+/// (`<plugin>@<marketplace>`, the `installed_plugins.json` key shape).
+///
+/// Fails open at every read/parse step — a missing `known_marketplaces.json`,
+/// a marketplace key it doesn't recognize, or an unparseable
+/// `marketplace.json` all report [`MarketplaceStatus::Resolved`] rather than
+/// manufacture a new false claim doctor could not make before this existed.
+/// This only ever *adds* a diagnosis (removed-upstream, directory-sourced);
+/// it never withholds one the existing skew/cache checks would otherwise
+/// emit (cameronsjo/cadence-hooks#474).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarketplaceStatus {
+    /// `known_marketplaces.json` sources this marketplace from a local
+    /// directory (`"source": "directory"`) — the plugin loads straight from
+    /// that path and has no cache dir *by design* (#474 case 2).
+    DirectorySourced,
+    /// The plugin no longer appears in its github-sourced marketplace's
+    /// `marketplace.json` plugin list — removed upstream (#474 case 1).
+    RemovedUpstream,
+    /// Present in its marketplace, or resolution could not be determined.
+    Resolved,
+}
+
+/// Parse `known_marketplaces.json` at `path` into its top-level object —
+/// shared by [`marketplace_status`] and [`known_marketplace_sources`] so both
+/// read the same schema through one place. Two independent parsers of one
+/// schema is exactly how they'd drift, and here they'd drift on the
+/// `source.source` field #474's diagnosis is keyed off. `None` on a missing
+/// file, invalid JSON, or a non-object top level.
+fn read_known_marketplaces(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.as_object().cloned()
+}
+
+/// The `source.source` discriminator string (`"github"`, `"directory"`, ...)
+/// for one `known_marketplaces.json` entry, or `None` when absent/malformed.
+fn marketplace_source_kind(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("source")?.get("source")?.as_str()
+}
+
+/// Resolve `label` against `known_marketplaces.json` (and, for a
+/// github-sourced marketplace, that marketplace's own `marketplace.json`).
+/// See [`MarketplaceStatus`] for the fail-open contract.
+fn marketplace_status(label: &str, known_marketplaces: &Path) -> MarketplaceStatus {
+    use MarketplaceStatus::{DirectorySourced, RemovedUpstream, Resolved};
+
+    let Some((plugin, marketplace)) = label.split_once('@') else {
+        return Resolved;
+    };
+    let Some(entries) = read_known_marketplaces(known_marketplaces) else {
+        return Resolved;
+    };
+    let Some(entry) = entries.get(marketplace) else {
+        return Resolved;
+    };
+
+    if marketplace_source_kind(entry) == Some("directory") {
+        return DirectorySourced;
+    }
+
+    let Some(install_location) = entry.get("installLocation").and_then(|v| v.as_str()) else {
+        return Resolved;
+    };
+    let marketplace_json = Path::new(install_location).join(".claude-plugin/marketplace.json");
+    let Ok(mp_content) = std::fs::read_to_string(&marketplace_json) else {
+        return Resolved;
+    };
+    let Ok(mp_json) = serde_json::from_str::<serde_json::Value>(&mp_content) else {
+        return Resolved;
+    };
+    let Some(plugins) = mp_json.get("plugins").and_then(|v| v.as_array()) else {
+        return Resolved;
+    };
+
+    let present = plugins
+        .iter()
+        .any(|p| p.get("name").and_then(|v| v.as_str()) == Some(plugin));
+    if present { Resolved } else { RemovedUpstream }
+}
+
+/// A `Warning` when an installed plugin no longer appears in its
+/// marketplace's plugin list — removed upstream, not a binary or cache
+/// problem (cameronsjo/cadence-hooks#474 case 1). Replaces the hooks.json
+/// skew scan for this plugin entirely: scanning a removed plugin's stale
+/// cached hooks.json for subcommand skew reports "not present in this
+/// binary" and points the operator at `cargo install --git` to chase
+/// subcommands that were intentionally retired — the exact misdiagnosis
+/// this finding exists to prevent.
+fn removed_upstream_finding(label: &str, install_dir: &Path) -> Finding {
+    let marketplace = label.split_once('@').map(|(_, m)| m).unwrap_or(label);
+    Finding {
+        severity: Severity::Warning,
+        plugin: label.to_string(),
+        file: install_dir.to_path_buf(),
+        line: None,
+        snippet: format!("not listed in {marketplace}'s marketplace.json"),
+        diagnosis: format!(
+            "{label} is installed but no longer appears in the '{marketplace}' \
+             marketplace's plugin list — it was removed upstream"
+        ),
+        remediation: format!(
+            "drop the stale entry for {label} from installed_plugins.json (or \
+             run /plugin and let Claude Code reconcile it) — this is not a \
+             binary or cache problem, so upgrading or reinstalling won't help"
+        ),
+    }
+}
+
+/// Findings from the manifest-driven hooks.json scan across every active
+/// install. A plugin still resolved against its marketplace gets the normal
+/// scan (skew included). A plugin [`marketplace_status`] reports
+/// [`MarketplaceStatus::RemovedUpstream`] gets [`removed_upstream_finding`]
+/// **plus** the still-scanned Check 0/Check 1 findings (missing CLI,
+/// shell-expansion `Error`s) — only the skew warning is suppressed. Those two
+/// checks are independent defects a removed plugin's stale `hooks.json` can
+/// still carry, and dropping them let a plugin's own publisher silence
+/// doctor's still-firing findings simply by delisting the plugin
+/// (cameronsjo/cadence-hooks#474).
+fn manifest_scan_findings(
+    installs: &[(String, PathBuf)],
+    channel: InstallChannel,
+    known_marketplaces: &Path,
+) -> Vec<Finding> {
+    installs
+        .iter()
+        .flat_map(
+            |(label, dir)| match marketplace_status(label, known_marketplaces) {
+                MarketplaceStatus::RemovedUpstream => {
+                    let mut findings = scan_plugin_dir(label, dir, channel, false);
+                    findings.push(removed_upstream_finding(label, dir));
+                    findings
+                }
+                MarketplaceStatus::DirectorySourced | MarketplaceStatus::Resolved => {
+                    scan_plugin_dir(label, dir, channel, true)
+                }
+            },
+        )
+        .collect()
 }
 
 /// Recursively discover `hooks/hooks.json` files under `root` and scan each.
@@ -567,7 +760,7 @@ fn scan_root(root: &Path, channel: InstallChannel) -> Vec<Finding> {
                 .filter(|p| !p.as_os_str().is_empty())
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| dir.display().to_string());
-            findings.extend(scan_plugin_dir(&label, &dir, channel));
+            findings.extend(scan_plugin_dir(&label, &dir, channel, true));
             // A plugin dir doesn't nest further plugins beneath it.
             continue;
         }
@@ -1522,10 +1715,29 @@ fn orphan_dirs(pinned: &[(String, PathBuf)], cache_root: &Path) -> Vec<PathBuf> 
 /// other pin's basename, so it would misreport a live install as "safe to
 /// prune". `cache_root` is forwarded to [`orphan_dirs`] — see that
 /// function's doc for the containment guarantee.
-fn orphan_findings(pinned: &[(String, PathBuf)], quiet: bool, cache_root: &Path) -> Vec<Finding> {
+///
+/// `known_marketplaces` resolves each `label` via [`marketplace_status`] so a
+/// directory-sourced plugin's recorded (but never populated) cache path is
+/// exempt from the missing/empty check (#474 case 2).
+fn orphan_findings(
+    pinned: &[(String, PathBuf)],
+    quiet: bool,
+    cache_root: &Path,
+    known_marketplaces: &Path,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     for (label, install_path) in pinned {
+        // A directory-sourced marketplace's plugin loads straight from its
+        // declared path and has no cache dir by design (#474 case 2) — the
+        // `installPath` the manifest still records under plugins/cache/ is
+        // bookkeeping only, and is EXPECTED to be missing/empty. Reporting
+        // it as broken sends the operator toward a reinstall that fixes
+        // nothing, because nothing is broken.
+        if marketplace_status(label, known_marketplaces) == MarketplaceStatus::DirectorySourced {
+            continue;
+        }
+
         let content_missing = match std::fs::read_dir(install_path) {
             Ok(mut entries) => entries.next().is_none(),
             Err(_) => true,
@@ -1818,27 +2030,20 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
 /// skipped. Fails open — a missing or unparseable file yields an empty vec,
 /// never an error — this is an advisory check, not a hard dependency.
 fn known_marketplace_sources(path: &Path) -> Vec<(String, PathBuf, String)> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Vec::new();
-    };
-    let Some(entries) = json.as_object() else {
+    let Some(entries) = read_known_marketplaces(path) else {
         return Vec::new();
     };
 
     let mut out = Vec::new();
-    for (name, entry) in entries {
-        let source = entry.get("source");
-        let is_github = source
-            .and_then(|s| s.get("source"))
-            .and_then(|v| v.as_str())
-            == Some("github");
-        if !is_github {
+    for (name, entry) in &entries {
+        if marketplace_source_kind(entry) != Some("github") {
             continue;
         }
-        let Some(repo) = source.and_then(|s| s.get("repo")).and_then(|v| v.as_str()) else {
+        let Some(repo) = entry
+            .get("source")
+            .and_then(|s| s.get("repo"))
+            .and_then(|v| v.as_str())
+        else {
             continue;
         };
         let Some(install_location) = entry.get("installLocation").and_then(|v| v.as_str()) else {
@@ -2035,10 +2240,9 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             match manifest_install_paths(&plugins.join("installed_plugins.json")) {
                 Some(installs) => {
                     let scanned = format!("{} installed plugin(s)", installs.len());
-                    let mut findings: Vec<Finding> = installs
-                        .iter()
-                        .flat_map(|(label, dir)| scan_plugin_dir(label, dir, channel))
-                        .collect();
+                    let known_marketplaces = plugins.join("known_marketplaces.json");
+                    let mut findings =
+                        manifest_scan_findings(&installs, channel, &known_marketplaces);
                     // Only reachable from the manifest branch: the enablement
                     // join needs the manifest's `<plugin>@<marketplace>` keys,
                     // which the recursive cache walk cannot reconstruct (its
@@ -2130,7 +2334,12 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         && let Some(plugins) = plugins_dir()
     {
         if let Some(pinned) = manifest_install_paths(&plugins.join("installed_plugins.json")) {
-            findings.extend(orphan_findings(&pinned, quiet, &plugins.join("cache")));
+            findings.extend(orphan_findings(
+                &pinned,
+                quiet,
+                &plugins.join("cache"),
+                &plugins.join("known_marketplaces.json"),
+            ));
         }
 
         for (marketplace, install_dir, declared_repo) in
@@ -2225,6 +2434,86 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── Finding::render sanitization (#440) ─────────────────────────────────
+
+    fn hostile_finding(text: &str) -> Finding {
+        Finding {
+            severity: Severity::Warning,
+            plugin: text.to_string(),
+            file: PathBuf::from(text),
+            line: None,
+            snippet: text.to_string(),
+            diagnosis: text.to_string(),
+            remediation: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn render_strips_bidi_and_ansi_and_tags_from_every_field() {
+        // One hostile string planted in EVERY text-bearing field — plugin,
+        // file (via `location`), snippet, diagnosis, remediation — proves
+        // completeness: a fix that only sanitized the one call site #438
+        // added would leave every other field carrying these bytes straight
+        // through to the terminal.
+        let hostile = "safe\u{202E}\u{1b}[31mtext\u{E0001}\u{E0041}\u{E007F}\u{200B}";
+        let rendered = hostile_finding(hostile).render();
+
+        for bad in [
+            '\u{202E}', // RIGHT-TO-LEFT OVERRIDE
+            '\u{E0001}',
+            '\u{E0041}',
+            '\u{E007F}', // Tags block
+            '\u{200B}',  // zero-width space
+        ] {
+            assert!(
+                !rendered.contains(bad),
+                "rendered output still carries {bad:?}: {rendered:?}"
+            );
+        }
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC (start of the ANSI sequence) survived: {rendered:?}"
+        );
+        // A denylist filter, not wholesale deletion of the field — ordinary
+        // text on either side of the smuggled characters must still render.
+        assert!(rendered.contains("safe"), "{rendered:?}");
+        assert!(rendered.contains("text"), "{rendered:?}");
+    }
+
+    #[test]
+    fn render_bounds_an_unbounded_snippet() {
+        // hooks.json places no length ceiling on a command string — the
+        // issue's "worth checking... a length ceiling belongs on snippet
+        // too" note.
+        let long = "x".repeat(MAX_FINDING_FIELD_CHARS + 250);
+        let mut finding = hostile_finding("");
+        finding.snippet = long.clone();
+
+        let rendered = finding.render();
+        assert!(
+            rendered.len() < long.len(),
+            "an unbounded snippet must be truncated: rendered {} chars from an input of {}",
+            rendered.len(),
+            long.len()
+        );
+        assert!(
+            rendered.contains('…'),
+            "truncation must leave the ellipsis marker: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_leaves_ordinary_unicode_intact() {
+        // The filter is a denylist over specific control/format categories,
+        // not "non-ASCII" — legitimate Unicode prose in a diagnosis must
+        // survive unchanged.
+        let mut finding = hostile_finding("plugin@mp");
+        finding.diagnosis = "cadence log-commit — naïve 日本語 ✓".to_string();
+
+        let rendered = finding.render();
+        assert!(rendered.contains("cadence log-commit — naïve 日本語 ✓"));
+    }
 
     // ── telemetry_finding tests ─────────────────────────────────────────────
 
@@ -3411,7 +3700,12 @@ mod tests {
         }
         let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
 
-        let findings = orphan_findings(&pinned, false, tmp.path());
+        let findings = orphan_findings(
+            &pinned,
+            false,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
         let orphan_finding = findings
             .iter()
             .find(|f| f.diagnosis.contains("orphaned"))
@@ -3429,7 +3723,12 @@ mod tests {
         let missing = tmp.path().join("mp/plugin/sha-gone");
         let pinned = vec![("plugin@mp".to_string(), missing)];
 
-        let findings = orphan_findings(&pinned, false, tmp.path());
+        let findings = orphan_findings(
+            &pinned,
+            false,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
         assert_eq!(findings.len(), 1);
         assert!(findings[0].diagnosis.contains("missing or empty"));
     }
@@ -3443,7 +3742,15 @@ mod tests {
         fs::write(pinned_dir.join("marker"), "x").unwrap();
         let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
 
-        assert!(orphan_findings(&pinned, false, tmp.path()).is_empty());
+        assert!(
+            orphan_findings(
+                &pinned,
+                false,
+                tmp.path(),
+                &tmp.path().join("known_marketplaces.json"),
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -3462,7 +3769,12 @@ mod tests {
             ("other@mp".to_string(), missing),
         ];
 
-        let findings = orphan_findings(&pinned, true, tmp.path());
+        let findings = orphan_findings(
+            &pinned,
+            true,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
         assert_eq!(
             findings.len(),
             1,
@@ -3493,7 +3805,12 @@ mod tests {
         std::os::unix::fs::symlink(&escape_target, &symlinked_sibling).unwrap();
 
         let pinned = vec![("plugin@mp".to_string(), pinned_dir)];
-        let findings = orphan_findings(&pinned, false, tmp.path());
+        let findings = orphan_findings(
+            &pinned,
+            false,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
 
         assert!(
             findings.is_empty(),
@@ -3521,7 +3838,12 @@ mod tests {
             ("p@mp".to_string(), parent.join("sha-B")),
         ];
 
-        let findings = orphan_findings(&pinned, false, tmp.path());
+        let findings = orphan_findings(
+            &pinned,
+            false,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
         let orphan_findings: Vec<_> = findings
             .iter()
             .filter(|f| f.diagnosis.contains("orphaned"))
@@ -3546,6 +3868,369 @@ mod tests {
             orphan_findings[0].file, parent,
             "the finding is attributed to the shared parent, not a sha subdir"
         );
+    }
+
+    // ── marketplace_status / manifest_scan_findings / orphan exemption (#474) ─
+
+    /// Write `known_marketplaces.json` with the given body — one general
+    /// JSON-body writer rather than one helper per source shape, mirroring
+    /// `tests/doctor.rs`'s `write_known_marketplaces`.
+    fn write_known_marketplaces(root: &Path, body: &serde_json::Value) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("known_marketplaces.json"),
+            serde_json::to_string(body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Write a github-sourced marketplace's own `marketplace.json` at
+    /// `install_location`, listing `plugin_names`.
+    fn write_marketplace_plugin_list(install_location: &Path, plugin_names: &[&str]) {
+        let mp_dir = install_location.join(".claude-plugin");
+        fs::create_dir_all(&mp_dir).unwrap();
+        let plugins: Vec<_> = plugin_names
+            .iter()
+            .map(|name| serde_json::json!({ "name": name, "source": format!("./plugins/{name}") }))
+            .collect();
+        fs::write(
+            mp_dir.join("marketplace.json"),
+            serde_json::to_string(&serde_json::json!({ "plugins": plugins })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn marketplace_status_directory_sourced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_path = tmp.path().join("dev/homelab");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "homelab": {
+                    "source": { "source": "directory", "path": plugin_path.to_str().unwrap() },
+                    "installLocation": plugin_path.to_str().unwrap(),
+                }
+            }),
+        );
+
+        assert_eq!(
+            marketplace_status(
+                "homelab@homelab",
+                &tmp.path().join("known_marketplaces.json")
+            ),
+            MarketplaceStatus::DirectorySourced
+        );
+    }
+
+    #[test]
+    fn marketplace_status_removed_upstream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_location = tmp.path().join("marketplaces/cadence-lab");
+        // marketplace.json lists two plugins; "persona" is deliberately absent
+        // — mirrors the exact #474 case 1 scenario (a plugin dropped from the
+        // marketplace two days before the stale hooks.json warning fired).
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
+        );
+        write_marketplace_plugin_list(&install_location, &["vibes", "macos"]);
+
+        assert_eq!(
+            marketplace_status(
+                "persona@cadence-lab",
+                &tmp.path().join("known_marketplaces.json")
+            ),
+            MarketplaceStatus::RemovedUpstream
+        );
+    }
+
+    #[test]
+    fn marketplace_status_present_is_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_location = tmp.path().join("marketplaces/cadence-lab");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
+        );
+        write_marketplace_plugin_list(&install_location, &["vibes", "macos"]);
+
+        // Positive control: a plugin that IS still listed must not be
+        // misreported as removed — proves this can discriminate, not just
+        // always report RemovedUpstream.
+        assert_eq!(
+            marketplace_status(
+                "vibes@cadence-lab",
+                &tmp.path().join("known_marketplaces.json")
+            ),
+            MarketplaceStatus::Resolved
+        );
+    }
+
+    #[test]
+    fn marketplace_status_fails_open_on_missing_known_marketplaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            marketplace_status("p@mp", &tmp.path().join("known_marketplaces.json")),
+            MarketplaceStatus::Resolved
+        );
+    }
+
+    #[test]
+    fn marketplace_status_fails_open_on_unrecognized_marketplace_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_path = tmp.path().join("dev/x");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "homelab": {
+                    "source": { "source": "directory", "path": plugin_path.to_str().unwrap() },
+                    "installLocation": plugin_path.to_str().unwrap(),
+                }
+            }),
+        );
+
+        // "other-mp" isn't in known_marketplaces.json at all.
+        assert_eq!(
+            marketplace_status("p@other-mp", &tmp.path().join("known_marketplaces.json")),
+            MarketplaceStatus::Resolved
+        );
+    }
+
+    #[test]
+    fn manifest_scan_findings_reports_removed_upstream_not_skew() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_location = tmp.path().join("marketplaces/cadence-lab");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
+        );
+        write_marketplace_plugin_list(&install_location, &["vibes", "macos"]);
+
+        // The removed plugin's stale cached hooks.json references a
+        // subcommand this binary doesn't know — the exact input that used
+        // to misdiagnose as binary skew.
+        let plugin_dir = tmp.path().join("cache/cadence-lab/persona/8f4df2542e4a");
+        fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
+        // The wrapper form (not a bare `cadence-hooks` command word) so this
+        // fixture's expected finding count doesn't depend on whether the
+        // host running the test happens to have `cadence-hooks` on PATH —
+        // Check 0 (missing-CLI) skips any command word containing `$`.
+        fs::write(
+            plugin_dir.join("hooks/hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" lab persona-nudge"}]}]}}"#,
+        )
+        .unwrap();
+
+        let installs = vec![("persona@cadence-lab".to_string(), plugin_dir)];
+        let findings = manifest_scan_findings(
+            &installs,
+            InstallChannel::Unknown,
+            &tmp.path().join("known_marketplaces.json"),
+        );
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "findings: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+        assert!(
+            findings[0].diagnosis.contains("removed upstream"),
+            "diagnosis: {}",
+            findings[0].diagnosis
+        );
+        assert!(
+            !findings[0].diagnosis.contains("not present in this binary"),
+            "must not misdiagnose a removed plugin as binary skew: {}",
+            findings[0].diagnosis
+        );
+    }
+
+    #[test]
+    fn manifest_scan_findings_still_reports_real_skew() {
+        // Positive control for the discrimination itself: a plugin that IS
+        // still in its marketplace, with a genuinely unknown subcommand,
+        // must still be flagged as skew. A change that stopped ALL skew
+        // reporting (rather than just the removed-upstream case) would pass
+        // the test above and be silently useless here.
+        let tmp = tempfile::tempdir().unwrap();
+        let install_location = tmp.path().join("marketplaces/cadence-lab");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
+        );
+        write_marketplace_plugin_list(&install_location, &["vibes"]);
+
+        let plugin_dir = tmp.path().join("cache/cadence-lab/vibes/abc123");
+        fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
+        // Wrapper form — see the sibling test's comment on why not a bare
+        // `cadence-hooks` command word.
+        fs::write(
+            plugin_dir.join("hooks/hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" lab hook-from-the-future"}]}]}}"#,
+        )
+        .unwrap();
+
+        let installs = vec![("vibes@cadence-lab".to_string(), plugin_dir)];
+        let findings = manifest_scan_findings(
+            &installs,
+            InstallChannel::Unknown,
+            &tmp.path().join("known_marketplaces.json"),
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].diagnosis.contains("not present in this binary"),
+            "a still-listed plugin's genuine skew must still be reported: {}",
+            findings[0].diagnosis
+        );
+    }
+
+    #[test]
+    fn manifest_scan_findings_removed_upstream_still_reports_other_defects() {
+        // Coverage-regression control: a removed-upstream plugin's stale
+        // hooks.json can carry independent defects (a real shell-expansion
+        // bug, an unresolvable CLI dependency) that have nothing to do with
+        // whether the plugin is still listed upstream. Suppressing the skew
+        // warning must not suppress those too — a plugin's own publisher
+        // must not be able to silence doctor's still-firing findings for
+        // their own plugin simply by delisting it from their marketplace.
+        let tmp = tempfile::tempdir().unwrap();
+        let install_location = tmp.path().join("marketplaces/cadence-lab");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
+        );
+        write_marketplace_plugin_list(&install_location, &["vibes"]);
+
+        // "persona" is absent from the marketplace's plugin list (removed
+        // upstream), and its stale hooks.json carries a real shell-expansion
+        // bug alongside the now-irrelevant skew reference.
+        let plugin_dir = tmp.path().join("cache/cadence-lab/persona/8f4df2542e4a");
+        fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
+        fs::write(
+            plugin_dir.join("hooks/hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"command":"'${CLAUDE_PLUGIN_ROOT}/hooks/run.sh' arg"}]}]}}"#,
+        )
+        .unwrap();
+
+        let installs = vec![("persona@cadence-lab".to_string(), plugin_dir)];
+        let findings = manifest_scan_findings(
+            &installs,
+            InstallChannel::Unknown,
+            &tmp.path().join("known_marketplaces.json"),
+        );
+
+        assert_eq!(
+            findings.len(),
+            2,
+            "expected the removed-upstream finding PLUS the still-independent \
+             shell-expansion Error, found: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.diagnosis.contains("removed upstream")),
+            "must still report the removed-upstream finding: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+        assert!(
+            findings.iter().any(|f| f.severity == Severity::Error
+                && f.diagnosis.contains("won't expand in /bin/sh")),
+            "the shell-expansion Error must survive the removed-upstream exemption \
+             — it is not a skew problem: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.diagnosis.contains("not present in this binary")),
+            "the skew warning is the ONLY thing the removed-upstream exemption \
+             should suppress: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orphan_findings_exempts_directory_sourced_missing_cache_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_source = tmp.path().join("dev/homelab");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "homelab": {
+                    "source": { "source": "directory", "path": plugin_source.to_str().unwrap() },
+                    "installLocation": plugin_source.to_str().unwrap(),
+                }
+            }),
+        );
+
+        // The recorded installPath under plugins/cache/ that Claude Code
+        // still writes for a directory-sourced plugin, but never
+        // populates — the exact #474 case 2 shape.
+        let missing_cache_dir = tmp.path().join("cache/homelab/homelab/1.0.0");
+        let pinned = vec![("homelab@homelab".to_string(), missing_cache_dir)];
+
+        let findings = orphan_findings(
+            &pinned,
+            false,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
+        assert!(
+            findings.is_empty(),
+            "a directory-sourced plugin's never-populated cache path must not \
+             report as broken: {:?}",
+            findings.iter().map(|f| &f.diagnosis).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orphan_findings_still_flags_missing_cache_dir_for_non_directory_source() {
+        // Positive control: the exemption above must not blanket-suppress
+        // the missing-dir check. Same missing-dir shape, but this plugin's
+        // marketplace is NOT directory-sourced (known_marketplaces.json
+        // doesn't even mention it), so the check must still fire — a
+        // genuinely broken cache still reports as broken.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("cache/workbench/plugin/sha-gone");
+        let pinned = vec![("plugin@workbench".to_string(), missing)];
+
+        let findings = orphan_findings(
+            &pinned,
+            false,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].diagnosis.contains("missing or empty"));
     }
 
     // ── known_marketplace_sources ────────────────────────────────────────────
