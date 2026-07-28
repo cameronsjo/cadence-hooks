@@ -675,9 +675,11 @@ fn mutation_targets(command: &str, cwd: &str) -> Vec<MutationTarget> {
 /// package manager writes its manifest relative to cwd). `python -m pip …`,
 /// `sudo`-wrapped forms, and unlisted managers are named accepted misses.
 ///
-/// The verb goes through [`command_word`], not a bare `basename`: this gate is
-/// block-capable, and `\npm install` / `\cargo add` produced no mutation target
-/// at all — the same silent-ALLOW shape as #450's commit gate, one file over.
+/// The verb goes through [`command_word`], not a bare `basename`: `\npm
+/// install` / `\cargo add` produced no mutation target at all — the same
+/// silent-ALLOW shape as #450's commit gate, one function over. This arm feeds
+/// [`mutation_nudge`], which is **advisory** (exit 0), so the cost of the miss
+/// was a lost nudge rather than a bypassed block — unlike the commit gate.
 fn is_package_mutation(argv: &[String]) -> bool {
     let Some(cmd) = argv.first() else {
         return false;
@@ -703,7 +705,8 @@ fn is_package_mutation(argv: &[String]) -> bool {
 ///
 /// Verb via [`command_word`] for the same reason [`is_package_mutation`] uses
 /// it: `\sed -i Cargo.toml` is a real in-place mutation, and matching on a bare
-/// `basename` collected nothing (#450 review).
+/// `basename` collected nothing (#450 review). Advisory like that sibling —
+/// these targets feed [`mutation_nudge`], not the block arm.
 fn file_mutation_targets(argv: &[String]) -> Vec<String> {
     let Some(cmd) = argv.first() else {
         return Vec::new();

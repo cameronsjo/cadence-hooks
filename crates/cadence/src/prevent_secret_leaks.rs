@@ -194,13 +194,25 @@ fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
 /// executed command at the start of a segment, never a substring of an
 /// argument, path, or compound name like `direnv`/`envoy`/`gh env`.
 fn command_dumps_env(lower: &str) -> bool {
-    split_segments(lower)
-        .iter()
-        .any(|segment| tokens_dump_env(&command_words(segment)))
+    split_segments(lower).iter().any(|segment| {
+        let words = command_words(segment);
+        let view: Vec<&str> = words.iter().map(String::as_str).collect();
+        tokens_dump_env(&view)
+    })
 }
 
 /// One segment's tokens with its redirections removed — what is left is the
 /// command word and its operands.
+///
+/// **Quote-aware ([`tokenize`], not `split_whitespace`), because the peel walks
+/// operands.** While only `tokens[0]` was compared, whitespace splitting was
+/// harmless; the moment the grammar walks past the verb, quoting decides
+/// verdicts. `env FOO="bar baz" printenv` split into four words, the second of
+/// which is not an assignment, so the peel stopped early and read a literal
+/// `printenv` as an operand rather than the verb — dropping a dump the old
+/// leading-word test caught. `env 'printenv'` failed the same way, on the
+/// quotes alone. This is a data-exposure guard and every other arm in this file
+/// is already quote-aware.
 ///
 /// **Redirections are skipped, not treated as the end of the command.** bash
 /// permits them anywhere in a simple command, so `env -i >out.sh bash script.sh`
@@ -217,17 +229,29 @@ fn command_dumps_env(lower: &str) -> bool {
 /// but the rest are kept as belt-and-suspenders: this function must not depend
 /// on another module's splitting staying exhaustive.
 ///
-/// (The rare leading-redirect spelling `> out.sh env` is an unchanged miss —
-/// `>` is skipped, `out.sh` becomes the apparent verb, and it is not a dump.)
-fn command_words(segment: &str) -> Vec<&str> {
+/// A leading redirection (`> out.sh env`) still reaches the dump: the bare
+/// operator consumes `out.sh` as its target and `env` lands in command
+/// position, which is the correct read.
+///
+/// **Named miss — a dump behind a shell wrapper.** `bash -c printenv`,
+/// `sh -c 'env'`, and `env -u FOO bash -c printenv` all dump and none is seen:
+/// the verb is `bash`/`sh` and the dump rides inside an operand. This is
+/// pre-existing (the leading-word test missed all three the same way), not
+/// something the operand walk introduced. Closing it needs the wrapper-aware
+/// [`command_segments`] *and* a prefix peel to find a wrapper sitting behind
+/// `env -u FOO` — measured: swapping the splitter alone catches the first two
+/// and still misses the third, while adding two new nudge classes. That is a
+/// coverage change worth its own issue and its own differential, not a rider on
+/// a quoting fix.
+fn command_words(segment: &str) -> Vec<String> {
     let segment = segment.trim_start_matches(['(', '{', ' ', '\t']);
     let mut words = Vec::new();
-    let mut tokens = segment.split_whitespace();
+    let mut tokens = tokenize(segment).into_iter().peekable();
     while let Some(token) = tokens.next() {
-        if matches!(token, "&" | ";" | "|" | "|&" | ")" | "}") {
+        if matches!(token.as_str(), "&" | ";" | "|" | "|&" | ")" | "}") {
             break;
         }
-        match redirection_of(token) {
+        match redirection_of(&token) {
             // `> out.sh` — the operator's target is the next token.
             Some(true) => {
                 tokens.next();
@@ -1686,8 +1710,80 @@ mod tests {
             ("env )", vec!["env"]),
             // Leading group punctuation is trimmed before the scan.
             ("( env -u foo make", vec!["env", "-u", "foo", "make"]),
+            // A leading redirection consumes its target; `env` lands in
+            // command position, which is the correct read.
+            ("> out.sh env", vec!["env"]),
+            // Quote-aware: an assignment VALUE containing a space is one word,
+            // and a quoted verb is the verb.
+            (
+                "env foo=\"bar baz\" printenv",
+                vec!["env", "foo=bar baz", "printenv"],
+            ),
+            (
+                "env \"foo=bar baz\" printenv",
+                vec!["env", "foo=bar baz", "printenv"],
+            ),
+            ("env 'printenv'", vec!["env", "printenv"]),
         ] {
             assert_eq!(command_words(segment), want, "command_words({segment:?})");
+        }
+    }
+
+    #[test]
+    fn bash_quoted_env_dumps_are_still_dumps() {
+        // The operand walk made quoting verdict-deciding. Splitting on
+        // whitespace broke an assignment value with a space into two words —
+        // the second not an assignment — so the peel stopped early and read a
+        // literal `printenv` as an operand instead of the verb. Every one of
+        // these dumps in real bash, and every one warned before the peel
+        // existed; losing them would have been a net weakening of a
+        // data-exposure guard.
+        for cmd in [
+            "env FOO=\"bar baz\" printenv",
+            "env \"FOO=bar baz\" printenv",
+            "env 'printenv'",
+            "env -u FOO 'printenv'",
+            "env \"FOO=bar baz\" env",
+            "env FOO='bar baz' -u X printenv",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "quoting must not hide a dump: {cmd}"
+            );
+        }
+        // Controls: quoting must not invent a dump out of a real exec.
+        for cmd in [
+            "env FOO=\"bar baz\" make",
+            "env 'make'",
+            "env -u FOO 'make' --jobs 4",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "quoting must not invent a dump: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_wrapped_dump_is_a_named_miss() {
+        // Pre-existing and recorded, not introduced by the operand walk: the
+        // verb is `bash`/`sh` and the dump rides inside an operand, so this
+        // check never sees it. Closing it needs the wrapper-aware
+        // `command_segments` AND a prefix peel to find a wrapper behind
+        // `env -u FOO` — measured, the splitter swap alone catches the first
+        // two and still misses the third. Its own issue, its own differential.
+        for cmd in [
+            "bash -c printenv",
+            "sh -c 'env'",
+            "env -u FOO bash -c printenv",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "named miss — a dump behind a shell wrapper: {cmd}"
+            );
         }
     }
 
