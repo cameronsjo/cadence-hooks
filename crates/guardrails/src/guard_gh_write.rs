@@ -165,9 +165,13 @@ pub(crate) fn repo_flag(command: &str) -> RepoFlag {
         } else if let Some(repo) = word.strip_prefix("-R")
             // Compact form: -Rowner/repo. Exclude other dash-prefixed flags by
             // requiring the remainder not start with another dash, and exclude
-            // whitespace — gh rejects a repo spec containing a space, so a
-            // `--body "-R some prose"` token is not a target gh could honor and
-            // must not manufacture a disagreement.
+            // whitespace. gh's own parser ACCEPTS a spec containing a space and
+            // forwards it — the request dies at GitHub, which resolves no repo
+            // from a name carrying whitespace and trims nothing (verified live
+            // across leading, trailing, and tab variants). So a
+            // `--body "-R some prose"` token can never become a write that
+            // lands, and counting it would only manufacture a disagreement that
+            // false-blocks a legitimate command.
             && !repo.is_empty()
             && !repo.starts_with('-')
             && !repo.contains(char::is_whitespace)
@@ -1141,8 +1145,9 @@ fn judge_write_segment(
                  Command: {segment}\n   \
                  Which one gh honors depends on whether a later `-R`-shaped token is a real \
                  flag or another flag's value — this guard cannot tell, so it will not guess.\n   \
-                 Fix: leave exactly one `-R owner/repo`, and quote any argument whose text \
-                 begins with `-R` or `--repo`"
+                 Fix: leave exactly one `-R owner/repo`. Quoting the other argument will NOT \
+                 help — quotes are stripped before this check — so reword it, or put a space \
+                 after the dash prefix (`-R owner/repo` inside prose is ignored)."
             ),
             BlockMetadata {
                 rule_id: "gh-write-target-unresolvable".to_string(),
@@ -3861,16 +3866,23 @@ mod tests {
 
     #[test]
     fn spaced_repo_prose_in_a_body_does_not_manufacture_ambiguity() {
-        // `-R some prose` is not a repo spec gh could honor, so it must not
-        // conflict with the real flag and false-block a legitimate write.
-        with_env(&owners_env(), || {
-            let input = input_with(
-                r#"gh issue comment 42 --body "-R starts my text" -R cameronsjo/cadence-hooks"#,
-                OWNED_DIR,
-            );
-            let result = GhWriteGuard.run(&input);
-            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
-        });
+        // A spec carrying whitespace resolves to no repo at GitHub, so it can
+        // never become a write that lands and must not conflict with the real
+        // flag. The second case is the exact remedy the ambiguity block message
+        // advises — "put a space after the dash prefix" — so the advice is
+        // pinned here rather than merely asserted in prose.
+        for command in [
+            r#"gh issue comment 42 --body "-R starts my text" -R cameronsjo/cadence-hooks"#,
+            r#"gh issue comment 42 --body "-R cameronsjo/allowed" -R cameronsjo/cadence-hooks"#,
+        ] {
+            with_env(&owners_env(), || {
+                let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{command}"
+                );
+            });
+        }
     }
 
     #[test]
