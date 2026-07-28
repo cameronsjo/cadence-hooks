@@ -679,6 +679,43 @@ fn all_binary_subcommands_are_registered() {
     );
 }
 
+/// #470 (split from #463): assert the COMPLEMENT of
+/// [`all_binary_subcommands_are_registered`]'s exemption. That test lets a
+/// `PENDING_WIRING_HOOKS` entry stay unregistered without failing; this one
+/// fails the moment an entry stops needing that exemption — i.e. the moment
+/// some hooks.json actually wires it. `PENDING_WIRING_HOOKS` is an allowlist
+/// of checks known-unwired *as of when they were added*; nothing previously
+/// checked that an entry was STILL unwired, so a wiring PR that forgot to
+/// remove its own exemption (or removed a different one) would leave a stale
+/// hole open indefinitely — and the next guard that is genuinely never wired
+/// inherits the same silent cover. This turns the allowlist self-expiring.
+#[test]
+fn pending_wiring_hooks_are_still_unwired() {
+    require_plugin_refs!(all_refs);
+
+    let registered: BTreeSet<String> = all_refs
+        .values()
+        .flat_map(|refs| refs.iter().map(|r| r.command.clone()))
+        .collect();
+
+    let now_wired: Vec<&(&str, &str)> = PENDING_WIRING_HOOKS
+        .iter()
+        .filter(|(command, _)| registered.contains(*command))
+        .collect();
+
+    assert!(
+        now_wired.is_empty(),
+        "PENDING_WIRING_HOOKS entry now appears in a hooks.json — its wiring PR \
+         landed, so the exemption has served its purpose and must be removed:\n{}\n\n\
+         {STALE_CHECKOUT_HINT}",
+        now_wired
+            .iter()
+            .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 #[test]
 fn no_cross_plugin_hooks() {
     require_plugin_refs!(all_refs);
