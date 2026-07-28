@@ -466,71 +466,61 @@ mod tests {
         // silently skipped on a genuine primary. `is_primary_checkout` (which
         // the block-capable enforce-worktree path uses) always called it
         // primary; the two now share one classifier and this dispatch nudges.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN").ok();
-        // SAFETY: serialized via ENV_LOCK; restored below.
-        unsafe {
-            std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN");
-        }
+        // #446 landed the shared `with_env` while this branch was open: it owns
+        // the lock and restores on unwind, so an assertion below can no longer
+        // leave the var unset for the rest of the process.
+        crate::with_env(&[("CADENCE_ALLOW_SUBAGENT_FROM_MAIN", None)], || {
+            let tmp = tempfile::tempdir().unwrap();
+            let primary = tmp.path().join("work");
+            let gitdir = tmp.path().join("gitdir");
+            std::fs::create_dir_all(&primary).unwrap();
+            let ok = std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg("-b")
+                .arg("main")
+                .arg(format!("--separate-git-dir={}", gitdir.display()))
+                .arg(&primary)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git init --separate-git-dir failed");
+            assert!(primary.join(".git").is_file(), "sanity: .git is a file");
+            git(&primary, &["config", "user.email", "t@t"]);
+            git(&primary, &["config", "user.name", "t"]);
+            git(&primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
+            let wt = tmp.path().join("wt");
+            git(
+                &primary,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    &wt.to_string_lossy(),
+                    "-b",
+                    "feat/x",
+                ],
+            );
 
-        let tmp = tempfile::tempdir().unwrap();
-        let primary = tmp.path().join("work");
-        let gitdir = tmp.path().join("gitdir");
-        std::fs::create_dir_all(&primary).unwrap();
-        let ok = std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg("-b")
-            .arg("main")
-            .arg(format!("--separate-git-dir={}", gitdir.display()))
-            .arg(&primary)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git init --separate-git-dir failed");
-        assert!(primary.join(".git").is_file(), "sanity: .git is a file");
-        git(&primary, &["config", "user.email", "t@t"]);
-        git(&primary, &["config", "user.name", "t"]);
-        git(&primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
-        let wt = tmp.path().join("wt");
-        git(
-            &primary,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                &wt.to_string_lossy(),
-                "-b",
-                "feat/x",
-            ],
-        );
+            let from_primary = make_agent(Some("general-purpose"), None, primary.to_str().unwrap());
+            let r = WarnSubagentWorktree.run(&from_primary);
+            assert_eq!(
+                r.outcome,
+                Outcome::Nudge,
+                "a separate-git-dir primary with a sibling worktree should nudge"
+            );
 
-        let from_primary = make_agent(Some("general-purpose"), None, primary.to_str().unwrap());
-        let r = WarnSubagentWorktree.run(&from_primary);
-        assert_eq!(
-            r.outcome,
-            Outcome::Nudge,
-            "a separate-git-dir primary with a sibling worktree should nudge"
-        );
-
-        // Control: the real linked worktree of the SAME repo — also a `.git`
-        // file — must still be silent. The fix distinguishes the two shapes
-        // rather than calling every `.git` file primary.
-        let from_wt = make_agent(Some("general-purpose"), None, wt.to_str().unwrap());
-        assert_eq!(
-            WarnSubagentWorktree.run(&from_wt).outcome,
-            Outcome::Allow,
-            "dispatch from inside the linked worktree stays silent"
-        );
-
-        // SAFETY: serialized via ENV_LOCK.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN", v),
-                None => std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN"),
-            }
-        }
+            // Control: the real linked worktree of the SAME repo — also a `.git`
+            // file — must still be silent. The fix distinguishes the two shapes
+            // rather than calling every `.git` file primary.
+            let from_wt = make_agent(Some("general-purpose"), None, wt.to_str().unwrap());
+            assert_eq!(
+                WarnSubagentWorktree.run(&from_wt).outcome,
+                Outcome::Allow,
+                "dispatch from inside the linked worktree stays silent"
+            );
+        });
     }
 
     // --- isolation() round-trips via make_agent ---
