@@ -322,9 +322,9 @@ not json at all
     fn missing_log_fails_open() {
         // Point CADENCE_METRICS_DIR at an empty temp dir (no subagents.jsonl) →
         // read fails → allow. Serialized against other env-touching tests.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::CADENCE_ENV_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: guarded by ENV_LOCK; restored below.
+        // SAFETY: guarded by CADENCE_ENV_TEST_LOCK; restored below.
         unsafe { std::env::set_var("CADENCE_METRICS_DIR", dir.path()) };
         let input = make_agent(Some("general-purpose"), None, "/tmp");
         let result = WarnSubagentConcurrency.run(&input);
@@ -336,7 +336,7 @@ not json at all
     fn garbage_bytes_fail_open() {
         // A subagents.jsonl full of non-JSON garbage → zero live → allow (below
         // the default cap). Never panics.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::CADENCE_ENV_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // Invalid UTF-8 bytes → read_to_string fails → fail-open; plus non-JSON
         // ASCII so even a lenient read yields zero live records.
@@ -345,7 +345,7 @@ not json at all
             b"\x00\xff garbage\nmore junk\n",
         )
         .unwrap();
-        // SAFETY: guarded by ENV_LOCK; restored below.
+        // SAFETY: guarded by CADENCE_ENV_TEST_LOCK; restored below.
         unsafe { std::env::set_var("CADENCE_METRICS_DIR", dir.path()) };
         let input = make_agent(Some("general-purpose"), None, "/tmp");
         let result = WarnSubagentConcurrency.run(&input);
@@ -353,6 +353,6 @@ not json at all
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
-    // Serializes the two tests that mutate process-global env (`set_var`).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The two tests above that mutate process-global env (`set_var`) serialize
+    // via the crate-shared CADENCE_ENV_TEST_LOCK (#446).
 }
