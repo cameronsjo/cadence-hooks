@@ -244,3 +244,6 @@ pub fn make_user_prompt_submit(
         ..Default::default()
     }
 }
+
+// Git-fixture builders (`Scratch`, `git_in`, `init_repo`) live in the sibling
+// `git_fixtures` module — see there.

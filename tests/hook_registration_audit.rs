@@ -560,6 +560,18 @@ fn settings_json_hooks() -> (Vec<String>, Vec<String>) {
     (shell_scripts, binary_dispatches)
 }
 
+/// Every `<plugin> <subcommand>` command any resolved plugin's `hooks.json`
+/// registers. Three tests built this identical set inline
+/// (`all_binary_subcommands_are_registered`, `pending_wiring_hooks_are_still_unwired`,
+/// `no_plugin_hooks_duplicated_in_settings_json`) — factored out so they
+/// can't quietly diverge.
+fn registered_commands(all_refs: &BTreeMap<String, Vec<HookRef>>) -> BTreeSet<&str> {
+    all_refs
+        .values()
+        .flat_map(|refs| refs.iter().map(|r| r.command.as_str()))
+        .collect()
+}
+
 // ---------- Tests ----------
 
 /// Skip the test unless **every** expected plugin hooks.json resolved.
@@ -613,10 +625,7 @@ fn all_binary_subcommands_are_registered() {
     let binary_cmds = binary_hooks();
     require_plugin_refs!(all_refs);
 
-    let registered: BTreeSet<String> = all_refs
-        .values()
-        .flat_map(|refs| refs.iter().map(|r| r.command.clone()))
-        .collect();
+    let registered = registered_commands(&all_refs);
 
     // Subcommands for plugins still using shell wrappers are expected to be unregistered.
     // They'll be migrated to binary dispatch later.
@@ -655,7 +664,7 @@ fn all_binary_subcommands_are_registered() {
 
     let unregistered: Vec<&String> = binary_cmds
         .iter()
-        .filter(|cmd| !registered.contains(*cmd))
+        .filter(|cmd| !registered.contains(cmd.as_str()))
         .filter(|cmd| !pending_wiring.contains(cmd.as_str()))
         .filter(|cmd| {
             let group = cmd.split_whitespace().next().unwrap_or("");
@@ -676,6 +685,40 @@ fn all_binary_subcommands_are_registered() {
             .collect::<Vec<_>>()
             .join("\n"),
         SHELL_PLUGIN_DIRS.len()
+    );
+}
+
+/// #470 (split from #463): assert the COMPLEMENT of
+/// [`all_binary_subcommands_are_registered`]'s exemption. That test lets a
+/// `PENDING_WIRING_HOOKS` entry stay unregistered without failing; this one
+/// fails the moment an entry stops needing that exemption — i.e. the moment
+/// some hooks.json actually wires it. `PENDING_WIRING_HOOKS` is an allowlist
+/// of checks known-unwired *as of when they were added*; nothing previously
+/// checked that an entry was STILL unwired, so a wiring PR that forgot to
+/// remove its own exemption (or removed a different one) would leave a stale
+/// hole open indefinitely — and the next guard that is genuinely never wired
+/// inherits the same silent cover. This turns the allowlist self-expiring.
+#[test]
+fn pending_wiring_hooks_are_still_unwired() {
+    require_plugin_refs!(all_refs);
+
+    let registered = registered_commands(&all_refs);
+
+    let now_wired: Vec<&(&str, &str)> = PENDING_WIRING_HOOKS
+        .iter()
+        .filter(|(command, _)| registered.contains(*command))
+        .collect();
+
+    assert!(
+        now_wired.is_empty(),
+        "PENDING_WIRING_HOOKS entry now appears in a hooks.json — its wiring PR \
+         landed, so the exemption has served its purpose and must be removed:\n{}\n\n\
+         {STALE_CHECKOUT_HINT}",
+        now_wired
+            .iter()
+            .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -748,16 +791,13 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
     let (shell_scripts, binary_dispatches) = settings_json_hooks();
 
     // Collect all plugin-registered commands for comparison
-    let plugin_commands: BTreeSet<String> = all_refs
-        .values()
-        .flat_map(|refs| refs.iter().map(|r| r.command.clone()))
-        .collect();
+    let plugin_commands = registered_commands(&all_refs);
 
     let mut duplicates = Vec::new();
 
     // Check if settings.json dispatches any cadence-hooks subcommands already in plugins
     for dispatch in &binary_dispatches {
-        if plugin_commands.contains(dispatch) {
+        if plugin_commands.contains(dispatch.as_str()) {
             duplicates.push(format!(
                 "  settings.json dispatches `{dispatch}` (already registered in a plugin)"
             ));
