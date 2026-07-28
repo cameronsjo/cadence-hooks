@@ -983,13 +983,30 @@ fn resolve_git_path(path: &str, base: &str) -> String {
 /// These were previously an `ambiguous` early return — a MISS dressed as a
 /// fail-open, since the targets resolve fine (#378). An unresolvable value still
 /// fails open downstream: [`assess_dir`] Allows when [`GitState`] finds no repo.
+///
+/// The leading word is matched by [`basename`] after removing ONE leading
+/// backslash, so a path-qualified (`/usr/bin/git commit`) or alias-escaped
+/// (`\git commit`) spelling is recognized as the commit it is. An exact-string
+/// compare missed both and yielded no target at all — no target means no block,
+/// so the narrowness was purely a bypass of a block-capable gate rather than a
+/// verdict anything depended on (#450). Both spellings are ordinary habits: a
+/// script invoking git by absolute path, and the standard way to sidestep a
+/// `git` alias. Removal is [`str::strip_prefix`], never `trim_start_matches`:
+/// the repeating form collapses `\\git` to `git`, but the shell removes exactly
+/// one backslash and looks up `\git`, a different command (the bug caught in
+/// #442's review). The siblings here — [`is_package_mutation`],
+/// [`file_mutation_targets`], [`is_dismiss_enforce_segment`] — already classify
+/// their verbs by basename; this brings the commit gate onto the same footing.
 fn commit_targets_of(
     argv: &[String],
     effective_dir: &str,
     env_work_tree: Option<&str>,
     env_git_dir: Option<&str>,
 ) -> Vec<CommitTarget> {
-    if argv.first().map(String::as_str) != Some("git") {
+    let Some(verb) = argv.first() else {
+        return Vec::new();
+    };
+    if basename(verb.strip_prefix('\\').unwrap_or(verb)) != "git" {
         return Vec::new();
     }
     const VALUE_GLOBALS: &[&str] = &[
@@ -1878,6 +1895,55 @@ mod tests {
     fn non_leading_git_ignored() {
         // Prose and echoes are not this session committing.
         assert!(git_commit_targets("echo git commit -m 'x'", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn path_qualified_and_escaped_git_verbs_are_commits() {
+        // #450's measured table. The first two ran a real commit and resolved
+        // to Allow, because the leading word was compared to the literal
+        // string `git`: `/usr/bin/git` is an ordinary scripted spelling and
+        // `\git` is the standard way past a `git` alias. `command`/`env` were
+        // already covered — the gap was the verb's own spelling, not the
+        // prefix.
+        for cmd in [
+            "git commit -m x",          // positive control
+            "/usr/bin/git commit -m x", // was ALLOW
+            r"\git commit -m x",        // was ALLOW
+            "./git commit -m x",        // was ALLOW
+            "command git commit -m x",  // already BLOCK
+            "env git commit -m x",      // already BLOCK
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "spelling should resolve a commit target: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn double_backslash_git_is_not_a_git_verb() {
+        // Exactly ONE leading backslash comes off (`strip_prefix`, never
+        // `trim_start_matches`): the shell strips one and looks up `\git`, a
+        // different command. A repeating strip would collapse this to `git`
+        // and invent a commit — the bug caught in #442's review.
+        assert!(git_commit_targets(r"\\git commit -m x", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn git_lookalike_verbs_are_not_commits() {
+        // Basename matching must not widen past the verb itself: a longer name
+        // ending in `git`, or a path whose DIRECTORY is named git, is not git.
+        for cmd in [
+            "legit commit -m x",
+            "gitk commit -m x",
+            "/opt/git/bin/hub commit -m x",
+        ] {
+            assert!(
+                git_commit_targets(cmd, "/cwd").is_empty(),
+                "not a git commit: {cmd}"
+            );
+        }
     }
 
     #[test]
