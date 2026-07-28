@@ -30,6 +30,7 @@
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use serde::Deserialize;
 use std::fs;
+use std::path::Path;
 
 /// The plugin-shipped baseline shape (`plugins/cadence/config/platform-baseline.json`
 /// in the cadence monorepo). Reused by `cadence-hooks doctor`'s unconditional
@@ -151,7 +152,8 @@ impl Check for PlatformDrift {
         }
 
         if let Some(transcript_path) = input.transcript_path()
-            && let Ok(transcript) = fs::read_to_string(transcript_path)
+            && let Some(transcript) =
+                cadence_hooks_core::transcript::read_tail(Path::new(transcript_path))
             && let Some(harness_version) =
                 cadence_hooks_core::transcript::last_assistant_harness_version(&transcript)
             && version_gap(&harness_version, &baseline.claude_code.last_swept_version)
