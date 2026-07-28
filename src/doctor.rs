@@ -590,6 +590,24 @@ enum MarketplaceStatus {
     Resolved,
 }
 
+/// Parse `known_marketplaces.json` at `path` into its top-level object —
+/// shared by [`marketplace_status`] and [`known_marketplace_sources`] so both
+/// read the same schema through one place. Two independent parsers of one
+/// schema is exactly how they'd drift, and here they'd drift on the
+/// `source.source` field #474's diagnosis is keyed off. `None` on a missing
+/// file, invalid JSON, or a non-object top level.
+fn read_known_marketplaces(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    json.as_object().cloned()
+}
+
+/// The `source.source` discriminator string (`"github"`, `"directory"`, ...)
+/// for one `known_marketplaces.json` entry, or `None` when absent/malformed.
+fn marketplace_source_kind(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("source")?.get("source")?.as_str()
+}
+
 /// Resolve `label` against `known_marketplaces.json` (and, for a
 /// github-sourced marketplace, that marketplace's own `marketplace.json`).
 /// See [`MarketplaceStatus`] for the fail-open contract.
@@ -599,22 +617,14 @@ fn marketplace_status(label: &str, known_marketplaces: &Path) -> MarketplaceStat
     let Some((plugin, marketplace)) = label.split_once('@') else {
         return Resolved;
     };
-    let Ok(content) = std::fs::read_to_string(known_marketplaces) else {
+    let Some(entries) = read_known_marketplaces(known_marketplaces) else {
         return Resolved;
     };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Resolved;
-    };
-    let Some(entry) = json.get(marketplace) else {
+    let Some(entry) = entries.get(marketplace) else {
         return Resolved;
     };
 
-    let is_directory = entry
-        .get("source")
-        .and_then(|s| s.get("source"))
-        .and_then(|v| v.as_str())
-        == Some("directory");
-    if is_directory {
+    if marketplace_source_kind(entry) == Some("directory") {
         return DirectorySourced;
     }
 
@@ -1989,27 +1999,20 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
 /// skipped. Fails open — a missing or unparseable file yields an empty vec,
 /// never an error — this is an advisory check, not a hard dependency.
 fn known_marketplace_sources(path: &Path) -> Vec<(String, PathBuf, String)> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Vec::new();
-    };
-    let Some(entries) = json.as_object() else {
+    let Some(entries) = read_known_marketplaces(path) else {
         return Vec::new();
     };
 
     let mut out = Vec::new();
-    for (name, entry) in entries {
-        let source = entry.get("source");
-        let is_github = source
-            .and_then(|s| s.get("source"))
-            .and_then(|v| v.as_str())
-            == Some("github");
-        if !is_github {
+    for (name, entry) in &entries {
+        if marketplace_source_kind(entry) != Some("github") {
             continue;
         }
-        let Some(repo) = source.and_then(|s| s.get("repo")).and_then(|v| v.as_str()) else {
+        let Some(repo) = entry
+            .get("source")
+            .and_then(|s| s.get("repo"))
+            .and_then(|v| v.as_str())
+        else {
             continue;
         };
         let Some(install_location) = entry.get("installLocation").and_then(|v| v.as_str()) else {
@@ -3838,44 +3841,21 @@ mod tests {
 
     // ── marketplace_status / manifest_scan_findings / orphan exemption (#474) ─
 
-    /// Write `known_marketplaces.json` with one entry.
-    fn write_known_marketplace_directory(root: &Path, marketplace: &str, path: &Path) {
+    /// Write `known_marketplaces.json` with the given body — one general
+    /// JSON-body writer rather than one helper per source shape, mirroring
+    /// `tests/doctor.rs`'s `write_known_marketplaces`.
+    fn write_known_marketplaces(root: &Path, body: &serde_json::Value) {
         fs::create_dir_all(root).unwrap();
-        let content = serde_json::json!({
-            marketplace: {
-                "source": { "source": "directory", "path": path.to_str().unwrap() },
-                "installLocation": path.to_str().unwrap(),
-            }
-        });
         fs::write(
             root.join("known_marketplaces.json"),
-            serde_json::to_string(&content).unwrap(),
+            serde_json::to_string(body).unwrap(),
         )
         .unwrap();
     }
 
-    /// Write `known_marketplaces.json` with one github-sourced entry, plus
-    /// that marketplace's own `marketplace.json` at `install_location`
-    /// listing `plugin_names`.
-    fn write_known_marketplace_github(
-        known_marketplaces_root: &Path,
-        marketplace: &str,
-        install_location: &Path,
-        plugin_names: &[&str],
-    ) {
-        fs::create_dir_all(known_marketplaces_root).unwrap();
-        let content = serde_json::json!({
-            marketplace: {
-                "source": { "source": "github", "repo": format!("owner/{marketplace}") },
-                "installLocation": install_location.to_str().unwrap(),
-            }
-        });
-        fs::write(
-            known_marketplaces_root.join("known_marketplaces.json"),
-            serde_json::to_string(&content).unwrap(),
-        )
-        .unwrap();
-
+    /// Write a github-sourced marketplace's own `marketplace.json` at
+    /// `install_location`, listing `plugin_names`.
+    fn write_marketplace_plugin_list(install_location: &Path, plugin_names: &[&str]) {
         let mp_dir = install_location.join(".claude-plugin");
         fs::create_dir_all(&mp_dir).unwrap();
         let plugins: Vec<_> = plugin_names
@@ -3893,7 +3873,15 @@ mod tests {
     fn marketplace_status_directory_sourced() {
         let tmp = tempfile::tempdir().unwrap();
         let plugin_path = tmp.path().join("dev/homelab");
-        write_known_marketplace_directory(tmp.path(), "homelab", &plugin_path);
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "homelab": {
+                    "source": { "source": "directory", "path": plugin_path.to_str().unwrap() },
+                    "installLocation": plugin_path.to_str().unwrap(),
+                }
+            }),
+        );
 
         assert_eq!(
             marketplace_status(
@@ -3911,12 +3899,16 @@ mod tests {
         // marketplace.json lists two plugins; "persona" is deliberately absent
         // — mirrors the exact #474 case 1 scenario (a plugin dropped from the
         // marketplace two days before the stale hooks.json warning fired).
-        write_known_marketplace_github(
+        write_known_marketplaces(
             tmp.path(),
-            "cadence-lab",
-            &install_location,
-            &["vibes", "macos"],
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
         );
+        write_marketplace_plugin_list(&install_location, &["vibes", "macos"]);
 
         assert_eq!(
             marketplace_status(
@@ -3931,12 +3923,16 @@ mod tests {
     fn marketplace_status_present_is_resolved() {
         let tmp = tempfile::tempdir().unwrap();
         let install_location = tmp.path().join("marketplaces/cadence-lab");
-        write_known_marketplace_github(
+        write_known_marketplaces(
             tmp.path(),
-            "cadence-lab",
-            &install_location,
-            &["vibes", "macos"],
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
         );
+        write_marketplace_plugin_list(&install_location, &["vibes", "macos"]);
 
         // Positive control: a plugin that IS still listed must not be
         // misreported as removed — proves this can discriminate, not just
@@ -3962,7 +3958,16 @@ mod tests {
     #[test]
     fn marketplace_status_fails_open_on_unrecognized_marketplace_key() {
         let tmp = tempfile::tempdir().unwrap();
-        write_known_marketplace_directory(tmp.path(), "homelab", &tmp.path().join("dev/x"));
+        let plugin_path = tmp.path().join("dev/x");
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "homelab": {
+                    "source": { "source": "directory", "path": plugin_path.to_str().unwrap() },
+                    "installLocation": plugin_path.to_str().unwrap(),
+                }
+            }),
+        );
 
         // "other-mp" isn't in known_marketplaces.json at all.
         assert_eq!(
@@ -3975,12 +3980,16 @@ mod tests {
     fn manifest_scan_findings_reports_removed_upstream_not_skew() {
         let tmp = tempfile::tempdir().unwrap();
         let install_location = tmp.path().join("marketplaces/cadence-lab");
-        write_known_marketplace_github(
+        write_known_marketplaces(
             tmp.path(),
-            "cadence-lab",
-            &install_location,
-            &["vibes", "macos"],
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
         );
+        write_marketplace_plugin_list(&install_location, &["vibes", "macos"]);
 
         // The removed plugin's stale cached hooks.json references a
         // subcommand this binary doesn't know — the exact input that used
@@ -4027,7 +4036,16 @@ mod tests {
         // the test above and be silently useless here.
         let tmp = tempfile::tempdir().unwrap();
         let install_location = tmp.path().join("marketplaces/cadence-lab");
-        write_known_marketplace_github(tmp.path(), "cadence-lab", &install_location, &["vibes"]);
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "cadence-lab": {
+                    "source": { "source": "github", "repo": "owner/cadence-lab" },
+                    "installLocation": install_location.to_str().unwrap(),
+                }
+            }),
+        );
+        write_marketplace_plugin_list(&install_location, &["vibes"]);
 
         let plugin_dir = tmp.path().join("cache/cadence-lab/vibes/abc123");
         fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
@@ -4056,7 +4074,15 @@ mod tests {
     fn orphan_findings_exempts_directory_sourced_missing_cache_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let plugin_source = tmp.path().join("dev/homelab");
-        write_known_marketplace_directory(tmp.path(), "homelab", &plugin_source);
+        write_known_marketplaces(
+            tmp.path(),
+            &serde_json::json!({
+                "homelab": {
+                    "source": { "source": "directory", "path": plugin_source.to_str().unwrap() },
+                    "installLocation": plugin_source.to_str().unwrap(),
+                }
+            }),
+        );
 
         // The recorded installPath under plugins/cache/ that Claude Code
         // still writes for a directory-sourced plugin, but never
