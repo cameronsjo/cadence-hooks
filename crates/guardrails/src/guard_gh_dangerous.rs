@@ -8,16 +8,18 @@
 //! guard enforces *irreversibility* — a repo delete is blocked even for a repo
 //! you own, because there is no undo.
 
-use cadence_hooks_core::shell::{command_segments, strip_quotes, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, contains_ignoring_ascii_case, fold_verb, strip_quotes, tokenize,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::sync::LazyLock;
 
 static GH_REPO_DELETE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bgh\s+repo\s+delete\b").expect("pattern should compile"));
+    LazyLock::new(|| Regex::new(r"\b(?i:gh)\s+repo\s+delete\b").expect("pattern should compile"));
 
 static EXEC_WRAPPER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(bash|sh|zsh)\s+-c\b").expect("pattern should compile"));
+    LazyLock::new(|| Regex::new(r"\b(?i:bash|sh|zsh)\s+-c\b").expect("pattern should compile"));
 
 /// Matches an API path at EXACTLY owner/repo depth: `repos/<owner>/<repo>`,
 /// with an optional leading or trailing slash. Sub-resource paths
@@ -61,7 +63,12 @@ impl Check for GhDangerousGuard {
             return CheckResult::allow();
         };
 
-        if !command.contains("gh") {
+        // Pre-filter on a folded copy, then match on the ORIGINAL text. The
+        // fold belongs here and not in the patterns' nouns: `GH` is a spelling
+        // the shell runs, `REPO DELETE` is not (cadence-hooks#488). A
+        // lowercase-only `contains` here silently defeated the folded patterns
+        // below — the fast path rejected the command before they ever ran.
+        if !contains_ignoring_ascii_case(command, "gh") {
             return CheckResult::allow();
         }
 
@@ -93,8 +100,10 @@ impl Check for GhDangerousGuard {
             let Some(first) = tokens.first() else {
                 continue;
             };
-            // Command word: basename so `/opt/homebrew/bin/gh` still counts.
-            let cmd_word = first.rsplit('/').next().unwrap_or(first);
+            // Command word: basename so `/opt/homebrew/bin/gh` still counts,
+            // ASCII folded so `GH`/`/opt/homebrew/bin/GH` do too (#488). The
+            // `api` subcommand stays case-sensitive — gh rejects `API`.
+            let cmd_word = fold_verb(first.rsplit('/').next().unwrap_or(first));
             if cmd_word != "gh" || tokens.get(1).map(String::as_str) != Some("api") {
                 continue;
             }
@@ -124,6 +133,33 @@ mod tests {
     fn repo_delete_in_exec_wrapper_blocked() {
         let result = GhDangerousGuard.run(&make_bash("bash -c \"gh repo delete my-repo --yes\""));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn case_folded_verbs_still_blocked() {
+        // cadence-hooks#488: a case-insensitive volume runs `GH` as `gh` and
+        // `BASH` as `bash`, but both verb gates here are raw-text regexes that
+        // matched only the lowercase spelling — a silent Allow on a repo
+        // deletion, the most destructive command this guard exists to stop.
+        for cmd in [
+            "GH repo delete my-repo --yes",
+            "Gh repo delete my-repo --yes",
+            "BASH -c \"GH repo delete my-repo --yes\"",
+        ] {
+            assert_eq!(
+                GhDangerousGuard.run(&make_bash(cmd)).outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{cmd}"
+            );
+        }
+        // Only the verb folds: gh rejects a capitalized subcommand, so folding
+        // past the verb would match text the shell could never run.
+        assert_eq!(
+            GhDangerousGuard
+                .run(&make_bash("gh REPO DELETE my-repo --yes"))
+                .outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
     }
 
     #[test]

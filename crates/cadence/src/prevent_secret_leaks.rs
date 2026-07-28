@@ -16,6 +16,7 @@ use cadence_hooks_core::shell::{
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -121,7 +122,7 @@ fn unwrap_command_prefixes(tokens: &[String]) -> &[String] {
             argv = &argv[1 + skip..];
             continue;
         }
-        if COMMAND_WRAPPERS.contains(&word) && argv.len() > 1 {
+        if COMMAND_WRAPPERS.contains(&word.as_ref()) && argv.len() > 1 {
             argv = &argv[1..];
             continue;
         }
@@ -162,7 +163,15 @@ fn env_prefix_len(rest: &[String]) -> Option<usize> {
 /// makes drift between them impossible rather than merely unlikely; the argv
 /// rides along because the caller that scans operands must scan the SAME
 /// resolved slice the head came from.
-fn resolve_command(tokens: &[String]) -> Option<(&str, &[String])> {
+///
+/// The [`Cow`] is [`command_word`]'s ASCII case fold (cadence-hooks#488), and
+/// in this file it is **always** the borrowed variant: [`bash_leaks_secrets`]
+/// lowercases the whole command before any of this runs, so no uppercase byte
+/// ever reaches the fold. That matters beyond allocation — the head this
+/// resolves feeds [`METADATA_SAFE_COMMANDS`], the one *exemption* lookup among
+/// `command_word`'s consumers, where matching more can only SUBTRACT blocks.
+/// The fold cannot widen it, because there is nothing left here to fold.
+fn resolve_command<'a>(tokens: &'a [String]) -> Option<(Cow<'a, str>, &'a [String])> {
     let argv = unwrap_command_prefixes(tokens);
     Some((command_word(argv.first()?), argv))
 }
@@ -269,7 +278,7 @@ fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
     if cmd_word == "forgectl" {
         return forgectl_env_leak(argv);
     }
-    if METADATA_SAFE_COMMANDS.contains(&cmd_word) {
+    if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
         return Vec::new();
     }
     argv.iter()
@@ -302,7 +311,7 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
         .position(|t| EXEC_FLAGS.contains(&t.as_str()))
         .and_then(|i| tokens.get(i + 1..))?;
     let (sub_word, _) = resolve_command(action)?;
-    if METADATA_SAFE_COMMANDS.contains(&sub_word) {
+    if METADATA_SAFE_COMMANDS.contains(&sub_word.as_ref()) {
         return None;
     }
     tokens
@@ -1018,6 +1027,66 @@ mod tests {
     fn bash_env_dump_warned() {
         let result = SecretLeaksGuard.run(&make_bash_input("printenv"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn verb_fold_cannot_widen_this_guards_exemption() {
+        // This file is the ONE consumer of `core::shell::command_word` whose
+        // lookup is an EXEMPTION (`METADATA_SAFE_COMMANDS`), where matching
+        // MORE can only SUBTRACT blocks. The verb fold added for #488 is a
+        // provable no-op here because `bash_leaks_secrets` already lowercases
+        // the whole command before any of this runs — so the exemption was
+        // already case-folded and the fold cannot widen it further.
+        //
+        // These assertions therefore hold IDENTICALLY before and after the
+        // fold. That is the point: they are the tripwire that fails the day
+        // the upstream lowercase is removed or the fold starts reaching an
+        // exemption it did not before.
+        use cadence_hooks_core::Outcome;
+        // Exempt, both cases — already true pre-fold.
+        for cmd in ["ls .env", "LS .env", "git add .env", "GIT add .env"] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                Outcome::Allow,
+                "{cmd}"
+            );
+        }
+        // NOT exempt, both cases — the fold must not hand these an exemption.
+        for cmd in ["cat .env", "CAT .env", "sudo cat .env", "SUDO cat .env"] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                Outcome::Block,
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_value_flags_stay_case_insensitive_after_the_verb_fold() {
+        // #489's regression, carried forward as a standing guard: lowercasing
+        // a whole command broke `-C`/`-P`/`-S` matching and `env -C /tmp
+        // printenv` went silent — a hardening change that NET WEAKENED the
+        // guard. #488 folds the VERB only, so this must stay green.
+        use cadence_hooks_core::Outcome;
+        for cmd in [
+            "env -C /tmp printenv",
+            "env -P /bin printenv",
+            "env -u FOO printenv",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                Outcome::Nudge,
+                "{cmd}"
+            );
+        }
+        // `-S`'s value IS the command line, so it stops the walk and stays
+        // silent — the named accepted miss, not a verdict the fold may change.
+        assert_eq!(
+            SecretLeaksGuard
+                .run(&make_bash_input("env -S x printenv"))
+                .outcome,
+            Outcome::Allow
+        );
     }
 
     fn make_grep_input(path: &str) -> HookInput {

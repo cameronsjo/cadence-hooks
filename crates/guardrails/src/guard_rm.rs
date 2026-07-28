@@ -81,10 +81,12 @@
 
 use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, looks_absolute, resolve_cd_target,
-    skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers, tokenize,
+    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, fold_verb, looks_absolute,
+    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome, normalize_path};
+use std::borrow::Cow;
 use std::path::Path;
 
 /// Delete verbs whose leading command word marks a filesystem deletion.
@@ -95,13 +97,21 @@ use std::path::Path;
 const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 
 /// The command word `token` names, stripped to what the shell will actually
-/// run: `basename` so `/bin/rm` matches, and a leading `\` removed so the
-/// alias-bypass form `\rm` is still seen as `rm`.
+/// run: `basename` so `/bin/rm` matches, a leading `\` removed so the
+/// alias-bypass form `\rm` is still seen as `rm`, and ASCII case folded so `RM`
+/// is too.
 ///
-/// (Deliberate miss: `RM` on a case-insensitive volume — matching
-/// case-insensitively would be wrong on Linux. Mitigated: a settings
-/// `allow Bash(rm:*)` rule keys on the leading word too, so it defers, never
-/// silently auto-approves.)
+/// The fold is cadence-hooks#488, and it tracks the shared
+/// [`cadence_hooks_core::shell::command_word`] deliberately — the same reason
+/// for the same measured hole. On a case-insensitive volume the shell resolves
+/// `RM` to the `rm` binary and deletes; this guard collected no target and
+/// returned a silent Allow. Every consumer of this function is a DETECTOR — the
+/// delete-verb set, the `find` arm, the shell-wrapper arm, and the
+/// transparent-prefix `Unresolvable` gate — so folding can only ADD an ask or a
+/// block, never subtract one. The old mitigation note (a settings
+/// `allow Bash(rm:*)` rule keys on the leading word, so the guard defers rather
+/// than auto-approving) applied to the *lowercase* spelling only; it never
+/// covered `RM`, which is why the miss was real rather than merely theoretical.
 ///
 /// **Deliberately NOT the shared [`cadence_hooks_core::shell::command_word`],
 /// which the enforce-worktree verb gates moved onto (#450 review).** The two
@@ -113,15 +123,15 @@ const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 /// in the wild, so it is left alone and tracked separately rather than ridden
 /// in on a PR about three other issues. The two are consistent in the direction
 /// that matters: every spelling the shell really runs as `rm` is caught by both.
-fn command_word(token: &str) -> &str {
-    basename(token).trim_start_matches('\\')
+fn command_word(token: &str) -> Cow<'_, str> {
+    fold_verb(basename(token).trim_start_matches('\\'))
 }
 
 /// `token` names one of the [`DELETE_VERBS`]. Shared by every site that has to
 /// recognize a delete verb, so the `\`-strip above lives in exactly one place —
 /// forgetting it at a new call site would silently re-open the alias bypass.
 fn is_delete_verb(token: &str) -> bool {
-    DELETE_VERBS.contains(&command_word(token))
+    DELETE_VERBS.contains(&command_word(token).as_ref())
 }
 
 /// Shell command words that take an inline script via `-c`. Mirrors the set
@@ -196,7 +206,7 @@ fn wrapper_script_deletes(tokens: &[String], depth: usize) -> bool {
         return false;
     }
     tokens.iter().enumerate().any(|(i, tok)| {
-        if !SHELL_WRAPPERS.contains(&command_word(tok)) {
+        if !SHELL_WRAPPERS.contains(&command_word(tok).as_ref()) {
             return false;
         }
         // `child_scripts` recognizes the shell word with a bare `rsplit('/')`,
@@ -471,7 +481,7 @@ fn collect_targets(
         // so a BLOCK from an already-recursed child script still wins.
         if argv.first().is_some_and(|first| {
             let word = command_word(first);
-            TRANSPARENT.contains(&word) || word == "eval"
+            TRANSPARENT.contains(&word.as_ref()) || word == "eval"
         }) && mentions_deletion(&tokens, 0)
         {
             out.push(TargetToken::Unresolvable);
@@ -480,6 +490,7 @@ fn collect_targets(
 
         let Some(first) = argv.first() else { continue };
         let verb = command_word(first);
+        let verb = verb.as_ref();
         if DELETE_VERBS.contains(&verb) {
             let recursive = rm_is_recursive(argv, verb);
             let operands = delete_operands(argv, verb);
@@ -2127,6 +2138,39 @@ mod tests {
     fn backslash_rm_alias_bypass_detected() {
         // Sec #3: `\rm` (bypasses a shell alias) is still `rm`.
         assert_eq!(judge("\\rm -rf /", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn case_folded_delete_verbs_detected() {
+        // cadence-hooks#488: on a case-insensitive volume the shell resolves
+        // `RM` to the `rm` binary and deletes, but the verb set was matched
+        // case-sensitively, so the whole guard collected no target — a silent
+        // Allow. Measured Allow before the fold.
+        for spelling in ["RM -rf /", "Rm -rf /", "\\RM -rf /", "/bin/RM -rf /"] {
+            assert_eq!(judge(spelling, "/home"), Outcome::Block, "{spelling}");
+        }
+        assert_eq!(judge("UNLINK /vaults/main/x", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn case_folded_verbs_reach_the_find_and_wrapper_arms() {
+        // The two spellings that name no delete verb in the token stream: an
+        // uppercase `find` and an uppercase shell wrapper. Both resolve their
+        // verb through the same normalization, so both fold with it.
+        assert_eq!(judge("FIND /vaults/main -delete", "/home"), Outcome::Block);
+        assert_eq!(
+            judge("SH -c 'rm -rf /vaults/main'", "/home"),
+            Outcome::Block
+        );
+    }
+
+    #[test]
+    fn case_folded_verbs_keep_distinct_words_apart() {
+        // The fold changes case, never shape: a longer word that merely
+        // contains a delete verb is still not one, and a benign command is
+        // still benign. Negative control for the two tests above.
+        assert_eq!(judge("LS -la /vaults/main", "/home"), Outcome::Allow);
+        assert_eq!(judge("RMDIR /vaults/main", "/home"), Outcome::Allow);
     }
 
     #[test]

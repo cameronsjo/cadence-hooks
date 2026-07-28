@@ -4,6 +4,7 @@
 //! running git commands, and resolving working directories from `cd` chains.
 
 use regex::Regex;
+use std::borrow::Cow;
 use std::process::Command;
 use std::sync::LazyLock;
 
@@ -190,6 +191,53 @@ pub fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
+/// ASCII-fold a resolved verb so a capitalized spelling matches the gate
+/// (cadence-hooks#488). Borrows unless the fold changes something, so the
+/// common already-lowercase verb costs no allocation.
+///
+/// **The one place the verb fold is spelled**, shared by
+/// [`command_word`] and by the two guards that keep a deliberately divergent
+/// local command word (`guard_rm`, which repeats the backslash strip;
+/// `warn_going_public`, which is basename-only). Those divergences are about
+/// the *path/escape* handling and are documented where they live — the fold is
+/// not one of them, and three hand-rolled copies of it would be four
+/// normalizations of "which verb is this?" all over again, which is exactly
+/// what #450 consolidated away.
+///
+/// ASCII, never [`str::to_lowercase`]: every verb a guard gates on is ASCII,
+/// while Unicode folding maps the dotted-I family and assorted homoglyphs onto
+/// ASCII letters, inventing verbs no shell would run.
+pub fn fold_verb(word: &str) -> Cow<'_, str> {
+    if word.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(word.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(word)
+    }
+}
+
+/// Case-insensitive (ASCII) substring test, allocation-free.
+///
+/// For the cheap `contains` **pre-filters** that guards open with before
+/// running their real patterns. Those filters exist to avoid work, so folding
+/// them by allocating a lowercased copy of the whole command works against
+/// their only purpose; this walks byte windows instead.
+///
+/// It earns its place by being the fix for a measured defect rather than a
+/// tidiness: `guard_gh_write`, `guard_gh_dangerous`, and `warn_going_public`
+/// each opened with a lowercase-only `contains("gh")`, which returned Allow on
+/// `GH pr create` **before** their case-folded verb patterns could run — so the
+/// folds read as correct in unit tests while the built binary still allowed the
+/// write (cadence-hooks#488). A pre-filter that is stricter than the matcher
+/// behind it is a silent veto, and having one spelling of it makes that
+/// invariant greppable.
+pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 /// The command word `token` names, normalized to the verb the shell will
 /// actually run: the path segment, one leading alias-bypass backslash removed,
 /// and a Windows `.exe` suffix dropped.
@@ -217,12 +265,62 @@ pub fn basename(token: &str) -> &str {
 ///    (`…/git.exe`, `C:\Program Files\Git\cmd\git.exe`) matches the same verb
 ///    as the POSIX one. No verb any caller gates on legitimately ends in
 ///    `.exe`, so this cannot collapse two distinct verbs together.
+/// 4. **Fold ASCII case**, LAST, so it composes with all three steps above.
+///
+/// # The case fold (cadence-hooks#488)
+///
+/// On a case-insensitive volume — APFS, the macOS default — the shell resolves
+/// `GIT` to the `git` binary and runs it. Every gate here compared against a
+/// lowercase literal, so `GIT commit` produced no commit target and `RM -rf`
+/// named no delete verb: measured silent Allows, and the `enforce_worktree`
+/// commit gate has no settings-rule mitigation behind it the way `guard_rm`
+/// does.
+///
+/// **Unconditional, not filesystem-aware.** Deciding "will the shell find
+/// `GIT`?" honestly means probing the case-sensitivity of whichever `$PATH`
+/// volume holds the binary — not the cwd, which is usually a different
+/// filesystem — for every verb, in a hook that runs on every Bash call. A
+/// `cfg!(target_os)` shortcut is simply wrong in both directions: macOS
+/// supports case-sensitive APFS volumes, and Linux supports case-insensitive
+/// mounts (ext4 casefold, ciopfs, NTFS/exFAT). So the fold is unconditional,
+/// and the cost of over-eagerness on a case-sensitive host is one spurious
+/// block on a command that would have failed as `command not found` anyway.
+/// That trade only holds because of the direction argument below.
+///
+/// **Why folding here cannot turn a BLOCK into an ALLOW.** A normalization
+/// copied into a DETECTOR may be over-eager safely — it can only add blocks.
+/// Copied into an EXEMPTION it can only subtract them, and over-eagerness is a
+/// vulnerability (the `xargs` bypass recorded in
+/// `prevent_secret_leaks::COMMAND_WRAPPERS`). This function feeds both kinds,
+/// so every consumer was enumerated:
+///
+/// - **Detectors** — [`skip_expansion_prefixes`] and [`shell_c_argument_tokens`]
+///   here; `enforce_worktree`'s commit gate, `is_package_mutation` and
+///   `file_mutation_targets`; `guard_rm`'s delete-verb, `find`, and
+///   shell-wrapper arms; `guard_gh_write::token_is_gh`. Folding widens what
+///   they find, which only ever ADDS a block, an ask, or a nudge.
+/// - **The one exemption** — `prevent_secret_leaks`' `METADATA_SAFE_COMMANDS`
+///   lookup, reached via that file's `resolve_command`. The fold is a provable
+///   **no-op** there: `bash_leaks_secrets` lowercases the entire command before
+///   any of it runs, so that consumer's input never contains an uppercase byte
+///   for this step to change. Its verdicts are identical before and after,
+///   which `verb_fold_cannot_widen_this_guards_exemption` asserts directly.
+///
+/// **ASCII-only**, never [`str::to_lowercase`]. Every verb any caller gates on
+/// is ASCII, while Unicode folding maps the dotted-I family and assorted
+/// homoglyphs onto ASCII letters — widening matching in ways no filesystem
+/// does, and inventing verbs the shell would never run.
+///
+/// Only the VERB folds. Folding a whole command string is what regressed
+/// `-C`/`-P`/`-S` in cadence-hooks#489 and silenced `env -C /tmp printenv`: a
+/// hardening change that net-weakened a guard. Flags are case-sensitive to the
+/// programs that receive them, and path operands are case-sensitive in content
+/// even on a case-insensitive volume.
 ///
 /// Deliberate misses, shared by every caller: a command word behind a
-/// substitution (`$(which git)`) or a variable, a mid-path escape
-/// (`/usr/bin/\git`), and a case-folded verb on a case-insensitive volume
-/// (`RM`) — matching case-insensitively would be wrong on Linux.
-pub fn command_word(token: &str) -> &str {
+/// substitution (`$(which git)`) or a variable, and a mid-path escape
+/// (`/usr/bin/\git`).
+pub fn command_word(token: &str) -> Cow<'_, str> {
     let has_drive_prefix = {
         let mut chars = token.chars();
         matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) && chars.next() == Some(':')
@@ -233,10 +331,11 @@ pub fn command_word(token: &str) -> &str {
         basename(token)
     };
     let segment = segment.strip_prefix('\\').unwrap_or(segment);
-    match segment.rsplit_once('.') {
+    let segment = match segment.rsplit_once('.') {
         Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => stem,
         _ => segment,
-    }
+    };
+    fold_verb(segment)
 }
 
 /// True when `p` is absolute — POSIX (`/foo`) or a Windows drive-absolute path
@@ -307,7 +406,15 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
     let mut start = 0;
     while start + 1 < tokens.len() {
         let tok = tokens[start].as_str();
-        if (TRANSPARENT.contains(&tok) && !tokens[start + 1].starts_with('-'))
+        // Membership is tested on the FOLDED word (cadence-hooks#488). `guard_rm`
+        // already folded before its own `TRANSPARENT` test, so a raw test here
+        // made the two disagree: `COMMAND rm -rf ~` kept `COMMAND` as the
+        // leading word and the delete verb behind it was never reached.
+        // Detector direction — skipping more prefixes only exposes more verbs
+        // to the gates downstream, so this can add blocks and never subtract.
+        // The flag refusal below is unchanged, so a prefix's own options are
+        // still never parsed.
+        if (TRANSPARENT.contains(&fold_verb(tok).as_ref()) && !tokens[start + 1].starts_with('-'))
             || is_assignment_word(tok)
         {
             start += 1;
@@ -1961,7 +2068,7 @@ fn skip_expansion_prefixes(tokens: &[String]) -> &[String] {
 fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
     let tokens = skip_expansion_prefixes(tokens);
     if !matches!(
-        command_word(tokens.first()?),
+        command_word(tokens.first()?).as_ref(),
         "sh" | "bash" | "zsh" | "dash"
     ) {
         return None;
@@ -2032,6 +2139,109 @@ mod tests {
         assert_ne!(command_word("a\\b\\git"), "git");
         // `.exe` stripping must not eat a bare dotfile-shaped name.
         assert_eq!(command_word(".exe"), ".exe");
+    }
+
+    #[test]
+    fn command_word_folds_ascii_case() {
+        // On a case-insensitive volume the shell resolves `GIT` to the `git`
+        // binary and runs it, so a verb gate comparing against the literal
+        // `git` never fired (cadence-hooks#488). The fold is the LAST step, so
+        // it composes with the path split, the backslash strip, and `.exe`.
+        for (token, want) in [
+            ("GIT", "git"),
+            ("Git", "git"),
+            ("gIt", "git"),
+            ("RM", "rm"),
+            ("/usr/bin/GIT", "git"),
+            ("\\GIT", "git"),
+            ("/opt/\\GIT", "git"),
+            ("GIT.EXE", "git"),
+            ("C:\\Program Files\\Git\\cmd\\GIT.exe", "git"),
+        ] {
+            assert_eq!(command_word(token), want, "command_word({token:?})");
+        }
+    }
+
+    #[test]
+    fn command_word_fold_keeps_distinct_verbs_apart() {
+        // Folding must not collapse words that were never the same verb — it
+        // changes only the CASE of the resolved word, never its shape.
+        assert_eq!(command_word("\\\\GIT"), "\\git");
+        for token in ["LEGIT", "GITK", "MYGIT", "GIT-LFS"] {
+            assert_ne!(command_word(token), "git", "command_word({token:?})");
+        }
+        // ASCII-only. A non-ASCII character is left exactly as it arrived:
+        // Unicode lowercasing would fold homoglyphs and locale-specific pairs
+        // (the dotted-I family) into ASCII verbs the shell would never run,
+        // which WIDENS matching in a way no filesystem does.
+        assert_eq!(command_word("GİT"), "gİt");
+        assert_eq!(command_word("ⓖⓘⓣ"), "ⓖⓘⓣ");
+    }
+
+    #[test]
+    fn skip_transparent_prefixes_folds_the_prefix_verb() {
+        // `TRANSPARENT` was tested against the RAW token while `guard_rm`
+        // folded before its own `TRANSPARENT` test — the two disagreed, so
+        // `COMMAND rm -rf ~` resolved its leading word to `COMMAND` and the
+        // delete verb behind it was never reached (cadence-hooks#488).
+        // Detector direction: skipping more prefixes only exposes more verbs.
+        let toks = |s: &str| -> Vec<String> { tokenize(s) };
+        for cmd in [
+            "COMMAND git commit",
+            "NICE git commit",
+            "ENV git commit",
+            "EXEC git commit",
+            "Command git commit",
+        ] {
+            let t = toks(cmd);
+            assert_eq!(
+                skip_transparent_prefixes(&t).first().map(String::as_str),
+                Some("git"),
+                "{cmd}"
+            );
+        }
+        // The flag refusal survives the fold: a prefix's own options are still
+        // never parsed, so this stays a documented miss rather than a wrong
+        // resolution.
+        let t = toks("NICE -n 10 git commit");
+        assert_eq!(
+            skip_transparent_prefixes(&t).first().map(String::as_str),
+            Some("NICE")
+        );
+        // Folding changes case, not membership — a non-prefix stays put.
+        let t = toks("SUDO git commit");
+        assert_eq!(
+            skip_transparent_prefixes(&t).first().map(String::as_str),
+            Some("SUDO")
+        );
+    }
+
+    #[test]
+    fn fold_verb_borrows_unless_it_changes_something() {
+        // The allocation-free path is the point on a function that runs for
+        // every segment of every Bash call, so assert the variant, not just
+        // the value — `assert_eq!` alone passes either way.
+        assert!(matches!(fold_verb("git"), Cow::Borrowed("git")));
+        assert!(matches!(fold_verb(""), Cow::Borrowed("")));
+        assert!(matches!(fold_verb("GIT"), Cow::Owned(_)));
+        assert_eq!(fold_verb("GIT"), "git");
+    }
+
+    #[test]
+    fn contains_ignoring_ascii_case_matches_every_spelling() {
+        for hay in ["gh pr create", "GH pr create", "Gh pr create", "x GH y"] {
+            assert!(contains_ignoring_ascii_case(hay, "gh"), "{hay}");
+        }
+        // Multi-word needles (the `gh repo` pre-filter) and the boundaries.
+        assert!(contains_ignoring_ascii_case("GH REPO create", "gh repo"));
+        assert!(contains_ignoring_ascii_case("anything", ""));
+        assert!(!contains_ignoring_ascii_case("g", "gh"));
+        assert!(!contains_ignoring_ascii_case("", "gh"));
+        assert!(!contains_ignoring_ascii_case("git push", "gh"));
+        // Non-ASCII bytes must not panic or match — the windows walk is over
+        // bytes, so a multi-byte character can straddle a window.
+        assert!(!contains_ignoring_ascii_case("ⓖⓗ", "gh"));
+        assert!(contains_ignoring_ascii_case("é GH é", "gh"));
     }
 
     // --- looks_absolute / resolve_cd_target (Windows path handling) ---

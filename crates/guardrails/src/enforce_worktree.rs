@@ -686,7 +686,7 @@ fn is_package_mutation(argv: &[String]) -> bool {
     };
     let sub = argv.get(1).map(String::as_str);
     matches!(
-        (command_word(cmd), sub),
+        (command_word(cmd).as_ref(), sub),
         ("uv", Some("add" | "remove" | "sync"))
             | ("cargo", Some("add" | "rm"))
             | ("pip" | "pip3", Some("install"))
@@ -711,7 +711,7 @@ fn file_mutation_targets(argv: &[String]) -> Vec<String> {
     let Some(cmd) = argv.first() else {
         return Vec::new();
     };
-    match command_word(cmd) {
+    match command_word(cmd).as_ref() {
         "sed" => {
             let in_place = argv.iter().any(|t| {
                 t == "-i"
@@ -1915,6 +1915,47 @@ mod tests {
         assert!(git_commit_targets("git status", "/cwd").is_empty());
         assert!(git_commit_targets("git add -A", "/cwd").is_empty());
         assert!(git_commit_targets("git push origin main", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn case_folded_git_verbs_are_commits() {
+        // cadence-hooks#488: on a case-insensitive volume the shell runs `GIT
+        // commit` as a real commit, but the gate compared against the literal
+        // `git` and produced NO target — and no target means no block, so this
+        // was a silent bypass of the one commit gate that has no settings-rule
+        // mitigation behind it. Measured Allow before the fold.
+        for spelling in [
+            "GIT commit -m 'x'",
+            "Git commit -m 'x'",
+            "/usr/bin/GIT commit -m 'x'",
+            "\\GIT commit -m 'x'",
+        ] {
+            assert_eq!(
+                git_commit_targets(spelling, "/cwd"),
+                vec!["/cwd".to_string()],
+                "{spelling}"
+            );
+        }
+        // The fold composes with the flag walk rather than replacing it: an
+        // uppercase `-C` is git's own flag and stays case-SENSITIVE, because
+        // folding a whole command string is what regressed `-C`/`-P`/`-S` in
+        // #489. Only the verb folds.
+        assert_eq!(
+            git_commit_targets("GIT -C /some/worktree commit -m 'x'", "/cwd"),
+            vec!["/some/worktree".to_string()]
+        );
+    }
+
+    #[test]
+    fn case_folded_non_commit_git_still_ignored() {
+        // Folding the verb must not manufacture a target where the SUBCOMMAND
+        // is not a commit — the subcommand is matched separately and is not
+        // folded, since `git COMMIT` is not a command git accepts.
+        assert!(git_commit_targets("GIT status", "/cwd").is_empty());
+        assert!(git_commit_targets("GIT push origin main", "/cwd").is_empty());
+        assert!(git_commit_targets("git COMMIT -m 'x'", "/cwd").is_empty());
+        // Prose is still prose.
+        assert!(git_commit_targets("echo GIT commit -m 'x'", "/cwd").is_empty());
     }
 
     #[test]
