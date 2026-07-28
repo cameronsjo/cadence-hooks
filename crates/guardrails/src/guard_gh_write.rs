@@ -54,12 +54,23 @@ static API_INPUT_FLAG: LazyLock<Regex> =
 /// Matched against parsed argv, never the raw command string, so a verb name
 /// appearing inside a quoted argument can't donate a target (#463).
 ///
-/// `edit` is absent deliberately: it takes a positional repo too and IS in
-/// [`WRITE_ACTIONS`], so its target currently falls through to the cwd remote —
-/// tracked as its own fix (#454) rather than smuggled in here.
+/// `edit` is here because without it the guard is UNSATISFIABLE (#457):
+/// `gh repo edit [<repository>]` has no `-R`/`--repo` flag at all (verified
+/// against gh 2.96.0), so the positional was ignored, the target came from the
+/// cwd remote — the issue caught it naming a different owner than its own
+/// `Fix:` line did — and the block advised a flag the subcommand cannot accept.
+/// No spelling of the command and no cwd could clear it.
+///
+/// Reading the positional relaxes no ownership rule. The verb stays in
+/// [`WRITE_ACTIONS`], and the `owner/repo` it names goes through the same
+/// allowlist check every other resolved target does, so `gh repo edit
+/// evil/repo` still blocks. What changes is only that a target the command
+/// spells out replaces a GUESS inferred from the cwd — strictly more accurate
+/// on both verdicts.
 const REPO_TARGET_VERBS: &[&str] = &[
     "archive",
     "delete",
+    "edit",
     "rename",
     "unarchive",
     "fork",
@@ -100,11 +111,44 @@ static SAFE_GRAPHQL_MUTATIONS: [&str; 2] = ["resolveReviewThread", "unresolveRev
 /// decides "is this a write?" from the same patterns this guard enforces —
 /// a second definition would drift the nudge away from the block.
 pub(crate) fn is_write_command(command: &str) -> bool {
-    WRITE_ACTIONS.is_match(command)
-        || WRITE_ACTIONS_EXTRA.is_match(command)
-        || API_WRITE_METHOD.is_match(command)
-        || API_FIELD_FLAGS.is_match(command)
-        || API_INPUT_FLAG.is_match(command)
+    if WRITE_ACTIONS.is_match(command) || WRITE_ACTIONS_EXTRA.is_match(command) {
+        return true;
+    }
+    // A spelled-out write method wins outright, before any narrowing below.
+    if API_WRITE_METHOD.is_match(command) {
+        return true;
+    }
+    if API_FIELD_FLAGS.is_match(command) || API_INPUT_FLAG.is_match(command) {
+        // These flags read as a write only because gh switches an otherwise-GET
+        // `gh api` to POST as soon as a parameter is added. An explicit
+        // `--method GET` cancels exactly that switch — gh documents it as the
+        // way to send the same parameters as a GET query string — so the
+        // command issues the identical request as the query-string spelling
+        // this guard already allows. Blocking one and allowing the other
+        // punished the more explicit form for being explicit (#454).
+        //
+        // Sound because the narrowing is bounded on all four sides:
+        //
+        // * `WRITE_ACTIONS` is tested above and independently, so nothing here
+        //   touches a non-`gh api` write.
+        // * `API_WRITE_METHOD` is tested above, so a spaced `-X POST` blocks
+        //   regardless of what else the argv contains.
+        // * [`api_explicit_method`] requires EVERY method reading to agree.
+        //   That unanimity is load-bearing, not belt-and-braces: gh (pflag)
+        //   obeys the LAST occurrence, while `API_WRITE_METHOD` matches only
+        //   the space-separated spelling — so a first-reading-wins scan would
+        //   clear `gh api … -X GET -XPOST -f a=b` as a read while gh POSTs.
+        //   Disagreement returns `None` and the command stays a write.
+        // * It reads parsed argv, so a `-X GET` inside a quoted `--body` or
+        //   `-f` value is one token and can never pose as the flag.
+        //
+        // The residual error is a false BLOCK (`-X POST -X GET`, which gh runs
+        // as a GET) — the direction this guard is allowed to err in. `HEAD` is
+        // deliberately not included: it is also a read, but no observed command
+        // uses it, and every verb added here is one more that must be argued.
+        return api_explicit_method(command).as_deref() != Some("GET");
+    }
+    false
 }
 
 /// What a segment's `gh` invocation says about its `-R`/`--repo` target.
@@ -664,6 +708,61 @@ fn gh_api_endpoint(segment: &str) -> Option<String> {
         return Some(tok.clone());
     }
     Some(String::new())
+}
+
+/// The HTTP method a `gh api` invocation names explicitly, uppercased — or
+/// `None` when no `-X`/`--method` flag appears, when two readings disagree, or
+/// when the segment isn't a `gh api` call at all.
+///
+/// Callers must treat `None` as "gh's implicit rule applies" (GET, or POST once
+/// a parameter is added), which is why disagreement collapses into it rather
+/// than into a method: falling back to the implicit rule is the fail-closed
+/// answer for a `gh api` carrying parameters. See [`is_write_command`] for why
+/// unanimity — rather than gh's own last-occurrence-wins rule — is the safe
+/// reading here.
+///
+/// Covers the four pflag spellings of a string flag (`-X V`, `-XV`, `-X=V`,
+/// `--method V`, `--method=V`) over parsed argv rather than raw text, so a
+/// method flag quoted inside another flag's value is one token and is not read
+/// as a flag. Only the `gh api` subcommand is inspected — a `-X` belonging to
+/// some other command is not a method.
+fn api_explicit_method(segment: &str) -> Option<String> {
+    gh_api_endpoint(segment)?;
+    let words = gh_argv(segment)?;
+    let clean = |s: &str| {
+        s.trim_matches(|c| c == '"' || c == '\'')
+            .to_ascii_uppercase()
+    };
+    let mut seen: Vec<String> = Vec::new();
+    // Start past argv[0] (`gh` itself).
+    let mut i = 1;
+    while i < words.len() {
+        let word = words[i].as_str();
+        if word == "-X" || word == "--method" {
+            if let Some(value) = words.get(i + 1) {
+                seen.push(clean(value));
+                // Skip the value so it cannot also be read as a flag.
+                i += 2;
+                continue;
+            }
+        } else if let Some(rest) = word
+            .strip_prefix("--method=")
+            .or_else(|| word.strip_prefix("-X"))
+            .filter(|rest| !rest.is_empty() && !rest.starts_with('-'))
+        {
+            // `-X=POST` is a valid pflag shorthand spelling; drop the `=` so it
+            // reads as the method it sets rather than as a distinct value that
+            // would manufacture a disagreement.
+            seen.push(clean(rest.strip_prefix('=').unwrap_or(rest)));
+        }
+        i += 1;
+    }
+    seen.sort();
+    seen.dedup();
+    match seen.len() {
+        1 => Some(seen.swap_remove(0)),
+        _ => None,
+    }
 }
 
 /// True when a command segment invokes `gh` as an actual command token — some
@@ -3956,5 +4055,224 @@ mod tests {
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
+    }
+
+    // --- #454: an explicit `-X GET` is a read, not a write ---
+
+    /// The command from the issue: an explicit GET carrying `-f` fields, which
+    /// gh sends as a query string. Blocked before; a read now.
+    const ISSUE_454_CMD: &str =
+        "gh api -X GET search/issues -f q=commenter:cameronsjo -f per_page=1 --jq .total_count";
+
+    #[test]
+    fn explicit_get_with_fields_is_not_a_write() {
+        assert!(!is_write_command(ISSUE_454_CMD));
+    }
+
+    #[test]
+    fn explicit_get_is_read_across_all_spellings() {
+        for cmd in [
+            "gh api -X GET search/issues -f q=x",
+            "gh api --method GET search/issues -f q=x",
+            "gh api -XGET search/issues -f q=x",
+            "gh api -X=GET search/issues -f q=x",
+            "gh api --method=GET search/issues -f q=x",
+        ] {
+            assert!(!is_write_command(cmd), "should read as a GET: {cmd}");
+        }
+    }
+
+    #[test]
+    fn explicit_get_is_case_insensitive() {
+        // `API_WRITE_METHOD` matches POST/PUT/PATCH/DELETE case-insensitively;
+        // the read side is symmetric. A lowercase `get` is forwarded verbatim
+        // and rejected by GitHub, so it cannot become a write either way.
+        assert!(!is_write_command("gh api -X get search/issues -f q=x"));
+    }
+
+    #[test]
+    fn explicit_get_also_covers_the_input_flag() {
+        // `--input` sits in the same narrowed branch as the field flags; a GET
+        // carrying a body is still a GET. Pinned so the behavior is chosen
+        // rather than incidental.
+        assert!(!is_write_command(
+            "gh api -X GET repos/cameronsjo/x --input body.json"
+        ));
+    }
+
+    // Negative controls: the write side must survive the narrowing.
+
+    #[test]
+    fn fields_without_an_explicit_method_stay_a_write() {
+        // gh switches to POST as soon as a parameter is added — the whole
+        // reason the field flags read as a write.
+        assert!(is_write_command("gh api repos/cameronsjo/x -f name=y"));
+    }
+
+    #[test]
+    fn explicit_post_stays_a_write() {
+        assert!(is_write_command("gh api -X POST repos/cameronsjo/x -f a=b"));
+    }
+
+    #[test]
+    fn disagreeing_methods_stay_a_write() {
+        // The hole unanimity closes. gh (pflag) obeys the LAST occurrence and
+        // `API_WRITE_METHOD` matches only the spaced spelling, so a
+        // first-reading-wins scan would clear each of these as a GET while gh
+        // performs the write.
+        for cmd in [
+            "gh api repos/cameronsjo/x -X GET -XPOST -f a=b",
+            "gh api repos/cameronsjo/x -X GET --method=POST -f a=b",
+            "gh api repos/cameronsjo/x -X GET -X=DELETE -f a=b",
+            "gh api repos/cameronsjo/x -XGET -X PATCH -f a=b",
+        ] {
+            assert!(is_write_command(cmd), "must stay a write: {cmd}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_get_method_cannot_pose_as_the_flag() {
+        // Reads argv, so a method flag inside another flag's value is one
+        // token and never a reading of its own.
+        assert!(is_write_command(
+            r#"gh api repos/cameronsjo/x -f body="-X GET" -f name=y"#
+        ));
+        assert!(is_write_command(
+            r#"gh api repos/cameronsjo/x --field note="--method GET" -f n=1"#
+        ));
+    }
+
+    #[test]
+    fn explicit_get_does_not_relax_a_non_api_write() {
+        // `WRITE_ACTIONS` is tested independently of the narrowing.
+        assert!(is_write_command(
+            "gh issue create -R cameronsjo/x --title t --body -X GET"
+        ));
+    }
+
+    #[test]
+    fn api_explicit_method_ignores_non_api_subcommands() {
+        // A `-X` belonging to some other gh subcommand is not a method.
+        assert_eq!(api_explicit_method("gh pr create -X GET --title t"), None);
+        assert_eq!(api_explicit_method("gh api -X GET x"), Some("GET".into()));
+    }
+
+    #[test]
+    fn issue_454_repro_allows_from_an_owned_dir() {
+        // End-to-end: the reported command blocked as
+        // `gh-write-api-unverifiable` because `search/issues` names no
+        // owner/repo. As a read it never reaches that gate.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(ISSUE_454_CMD, OWNED_DIR));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn issue_454_repro_allows_from_an_unowned_dir() {
+        // Reads are owner-independent, so the fix must not depend on the cwd
+        // resolving to an owned repo.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(ISSUE_454_CMD, "/tmp"));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn the_adjacent_search_write_still_blocks() {
+        // Same unverifiable endpoint, one flag different: still a write, still
+        // blocked. This is the control proving the fix narrowed the method
+        // decision rather than the endpoint gate.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                "gh api -X POST search/issues -f q=x",
+                OWNED_DIR,
+            ));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    // --- #457: `gh repo edit` names its target positionally ---
+
+    #[test]
+    fn repo_edit_is_still_a_write() {
+        assert!(is_write_command(
+            "gh repo edit cameronsjo/x --enable-issues"
+        ));
+    }
+
+    #[test]
+    fn repo_edit_positional_names_the_target() {
+        assert_eq!(
+            gh_repo_positional_target("gh repo edit cameronsjo/cli-capture --enable-issues"),
+            Some(("edit".to_string(), "cameronsjo/cli-capture".to_string()))
+        );
+    }
+
+    #[test]
+    fn issue_457_repro_allows_from_an_unowned_dir() {
+        // The reported shape: an owned repo named positionally, from a checkout
+        // whose origin belongs to someone else. `gh repo edit` has no
+        // `-R`/`--repo` flag, so the block's advised fix was unsatisfiable and
+        // no cwd could clear it. /tmp stands in for "cwd does not resolve to
+        // the target" without depending on a fixture remote.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                "gh repo edit cameronsjo/cli-capture --enable-issues",
+                "/tmp",
+            ));
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn repo_edit_of_an_unowned_target_still_blocks() {
+        // The other direction, and a false ALLOW closed on the way: from an
+        // owned checkout the cwd remote used to answer for this command, so an
+        // off-owner `gh repo edit` resolved to the OWNED repo and passed. The
+        // positional now decides, and ownership is judged against the repo the
+        // command actually names.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                "gh repo edit evil-corp/cool-tool --enable-issues",
+                OWNED_DIR,
+            ));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        });
+    }
+
+    #[test]
+    fn repo_edit_without_a_positional_still_falls_back_to_the_cwd() {
+        // `gh repo edit --enable-issues` edits the cwd's repo, so resolution
+        // must still reach the git-remote arm — the positional arm declines
+        // rather than reading a flag as a target.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with("gh repo edit --enable-issues", "/tmp"));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+        });
+    }
+
+    #[test]
+    fn repo_edit_positional_silences_the_bare_write_nudge() {
+        // The nudge advises `-R owner/repo`, which `gh repo edit` cannot
+        // accept. Now that the positional counts as an explicit target, the
+        // complement predicate agrees and the advice is withheld.
+        assert!(!segment_lacks_explicit_target(
+            "gh repo edit cameronsjo/cli-capture --enable-issues"
+        ));
+    }
+
+    #[test]
+    fn repo_edit_verb_in_quoted_prose_still_donates_no_target() {
+        // #463's invariant must hold for the newly-added verb too.
+        assert_eq!(
+            gh_repo_positional_target(
+                r#"gh issue create -R cameronsjo/x --body "run gh repo edit evil/target""#
+            ),
+            None
+        );
     }
 }
