@@ -102,6 +102,17 @@ const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 /// case-insensitively would be wrong on Linux. Mitigated: a settings
 /// `allow Bash(rm:*)` rule keys on the leading word too, so it defers, never
 /// silently auto-approves.)
+///
+/// **Deliberately NOT the shared [`cadence_hooks_core::shell::command_word`],
+/// which the enforce-worktree verb gates moved onto (#450 review).** The two
+/// differ on one input: the shared one strips exactly ONE backslash, so `\\rm`
+/// normalizes to `\rm` and is not a delete verb — which is what the shell does,
+/// since it removes one backslash and then finds no command named `\rm`. The
+/// repeating strip here calls `\\rm` a deletion and blocks it. Converging would
+/// therefore *loosen* a block-capable guard on a spelling nobody has measured
+/// in the wild, so it is left alone and tracked separately rather than ridden
+/// in on a PR about three other issues. The two are consistent in the direction
+/// that matters: every spelling the shell really runs as `rm` is caught by both.
 fn command_word(token: &str) -> &str {
     basename(token).trim_start_matches('\\')
 }

@@ -165,8 +165,9 @@ use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, looks_absolute, redirect_targets,
-    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops, tokenize,
+    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, command_word, looks_absolute,
+    redirect_targets, resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops,
+    tokenize,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -604,23 +605,14 @@ fn is_linked_worktree_admin_dir(path: &str) -> bool {
 /// `==` comparisons — is not skipped, so this can only widen the leading-word
 /// gate past words the shell itself treats as environment prefixes.
 ///
-/// Kept local rather than imported: `cadence_hooks_core::shell` has its own
-/// copy, but it is private there — only that crate's `skip_transparent_prefixes`
-/// needs it. This guard's [`is_prefix_word`] needs the identical predicate for
-/// [`git_env_overrides`]'s shared prefix region (see there), and duplicating a
-/// four-line predicate is cheaper than widening core's visibility for one
-/// extra caller.
-fn is_assignment_word(token: &str) -> bool {
-    match token.split_once('=') {
-        Some((name, _)) if !name.is_empty() => {
-            name.chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        _ => false,
-    }
-}
+/// Re-exported from `cadence_hooks_core::shell` rather than duplicated. It was
+/// a local copy while core's was private; core made it `pub` so the
+/// `prevent-secret-leaks` `env`-operand peel could share one definition (#411),
+/// which retires the duplicate here. [`is_prefix_word`] needs exactly the
+/// predicate `skip_transparent_prefixes` uses, so the two agreeing by
+/// construction is the point — a drifted copy would let this guard and core
+/// disagree about what the shell treats as an environment prefix.
+use cadence_hooks_core::shell::is_assignment_word;
 
 /// `strip_group_wrappers`, along with `skip_transparent_prefixes` and
 /// `TRANSPARENT`, now lives in [`cadence_hooks_core::shell`] (cadence-hooks#419)
@@ -682,13 +674,17 @@ fn mutation_targets(command: &str, cwd: &str) -> Vec<MutationTarget> {
 /// being the primary checkout is the sole trigger, no path resolution (a
 /// package manager writes its manifest relative to cwd). `python -m pip …`,
 /// `sudo`-wrapped forms, and unlisted managers are named accepted misses.
+///
+/// The verb goes through [`command_word`], not a bare `basename`: this gate is
+/// block-capable, and `\npm install` / `\cargo add` produced no mutation target
+/// at all — the same silent-ALLOW shape as #450's commit gate, one file over.
 fn is_package_mutation(argv: &[String]) -> bool {
     let Some(cmd) = argv.first() else {
         return false;
     };
     let sub = argv.get(1).map(String::as_str);
     matches!(
-        (basename(cmd), sub),
+        (command_word(cmd), sub),
         ("uv", Some("add" | "remove" | "sync"))
             | ("cargo", Some("add" | "rm"))
             | ("pip" | "pip3", Some("install"))
@@ -704,11 +700,15 @@ fn is_package_mutation(argv: &[String]) -> bool {
 /// operand — multiple files catch only the last) and `tee <file>` (every
 /// non-flag operand). Other tree mutators (`cp`/`mv`/`dd`/`patch`/`perl -i`/
 /// `git apply|restore|rm|mv`/…) are named accepted misses — not enumerated.
+///
+/// Verb via [`command_word`] for the same reason [`is_package_mutation`] uses
+/// it: `\sed -i Cargo.toml` is a real in-place mutation, and matching on a bare
+/// `basename` collected nothing (#450 review).
 fn file_mutation_targets(argv: &[String]) -> Vec<String> {
     let Some(cmd) = argv.first() else {
         return Vec::new();
     };
-    match basename(cmd) {
+    match command_word(cmd) {
         "sed" => {
             let in_place = argv.iter().any(|t| {
                 t == "-i"
@@ -984,19 +984,19 @@ fn resolve_git_path(path: &str, base: &str) -> String {
 /// fail-open, since the targets resolve fine (#378). An unresolvable value still
 /// fails open downstream: [`assess_dir`] Allows when [`GitState`] finds no repo.
 ///
-/// The leading word is matched by [`basename`] after removing ONE leading
-/// backslash, so a path-qualified (`/usr/bin/git commit`) or alias-escaped
-/// (`\git commit`) spelling is recognized as the commit it is. An exact-string
-/// compare missed both and yielded no target at all — no target means no block,
-/// so the narrowness was purely a bypass of a block-capable gate rather than a
-/// verdict anything depended on (#450). Both spellings are ordinary habits: a
-/// script invoking git by absolute path, and the standard way to sidestep a
-/// `git` alias. Removal is [`str::strip_prefix`], never `trim_start_matches`:
-/// the repeating form collapses `\\git` to `git`, but the shell removes exactly
-/// one backslash and looks up `\git`, a different command (the bug caught in
-/// #442's review). The siblings here — [`is_package_mutation`],
-/// [`file_mutation_targets`], [`is_dismiss_enforce_segment`] — already classify
-/// their verbs by basename; this brings the commit gate onto the same footing.
+/// The leading word is matched through [`command_word`], so a path-qualified
+/// (`/usr/bin/git commit`), alias-escaped (`\git commit`), or Windows
+/// (`C:\Program Files\Git\cmd\git.exe commit`) spelling is recognized as the
+/// commit it is. An exact-string compare against `"git"` missed every one of
+/// them and yielded no target at all — no target means no block, so the
+/// narrowness was purely a bypass of a block-capable gate rather than a verdict
+/// anything depended on (#450). These are ordinary habits: a script invoking
+/// git by absolute path, and the standard way to sidestep a `git` alias.
+///
+/// [`command_word`] is shared with [`is_package_mutation`] and
+/// [`file_mutation_targets`], which had the same gap — the normalization lives
+/// in exactly one place so a new verb gate cannot silently reopen the bypass by
+/// forgetting a step.
 fn commit_targets_of(
     argv: &[String],
     effective_dir: &str,
@@ -1006,7 +1006,7 @@ fn commit_targets_of(
     let Some(verb) = argv.first() else {
         return Vec::new();
     };
-    if basename(verb.strip_prefix('\\').unwrap_or(verb)) != "git" {
+    if command_word(verb) != "git" {
         return Vec::new();
     }
     const VALUE_GLOBALS: &[&str] = &[
@@ -1195,6 +1195,12 @@ fn inchain_dismissed_commits(command: &str, cwd: &str) -> HashMap<CommitTarget, 
 /// `cadence-hooks` binary (by basename) — so a dismiss wrapped in `$(…)` or
 /// `sh -c '…'`, where the binary word is not the segment's own command, is not
 /// matched (top-level only, #323).
+/// Deliberately on a bare [`basename`] rather than [`command_word`], unlike the
+/// verb gates above. This one recognizes a *bypass*, so the two directions
+/// invert: a missed spelling here refuses a dismissal the operator meant to
+/// perform (annoying, and it fails toward blocking), while a *widened* one
+/// widens the escape hatch itself. The verb gates widen toward more blocking
+/// and want every spelling; this gate does not.
 fn is_dismiss_enforce_segment(argv: &[String]) -> bool {
     argv.first().map(|c| basename(c)) == Some("cadence-hooks")
         && argv
@@ -1928,6 +1934,63 @@ mod tests {
         // different command. A repeating strip would collapse this to `git`
         // and invent a commit — the bug caught in #442's review.
         assert!(git_commit_targets(r"\\git commit -m x", "/cwd").is_empty());
+    }
+
+    #[test]
+    fn windows_git_spellings_are_commits() {
+        // The CHANGELOG for #450 claimed parity with the file's other verb
+        // classifiers; `basename` splits on `/` only and never dropped `.exe`,
+        // so both Windows spellings fell through to ALLOW — the same silent
+        // bypass the issue is about. This guard already treats Windows paths as
+        // a live fail-open class (#377/#378), so they are not hypothetical.
+        for cmd in [
+            "git.exe commit -m x",
+            "C:/tools/git.exe commit -m x",
+            "C:\\tools\\git.exe commit -m x",
+            "/c/git/cmd/git.exe commit -m x",
+            "\"/c/Program Files/Git/cmd/git.exe\" commit -m x",
+        ] {
+            assert_eq!(
+                git_commit_targets(cmd, "/cwd"),
+                vec!["/cwd".to_string()],
+                "windows spelling should resolve a commit target: {cmd}"
+            );
+        }
+        // Accepted miss, and it is the TOKENIZER's, not the verb classifier's:
+        // a backslash-escaped space splits `/c/Program\ Files/…` into two
+        // tokens, so the command word is `/c/Program\` before `command_word`
+        // ever runs. The quoted spelling above is the one that survives
+        // tokenization, and it resolves. Teaching `tokenize` about escaped
+        // spaces would move a primitive several block-capable guards share.
+        assert!(
+            git_commit_targets("/c/Program\\ Files/Git/cmd/git.exe commit -m x", "/cwd").is_empty()
+        );
+    }
+
+    #[test]
+    fn escaped_package_and_file_mutators_are_seen() {
+        // #450 was only half closed: the commit gate got the normalization and
+        // the sibling mutation gates did not, so `\npm install` and
+        // `\sed -i <file>` produced no mutation target at all — the identical
+        // silent-ALLOW shape, one function over. All three now share
+        // `command_word`.
+        for cmd in [
+            "\\npm install",
+            "\\cargo add serde",
+            "/usr/local/bin/npm install",
+        ] {
+            assert!(
+                !mutation_targets(cmd, "/cwd").is_empty(),
+                "escaped/path-qualified package mutation should register: {cmd}"
+            );
+        }
+        assert!(
+            !mutation_targets("\\sed -i '' s/a/b/ f.txt", "/cwd").is_empty(),
+            "escaped in-place sed should register a mutation target"
+        );
+        // Negative control: the widening must not invent mutations.
+        assert!(mutation_targets("\\\\npm install", "/cwd").is_empty());
+        assert!(mutation_targets("npmx install", "/cwd").is_empty());
     }
 
     #[test]
