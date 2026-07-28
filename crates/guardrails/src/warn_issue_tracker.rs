@@ -14,7 +14,7 @@
 
 use cadence_hooks_core::config::{self, default_host, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::shell::{
-    git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
+    contains_ignoring_ascii_case, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -63,26 +63,33 @@ fn trackers() -> Vec<String> {
 
 /// Matches `gh api /?repos/OWNER/REPO/issues` where `/issues` is the final
 /// path segment (no issue number, comments, or other sub-resource after it).
+///
+/// The four patterns here fold their leading `gh` and nothing else
+/// (cadence-hooks#488): `GH` is a spelling the shell runs on a case-insensitive
+/// volume, while `api` and the method values are gh's own and stay
+/// case-sensitive where gh is. These are deliberate LOCAL copies of
+/// `guard_gh_write`'s same-named patterns, so folding one file's set does not
+/// reach the other's — each has to be done on its own.
 static API_ISSUES_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api\s[^\n]*/?repos/([^/\s]+/[^/\s]+)/issues(?:\s|$|[?#])")
+    Regex::new(r"(?i:gh)\s+api\s[^\n]*/?repos/([^/\s]+/[^/\s]+)/issues(?:\s|$|[?#])")
         .expect("pattern should compile")
 });
 
 /// Detects a `gh api` call with an explicit write method flag.
 static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
+    Regex::new(r"(?i:gh)\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
         .expect("pattern should compile")
 });
 
 /// Detects a `gh api` call with field flags (implies a write).
 static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
+    Regex::new(r"(?i:gh)\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
         .expect("pattern should compile")
 });
 
 /// Detects a `gh api` call with `--input` (implies a write).
 static API_INPUT_FLAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"gh\s+api.*\s--input\s").expect("pattern should compile"));
+    LazyLock::new(|| Regex::new(r"(?i:gh)\s+api.*\s--input\s").expect("pattern should compile"));
 
 /// Extract a `-R`/`--repo` flag value from a raw command string.
 ///
@@ -115,7 +122,7 @@ fn extract_repo_flag(command: &str) -> Option<String> {
 /// - `gh issue create` (after quote-stripping, so quoted occurrences are data)
 /// - `gh api .../repos/OWNER/REPO/issues` path with a write method or field flags
 fn is_issue_create(stripped: &str) -> bool {
-    if stripped.contains("gh issue create") {
+    if contains_ignoring_ascii_case(stripped, "gh issue create") {
         return true;
     }
     API_ISSUES_PATH.is_match(stripped)
@@ -214,9 +221,15 @@ impl Check for WarnIssueTracker {
             return CheckResult::allow();
         };
 
-        // Fast-path: skip commands that can't possibly match.
+        // Fast-path: skip commands that can't possibly match. Folded, like
+        // the matcher behind it — a lowercase-only pre-filter is a silent veto
+        // over a case-folded matcher (cadence-hooks#488). The `API_*` method
+        // patterns this guard shares with `guard_gh_write` fold their `gh`, so
+        // these two tests must too or the `gh api` arm stays half-folded.
         let stripped = strip_quotes(command);
-        if !stripped.contains("gh issue create") && !stripped.contains("gh api") {
+        if !contains_ignoring_ascii_case(&stripped, "gh issue create")
+            && !contains_ignoring_ascii_case(&stripped, "gh api")
+        {
             return CheckResult::allow();
         }
 
@@ -344,6 +357,33 @@ mod tests {
                     &workdir("/tmp"),
                 );
                 assert_eq!(result, Some("cameronsjo/workbench".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn case_folded_gh_verb_nudges() {
+        // cadence-hooks#488. This guard shares the `API_*` method patterns with
+        // `guard_gh_write`, and those fold their `gh` — so its own `gh issue
+        // create` / `gh api` tests had to fold too, or the `gh api` arm would
+        // be half-folded: the method matched, the invocation didn't.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                for cmd in [
+                    "GH issue create -R cameronsjo/workbench --title x",
+                    "Gh issue create -R cameronsjo/workbench --title x",
+                    "GH api repos/cameronsjo/workbench/issues -X POST -f title=x",
+                ] {
+                    assert_eq!(
+                        judge_issue_target(cmd, &workdir("/tmp")),
+                        Some("cameronsjo/workbench".to_string()),
+                        "{cmd}"
+                    );
+                }
             },
         );
     }

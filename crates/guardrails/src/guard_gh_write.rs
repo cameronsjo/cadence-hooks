@@ -9,8 +9,8 @@ use cadence_hooks_core::config::{
 };
 use cadence_hooks_core::loop_analysis::{self, LoopAnalysis};
 use cadence_hooks_core::shell::{
-    LOOP_PATTERN, command_segments, command_word, host_and_repo_from_url, parse_work_dir,
-    strip_quotes, tokenize,
+    LOOP_PATTERN, command_segments, command_word, contains_ignoring_ascii_case,
+    host_and_repo_from_url, parse_work_dir, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{BlockMetadata, Check, CheckResult, HookInput};
 use regex::Regex;
@@ -18,9 +18,20 @@ use std::sync::LazyLock;
 
 // --- Write detection patterns ---
 
+// The leading `gh` is matched case-INSENSITIVELY, and nothing else in these
+// patterns is (cadence-hooks#488). On a case-insensitive volume the shell
+// resolves `GH` to the `gh` binary and runs the write; write detection is a raw
+// TEXT regex, so a literal lowercase `gh` here meant `GH pr create` never
+// reached the ownership decision — a silent Allow, measured against the built
+// binary. Folding `token_is_gh` alone does not close it: this test runs first.
+//
+// The nouns and subcommand verbs stay case-sensitive on purpose. gh itself
+// rejects `gh PR CREATE`, so folding them would match text the shell could
+// never run — the shape of #489's regression, where case-folding past the verb
+// broke `-C`/`-P`/`-S` and net-weakened a guard. Fold the verb, only the verb.
 static WRITE_ACTIONS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"gh\s+(pr|issue|release|label|repo|gist|workflow)\s+(create|merge|close|comment|edit|delete|transfer|archive|rename|review|reopen|ready|lock|unlock|fork|run|enable|disable)"
+        r"(?i:gh)\s+(pr|issue|release|label|repo|gist|workflow)\s+(create|merge|close|comment|edit|delete|transfer|archive|rename|review|reopen|ready|lock|unlock|fork|run|enable|disable)"
     ).expect("pattern should compile")
 });
 
@@ -33,23 +44,23 @@ static WRITE_ACTIONS: LazyLock<Regex> = LazyLock::new(|| {
 /// `gh project` are deliberately excluded (no `-R` → would mis-target cwd).
 static WRITE_ACTIONS_EXTRA: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"gh\s+(secret|variable)\s+(set|delete)\b|gh\s+release\s+upload\b|gh\s+label\s+clone\b",
+        r"(?i:gh)\s+(secret|variable)\s+(set|delete)\b|(?i:gh)\s+release\s+upload\b|(?i:gh)\s+label\s+clone\b",
     )
     .expect("pattern should compile")
 });
 
 static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
+    Regex::new(r"(?i:gh)\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
         .expect("pattern should compile")
 });
 
 static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
+    Regex::new(r"(?i:gh)\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
         .expect("pattern should compile")
 });
 
 static API_INPUT_FLAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"gh\s+api.*\s--input\s").expect("pattern should compile"));
+    LazyLock::new(|| Regex::new(r"(?i:gh)\s+api.*\s--input\s").expect("pattern should compile"));
 
 /// `gh repo` verbs whose FIRST positional argument names the target repo.
 /// Matched against parsed argv, never the raw command string, so a verb name
@@ -1722,7 +1733,13 @@ impl Check for GhWriteGuard {
             return CheckResult::allow();
         };
 
-        if !command.contains("gh") {
+        // Pre-filter on a folded copy, then judge the ORIGINAL text below. A
+        // lowercase-only `contains` here silently defeated the folded verb
+        // patterns and `token_is_gh` — the fast path returned Allow on `GH pr
+        // create` before either ran (cadence-hooks#488). The fold stops at this
+        // filter: nouns, subcommand verbs, flags, and `-R owner/repo` operands
+        // are all still matched case-sensitively downstream.
+        if !contains_ignoring_ascii_case(command, "gh") {
             return CheckResult::allow();
         }
 
@@ -1977,6 +1994,37 @@ mod tests {
         for tok in ["ghi", "github", "\\\\gh", "/opt/gh/bin/hub", "ghq"] {
             assert!(!token_is_gh(tok), "should NOT resolve to gh: {tok}");
         }
+    }
+
+    #[test]
+    fn token_is_gh_folds_ascii_case() {
+        // cadence-hooks#488: a case-insensitive volume runs `GH` as `gh`, so
+        // the write detector missed every capitalized spelling.
+        for tok in ["GH", "Gh", "/usr/bin/GH", "\\GH", "GH.EXE"] {
+            assert!(token_is_gh(tok), "should resolve to gh: {tok}");
+        }
+        for tok in ["GHI", "GITHUB", "\\\\GH", "GHQ"] {
+            assert!(!token_is_gh(tok), "should NOT resolve to gh: {tok}");
+        }
+    }
+
+    #[test]
+    fn write_detection_folds_the_gh_verb_only() {
+        // `token_is_gh` folding is necessary but NOT sufficient: write
+        // detection is a raw-TEXT regex, and its `gh` was a literal lowercase
+        // one, so `GH pr create` never reached the ownership decision at all
+        // (measured ALLOW against the built binary, cadence-hooks#488).
+        assert!(is_write_command("GH pr create --title x"));
+        assert!(is_write_command("Gh issue comment 1 --body x"));
+        assert!(is_write_command("GH secret set FOO"));
+        // Only the VERB folds. gh's own nouns and subcommand verbs stay
+        // case-SENSITIVE because gh itself rejects them capitalized — folding
+        // the whole pattern would match text the shell could never run, which
+        // is the #489 mistake in regex form.
+        assert!(!is_write_command("gh PR CREATE --title x"));
+        assert!(!is_write_command("gh pr CREATE --title x"));
+        // Longer words starting with the verb are still not the verb.
+        assert!(!is_write_command("GHQ pr create --title x"));
     }
 
     #[test]
@@ -3177,6 +3225,30 @@ mod tests {
             let input = input_with("gh repo create evil/x --public", "/tmp");
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn case_folded_gh_write_blocked_end_to_end() {
+        // The unit-level `is_write_command` / `token_is_gh` folds are not
+        // enough on their own: this guard opens with a `contains("gh")` fast
+        // path, and while that was lowercase-only it returned Allow on `GH pr
+        // create` before either fold could run (cadence-hooks#488, measured
+        // ALLOW against the built binary even with both unit tests green).
+        // Asserting through `run` is what makes the pre-filter part of the
+        // contract instead of an invisible upstream veto.
+        with_env(&owners_env_212(), || {
+            for cmd in [
+                "GH repo create evil/x --public",
+                "Gh repo create evil/x --public",
+                "/usr/bin/GH repo create evil/x --public",
+            ] {
+                let result = GhWriteGuard.run(&input_with(cmd, "/tmp"));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "{cmd}"
+                );
+            }
         });
     }
 
