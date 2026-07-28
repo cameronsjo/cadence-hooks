@@ -260,8 +260,25 @@ pub fn render_disclosure(own: &SessionRecord, peers: &[Peer]) -> String {
 mod tests {
     use super::*;
     use cadence_hooks_core::Outcome;
+    use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
     use cadence_hooks_core::test_builders::make_session;
     use tempfile::TempDir;
+
+    /// This crate's own `target/`-relative scratch root — `env!` resolves at
+    /// THIS call site, landing under `crates/session`'s own `target/`. Only a
+    /// default: [`cadence_hooks_core::git_fixtures::resolve_scratch_dir`]
+    /// relocates outside it when the checkout itself sits under a carve-out
+    /// (cadence-hooks#403 — the exact split #437 documented below at
+    /// `run_start_stays_silent_with_no_in_flight_plans` was a symptom of).
+    fn scratch_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/session-posture-scratch")
+    }
+
+    /// Thin wrapper binding [`Scratch::new`] to this module's own
+    /// `scratch_root()` — same convention `enforce_worktree`'s tests use.
+    fn scratch(tag: &str) -> Scratch {
+        Scratch::new(&scratch_root(), tag)
+    }
 
     fn make_session_with_cwd(session_id: &str, source: &str, cwd: &str) -> HookInput {
         let mut input = make_session(session_id, source);
@@ -537,9 +554,9 @@ mod tests {
 
     #[test]
     fn run_start_surfaces_in_flight_plan_disclosure() {
-        let scratch = Scratch::new("plan-disclosure");
-        init_repo(&scratch.0);
-        let plans_dir = scratch.0.join("docs").join("plans");
+        let scratch = scratch("plan-disclosure");
+        init_repo(scratch.path());
+        let plans_dir = scratch.path().join("docs").join("plans");
         std::fs::create_dir_all(&plans_dir).unwrap();
         std::fs::write(
             plans_dir.join("2026-07-25-x.md"),
@@ -547,7 +564,7 @@ mod tests {
         )
         .unwrap();
         let registry_dir = TempDir::new().unwrap();
-        let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
+        let input = make_session_with_cwd("solo", "startup", &scratch.path().to_string_lossy());
         let r = with_clean_worktree_env(|| {
             run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
         });
@@ -563,10 +580,10 @@ mod tests {
 
     #[test]
     fn run_start_stays_silent_with_no_in_flight_plans() {
-        let scratch = Scratch::new("plan-disclosure-empty");
-        init_repo(&scratch.0);
+        let scratch = scratch("plan-disclosure-empty");
+        init_repo(scratch.path());
         let registry_dir = TempDir::new().unwrap();
-        let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
+        let input = make_session_with_cwd("solo", "startup", &scratch.path().to_string_lossy());
         // CADENCE_ALLOW_MAIN pins the worktree-posture half of `finish()`
         // silent regardless of environment (the same pattern
         // `posture_line_silent_when_allow_main_env_set` uses below), so this
@@ -724,51 +741,15 @@ mod tests {
 
     // --- worktree-posture line (cadence-hooks#236) ---
     //
-    // Fixtures live under `target/`, NOT a tempdir — `is_temp_root`'s own
-    // exemption would otherwise mask the posture line entirely (the
+    // Fixtures live under `target/` by default, NOT a tempdir — `is_temp_root`'s
+    // own exemption would otherwise mask the posture line entirely (the
     // documented Scratch/E2E gotcha; see enforce_worktree's identical
-    // pattern). Serialized against the other env-mutating tests in this
-    // block via ENV_LOCK, since `would_block_here` reads real process env.
+    // pattern). `Scratch` relocates outside the checkout when that default
+    // itself lands under a carve-out (cadence-hooks#403). Serialized against
+    // the other env-mutating tests in this block via ENV_LOCK, since
+    // `would_block_here` reads real process env.
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct Scratch(std::path::PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/session-posture-scratch")
-                .join(format!("{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn git_in(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert!(ok, "git {args:?} failed in {dir:?}");
-    }
-
-    fn init_repo(dir: &Path) {
-        git_in(dir, &["init", "-q", "-b", "main"]);
-        git_in(dir, &["config", "user.email", "t@t"]);
-        git_in(dir, &["config", "user.name", "t"]);
-        std::fs::write(dir.join("f.txt"), "x").unwrap();
-        git_in(dir, &["add", "f.txt"]);
-        git_in(dir, &["commit", "-q", "-m", "init"]);
-    }
 
     /// Restores the caller's `CADENCE_ALLOW_MAIN`/`CADENCE_NO_ENFORCE_WORKTREE`
     /// on drop — including on panic, so a failed assertion can't leak a
@@ -833,9 +814,10 @@ mod tests {
 
     #[test]
     fn posture_line_fires_in_primary_checkout() {
-        let scratch = Scratch::new("primary");
-        init_repo(&scratch.0);
-        let line = with_clean_worktree_env(|| worktree_posture_line(&scratch.0.to_string_lossy()));
+        let scratch = scratch("primary");
+        init_repo(scratch.path());
+        let line =
+            with_clean_worktree_env(|| worktree_posture_line(&scratch.path().to_string_lossy()));
         assert!(line.is_some());
         let msg = line.unwrap();
         assert!(msg.contains("primary checkout"));
@@ -845,11 +827,11 @@ mod tests {
 
     #[test]
     fn posture_line_silent_in_linked_worktree() {
-        let scratch = Scratch::new("wt");
-        init_repo(&scratch.0);
-        let wt = scratch.0.join("wt");
+        let scratch = scratch("wt");
+        init_repo(scratch.path());
+        let wt = scratch.path().join("wt");
         git_in(
-            &scratch.0,
+            scratch.path(),
             &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
         );
         // Clean env: silence must come from the linked-worktree cwd, not an
@@ -860,19 +842,19 @@ mod tests {
 
     #[test]
     fn posture_line_silent_when_allow_main_env_set() {
-        let scratch = Scratch::new("allow-main-env");
-        init_repo(&scratch.0);
+        let scratch = scratch("allow-main-env");
+        init_repo(scratch.path());
         let line = with_worktree_env(Some("true"), None, || {
-            worktree_posture_line(&scratch.0.to_string_lossy())
+            worktree_posture_line(&scratch.path().to_string_lossy())
         });
         assert!(line.is_none(), "CADENCE_ALLOW_MAIN env silences the line");
     }
 
     #[test]
     fn posture_line_silent_when_allow_main_repo_declared() {
-        let scratch = Scratch::new("allow-main-repo");
-        init_repo(&scratch.0);
-        let claude_dir = scratch.0.join(".claude");
+        let scratch = scratch("allow-main-repo");
+        init_repo(scratch.path());
+        let claude_dir = scratch.path().join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
         std::fs::write(
             claude_dir.join("settings.json"),
@@ -881,26 +863,27 @@ mod tests {
         .unwrap();
         // Clean env: silence must come from the repo-declared flag, not an
         // ambient env exemption.
-        let line = with_clean_worktree_env(|| worktree_posture_line(&scratch.0.to_string_lossy()));
+        let line =
+            with_clean_worktree_env(|| worktree_posture_line(&scratch.path().to_string_lossy()));
         assert!(line.is_none());
     }
 
     #[test]
     fn posture_line_silent_when_kill_switch_set() {
-        let scratch = Scratch::new("kill-switch");
-        init_repo(&scratch.0);
+        let scratch = scratch("kill-switch");
+        init_repo(scratch.path());
         let line = with_worktree_env(None, Some("1"), || {
-            worktree_posture_line(&scratch.0.to_string_lossy())
+            worktree_posture_line(&scratch.path().to_string_lossy())
         });
         assert!(line.is_none(), "kill switch silences the line");
     }
 
     #[test]
     fn posture_line_silent_when_snoozed() {
-        let scratch = Scratch::new("snoozed");
-        init_repo(&scratch.0);
+        let scratch = scratch("snoozed");
+        init_repo(scratch.path());
         let marker =
-            cadence_hooks_core::worktree::enforce_worktree_marker_path_for(&scratch.0).unwrap();
+            cadence_hooks_core::worktree::enforce_worktree_marker_path_for(scratch.path()).unwrap();
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         let until = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -910,7 +893,8 @@ mod tests {
         std::fs::write(&marker, format!("{until}\n")).unwrap();
         // Clean env: silence must come from the snooze marker, not an ambient
         // env exemption.
-        let line = with_clean_worktree_env(|| worktree_posture_line(&scratch.0.to_string_lossy()));
+        let line =
+            with_clean_worktree_env(|| worktree_posture_line(&scratch.path().to_string_lossy()));
         assert!(line.is_none());
     }
 
@@ -919,10 +903,10 @@ mod tests {
         // The core fix: today `run_start` returns Allow silently when there
         // are no live peers. A primary-checkout cwd must still surface the
         // posture line even with an empty room.
-        let scratch = Scratch::new("run-start-solo");
-        init_repo(&scratch.0);
+        let scratch = scratch("run-start-solo");
+        init_repo(scratch.path());
         let registry_dir = tempfile::TempDir::new().unwrap();
-        let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
+        let input = make_session_with_cwd("solo", "startup", &scratch.path().to_string_lossy());
         let r = with_clean_worktree_env(|| {
             run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
         });
@@ -937,10 +921,10 @@ mod tests {
 
     #[test]
     fn run_start_joins_posture_and_peer_disclosure() {
-        let scratch = Scratch::new("run-start-both");
-        init_repo(&scratch.0);
+        let scratch = scratch("run-start-both");
+        init_repo(scratch.path());
         let registry_dir = tempfile::TempDir::new().unwrap();
-        let cwd = scratch.0.to_string_lossy().into_owned();
+        let cwd = scratch.path().to_string_lossy().into_owned();
 
         let peer_input = make_session_with_cwd("peer-session", "startup", &cwd);
         run_start(
@@ -967,11 +951,11 @@ mod tests {
     #[test]
     fn run_start_stays_silent_off_primary_checkout() {
         // A linked worktree cwd with no peers: neither disclosure fires.
-        let scratch = Scratch::new("run-start-wt");
-        init_repo(&scratch.0);
-        let wt = scratch.0.join("wt");
+        let scratch = scratch("run-start-wt");
+        init_repo(scratch.path());
+        let wt = scratch.path().join("wt");
         git_in(
-            &scratch.0,
+            scratch.path(),
             &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/y"],
         );
         let registry_dir = tempfile::TempDir::new().unwrap();
@@ -996,17 +980,17 @@ mod tests {
     fn posture_line_matches_enforce_worktree_block_decision() {
         // ENV_LOCK is taken by `with_clean_worktree_env` below (non-reentrant
         // — do not also acquire it here).
-        let scratch = Scratch::new("parity");
-        let primary = scratch.0.join("primary");
+        let scratch = scratch("parity");
+        let primary = scratch.path().join("primary");
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
-        let wt = scratch.0.join("wt");
+        let wt = scratch.path().join("wt");
         git_in(
             &primary,
             &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
         );
 
-        let snoozed = scratch.0.join("snoozed-repo");
+        let snoozed = scratch.path().join("snoozed-repo");
         std::fs::create_dir(&snoozed).unwrap();
         init_repo(&snoozed);
         let marker =

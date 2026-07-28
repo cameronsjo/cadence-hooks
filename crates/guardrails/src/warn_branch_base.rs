@@ -381,52 +381,21 @@ mod tests {
     // Scratch/E2E gotcha `enforce_worktree`'s own tests carry the same note
     // for).
 
+    use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
     use std::path::PathBuf;
 
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/warn-branch-base-scratch")
-                .join(format!("{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn git_in(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert!(ok, "git {args:?} failed in {dir:?}");
-    }
-
-    fn init_repo(dir: &Path) {
-        git_in(dir, &["init", "-q", "-b", "main"]);
-        git_in(dir, &["config", "user.email", "t@t"]);
-        git_in(dir, &["config", "user.name", "t"]);
-        std::fs::write(dir.join("f.txt"), "x").unwrap();
-        git_in(dir, &["add", "f.txt"]);
-        git_in(dir, &["commit", "-q", "-m", "init"]);
+    /// Thin wrapper binding [`Scratch::new`] to this module's own
+    /// `scratch_root()` — same convention `enforce_worktree`'s tests use.
+    fn scratch(tag: &str) -> Scratch {
+        Scratch::new(&scratch_root(), tag)
     }
 
     /// Primary repo + linked worktree under a non-temp scratch root.
     fn primary_and_worktree(scratch: &Scratch) -> (PathBuf, PathBuf) {
-        let primary = scratch.0.join("repo");
+        let primary = scratch.path().join("repo");
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
-        let wt = scratch.0.join("wt");
+        let wt = scratch.path().join("wt");
         git_in(
             &primary,
             &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
@@ -443,6 +412,15 @@ mod tests {
     // module locks would not exclude each other under cargo's parallel runner
     // (cadence-hooks#298). Mirrors `session::start`'s
     // `with_worktree_env`/`WorktreeEnvGuard` pattern.
+
+    /// This crate's own `target/`-relative scratch root — `env!` resolves at
+    /// THIS call site, landing under `crates/guardrails`'s own `target/`.
+    /// Only a default: [`cadence_hooks_core::git_fixtures::resolve_scratch_dir`]
+    /// relocates outside it when the checkout itself sits under a carve-out
+    /// (cadence-hooks#403).
+    fn scratch_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/warn-branch-base-scratch")
+    }
 
     struct WorktreeEnvGuard {
         allow: Option<std::ffi::OsString>,
@@ -498,7 +476,7 @@ mod tests {
     #[test]
     fn checkout_b_in_primary_checkout_nudges_worktree_first() {
         with_clean_worktree_env(|| {
-            let scratch = Scratch::new("checkout-b-primary");
+            let scratch = scratch("checkout-b-primary");
             let (primary, _wt) = primary_and_worktree(&scratch);
             let input = make_bash_with_cwd("git checkout -b feat/x", primary.to_str().unwrap());
             let result = WarnBranchBase.run(&input);
@@ -512,7 +490,7 @@ mod tests {
     #[test]
     fn switch_c_in_primary_checkout_nudges_worktree_first() {
         with_clean_worktree_env(|| {
-            let scratch = Scratch::new("switch-c-primary");
+            let scratch = scratch("switch-c-primary");
             let (primary, _wt) = primary_and_worktree(&scratch);
             let input = make_bash_with_cwd("git switch -c feat/x", primary.to_str().unwrap());
             let result = WarnBranchBase.run(&input);
@@ -527,7 +505,7 @@ mod tests {
     #[test]
     fn checkout_b_in_linked_worktree_keeps_existing_behavior() {
         with_clean_worktree_env(|| {
-            let scratch = Scratch::new("checkout-b-wt");
+            let scratch = scratch("checkout-b-wt");
             let (_primary, wt) = primary_and_worktree(&scratch);
             // `wt` is checked out on `feat/x` (non-main) — since
             // `would_block_here` is false here (linked worktree, `.git` is a
@@ -548,7 +526,7 @@ mod tests {
     #[test]
     fn checkout_b_allow_main_suppresses_worktree_first_nudge() {
         with_worktree_env(Some("true"), None, || {
-            let scratch = Scratch::new("checkout-b-allow-main");
+            let scratch = scratch("checkout-b-allow-main");
             let (primary, _wt) = primary_and_worktree(&scratch);
             // Base is main and CADENCE_ALLOW_MAIN exempts the primary from
             // `would_block_here` — falls through to the unchanged
@@ -563,7 +541,7 @@ mod tests {
     #[test]
     fn checkout_b_kill_switch_suppresses_worktree_first_nudge() {
         with_worktree_env(None, Some("1"), || {
-            let scratch = Scratch::new("checkout-b-kill-switch");
+            let scratch = scratch("checkout-b-kill-switch");
             let (primary, _wt) = primary_and_worktree(&scratch);
             let input = make_bash_with_cwd("git checkout -b feat/x", primary.to_str().unwrap());
             let result = WarnBranchBase.run(&input);
@@ -602,7 +580,7 @@ mod tests {
     #[test]
     fn explicit_non_main_base_outside_primary_unchanged() {
         with_clean_worktree_env(|| {
-            let scratch = Scratch::new("explicit-base-wt");
+            let scratch = scratch("explicit-base-wt");
             let (_primary, wt) = primary_and_worktree(&scratch);
             let input = make_bash_with_cwd("git checkout -b feature develop", wt.to_str().unwrap());
             let result = WarnBranchBase.run(&input);
@@ -616,7 +594,7 @@ mod tests {
     #[test]
     fn plain_checkout_in_primary_stays_silent() {
         with_clean_worktree_env(|| {
-            let scratch = Scratch::new("plain-checkout-primary");
+            let scratch = scratch("plain-checkout-primary");
             let (primary, _wt) = primary_and_worktree(&scratch);
             // No `-b`/`-c` — is_branch_create gates before the worktree-first
             // check ever runs.
