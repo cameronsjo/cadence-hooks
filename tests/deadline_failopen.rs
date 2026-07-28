@@ -10,6 +10,7 @@
 //! wiring is exercised, not a unit seam.
 #![cfg(unix)]
 
+use cadence_hooks_core::git_fixtures::{Scratch, git_in};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output, Stdio};
@@ -374,14 +375,11 @@ fn enforce_worktree_edit_arm_spawns_no_git() {
     );
 }
 
-use cadence_hooks_core::test_builders::{Scratch, git_in};
-
 /// This crate's own `target/`-relative scratch root for the mutation-nudge
 /// spawn-bound tests below — `env!` resolves at THIS call site, so the
-/// promoted `Scratch` (cadence-hooks#485; formerly this file's own
-/// near-identical copy of `enforce_worktree`'s in-crate helper) still lands
-/// fixtures under `target/mutation-nudge-scratch/`, exactly where the
-/// pre-promotion local helper put them.
+/// promoted `Scratch` still lands fixtures under
+/// `target/mutation-nudge-scratch/`, exactly where the pre-promotion local
+/// helper put them.
 fn scratch_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/mutation-nudge-scratch")
 }
@@ -459,7 +457,7 @@ fn spawn_log(count_file: &std::path::Path) -> String {
 /// than suppressed by a knob that could silently grow.
 fn run_mutation_nudge(tag: &str, allow_main: bool) -> (String, String) {
     let scratch = Scratch::new(&scratch_root(), tag);
-    init_mutation_nudge_repo(&scratch.0);
+    init_mutation_nudge_repo(scratch.path());
 
     let shim = tempfile::tempdir().unwrap();
     let counts = tempfile::tempdir().unwrap();
@@ -470,7 +468,7 @@ fn run_mutation_nudge(tag: &str, allow_main: bool) -> (String, String) {
     let payload = serde_json::json!({
         "tool_name": "Bash",
         "tool_input": { "command": "tee root_file.txt sub/sub_file.txt" },
-        "cwd": scratch.0.to_string_lossy(),
+        "cwd": scratch.path().to_string_lossy(),
     })
     .to_string();
 
