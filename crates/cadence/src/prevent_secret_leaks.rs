@@ -11,7 +11,7 @@ use crate::secret_patterns::{
     command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token, is_safe_template, is_secret_shaped_var_name,
 };
-use cadence_hooks_core::shell::{command_segments, split_segments, tokenize};
+use cadence_hooks_core::shell::{command_segments, is_assignment_word, split_segments, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use std::path::Path;
@@ -194,37 +194,69 @@ fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
 /// executed command at the start of a segment, never a substring of an
 /// argument, path, or compound name like `direnv`/`envoy`/`gh env`.
 fn command_dumps_env(lower: &str) -> bool {
-    split_segments(lower).iter().any(|segment| {
-        let segment = segment.trim_start_matches(['(', '{', ' ', '\t']);
-        let tokens: Vec<&str> = segment
-            .split_whitespace()
-            .take_while(|t| !is_shell_operator(t))
-            .collect();
-        tokens_dump_env(&tokens)
-    })
+    split_segments(lower)
+        .iter()
+        .any(|segment| tokens_dump_env(&command_words(segment)))
 }
 
-/// A token that ends the current simple command's operand list — a redirection
-/// (`>`, `>>`, `2>`, `&>`, `>&2`, `<`, `<<<`, and their attached forms like
-/// `>out.sh`) or a leftover control operator [`split_segments`] did not consume
-/// (`&`, `;`, `|`, and closing group punctuation).
+/// One segment's tokens with its redirections removed — what is left is the
+/// command word and its operands.
 ///
-/// Load-bearing for [`command_dumps_env`]: `env > out.sh` is a dump whose
-/// **output is redirected**, and without this the `>` reads as `env`'s command
-/// operand and the whole thing looks like an exec — silently dropping a warning
-/// the previous leading-word test caught. A command operand cannot follow a
-/// redirection within one simple command, so truncating here is safe. (The rare
-/// leading-redirect spelling `> out.sh env` is an unchanged miss — the old
-/// leading-word test did not see it either.)
-fn is_shell_operator(token: &str) -> bool {
-    if matches!(token, "&" | ";" | "|" | "|&" | ")" | "}") {
-        return true;
+/// **Redirections are skipped, not treated as the end of the command.** bash
+/// permits them anywhere in a simple command, so `env -i >out.sh bash script.sh`
+/// and `env -u FOO 2>/dev/null make` are ordinary execs — truncating at the
+/// first `>` left options only and re-fired exactly the #411 false nudge this
+/// check exists to stop. Skipping keeps `env > out.sh` a dump (a dump whose
+/// output is being captured, which is the more alarming shape, not less) while
+/// letting the real verb behind a redirection be found.
+///
+/// A bare operator takes the following token as its target (`> out.sh`); an
+/// attached one carries it (`>out.sh`, `2>&1`). Control operators still end the
+/// scan — [`split_segments`] consumes `&`, `;`, `|`, `&&`, `||` and newlines
+/// outside quotes, so in practice only the group-closing `)`/`}` reach here,
+/// but the rest are kept as belt-and-suspenders: this function must not depend
+/// on another module's splitting staying exhaustive.
+///
+/// (The rare leading-redirect spelling `> out.sh env` is an unchanged miss —
+/// `>` is skipped, `out.sh` becomes the apparent verb, and it is not a dump.)
+fn command_words(segment: &str) -> Vec<&str> {
+    let segment = segment.trim_start_matches(['(', '{', ' ', '\t']);
+    let mut words = Vec::new();
+    let mut tokens = segment.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if matches!(token, "&" | ";" | "|" | "|&" | ")" | "}") {
+            break;
+        }
+        match redirection_of(token) {
+            // `> out.sh` — the operator's target is the next token.
+            Some(true) => {
+                tokens.next();
+            }
+            // `>out.sh`, `2>&1` — the operator carries its own target.
+            Some(false) => {}
+            None => words.push(token),
+        }
     }
-    // Strip an fd prefix (`2>`, `1>&2`) and an `&` prefix (`&>`), then look for
-    // the redirection character itself.
+    words
+}
+
+/// Is `token` a redirection, and if so does its target live in the NEXT token?
+///
+/// `Some(true)` for a bare operator (`>`, `>>`, `2>`, `&>`, `<`, `<<<`, `>&`),
+/// whose target follows as its own token. `Some(false)` for one carrying its
+/// target (`>out.sh`, `2>&1`, `>&2`). `None` when the token is not a
+/// redirection at all.
+fn redirection_of(token: &str) -> Option<bool> {
+    // Strip an fd prefix (`2>`, `1>&2`) and an `&` prefix (`&>`) before looking
+    // for the redirection character itself.
     let rest = token.trim_start_matches(|c: char| c.is_ascii_digit());
     let rest = rest.strip_prefix('&').unwrap_or(rest);
-    rest.starts_with('>') || rest.starts_with('<')
+    if !(rest.starts_with('>') || rest.starts_with('<')) {
+        return None;
+    }
+    // Nothing but operator punctuation left means the target is a separate
+    // token; anything else (a path, an fd after `>&`) is the target itself.
+    Some(rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '|')))
 }
 
 /// The dump decision for one segment's tokens.
@@ -266,21 +298,37 @@ fn tokens_dump_env<'a>(mut tokens: &'a [&'a str]) -> bool {
 /// two block-capable guards also depend on.
 ///
 /// The options that take a value are `-u`/`--unset`, `-C`/`--chdir`, and
-/// `-P`/`--default-path`; `--` ends option parsing. `-S`/`--split-string`
-/// returns `None` rather than consuming a value, because its value *is* the
-/// command line to run — treating it as an ordinary value would leave nothing
-/// behind and warn on a real exec, the very bug being fixed. Unrecognized
-/// options are assumed valueless, which can only leave a *later* token as the
-/// apparent verb; the dump-set test then rejects it and the check stays silent,
-/// the nudge-only fail-open direction.
+/// `-P`/`--default-path`; `--` ends *option* parsing but not assignment
+/// parsing, since `env -- FOO=1 printenv` still sets `FOO` and still dumps.
+///
+/// `-S`/`--split-string` returns `None` rather than consuming a value, because
+/// its value *is* the command line to run — treating it as an ordinary value
+/// would leave nothing behind and warn on a real exec, the very bug being
+/// fixed. **The named cost:** a dump spelled *inside* that string
+/// (`env -S 'printenv'`) is therefore never seen. Reading it would mean
+/// re-splitting the quoted value and re-entering the dump test on it, which
+/// this check's `split_whitespace` tokenizer cannot do faithfully; an accepted
+/// miss in the silent direction, consistent with the nudge-only posture.
+///
+/// Unrecognized options are assumed valueless, which can only leave a *later*
+/// token as the apparent verb; the dump-set test then rejects it and the check
+/// stays silent, the same fail-open direction.
 fn peel_env_options<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
     let mut idx = 0;
+    let mut options_ended = false;
     while idx < tokens.len() {
         let tok = tokens[idx];
-        if tok == "--" {
-            return Some(&tokens[(idx + 1).min(tokens.len())..]);
+        // Assignments are env's payload, not its options, and they may follow
+        // `--` — so this test comes before the end-of-options check.
+        if is_assignment_word(tok) {
+            idx += 1;
+            continue;
         }
-        if cadence_hooks_core::shell::is_assignment_word(tok) {
+        if options_ended {
+            return Some(&tokens[idx..]);
+        }
+        if tok == "--" {
+            options_ended = true;
             idx += 1;
             continue;
         }
@@ -300,11 +348,9 @@ fn peel_env_options<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
             if name == "split-string" {
                 return None;
             }
-            if value_attached {
-                idx += 1;
-            } else {
-                idx += usize::from(matches!(name, "unset" | "chdir" | "default-path")) + 1;
-            }
+            let takes_separate_value =
+                !value_attached && matches!(name, "unset" | "chdir" | "default-path");
+            idx += if takes_separate_value { 2 } else { 1 };
             continue;
         }
         // Short options, possibly clustered (`-iu FOO`). The FIRST value-taking
@@ -325,10 +371,18 @@ fn peel_env_options<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
             .find(|(_, c)| matches!(c.to_ascii_uppercase(), 'S' | 'U' | 'C' | 'P'))
         {
             Some((_, c)) if c.eq_ignore_ascii_case(&'s') => return None,
-            Some((i, c)) => idx += usize::from(i + c.len_utf8() == flag.len()) + 1,
+            Some((i, c)) => {
+                // The value is the rest of THIS token (`-uFOO`) unless the
+                // letter ends it, in which case the next token is the value.
+                let value_is_next_token = i + c.len_utf8() == flag.len();
+                idx += if value_is_next_token { 2 } else { 1 };
+            }
             None => idx += 1,
         }
     }
+    // Ran off the end: options and assignments only, no command operand. `idx`
+    // may have overshot (a value-taking option with nothing after it), so slice
+    // at the length rather than at `idx`.
     Some(&tokens[tokens.len()..])
 }
 
@@ -1545,6 +1599,10 @@ mod tests {
             "env -P /opt env",
             "env --chdir=/tmp printenv",
             "env --unset=FOO printenv",
+            // `--` ends OPTION parsing, not assignment parsing: env still sets
+            // FOO and still runs the dump behind it.
+            "env -- FOO=1 printenv",
+            "env -- printenv",
         ] {
             assert_eq!(
                 SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
@@ -1552,6 +1610,146 @@ mod tests {
                 "the verb surviving the peel is itself a dump: {cmd}"
             );
         }
+    }
+
+    // --- peel_env_options / command_words (direct unit coverage) ---
+    //
+    // The guard-level tables below drive these through the whole check, where a
+    // wrong peel can still reach the right verdict by accident (a mis-consumed
+    // value simply becomes a non-dump verb). These pin the grammar itself.
+
+    #[test]
+    fn peel_env_options_consumes_values_and_finds_the_operand() {
+        for (args, want) in [
+            // Options only — no command operand survives.
+            (vec![], Some(vec![])),
+            (vec!["-i"], Some(vec![])),
+            (vec!["-u", "foo"], Some(vec![])),
+            (vec!["-0", "-v"], Some(vec![])),
+            // A value-taking option with nothing after it must not panic.
+            (vec!["-u"], Some(vec![])),
+            (vec!["--unset"], Some(vec![])),
+            (vec!["--"], Some(vec![])),
+            // Separate values.
+            (vec!["-u", "foo", "make"], Some(vec!["make"])),
+            (vec!["-c", "/tmp", "make"], Some(vec!["make"])),
+            (vec!["-p", "/opt", "make"], Some(vec!["make"])),
+            // Attached values, long and short.
+            (vec!["-ufoo", "make"], Some(vec!["make"])),
+            (vec!["--unset=foo", "make"], Some(vec!["make"])),
+            (vec!["--chdir=/tmp", "make"], Some(vec!["make"])),
+            // Clustered shorts: the value-taking letter ends the cluster.
+            (vec!["-iu", "foo", "make"], Some(vec!["make"])),
+            // Assignments are payload, not options — and survive `--`.
+            (vec!["foo=bar", "make"], Some(vec!["make"])),
+            (vec!["--", "foo=1", "printenv"], Some(vec!["printenv"])),
+            (vec!["--", "make"], Some(vec!["make"])),
+            // `--` stops option parsing: a later `-x` is the command, not a flag.
+            (vec!["--", "-x"], Some(vec!["-x"])),
+            // Unknown options are assumed valueless.
+            (vec!["--debug", "make"], Some(vec!["make"])),
+            // `-S`/`--split-string` always supplies a command line.
+            (vec!["-s", "make -j4"], None),
+            (vec!["--split-string=make -j4"], None),
+        ] {
+            let got = peel_env_options(&args).map(<[&str]>::to_vec);
+            assert_eq!(got, want, "peel_env_options({args:?})");
+        }
+    }
+
+    #[test]
+    fn command_words_skips_redirections_without_ending_the_command() {
+        for (segment, want) in [
+            ("env", vec!["env"]),
+            // Bare operator: the target is the next token, both dropped.
+            ("env > out.sh", vec!["env"]),
+            (
+                "env -i > out.sh bash script.sh",
+                vec!["env", "-i", "bash", "script.sh"],
+            ),
+            // Attached operator: only that token is dropped.
+            (
+                "env -i >out.sh bash script.sh",
+                vec!["env", "-i", "bash", "script.sh"],
+            ),
+            (
+                "env -u foo 2>/dev/null make",
+                vec!["env", "-u", "foo", "make"],
+            ),
+            // `split_segments` splits on the `&` inside `2>&1`, so what reaches
+            // here is the truncated segment, never the whole command. Asserted
+            // in the shape production actually produces (see
+            // `bash_fd_dup_redirection_is_an_accepted_miss`).
+            ("env 2>", vec!["env"]),
+            ("env make 2>", vec!["env", "make"]),
+            // Group punctuation still ends the scan.
+            ("env )", vec!["env"]),
+            // Leading group punctuation is trimmed before the scan.
+            ("( env -u foo make", vec!["env", "-u", "foo", "make"]),
+        ] {
+            assert_eq!(command_words(segment), want, "command_words({segment:?})");
+        }
+    }
+
+    #[test]
+    fn bash_grouped_env_is_still_a_dump() {
+        // The `)`/`}` arm of `command_words` is the reachable one: without it
+        // the trailing token becomes an operand and `( env )` reads as an exec.
+        for cmd in ["( env )", "{ env; }", "( printenv )"] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "a grouped dump is still a dump: {cmd}"
+            );
+        }
+        // Control: grouping must not turn a real exec into a dump.
+        assert_eq!(
+            SecretLeaksGuard
+                .run(&make_bash_input("( env -u FOO make )"))
+                .outcome,
+            cadence_hooks_core::Outcome::Allow,
+            "a grouped exec is still an exec"
+        );
+    }
+
+    #[test]
+    fn bash_env_exec_behind_a_redirection_is_not_a_dump() {
+        // #411 round two: bash allows redirections anywhere in a simple
+        // command, so truncating at the first `>` left options only and
+        // re-fired the exact false nudge this check exists to stop.
+        for cmd in [
+            "env -i >out.sh bash script.sh",
+            "env -i > out.sh bash script.sh",
+            "env -u FOO 2>/dev/null make",
+            "env >log make",
+            "env -u FOO make 2>&1",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(cmd)).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "a redirection does not hide the command operand: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_fd_dup_redirection_is_an_accepted_miss() {
+        // `env 2>&1 make` still nudges, and NOT through anything this check
+        // decides: `split_segments` treats the `&` inside `2>&1` as a control
+        // operator, so the segment handed over is `env 2>` — a bare `env` with
+        // its operand in the *next* segment. Pre-existing (the old leading-word
+        // test nudged here too) and shared with every guard built on
+        // `split_segments`, so teaching it fd-dup syntax would move a primitive
+        // two block-capable guards depend on. Pinned so the miss is a recorded
+        // choice rather than a silent surprise, and so a future fix to the
+        // splitter shows up here as a failing test.
+        assert_eq!(
+            SecretLeaksGuard
+                .run(&make_bash_input("env 2>&1 make"))
+                .outcome,
+            cadence_hooks_core::Outcome::Nudge,
+            "accepted miss: the `&` of `2>&1` ends the segment before `make`"
+        );
     }
 
     #[test]
