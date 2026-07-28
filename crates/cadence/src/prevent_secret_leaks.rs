@@ -149,9 +149,11 @@ fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
 ///
 /// Quote-aware splitting prevents substring/heredoc false positives like
 /// `gh issue create --body "$(cat <<EOF ... env ... EOF)"` or
-/// `git commit -m "docs: foo; env usage"`. Known delta from the old
-/// hand-rolled splitter: backslash escapes are not handled, so a contrived
-/// `foo\;env` yields a spurious nudge (never a block) — accepted.
+/// `git commit -m "docs: foo; env usage"`. The escaped-separator delta this
+/// once accepted — a contrived `foo\;env` splitting into a bare `env` segment
+/// and nudging — is gone since `split_segments` began honoring backslash
+/// escapes (cameronsjo/cadence-hooks#475): `\;` is one escaped character, so
+/// the text stays a single token that matches nothing.
 fn is_executed_command(lower: &str, cmd: &[&str]) -> bool {
     for segment in split_segments(lower) {
         // Strip leading subshell/brace-group punctuation so a grouped command
@@ -525,6 +527,18 @@ mod tests {
 
     use cadence_hooks_core::test_builders::make_bash as make_bash_input;
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
+
+    #[test]
+    fn escaped_separator_does_not_fabricate_a_command_segment() {
+        // `foo\;env` is one word to the shell — the `;` is escaped, so no `env`
+        // command exists to nudge about. This was a documented false positive
+        // until `split_segments` started honoring backslash escapes (#475).
+        assert!(!is_executed_command("foo\\;env", &["env"]));
+        // Control: an UNescaped separator really does start an `env` command,
+        // so the assertion above is evidence about the escape, not about
+        // segment detection having stopped working.
+        assert!(is_executed_command("foo;env", &["env"]));
+    }
 
     #[test]
     fn read_env_blocked() {
