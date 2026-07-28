@@ -10,9 +10,12 @@
 //!
 //! 1. the spawn does not already set `isolation: "worktree"` (which would give
 //!    it a fresh agent-owned worktree, so it's already confined), and
-//! 2. the spawning session sits in the **primary checkout** (its `.git` is a
-//!    directory — a linked worktree's `.git` is a *file*, meaning the session
-//!    is already inside a worktree and its subagents inherit that isolation), and
+//! 2. the spawning session sits in the **primary checkout** — a session already
+//!    inside a linked worktree has subagents that inherit that isolation.
+//!    Primary-vs-linked comes from [`GitState`], which decides it by resolved
+//!    git identity rather than the `.git` surface form: a `--separate-git-dir`
+//!    primary has a `.git` *file* too, and reading that as linked skipped this
+//!    nudge on a genuine primary (cadence-hooks#345), and
 //! 3. a **sibling worktree exists** (`git worktree list` shows more than the
 //!    primary) — the sharpener that keeps the nudge silent unless a worktree is
 //!    actually in play.
@@ -441,6 +444,81 @@ mod tests {
             r.outcome,
             Outcome::Allow,
             "Explore dispatch from primary + sibling worktree is silent (read-only by convention)"
+        );
+
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN", v),
+                None => std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN"),
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_from_separate_git_dir_primary_nudges() {
+        // #345: a `--separate-git-dir` primary has a `.git` FILE, and
+        // `GitState` classified primary-vs-linked by that surface form — so
+        // this checkout read as Linked, `in_main` was false, and the nudge was
+        // silently skipped on a genuine primary. `is_primary_checkout` (which
+        // the block-capable enforce-worktree path uses) always called it
+        // primary; the two now share one classifier and this dispatch nudges.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN").ok();
+        // SAFETY: serialized via ENV_LOCK; restored below.
+        unsafe {
+            std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("work");
+        let gitdir = tmp.path().join("gitdir");
+        std::fs::create_dir_all(&primary).unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg("-b")
+            .arg("main")
+            .arg(format!("--separate-git-dir={}", gitdir.display()))
+            .arg(&primary)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git init --separate-git-dir failed");
+        assert!(primary.join(".git").is_file(), "sanity: .git is a file");
+        git(&primary, &["config", "user.email", "t@t"]);
+        git(&primary, &["config", "user.name", "t"]);
+        git(&primary, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = tmp.path().join("wt");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &wt.to_string_lossy(),
+                "-b",
+                "feat/x",
+            ],
+        );
+
+        let from_primary = make_agent(Some("general-purpose"), None, primary.to_str().unwrap());
+        let r = WarnSubagentWorktree.run(&from_primary);
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "a separate-git-dir primary with a sibling worktree should nudge"
+        );
+
+        // Control: the real linked worktree of the SAME repo — also a `.git`
+        // file — must still be silent. The fix distinguishes the two shapes
+        // rather than calling every `.git` file primary.
+        let from_wt = make_agent(Some("general-purpose"), None, wt.to_str().unwrap());
+        assert_eq!(
+            WarnSubagentWorktree.run(&from_wt).outcome,
+            Outcome::Allow,
+            "dispatch from inside the linked worktree stays silent"
         );
 
         // SAFETY: serialized via ENV_LOCK.

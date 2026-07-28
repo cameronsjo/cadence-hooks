@@ -89,17 +89,41 @@ pub fn is_primary_checkout(repo_root: &str) -> bool {
     if dot_git.is_dir() {
         return true;
     }
-    // `.git` is a file (or absent): resolve the worktree admin dir (git-dir)
-    // and the shared common dir, then compare canonical identities. Reuses
-    // `crate::paths` exactly as `GitState::resolve` does — no git subprocess.
+    // `.git` is a file (or absent): resolve the worktree admin dir (git-dir),
+    // then compare canonical identities against the common dir.
     let Some(git_dir) = crate::paths::read_gitdir_file(&dot_git, root) else {
         return false;
     };
-    let Some(common_dir) = crate::paths::resolve_git_common_dir(root) else {
+    git_dir_is_common_dir(&git_dir, root)
+}
+
+/// True when an already-resolved worktree git-dir **is** the repository's
+/// shared common dir — the canonical primary-vs-linked comparison, factored out
+/// so [`is_primary_checkout`] and [`crate::gitstate::GitState`] cannot drift
+/// apart (cadence-hooks#345). `GitState` classified by the `.git` surface form
+/// alone, so a `--separate-git-dir` primary read as Linked there while reading
+/// Primary here — one repository, two answers, depending on which guard asked.
+///
+/// The comparison is the one [`is_primary_checkout`]'s docs describe: a
+/// primary's git-dir IS the common dir, a linked worktree's is
+/// `…/.git/worktrees/<name>` and is not. Both sides are canonicalized so `..`
+/// segments (`resolve_git_common_dir` returns an un-normalized
+/// `…/worktrees/<wt>/../..` for a linked worktree) and symlinked prefixes
+/// (macOS `/var` vs `/private/var`) cannot make one repository compare unequal
+/// to itself.
+///
+/// Any resolution failure returns `false` — **not** primary. That is the
+/// fail-open direction for both callers (ADR-0001): a broken `.git` must never
+/// *newly* block `enforce-worktree`, nor *newly* nudge `warn-subagent-worktree`.
+///
+/// Callers handle the `.git`-is-a-directory fast path themselves, since they
+/// already stat it to decide whether there is a git-dir file to read at all.
+pub(crate) fn git_dir_is_common_dir(git_dir: &Path, repo_root: &Path) -> bool {
+    let Some(common_dir) = crate::paths::resolve_git_common_dir(repo_root) else {
         return false;
     };
     match (
-        std::fs::canonicalize(&git_dir),
+        std::fs::canonicalize(git_dir),
         std::fs::canonicalize(&common_dir),
     ) {
         (Ok(g), Ok(c)) => g == c,
