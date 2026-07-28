@@ -1714,7 +1714,15 @@ impl Check for EnforceWorktree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadence_hooks_core::test_builders::{make_bash, make_edit};
+    use cadence_hooks_core::test_builders::{Scratch, git_in, init_repo, make_bash, make_edit};
+
+    /// This crate's own `target/`-relative scratch root — `env!` resolves at
+    /// THIS call site, so the promoted `Scratch` (cadence-hooks#485) still
+    /// lands fixtures under `crates/guardrails/../../target/`, exactly where
+    /// the pre-promotion in-crate helper put them.
+    fn scratch_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/enforce-worktree-scratch")
+    }
 
     fn cfg(allow_main: bool, kill_switch: bool) -> EnvConfig {
         EnvConfig {
@@ -1833,7 +1841,7 @@ mod tests {
         // exemption must fire anyway. Simulated with a symlinked tmpdir under
         // the non-temp scratch root (`Scratch` is defined with the
         // end-to-end tests below).
-        let scratch = Scratch::new("tmpdir-canon");
+        let scratch = Scratch::new(&scratch_root(), "tmpdir-canon");
         let real = scratch.0.join("real");
         let link = scratch.0.join("link");
         std::fs::create_dir_all(&real).unwrap();
@@ -2559,58 +2567,6 @@ mod tests {
     // The scratch root lives under the workspace `target/` dir, NOT a tempdir:
     // the temp-root exemption would otherwise mask the block path entirely.
 
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/enforce-worktree-scratch")
-                .join(format!("{tag}-{}", std::process::id()));
-            // #312: the whole point of a `target/`-rooted fixture is to sit
-            // OUTSIDE the guard's own carve-outs — a `.claude/` component or a
-            // temp prefix would silently exempt every fixture and make the block
-            // paths pass vacuously. Fail loudly rather than test nothing.
-            assert!(
-                !is_claude_managed_dir(&root)
-                    && !cadence_hooks_core::worktree::path_under_temp_root(
-                        &root,
-                        std::env::var("TMPDIR").ok().as_deref(),
-                    ),
-                "fixture root sits under a carve-out (.claude/ or temp) — run the suite \
-                 from a carve-out-free checkout: {}",
-                root.display()
-            );
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn git_in(dir: &Path, args: &[&str]) {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert!(ok, "git {args:?} failed in {dir:?}");
-    }
-
-    fn init_repo(dir: &Path) {
-        git_in(dir, &["init", "-q", "-b", "main"]);
-        git_in(dir, &["config", "user.email", "t@t"]);
-        git_in(dir, &["config", "user.name", "t"]);
-        std::fs::write(dir.join("f.txt"), "x").unwrap();
-        git_in(dir, &["add", "f.txt"]);
-        git_in(dir, &["commit", "-q", "-m", "init"]);
-    }
-
     /// Write a repo-scoped Claude settings file declaring `env` values, for
     /// exercising `CADENCE_ALLOW_MAIN`'s target-repo-settings resolution.
     fn write_settings(repo: &Path, name: &str, body: &str) {
@@ -2634,7 +2590,7 @@ mod tests {
 
     #[test]
     fn edit_in_primary_blocks_and_in_worktree_allows() {
-        let scratch = Scratch::new("edit");
+        let scratch = Scratch::new(&scratch_root(), "edit");
         let (primary, wt) = primary_and_worktree(&scratch);
 
         let file = primary.join("src.rs");
@@ -2652,7 +2608,7 @@ mod tests {
 
     #[test]
     fn allow_main_and_kill_switch_exempt_primary() {
-        let scratch = Scratch::new("env");
+        let scratch = Scratch::new(&scratch_root(), "env");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let file = primary.join("src.rs");
         let input = edit_in(&primary, &file);
@@ -2669,7 +2625,7 @@ mod tests {
 
     #[test]
     fn claude_dir_and_plan_docs_exempt_in_primary() {
-        let scratch = Scratch::new("carveouts");
+        let scratch = Scratch::new(&scratch_root(), "carveouts");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         for sub in [".claude/worktrees/x/src.rs", "docs/plans/2026-07-02-p.md"] {
@@ -2683,7 +2639,7 @@ mod tests {
 
     #[test]
     fn snooze_marker_exempts_primary_and_attributes_dismissal() {
-        let scratch = Scratch::new("snooze");
+        let scratch = Scratch::new(&scratch_root(), "snooze");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let marker = dismiss_enforce_worktree::marker_path_for(&primary).unwrap();
@@ -2723,7 +2679,7 @@ mod tests {
     fn snooze_without_sidecar_allows_with_none_reason() {
         // An older marker armed before the sidecar existed: the guard still
         // allows and attributes a Dismissal, just with no reason/session.
-        let scratch = Scratch::new("snooze-legacy");
+        let scratch = Scratch::new(&scratch_root(), "snooze-legacy");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let marker = dismiss_enforce_worktree::marker_path_for(&primary).unwrap();
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
@@ -2748,7 +2704,7 @@ mod tests {
     fn env_switch_allow_attributes_env_switch() {
         // CADENCE_ALLOW_MAIN / CADENCE_NO_ENFORCE_WORKTREE suppress the block on a
         // primary checkout — the allow must carry an EnvSwitch bypass naming which.
-        let scratch = Scratch::new("env-bypass");
+        let scratch = Scratch::new(&scratch_root(), "env-bypass");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let file = primary.join("src.rs");
         let input = edit_in(&primary, &file);
@@ -2769,7 +2725,7 @@ mod tests {
     fn worktree_allow_carries_no_bypass() {
         // A normal worktree edit is fine on its own — no guard was stepped
         // outside of, so the allow stays bare (no bypasses.jsonl line).
-        let scratch = Scratch::new("wt-nobypass");
+        let scratch = Scratch::new(&scratch_root(), "wt-nobypass");
         let (_primary, wt) = primary_and_worktree(&scratch);
         let file = wt.join("src.rs");
         let input = edit_in(&wt, &file);
@@ -2780,7 +2736,7 @@ mod tests {
 
     #[test]
     fn commit_in_primary_blocks_and_in_worktree_allows() {
-        let scratch = Scratch::new("commit");
+        let scratch = Scratch::new(&scratch_root(), "commit");
         let (primary, wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("git commit -m 'x'");
@@ -2822,7 +2778,7 @@ mod tests {
         // The bug this fixes (issue #213): `cd <worktree> && git commit`, run
         // from a primary checkout's cwd, targets the worktree exactly like the
         // already-honored `git -C <worktree> commit` does.
-        let scratch = Scratch::new("cd-wt");
+        let scratch = Scratch::new(&scratch_root(), "cd-wt");
         let (primary, wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash(&format!("cd {} && git commit -m 'x'", wt.to_string_lossy()));
@@ -2844,7 +2800,7 @@ mod tests {
         // Issue #224: the target repo of a `cd <dir> && git commit` may be a
         // different primary checkout than the one the shell started in — it
         // must still be judged (and named) against the target, not the origin.
-        let scratch = Scratch::new("cd-other-primary");
+        let scratch = Scratch::new(&scratch_root(), "cd-other-primary");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let other_primary = scratch.0.join("other-repo");
         std::fs::create_dir(&other_primary).unwrap();
@@ -2889,7 +2845,7 @@ mod tests {
         // shows up once a real fixture repo is judged. cwd is the *worktree*
         // (allowed to commit on its own), so a bypass here would slip an
         // other-primary commit through as if it were the worktree.
-        let scratch = Scratch::new("cd-or-true");
+        let scratch = Scratch::new(&scratch_root(), "cd-or-true");
         let (_primary, wt) = primary_and_worktree(&scratch);
         let other_primary = scratch.0.join("other-repo");
         std::fs::create_dir(&other_primary).unwrap();
@@ -2922,7 +2878,7 @@ mod tests {
         // a bogus "<primary>/-P" path that resolves to no repo (fail-open
         // Allow), a regression this fix introduced relative to the pre-fix
         // cd-blind code (which judged cwd=primary and correctly blocked).
-        let scratch = Scratch::new("cd-dash-p");
+        let scratch = Scratch::new(&scratch_root(), "cd-dash-p");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("cd -P . && git commit -m 'x'");
@@ -2933,7 +2889,7 @@ mod tests {
 
     #[test]
     fn cd_double_dash_flag_still_blocks_from_primary() {
-        let scratch = Scratch::new("cd-double-dash");
+        let scratch = Scratch::new(&scratch_root(), "cd-double-dash");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("cd -- . && git commit -m 'x'");
@@ -2947,7 +2903,7 @@ mod tests {
         // `cd $DIR` — an unresolvable shell variable must not produce a
         // bogus "<primary>/$DIR" path that dodges repo detection; the pre-cd
         // directory (the primary) is judged instead.
-        let scratch = Scratch::new("cd-dollar-var");
+        let scratch = Scratch::new(&scratch_root(), "cd-dollar-var");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("cd $DIR && git commit -m 'x'");
@@ -2960,7 +2916,7 @@ mod tests {
     fn cd_dash_previous_dir_target_blocks_judged_against_pre_cd_dir() {
         // `cd -` (go to $OLDPWD) is unknowable at guard-eval time; the pre-cd
         // directory is judged instead of a bogus "<primary>/-" path.
-        let scratch = Scratch::new("cd-dash");
+        let scratch = Scratch::new(&scratch_root(), "cd-dash");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("cd - && git commit -m 'x'");
@@ -2976,7 +2932,7 @@ mod tests {
         // all. The guard resolves the (nonexistent, hence repo-less)
         // directory and fails open to Allow (ADR-0001) — same practical
         // outcome, different reason, still sane.
-        let scratch = Scratch::new("cd-nonexistent");
+        let scratch = Scratch::new(&scratch_root(), "cd-nonexistent");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("cd ./does-not-exist-xyz || exit; git commit -m 'x'");
@@ -2997,7 +2953,7 @@ mod tests {
         // `snooze_marker_exempts_primary` above). Confirms the
         // guard reads the snooze off the *target* repo, so a dismiss keyed to
         // the target (not the shell's cwd) is what actually unblocks it.
-        let scratch = Scratch::new("dismiss-repo");
+        let scratch = Scratch::new(&scratch_root(), "dismiss-repo");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let other_primary = scratch.0.join("other-repo");
         std::fs::create_dir(&other_primary).unwrap();
@@ -3080,7 +3036,7 @@ mod tests {
         // SEPARATE primary B that declares CADENCE_ALLOW_MAIN in its own
         // .claude/settings.json — the exemption must travel with the target,
         // not the shell's cwd.
-        let scratch = Scratch::new("cross-repo-allow-main");
+        let scratch = Scratch::new(&scratch_root(), "cross-repo-allow-main");
         let (primary_a, _wt) = primary_and_worktree(&scratch);
         let primary_b = scratch.0.join("declares-allow-main");
         std::fs::create_dir(&primary_b).unwrap();
@@ -3123,7 +3079,7 @@ mod tests {
         // so a `git commit` ridden through an env switch was never recorded in
         // bypasses.jsonl. Exercised here via CADENCE_ALLOW_MAIN (process env),
         // independent of the repo-settings mechanism, to lock the general fix.
-        let scratch = Scratch::new("bash-bypass-prov");
+        let scratch = Scratch::new(&scratch_root(), "bash-bypass-prov");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("git commit -m 'x'");
@@ -3142,7 +3098,7 @@ mod tests {
         // `dismiss && git commit` in the same primary: the dismiss arms the
         // snooze before the commit runs, so the commit is allowed — and recorded
         // as an in-chain Dismissal bypass, never a bare allow.
-        let scratch = Scratch::new("inchain-same");
+        let scratch = Scratch::new(&scratch_root(), "inchain-same");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash(
@@ -3167,7 +3123,7 @@ mod tests {
         // GATE RIDER: a `;` between the dismiss and the commit means the dismiss
         // might have failed at runtime with the commit still running — so the
         // snooze is not guaranteed to exist. Fail closed: still BLOCK.
-        let scratch = Scratch::new("inchain-semicolon");
+        let scratch = Scratch::new(&scratch_root(), "inchain-semicolon");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash(
@@ -3186,7 +3142,7 @@ mod tests {
     #[test]
     fn inchain_dismiss_different_repo_still_blocks() {
         // A dismiss `--repo B` does not license a commit landing in A.
-        let scratch = Scratch::new("inchain-diff-repo");
+        let scratch = Scratch::new(&scratch_root(), "inchain-diff-repo");
         let (primary_a, _wt) = primary_and_worktree(&scratch);
         let primary_b = scratch.0.join("other");
         std::fs::create_dir(&primary_b).unwrap();
@@ -3210,7 +3166,7 @@ mod tests {
     fn dismiss_after_commit_still_blocks() {
         // Order matters: a dismiss AFTER the commit cannot have armed the snooze
         // in time — the commit still blocks.
-        let scratch = Scratch::new("inchain-after");
+        let scratch = Scratch::new(&scratch_root(), "inchain-after");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash(
@@ -3231,7 +3187,7 @@ mod tests {
         // Top-level only: a dismiss buried in a `sh -c '…'` wrapper or a `$(…)`
         // substitution is not the segment's own command and does not license a
         // top-level commit.
-        let scratch = Scratch::new("inchain-subshell");
+        let scratch = Scratch::new(&scratch_root(), "inchain-subshell");
         let (primary, _wt) = primary_and_worktree(&scratch);
 
         for cmd in [
@@ -3259,7 +3215,7 @@ mod tests {
         // primary repo (its own `.git`, initialized inside another repo's tree)
         // must resolve to the nested repo — the block names it, not the
         // enclosing parent.
-        let scratch = Scratch::new("nested-attribution");
+        let scratch = Scratch::new(&scratch_root(), "nested-attribution");
         let parent = scratch.0.join("parent");
         std::fs::create_dir(&parent).unwrap();
         init_repo(&parent);
@@ -3287,7 +3243,7 @@ mod tests {
 
     #[test]
     fn same_repo_edit_honors_repo_declared_allow_main() {
-        let scratch = Scratch::new("same-repo-allow-main");
+        let scratch = Scratch::new(&scratch_root(), "same-repo-allow-main");
         let primary = scratch.0.join("repo");
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
@@ -3307,7 +3263,7 @@ mod tests {
 
     #[test]
     fn repo_settings_precedence_and_falsy_cases() {
-        let scratch = Scratch::new("allow-main-precedence");
+        let scratch = Scratch::new(&scratch_root(), "allow-main-precedence");
 
         // local false + shared true → Block (local wins, and it's falsy).
         let primary = scratch.0.join("local-false-shared-true");
@@ -3390,7 +3346,7 @@ mod tests {
         // the env override is the session-wide short-circuit and precedes the
         // repo-settings lookup entirely, so the mechanism string stays the
         // BARE "CADENCE_ALLOW_MAIN", not the repo-settings variant.
-        let scratch = Scratch::new("env-wins-over-repo-falsy");
+        let scratch = Scratch::new(&scratch_root(), "env-wins-over-repo-falsy");
         let primary = scratch.0.join("repo");
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
@@ -3413,7 +3369,7 @@ mod tests {
         // short-circuit means the repo-settings lookup never runs, so the
         // mechanism stays the BARE "CADENCE_ALLOW_MAIN" (not the repo-settings
         // variant). Locks that the env arm precedes the repo-declared arm.
-        let scratch = Scratch::new("env-wins-over-repo-truthy");
+        let scratch = Scratch::new(&scratch_root(), "env-wins-over-repo-truthy");
         let primary = scratch.0.join("repo");
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
@@ -3432,7 +3388,7 @@ mod tests {
 
     #[test]
     fn repo_allow_main_memo_is_deterministic_within_invocation_and_per_repo() {
-        let scratch = Scratch::new("repo-allow-memo");
+        let scratch = Scratch::new(&scratch_root(), "repo-allow-memo");
         let declaring = scratch.0.join("declares");
         std::fs::create_dir(&declaring).unwrap();
         init_repo(&declaring);
@@ -3482,7 +3438,7 @@ mod tests {
     // native_windows_drive_path_commit_targets_redirect.
     #[test]
     fn cross_repo_block_message_names_target_repos_settings_path() {
-        let scratch = Scratch::new("cross-repo-block-message");
+        let scratch = Scratch::new(&scratch_root(), "cross-repo-block-message");
         let (primary_a, _wt) = primary_and_worktree(&scratch);
         let primary_b = scratch.0.join("non-declaring");
         std::fs::create_dir(&primary_b).unwrap();
@@ -3515,7 +3471,7 @@ mod tests {
         // a SEPARATE primary B on main (an Obsidian vault, a sibling repo, a
         // notes dir). B has no CADENCE_ALLOW_MAIN. Pre-#238 the arm judged only
         // B and blocked; now a foreign-location write is out of scope → allow.
-        let scratch = Scratch::new("foreign-write");
+        let scratch = Scratch::new(&scratch_root(), "foreign-write");
         let (primary_a, _wt) = primary_and_worktree(&scratch);
         let foreign = scratch.0.join("foreign-repo");
         std::fs::create_dir(&foreign).unwrap();
@@ -3537,7 +3493,7 @@ mod tests {
         // walks UP to an enclosing parent repo (a note under `~/Documents`, say).
         // When the session isn't in that parent, it's still a foreign write →
         // allow (pre-#238 this blocked, naming the parent).
-        let scratch = Scratch::new("foreign-parent");
+        let scratch = Scratch::new(&scratch_root(), "foreign-parent");
         let (primary_a, _wt) = primary_and_worktree(&scratch);
         let parent = scratch.0.join("parent-repo");
         std::fs::create_dir(&parent).unwrap();
@@ -3558,7 +3514,7 @@ mod tests {
     fn own_repo_write_still_blocks_after_scoping() {
         // Regression: the core case is preserved — the session in primary A
         // editing A's OWN tree still blocks (edit_in sets cwd = that primary).
-        let scratch = Scratch::new("own-repo-block");
+        let scratch = Scratch::new(&scratch_root(), "own-repo-block");
         let (primary_a, _wt) = primary_and_worktree(&scratch);
         let input = edit_in(&primary_a, &primary_a.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
@@ -3576,7 +3532,7 @@ mod tests {
         // repo (shared common dir) — not a foreign drop — so it still blocks
         // (the ADR-0030 collision). Comparing toplevels (distinct per worktree)
         // would have wrongly allowed this.
-        let scratch = Scratch::new("wt-into-primary");
+        let scratch = Scratch::new(&scratch_root(), "wt-into-primary");
         let (primary, wt) = primary_and_worktree(&scratch);
         let input = edit_in(&wt, &primary.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
@@ -3592,7 +3548,7 @@ mod tests {
         // The mirror: writing into a linked worktree from the primary session
         // is the same repo, but the target is a worktree (not a primary), so
         // `is_primary_checkout` lets it through.
-        let scratch = Scratch::new("primary-into-wt");
+        let scratch = Scratch::new(&scratch_root(), "primary-into-wt");
         let (primary, wt) = primary_and_worktree(&scratch);
         let input = edit_in(&primary, &wt.join("src.rs"));
         let r = run_enforce(&input, &cfg(false, false));
@@ -3607,7 +3563,7 @@ mod tests {
     fn cwd_not_in_any_repo_write_into_primary_allows() {
         // Session cwd is a plain non-git dir; the target lands in a primary on
         // main. There is no "session repo" to match → foreign → allow.
-        let scratch = Scratch::new("cwd-no-repo");
+        let scratch = Scratch::new(&scratch_root(), "cwd-no-repo");
         let non_repo = scratch.0.join("plain");
         std::fs::create_dir(&non_repo).unwrap();
         let target = scratch.0.join("target-repo");
@@ -3628,7 +3584,7 @@ mod tests {
         // The Edit/Write scoping is deliberately arm-local: committing into a
         // DIFFERENT primary checkout than the session's cwd still blocks (#224),
         // so persistence into a foreign primary is unaffected by #238.
-        let scratch = Scratch::new("scope-commit-unchanged");
+        let scratch = Scratch::new(&scratch_root(), "scope-commit-unchanged");
         let (primary_a, _wt) = primary_and_worktree(&scratch);
         let other_primary = scratch.0.join("other-repo");
         std::fs::create_dir(&other_primary).unwrap();
@@ -3655,7 +3611,7 @@ mod tests {
         // session's own primary must still block. The parent dir doesn't exist
         // yet, so the pre-fix `repo_root_for` failed open; ascending to the
         // nearest existing ancestor (the repo root) judges it correctly.
-        let scratch = Scratch::new("new-subdir");
+        let scratch = Scratch::new(&scratch_root(), "new-subdir");
         let (primary, _wt) = primary_and_worktree(&scratch);
         // `primary/newmod` deliberately does NOT exist.
         let input = edit_in(&primary, &primary.join("newmod/lib.rs"));
@@ -3677,7 +3633,7 @@ mod tests {
         // commit whose target dir lexically contains those segments no longer
         // rides through — the commit isn't scoped to those files, so a repo-wide
         // change would otherwise slip onto main disk-free.
-        let scratch = Scratch::new("commit-carveout");
+        let scratch = Scratch::new(&scratch_root(), "commit-carveout");
         let (primary, _wt) = primary_and_worktree(&scratch);
         std::fs::create_dir_all(primary.join(".claude")).unwrap();
         std::fs::create_dir_all(primary.join("docs/plans")).unwrap();
@@ -3703,7 +3659,7 @@ mod tests {
         // cwd (allow) exercises the full loop — no early block short-circuits it
         // — so all three `git commit` segments resolve to the one worktree
         // target and collapse to a single assessment.
-        let scratch = Scratch::new("dedup-wt");
+        let scratch = Scratch::new(&scratch_root(), "dedup-wt");
         let (_primary, wt) = primary_and_worktree(&scratch);
         let mut input = make_bash("git commit -m x; git commit -m x; git commit -m x");
         input.cwd = Some(wt.to_string_lossy().into_owned());
@@ -3922,7 +3878,7 @@ mod tests {
 
     #[test]
     fn package_mutation_in_primary_nudges_and_in_worktree_is_silent() {
-        let scratch = Scratch::new("mut-uv");
+        let scratch = Scratch::new(&scratch_root(), "mut-uv");
         let (primary, wt) = primary_and_worktree(&scratch);
 
         let mut input = make_bash("uv add serde");
@@ -3951,7 +3907,7 @@ mod tests {
 
     #[test]
     fn sed_in_place_in_primary_nudges() {
-        let scratch = Scratch::new("mut-sed");
+        let scratch = Scratch::new(&scratch_root(), "mut-sed");
         let (primary, _wt) = primary_and_worktree(&scratch);
         // Same fixture gap as `redirect_into_primary_nudges_clobber_and_append`:
         // `src/foo.rs` was never created, so this asserted a nudge on a path
@@ -3971,7 +3927,7 @@ mod tests {
     fn sed_in_place_without_file_in_primary_is_silent() {
         // Code-review finding: `sed -i 's/a/b/'` with no file operand mutates
         // nothing, so it must not nudge even in the primary checkout.
-        let scratch = Scratch::new("mut-sed-nofile");
+        let scratch = Scratch::new(&scratch_root(), "mut-sed-nofile");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let mut input = make_bash("sed -i s/a/b/");
         input.cwd = Some(primary.to_string_lossy().into_owned());
@@ -3991,7 +3947,7 @@ mod tests {
         // (its own exists() short-circuits the ascent), then `git -C <file>
         // rev-parse` failed "Not a directory" → common_dir None → silent Allow.
         // The fix takes the file's `.parent()` first, mirroring `git_dir_for_input`.
-        let scratch = Scratch::new("mut-existing");
+        let scratch = Scratch::new(&scratch_root(), "mut-existing");
         let (primary, _wt) = primary_and_worktree(&scratch);
         // `f.txt` is committed by init_repo; add a committed nested file too.
         std::fs::create_dir_all(primary.join("src")).unwrap();
@@ -4022,7 +3978,7 @@ mod tests {
         // legitimate out-of-tree scratch path, from a primary checkout, must
         // NOT nudge — the guard cannot know where `$SCRATCH` actually points,
         // and assuming worst-case (in-primary) was the false positive.
-        let scratch = Scratch::new("mut-scratch-var");
+        let scratch = Scratch::new(&scratch_root(), "mut-scratch-var");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let mut input = make_bash(
             "SCRATCH=/tmp/scratch\ncat > \"$SCRATCH/payload.json\" <<'JSON'\n{}\nJSON\ncat \"$SCRATCH/payload.json\"",
@@ -4038,7 +3994,7 @@ mod tests {
 
     #[test]
     fn redirect_into_primary_nudges_clobber_and_append() {
-        let scratch = Scratch::new("mut-redirect");
+        let scratch = Scratch::new(&scratch_root(), "mut-redirect");
         let (primary, _wt) = primary_and_worktree(&scratch);
         // The fixture must match the test's NAME: `src/tracked.txt` has to
         // actually be a tracked file. It never was, so the assertions below
@@ -4075,7 +4031,7 @@ mod tests {
         // checkout `<repo>`" (naming only the repo) read as the guard having
         // misidentified the cwd. The `existing_tracked_file_mutations_in_primary_nudge`
         // test above is the other half of this contract: the loosening stops here.
-        let scratch = Scratch::new("mut-brand-new");
+        let scratch = Scratch::new(&scratch_root(), "mut-brand-new");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let mut input = make_bash("git diff > report.txt");
         input.cwd = Some(primary.to_string_lossy().into_owned());
@@ -4093,7 +4049,7 @@ mod tests {
         // could not tell WHICH path the walk had resolved — the whole reason the
         // reporter inferred a wrong-cwd bug. It must name the path, and it must
         // not claim the target is "tracked" (the walk never asks git that).
-        let scratch = Scratch::new("mut-msg-path");
+        let scratch = Scratch::new(&scratch_root(), "mut-msg-path");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let mut input = make_bash("echo x >> f.txt");
         input.cwd = Some(primary.to_string_lossy().into_owned());
@@ -4112,7 +4068,7 @@ mod tests {
         // #378: `--work-tree` names the checkout being mutated as plainly as a
         // `-C` does. It used to set the `ambiguous` flag and skip the check —
         // a MISS dressed as a fail-open, and a real bypass from a worktree.
-        let scratch = Scratch::new("cw-work-tree");
+        let scratch = Scratch::new(&scratch_root(), "cw-work-tree");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy();
         for cmd in [
@@ -4134,7 +4090,7 @@ mod tests {
     fn git_dir_flag_commit_into_primary_blocks() {
         // Same bypass via `--git-dir`. No `.git`-stripping is needed: GitState
         // resolves `<repo>/.git` back to `<repo>`.
-        let scratch = Scratch::new("cw-git-dir");
+        let scratch = Scratch::new(&scratch_root(), "cw-git-dir");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy();
         for cmd in [
@@ -4157,7 +4113,7 @@ mod tests {
         // The env spelling of the same redirect. `skip_transparent_prefixes`
         // discards assignment words so the leading-word gate sees `git` (#228);
         // `git_env_overrides` now reads the two that name a tree before they go.
-        let scratch = Scratch::new("cw-git-env");
+        let scratch = Scratch::new(&scratch_root(), "cw-git-env");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy();
         for cmd in [
@@ -4190,7 +4146,7 @@ mod tests {
         // wrong: with the repo dir pointed at the primary, that commit advances
         // the PRIMARY's HEAD and index. `git_dir_naming_primary_blocks_even_with_a_work_tree`
         // below now pins that case as a Block (security review, #378).
-        let scratch = Scratch::new("cw-env-precedence");
+        let scratch = Scratch::new(&scratch_root(), "cw-env-precedence");
         let (primary, wt) = primary_and_worktree(&scratch);
         let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
         let cmd = format!("GIT_WORK_TREE={p} git --work-tree={w} commit -m x");
@@ -4210,7 +4166,7 @@ mod tests {
         // index in --git-dir's repository. Ranking work-tree above git-dir and
         // returning ONE target dropped the git-dir entirely, so this mutated the
         // primary and Allowed. Both targets are emitted now.
-        let scratch = Scratch::new("cw-gitdir-both");
+        let scratch = Scratch::new(&scratch_root(), "cw-gitdir-both");
         let (primary, wt) = primary_and_worktree(&scratch);
         let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
         for cmd in [
@@ -4236,7 +4192,7 @@ mod tests {
         // outranked the `-C` redirect made this Allow while git committed into
         // the primary — a bypass the branch itself introduced, and one every
         // absolute-path env test missed (security review, #378).
-        let scratch = Scratch::new("cw-rel-env");
+        let scratch = Scratch::new(&scratch_root(), "cw-rel-env");
         let (primary, wt) = primary_and_worktree(&scratch);
         let (p, w) = (primary.to_string_lossy(), wt.to_string_lossy());
 
@@ -4279,7 +4235,7 @@ mod tests {
         // the `<repo>/.git` one, and the undismissed half blocked a chain the
         // user had explicitly licensed. Normalizing `<repo>/.git` → `<repo>`
         // collapses them; this pins that a dismiss still covers the commit.
-        let scratch = Scratch::new("cw-dismiss-parity");
+        let scratch = Scratch::new(&scratch_root(), "cw-dismiss-parity");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy();
         let dismiss =
@@ -4317,7 +4273,7 @@ mod tests {
         // tree — so this commits the worktree's files onto the PRIMARY's branch.
         // The exclusion dropped the git-dir target and the walk fell through to
         // the session's own worktree, yielding Allow.
-        let scratch = Scratch::new("cw-dotdot-evade");
+        let scratch = Scratch::new(&scratch_root(), "cw-dotdot-evade");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy();
         for cmd in [
@@ -4478,7 +4434,7 @@ mod tests {
         // here, inheriting a git env prefix into a wrapper's child. The user's
         // own dismiss then failed to license the commit it was run for, and the
         // block pointed at the dismiss they had just executed.
-        let scratch = Scratch::new("cw-dismiss-reach");
+        let scratch = Scratch::new(&scratch_root(), "cw-dismiss-reach");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy();
         let dismiss =
@@ -4546,7 +4502,7 @@ mod tests {
         // `GIT_WORK_TREE=<primary> sh -c 'git commit'` really does commit into
         // the primary. The per-segment capture never reached the child script
         // recursion (security review, #378).
-        let scratch = Scratch::new("cw-env-child");
+        let scratch = Scratch::new(&scratch_root(), "cw-env-child");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy();
         for cmd in [
@@ -4569,7 +4525,7 @@ mod tests {
         // git documents each subsequent non-absolute `-C <path>` as relative to
         // the preceding one. The walk used to OVERWRITE, so `-C <primary> -C .`
         // resolved against the session cwd (the worktree) and allowed.
-        let scratch = Scratch::new("cw-multi-c");
+        let scratch = Scratch::new(&scratch_root(), "cw-multi-c");
         let (primary, wt) = primary_and_worktree(&scratch);
         let p = primary.to_string_lossy();
 
@@ -4599,7 +4555,7 @@ mod tests {
         // THE false-block guard on this tightening. Sitting in the primary and
         // committing into a linked worktree by flag is exactly what the guard
         // wants people to do — it must not block, by any of the four spellings.
-        let scratch = Scratch::new("cw-false-block");
+        let scratch = Scratch::new(&scratch_root(), "cw-false-block");
         let (primary, wt) = primary_and_worktree(&scratch);
         let w = wt.to_string_lossy();
         for cmd in [
@@ -4624,7 +4580,7 @@ mod tests {
         // ADR-0001: the guard resolves the named tree instead of skipping, but a
         // value that names no repo still Allows — `assess_dir` fails open when
         // GitState finds nothing there. Resolving is not the same as guessing.
-        let scratch = Scratch::new("cw-unresolvable");
+        let scratch = Scratch::new(&scratch_root(), "cw-unresolvable");
         let (_primary, wt) = primary_and_worktree(&scratch);
         for cmd in [
             "git --work-tree=/nonexistent/x commit -m x",
@@ -4645,7 +4601,7 @@ mod tests {
     fn redirect_into_temp_is_silent() {
         // A redirect whose target is outside the session's repo (a `/tmp`
         // scratch file) is out of scope — no nudge.
-        let scratch = Scratch::new("mut-redirect-temp");
+        let scratch = Scratch::new(&scratch_root(), "mut-redirect-temp");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let mut input = make_bash("echo x > /tmp/scratch-234-probe");
         input.cwd = Some(primary.to_string_lossy().into_owned());
@@ -4661,7 +4617,7 @@ mod tests {
     fn mutation_then_commit_in_primary_still_blocks_no_double_fire() {
         // Composition contract: block-first. `uv add && git commit` into the
         // primary BLOCKS on the commit — the mutation nudge never fires.
-        let scratch = Scratch::new("mut-and-commit");
+        let scratch = Scratch::new(&scratch_root(), "mut-and-commit");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let mut input = make_bash("uv add serde && git commit -m x");
         input.cwd = Some(primary.to_string_lossy().into_owned());
@@ -4677,7 +4633,7 @@ mod tests {
     fn foreign_repo_mutation_is_silent() {
         // A mutation whose effective cwd resolves into a DIFFERENT repo than the
         // session's own is a foreign drop → silent, mirroring the Edit/Write arm.
-        let scratch = Scratch::new("mut-foreign");
+        let scratch = Scratch::new(&scratch_root(), "mut-foreign");
         let (primary_a, _wt) = primary_and_worktree(&scratch);
         let foreign = scratch.0.join("foreign-repo");
         std::fs::create_dir(&foreign).unwrap();
@@ -4702,7 +4658,7 @@ mod tests {
 
     #[test]
     fn mutation_suppressions_silence_the_nudge() {
-        let scratch = Scratch::new("mut-suppress");
+        let scratch = Scratch::new(&scratch_root(), "mut-suppress");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let bash_uv = |dir: &Path| {
             let mut input = make_bash("uv add serde");
@@ -4733,7 +4689,7 @@ mod tests {
 
     #[test]
     fn read_only_command_in_primary_is_silent() {
-        let scratch = Scratch::new("mut-readonly");
+        let scratch = Scratch::new(&scratch_root(), "mut-readonly");
         let (primary, _wt) = primary_and_worktree(&scratch);
         let mut input = make_bash("cat src/foo.rs && git status");
         input.cwd = Some(primary.to_string_lossy().into_owned());
@@ -4762,7 +4718,7 @@ mod tests {
         // The fix: a commitless (unborn-HEAD) primary is exempt on ALL THREE
         // arms — one carve-out in `assess_dir` covers Edit/Write, the Bash
         // commit channel, and the mutation-nudge channel.
-        let scratch = Scratch::new("bootstrap-exempt");
+        let scratch = Scratch::new(&scratch_root(), "bootstrap-exempt");
         let repo = scratch.0.join("fresh");
         std::fs::create_dir(&repo).unwrap();
         init_commitless_repo(&repo);
@@ -4814,7 +4770,7 @@ mod tests {
     fn one_commit_ends_the_bootstrap_exemption() {
         // Narrowness control: the exemption is specific to commitless, not a
         // blanket allow — the very first commit re-arms the block.
-        let scratch = Scratch::new("bootstrap-narrow");
+        let scratch = Scratch::new(&scratch_root(), "bootstrap-narrow");
         let repo = scratch.0.join("fresh");
         std::fs::create_dir(&repo).unwrap();
         init_commitless_repo(&repo);
@@ -4845,7 +4801,7 @@ mod tests {
         // commits reachable from the original branch, so a worktree IS still
         // possible — the block MUST stand. The predicate keys on "any commit
         // anywhere", not the current HEAD.
-        let scratch = Scratch::new("bootstrap-orphan");
+        let scratch = Scratch::new(&scratch_root(), "bootstrap-orphan");
         let primary = scratch.0.join("repo");
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
@@ -4877,7 +4833,7 @@ mod tests {
         // ref is deleted (current HEAD unborn) but a surviving `other` ref
         // still holds the commit → a worktree is possible off `other` → the
         // block MUST stand.
-        let scratch = Scratch::new("bootstrap-updateref");
+        let scratch = Scratch::new(&scratch_root(), "bootstrap-updateref");
         let primary = scratch.0.join("repo");
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
@@ -4899,7 +4855,7 @@ mod tests {
         // Detached-HEAD control: commits exist and HEAD resolves to a sha
         // (`Value(<sha>)`), so the repo is NOT commitless — proves the
         // exemption keys on *zero commits*, not on any HEAD-resolution quirk.
-        let scratch = Scratch::new("bootstrap-detached");
+        let scratch = Scratch::new(&scratch_root(), "bootstrap-detached");
         let primary = scratch.0.join("repo");
         std::fs::create_dir(&primary).unwrap();
         init_repo(&primary);
@@ -4920,7 +4876,7 @@ mod tests {
         // on an established repo forced to orphan-HEAD (commits still exist).
         // Each fixture uses a fresh `GitProbe` so the memo never masks the
         // per-repo answer.
-        let scratch = Scratch::new("bootstrap-probe");
+        let scratch = Scratch::new(&scratch_root(), "bootstrap-probe");
 
         let fresh = scratch.0.join("fresh");
         std::fs::create_dir(&fresh).unwrap();
