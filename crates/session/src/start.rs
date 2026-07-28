@@ -13,6 +13,15 @@
 //! surface already runs unconditionally on every SessionStart and already
 //! joins independent disclosure parts in [`finish`], so a third part costs no
 //! new hooks.json row.
+//!
+//! A fourth part rides the same reasoning (cadence-hooks#277): a recent burst
+//! of guard fail-opens means the suite may not be enforcing on this machine,
+//! and the only existing signal for it was `doctor` — which nobody runs on the
+//! host that needs it. [`cadence_hooks_metrics::failopen_disclose`] owns the
+//! ledger read, the two-tier verdict, and the once-per-day gate; this surface
+//! only composes the line it returns. Unlike the other three it is resolved
+//! *before* the registry guards, since guard health belongs to the machine
+//! rather than to a repo — a cwd with no git repository still hears it.
 
 use crate::identity::{self, SessionRecord};
 use crate::registry::{self, Peer};
@@ -30,29 +39,38 @@ impl Check for Start {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
+        // Resolved before the guards below, and outside `run_start`, for two
+        // independent reasons. It reads the live metrics dir — a process-global
+        // env lookup and a wall clock the testable core must stay free of. And
+        // guard health is a property of the *machine*, not of this repo: gating
+        // it behind the registry guards would silence it in exactly the cwd
+        // that has no git repo to coordinate in.
+        let failopen = cadence_hooks_metrics::failopen_disclose::disclosure_line();
         let Some(cwd) = input.cwd.as_deref() else {
-            return CheckResult::allow();
+            return finish(None, None, None, failopen);
         };
         let Some(dir) = registry::sessions_dir(cwd) else {
             // Not a git repository — no registry, nothing to coordinate.
-            return CheckResult::allow();
+            return finish(None, None, None, failopen);
         };
         if let Some(root) = registry::repo_root(cwd) {
             registry::ensure_git_excluded(&root);
         }
         let branch = git_command(cwd, &["branch", "--show-current"]);
         let stale_secs = registry::stale_minutes() * 60;
-        run_start(input, &dir, branch, stale_secs)
+        run_start(input, &dir, branch, stale_secs, failopen)
     }
 }
 
-/// Testable core: registry path and branch are injected so tests can target a
-/// tempdir without a git repository.
+/// Testable core: registry path, branch, and the fail-open disclosure are
+/// injected so tests can target a tempdir without a git repository — and
+/// without reading the machine's real telemetry.
 pub fn run_start(
     input: &HookInput,
     dir: &std::path::Path,
     branch: Option<String>,
     stale_secs: u64,
+    failopen: Option<String>,
 ) -> CheckResult {
     // Independent of session registration: fires whenever `enforce-worktree`
     // would actually block a mutation here, so a session with no (or an
@@ -71,7 +89,7 @@ pub fn run_start(
         .session_id()
         .filter(|s| identity::is_safe_session_id(s))
     else {
-        return finish(posture, None, plan_disclosure);
+        return finish(posture, None, plan_disclosure, failopen);
     };
 
     // Register (or re-register on resume — preserves any declared
@@ -118,7 +136,7 @@ pub fn run_start(
     };
     if registry::write_record(dir, &record).is_err() {
         // Fail open: a read-only filesystem must not break session start.
-        return finish(posture, None, plan_disclosure);
+        return finish(posture, None, plan_disclosure, failopen);
     }
 
     // Housekeeping: presumed-dead peers leave the room before roll call. Our
@@ -128,7 +146,7 @@ pub fn run_start(
     // Disclose live peers, if any.
     let peers = registry::live_peers(dir, sid, stale_secs);
     let peer_disclosure = (!peers.is_empty()).then(|| render_disclosure(&record, &peers));
-    finish(posture, peer_disclosure, plan_disclosure)
+    finish(posture, peer_disclosure, plan_disclosure, failopen)
 }
 
 /// The worktree-posture line for `cwd`, or `None` when `enforce-worktree`
@@ -157,14 +175,19 @@ fn plan_disclosure_line(cwd: &str) -> Option<String> {
 }
 
 /// Compose the final result from the optional posture line, peer disclosure,
-/// and plan disclosure: `Nudge` if any is present, else `Allow`. The single
-/// point where the independent disclosures on this surface are joined.
+/// plan disclosure, and fail-open disclosure: `Nudge` if any is present, else
+/// `Allow`. The single point where the independent disclosures on this surface
+/// are joined.
+///
+/// Order is append-only — a new part goes last, so an operator's eye does not
+/// have to re-learn the block each time one is added.
 fn finish(
     posture: Option<String>,
     peer_disclosure: Option<String>,
     plan_disclosure: Option<String>,
+    failopen: Option<String>,
 ) -> CheckResult {
-    let parts: Vec<String> = [posture, peer_disclosure, plan_disclosure]
+    let parts: Vec<String> = [posture, peer_disclosure, plan_disclosure, failopen]
         .into_iter()
         .flatten()
         .collect();
@@ -255,7 +278,7 @@ mod tests {
             cwd: Some("/tmp".into()),
             ..Default::default()
         };
-        let r = run_start(&input, tmp.path(), None, 600);
+        let r = run_start(&input, tmp.path(), None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -263,7 +286,7 @@ mod tests {
     fn unsafe_session_id_allows() {
         let tmp = TempDir::new().unwrap();
         let input = make_session_with_cwd("../escape", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), None, 600);
+        let r = run_start(&input, tmp.path(), None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
             std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
@@ -277,7 +300,7 @@ mod tests {
     fn empty_room_registers_silently() {
         let tmp = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), Some("main".into()), 600);
+        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
         assert_eq!(r.outcome, Outcome::Allow, "no peers → no disclosure");
         let own = registry::read_own(tmp.path(), "solo-session").unwrap();
         assert_eq!(own.branch.as_deref(), Some("main"));
@@ -289,7 +312,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // First registration + declaration.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 600);
+        run_start(&input, tmp.path(), Some("main".into()), 600, None);
         let mut rec = registry::read_own(tmp.path(), "self-session").unwrap();
         rec.intent = Some("cadence-hooks#54".into());
         rec.touching = vec!["crates/session/".into()];
@@ -297,7 +320,7 @@ mod tests {
 
         // Re-register (e.g. after /clear) on a new branch.
         let input = make_session_with_cwd("self-session", "clear", "/tmp");
-        run_start(&input, tmp.path(), Some("feat/x".into()), 600);
+        run_start(&input, tmp.path(), Some("feat/x".into()), 600, None);
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
         assert_eq!(back.intent.as_deref(), Some("cadence-hooks#54"));
@@ -320,7 +343,7 @@ mod tests {
 
         // First registration + declaration.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 600);
+        run_start(&input, tmp.path(), Some("main".into()), 600, None);
         let mut rec = registry::read_own(tmp.path(), "self-session").unwrap();
         rec.intent = Some("cadence-hooks#69".into());
         rec.touching = vec!["crates/session/".into()];
@@ -330,7 +353,7 @@ mod tests {
         // the OLD sweep-first ordering would have deleted it before read_own.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let input = make_session_with_cwd("self-session", "clear", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 0);
+        run_start(&input, tmp.path(), Some("main".into()), 0, None);
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
         assert_eq!(
@@ -348,11 +371,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // A peer registers first.
         let peer_input = make_session_with_cwd("peer-session", "startup", "/tmp");
-        run_start(&peer_input, tmp.path(), Some("feat/issue-52".into()), 600);
+        run_start(
+            &peer_input,
+            tmp.path(),
+            Some("feat/issue-52".into()),
+            600,
+            None,
+        );
 
         // We arrive.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), Some("main".into()), 600);
+        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(msg.contains("feat/issue-52"), "peer branch named: {msg}");
@@ -370,7 +399,7 @@ mod tests {
     fn stale_peer_does_not_trigger_disclosure() {
         let tmp = TempDir::new().unwrap();
         let peer_input = make_session_with_cwd("peer-session", "startup", "/tmp");
-        run_start(&peer_input, tmp.path(), None, 600);
+        run_start(&peer_input, tmp.path(), None, 600, None);
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
         // stale_secs = 0: any measurable age (whole seconds) counts as stale.
@@ -379,7 +408,7 @@ mod tests {
         // process-global CADENCE_METRICS_DIR.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
         let r = registry::test_metrics_env::with_scratch_metrics_dir(|| {
-            run_start(&input, tmp.path(), None, 0)
+            run_start(&input, tmp.path(), None, 0, None)
         });
         assert_eq!(r.outcome, Outcome::Allow, "stale peers are ignored");
         assert!(
@@ -393,9 +422,111 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Same session re-starting (e.g. compact) must not see itself as a peer.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), None, 600);
-        let r = run_start(&input, tmp.path(), None, 600);
+        run_start(&input, tmp.path(), None, 600, None);
+        let r = run_start(&input, tmp.path(), None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    // --- fail-open disclosure composition (cadence-hooks#277) ---
+    //
+    // The verdict, threshold, and once-per-day gate are the metrics crate's
+    // (`failopen_disclose`); these only prove `finish` composes the line it is
+    // handed. `cwd` is `/tmp` throughout, which silences the posture line via
+    // `is_temp_root` and the plan disclosure via a `repo_root` that resolves to
+    // nothing — so the verdict here is the fail-open half and nothing else,
+    // in every checkout location.
+
+    #[test]
+    fn failopen_line_alone_nudges() {
+        let tmp = TempDir::new().unwrap();
+        let input = make_session_with_cwd("solo-session", "startup", "/tmp");
+        let r = run_start(
+            &input,
+            tmp.path(),
+            Some("main".into()),
+            600,
+            Some("guards are NOT enforcing".into()),
+        );
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "an otherwise-silent start still speaks the fail-open line"
+        );
+        assert_eq!(r.message.unwrap(), "guards are NOT enforcing");
+    }
+
+    #[test]
+    fn no_failopen_line_leaves_the_start_silent() {
+        let tmp = TempDir::new().unwrap();
+        let input = make_session_with_cwd("solo-session", "startup", "/tmp");
+        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        assert_eq!(r.outcome, Outcome::Allow, "healthy telemetry adds nothing");
+    }
+
+    #[test]
+    fn failopen_line_survives_a_cwd_with_no_git_repository() {
+        // Guard health is a property of the machine, so the `Check` impl
+        // resolves it ahead of the registry guards. `/tmp` is not a git repo:
+        // `sessions_dir` returns `None` and the check takes its earliest
+        // return — which must still carry the line. This drives the real
+        // `Start::run`, not `run_start`, because the ordering being pinned
+        // lives in the guards themselves.
+        let metrics = TempDir::new().unwrap();
+        let input = make_session_with_cwd("solo-session", "startup", "/tmp");
+        let r = registry::test_metrics_env::with_metrics_dir(metrics.path(), || {
+            for _ in 0..3 {
+                cadence_hooks_metrics::log_failopen(
+                    "deadline",
+                    Some("guardrails"),
+                    Some("guard-rm"),
+                    "1.0.0",
+                    None,
+                );
+            }
+            Start.run(&input)
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "a non-repo cwd still hears that guards are degraded"
+        );
+        assert!(
+            r.message.unwrap().contains("failopen.jsonl"),
+            "and it is the fail-open line"
+        );
+    }
+
+    #[test]
+    fn failopen_line_composes_last_after_the_peer_disclosure() {
+        let tmp = TempDir::new().unwrap();
+        let peer_input = make_session_with_cwd("peer-session", "startup", "/tmp");
+        run_start(
+            &peer_input,
+            tmp.path(),
+            Some("feat/issue-52".into()),
+            600,
+            None,
+        );
+
+        let input = make_session_with_cwd("self-session", "startup", "/tmp");
+        let r = run_start(
+            &input,
+            tmp.path(),
+            Some("main".into()),
+            600,
+            Some("FAILOPEN-MARKER".into()),
+        );
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        let peer_at = msg
+            .find("Shared-checkout protocol")
+            .expect("peer disclosure still present");
+        let failopen_at = msg.find("FAILOPEN-MARKER").expect("fail-open line present");
+        assert!(
+            peer_at < failopen_at,
+            "the new part appends; it does not reorder the existing three: {msg}"
+        );
+        assert!(msg.ends_with("FAILOPEN-MARKER"), "and it lands last: {msg}");
     }
 
     // --- plan disclosure (cadence-hooks#429) ---
@@ -418,7 +549,7 @@ mod tests {
         let registry_dir = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600)
+            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -451,7 +582,7 @@ mod tests {
         // posture_line_* tests below, which fail locally for the identical
         // environment reason and pass in CI).
         let r = with_worktree_env(Some("true"), None, || {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600)
+            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
         });
         assert_eq!(
             r.outcome,
@@ -793,7 +924,7 @@ mod tests {
         let registry_dir = tempfile::TempDir::new().unwrap();
         let input = make_session_with_cwd("solo", "startup", &scratch.0.to_string_lossy());
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600)
+            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
         });
         assert_eq!(r.outcome, Outcome::Nudge, "posture alone still nudges");
         let msg = r.message.unwrap();
@@ -812,11 +943,17 @@ mod tests {
         let cwd = scratch.0.to_string_lossy().into_owned();
 
         let peer_input = make_session_with_cwd("peer-session", "startup", &cwd);
-        run_start(&peer_input, registry_dir.path(), Some("feat/x".into()), 600);
+        run_start(
+            &peer_input,
+            registry_dir.path(),
+            Some("feat/x".into()),
+            600,
+            None,
+        );
 
         let input = make_session_with_cwd("self-session", "startup", &cwd);
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600)
+            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -840,7 +977,13 @@ mod tests {
         let registry_dir = tempfile::TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-wt", "startup", &wt.to_string_lossy());
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("feat/y".into()), 600)
+            run_start(
+                &input,
+                registry_dir.path(),
+                Some("feat/y".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(r.outcome, Outcome::Allow);
     }
