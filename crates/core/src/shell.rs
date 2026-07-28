@@ -62,34 +62,67 @@ pub fn strip_quotes(s: &str) -> String {
 /// A backslash anywhere else stays a literal character. `\gh` keeps its
 /// backslash for the callers that strip it themselves, and a Windows path
 /// (`C:\Users\x`) survives intact — consuming those would corrupt the very
-/// targets the destructive-command guards compare. Single quotes get no escape
-/// processing at all, matching POSIX: inside `'…'` a backslash is literal and
-/// the first `'` always closes.
+/// targets the destructive-command guards compare.
+///
+/// **Three quoting modes, because `'…'` and `$'…'` are not the same thing.**
+/// Plain single quotes get no escape processing, matching POSIX: a backslash is
+/// literal and the first `'` always closes. But bash's ANSI-C form `$'…'` DOES
+/// honor `\'`, and treating the two alike is the same exploitable divergence in
+/// a different costume — `--title $'a\'b' -R evil/target` closed on the escaped
+/// quote, so the real closing `'` reopened a phantom string that swallowed the
+/// rest of the command, `-R evil/target` included. `$'…'` is therefore its own
+/// mode where a backslash consumes the character after it.
 pub fn tokenize(command: &str) -> Vec<String> {
+    /// How the tokenizer reads the run it is currently inside.
+    #[derive(Clone, Copy)]
+    enum Quote {
+        /// `'…'` — fully literal; the first `'` closes (POSIX).
+        Single,
+        /// `"…"` — `\` escapes `"` and `\`; other backslashes stay literal.
+        Double,
+        /// `$'…'` — bash ANSI-C; `\` escapes whatever follows, including `'`.
+        AnsiC,
+    }
+
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
-    let mut quote: Option<char> = None;
+    let mut quote: Option<Quote> = None;
     let mut chars = command.chars().peekable();
 
     while let Some(c) = chars.next() {
         match quote {
-            // POSIX: no escapes exist inside single quotes.
-            Some('\'') => {
+            Some(Quote::Single) => {
                 if c == '\'' {
                     quote = None;
                 } else {
                     current.push(c);
                 }
             }
-            Some(q) => {
+            Some(Quote::AnsiC) => {
+                // The escape is consumed and the next character kept verbatim.
+                // Only the boundary matters here: decoding `\n` to a newline
+                // would be modelling bash's escape table, which this is not.
+                if c == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                    continue;
+                }
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+            }
+            Some(Quote::Double) => {
                 // Inside `"…"`, `\` escapes `"` and `\` — so an escaped quote
                 // is content and must not end the string.
                 if c == '\\' && matches!(chars.peek(), Some('"' | '\\')) {
                     current.push(chars.next().expect("peeked"));
                     continue;
                 }
-                if c == q {
+                if c == '"' {
                     quote = None;
                 } else {
                     current.push(c);
@@ -102,8 +135,20 @@ pub fn tokenize(command: &str) -> Vec<String> {
                     current.push(chars.next().expect("peeked"));
                     in_token = true;
                 }
-                '\'' | '"' => {
-                    quote = Some(c);
+                // `$'` opens ANSI-C quoting; the `$` is part of the syntax, not
+                // the word, so it is consumed like the quote itself. A `$`
+                // before anything else (`$VAR`, `$(…)`) is ordinary text.
+                '$' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    quote = Some(Quote::AnsiC);
+                    in_token = true;
+                }
+                '\'' => {
+                    quote = Some(Quote::Single);
+                    in_token = true;
+                }
+                '"' => {
+                    quote = Some(Quote::Double);
                     in_token = true;
                 }
                 c if c.is_whitespace() => {
@@ -2111,6 +2156,39 @@ mod tests {
     fn tokenize_escaped_backslash_inside_double_quotes_still_closes() {
         // `\\` is an escaped backslash, so the `"` after it DOES close.
         assert_eq!(tokenize(r#"echo "a\\" b"#), vec!["echo", r"a\", "b"]);
+    }
+
+    #[test]
+    fn tokenize_ansi_c_quoting_honors_escaped_quote() {
+        // bash `$'…'` honors `\'`, so the word ends at the FINAL quote. Closing
+        // early made the real closing quote reopen a phantom string that ate
+        // the rest of the command (cameronsjo/cadence-hooks#463 review).
+        assert_eq!(
+            tokenize(r"gh issue create --title $'a\'b' -R evil/target"),
+            vec![
+                "gh",
+                "issue",
+                "create",
+                "--title",
+                "a'b",
+                "-R",
+                "evil/target"
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_ansi_c_escaped_backslash_does_not_leak() {
+        assert_eq!(tokenize(r"echo $'a\\' b"), vec!["echo", r"a\", "b"]);
+    }
+
+    #[test]
+    fn tokenize_dollar_outside_ansi_c_is_ordinary_text() {
+        // Only `$` immediately followed by `'` opens ANSI-C quoting.
+        assert_eq!(
+            tokenize(r#"echo $HOME $(date) "$x""#),
+            vec!["echo", "$HOME", "$(date)", "$x"]
+        );
     }
 
     #[test]
