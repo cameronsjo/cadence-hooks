@@ -56,11 +56,10 @@
 //! - A `..`-bearing target resolves ambiguously (symlinks, escapes), so it
 //!   downgrades to ASK rather than a guessed BLOCK/ALLOW.
 //! - The symlink carve-out above is applied to every path *operand*, not only
-//!   `rm`/`unlink` ones, so a `find` that dereferences its search roots
-//!   (`find -L <symlink-to-repo> -delete`) is judged on the link and allows.
-//!   Accepted rather than closed: the accident this guard exists to catch is
-//!   not spelled that way, and the same imprecision already rides
-//!   `rm -rf <symlink>/*`, which pathname expansion dereferences.
+//!   `rm`/`unlink` ones, so a `find` reaches it through its search roots. The
+//!   dereferencing spellings are excluded rather than accepted: `find -L` and
+//!   `find -H` both follow a symlinked root, and both keep the BLOCK. `-P` and
+//!   the default do not follow, so those still judge the link itself.
 //! - Same-command variable expansion is deliberately **absent**. Resolving
 //!   `SP=/tmp/x; rm -rf "$SP"` was built and then withdrawn: three adversarial
 //!   review rounds found sixteen silent-ALLOW misses in it, and the last round
@@ -136,10 +135,30 @@ const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash"];
 /// `depth` bounds the wrapper recursion on the shared [`MAX_WRAPPER_DEPTH`]
 /// budget, so a nested `sh -c 'sh -c "rm -rf ~"'` terminates.
 fn mentions_deletion(tokens: &[String], depth: usize) -> bool {
+    // Bound the scan. `wrapper_script_deletes` is quadratic in token count — it
+    // copies the tail at each wrapper candidate — and measured ~1s at 8000
+    // tokens. Past the cap, report a deletion WITHOUT scanning: the gate emits
+    // an `Unresolvable` and the command ASKs.
+    //
+    // Failing toward the prompt is this guard's whole default posture — a
+    // command this large is emphatically not "structurally proven safe" — so
+    // the cap costs at most one prompt on a pathological input and cannot open
+    // a hole. Reachable only behind a flagged transparent prefix, which is a
+    // narrow slice of commands to begin with. Not a security bound: these are
+    // self-authored commands, so the concern is a stalled hook, not an attacker.
+    if tokens.len() > MAX_GATE_TOKENS {
+        return true;
+    }
     tokens.iter().any(|t| is_delete_verb(t))
         || destructive_find(tokens)
         || wrapper_script_deletes(tokens, depth)
 }
+
+/// Token ceiling for the flagged-prefix deletion scan — past this,
+/// [`mentions_deletion`] reports a deletion unscanned and the command ASKs.
+/// Far above any hand-written command; sized to bound the quadratic wrapper
+/// scan, not to judge anything.
+const MAX_GATE_TOKENS: usize = 2048;
 
 /// These tokens run a `find` that deletes. Gated on a `find` command word so a
 /// stray `-delete` in an unrelated command cannot arm the gate on its own, then
@@ -475,6 +494,7 @@ fn collect_targets(
                     dir_known,
                     recursive,
                     single_file,
+                    false,
                 ));
             }
         } else if verb == "xargs" && xargs_runs_delete(argv) {
@@ -492,6 +512,10 @@ fn collect_targets(
             // target → ASK, rather than a silent cwd default.
             match find_roots(argv) {
                 FindTargets::Paths(roots) => {
+                    // `-L`/`-H` make `find` follow a symlinked search root, so
+                    // the walk lands in the real tree and the #402 demotion must
+                    // not treat that root as "just a link" (#402 review).
+                    let follows = find_follows_symlinks(argv);
                     for root in roots {
                         // A destructive `find` recurses by nature — treat its
                         // roots conservatively (recursive = true).
@@ -501,6 +525,7 @@ fn collect_targets(
                             dir_known,
                             true,
                             false,
+                            follows,
                         ));
                     }
                 }
@@ -544,6 +569,18 @@ fn find_is_destructive(argv: &[String]) -> bool {
         }
     }
     false
+}
+
+/// This `find` will follow a symlink named on its command line. `-L` follows
+/// every symlink it meets; `-H` follows the ones in the arguments — and a
+/// search root IS an argument, so both dereference a symlinked root and walk
+/// the real tree behind it. `-P` (the default) does not.
+///
+/// Matters only to the #402 symlink demotion: without this, `find -H <link>
+/// -delete` classified on the link, demoted, and silently ALLOWed a delete that
+/// empties the repo the link points at.
+fn find_follows_symlinks(argv: &[String]) -> bool {
+    argv.iter().any(|t| t == "-L" || t == "-H")
 }
 
 /// Path operands of an `rm`/`unlink`/`shred`/`truncate` invocation: non-flag
@@ -635,12 +672,18 @@ fn find_roots(argv: &[String]) -> FindTargets {
 /// `recursive` records whether the invocation carried `-r`/`-R`; it rides along
 /// on a [`TargetToken::FileGlob`] so the judge can soften a flat artifact sweep
 /// but not a recursive one.
+///
+/// `caller_dereferences` lets the caller assert what only it can know: that
+/// this invocation follows a symlinked operand regardless of how the operand is
+/// spelled (`find -L`/`-H`). It is OR'd into the `dereferences` fact computed
+/// from the operand itself.
 fn resolve_target(
     operand: &str,
     effective_dir: &str,
     dir_known: bool,
     recursive: bool,
     single_file: bool,
+    caller_dereferences: bool,
 ) -> TargetToken {
     // Unexpanded variable / command substitution — can't prove anything. This
     // guard (with the `..` checks below) runs AHEAD of glob detection, so an
@@ -689,7 +732,12 @@ fn resolve_target(
     // from the operand, because by the time the judge sees a resolved path the
     // three spellings are indistinguishable: `rm -rf link/*`, `rm -rf link/.*`,
     // and `cd link && rm -rf *` all reduce to `link`.
-    let dereferences = operand.contains(['*', '?', '[']) || literal.is_empty() || literal == ".";
+    // `caller_dereferences` carries what the operand string cannot show: a
+    // `find -L`/`-H` follows a symlinked root however plainly it is spelled.
+    let dereferences = caller_dereferences
+        || operand.contains(['*', '?', '['])
+        || literal.is_empty()
+        || literal == ".";
     // A bare glob-less cwd reference (`*` → "", or a literal `.`) is the
     // effective directory itself.
     let resolved = if literal.is_empty() || literal == "." {
@@ -868,9 +916,14 @@ fn classify_operand(
         // - `!dereferences` — a glob operand or a bare cwd sweep resolves
         //   through the link (`rm -rf link/*`, `cd link && rm -rf *`). See
         //   [`TargetToken::Path`].
-        // - `!path.ends_with('/')` — pathname resolution dereferences a
+        // - `!path.ends_with(['/', '\\'])` — pathname resolution dereferences a
         //   trailing slash, and BSD fts descends (`find link/` lists the
-        //   target's contents), so `rm -rf link/` keeps its verdict.
+        //   target's contents), so `rm -rf link/` keeps its verdict. BOTH
+        //   separators are checked because this reads the RAW path: `normalize`
+        //   would fold `\` to `/` but also strip the trailing separator, which
+        //   is the very signal being tested. Windows is a shipped target, so a
+        //   `/`-only test let `rm -rf C:\repo\link\` allow where its
+        //   forward-slash twin blocked.
         // - `!has_git_component(...)` — `PathClass::GitRoot` has two halves,
         //   `has_git_component(norm) || is_git_root(norm)`, and only the second
         //   is the probe this rationale is about. A symlinked `.git` (the real
@@ -891,7 +944,7 @@ fn classify_operand(
         // dereferenced target is a directory, and both verbs fail on one.
         TargetClass::GitRepo
             if !dereferences
-                && !path.ends_with('/')
+                && !path.ends_with(['/', '\\'])
                 && !has_git_component(&pathclass::normalize(path))
                 && is_symlink(path) =>
         {
@@ -1634,6 +1687,51 @@ mod tests {
         assert_eq!(
             judge_with_symlinks("rm /srv/repo/.git", "/home", &[], &["/srv/repo/.git"]),
             Outcome::Block
+        );
+    }
+
+    /// `find -L` follows every symlink; `find -H` follows the ones in its
+    /// arguments — and a search root IS an argument. Both walk the real tree
+    /// behind a symlinked root, so both must keep the BLOCK. The plain and
+    /// `-P` spellings do not follow, so those still judge the link itself.
+    #[test]
+    fn find_that_follows_symlinks_still_blocks() {
+        for command in [
+            "find -H /srv/link -delete",
+            "find -L /srv/link -delete",
+            "find -L /srv/link -name '*.md' -delete",
+            "find -H /srv/link -exec rm -rf {} +",
+        ] {
+            assert_eq!(
+                judge_with_symlinks(command, "/home", &["/srv/link"], &["/srv/link"]),
+                Outcome::Block,
+                "-L/-H dereference a symlinked search root: {command}"
+            );
+        }
+        // The control: without a following flag, `find` deletes the link.
+        for command in ["find /srv/link -delete", "find -P /srv/link -delete"] {
+            assert_eq!(
+                judge_with_symlinks(command, "/home", &["/srv/link"], &["/srv/link"]),
+                Outcome::Allow,
+                "no -L/-H means the link itself is the target: {command}"
+            );
+        }
+    }
+
+    /// The trailing-separator guard reads the RAW path — `normalize` would fold
+    /// `\` to `/` but also strip the separator, which is the signal. Windows is
+    /// a shipped target, so both spellings must behave the same.
+    #[test]
+    fn a_windows_trailing_separator_also_dereferences() {
+        assert_eq!(
+            judge_with_symlinks(
+                "rm -rf C:\\repo\\link\\",
+                "/home",
+                &["C:/repo/link"],
+                &["C:\\repo\\link\\"],
+            ),
+            Outcome::Block,
+            "a backslash-terminated path dereferences exactly as `link/` does"
         );
     }
 
