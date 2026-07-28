@@ -393,16 +393,27 @@ mod tests {
 
     #[test]
     fn session_marker_differs_per_session() {
-        let a = session_marker(&input_with_session("sid-a"), "kind", Some("/tmp/repo"));
-        let b = session_marker(&input_with_session("sid-b"), "kind", Some("/tmp/repo"));
-        assert_ne!(a, b, "distinct sessions must not share a marker");
+        // session_marker() reads marker_dir() (CADENCE_MARKER_DIR), so hold the
+        // shared lock via with_marker_dir even though the assertion only compares
+        // two markers — an unguarded read races a concurrent with_marker_dir
+        // test flipping the base mid-comparison (#373).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = session_marker(&input_with_session("sid-a"), "kind", Some("/tmp/repo"));
+            let b = session_marker(&input_with_session("sid-b"), "kind", Some("/tmp/repo"));
+            assert_ne!(a, b, "distinct sessions must not share a marker");
+        });
     }
 
     #[test]
     fn session_marker_differs_per_repo() {
-        let a = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-a"));
-        let b = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-b"));
-        assert_ne!(a, b, "distinct repos must not share a marker");
+        // See session_marker_differs_per_session: guard the marker_dir() read.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-a"));
+            let b = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-b"));
+            assert_ne!(a, b, "distinct repos must not share a marker");
+        });
     }
 
     #[test]
@@ -452,16 +463,25 @@ mod tests {
 
     #[test]
     fn polish_marker_differs_per_branch() {
-        let a = polish_marker("/tmp/repo", "branch-a");
-        let b = polish_marker("/tmp/repo", "branch-b");
-        assert_ne!(a, b, "distinct branches must not share a marker");
+        // polish_marker() reads marker_dir() (CADENCE_MARKER_DIR); guard the
+        // read the same way as session_marker_differs_per_session (#373).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = polish_marker("/tmp/repo", "branch-a");
+            let b = polish_marker("/tmp/repo", "branch-b");
+            assert_ne!(a, b, "distinct branches must not share a marker");
+        });
     }
 
     #[test]
     fn polish_marker_differs_per_repo() {
-        let a = polish_marker("/tmp/repo-a", "main");
-        let b = polish_marker("/tmp/repo-b", "main");
-        assert_ne!(a, b, "distinct repos must not share a marker");
+        // See polish_marker_differs_per_branch: guard the marker_dir() read.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = polish_marker("/tmp/repo-a", "main");
+            let b = polish_marker("/tmp/repo-b", "main");
+            assert_ne!(a, b, "distinct repos must not share a marker");
+        });
     }
 
     #[test]
