@@ -169,7 +169,7 @@ pub(crate) fn is_write_command(command: &str) -> bool {
         // its verdict to it: `--hostname` points the same command at a GHES
         // instance answering on someone else's terms, and an `--input` body
         // transmits on a GET regardless. Let it fall through to the graphql arm.
-        if gh_api_endpoint(command).as_deref() == Some("graphql") {
+        if segment_is_graphql(command) {
             return true;
         }
         return api_explicit_method(command).as_deref() != Some("GET");
@@ -893,6 +893,46 @@ fn gh_argv_depth(segment: &str, depth: usize) -> Option<Vec<String>> {
     None
 }
 
+/// True when a `gh api` endpoint addresses the GraphQL API, in any spelling gh
+/// accepts.
+///
+/// Exact string equality against `"graphql"` was not enough, and the gap was
+/// live: `/graphql`, `graphql?x=1`, and `https://api.github.com/graphql` all
+/// reach the same endpoint while comparing unequal, so each took the GET
+/// narrowing and skipped the mutation classifier that `graphql` alone reached.
+///
+/// Compares the PATH, cut at `?`/`#` before anything else — so a query-string
+/// red herring like `repos/<owner>/<repo>?graphql=1` is NOT graphql and still
+/// takes the ordinary owner-checked path.
+///
+/// A URL is reduced to its path component and matched against BOTH endpoint
+/// layouts: `/graphql` as github.com serves it, and `/api/graphql` as a GitHub
+/// Enterprise Server instance does. Any host counts, which is the fail-closed
+/// direction — a non-github host is exactly where "GitHub ignores the query
+/// parameter on `GET /graphql`" stops being a safe assumption to rest a verdict
+/// on. The `/api/` spelling is accepted only for URL forms: a RELATIVE endpoint
+/// is resolved against the API base by gh itself, so there `graphql` is the
+/// only spelling, and matching a trailing `/graphql` would swallow
+/// `repos/<owner>/graphql` — a real repo named `graphql`, which must stay
+/// owner-checked rather than becoming unverifiable.
+fn is_graphql_endpoint(endpoint: &str) -> bool {
+    let path = endpoint.split(['?', '#']).next().unwrap_or("");
+    match path.split_once("://") {
+        Some((_scheme, rest)) => {
+            let path = rest.find('/').map(|idx| &rest[idx..]).unwrap_or("");
+            matches!(path, "/graphql" | "/api/graphql")
+        }
+        None => path.trim_start_matches('/') == "graphql",
+    }
+}
+
+/// True when `segment` is a `gh api` call against the GraphQL API.
+/// The one place the endpoint parse and [`is_graphql_endpoint`] are combined,
+/// so the several arms that branch on "is this graphql?" cannot drift apart.
+fn segment_is_graphql(segment: &str) -> bool {
+    gh_api_endpoint(segment).is_some_and(|e| is_graphql_endpoint(&e))
+}
+
 /// The `owner/repo` a `gh api` endpoint targets, or `None` when the endpoint is
 /// not a `repos/<owner>/<repo>` path.
 ///
@@ -1490,7 +1530,7 @@ fn graphql_is_safe_mutation(segment: &str) -> bool {
 /// `repos/<owner>/<repo>`). When `undeterminable_query` is set, the GraphQL
 /// query was loaded from a file, so its mutation status couldn't be confirmed.
 fn api_unverifiable_message(segment: &str, undeterminable_query: bool) -> String {
-    let is_graphql = gh_api_endpoint(segment).as_deref() == Some("graphql");
+    let is_graphql = segment_is_graphql(segment);
     let note = if undeterminable_query {
         "\n   Note: the GraphQL query is loaded from a file (`-F query=@…`), so its \
          mutation status can't be verified — treated as a write."
@@ -1525,7 +1565,7 @@ fn api_unverifiable_block(
 ) -> CheckResult {
     // graphql has no -R/repos form, so its structured fix states the reality
     // rather than the unsatisfiable "use gh api repos/…" (#317).
-    let fix = if gh_api_endpoint(segment).as_deref() == Some("graphql") {
+    let fix = if segment_is_graphql(segment) {
         "gh api graphql has no -R/repos form; resolveReviewThread/unresolveReviewThread are auto-allowed — any other mutation must be run by the user directly".to_string()
     } else {
         "use gh api repos/<owner>/<repo>/… so ownership is checkable, or ask the user".to_string()
@@ -1827,7 +1867,7 @@ impl Check for GhWriteGuard {
             // graphql reads are exempt; any non-`repos/<owner>/<repo>` api write
             // is unverifiable — block it rather than trusting the owned checkout.
             if let Some(endpoint) = gh_api_endpoint(&segment) {
-                if endpoint == "graphql" {
+                if is_graphql_endpoint(&endpoint) {
                     match graphql_mutation_status(&segment) {
                         // Inline read query — no ownership to check, allow.
                         Some(false) => continue,
@@ -4604,6 +4644,79 @@ mod tests {
             ));
             let meta = result.block_metadata.expect("structured block");
             assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn graphql_is_recognized_in_every_spelling_gh_accepts() {
+        for endpoint in [
+            "graphql",
+            "/graphql",
+            "graphql?x=1",
+            "https://api.github.com/graphql",
+            "https://api.github.com/graphql?x=1",
+            // Any host counts — a non-github host is exactly where "GitHub
+            // ignores the query param on GET" stops holding. GHES serves the
+            // API under /api/.
+            "https://ghes.example.com/api/graphql",
+            "https://ghes.example.com/graphql",
+        ] {
+            assert!(
+                is_graphql_endpoint(endpoint),
+                "should be graphql: {endpoint}"
+            );
+        }
+        for endpoint in [
+            // A query-string red herring: cutting at `?` happens before the
+            // comparison, so this keeps the ordinary owner-checked path.
+            "repos/cameronsjo/x?graphql=1",
+            // A real repo NAMED graphql stays owner-checked. This is why the
+            // relative form matches only the exact word, never a trailing
+            // `/graphql`.
+            "repos/cameronsjo/graphql",
+            "https://api.github.com/repos/cameronsjo/graphql",
+            "orgs/evil/repos#graphql",
+            "search/issues",
+        ] {
+            assert!(
+                !is_graphql_endpoint(endpoint),
+                "should NOT be graphql: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_graphql_spelling_reaches_the_mutation_classifier() {
+        // Exact equality against "graphql" let three spellings of the same
+        // endpoint take the GET narrowing and skip the classifier entirely.
+        const MUT: &str = "mutation { createRepository(input: {}) { id } }";
+        for cmd in [
+            format!("gh api graphql -X GET -f query='{MUT}'"),
+            format!("gh api /graphql -X GET -f query='{MUT}'"),
+            format!("gh api 'graphql?x=1' -X GET -f query='{MUT}'"),
+            format!("gh api https://api.github.com/graphql -X GET -f query='{MUT}'"),
+        ] {
+            with_env(&owners_env(), || {
+                let result = GhWriteGuard.run(&input_with(&cmd, OWNED_DIR));
+                let meta = result
+                    .block_metadata
+                    .unwrap_or_else(|| panic!("expected a structured block: {cmd}"));
+                assert_eq!(meta.rule_id, "gh-write-api-unverifiable", "for: {cmd}");
+            });
+        }
+    }
+
+    #[test]
+    fn a_graphql_red_herring_endpoint_is_not_exempted() {
+        // `?graphql=1` must not buy the graphql treatment — the segment still
+        // resolves `repos/<owner>/<repo>` and faces the allowlist.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                "gh api 'repos/evil-corp/x?graphql=1' -X POST -f name=pwned",
+                OWNED_DIR,
+            ));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
         });
     }
 
