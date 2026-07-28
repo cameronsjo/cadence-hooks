@@ -7,10 +7,93 @@
 //! text, no I/O) so both the fire-and-forget metrics logger and the PreToolUse
 //! gate that blocks an evidenced polish-skip share one implementation and one
 //! set of tests.
+//!
+//! [`read_tail`] is the one deliberate exception to that purity: getting the
+//! transcript text off disk is I/O every consumer of the pure resolvers needs,
+//! and doing it once here is what keeps the bound in a single place (#361).
 
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+/// Default bound for a transcript tail read: 1 MiB.
+///
+/// Every consumer of [`read_tail`] resolves a field off the *last assistant
+/// line* ([`last_assistant_model`], [`last_assistant_harness_version`]), and on
+/// each of today's callers that line sits at or near the very end of the file —
+/// the hook fires while the assistant's own tool call is the newest turn. 1 MiB
+/// therefore covers the needed line hundreds of times over, with headroom for a
+/// tail made entirely of large tool-result lines, while bounding the read of a
+/// long session's multi-hundred-MB transcript to a fixed cost.
+pub const TAIL_READ_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Read the last [`TAIL_READ_MAX_BYTES`] of a session transcript.
+/// See [`read_tail_bounded`] for the semantics.
+pub fn read_tail(path: &Path) -> Option<String> {
+    read_tail_bounded(path, TAIL_READ_MAX_BYTES)
+}
+
+/// Read at most `max_bytes` from the END of `path`, returning whole lines.
+///
+/// The transcript resolvers in this module all scan from the tail
+/// (`.lines().rev()`), so they never need the head of a file that can reach
+/// hundreds of MB in a long session. This is the shared bounded read those
+/// callers route through instead of `read_to_string`.
+///
+/// **The cap does not trust `st_size`.** The read is capped with
+/// `take(max_bytes)` regardless of what the size said, so a file reporting 0
+/// while holding gigabytes (a `/proc`-style file on Linux) is still bounded —
+/// it is simply read from the front instead of seeked. The size is used only
+/// to choose the seek offset, so a lie costs a wrong window, never an
+/// unbounded read.
+///
+/// **A byte offset can land mid-codepoint.** When the file is larger than the
+/// cap, everything up to and including the first `\n` in the window is dropped:
+/// that first line is a fragment of a line the caller would not have parsed
+/// anyway, and `\n` cannot occur inside a multi-byte UTF-8 sequence, so the
+/// remainder is guaranteed to start on a codepoint boundary. Tail-scan
+/// semantics tolerate the loss — a dropped fragment is one line further from
+/// the tail than anything the resolvers want. A window with no `\n` at all (one
+/// pathologically long final line) yields an empty string, and the caller's
+/// resolver returns `None` — fail-open, per ADR-0001.
+///
+/// `None` on any open/stat/read failure or non-UTF-8 content, matching the
+/// `read_to_string` this replaces. A non-regular target (directory, FIFO,
+/// device) is rejected on the pre-open `stat`, since a FIFO blocks on `open`
+/// and a check afterwards would already be too late — the same ordering
+/// [`crate::paths::read_capped`] depends on.
+pub fn read_tail_bounded(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None; // FIFO / device / dir / broken symlink
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    // Length from an `fstat` on the OPEN handle, not the path stat above: the
+    // seek offset is then computed from the file we actually hold, with no
+    // second path resolution in between. The `take` below bounds the read
+    // whatever this reports, so a lie costs at most a wasted seek.
+    let len = file.metadata().ok()?.len();
+    let seeked = len > max_bytes;
+    if seeked {
+        file.seek(SeekFrom::Start(len - max_bytes)).ok()?;
+    }
+
+    let mut buf = Vec::with_capacity(len.min(max_bytes) as usize);
+    (&file).take(max_bytes).read_to_end(&mut buf).ok()?;
+
+    if seeked {
+        // Drop the leading partial line — see the codepoint note above. A
+        // window with no newline at all is entirely one fragment, so all of it
+        // goes.
+        let cut = buf
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |newline| newline + 1);
+        buf.drain(..cut);
+    }
+    String::from_utf8(buf).ok()
+}
 
 /// Minimal transcript-line shape for model resolution. Only the fields
 /// [`last_assistant_model`] needs are deserialized; every other key is ignored.
@@ -351,6 +434,148 @@ mod tests {
         )
         .unwrap();
         assert!(!subagent_transcripts_have_polish_run(&parent));
+    }
+
+    // --- read_tail_bounded (#361) ---
+
+    /// Write `content` to a fresh temp dir and return `(dir, path)`. The dir is
+    /// returned so the caller keeps it alive for the test's duration.
+    fn transcript_file(content: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sess.jsonl");
+        std::fs::write(&path, content).unwrap();
+        (tmp, path)
+    }
+
+    #[test]
+    fn read_tail_returns_a_short_file_whole() {
+        // Under the bound → read from offset 0, so NO partial-line drop. The
+        // first line must survive; this is the per-caller behavior preservation.
+        let content = [
+            model_line("assistant", "claude-sonnet-4-5"),
+            model_line("assistant", "claude-opus-4-8"),
+        ]
+        .join("\n");
+        let (_tmp, path) = transcript_file(content.as_bytes());
+        assert_eq!(read_tail_bounded(&path, 1024).as_deref(), Some(&*content));
+    }
+
+    #[test]
+    fn read_tail_bounds_the_read_of_a_large_file() {
+        // A file far over the bound: the read must be capped at the bound, and
+        // the tail-most assistant model must still resolve off what came back.
+        const BOUND: u64 = 4 * 1024;
+        let filler = model_line("assistant", "claude-old-model");
+        let mut content = String::new();
+        while content.len() < 40 * 1024 {
+            content.push_str(&filler);
+            content.push('\n');
+        }
+        content.push_str(&model_line("assistant", "claude-fable-5"));
+        let (_tmp, path) = transcript_file(content.as_bytes());
+
+        let tail = read_tail_bounded(&path, BOUND).unwrap();
+        assert!(
+            tail.len() as u64 <= BOUND,
+            "the read must be bounded: got {} bytes for a {}-byte bound",
+            tail.len(),
+            BOUND
+        );
+        assert!(
+            (tail.len() as u64) < content.len() as u64,
+            "the fixture must actually exceed the bound, or this proves nothing"
+        );
+        assert_eq!(
+            last_assistant_model(&tail).as_deref(),
+            Some("claude-fable-5"),
+            "the tail-most model must still resolve from the bounded read"
+        );
+    }
+
+    #[test]
+    fn read_tail_drops_a_line_split_mid_codepoint() {
+        // The bound lands INSIDE a multi-byte character on the first line of the
+        // window. A naive byte slice would be invalid UTF-8; dropping through
+        // the first newline must yield clean, whole lines.
+        let head = format!("{{\"pad\":\"{}\"}}", "é".repeat(64)); // 2 bytes each
+        let tail_line = model_line("assistant", "claude-fable-5");
+        let content = format!("{head}\n{tail_line}");
+        let (_tmp, path) = transcript_file(content.as_bytes());
+
+        // The head's last `é` occupies bytes head.len()-4..head.len()-2 (the
+        // trailing `"}` is the final 2 bytes), so a window opening at
+        // head.len()-3 starts on that character's SECOND byte.
+        let bound = (content.len() - (head.len() - 3)) as u64;
+        assert_eq!(
+            content.as_bytes()[head.len() - 3] & 0b1100_0000,
+            0b1000_0000,
+            "the fixture must actually open mid-codepoint (a continuation byte), \
+             or this test proves nothing"
+        );
+
+        let tail = read_tail_bounded(&path, bound).unwrap();
+        assert_eq!(
+            tail, tail_line,
+            "the mid-codepoint partial line must be dropped, leaving whole lines"
+        );
+        assert_eq!(
+            last_assistant_model(&tail).as_deref(),
+            Some("claude-fable-5")
+        );
+    }
+
+    #[test]
+    fn read_tail_window_without_a_newline_is_empty() {
+        // One pathologically long line, so the whole window is a fragment. No
+        // whole line survives → empty, and the resolver falls through to None
+        // (fail-open) rather than parsing a truncated JSON object.
+        let content = model_line("assistant", &"m".repeat(4096));
+        let (_tmp, path) = transcript_file(content.as_bytes());
+        let tail = read_tail_bounded(&path, 64).unwrap();
+        assert_eq!(tail, "");
+        assert_eq!(last_assistant_model(&tail), None);
+    }
+
+    #[test]
+    fn read_tail_at_exactly_the_bound_keeps_the_first_line() {
+        // Boundary: len == max_bytes is NOT over the bound, so no seek and no
+        // partial-line drop. An off-by-one here would eat a real first line.
+        let content = model_line("assistant", "claude-fable-5");
+        let (_tmp, path) = transcript_file(content.as_bytes());
+        assert_eq!(
+            read_tail_bounded(&path, content.len() as u64).as_deref(),
+            Some(&*content)
+        );
+    }
+
+    #[test]
+    fn read_tail_missing_file_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_tail_bounded(&tmp.path().join("absent.jsonl"), 1024),
+            None
+        );
+    }
+
+    #[test]
+    fn read_tail_non_regular_target_is_none() {
+        // A directory at the transcript path is not a transcript.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_tail_bounded(tmp.path(), 1024), None);
+    }
+
+    #[test]
+    fn read_tail_non_utf8_is_none() {
+        // Matches the `read_to_string` this replaces: undecodable → None →
+        // the caller fails open.
+        let (_tmp, path) = transcript_file(&[0xff, 0xfe, b'\n', 0xff]);
+        assert_eq!(read_tail_bounded(&path, 1024), None);
+    }
+
+    #[test]
+    fn read_tail_empty_file_is_empty() {
+        let (_tmp, path) = transcript_file(b"");
+        assert_eq!(read_tail_bounded(&path, 1024).as_deref(), Some(""));
     }
 
     // --- last_assistant_model (#144) ---

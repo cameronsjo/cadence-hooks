@@ -177,7 +177,7 @@ impl Check for GuardReadModel {
         // on_unknown (default allow) — so a missing transcript never bricks reads.
         let resolved = input
             .transcript_path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|path| cadence_hooks_core::transcript::read_tail(std::path::Path::new(path)))
             .and_then(|content| cadence_hooks_core::transcript::last_assistant_model(&content));
 
         match judge(resolved.as_deref(), mode, &models, on_unknown) {
