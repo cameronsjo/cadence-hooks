@@ -17,21 +17,31 @@
 //! `.claude/cadence.json` `redaction.allowlist` is the escape hatch for the
 //! recurring legitimate case.
 //!
-//! ## Body extraction (not segment-based)
+//! ## Body extraction is scoped to the posting segment (#424)
 //!
-//! Bodies are pulled from flag VALUES via [`tokenize`] over the **raw** command
-//! — deliberately NOT via [`split_segments`]/`command_segments`, which strip
-//! heredoc bodies as "data" (the exact text we must scan). Because [`tokenize`]
-//! keeps a quoted value as one token, a heredoc carried in a quoted command
-//! substitution — `git commit -m "$(cat <<'EOF' … EOF)"` — rides into the `-m`
-//! value intact, so its body lines are scanned. Only flag values are scanned,
-//! so the command words/flags themselves never trip the blocklist.
+//! Gate and extraction run **per segment** ([`command_segments`]), never over
+//! the whole command line. A whole-line gate paired with whole-line extraction
+//! made one posting segment authorize extraction from every *sibling* segment,
+//! so `gh secret set N --body '…' && gh pr comment -b hi` scanned the secret's
+//! body (which never posts anywhere) and `gh api x --body-file f && git commit`
+//! *read the file* `gh api` named. A file named by a non-posting segment must
+//! never be opened, so the per-segment gate has to precede extraction rather
+//! than filter its results.
+//!
+//! Within a matching segment, bodies are pulled from flag VALUES via
+//! [`tokenize`] — deliberately not from a further re-split, since [`tokenize`]
+//! keeps a quoted value as one token. A heredoc carried in a quoted command
+//! substitution — `git commit -m "$(cat <<'EOF' … EOF)"` — survives
+//! segmentation intact (the heredoc sits inside quotes, so segment splitting
+//! never treats it as a top-level heredoc body) and rides into the `-m` value,
+//! so its body lines are still scanned. Only flag values are scanned, so the
+//! command words/flags themselves never trip the blocklist.
 //!
 //! Failure is silent (`allow()`): no recognized body flag, an unreadable
 //! `--body-file`, a parse miss, or no hits all proceed without a message. In
 //! nudge mode, silent failure beats false positives.
 
-use cadence_hooks_core::shell::{strip_quotes, tokenize};
+use cadence_hooks_core::shell::{command_segments, strip_quotes, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use serde::Deserialize;
@@ -272,15 +282,18 @@ impl Check for RedactExternalContent {
             return CheckResult::allow();
         };
 
-        // Gate: scan only commands that actually publish content. Quote-strip
-        // first so a body merely mentioning `gh pr create` can't self-trip.
-        if !EXTERNAL_POST.is_match(&strip_quotes(command)) {
-            return CheckResult::allow();
-        }
-
-        // Phase 2 — pull body text from flag values; silent allow if none.
+        // Phase 2 — gate and extract PER SEGMENT (#424). A segment that does
+        // not itself publish contributes no body, so its `--body-file` is never
+        // opened; only a segment that passes the gate has its flag values read.
+        // Quote-strip each segment first so a body merely mentioning `gh pr
+        // create` can't self-trip. Silent allow if no segment yields a body.
         let base_dir = resolve_base_dir(input);
-        let bodies = extract_bodies(command, &base_dir);
+        let mut bodies: Vec<String> = Vec::new();
+        for segment in command_segments(command) {
+            if EXTERNAL_POST.is_match(&strip_quotes(&segment)) {
+                bodies.extend(extract_bodies(&segment, &base_dir));
+            }
+        }
         if bodies.is_empty() {
             return CheckResult::allow();
         }
@@ -322,7 +335,10 @@ fn resolve_base_dir(input: &HookInput) -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
-/// Extract body text from a posting command's flag values.
+/// Extract body text from the flag values of ONE gate-passing segment. Callers
+/// must apply the [`EXTERNAL_POST`] gate to the segment first — a file-body flag
+/// is read here, so handing this a non-posting segment performs I/O the guard
+/// has no business doing (#424).
 ///
 /// Literal-body flags (`--body`/`-b`/`-m`/`--message`, plus their `=`-joined and
 /// glued-short forms) contribute their value verbatim. File-body flags
@@ -331,8 +347,8 @@ fn resolve_base_dir(input: &HookInput) -> String {
 /// value as one token, so a heredoc inside `"$(cat <<EOF … EOF)"` rides into the
 /// value intact. `--title`/`-t` is deliberately out of scope (the spec scans
 /// bodies only).
-fn extract_bodies(command: &str, base_dir: &str) -> Vec<String> {
-    let tokens = tokenize(command);
+fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
+    let tokens = tokenize(segment);
     let mut bodies = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
@@ -745,6 +761,208 @@ mod tests {
         let path = dir.path().join("body.md");
         std::fs::write(&path, "writeup mentioning cadence:polish here").unwrap();
         let cmd = format!("gh pr create --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
+    // --- #424: gate and extraction are scoped to the matching segment ---
+
+    #[test]
+    fn compound_line_does_not_scan_a_non_posting_sibling_body() {
+        // PoC 1: the secret's value never posts anywhere, but the sibling
+        // `gh pr comment` used to authorize extracting it. The posting segment
+        // here is clean, so the only possible hit is the secret's body.
+        assert_eq!(
+            run("gh secret set NAME --body 'cadence:attune' && gh pr comment 1 -b hello").outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn compound_line_does_not_read_a_non_posting_siblings_body_file() {
+        // PoC 2: `gh api --body-file` is not a post, so the file it names must
+        // never be opened. The fixture is loaded with a hit, so any read flips
+        // the outcome to Nudge and fails loudly — this asserts zero file I/O
+        // for the non-matching segment. The discriminating control is the test
+        // named below, which uses the same fixture shape on a POSTING segment
+        // and does nudge — so an Allow here is evidence of no read, not of a
+        // scan that could never have hit:
+        //   compound_line_reads_the_posting_segments_body_file
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canary.md");
+        std::fs::write(&path, "tripwire body naming cadence:attune").unwrap();
+        let cmd = format!(
+            "gh api repos/x --body-file {} && git commit -m hello",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn compound_line_still_scans_the_posting_segment() {
+        // Positive control for both PoCs: scoping must not stop a genuinely
+        // posting segment in a compound line from being scanned.
+        assert_eq!(
+            run("git status && gh pr comment 1 -b 'see cadence:attune'").outcome,
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn compound_line_reads_the_posting_segments_body_file() {
+        // Positive control specifically for the file-read path: the same
+        // compound shape as PoC 2, but the file belongs to the posting segment.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup mentioning cadence:polish here").unwrap();
+        let cmd = format!(
+            "git status && gh pr create --body-file {}",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn compound_line_with_two_posting_segments_scans_both() {
+        // Scoping is per segment, not first-match — a line where BOTH segments
+        // post must surface a hit from each.
+        let result =
+            run("gh pr comment 1 -b 'see cadence:attune' && git commit -m 'ref /Users/cameron/x'");
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let message = result.message.as_deref().unwrap();
+        assert!(
+            message.contains("[skill-id] cadence:attune"),
+            "expected the first segment's hit in: {message:?}"
+        );
+        assert!(
+            message.contains("[local-path] /Users/cameron/x"),
+            "expected the second segment's hit in: {message:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_non_posting_body_flag_unchanged() {
+        // The issue's original premise, kept as a regression: a standalone
+        // non-posting command was already clean via the whole-command gate, and
+        // must stay clean now that the gate is per segment.
+        assert_eq!(
+            run("gh secret set NAME --body 'cadence:attune'").outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn standalone_non_posting_body_file_is_not_read() {
+        // Same premise on the file path: `gh api --body-file` standalone must
+        // not open the file it names.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canary.md");
+        std::fs::write(&path, "tripwire body naming cadence:attune").unwrap();
+        let cmd = format!("gh api repos/x --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    // --- Multi-line posting commands (#475) ---
+    //
+    // Per-segment scoping is only safe if a segment boundary means what the
+    // shell means by it. A backslash-newline is a continuation, not a
+    // boundary — cutting there put the posting verb in one segment and its
+    // `--body`/`--body-file` in the next, so the gate failed on the segment
+    // holding the body and nothing was scanned at all. Every case below is a
+    // shape a person writes by hand.
+
+    #[test]
+    fn continued_body_file_is_scanned() {
+        // The shape `cadence:creating-issue` MANDATES: `--body-file`, flags
+        // spread across continuation lines.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup naming cadence:attune").unwrap();
+        let cmd = format!(
+            "gh issue create --repo cameronsjo/cadence-hooks \\\n  --title \"issue title\" \\\n  --body-file {}",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn continued_literal_body_is_scanned() {
+        assert_eq!(
+            run("gh pr create \\\n  --title t \\\n  --body \"see cadence:attune\"").outcome,
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn continued_heredoc_in_substitution_is_scanned() {
+        // The `--body "$(cat <<'EOF' … EOF)"` form, reached over a
+        // continuation. The heredoc rides inside the quoted value, so
+        // segmentation must neither cut at the continuation nor at the body's
+        // own newlines.
+        let cmd = "gh pr create \\\n  --body \"$(cat <<'EOF'\nRefactored per cadence:attune today.\nEOF\n)\"";
+        assert_eq!(run(cmd).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn continued_body_with_crlf_is_scanned() {
+        assert_eq!(
+            run("gh pr create \\\r\n  --body \"see cadence:attune\"").outcome,
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn bare_newline_between_commands_still_scopes_per_command() {
+        // Discriminating control for the four above: a plain newline IS a
+        // boundary, so the non-posting neighbour's body stays unscanned. Were
+        // continuations handled by simply not splitting on newlines, this
+        // would nudge.
+        assert_eq!(
+            run("gh secret set NAME --body 'cadence:attune'\ngh pr comment 1 -b hello").outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn escaped_quote_cannot_launder_a_body_past_the_gate() {
+        // `\"` inside `"…"` is content, so the operator after it is still
+        // inside the `-m` value and creates no segment boundary. When the
+        // splitter disagreed with the tokenizer, the text after the operator
+        // became its own non-posting segment and went unscanned.
+        for op in ["&&", ";", "|"] {
+            let cmd = format!("git commit -m \"he said \\\" {op} cadence:attune here\"");
+            assert_eq!(run(&cmd).outcome, Outcome::Nudge, "operator {op}");
+        }
+    }
+
+    #[test]
+    fn later_assignment_does_not_make_the_guard_read_a_file() {
+        // The shell expands `$F` before reaching the `||` branch, so this
+        // command never names the canary. The guard must not either. The
+        // fixture holds a hit, so any read flips the outcome and fails loudly;
+        // the discriminating control is the test named below, which reads the
+        // same fixture through an assignment that genuinely precedes its use:
+        //   preceding_assignment_still_resolves_the_body_file
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canary.md");
+        std::fs::write(&path, "tripwire body naming cadence:attune").unwrap();
+        let cmd = format!(
+            "gh pr create --body-file $F || F={}",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn preceding_assignment_still_resolves_the_body_file() {
+        // Positive control: an assignment BEFORE the use is what the shell
+        // would expand, so the guard follows it and reads the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup naming cadence:attune").unwrap();
+        let cmd = format!(
+            "F={} && gh pr create --body-file $F",
+            path.to_str().unwrap()
+        );
         assert_eq!(run(&cmd).outcome, Outcome::Nudge);
     }
 
