@@ -15,6 +15,8 @@ pub mod common;
 
 /// USD cost from token totals and a model name.
 pub mod compute_cost;
+/// Disclose at SessionStart when the guard suite has recently been failing open.
+pub mod failopen_disclose;
 /// Append AskUserQuestion stance/shape records to `askuserquestion.jsonl`.
 pub mod log_askuserquestion;
 /// Append guard-bypass audit records (armed/used) to `bypasses.jsonl`.

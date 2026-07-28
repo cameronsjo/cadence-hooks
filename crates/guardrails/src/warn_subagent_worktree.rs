@@ -372,10 +372,11 @@ mod tests {
     // fact survives the swap end to end: a dispatch from the primary checkout
     // nudges, and one from inside the sibling worktree does not.
 
-    /// Serialize the env-reading dispatch tests: `assess_spawn`'s `allowed` arm
-    /// reads `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` from real process env, which an
-    /// ambient session value could otherwise flip to a false allow.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Serialize the env-reading dispatch tests via the crate-shared
+    // CADENCE_ENV_TEST_LOCK: `assess_spawn`'s `allowed` arm reads
+    // `CADENCE_ALLOW_SUBAGENT_FROM_MAIN` from real process env, which an
+    // ambient session value — or a concurrent env-mutating test elsewhere in
+    // this crate (#446) — could otherwise flip to a false allow.
 
     fn git(dir: &Path, args: &[&str]) {
         let ok = std::process::Command::new("git")
@@ -391,9 +392,11 @@ mod tests {
 
     #[test]
     fn dispatch_from_primary_with_sibling_worktree_nudges() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::CADENCE_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN").ok();
-        // SAFETY: serialized via ENV_LOCK; restored below.
+        // SAFETY: serialized via CADENCE_ENV_TEST_LOCK; restored below.
         unsafe {
             std::env::remove_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN");
         }
@@ -446,7 +449,7 @@ mod tests {
             "Explore dispatch from primary + sibling worktree is silent (read-only by convention)"
         );
 
-        // SAFETY: serialized via ENV_LOCK.
+        // SAFETY: serialized via CADENCE_ENV_TEST_LOCK.
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("CADENCE_ALLOW_SUBAGENT_FROM_MAIN", v),
