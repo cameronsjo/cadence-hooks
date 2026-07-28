@@ -139,8 +139,35 @@ pub(crate) fn git_dir_is_common_dir(git_dir: &Path, repo_root: &Path) -> bool {
 /// This is the generic predicate behind [`is_temp_root`]; `guardrails::guard_rm`
 /// reuses it to classify an `rm` target path (cadence-hooks#261), while
 /// `is_temp_root` keeps its repo-root-focused name for the enforce-worktree
-/// carve-out.
+/// carve-out. Canonicalizes `tmpdir` on every call — fine for a single check,
+/// but see [`path_under_temp_root_with_canonical`] when a caller checks
+/// several candidate paths against the same `$TMPDIR` in one pass.
 pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>) -> bool {
+    let canonical = canonicalize_tmpdir(tmpdir);
+    path_under_temp_root_with_canonical(path, tmpdir, canonical.as_deref())
+}
+
+/// `$TMPDIR`, canonicalized once — factored out of [`path_under_temp_root`]
+/// so a caller checking multiple candidate paths against the same `$TMPDIR`
+/// (e.g. [`crate::git_fixtures::resolve_scratch_dir`]'s up-to-three-candidate
+/// fallback chain, cadence-hooks#403 code review) can canonicalize once and
+/// reuse it, instead of re-running a real `realpath` syscall chain per
+/// candidate.
+pub(crate) fn canonicalize_tmpdir(tmpdir: Option<&str>) -> Option<PathBuf> {
+    tmpdir
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "/")
+        .and_then(|t| std::fs::canonicalize(t).ok())
+}
+
+/// Same check as [`path_under_temp_root`], but takes an already-canonicalized
+/// `$TMPDIR` (from [`canonicalize_tmpdir`]) instead of canonicalizing on
+/// every call.
+pub(crate) fn path_under_temp_root_with_canonical(
+    path: &Path,
+    tmpdir: Option<&str>,
+    tmpdir_canonical: Option<&Path>,
+) -> bool {
     let fixed = path.starts_with("/tmp") || path.starts_with("/private/tmp");
     let via_env = tmpdir
         .map(str::trim)
@@ -152,8 +179,7 @@ pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>) -> bool {
             // against the canonicalized tmpdir too, or the match never fires
             // on macOS.
             path.starts_with(t)
-                || std::fs::canonicalize(t)
-                    .is_ok_and(|c| c != Path::new("/") && path.starts_with(&c))
+                || tmpdir_canonical.is_some_and(|c| c != Path::new("/") && path.starts_with(c))
         });
     fixed || via_env
 }
