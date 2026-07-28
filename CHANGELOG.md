@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`guard-gh-write` judges the parsed argv of a command, not the characters in it** (cameronsjo/cadence-hooks#463, #353). Every target-resolution arm matched a regex against the whole raw segment, so the guard decided *where a write would land* from text that the shell would never execute as a command. Four escapes, all silent ALLOWs on `main`, all closed by routing the arms through one quote-aware parse (`gh_argv`) instead:
+
+  **Prose in a `--body` donated a target.** `gh issue comment 42 --body "moved to repos/cameronsjo/allowed"` matched arm 3's `API_REPOS` over the entire segment, resolved to an allowed repo, passed the allowlist, and returned *before* the git-remote arm ever ran — so gh then wrote to a cwd remote the guard never checked. Arm 1 shared the shape via `split_whitespace`, which read a bare `-R owner/repo` inside a quoted body as the flag itself; arm 2's `REPO_SUBCOMMAND` matched `gh repo archive owner/repo` anywhere in the segment, including inside quotes. No adversary is required for any of these — quoting a repo path in a comment body is enough, which defeats exactly the silent-wrong-target case the guard exists for.
+
+  **The user-scoped exemption was the worst of the four**, because it did not merely resolve the wrong target — it skipped resolution entirely. `gh gist` and `gh repo fork` create under your own account, so both are exempted by an unconditional `continue`. That exemption keyed on the substrings `gh\s+gist\s` and `gh\s+repo\s+fork\b`, so `gh pr create --title t --body "see gh gist for logs"` was waved through with no ownership check at all.
+
+  **`repos/<owner>/<repo>` is now read from the parsed API endpoint rather than the segment**, and the `-R` scan, the `gh repo <verb>` positional, and the gist/fork exemption all read argv positions. Quoted text is one token, so it can never masquerade as a flag or a subcommand. `gh repo edit` is still resolved from the cwd remote despite being a write with a positional target — that is #454, deliberately not folded in here.
+
+  **#353's own diagnosis is refuted, and its fix would have been inert.** The issue reports a loop-wrapped read-only `gh api graphql` being blocked as a write, and prescribes applying the `graphql_mutation_status` downgrade at the three loop call sites, on the theory that `API_FIELD_FLAGS` matches any `-f query=…`. It does not, on that path: core's `suffix_words` keeps only `Word` items when building `LoopedCommand::args`, so the payload is dropped and the command reconstructs as a bare `gh api graphql -f` — matching no write pattern at all. The loop gate returns `has_write: false` and declines to judge, which means there was never a verdict there to downgrade; a test now pins that reconstruction verbatim. The block the issue observed came from the *per-segment* pass below the loop gate, and it arrived there because `command_segments` splits `for …; do gh …; done` on the `;` and leaves `do` welded to the body — which made `gh_api_endpoint` return `None`, skipping the graphql arm that would have allowed the read. Peeling that keyword in `gh_argv` is the whole fix; the three named call sites are untouched.
+
+  **The same blindness was also a false ALLOW in the other direction**, which neither issue reports. From an *owned* checkout, a loop-wrapped `gh api graphql -f query='mutation …'`, `gh api -X POST orgs/evil/repos`, or `gh api orgs/evil/repos -f name=x` skipped the api-unverifiable arm for the same reason and fell through to cwd resolution, which allowed it — reopening #78's bypass to anyone who wrapped the call in a loop. All three now block as `gh-write-api-unverifiable`, and a loop-wrapped `resolveReviewThread` stays allowed.
+
+  The loop gate itself is still blind to `gh api` payloads; fixing core's `suffix_words` alone would hard-block every looped GraphQL *read* — re-creating #353 one layer up — so it must land together with a graphql-aware wrapper at those call sites. That is #471, with `debt:` markers at all three. Verified by differential: the eleven end-to-end cases were spliced onto the pre-change source, where eight fail and the three preservation regressions pass.
+
 ## [0.70.0] - 2026-07-27
 
 ### Added

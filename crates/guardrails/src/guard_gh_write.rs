@@ -50,10 +50,22 @@ static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
 static API_INPUT_FLAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh\s+api.*\s--input\s").expect("pattern should compile"));
 
-static REPO_SUBCOMMAND: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+repo\s+(archive|delete|rename|unarchive|fork|clone|create)\b")
-        .expect("pattern should compile")
-});
+/// `gh repo` verbs whose FIRST positional argument names the target repo.
+/// Matched against parsed argv, never the raw command string, so a verb name
+/// appearing inside a quoted argument can't donate a target (#463).
+///
+/// `edit` is absent deliberately: it takes a positional repo too and IS in
+/// [`WRITE_ACTIONS`], so its target currently falls through to the cwd remote —
+/// tracked as its own fix (#454) rather than smuggled in here.
+const REPO_TARGET_VERBS: &[&str] = &[
+    "archive",
+    "delete",
+    "rename",
+    "unarchive",
+    "fork",
+    "clone",
+    "create",
+];
 
 static API_REPOS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/?repos/([^/]+/[^/ ]+)").expect("pattern should compile"));
@@ -79,12 +91,6 @@ static MUTATION_KEYWORD: LazyLock<Regex> =
 /// blocked.
 static SAFE_GRAPHQL_MUTATIONS: [&str; 2] = ["resolveReviewThread", "unresolveReviewThread"];
 
-static GIST_COMMAND: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"gh\s+gist\s").expect("pattern should compile"));
-
-static REPO_FORK_COMMAND: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"gh\s+repo\s+fork\b").expect("pattern should compile"));
-
 /// True when `command` names a `gh` sub-command that mutates GitHub state.
 ///
 /// `pub(crate)` so [`inject_gh_write_context`](super::inject_gh_write_context)
@@ -104,12 +110,17 @@ pub(crate) fn is_write_command(command: &str) -> bool {
 /// mirroring `loop_analysis::extract_repo_flag`, which does the same over
 /// parsed AST words. Values keep their quotes trimmed so `--repo "o/r"`
 /// resolves to `o/r`.
+///
+/// Tokenized quote-aware rather than on whitespace: a `-R owner/repo` spelled
+/// inside another flag's quoted value (`--body "use -R cameronsjo/allowed"`) is
+/// ONE token, so prose can no longer donate a target to a write that never
+/// named one (#463).
 pub(crate) fn extract_repo_flag_str(command: &str) -> Option<String> {
     let trim_value = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
-    let words: Vec<&str> = command.split_whitespace().collect();
+    let words = tokenize(command);
     let mut iter = words.iter();
     while let Some(word) = iter.next() {
-        if *word == "-R" || *word == "--repo" {
+        if word == "-R" || word == "--repo" {
             return iter.next().map(|s| trim_value(s));
         }
         if let Some(repo) = word.strip_prefix("--repo=") {
@@ -162,35 +173,33 @@ fn resolve_target_repo(
     }
 
     // 2. gh repo <subcommand> <owner/repo> (positional arg)
-    if let Some(caps) = REPO_SUBCOMMAND.captures(command) {
-        let subcommand = caps.get(1).unwrap().as_str();
-        let split_key = format!("gh repo {subcommand}");
-        let after = command.split(&split_key).nth(1).unwrap_or("").trim();
-        let first_arg = after.split_whitespace().next().unwrap_or("");
-        if !first_arg.is_empty() && !first_arg.starts_with('-') {
-            if first_arg.contains('/') {
-                return RepoResolution::Resolved {
-                    host: dh,
-                    repo: first_arg.to_string(),
-                };
-            }
-            // Only `create` can infer owner from a bare name (no `/`)
-            if subcommand == "create" {
-                let default_owner = allowed_owners
-                    .iter()
-                    .find(|e| e.host.is_none() || e.host.as_deref() == Some(&dh))
-                    .map(|e| e.owner.as_str())
-                    .unwrap_or("");
-                return RepoResolution::Resolved {
-                    host: dh,
-                    repo: format!("{default_owner}/{first_arg}"),
-                };
-            }
+    if let Some((subcommand, first_arg)) = gh_repo_positional_target(command) {
+        if first_arg.contains('/') {
+            return RepoResolution::Resolved {
+                host: dh,
+                repo: first_arg,
+            };
+        }
+        // Only `create` can infer owner from a bare name (no `/`)
+        if subcommand == "create" {
+            let default_owner = allowed_owners
+                .iter()
+                .find(|e| e.host.is_none() || e.host.as_deref() == Some(&dh))
+                .map(|e| e.owner.as_str())
+                .unwrap_or("");
+            return RepoResolution::Resolved {
+                host: dh,
+                repo: format!("{default_owner}/{first_arg}"),
+            };
         }
     }
 
-    // 3. gh api repos/OWNER/REPO
-    if let Some(caps) = API_REPOS.captures(command)
+    // 3. gh api repos/OWNER/REPO — matched against the parsed ENDPOINT, never
+    // the whole command: a `repos/owner/repo` string sitting in a `--body`,
+    // `--jq`, or commit-message argument used to donate its owner to an
+    // unrelated write, resolving a target the command never named (#463).
+    if let Some(endpoint) = gh_api_endpoint(command)
+        && let Some(caps) = API_REPOS.captures(&endpoint)
         && let Some(repo) = caps.get(1)
     {
         return RepoResolution::Resolved {
@@ -473,17 +482,88 @@ fn api_flag_takes_separate_value(flag: &str) -> bool {
     )
 }
 
-/// If `segment` invokes `gh api` (command word `gh` or a `*/gh` basename, first
+/// The argv of a `gh` invocation in `segment`, with `gh` at index 0 — or `None`
+/// when the segment invokes no `gh`.
+///
+/// The single parse every target-resolution arm reads, replacing the raw
+/// substring regexes that judged a command by what its *text* contained rather
+/// than by what it would *run* (#463). Two properties matter:
+///
+/// 1. **Quote-aware** (via [`tokenize`]), so `--body "gh repo archive o/r"` is
+///    ONE token and its prose can never be resolved as an invocation.
+/// 2. **Positional-agnostic** — it scans for the first token that resolves to
+///    `gh`, exactly as [`segment_invokes_gh`]'s gate does, rather than
+///    demanding `gh` be the command word. That peels the shell keywords
+///    `command_segments` leaves attached to a loop-body segment (`do gh api …`,
+///    `then gh …`, `! gh …`) and keeps the env-assignment (`GH_TOKEN=x gh …`),
+///    transparent-prefix (`sudo`/`env`/`command`/`exec`/`nice`/`timeout gh …`)
+///    and argument-position (`xargs gh …`, `find … -exec gh …`) forms that the
+///    regexes covered. Requiring the command word would drop those to the
+///    cwd-remote fallback — turning a named off-owner target into a guess.
+fn gh_argv(segment: &str) -> Option<Vec<String>> {
+    gh_argv_depth(segment, 0)
+}
+
+fn gh_argv_depth(segment: &str, depth: usize) -> Option<Vec<String>> {
+    let tokens = tokenize(segment);
+    if let Some(start) = tokens.iter().position(|tok| token_is_gh(tok)) {
+        return Some(tokens[start..].to_vec());
+    }
+    // `eval "<script>"` is the one wrapper `command_segments` does not unwrap,
+    // so its argument arrives as a single opaque token. Peel it exactly as
+    // `segment_invokes_gh` does, or an `eval`-wrapped write with a named target
+    // would silently fall through to the cwd remote.
+    if depth < MAX_EVAL_DEPTH
+        && tokens
+            .first()
+            .is_some_and(|t| t.rsplit('/').next().unwrap_or(t) == "eval")
+    {
+        return gh_argv_depth(&tokens[1..].join(" "), depth + 1);
+    }
+    None
+}
+
+/// The `(verb, target)` of a `gh repo <verb> <target>` invocation whose first
+/// positional names the repo, per [`REPO_TARGET_VERBS`]. `None` when the
+/// segment isn't that shape, or the positional is absent or a flag.
+///
+/// Shared by [`resolve_target_repo`]'s positional arm and
+/// [`segment_lacks_explicit_target`] so a new target-naming verb lands in one
+/// place and the resolver and the nudge predicate can't drift apart.
+fn gh_repo_positional_target(segment: &str) -> Option<(String, String)> {
+    let argv = gh_argv(segment)?;
+    if argv.get(1).map(String::as_str) != Some("repo") {
+        return None;
+    }
+    let verb = argv.get(2)?;
+    if !REPO_TARGET_VERBS.contains(&verb.as_str()) {
+        return None;
+    }
+    let target = argv.get(3)?;
+    if target.is_empty() || target.starts_with('-') {
+        return None;
+    }
+    Some((verb.clone(), target.clone()))
+}
+
+/// True when `segment`'s gh invocation targets the user's own account
+/// implicitly: any `gh gist` sub-command (gists are user-scoped) or
+/// `gh repo fork` (which creates under your account). Both are writes with no
+/// `-R` and no positional target, so they're exempt from ownership resolution.
+fn gh_write_is_user_scoped(segment: &str) -> bool {
+    let Some(argv) = gh_argv(segment) else {
+        return false;
+    };
+    let at = |i: usize| argv.get(i).map(String::as_str);
+    at(1) == Some("gist") || (at(1) == Some("repo") && at(2) == Some("fork"))
+}
+
+/// If `segment` invokes `gh api` (a `gh` invocation per [`gh_argv`], first
 /// non-flag subcommand `api`), return its endpoint — the first positional token
 /// after `api`, skipping flags and their values. `Some("")` for a bare `gh api`
 /// with no endpoint; `None` when the segment isn't a `gh api` call.
 fn gh_api_endpoint(segment: &str) -> Option<String> {
-    let tokens = tokenize(segment);
-    let first = tokens.first()?;
-    let cmd = first.rsplit('/').next().unwrap_or(first);
-    if cmd != "gh" {
-        return None;
-    }
+    let tokens = gh_argv(segment)?;
     // First non-flag token after `gh` must be the `api` subcommand.
     let mut i = 1;
     while i < tokens.len() && tokens[i].starts_with('-') {
@@ -543,12 +623,16 @@ pub(crate) fn segment_invokes_gh(segment: &str) -> bool {
 /// as a predicate rather than a resolution: the JIT nudge only needs to know
 /// *whether* a target was spelled out, not what it resolves to. Kept beside the
 /// patterns it reads so a new positional-target shape lands in one file.
+///
+/// Each clause reads the same parsed argv its resolver arm does, so the
+/// complement stays exact: a `repos/<owner>/<repo>` path or a `gh repo archive`
+/// phrase that appears only inside a quoted argument names no target for
+/// resolution, and must not silence the nudge either (#463).
 pub(crate) fn segment_lacks_explicit_target(segment: &str) -> bool {
     extract_repo_flag_str(segment).is_none()
-        && !API_REPOS.is_match(segment)
-        && !REPO_SUBCOMMAND.is_match(segment)
-        && !GIST_COMMAND.is_match(segment)
-        && !REPO_FORK_COMMAND.is_match(segment)
+        && !gh_api_endpoint(segment).is_some_and(|endpoint| API_REPOS.is_match(&endpoint))
+        && gh_repo_positional_target(segment).is_none()
+        && !gh_write_is_user_scoped(segment)
 }
 
 /// `eval` nesting is peeled at most this deep before the argument is treated as
@@ -575,13 +659,16 @@ fn segment_invokes_gh_depth(segment: &str, depth: usize) -> bool {
     false
 }
 
-/// True when any token resolves to `gh` (bare, a `*/gh` path, or a
+/// True when a single token resolves to `gh` (bare, a `*/gh` path, or a
 /// backslash-escaped `\gh`).
+fn token_is_gh(tok: &str) -> bool {
+    let unescaped = tok.strip_prefix('\\').unwrap_or(tok);
+    unescaped.rsplit('/').next().unwrap_or(unescaped) == "gh"
+}
+
+/// True when any token resolves to `gh`.
 fn tokens_contain_gh(tokens: &[String]) -> bool {
-    tokens.iter().any(|tok| {
-        let unescaped = tok.strip_prefix('\\').unwrap_or(tok);
-        unescaped.rsplit('/').next().unwrap_or(unescaped) == "gh"
-    })
+    tokens.iter().any(|tok| token_is_gh(tok))
 }
 
 /// Extract the value of a `gh api graphql` `query=` field across the
@@ -1040,6 +1127,15 @@ impl Check for GhWriteGuard {
                 // branch, which already gates on is_write_command (#158). -R targets are
                 // always on the default host (gh CLI convention).
                 let dh = default_host();
+                // debt: `c.args` is lossy — core's `suffix_words` keeps only Word
+                // items, so an assignment-shaped suffix (`-f query=…`, `-f name=x`)
+                // is dropped and `gh api graphql -f query=<mutation>` reconstructs
+                // as `gh api graphql -f`, which `is_write_command` reads as a read.
+                // This loop gate is therefore blind to `gh api` payloads. Fixing
+                // core alone would hard-block looped graphql READS (re-creating
+                // #353 one layer up), so it must land with a graphql-aware wrapper
+                // here — #471. Mitigated today by the per-segment pass below, which
+                // judges these correctly now that `gh_argv` peels the `do` keyword.
                 let unowned_write_targets: Vec<&str> = cmds
                     .iter()
                     .filter(|c| {
@@ -1073,6 +1169,11 @@ impl Check for GhWriteGuard {
             LoopAnalysis::MissingTargets(cmds) => {
                 // Only block if any looped gh command is a write — read-only
                 // commands (gh pr list, gh issue view) are safe without -R.
+                //
+                // debt: same lossy `c.args` reconstruction as the arm above — a
+                // looped `gh api … -f key=value` loses its payload and reads as a
+                // non-write here, so `has_write` is false and this gate declines
+                // to judge it. Pairs with a core `suffix_words` fix, #471.
                 let has_write = cmds.iter().any(|c| {
                     let reconstructed = format!("gh {}", c.args.join(" "));
                     is_write_command(&reconstructed)
@@ -1096,6 +1197,10 @@ impl Check for GhWriteGuard {
                         &extra_hosts,
                     );
                     if let LoopWriteDecision::Block { suggestion } = decision {
+                        // debt: the same lossy `c.args` reconstruction (#471) —
+                        // here it only shapes the message's "Found:" list, so a
+                        // dropped `-f key=value` suffix omits a command from the
+                        // listing rather than changing the verdict.
                         let writes: Vec<String> = cmds
                             .iter()
                             .filter(|c| {
@@ -1160,7 +1265,7 @@ impl Check for GhWriteGuard {
             }
 
             // Gists are user-scoped; a fork creates under your account.
-            if GIST_COMMAND.is_match(&segment) || REPO_FORK_COMMAND.is_match(&segment) {
+            if gh_write_is_user_scoped(&segment) {
                 continue;
             }
 
@@ -3154,5 +3259,232 @@ mod tests {
         assert!(!graphql_is_safe_mutation(
             r#"gh api graphql -f query='mutation { resolveReviewThread(input: {}) { thread { id } } deleteRepository(input: {}) { clientMutationId } }'"#
         ));
+    }
+
+    // --- #463 / #353: targets resolve from parsed argv, never the raw string ---
+
+    // unit: gh_argv
+
+    #[test]
+    fn gh_argv_peels_the_loop_body_keyword() {
+        // `command_segments` splits `for …; do gh …; done` on the `;`, leaving
+        // `do` welded to the body segment. Every arm that demanded `gh` be the
+        // command word went blind here (#353).
+        assert_eq!(
+            gh_argv("do gh api graphql -f query=x"),
+            Some(vec![
+                "gh".to_string(),
+                "api".to_string(),
+                "graphql".to_string(),
+                "-f".to_string(),
+                "query=x".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn gh_argv_keeps_quoted_prose_in_one_token() {
+        // The `gh repo archive …` phrase lives inside --body's VALUE, so it is a
+        // single token: argv[1] stays `issue` and no positional target exists.
+        let argv = gh_argv(r#"gh issue comment 42 --body "gh repo archive cameronsjo/allowed""#)
+            .expect("gh invocation");
+        assert_eq!(argv[1], "issue");
+        assert_eq!(argv.len(), 6);
+    }
+
+    #[test]
+    fn gh_argv_none_when_gh_appears_only_in_prose() {
+        assert_eq!(gh_argv(r#"git commit -m "mentions gh repo create""#), None);
+    }
+
+    #[test]
+    fn gh_argv_peels_eval_wrapper() {
+        let argv = gh_argv(r#"eval "gh repo delete evil/repo""#).expect("gh invocation");
+        assert_eq!(argv[1], "repo");
+        assert_eq!(argv[3], "evil/repo");
+    }
+
+    // e2e: prose can no longer donate a target (the false-ALLOW half of #463)
+
+    #[test]
+    fn repos_path_in_body_no_longer_donates_a_target() {
+        // Arm 3 used to run API_REPOS over the WHOLE segment, so this resolved
+        // to cameronsjo/allowed, passed the allowlist, and returned before the
+        // git-remote arm ran — gh then wrote to the never-checked cwd remote.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh issue comment 42 --body "moved to repos/cameronsjo/allowed""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+        });
+    }
+
+    #[test]
+    fn repo_flag_in_body_no_longer_donates_a_target() {
+        // Arm 1 whitespace-split, so a bare `-R owner/repo` inside a quoted
+        // --body read as the flag itself.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh issue comment 42 --body "use -R cameronsjo/allowed""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+        });
+    }
+
+    #[test]
+    fn repo_subcommand_in_body_no_longer_donates_a_target() {
+        // Arm 2's REPO_SUBCOMMAND regex matched anywhere in the segment.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh issue comment 42 --body "then gh repo archive cameronsjo/allowed""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+        });
+    }
+
+    #[test]
+    fn gist_phrase_in_body_no_longer_exempts_the_write() {
+        // The user-scoped exemption used a `gh\s+gist\s` substring, so the word
+        // "gh gist" in a PR body skipped ownership resolution entirely.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh pr create --title t --body "see gh gist for logs""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
+        });
+    }
+
+    // e2e regression: the REAL user-scoped writes stay exempt
+
+    #[test]
+    fn real_gist_create_still_allowed_from_unowned_cwd() {
+        with_env(&owners_env(), || {
+            let input = input_with("gh gist create x.md", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn real_repo_fork_still_allowed_from_unowned_cwd() {
+        with_env(&owners_env(), || {
+            let input = input_with("gh repo fork otherowner/repo", "/tmp");
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    // e2e: #353 — a loop body's `do` keyword no longer hides gh api from the
+    // per-segment judgment
+
+    #[test]
+    fn looped_graphql_read_is_allowed() {
+        // The `do` prefix made gh_api_endpoint return None, so the graphql arm
+        // never ran and a READ fell through to cwd resolution — an unowned cwd
+        // then blocked it as unresolvable.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"for n in 1 2; do gh api graphql -f query="query { viewer { login } }"; done"#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn looped_graphql_mutation_blocks_from_owned_dir() {
+        // The mirror image: from an OWNED cwd the same blindness resolved the
+        // mutation to the owned repo and allowed it — #78's bypass, restored by
+        // wrapping the call in a loop.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"for n in 1 2; do gh api graphql -f query="mutation { addComment(input: {}) { id } }"; done"#,
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn looped_api_post_to_orgs_blocks_from_owned_dir() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for n in 1 2; do gh api -X POST orgs/evil/repos; done",
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn looped_api_field_write_to_orgs_blocks_from_owned_dir() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for n in 1 2; do gh api orgs/evil/repos -f name=x; done",
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn loop_gate_never_sees_the_gh_api_payload() {
+        // Pins the #471 debt the three `debt:` markers name, and refutes #353's
+        // own diagnosis: its suggested fix — apply the graphql downgrade at the
+        // three loop call sites — would be INERT, because `is_write_command`
+        // never returns true there to be downgraded. Core's `suffix_words`
+        // keeps only Word items, so `-f query=…` is dropped and the command
+        // reconstructs as a bare `gh api graphql -f`, which matches no write
+        // pattern. The real verdict comes from the per-segment pass instead.
+        let cmd = r#"for n in 1 2; do gh api graphql -f query="mutation { addComment(input: {}) { id } }"; done"#;
+        match analyze_gh_loops(cmd) {
+            LoopAnalysis::MissingTargets(cmds) => {
+                let reconstructed = format!("gh {}", cmds[0].args.join(" "));
+                assert_eq!(reconstructed, "gh api graphql -f");
+                assert!(
+                    !is_write_command(&reconstructed),
+                    "loop gate sees a mutation as a read — the payload was dropped"
+                );
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn looped_safe_graphql_mutation_stays_allowed() {
+        // Now that the loop body is judged, the safe-mutation exemption must
+        // still apply through it — otherwise the fix converts a working review
+        // workflow into a hard block.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"for n in 1 2; do gh api graphql -f query="mutation { resolveReviewThread(input: {}) { thread { id } } }"; done"#,
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
     }
 }
