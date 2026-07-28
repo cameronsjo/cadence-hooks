@@ -1045,6 +1045,83 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
     delims
 }
 
+/// Resolve backslash-newline line continuations into one logical line, the way
+/// the shell does before it interprets anything else.
+///
+/// Both characters are removed, so `gh issue create \`⏎`  --body-file b.md` is
+/// read as the single command it is. `\r\n` is handled for CRLF sources; a lone
+/// `\<CR>` is an ordinary escape and is left alone.
+///
+/// Quoting decides whether a continuation exists at all, and the two quote
+/// styles differ — verified against bash, not assumed. Inside `'…'` nothing
+/// escapes, so a backslash-newline is literal text and is preserved. Inside
+/// `"…"` it IS a continuation and is removed, same as unquoted. Outside single
+/// quotes a backslash also consumes whatever follows it, so an escaped quote
+/// (`\'`, `\"`) opens no string and cannot desynchronize the quote state.
+///
+/// This runs before [`strip_heredoc_bodies`] because a heredoc body begins on
+/// the line after the *logical* line that introduces it. Stripping first reads
+/// the body from the wrong line, and leaves the introducer's trailing backslash
+/// dangling in front of whatever line followed the terminator — which the
+/// splitter would then join, merging a command the shell runs separately into
+/// its predecessor's segment (#475).
+fn join_line_continuations(command: &str) -> String {
+    if !command.contains('\\') {
+        return command.to_string();
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(c) = chars.next() {
+        // `'…'` takes no escapes: copy through verbatim until it closes.
+        if quote == Some('\'') {
+            out.push(c);
+            if c == '\'' {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '\\' {
+            match chars.peek() {
+                Some('\n') => {
+                    chars.next();
+                }
+                Some('\r') => {
+                    chars.next();
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    } else {
+                        out.push('\\');
+                        out.push('\r');
+                    }
+                }
+                Some(_) => {
+                    out.push('\\');
+                    out.push(chars.next().expect("peeked"));
+                }
+                None => out.push('\\'),
+            }
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                out.push(c);
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Split a shell command into top-level command segments.
 ///
 /// Splits on the control operators `&&`, `||`, `;`, `|`, `&`, and newlines —
@@ -1079,7 +1156,15 @@ pub fn split_segments(command: &str) -> Vec<String> {
 /// flow between segments — e.g. a `cd` immediately before `||` only takes
 /// effect on the failure path, so it must not redirect what comes after.
 pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static str>)> {
-    let command = strip_heredoc_bodies(command);
+    // Continuations are joined BEFORE heredoc stripping, because that is the
+    // order the shell reads in: it assembles one logical line, and only then
+    // does a heredoc body begin on the line after it. Stripping first is
+    // line-based and would measure the body from the wrong line — and would
+    // leave a dangling trailing backslash whose "next line" is no longer the
+    // one the shell would join, gluing two unrelated commands into one segment
+    // (#475).
+    let command = join_line_continuations(command);
+    let command = strip_heredoc_bodies(&command);
     let command = command.as_str();
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
     let mut current = String::new();
@@ -1108,32 +1193,18 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
         }
         match c {
             // Outside quotes a backslash escapes the next character: it opens
-            // no string and starts no operator, so both characters are consumed
-            // together. A backslash-newline is the shell's line continuation —
-            // it is removed and the command flows on — so it must not flush the
-            // segment. Cutting there put a posting verb in one segment and its
-            // `--body-file` in the next, which is how a whole class of
-            // multi-line commands escaped per-segment guards (#475).
-            '\\' => match chars.peek() {
-                Some('\n') => {
-                    chars.next();
-                }
-                Some('\r') => {
-                    chars.next();
-                    if chars.peek() == Some(&'\n') {
-                        chars.next();
-                    } else {
-                        // A lone `\<CR>` is an ordinary escape, not a join.
-                        current.push('\\');
-                        current.push('\r');
-                    }
-                }
-                Some(_) => {
-                    current.push('\\');
-                    current.push(chars.next().expect("peeked"));
-                }
-                None => current.push('\\'),
-            },
+            // no string and starts no operator, so both are consumed together
+            // and `\"`/`\'`/`\&`/`\;` stay ordinary text (#475).
+            //
+            // A newline is the exception and is deliberately NOT swallowed.
+            // Every continuation the shell would join is already gone by now
+            // ([`join_line_continuations`] ran first), so a backslash-newline
+            // surviving to here means the two parsers disagree — and the safe
+            // direction for a guard is always MORE segments, never fewer.
+            '\\' if chars.peek().is_some_and(|&n| n != '\n') => {
+                current.push('\\');
+                current.push(chars.next().expect("peeked"));
+            }
             '\'' | '"' => {
                 quote = Some(c);
                 current.push(c);
@@ -2438,6 +2509,35 @@ mod tests {
             split_segments("echo \"a\\\\\" && git status"),
             vec!["echo \"a\\\\\"", "git status"]
         );
+    }
+
+    #[test]
+    fn split_segments_continuation_on_a_heredoc_line_does_not_swallow_the_next_command() {
+        // The merge hazard the continuation fix creates if it runs AFTER the
+        // line-based heredoc strip. Verified against bash: the continuation
+        // joins line 1 to `body`, the heredoc body is empty because `EOF`
+        // immediately terminates it, and `rm -rf /tmp/x` is a SEPARATE command.
+        // Joining first must not let the introducer's trailing backslash reach
+        // across the stripped body and absorb that command.
+        let out = split_segments("cat <<'EOF' \\\nbody\nEOF\nrm -rf /tmp/x");
+        assert!(
+            out.contains(&"rm -rf /tmp/x".to_string()),
+            "next command was swallowed into the heredoc segment: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_heredoc_without_continuation_still_drops_its_body() {
+        // Discriminating control: the ordinary heredoc (no continuation) must
+        // still have its prose body stripped, so the test above is evidence
+        // about continuation ordering rather than about heredoc handling
+        // having been disabled.
+        let out = split_segments("cat <<'EOF'\nsee the .env file\nEOF\nrm -rf /tmp/x");
+        assert!(
+            !out.iter().any(|s| s.contains(".env")),
+            "heredoc prose leaked into segments: {out:?}"
+        );
+        assert!(out.contains(&"rm -rf /tmp/x".to_string()), "{out:?}");
     }
 
     #[test]
