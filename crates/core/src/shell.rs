@@ -898,8 +898,21 @@ pub fn resolve_cd_target(target: &str, effective: &str) -> String {
 /// which reuses [`child_scripts`] on the same budget.
 pub const MAX_WRAPPER_DEPTH: usize = 3;
 
-/// Strip heredoc bodies from a command so their prose never reaches the
-/// segment splitter.
+/// Reduce a command to the logical lines the shell will execute: join
+/// backslash-newline continuations, and strip heredoc bodies so their prose
+/// never reaches the segment splitter.
+///
+/// The two jobs are interleaved rather than sequential because they depend on
+/// each other. A heredoc body begins on the line after the *logical* line that
+/// introduces it, so continuations must be joined first — otherwise the body is
+/// measured from the wrong line, and an introducer ending in a backslash leaves
+/// that backslash dangling in front of whatever followed the terminator, which
+/// then absorbs a command the shell runs separately. But the joining must not
+/// run as a pre-pass over the whole command either: body text is data, exempt
+/// from shell quoting, and a quote-tracking pre-pass desynchronized on the
+/// first apostrophe in ordinary prose ("it's") and suppressed every later
+/// continuation. Assembling one logical line at a time and reading each body
+/// raw ([`take_logical_line`]) is what satisfies both (#475).
 ///
 /// A heredoc body (`cmd <<WORD` … `WORD`) is data, not commands — but its
 /// newlines would otherwise make [`split_segments`] turn each body line into a
@@ -924,16 +937,19 @@ pub const MAX_WRAPPER_DEPTH: usize = 3;
 /// quotes (a `<<WORD` inside `"…"` is literal text), with the
 /// terminator-not-found rule as the backstop for cross-line quote state.
 fn strip_heredoc_bodies(command: &str) -> String {
-    if !command.contains("<<") {
-        return command.to_string();
-    }
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let mut line = lines[i].to_string();
-        let delims = heredoc_delimiters(lines[i]);
-        i += 1;
+        // Assemble the LOGICAL line first: the shell joins backslash-newline
+        // continuations before it interprets anything, and a heredoc body
+        // begins on the line after the logical line that introduces it. Doing
+        // this per line — rather than as a pre-pass over the whole command —
+        // is what keeps body lines out of it: a body is read raw below, so a
+        // stray apostrophe in prose can never desynchronize a quote tracker
+        // and suppress a later continuation (#475).
+        let mut line = take_logical_line(&lines, &mut i);
+        let delims = heredoc_delimiters(&line);
         for (word, expands) in delims {
             // Scan ahead for the terminator without committing the drop. Only
             // if it is found do we replace the body with the carried-forward
@@ -948,8 +964,15 @@ fn strip_heredoc_bodies(command: &str) -> String {
                     found = true;
                     break;
                 }
-                if expands && (body.contains("$(") || body.contains('`')) {
-                    carried.push(body.to_string());
+                if expands {
+                    // Carry only the substitution SPANS, never the prose around
+                    // them. A heredoc body is data: its apostrophes are
+                    // ordinary characters, but everything downstream reads a
+                    // segment as shell syntax, so splicing a whole body line in
+                    // let a contraction ("it's here $(cat .env)") open a quote
+                    // state that suppressed the very substitution the
+                    // carry-forward exists to surface (#475).
+                    carried.extend(substitution_spans(body));
                 }
                 i += 1;
             }
@@ -969,6 +992,107 @@ fn strip_heredoc_bodies(command: &str) -> String {
         out.push(line);
     }
     out.join("\n")
+}
+
+/// Consume one logical line from `lines` starting at `*i`, joining
+/// backslash-newline continuations and advancing `*i` past every physical line
+/// absorbed. The backslash and the newline are both removed, as the shell
+/// removes them.
+///
+/// A trailing backslash continues the line only when it is not itself escaped,
+/// so the count of trailing backslashes decides it: odd continues, even is a
+/// literal backslash ending the line. `\r\n` sources are handled by testing the
+/// line with any trailing `\r` removed.
+///
+/// **Quoting is deliberately not tracked, and that is safe for segmentation.**
+/// Inside `'…'` the shell keeps a backslash-newline literal, so joining there
+/// diverges — but only in the CONTENT of a quoted string, never in where a
+/// segment ends: the characters removed are a backslash and a newline, neither
+/// of which is a quote character, and a newline inside quotes was never a
+/// boundary to begin with. The earlier attempt to be faithful here tracked
+/// quotes in a pre-pass and desynchronized on the first apostrophe in heredoc
+/// prose ("it's"), suppressing every later continuation and splitting commands
+/// the shell keeps whole — a guard MISS traded for a cosmetic fidelity point.
+/// Joining unconditionally can only merge text INSIDE a quoted value, which
+/// makes a scan see more, never less.
+fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
+    let mut line = lines[*i].to_string();
+    *i += 1;
+    while *i < lines.len() {
+        let probe = line.strip_suffix('\r').unwrap_or(&line);
+        let trailing = probe.chars().rev().take_while(|&c| c == '\\').count();
+        if trailing % 2 == 0 {
+            break;
+        }
+        line.truncate(probe.len() - 1); // drop the continuing backslash (and any `\r`)
+        line.push_str(lines[*i]);
+        *i += 1;
+    }
+    line
+}
+
+/// Command-substitution spans in a heredoc body line, returned with their
+/// `$(…)` / `` `…` `` delimiters intact so they can be spliced onto the
+/// introducing line and re-parsed downstream.
+///
+/// Deliberately quote-BLIND, which is what separates it from
+/// [`substitution_bodies`]. Inside an expanding heredoc body there is no
+/// quoting: `'` and `"` are ordinary characters and a substitution runs
+/// regardless of how many apostrophes precede it. Reusing the quote-aware
+/// scanner here made an ordinary contraction suppress the substitution.
+/// Backslash still escapes, so `\$(` is literal and produces no span.
+fn substitution_spans(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
+            let start = i;
+            let mut depth = 1;
+            let mut j = i + 2;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            // An unclosed `$(` is not a substitution the shell would run; skip
+            // the `$` and keep scanning rather than carrying a truncated span.
+            if depth == 0 {
+                spans.push(chars[start..j].iter().collect());
+                i = j;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if chars[i] == '`' {
+            let start = i;
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '`' {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+            }
+            if j < chars.len() {
+                spans.push(chars[start..=j].iter().collect());
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    spans
 }
 
 /// Find heredoc delimiters introduced on a single line, outside quotes.
@@ -1045,83 +1169,6 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
     delims
 }
 
-/// Resolve backslash-newline line continuations into one logical line, the way
-/// the shell does before it interprets anything else.
-///
-/// Both characters are removed, so `gh issue create \`⏎`  --body-file b.md` is
-/// read as the single command it is. `\r\n` is handled for CRLF sources; a lone
-/// `\<CR>` is an ordinary escape and is left alone.
-///
-/// Quoting decides whether a continuation exists at all, and the two quote
-/// styles differ — verified against bash, not assumed. Inside `'…'` nothing
-/// escapes, so a backslash-newline is literal text and is preserved. Inside
-/// `"…"` it IS a continuation and is removed, same as unquoted. Outside single
-/// quotes a backslash also consumes whatever follows it, so an escaped quote
-/// (`\'`, `\"`) opens no string and cannot desynchronize the quote state.
-///
-/// This runs before [`strip_heredoc_bodies`] because a heredoc body begins on
-/// the line after the *logical* line that introduces it. Stripping first reads
-/// the body from the wrong line, and leaves the introducer's trailing backslash
-/// dangling in front of whatever line followed the terminator — which the
-/// splitter would then join, merging a command the shell runs separately into
-/// its predecessor's segment (#475).
-fn join_line_continuations(command: &str) -> String {
-    if !command.contains('\\') {
-        return command.to_string();
-    }
-    let mut out = String::with_capacity(command.len());
-    let mut chars = command.chars().peekable();
-    let mut quote: Option<char> = None;
-
-    while let Some(c) = chars.next() {
-        // `'…'` takes no escapes: copy through verbatim until it closes.
-        if quote == Some('\'') {
-            out.push(c);
-            if c == '\'' {
-                quote = None;
-            }
-            continue;
-        }
-        if c == '\\' {
-            match chars.peek() {
-                Some('\n') => {
-                    chars.next();
-                }
-                Some('\r') => {
-                    chars.next();
-                    if chars.peek() == Some(&'\n') {
-                        chars.next();
-                    } else {
-                        out.push('\\');
-                        out.push('\r');
-                    }
-                }
-                Some(_) => {
-                    out.push('\\');
-                    out.push(chars.next().expect("peeked"));
-                }
-                None => out.push('\\'),
-            }
-            continue;
-        }
-        match quote {
-            Some(q) => {
-                out.push(c);
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => {
-                out.push(c);
-                if c == '\'' || c == '"' {
-                    quote = Some(c);
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Split a shell command into top-level command segments.
 ///
 /// Splits on the control operators `&&`, `||`, `;`, `|`, `&`, and newlines —
@@ -1131,13 +1178,23 @@ fn join_line_continuations(command: &str) -> String {
 /// Quote characters are preserved within each segment; segments are trimmed and
 /// empty segments dropped.
 ///
-/// Backslash escapes are honored the same way [`tokenize`] honors them, because
-/// a splitter that disagrees with the tokenizer hands a guard a boundary the
-/// shell does not have (#475). Two consequences: a backslash-newline is a line
-/// continuation, so the command flows across it into ONE segment rather than
-/// being cut in two (`\r\n` too); and an escaped quote is a literal character,
-/// so `-m "he said \" && x"` stays one segment holding one argument instead of
-/// splitting at a `&&` the shell keeps inside the string.
+/// Backslash escapes in `'…'`, `"…"`, and unquoted context are honored the way
+/// [`tokenize`] honors them, because a splitter that disagrees with the
+/// tokenizer hands a guard a boundary the shell does not have (#475). Two
+/// consequences: a backslash-newline is a line continuation, so the command
+/// flows across it into ONE segment rather than being cut in two (`\r\n` too);
+/// and an escaped quote is a literal character, so `-m "he said \" && x"` stays
+/// one segment holding one argument instead of splitting at a `&&` the shell
+/// keeps inside the string.
+///
+/// **The agreement stops at ANSI-C quoting.** [`tokenize`] has a dedicated
+/// `$'…'` mode (hardened by #463 so a `\'` inside one does not close it); this
+/// splitter has none, and reads the `$` as ordinary text before opening a plain
+/// single-quote string at the `'`. A `$'…'` value containing an escaped quote
+/// therefore closes early here and the real trailing `'` reopens a string that
+/// swallows the rest of the line, hiding any operator in it. That predates this
+/// function's escape handling and is tracked separately — do not read the
+/// paragraph above as covering it.
 ///
 /// Heredoc bodies are stripped first ([`strip_heredoc_bodies`]) so their prose
 /// does not become fake segments. This is otherwise syntactic splitting, not
@@ -1156,15 +1213,10 @@ pub fn split_segments(command: &str) -> Vec<String> {
 /// flow between segments — e.g. a `cd` immediately before `||` only takes
 /// effect on the failure path, so it must not redirect what comes after.
 pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static str>)> {
-    // Continuations are joined BEFORE heredoc stripping, because that is the
-    // order the shell reads in: it assembles one logical line, and only then
-    // does a heredoc body begin on the line after it. Stripping first is
-    // line-based and would measure the body from the wrong line — and would
-    // leave a dangling trailing backslash whose "next line" is no longer the
-    // one the shell would join, gluing two unrelated commands into one segment
-    // (#475).
-    let command = join_line_continuations(command);
-    let command = strip_heredoc_bodies(&command);
+    // Continuations are resolved inside [`strip_heredoc_bodies`], interleaved
+    // with the body scan, because the shell reads one logical line and only
+    // then begins a heredoc body on the line after it (#475).
+    let command = strip_heredoc_bodies(command);
     let command = command.as_str();
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
     let mut current = String::new();
@@ -1198,7 +1250,7 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
             //
             // A newline is the exception and is deliberately NOT swallowed.
             // Every continuation the shell would join is already gone by now
-            // ([`join_line_continuations`] ran first), so a backslash-newline
+            // ([`take_logical_line`] ran first), so a backslash-newline
             // surviving to here means the two parsers disagree — and the safe
             // direction for a guard is always MORE segments, never fewer.
             '\\' if chars.peek().is_some_and(|&n| n != '\n') => {
@@ -2472,12 +2524,72 @@ mod tests {
     }
 
     #[test]
-    fn split_segments_continuation_inside_single_quotes_is_literal() {
-        // `'…'` takes no escapes: a backslash-newline inside one is literal
-        // text, and the quote already suppresses splitting either way.
+    fn split_segments_continuation_inside_single_quotes_diverges_only_in_content() {
+        // KNOWN, DELIBERATE divergence. Bash keeps a backslash-newline literal
+        // inside `'…'` (verified: `printf '[%s]' 'a \<newline>b'` prints the
+        // backslash and the newline); the joiner is quote-blind and removes it.
+        // The trade is documented on `take_logical_line`: tracking quotes here
+        // is what desynchronized on an apostrophe in heredoc prose and split
+        // commands the shell keeps whole.
+        //
+        // What must hold is that the divergence is confined to the CONTENT of
+        // a quoted value and never moves a boundary, so this asserts the
+        // segment COUNT rather than pinning the joined text as if it were
+        // correct.
+        assert_eq!(split_segments("git commit -m 'a \\\n b'").len(), 1);
+    }
+
+    #[test]
+    fn split_segments_quoted_operator_survives_the_quote_blind_join() {
+        // The property the divergence above must not cost: an operator inside
+        // `'…'` is still text, not a boundary, even when a continuation was
+        // joined inside the same string. Removing a backslash and a newline
+        // cannot change which quote characters the splitter sees.
         assert_eq!(
-            split_segments("git commit -m 'a \\\n b'"),
-            vec!["git commit -m 'a \\\n b'"]
+            split_segments("git commit -m 'a \\\n && rm -rf ~'").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn split_segments_apostrophe_in_heredoc_prose_does_not_suppress_a_continuation() {
+        // Regression for the desync a quote-tracking pre-pass caused: an
+        // ordinary contraction in heredoc body text put the tracker in
+        // single-quote mode, so every LATER continuation went unjoined and the
+        // command was cut in half. Heredoc bodies are read raw, so prose
+        // cannot reach the continuation logic at all.
+        let out = split_segments(
+            "cat <<'EOF'\nit's fine\nEOF\ngh issue create --repo o/r \\\n  --body-file body.md",
+        );
+        assert!(
+            out.iter()
+                .any(|s| s.contains("gh issue create") && s.contains("--body-file")),
+            "continuation was suppressed by prose: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_apostrophe_in_prose_does_not_hide_a_substitution() {
+        // Same desync reaching the unquoted-heredoc carry-forward: a body line
+        // holding a command substitution must still surface as its own segment
+        // when the prose around it contains an apostrophe.
+        //
+        // Asserted as its OWN segment, not as a substring: the carrier segment
+        // `echo <<EOF it's here $(cat .env)` contains the text either way, so a
+        // `contains` check passes even when the recursion never surfaced the
+        // read — which is precisely the miss being guarded against.
+        let out = command_segments("echo <<EOF\nit's here $(cat .env)\nEOF");
+        assert!(
+            out.iter().any(|s| s.trim() == "cat .env"),
+            "substitution never surfaced as its own segment: {out:?}"
+        );
+        // Control: the same command WITHOUT the apostrophe, so a failure above
+        // is attributable to the apostrophe rather than to carry-forward being
+        // broken outright.
+        let clean = command_segments("echo <<EOF\nsee $(cat .env)\nEOF");
+        assert!(
+            clean.iter().any(|s| s.trim() == "cat .env"),
+            "carry-forward is broken independently of the apostrophe: {clean:?}"
         );
     }
 
