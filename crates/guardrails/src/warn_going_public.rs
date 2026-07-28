@@ -225,42 +225,13 @@ fn nudge_message(term: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::with_env;
     use cadence_hooks_core::test_builders::make_bash;
 
-    // Serialize tests that mutate CADENCE_GOING_PUBLIC_TERMS / _IGNORE so they
-    // don't race each other (env is process-global). Per-file ENV_LOCK, matching
-    // the pattern on origin/main.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prior: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
-            .collect();
-        for (k, v) in vars {
-            // SAFETY: serialized via ENV_LOCK; restored in the block below.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        for (k, v) in prior {
-            // SAFETY: same lock still held; restoring prior state.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(&k, val),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
-    }
+    // Tests that mutate CADENCE_GOING_PUBLIC_TERMS / _IGNORE serialize via the
+    // crate-shared with_env/CADENCE_ENV_TEST_LOCK so they don't race each
+    // other (env is process-global) or the globals mutated elsewhere in this
+    // crate (#446).
 
     fn outcome(cmd: &str) -> cadence_hooks_core::Outcome {
         GoingPublicGuard.run(&make_bash(cmd)).outcome

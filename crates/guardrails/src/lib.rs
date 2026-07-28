@@ -11,15 +11,64 @@
 #[cfg(test)]
 pub(crate) static CADENCE_ALLOW_MAIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Shared test lock serializing every test that mutates the process-global
-/// `CADENCE_ALLOWED_OWNERS` / `CADENCE_ALLOWED_REPOS` / `CADENCE_EXTRA_HOSTS`
-/// allowlist env vars — read by `guard_push_remote`, `guard_gh_write`, and
-/// `warn_issue_tracker`. These three modules used to mint separate
-/// module-local `ENV_LOCK`s over the *same* shared globals, which provide no
-/// mutual exclusion under cargo's parallel test runner (cadence-hooks#446,
-/// same root cause as #298); one crate-shared lock serializes them all.
+/// Shared test lock serializing every test in this crate that mutates a
+/// process-global env var OUTSIDE the `CADENCE_ALLOW_MAIN` family above
+/// (`guard_push_remote`, `guard_gh_write`, `warn_issue_tracker`,
+/// `warn_subagent_worktree`, `warn_going_public`, `warn_subagent_concurrency`,
+/// `guard_read_model` — seven modules, seven different var sets). Each used
+/// to mint its own module-local `ENV_LOCK`, on the theory that disjoint var
+/// sets need no shared exclusion — but that theory lives only in a doc
+/// comment, and the moment two modules' vars overlap (or a future edit adds
+/// one that does), the failure is a silent flake under cargo's parallel test
+/// runner, not a compile error (cadence-hooks#446, same root cause as #298).
+/// One lock removes the need to keep proving disjointness — mirrors the
+/// ruling `crates/metrics/src/common.rs` already made for its own env-mutating
+/// tests (one crate-wide `ENV_LOCK`, not one per var family).
 #[cfg(test)]
-pub(crate) static CADENCE_ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CADENCE_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` with each `(key, value)` in `vars` set (`None` removes the var),
+/// serialized against every other env-mutating test in this crate via
+/// [`CADENCE_ENV_TEST_LOCK`], and restore the *prior* value of each var
+/// afterward — panic-safe via `catch_unwind`, so a failing `f` still restores
+/// rather than leaking state into the next test in the same binary.
+///
+/// The single shared implementation for every module whose tests fit this
+/// vars-slice shape. Mirrors `core::test_builders::with_marker_dir`'s
+/// discipline: the lock lives behind this one function so a module cannot
+/// mint a rival — `use crate::with_env;`, never a module-local copy.
+#[cfg(test)]
+pub(crate) fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
+    let _guard = CADENCE_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let prior: Vec<(String, Option<String>)> = vars
+        .iter()
+        .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
+        .collect();
+    for (k, v) in vars {
+        // SAFETY: serialized via CADENCE_ENV_TEST_LOCK; restored below.
+        unsafe {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    for (k, v) in prior {
+        // SAFETY: same lock still held; restoring prior state.
+        unsafe {
+            match v {
+                Some(val) => std::env::set_var(&k, val),
+                None => std::env::remove_var(&k),
+            }
+        }
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
 
 /// Per-repo snooze command + helper consumed by `enforce_worktree`.
 pub mod dismiss_enforce_worktree;

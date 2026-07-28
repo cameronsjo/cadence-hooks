@@ -2888,12 +2888,13 @@ mod tests {
 
     // --- BlockMetadata payloads on hard blocks ---
 
+    use crate::with_env;
     use cadence_hooks_core::HookInput;
 
     // GhWriteGuard.run() reads CADENCE_ALLOWED_OWNERS / CADENCE_ALLOWED_REPOS
     // / CADENCE_EXTRA_HOSTS via process-global env vars. Serialize all
-    // metadata-shape tests via the crate-shared CADENCE_ALLOWLIST_TEST_LOCK so
-    // they don't race each other or the same globals mutated in
+    // metadata-shape tests via the crate-shared with_env/CADENCE_ENV_TEST_LOCK
+    // so they don't race each other or the same globals mutated in
     // guard_push_remote / warn_issue_tracker (#446).
 
     fn input_with(command: &str, cwd: &str) -> HookInput {
@@ -2905,38 +2906,6 @@ mod tests {
             "cwd": cwd,
         });
         serde_json::from_value(json).expect("HookInput deserializes")
-    }
-
-    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = crate::CADENCE_ALLOWLIST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prior: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
-            .collect();
-        for (k, v) in vars {
-            // SAFETY: serialized via CADENCE_ALLOWLIST_TEST_LOCK; restored below.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        for (k, v) in prior {
-            // SAFETY: same lock still held; we're restoring the prior state.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(&k, val),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
     }
 
     #[test]

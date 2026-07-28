@@ -799,44 +799,13 @@ mod tests {
     // --- PushRemoteGuard::run(): explicit-URL ownership (#68) ---
     //
     // run() reads CADENCE_ALLOWED_OWNERS from the process-global environment,
-    // so these tests serialize via the crate-shared CADENCE_ALLOWLIST_TEST_LOCK
+    // so these tests serialize via the crate-shared with_env/CADENCE_ENV_TEST_LOCK
     // and restore prior values (#446). They run inside this crate's checkout
     // (a real git repo) so run()'s `rev-parse --git-dir` gate passes; the
     // explicit URL is validated directly and never resolves through a remote.
 
+    use crate::with_env;
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
-
-    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = crate::CADENCE_ALLOWLIST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let prior: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
-            .collect();
-        for (k, v) in vars {
-            // SAFETY: serialized via CADENCE_ALLOWLIST_TEST_LOCK; restored below.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        for (k, v) in prior {
-            // SAFETY: same lock still held; restoring prior state.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(&k, val),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
-    }
 
     /// Allowlist = `cameronsjo` only, on the default `github.com` host.
     fn owners_only() -> Vec<(&'static str, Option<&'static str>)> {
