@@ -1269,9 +1269,20 @@ fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> 
     }
 }
 
+/// Shared with [`platform_drift_status_lines`]'s not-found message, so the two
+/// can never independently drift the way two separately-typed literals would
+/// (cadence#667): one names where [`find_baseline_in`] actually looked, the
+/// other only *describes* that search for the operator, and a second
+/// hand-copied literal is exactly how such a description quietly stops
+/// matching the real join.
+const CADENCE_CACHE_SUBDIR: &str = "workbench/cadence";
+/// Shared with [`platform_drift_status_lines`] for the same reason as
+/// [`CADENCE_CACHE_SUBDIR`].
+const PLATFORM_BASELINE_REL: &str = "config/platform-baseline.json";
+
 /// Find the plugin-shipped platform baseline in the marketplace cache, under
 /// `cache_root` (cadence#667, never a hardcoded `~/.claude/plugins/cache`
-/// literal): search `<cache_root>/workbench/cadence/*/config/platform-baseline.json`.
+/// literal): search `<cache_root>/<CADENCE_CACHE_SUBDIR>/*/<PLATFORM_BASELINE_REL>`.
 /// Newest pin wins when more than one SHA-pinned copy exists (a mid-update
 /// transient, or a stale sibling left behind) — `None` when the cadence
 /// plugin's cache directory, or every pin's baseline file, is missing.
@@ -1283,11 +1294,11 @@ fn hook_latency_findings(projects: &Path, window: Duration, now: SystemTime) -> 
 /// `CLAUDE_CONFIG_DIR`-set-but-plugins-not-relocated fallback (see
 /// [`plugins_dir`]'s own doc comment) stays intact here too.
 fn find_baseline_in(cache_root: &Path) -> Option<PathBuf> {
-    let cadence_dir = cache_root.join("workbench/cadence");
+    let cadence_dir = cache_root.join(CADENCE_CACHE_SUBDIR);
     let entries = std::fs::read_dir(&cadence_dir).ok()?;
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
-        let candidate = entry.path().join("config/platform-baseline.json");
+        let candidate = entry.path().join(PLATFORM_BASELINE_REL);
         let Ok(meta) = std::fs::metadata(&candidate) else {
             continue;
         };
@@ -1345,7 +1356,7 @@ fn platform_drift_status_lines(
     let Some(baseline_path) = baseline_path else {
         return vec![match searched_dir {
             Some(dir) => format!(
-                "cadence-hooks doctor: platform baseline not found under {}/workbench/cadence/*/config/platform-baseline.json",
+                "cadence-hooks doctor: platform baseline not found under {}/{CADENCE_CACHE_SUBDIR}/*/{PLATFORM_BASELINE_REL}",
                 dir.display()
             ),
             None => "cadence-hooks doctor: platform baseline not found — could not resolve the \
@@ -4325,6 +4336,55 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let newest_path = write_platform_baseline(&new_pin, "0.70.0", "2.1.218");
         assert_eq!(find_baseline_in(cache_root.path()), Some(newest_path));
+    }
+
+    #[test]
+    fn regression_relocated_config_dir_without_plugins_falls_back_like_plugins_dir_does() {
+        // Differential control for the exact regression three review arms
+        // independently flagged on this branch: on a profile where
+        // CLAUDE_CONFIG_DIR is set but plugins/ was never relocated, the
+        // baseline still lives under $HOME/.claude/plugins/cache. The BUGGY
+        // pattern re-derives `claude_config_dir().join("plugins/cache")`
+        // directly with no existence check and no fallback; the FIXED
+        // pattern is plugins_dir()'s own exists()-check-then-fallback,
+        // mirrored inline below since plugins_dir() reads real env/HOME and
+        // can't be env-mutated safely under a parallel test runner.
+        //
+        // Both branches run against the SAME on-disk fixture in one test, so
+        // this is a true red/green pair rather than two tests that could
+        // drift apart: the buggy resolver must return None while the fixed
+        // resolver, given the identical fixture, must find the baseline.
+        let home_root = tempfile::tempdir().unwrap();
+        let config_root = tempfile::tempdir().unwrap(); // CLAUDE_CONFIG_DIR override — carries no plugins/
+
+        let home_plugins_cache = home_root.path().join(".claude/plugins/cache");
+        let pin_dir = home_plugins_cache.join("workbench/cadence/some-sha");
+        fs::create_dir_all(pin_dir.join("config")).unwrap();
+        let baseline_path = write_platform_baseline(&pin_dir.join("config"), "0.70.0", "2.1.218");
+
+        // BUGGY: re-derive directly — no exists() check, no fallback. This
+        // is the exact shape of the flagged regression.
+        let buggy_cache_root = config_root.path().join("plugins").join("cache");
+        assert_eq!(
+            find_baseline_in(&buggy_cache_root),
+            None,
+            "the regression: reports the baseline missing even though it exists at the default location"
+        );
+
+        // FIXED: plugins_dir()'s own logic — prefer the config-dir variant,
+        // fall back to $HOME/.claude/plugins when that variant doesn't exist.
+        let config_variant = config_root.path().join("plugins");
+        let fixed_plugins_dir = if config_variant.exists() {
+            config_variant
+        } else {
+            home_root.path().join(".claude/plugins")
+        };
+        let fixed_cache_root = plugins_cache_dir_from(&fixed_plugins_dir);
+        assert_eq!(
+            find_baseline_in(&fixed_cache_root),
+            Some(baseline_path),
+            "the fix: falls back to the default location and finds the baseline"
+        );
     }
 
     // ── platform_drift_status_lines tests ───────────────────────────────────
