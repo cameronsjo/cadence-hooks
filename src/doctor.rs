@@ -41,23 +41,57 @@ struct Finding {
     remediation: String,
 }
 
+/// Character ceiling applied to every field [`Finding::render`] sanitizes.
+/// `snippet` is a raw `hooks.json` command with no bounded length of its own
+/// (cameronsjo/cadence-hooks#440); `diagnosis`/`remediation` can compose
+/// prose around an already-`display_safe_bounded`-clamped 200-char error
+/// string from `log_failopen` (`MAX_ERROR_CHARS`), so 500 leaves real
+/// content intact while still bounding a pathological one.
+const MAX_FINDING_FIELD_CHARS: usize = 500;
+
 impl Finding {
-    fn print(&self) {
+    /// Render this finding for terminal display. Sanitizes every
+    /// file-sourced field ONCE, here, rather than at each construction site
+    /// (cameronsjo/cadence-hooks#440). A `hooks.json` command snippet, an
+    /// `installed_plugins.json` label, or a directory name any of them
+    /// interpolated into a diagnosis/remediation string, can all carry ANSI
+    /// escapes, C1 controls, or Trojan-Source bidi/Tags primitives — printed
+    /// verbatim, those reorder or overwrite the rest of the terminal line.
+    /// Per-call-site sanitizing is the wrong shape long-term: every future
+    /// check would have to remember, and the one that forgets is invisible
+    /// until someone reads the output closely. Pure and side-effect-free so
+    /// completeness is testable without capturing real stdout — [`print`]
+    /// is the only thing that writes it out, and it is a one-line wrapper,
+    /// so no second path can bypass this sanitization.
+    ///
+    /// [`print`]: Finding::print
+    fn render(&self) -> String {
         let level = match self.severity {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
-        let location = match self.line {
+        let location_raw = match self.line {
             Some(n) => format!("{}:{n}", self.file.display()),
             None => self.file.display().to_string(),
         };
+        let sanitize = |s: &str| {
+            cadence_hooks_metrics::common::display_safe_bounded(s, MAX_FINDING_FIELD_CHARS)
+        };
+        let plugin = sanitize(&self.plugin);
+        let location = sanitize(&location_raw);
+        let snippet = sanitize(&self.snippet);
+        let diagnosis = sanitize(&self.diagnosis);
+        let remediation = sanitize(&self.remediation);
         // <level> [<plugin>] <file>[:line]: <diagnosis>
         //   command: <snippet>
         //   fix: <remediation>
-        println!(
-            "{level} [{}] {}: {}\n  command: {}\n  fix: {}",
-            self.plugin, location, self.diagnosis, self.snippet, self.remediation
-        );
+        format!(
+            "{level} [{plugin}] {location}: {diagnosis}\n  command: {snippet}\n  fix: {remediation}"
+        )
+    }
+
+    fn print(&self) {
+        println!("{}", self.render());
     }
 }
 
@@ -495,29 +529,24 @@ fn unenabled_plugin_findings(installs: &[(String, PathBuf)], config_dir: &Path) 
         .map(|(label, hooks)| Finding {
             severity: Severity::Warning,
             // The label is an `installed_plugins.json` key — third-party
-            // influenced, and every `Finding` field prints verbatim. Sanitizing
-            // at construction is the narrow fix; the broader one (sanitize once
-            // at the `Finding` display boundary, covering the pre-existing raw
-            // hooks.json snippets too) is filed rather than smuggled in here.
-            plugin: cadence_hooks_metrics::common::display_safe(label),
+            // influenced. Every `Finding` field is sanitized once, at the
+            // display boundary (`Finding::render`, cameronsjo/cadence-hooks#440),
+            // so it is used verbatim here rather than sanitized again at
+            // construction.
+            plugin: label.clone(),
             file: hooks,
             line: None,
-            snippet: format!(
-                "{}: no enabledPlugins entry",
-                cadence_hooks_metrics::common::display_safe(label)
-            ),
+            snippet: format!("{label}: no enabledPlugins entry"),
             diagnosis: format!(
-                "{} is installed and ships hooks, but has no entry in \
+                "{label} is installed and ships hooks, but has no entry in \
                  enabledPlugins — none of its hooks can fire. Any logger or \
                  guard it wires is silently inert, including a staleness \
-                 canary wired inside the plugin it watches (#397)",
-                cadence_hooks_metrics::common::display_safe(label)
+                 canary wired inside the plugin it watches (#397)"
             ),
             remediation: format!(
-                "enable it (`/plugin` → enable {}) if its hooks should be \
+                "enable it (`/plugin` → enable {label}) if its hooks should be \
                  running, or set it to false in {} to record the choice — an \
                  explicit false is silent here, a missing key is not",
-                cadence_hooks_metrics::common::display_safe(label),
                 config_dir.join("settings.json").display()
             ),
         })
@@ -2225,6 +2254,86 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── Finding::render sanitization (#440) ─────────────────────────────────
+
+    fn hostile_finding(text: &str) -> Finding {
+        Finding {
+            severity: Severity::Warning,
+            plugin: text.to_string(),
+            file: PathBuf::from(text),
+            line: None,
+            snippet: text.to_string(),
+            diagnosis: text.to_string(),
+            remediation: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn render_strips_bidi_and_ansi_and_tags_from_every_field() {
+        // One hostile string planted in EVERY text-bearing field — plugin,
+        // file (via `location`), snippet, diagnosis, remediation — proves
+        // completeness: a fix that only sanitized the one call site #438
+        // added would leave every other field carrying these bytes straight
+        // through to the terminal.
+        let hostile = "safe\u{202E}\u{1b}[31mtext\u{E0001}\u{E0041}\u{E007F}\u{200B}";
+        let rendered = hostile_finding(hostile).render();
+
+        for bad in [
+            '\u{202E}', // RIGHT-TO-LEFT OVERRIDE
+            '\u{E0001}',
+            '\u{E0041}',
+            '\u{E007F}', // Tags block
+            '\u{200B}',  // zero-width space
+        ] {
+            assert!(
+                !rendered.contains(bad),
+                "rendered output still carries {bad:?}: {rendered:?}"
+            );
+        }
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC (start of the ANSI sequence) survived: {rendered:?}"
+        );
+        // A denylist filter, not wholesale deletion of the field — ordinary
+        // text on either side of the smuggled characters must still render.
+        assert!(rendered.contains("safe"), "{rendered:?}");
+        assert!(rendered.contains("text"), "{rendered:?}");
+    }
+
+    #[test]
+    fn render_bounds_an_unbounded_snippet() {
+        // hooks.json places no length ceiling on a command string — the
+        // issue's "worth checking... a length ceiling belongs on snippet
+        // too" note.
+        let long = "x".repeat(MAX_FINDING_FIELD_CHARS + 250);
+        let mut finding = hostile_finding("");
+        finding.snippet = long.clone();
+
+        let rendered = finding.render();
+        assert!(
+            rendered.len() < long.len(),
+            "an unbounded snippet must be truncated: rendered {} chars from an input of {}",
+            rendered.len(),
+            long.len()
+        );
+        assert!(
+            rendered.contains('…'),
+            "truncation must leave the ellipsis marker: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_leaves_ordinary_unicode_intact() {
+        // The filter is a denylist over specific control/format categories,
+        // not "non-ASCII" — legitimate Unicode prose in a diagnosis must
+        // survive unchanged.
+        let mut finding = hostile_finding("plugin@mp");
+        finding.diagnosis = "cadence log-commit — naïve 日本語 ✓".to_string();
+
+        let rendered = finding.render();
+        assert!(rendered.contains("cadence log-commit — naïve 日本語 ✓"));
+    }
 
     // ── telemetry_finding tests ─────────────────────────────────────────────
 
