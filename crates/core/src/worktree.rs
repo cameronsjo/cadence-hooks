@@ -153,7 +153,7 @@ pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>) -> bool {
 /// fallback chain, cadence-hooks#403 code review) can canonicalize once and
 /// reuse it, instead of re-running a real `realpath` syscall chain per
 /// candidate.
-pub fn canonicalize_tmpdir(tmpdir: Option<&str>) -> Option<PathBuf> {
+pub(crate) fn canonicalize_tmpdir(tmpdir: Option<&str>) -> Option<PathBuf> {
     tmpdir
         .map(str::trim)
         .filter(|t| !t.is_empty() && *t != "/")
@@ -163,7 +163,7 @@ pub fn canonicalize_tmpdir(tmpdir: Option<&str>) -> Option<PathBuf> {
 /// Same check as [`path_under_temp_root`], but takes an already-canonicalized
 /// `$TMPDIR` (from [`canonicalize_tmpdir`]) instead of canonicalizing on
 /// every call.
-pub fn path_under_temp_root_with_canonical(
+pub(crate) fn path_under_temp_root_with_canonical(
     path: &Path,
     tmpdir: Option<&str>,
     tmpdir_canonical: Option<&Path>,

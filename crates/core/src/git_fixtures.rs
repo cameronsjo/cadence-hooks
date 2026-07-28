@@ -140,9 +140,22 @@ fn resolve_scratch_dir_with(
     let tmpdir_canonical = crate::worktree::canonicalize_tmpdir(tmpdir);
     let suffix = format!("{tag}-{}", std::process::id());
     let candidate = |base: &Path| base.join(&suffix);
+    // Canonicalize `dir` (or its nearest existing ancestor — the `{tag}-{pid}`
+    // leaf doesn't exist yet when this runs) before checking it: a lexical
+    // check on the literal `CARGO_MANIFEST_DIR`-derived string can diverge
+    // from what the guard being tested actually sees, if any ancestor
+    // component is a symlink. Verified empirically (cadence-hooks#403 code
+    // review / CodeRabbit): `git rev-parse --show-toplevel` — what
+    // `enforce-worktree`'s own checks resolve a repo root through —
+    // resolves symlinks (a checkout reached via a symlink into `/tmp`
+    // reports the real `/tmp/...` path), so a fixture root whose LITERAL
+    // path escapes the carve-out could still land somewhere the guard's
+    // real resolution treats as exempt, reopening this exact bug through
+    // symlink indirection instead of a direct `/tmp` prefix.
     let escapes_carveout = |dir: &Path| {
-        !is_claude_managed_dir(dir)
-            && !path_under_temp_root_with_canonical(dir, tmpdir, tmpdir_canonical.as_deref())
+        let resolved = canonicalize_nearest_existing(dir);
+        !is_claude_managed_dir(&resolved)
+            && !path_under_temp_root_with_canonical(&resolved, tmpdir, tmpdir_canonical.as_deref())
     };
 
     let default_dir = candidate(root);
@@ -150,8 +163,22 @@ fn resolve_scratch_dir_with(
         return default_dir;
     }
 
+    // `root`'s own final component names the CALLER's distinct fixture
+    // directory (`git-fixtures-scratch`, `enforce-worktree-scratch`,
+    // `session-posture-scratch`, …) — the module doc at the top explains why
+    // `root` is taken at all rather than a fixed relative join. A fallback
+    // that dropped this component would collapse every caller into one
+    // shared directory once relocated, and since `Drop` only reclaims the
+    // `{tag}-{pid}` leaf, the accumulating parent gives no hint which crate
+    // produced what (cadence-hooks#403 code review). Preserve it as a
+    // namespacing subdirectory under whichever fallback root wins.
+    let namespace = root
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("scratch"));
+
     if let Some(override_root) = override_root {
-        let dir = candidate(override_root);
+        let dir = candidate(&override_root.join(&namespace));
         assert!(
             escapes_carveout(&dir),
             "{SCRATCH_ROOT_OVERRIDE_ENV} itself sits under a carve-out (.claude/ or temp): {}",
@@ -165,7 +192,11 @@ fn resolve_scratch_dir_with(
     }
 
     if let Some(cargo_home) = cargo_home {
-        let dir = candidate(&cargo_home.join("cadence-hooks-test-scratch"));
+        let dir = candidate(
+            &cargo_home
+                .join("cadence-hooks-test-scratch")
+                .join(&namespace),
+        );
         if escapes_carveout(&dir) {
             note_relocation_once(&format!("to $CARGO_HOME: {}", dir.display()));
             return dir;
@@ -180,6 +211,37 @@ fn resolve_scratch_dir_with(
          from here.",
         default_dir.display()
     );
+}
+
+/// Canonicalize `path`, walking up to the nearest existing ancestor when
+/// `path` itself doesn't exist yet (`std::fs::canonicalize` errors on a
+/// missing path, and the `{tag}-{pid}` leaf a `Scratch` candidate names is
+/// never created before this check runs) — then re-append the removed tail
+/// components onto the resolved ancestor.
+///
+/// Falls back to `path` unchanged if canonicalization never succeeds (no
+/// ancestor exists, or another resolution failure) — fail-open to the
+/// lexical check rather than panicking on a filesystem edge case unrelated
+/// to what this function exists to catch.
+fn canonicalize_nearest_existing(path: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&cur) {
+            let mut result = canonical;
+            for component in tail.into_iter().rev() {
+                result.push(component);
+            }
+            return result;
+        }
+        let Some(name) = cur.file_name().map(std::ffi::OsStr::to_os_string) else {
+            return path.to_path_buf();
+        };
+        tail.push(name);
+        if !cur.pop() {
+            return path.to_path_buf();
+        }
+    }
 }
 
 /// Print the carve-out relocation notice to stderr exactly **once per
@@ -200,23 +262,38 @@ fn note_relocation_once(detail: &str) {
 
 /// `$CARGO_HOME`, falling back to the user's home directory joined with
 /// `.cargo` — both stable, checkout-independent locations that exist on any
-/// machine able to run `cargo test`.
+/// machine able to run `cargo test`. Reads real process env; see
+/// [`cargo_home_from`] for the injectable decision this wraps.
 ///
 /// Routes the fallback through [`crate::paths::user_home`] rather than
 /// reading `$HOME` directly (cadence-hooks#403 code review): `$HOME` is
 /// unix-only, and `CONTRIBUTING.md` documents Windows support, where a
 /// contributor has no `$HOME` at all — `user_home` already carries the
-/// `$USERPROFILE`/`$HOMEDRIVE`+`$HOMEPATH` chain. It also treats an
-/// empty-but-set var as unset; without that, `CARGO_HOME=""` would make
-/// `PathBuf::from("")` — and `.join(".cargo")` on it resolves the *relative*
-/// path `.cargo`, which names neither `.claude/` nor a temp root, so
-/// `escapes_carveout` would bless it and this fixture would be created
-/// relative to the test binary's cwd instead of failing loudly.
+/// `$USERPROFILE`/`$HOMEDRIVE`+`$HOMEPATH` chain.
 fn cargo_home() -> Option<PathBuf> {
-    std::env::var_os("CARGO_HOME")
+    cargo_home_from(
+        crate::paths::non_empty_var("CARGO_HOME"),
+        crate::paths::user_home(),
+    )
+}
+
+/// `cargo_home`'s decision, with `$CARGO_HOME` and the resolved home
+/// directory passed in rather than read live — so the empty-`$CARGO_HOME`
+/// rule is pinnable without mutating real process env (cadence-hooks#403
+/// code review: the rule was documented at length but had no test, and
+/// couldn't get one against the live-env version).
+///
+/// `cargo_home_var` comes from [`crate::paths::non_empty_var`], which
+/// already treats an empty-but-set var as unset — without that,
+/// `CARGO_HOME=""` would make `PathBuf::from("")`, and `.join(".cargo")` on
+/// it resolves the *relative* path `.cargo`, which names neither `.claude/`
+/// nor a temp root, so `escapes_carveout` would bless it and this fixture
+/// would be created relative to the test binary's cwd instead of failing
+/// loudly.
+fn cargo_home_from(cargo_home_var: Option<String>, home: Option<PathBuf>) -> Option<PathBuf> {
+    cargo_home_var
         .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| crate::paths::user_home().map(|h| h.join(".cargo")))
+        .or_else(|| home.map(|h| h.join(".cargo")))
 }
 
 impl Drop for Scratch {
@@ -266,6 +343,7 @@ pub fn init_repo(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worktree::path_under_temp_root;
 
     /// This module's own `target/`-relative scratch root, mirroring the
     /// `scratch_root()` convention every consumer of this fixture uses —
@@ -422,6 +500,17 @@ mod tests {
             None,
             Some(Path::new("/Users/dev/.cargo")),
         );
+        // `!is_claude_managed_dir(&dir)` alone would pass for ANY non-`.claude`
+        // result, including a wrong branch that happened to land somewhere
+        // else entirely — it can't distinguish "took the $CARGO_HOME
+        // fallback" from "went somewhere unrelated" (cadence-hooks#403 code
+        // review). Mirror the sibling temp-root test's `starts_with` so this
+        // actually pins the branch under test.
+        assert!(
+            dir.starts_with("/Users/dev/.cargo/cadence-hooks-test-scratch"),
+            "must take the $CARGO_HOME fallback, not just land somewhere non-.claude: {}",
+            dir.display()
+        );
         assert!(!is_claude_managed_dir(&dir));
     }
 
@@ -447,6 +536,106 @@ mod tests {
             Some(Path::new("/tmp/bad-override")),
             None,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "carve-out")]
+    fn resolve_panics_when_cargo_home_itself_is_carved_out_and_no_override() {
+        // A gap in the earlier fallback-chain tests: none of them passed a
+        // `cargo_home` that is ITSELF under a carve-out (as opposed to
+        // `None`) — so the "nothing escapes" panic path was pinned only for
+        // a missing `$CARGO_HOME`, not a carved-out one. Both must panic;
+        // this exercises the other branch (cadence-hooks#403 code review).
+        let _ = resolve_scratch_dir_with(
+            Path::new("/tmp/checkout/target/scratch"),
+            "tag",
+            None,
+            None,
+            Some(Path::new("/tmp/carved-out-cargo-home")),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_scratch_dir_resolves_symlinks_before_checking_the_carveout() {
+        // A checkout reached via a symlink can have a LITERAL path that
+        // doesn't look like a carve-out, while resolving — as `git
+        // rev-parse --show-toplevel` (what the guard under test actually
+        // uses) resolves — to a real location that IS one. Verified
+        // empirically (cadence-hooks#403 code review / CodeRabbit): a
+        // symlink at a non-carve-out path pointing into `/tmp` makes `git
+        // rev-parse --show-toplevel`, run from inside it, report the
+        // resolved `/private/tmp/...` form, not the symlinked literal path.
+        // A lexical-only carve-out check would miss this and hand back a
+        // fixture the real guard machinery still treats as exempt.
+        let real_target = Path::new("/tmp/git-fixtures-symlink-target-check");
+        let _ = std::fs::remove_dir_all(real_target);
+        std::fs::create_dir_all(real_target).unwrap();
+
+        // The symlink itself must live at a location guaranteed non-carve-out
+        // REGARDLESS of where this test's own checkout sits — `scratch_root()`
+        // won't do, since it's checkout-relative and would itself be under
+        // `/tmp` when this suite runs from a `/tmp` worktree (exactly the
+        // scenario this fix targets), which would make the sanity assertion
+        // below fail for the wrong reason. `cargo_home()` is the one location
+        // this module already treats as reliably outside every carve-out.
+        let symlink_parent = cargo_home()
+            .expect("test environment must have $CARGO_HOME or a resolvable home directory")
+            .join("git-fixtures-symlink-check");
+        std::fs::create_dir_all(&symlink_parent).unwrap();
+        let symlink_root = symlink_parent.join("symlink-checkout-check");
+        let _ = std::fs::remove_file(&symlink_root);
+        std::os::unix::fs::symlink(real_target, &symlink_root).unwrap();
+
+        // Sanity: the literal path does NOT lexically look like a carve-out.
+        assert!(
+            !path_under_temp_root(&symlink_root.join("tag-x"), None),
+            "test setup: the symlink's literal path must not itself start with /tmp"
+        );
+
+        let dir = resolve_scratch_dir_with(
+            &symlink_root,
+            "symlink-check",
+            None,
+            None,
+            Some(Path::new("/Users/dev/.cargo")),
+        );
+        assert!(
+            dir.starts_with("/Users/dev/.cargo/cadence-hooks-test-scratch"),
+            "must relocate via the $CARGO_HOME fallback — the symlink resolves under /tmp \
+             even though its literal path doesn't: {}",
+            dir.display()
+        );
+
+        let _ = std::fs::remove_file(&symlink_root);
+        let _ = std::fs::remove_dir_all(&symlink_parent);
+        let _ = std::fs::remove_dir_all(real_target);
+    }
+
+    #[test]
+    fn cargo_home_from_prefers_the_env_var() {
+        let dir = cargo_home_from(
+            Some("/custom/cargo/home".to_string()),
+            Some(PathBuf::from("/Users/dev")),
+        );
+        assert_eq!(dir, Some(PathBuf::from("/custom/cargo/home")));
+    }
+
+    #[test]
+    fn cargo_home_from_falls_back_to_home_when_env_var_is_none() {
+        // `None` here simulates `non_empty_var("CARGO_HOME")` having already
+        // turned an empty-but-set `$CARGO_HOME=""` into `None` — that
+        // filtering is `non_empty_var`'s job (tested in `paths.rs`), not
+        // this function's; this pins `cargo_home_from`'s OWN composition
+        // rule: `None` falls back to `home.join(".cargo")`.
+        let dir = cargo_home_from(None, Some(PathBuf::from("/Users/dev")));
+        assert_eq!(dir, Some(PathBuf::from("/Users/dev/.cargo")));
+    }
+
+    #[test]
+    fn cargo_home_from_is_none_when_neither_is_available() {
+        let dir = cargo_home_from(None, None);
+        assert_eq!(dir, None);
     }
 
     #[test]
