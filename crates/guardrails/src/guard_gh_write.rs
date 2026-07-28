@@ -107,51 +107,82 @@ pub(crate) fn is_write_command(command: &str) -> bool {
         || API_INPUT_FLAG.is_match(command)
 }
 
-/// Extract a `-R`/`--repo` flag value from a raw command string.
+/// What a segment's `gh` invocation says about its `-R`/`--repo` target.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RepoFlag {
+    /// No repo-flag reading anywhere in the invocation.
+    Absent,
+    /// Every reading agrees on one target.
+    Target(String),
+    /// Two or more readings disagree, so which one gh obeys depends on a flag
+    /// table this guard does not have. Fails closed — see [`repo_flag`].
+    Ambiguous,
+}
+
+/// Read the `-R`/`--repo` target out of a segment's `gh` invocation.
 ///
 /// Handles all four gh CLI forms: `-R x`, `-Rx`, `--repo x`, `--repo=x` —
 /// mirroring `loop_analysis::extract_repo_flag`, which does the same over
 /// parsed AST words. Values keep their quotes trimmed so `--repo "o/r"`
 /// resolves to `o/r`.
 ///
-/// Tokenized quote-aware rather than on whitespace: a `-R owner/repo` spelled
-/// inside another flag's quoted value (`--body "use -R cameronsjo/allowed"`) is
-/// ONE token, so prose can no longer donate a target to a write that never
-/// named one (#463).
+/// Reads [`gh_argv`], not the raw string, on both counts that matter. Quoted
+/// text is one token, so a `-R owner/repo` spelled inside another flag's value
+/// cannot pose as the flag; and the scan starts at the `gh` token, so an
+/// `eval "gh … -R evil/target"` wrapper is peeled like every other arm already
+/// peels it. Scanning `tokenize` directly left arm 1 the ONLY resolution path
+/// blind to `eval`, and a plain unescaped wrapper walked through it (#463).
 ///
-/// **The LAST occurrence wins, because that is the one gh obeys.** Verified
-/// against gh 2.96.0: with two repo flags, a malformed value is rejected when
-/// it is last and ignored when it is first. Returning the first match let a
-/// benign leading flag cover a real one — `gh issue comment 42
-/// -R cameronsjo/allowed -R evil/target` resolved the allowed repo while the
-/// write landed on `evil/target` (#463 review).
-pub(crate) fn extract_repo_flag_str(command: &str) -> Option<String> {
+/// **Disagreement fails closed, because "which `-R` wins" is not answerable
+/// here.** gh obeys the last *real* repo flag, but a token that merely looks
+/// like one may be another flag's value — `--body -Rcameronsjo/allowed` is a
+/// body, not a target. Distinguishing them needs gh's per-subcommand flag
+/// table: skipping the token after every flag would swallow the real `-R` after
+/// a boolean like `--draft`, and skipping after none lets the decoy win. Both
+/// mistakes resolve toward ALLOW — dropping the flag falls through to the
+/// cwd-remote arm, which passes from an owned checkout. So when readings
+/// disagree this reports [`RepoFlag::Ambiguous`] and the caller blocks. Readings
+/// that AGREE are not ambiguous, so a repeated or echoed target still resolves.
+pub(crate) fn repo_flag(command: &str) -> RepoFlag {
+    let Some(words) = gh_argv(command) else {
+        return RepoFlag::Absent;
+    };
     let trim_value = |s: &str| s.trim_matches(|c| c == '"' || c == '\'').to_string();
-    let words = tokenize(command);
-    let mut found = None;
-    let mut i = 0;
+    let mut seen: Vec<String> = Vec::new();
+    // Start past argv[0] (`gh` itself).
+    let mut i = 1;
     while i < words.len() {
         let word = words[i].as_str();
         if word == "-R" || word == "--repo" {
             if let Some(value) = words.get(i + 1) {
-                found = Some(trim_value(value));
+                seen.push(trim_value(value));
                 // Skip the value so it cannot also be read as a flag.
                 i += 2;
                 continue;
             }
         } else if let Some(repo) = word.strip_prefix("--repo=") {
-            found = Some(trim_value(repo));
+            seen.push(trim_value(repo));
         } else if let Some(repo) = word.strip_prefix("-R")
-            // Compact form: -Rowner/repo (no space). Exclude other dash-prefixed
-            // flags by requiring the remainder not start with another dash.
+            // Compact form: -Rowner/repo. Exclude other dash-prefixed flags by
+            // requiring the remainder not start with another dash, and exclude
+            // whitespace — gh rejects a repo spec containing a space, so a
+            // `--body "-R some prose"` token is not a target gh could honor and
+            // must not manufacture a disagreement.
             && !repo.is_empty()
             && !repo.starts_with('-')
+            && !repo.contains(char::is_whitespace)
         {
-            found = Some(trim_value(repo));
+            seen.push(trim_value(repo));
         }
         i += 1;
     }
-    found
+    seen.sort();
+    seen.dedup();
+    match seen.len() {
+        0 => RepoFlag::Absent,
+        1 => RepoFlag::Target(seen.swap_remove(0)),
+        _ => RepoFlag::Ambiguous,
+    }
 }
 
 /// Resolve target repo from command context.
@@ -169,6 +200,11 @@ enum RepoResolution {
     },
     /// Cannot determine target
     Unresolvable,
+    /// Repo flags disagree, so the target depends on gh's flag table rather
+    /// than on anything readable here ([`RepoFlag::Ambiguous`]). Distinct from
+    /// `Unresolvable` only in the message — a target WAS spelled out, so "add
+    /// `-R`" would be useless advice — and blocks under the same rule id.
+    AmbiguousFlags,
     /// Resolution abandoned at the #271 subprocess deadline. Distinct from
     /// `Unresolvable` (git answered; genuinely ambiguous — fail-closed block
     /// stands): a timeout is the guard's own infrastructure failing, which
@@ -184,8 +220,10 @@ fn resolve_target_repo(
     let dh = default_host();
 
     // 1. Explicit -R / --repo flag (gh CLI always targets GH_HOST or github.com)
-    if let Some(repo) = extract_repo_flag_str(command) {
-        return RepoResolution::Resolved { host: dh, repo };
+    match repo_flag(command) {
+        RepoFlag::Target(repo) => return RepoResolution::Resolved { host: dh, repo },
+        RepoFlag::Ambiguous => return RepoResolution::AmbiguousFlags,
+        RepoFlag::Absent => {}
     }
 
     // 2. gh repo <subcommand> <owner/repo> (positional arg)
@@ -664,7 +702,7 @@ pub(crate) fn segment_invokes_gh(segment: &str) -> bool {
 /// phrase that appears only inside a quoted argument names no target for
 /// resolution, and must not silence the nudge either (#463).
 pub(crate) fn segment_lacks_explicit_target(segment: &str) -> bool {
-    extract_repo_flag_str(segment).is_none()
+    repo_flag(segment) == RepoFlag::Absent
         && gh_api_endpoint(segment).is_none_or(|endpoint| api_repos_target(&endpoint).is_none())
         && gh_repo_positional_target(segment).is_none()
         && !gh_write_is_user_scoped(segment)
@@ -1092,6 +1130,27 @@ fn judge_write_segment(
             cadence_hooks_core::deadline::note_suppressed_block();
             None
         }
+        // Repo flags disagree. A target WAS spelled out, so the unresolvable
+        // arm's "add -R" advice would be wrong; say which readings conflict and
+        // let the operator pick. Same rule id — an ambiguous target IS an
+        // unresolvable one, and downstream consumers keyed on the id shouldn't
+        // have to learn a new one to keep blocking.
+        RepoResolution::AmbiguousFlags => Some(CheckResult::block_structured(
+            format!(
+                "🚫 git-guardrails: gh write names more than one target repo\n   \
+                 Command: {segment}\n   \
+                 Which one gh honors depends on whether a later `-R`-shaped token is a real \
+                 flag or another flag's value — this guard cannot tell, so it will not guess.\n   \
+                 Fix: leave exactly one `-R owner/repo`, and quote any argument whose text \
+                 begins with `-R` or `--repo`"
+            ),
+            BlockMetadata {
+                rule_id: "gh-write-target-unresolvable".to_string(),
+                fix: "leave exactly one -R owner/repo".to_string(),
+                allowed_owners: allowed_display_list(allowed_owners, allowed_repos),
+                severity: "error",
+            },
+        )),
         RepoResolution::Unresolvable => {
             // Suggest the first allowed owner so the fix is concrete even when no
             // repo can be inferred from the directory.
@@ -1392,10 +1451,20 @@ mod tests {
         assert!(!is_write_command("gh pr list"));
     }
 
+    /// The resolved target of an unambiguous repo flag — test sugar so the
+    /// single-target cases stay readable. Cases that care about `Absent` vs
+    /// `Ambiguous` match on [`RepoFlag`] directly.
+    fn repo_flag_value(command: &str) -> Option<String> {
+        match repo_flag(command) {
+            RepoFlag::Target(repo) => Some(repo),
+            _ => None,
+        }
+    }
+
     #[test]
     fn repo_flag_extraction() {
         assert_eq!(
-            extract_repo_flag_str("gh pr create -R cameronsjo/test --title hi"),
+            repo_flag_value("gh pr create -R cameronsjo/test --title hi"),
             Some("cameronsjo/test".to_string())
         );
     }
@@ -1403,7 +1472,7 @@ mod tests {
     #[test]
     fn repo_flag_long_form() {
         assert_eq!(
-            extract_repo_flag_str("gh issue create --repo cameronsjo/test --title hi"),
+            repo_flag_value("gh issue create --repo cameronsjo/test --title hi"),
             Some("cameronsjo/test".to_string())
         );
     }
@@ -3643,9 +3712,12 @@ mod tests {
     }
 
     #[test]
-    fn last_repo_flag_wins_over_a_benign_leading_one() {
-        // gh honors the LAST -R; resolving the first let a benign leading flag
-        // cover the real target.
+    fn disagreeing_repo_flags_block() {
+        // Was `last_repo_flag_wins_over_a_benign_leading_one`. Still BLOCKS —
+        // the security outcome is unchanged — but the reason moved: taking the
+        // last reading is itself exploitable when the last token is another
+        // flag's VALUE, so disagreement now fails closed instead of picking a
+        // side. Hence the unresolvable rule id rather than unauthorized-target.
         with_env(&owners_env(), || {
             let input = input_with(
                 "gh issue comment 42 -R cameronsjo/allowed -R evil/target --body x",
@@ -3654,30 +3726,37 @@ mod tests {
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
             let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+            assert_eq!(meta.rule_id, "gh-write-target-unresolvable");
         });
     }
 
     #[test]
-    fn last_repo_flag_wins_across_all_four_spellings() {
-        // The rule has to hold for every form gh accepts, not just `-R x`.
+    fn disagreement_is_detected_across_all_four_spellings() {
+        // Was `last_repo_flag_wins_across_all_four_spellings`, asserting
+        // `Some("b/second")`. Every form gh accepts must still be READ — the
+        // change is only in what happens when two readings disagree.
+        for command in [
+            "gh pr create -R a/first --repo b/second",
+            "gh pr create --repo=a/first -Rb/second",
+            "gh pr create -Ra/first --repo=b/second",
+        ] {
+            assert_eq!(repo_flag(command), RepoFlag::Ambiguous, "{command}");
+        }
+    }
+
+    #[test]
+    fn repeated_agreeing_repo_flags_still_resolve() {
+        // Agreement is not ambiguity: naming the same target twice, in any
+        // spelling, must still resolve rather than fail closed.
         assert_eq!(
-            extract_repo_flag_str("gh pr create -R a/first --repo b/second"),
-            Some("b/second".to_string())
-        );
-        assert_eq!(
-            extract_repo_flag_str("gh pr create --repo=a/first -Rb/second"),
-            Some("b/second".to_string())
-        );
-        assert_eq!(
-            extract_repo_flag_str("gh pr create -Ra/first --repo=b/second"),
-            Some("b/second".to_string())
+            repo_flag("gh pr create -R cameronsjo/x --repo=cameronsjo/x"),
+            RepoFlag::Target("cameronsjo/x".to_string())
         );
     }
 
     #[test]
     fn single_repo_flag_still_allows() {
-        // Positive control for last-wins: one allowed target still resolves.
+        // Positive control: one allowed target still resolves.
         with_env(&owners_env(), || {
             let input = input_with(
                 "gh issue comment 42 -R cameronsjo/cadence-hooks --body x",
@@ -3739,6 +3818,115 @@ mod tests {
                 OWNED_DIR,
             );
             let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    // --- #463 review round 3: value-shaped decoys and the eval-blind arm 1 ---
+
+    #[test]
+    fn a_flag_value_shaped_like_a_repo_flag_cannot_override_the_real_target() {
+        // gh consumes each of these later tokens as the PRECEDING flag's value
+        // and keeps the first real -R. Taking the last reading handed the write
+        // to the decoy's allowed owner while gh targeted evil/target.
+        for command in [
+            "gh issue create -R evil/target --body -Rcameronsjo/allowed",
+            r#"gh issue create -R evil/target --body "-Rcameronsjo/allowed""#,
+            r#"gh issue create -R evil/target --body "--repo=cameronsjo/allowed""#,
+            r#"gh pr create --repo evil/target --title "-Rcameronsjo/allowed""#,
+        ] {
+            with_env(&owners_env(), || {
+                let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "{command}"
+                );
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-target-unresolvable", "{command}");
+            });
+        }
+    }
+
+    #[test]
+    fn a_boolean_flag_does_not_swallow_the_real_repo_flag() {
+        // The mirror hazard: "skip the token after every flag" would consume
+        // `-R` as --draft's value, resolve nothing, and fall through to the
+        // cwd-remote arm — an ALLOW from an owned checkout. The real target
+        // must still be read.
+        assert_eq!(
+            repo_flag("gh pr create --draft -R evil/target"),
+            RepoFlag::Target("evil/target".to_string())
+        );
+    }
+
+    #[test]
+    fn spaced_repo_prose_in_a_body_does_not_manufacture_ambiguity() {
+        // `-R some prose` is not a repo spec gh could honor, so it must not
+        // conflict with the real flag and false-block a legitimate write.
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"gh issue comment 42 --body "-R starts my text" -R cameronsjo/cadence-hooks"#,
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn eval_wrapped_repo_flag_is_resolved_by_arm_one() {
+        // Arm 1 read `tokenize` directly, making it the ONE resolution path
+        // blind to eval: a plain unescaped wrapper resolved nothing and an
+        // owned cwd allowed the write. Nested eval is peeled too, bounded by
+        // MAX_EVAL_DEPTH.
+        for command in [
+            r#"eval "gh issue create --title x -R evil/target""#,
+            r#"eval "eval 'gh issue create --title x -R evil/target'""#,
+        ] {
+            with_env(&owners_env(), || {
+                let result = GhWriteGuard.run(&input_with(command, OWNED_DIR));
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Block),
+                    "{command}"
+                );
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            });
+        }
+    }
+
+    #[test]
+    fn eval_wrapped_positional_and_api_targets_already_blocked() {
+        // Controls for the arm-1 fix: arms 2 and 3 route through gh_argv and
+        // peeled eval correctly all along. They must keep blocking, so the fix
+        // is shown to close a gap rather than shift one.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                r#"eval "gh repo delete evil/target""#,
+                OWNED_DIR,
+            ));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        });
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                r#"eval "gh api orgs/evil-org/repos -X POST -f name=x""#,
+                OWNED_DIR,
+            ));
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
+    }
+
+    #[test]
+    fn eval_wrapped_owned_write_still_allows() {
+        // Positive control: peeling eval must not turn a legitimate wrapped
+        // write into a block.
+        with_env(&owners_env(), || {
+            let result = GhWriteGuard.run(&input_with(
+                r#"eval "gh issue create --title x -R cameronsjo/cadence-hooks""#,
+                OWNED_DIR,
+            ));
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
     }
