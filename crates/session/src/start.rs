@@ -266,7 +266,7 @@ mod tests {
 
     /// This crate's own `target/`-relative scratch root — `env!` resolves at
     /// THIS call site, landing under `crates/session`'s own `target/`. Only a
-    /// default: [`cadence_hooks_core::git_fixtures::resolve_scratch_dir`]
+    /// default: `Scratch::new`'s internal `resolve_scratch_dir`
     /// relocates outside it when the checkout itself sits under a carve-out
     /// (cadence-hooks#403 — the exact split #437 documented below at
     /// `run_start_stays_silent_with_no_in_flight_plans` was a symptom of).

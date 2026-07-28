@@ -415,7 +415,7 @@ mod tests {
 
     /// This crate's own `target/`-relative scratch root — `env!` resolves at
     /// THIS call site, landing under `crates/guardrails`'s own `target/`.
-    /// Only a default: [`cadence_hooks_core::git_fixtures::resolve_scratch_dir`]
+    /// Only a default: `Scratch::new`'s internal `resolve_scratch_dir`
     /// relocates outside it when the checkout itself sits under a carve-out
     /// (cadence-hooks#403).
     fn scratch_root() -> PathBuf {

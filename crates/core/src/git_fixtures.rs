@@ -17,17 +17,21 @@
 //! directory removal included — into the shipped binary as dead code. A
 //! resolver downgrade is the one change that silently reopens that.
 
-use crate::worktree::{is_claude_managed_dir, path_under_temp_root};
+use crate::worktree::{is_claude_managed_dir, path_under_temp_root_with_canonical};
 use std::path::{Path, PathBuf};
 
 /// Env var overriding [`resolve_scratch_dir`]'s fallback root, for the rare
 /// case where neither the caller's default nor `$CARGO_HOME`/`$HOME/.cargo`
 /// escapes a carve-out (e.g. a sandboxed runner with `$CARGO_HOME` itself
-/// under `/tmp`). Unset in the overwhelming common case.
-pub const SCRATCH_ROOT_OVERRIDE_ENV: &str = "CADENCE_HOOKS_TEST_SCRATCH_ROOT";
+/// under `/tmp`). Unset in the overwhelming common case. `pub(crate)`, not
+/// `pub` — no caller outside this crate needs the Rust constant; the env var
+/// itself is a shell-level contract (documented in `CONTRIBUTING.md`), set
+/// from a developer's shell, never referenced by name from other crates'
+/// code.
+pub(crate) const SCRATCH_ROOT_OVERRIDE_ENV: &str = "CADENCE_HOOKS_TEST_SCRATCH_ROOT";
 
 /// A `target/`-rooted-by-default (never tempdir-rooted), auto-cleaning
-/// scratch directory. [`path_under_temp_root`] exempts anything under the
+/// scratch directory. [`crate::worktree::path_under_temp_root`] exempts anything under the
 /// platform temp dir (cadence-hooks#312), so a tempdir-rooted fixture would
 /// silently allow every blocked-path case and the test would never reach the
 /// git-spawning/blocking branch at all.
@@ -62,7 +66,20 @@ impl Scratch {
         );
         let dir = resolve_scratch_dir(root, tag);
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // `escapes_carveout` is purely lexical — it blesses `$CARGO_HOME`
+        // (or the override) without checking it's writable. On a read-only
+        // or vendored cargo home this create would fail — name the escape
+        // hatch in the message rather than dying with a bare `Os { code: 30,
+        // ReadOnlyFilesystem }` that never points at the fix (cadence-hooks#403
+        // code review).
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+            panic!(
+                "failed to create fixture dir {}: {e} — if this is under \
+                 $CARGO_HOME/$HOME/.cargo and it's read-only or vendored, set \
+                 {SCRATCH_ROOT_OVERRIDE_ENV} to a writable, carve-out-free directory",
+                dir.display()
+            )
+        });
         Self(dir)
     }
 
@@ -74,7 +91,24 @@ impl Scratch {
 
 /// Resolve `root.join("{tag}-{pid}")`, guaranteeing the result sits outside
 /// every enforce-worktree carve-out (`.claude/` or a temp root) — see the
-/// module doc for why that guarantee matters.
+/// module doc for why that guarantee matters. Reads real process env; see
+/// [`resolve_scratch_dir_with`] for the injectable decision this wraps.
+pub(crate) fn resolve_scratch_dir(root: &Path, tag: &str) -> PathBuf {
+    let override_root = std::env::var_os(SCRATCH_ROOT_OVERRIDE_ENV).map(PathBuf::from);
+    resolve_scratch_dir_with(
+        root,
+        tag,
+        std::env::var("TMPDIR").ok().as_deref(),
+        override_root.as_deref(),
+        cargo_home().as_deref(),
+    )
+}
+
+/// `resolve_scratch_dir`'s decision, with every environment input passed in
+/// rather than read live — so tests can exercise the fallback chain without
+/// mutating real process env (which every concurrently-running test in the
+/// same binary would also observe, since `cargo test` runs tests as threads
+/// in one process; cadence-hooks#403 code review).
 ///
 /// `root` is tried first, since it keeps fixtures local to the checkout for
 /// the common case. But `root` is computed from `CARGO_MANIFEST_DIR`, which
@@ -82,48 +116,58 @@ impl Scratch {
 /// carve-out (a `/tmp` worktree, following the documented worktree
 /// convention; cadence-hooks#403), `root` is under that same carve-out and no
 /// subdirectory of it can escape. In that case, fall back to a location
-/// outside the checkout entirely: [`SCRATCH_ROOT_OVERRIDE_ENV`] if set, else
-/// `$CARGO_HOME` (or `$HOME/.cargo`) — both of which exist on any machine
-/// that can run `cargo test` at all, and neither of which is
-/// checkout-relative. Panics only if none of these escape the carve-out,
-/// which should never happen outside a deliberately broken environment.
+/// outside the checkout entirely: `override_root`
+/// ([`SCRATCH_ROOT_OVERRIDE_ENV`]) if given, else `cargo_home`
+/// (`$CARGO_HOME`/`$HOME/.cargo`) — both of which exist on any machine that
+/// can run `cargo test` at all, and neither of which is checkout-relative.
+/// Panics only if none of these escape the carve-out, which should never
+/// happen outside a deliberately broken environment.
 ///
 /// This never silently narrows coverage: every caller's actual test logic
 /// still runs against a real, non-exempt fixture, whichever root won.
-pub fn resolve_scratch_dir(root: &Path, tag: &str) -> PathBuf {
-    let tmpdir = std::env::var("TMPDIR").ok();
-    let candidate = |base: &Path| base.join(format!("{tag}-{}", std::process::id()));
-    let escapes_carveout =
-        |dir: &Path| !is_claude_managed_dir(dir) && !path_under_temp_root(dir, tmpdir.as_deref());
+fn resolve_scratch_dir_with(
+    root: &Path,
+    tag: &str,
+    tmpdir: Option<&str>,
+    override_root: Option<&Path>,
+    cargo_home: Option<&Path>,
+) -> PathBuf {
+    // `$TMPDIR` is invariant for the process — canonicalize once (a real
+    // `realpath` syscall chain) and reuse it across all three candidates,
+    // rather than re-canonicalizing per candidate inside `escapes_carveout`
+    // (cadence-hooks#403 code review: the relocation path this function
+    // exists for is precisely the one that was paying that cost 2-3x).
+    let tmpdir_canonical = crate::worktree::canonicalize_tmpdir(tmpdir);
+    let suffix = format!("{tag}-{}", std::process::id());
+    let candidate = |base: &Path| base.join(&suffix);
+    let escapes_carveout = |dir: &Path| {
+        !is_claude_managed_dir(dir)
+            && !path_under_temp_root_with_canonical(dir, tmpdir, tmpdir_canonical.as_deref())
+    };
 
     let default_dir = candidate(root);
     if escapes_carveout(&default_dir) {
         return default_dir;
     }
 
-    if let Some(override_root) = std::env::var_os(SCRATCH_ROOT_OVERRIDE_ENV) {
-        let dir = candidate(Path::new(&override_root));
+    if let Some(override_root) = override_root {
+        let dir = candidate(override_root);
         assert!(
             escapes_carveout(&dir),
             "{SCRATCH_ROOT_OVERRIDE_ENV} itself sits under a carve-out (.claude/ or temp): {}",
             dir.display()
         );
-        eprintln!(
-            "note: checkout lives under a carve-out (.claude/ or temp) — fixtures relocated \
-             via ${SCRATCH_ROOT_OVERRIDE_ENV}: {}",
+        note_relocation_once(&format!(
+            "via ${SCRATCH_ROOT_OVERRIDE_ENV}: {}",
             dir.display()
-        );
+        ));
         return dir;
     }
 
-    if let Some(cargo_home) = cargo_home() {
+    if let Some(cargo_home) = cargo_home {
         let dir = candidate(&cargo_home.join("cadence-hooks-test-scratch"));
         if escapes_carveout(&dir) {
-            eprintln!(
-                "note: checkout lives under a carve-out (.claude/ or temp) — fixtures \
-                 relocated to $CARGO_HOME: {}",
-                dir.display()
-            );
+            note_relocation_once(&format!("to $CARGO_HOME: {}", dir.display()));
             return dir;
         }
     }
@@ -138,12 +182,41 @@ pub fn resolve_scratch_dir(root: &Path, tag: &str) -> PathBuf {
     );
 }
 
-/// `$CARGO_HOME`, falling back to `$HOME/.cargo` — both stable, checkout-independent
-/// locations that exist on any machine able to run `cargo test`.
+/// Print the carve-out relocation notice to stderr exactly **once per
+/// process**, not once per `Scratch::new` call. A `/tmp`-worktree test run
+/// calls this indirectly from every one of the ~120 fixture call sites
+/// across the workspace — without the guard, that's up to ~120 near-identical
+/// stderr lines (cadence-hooks#403 code review), which is exactly the noise
+/// the single `note:` line this docstring — and `CONTRIBUTING.md` — promise.
+fn note_relocation_once(detail: &str) {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    NOTED.call_once(|| {
+        eprintln!(
+            "note: checkout lives under a carve-out (.claude/ or temp) — fixtures relocated \
+             {detail} (further relocations this run are silent)"
+        );
+    });
+}
+
+/// `$CARGO_HOME`, falling back to the user's home directory joined with
+/// `.cargo` — both stable, checkout-independent locations that exist on any
+/// machine able to run `cargo test`.
+///
+/// Routes the fallback through [`crate::paths::user_home`] rather than
+/// reading `$HOME` directly (cadence-hooks#403 code review): `$HOME` is
+/// unix-only, and `CONTRIBUTING.md` documents Windows support, where a
+/// contributor has no `$HOME` at all — `user_home` already carries the
+/// `$USERPROFILE`/`$HOMEDRIVE`+`$HOMEPATH` chain. It also treats an
+/// empty-but-set var as unset; without that, `CARGO_HOME=""` would make
+/// `PathBuf::from("")` — and `.join(".cargo")` on it resolves the *relative*
+/// path `.cargo`, which names neither `.claude/` nor a temp root, so
+/// `escapes_carveout` would bless it and this fixture would be created
+/// relative to the test binary's cwd instead of failing loudly.
 fn cargo_home() -> Option<PathBuf> {
     std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| crate::paths::user_home().map(|h| h.join(".cargo")))
 }
 
 impl Drop for Scratch {
@@ -202,10 +275,29 @@ mod tests {
     }
 
     #[test]
-    fn new_creates_a_directory_at_the_expected_path() {
+    fn new_creates_a_tag_pid_named_directory() {
+        // `scratch_root()` is only ever a *default* (cadence-hooks#403) —
+        // when THIS checkout itself sits under a carve-out (a `/tmp`
+        // worktree), `Scratch` relocates, so asserting `starts_with
+        // scratch_root()` here would reintroduce the exact bug #403 fixes
+        // for this one test. The carve-out-escape guarantee itself is
+        // pinned hermetically by the `resolve_*` tests below, against
+        // `resolve_scratch_dir_with` directly — not here, and not by
+        // constructing a real `Scratch` against a hardcoded carve-out root
+        // (that would relocate into this machine's REAL `$CARGO_HOME` on
+        // every run, carve-out or not; see the comment above the
+        // `resolve_*` tests). This test only pins what's true regardless of
+        // which root wins: a real directory, named `{tag}-{pid}`.
         let scratch = Scratch::new(&scratch_root(), "new-basic");
         assert!(scratch.path().is_dir());
-        assert!(scratch.path().starts_with(scratch_root()));
+        assert!(
+            scratch
+                .path()
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("new-basic-")),
+            "unexpected fixture path: {}",
+            scratch.path().display()
+        );
     }
 
     #[test]
@@ -213,13 +305,29 @@ mod tests {
         // A prior run that crashed or was killed before `Drop` fired would
         // leave the same tag+pid directory behind with old contents — `new()`
         // must not just no-op create_dir_all over it, it must wipe it first.
+        //
+        // Pre-seeding `root.join("{tag}-{pid}")` directly (rather than asking
+        // where `Scratch` actually resolves to) would only exercise the wipe
+        // when `root` happens to escape a carve-out — a `resolve_scratch_dir`
+        // relocation (cadence-hooks#403) would leave the pre-seeded stale dir
+        // untouched at a path `Scratch` never visits, and the assertion below
+        // would pass vacuously. Learn the real resolved path via the pure
+        // `resolve_scratch_dir` (no filesystem writes) rather than
+        // constructing-then-dropping a throwaway `Scratch` — same `tag` and
+        // process (so same pid), so the real `Scratch::new` call below
+        // resolves identically.
         let root = scratch_root();
         let tag = "stale-wipe";
-        let dir = root.join(format!("{tag}-{}", std::process::id()));
+        let dir = resolve_scratch_dir(&root, tag);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("leftover.txt"), "stale").unwrap();
 
         let scratch = Scratch::new(&root, tag);
+        assert_eq!(
+            scratch.path().to_path_buf(),
+            dir,
+            "sanity: Scratch::new must resolve to the same path resolve_scratch_dir predicted"
+        );
         assert!(scratch.path().is_dir());
         assert!(
             !scratch.path().join("leftover.txt").exists(),
@@ -248,145 +356,96 @@ mod tests {
     //
     // `root` is only a default — when it lands inside a carve-out (the
     // checkout itself sits under `/tmp`, e.g. a worktree created following
-    // the documented `git worktree add /tmp/...` convention), `Scratch::new`
+    // the documented `git worktree add /tmp/...` convention), the resolver
     // must relocate to escape it rather than panic, so the guard's actual
     // block/allow logic still runs for real instead of the whole suite
-    // reporting confusing failures. These tests mutate process env, so they
-    // share `ENV_LOCK`/`EnvGuard` with `env_override_wins_over_cargo_home_fallback`
-    // and `panics_when_no_fallback_escapes_either` below.
+    // reporting confusing failures.
+    //
+    // The fallback-chain branches (default escapes, override wins,
+    // `$CARGO_HOME` fallback, the final panic) are pinned against
+    // `resolve_scratch_dir_with` directly, with every env input passed as a
+    // plain argument — NOT via a real `Scratch::new` call against a
+    // hardcoded carve-out root. Two hazards rule that out: (1) `cargo test`
+    // runs tests as threads in one process, so a real `std::env::set_var`
+    // would be visible to every *other* concurrently-running test's own
+    // `Scratch::new`/`resolve_scratch_dir` call, most of which don't
+    // coordinate on any lock — a real, observed hazard while developing this
+    // fix, not a hypothetical one; and (2) a hardcoded carve-out root
+    // relocates on EVERY run, not just when the ambient checkout is actually
+    // under one — which means every plain `cargo test` (not just a `/tmp`
+    // worktree run) would create-then-partially-clean a directory under this
+    // machine's REAL `$CARGO_HOME` (`Drop` only removes the `{tag}-{pid}`
+    // leaf, so the `cadence-hooks-test-scratch` parent accumulates forever).
+    // Verified on this machine: it did (cadence-hooks#403 code review).
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Restores `CADENCE_HOOKS_TEST_SCRATCH_ROOT`/`CARGO_HOME`/`HOME` on
-    /// drop — including on panic — so one test's env mutation can never leak
-    /// into another sharing `ENV_LOCK`.
-    struct EnvGuard {
-        r#override: Option<std::ffi::OsString>,
-        cargo_home: Option<std::ffi::OsString>,
-        home: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn capture() -> Self {
-            Self {
-                r#override: std::env::var_os(SCRATCH_ROOT_OVERRIDE_ENV),
-                cargo_home: std::env::var_os("CARGO_HOME"),
-                home: std::env::var_os("HOME"),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: only constructed under `ENV_LOCK`, held for this
-            // guard's whole lifetime (declared after the lock, so it drops
-            // before the lock releases — panic included).
-            unsafe {
-                match self.r#override.take() {
-                    Some(v) => std::env::set_var(SCRATCH_ROOT_OVERRIDE_ENV, v),
-                    None => std::env::remove_var(SCRATCH_ROOT_OVERRIDE_ENV),
-                }
-                match self.cargo_home.take() {
-                    Some(v) => std::env::set_var("CARGO_HOME", v),
-                    None => std::env::remove_var("CARGO_HOME"),
-                }
-                match self.home.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
+    #[test]
+    fn resolve_uses_the_default_when_it_escapes_the_carveout() {
+        let root = Path::new("/Users/dev/checkout/target/scratch");
+        let dir = resolve_scratch_dir_with(root, "basic", None, None, None);
+        assert_eq!(dir, root.join(format!("basic-{}", std::process::id())));
     }
 
     #[test]
-    fn new_relocates_when_root_sits_under_a_temp_root() {
-        // Fixed check in `path_under_temp_root`: anything under `/tmp` counts,
-        // independent of `$TMPDIR` — no env setup needed to trigger it. This
-        // simulates the checkout-itself-under-`/tmp` scenario: the caller's
-        // `target/`-relative default can't escape a carve-out that IS the
-        // checkout, so `Scratch` must fall back instead of panicking.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _restore = EnvGuard::capture();
-        let scratch = Scratch::new(
-            Path::new("/tmp/git-fixtures-carveout-check"),
-            "relocate-temp",
+    fn resolve_override_wins_when_default_is_carved_out() {
+        let dir = resolve_scratch_dir_with(
+            Path::new("/tmp/checkout/target/scratch"),
+            "tag",
+            None,
+            Some(Path::new("/Users/dev/.cargo/cadence-hooks-test-scratch")),
+            Some(Path::new("/Users/dev/.cargo/should-not-be-used")),
         );
-        assert!(scratch.path().is_dir());
         assert!(
-            !path_under_temp_root(scratch.path(), std::env::var("TMPDIR").ok().as_deref()),
-            "relocated fixture must not itself sit under a temp root: {}",
-            scratch.path().display()
+            dir.starts_with("/Users/dev/.cargo/cadence-hooks-test-scratch"),
+            "override must be tried before the $CARGO_HOME fallback: {}",
+            dir.display()
         );
     }
 
     #[test]
-    fn new_relocates_when_root_contains_a_claude_component() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _restore = EnvGuard::capture();
-        let root = scratch_root().join(".claude");
-        let scratch = Scratch::new(&root, "relocate-claude");
-        assert!(scratch.path().is_dir());
-        assert!(
-            !is_claude_managed_dir(scratch.path()),
-            "relocated fixture must not itself sit under .claude/: {}",
-            scratch.path().display()
+    fn resolve_falls_back_to_cargo_home_when_default_is_temp_and_no_override() {
+        let dir = resolve_scratch_dir_with(
+            Path::new("/tmp/checkout/target/scratch"),
+            "tag",
+            None,
+            None,
+            Some(Path::new("/Users/dev/.cargo")),
+        );
+        assert!(dir.starts_with("/Users/dev/.cargo/cadence-hooks-test-scratch"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_cargo_home_when_default_is_claude_managed() {
+        let dir = resolve_scratch_dir_with(
+            Path::new("/Users/dev/checkout/.claude/scratch"),
+            "tag",
+            None,
+            None,
+            Some(Path::new("/Users/dev/.cargo")),
+        );
+        assert!(!is_claude_managed_dir(&dir));
+    }
+
+    #[test]
+    #[should_panic(expected = "CADENCE_HOOKS_TEST_SCRATCH_ROOT")]
+    fn resolve_panics_when_nothing_escapes_the_carveout() {
+        let _ = resolve_scratch_dir_with(
+            Path::new("/tmp/checkout/target/scratch"),
+            "tag",
+            None,
+            None,
+            None,
         );
     }
 
     #[test]
-    fn env_override_wins_when_default_is_carved_out() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _restore = EnvGuard::capture();
-        let override_root = scratch_root().join("override-target");
-        // SAFETY: serialized via ENV_LOCK; `_restore` puts the caller's
-        // values back on scope exit, panic included.
-        unsafe {
-            std::env::set_var(SCRATCH_ROOT_OVERRIDE_ENV, &override_root);
-        }
-        let scratch = Scratch::new(
-            Path::new("/tmp/git-fixtures-override-check"),
-            "env-override",
-        );
-        assert!(
-            scratch.path().starts_with(&override_root),
-            "override env var must win once the default lands in a carve-out: {}",
-            scratch.path().display()
-        );
-    }
-
-    #[test]
-    fn panics_when_no_fallback_escapes_either() {
-        // Everything under a carve-out: the default root, plus no override
-        // and no usable `$CARGO_HOME`/`$HOME` to fall back to — the one case
-        // `Scratch::new` cannot silently work around.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _restore = EnvGuard::capture();
-        // SAFETY: serialized via ENV_LOCK; `_restore` puts the caller's
-        // values back on scope exit, panic included.
-        unsafe {
-            std::env::remove_var(SCRATCH_ROOT_OVERRIDE_ENV);
-            std::env::remove_var("CARGO_HOME");
-            std::env::set_var("HOME", "/tmp/git-fixtures-no-fallback-home");
-        }
-        let result = std::panic::catch_unwind(|| {
-            Scratch::new(
-                Path::new("/tmp/git-fixtures-no-fallback-check"),
-                "no-fallback",
-            )
-        });
-        let err = match result {
-            Ok(_) => panic!("must panic when no candidate root escapes a carve-out"),
-            Err(e) => e,
-        };
-        let msg = err
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default();
-        assert!(msg.contains("carve-out"), "panic message: {msg}");
-        assert!(
-            msg.contains(SCRATCH_ROOT_OVERRIDE_ENV),
-            "panic message points at the escape hatch: {msg}"
+    #[should_panic(expected = "itself sits under a carve-out")]
+    fn resolve_panics_when_the_override_itself_is_carved_out() {
+        let _ = resolve_scratch_dir_with(
+            Path::new("/tmp/checkout/target/scratch"),
+            "tag",
+            None,
+            Some(Path::new("/tmp/bad-override")),
+            None,
         );
     }
 

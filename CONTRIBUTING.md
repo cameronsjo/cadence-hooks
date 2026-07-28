@@ -100,6 +100,25 @@ diagnostics that have no value on trivial sessions.
 - Use helper functions (`make_input`, `make_bash_input`) for test setup
 - Group tests: happy path first, then unhappy path / edge cases
 
+### Running the suite from a `/tmp` worktree
+
+`git worktree add /tmp/my-feature ...` (the pattern this project's own
+worktree docs recommend) works fine for `cargo test --workspace`: fixture
+directories that would otherwise land under the checkout's own `target/` —
+itself under `/tmp` in that layout, which `enforce-worktree`'s carve-out
+exempts — automatically relocate to `$CARGO_HOME` (or `$HOME/.cargo`) instead,
+so the guard's block/allow logic is still exercised for real
+(cadence-hooks#403). A one-line `note:` on stderr says when this happens —
+once per test binary (`cargo test --workspace` runs several, each its own
+process), not once per fixture.
+
+If your machine has neither a usable `$CARGO_HOME` nor `$HOME` (a stripped-down
+sandbox), point fixtures at an explicit directory instead:
+
+```bash
+export CADENCE_HOOKS_TEST_SCRATCH_ROOT=/some/carve-out-free/dir
+```
+
 ## Reproducing a Check by Hand
 
 A check is stdin JSON → exit code, so any reported bug (or new check) can be
