@@ -1140,21 +1140,44 @@ fn substitution_spans(body: &str) -> Vec<String> {
             // the text INSIDE one is shell code the shell will run, so a `)` in
             // a quoted string there does not close it. Counting blind ended the
             // span early and dropped every command after the quoted paren.
-            let mut quoted: Option<char> = None;
+            // Same [`Quote`] modes the tokenizer and the segmenter use. Rolling
+            // a private two-state tracker here is exactly what produced the
+            // earlier desyncs: `$'a\'b'` inside a substitution closed on the
+            // ESCAPED quote, the real one reopened a string that ate the
+            // closing paren, and every command after it was dropped — bash runs
+            // them (checked directly).
+            let mut quoted: Option<Quote> = None;
             while j < chars.len() && depth > 0 {
                 let c = chars[j];
                 match quoted {
                     Some(q) => {
-                        if c == '\\' && q == '"' {
+                        let escapes = match q {
+                            Quote::Double => matches!(chars.get(j + 1), Some('"' | '\\')),
+                            Quote::AnsiC => chars.get(j + 1).is_some(),
+                            Quote::Single => false,
+                        };
+                        if c == '\\' && escapes {
                             j += 2;
                             continue;
                         }
-                        if c == q {
+                        let closes = match q {
+                            Quote::Single | Quote::AnsiC => c == '\'',
+                            Quote::Double => c == '"',
+                        };
+                        if closes {
                             quoted = None;
                         }
                     }
                     None => match c {
-                        '\'' | '"' => quoted = Some(c),
+                        // `$'` opens ANSI-C; `$(` is a nested substitution and
+                        // falls through so the `(` bumps depth next pass.
+                        '$' if chars.get(j + 1) == Some(&'\'') => {
+                            quoted = Some(Quote::AnsiC);
+                            j += 2;
+                            continue;
+                        }
+                        '\'' => quoted = Some(Quote::Single),
+                        '"' => quoted = Some(Quote::Double),
                         '\\' => {
                             j += 2;
                             continue;
@@ -2784,6 +2807,40 @@ mod tests {
         assert!(
             out.iter().any(|s| s.contains("cat .env")),
             "quoted paren truncated the span: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_ansi_c_inside_a_substitution_does_not_truncate_the_span() {
+        // `$'a\'b'` inside `$( … )` honors the escaped quote and closes at the
+        // real one, so the `;` command after it still runs and the `)` still
+        // closes the span. A private two-state quote tracker read the escaped
+        // quote as the closer, reopened a string on the real one, and swallowed
+        // the closing paren — dropping every command after it. Bash runs them.
+        let out = command_segments("cat <<EOF\nx $(echo $'a\\'b' ; cat .env)\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "ANSI-C string truncated the span: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_substitution_scan_stops_at_the_terminator() {
+        // The mirror of the hidden-command bug: widening the scan to the whole
+        // body must not let it reach PAST the terminator and fabricate a
+        // command out of text the heredoc never contained. The body here holds
+        // an unclosed `$(`; the `cat .env` after the terminator is a real
+        // command in its own right and must appear as its own segment, never
+        // absorbed into a span from inside the body.
+        let out = command_segments("cat <<EOF\nx $(echo hi\nEOF\ncat .env");
+        assert!(
+            out.iter().any(|s| s.trim() == "cat .env"),
+            "post-terminator command lost: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|s| s.contains("$(echo hi") && s.contains("cat .env")),
+            "scan ran past the terminator and fabricated a span: {out:?}"
         );
     }
 
