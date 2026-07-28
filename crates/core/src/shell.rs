@@ -1020,7 +1020,7 @@ fn strip_heredoc_bodies(command: &str) -> String {
             // if it is found do we replace the body with the carried-forward
             // substitution lines; otherwise the lines are restored untouched.
             let body_start = i;
-            let mut carried: Vec<String> = Vec::new();
+            let mut body_lines: Vec<&str> = Vec::new();
             let mut found = false;
             while i < lines.len() {
                 let body = lines[i];
@@ -1029,22 +1029,31 @@ fn strip_heredoc_bodies(command: &str) -> String {
                     found = true;
                     break;
                 }
+                body_lines.push(body);
+                i += 1;
+            }
+            if found {
                 if expands {
-                    // Carry only the substitution SPANS, never the prose around
+                    // Carry the substitution SPANS, never the prose around
                     // them. A heredoc body is data: its apostrophes are
                     // ordinary characters, but everything downstream reads a
                     // segment as shell syntax, so splicing a whole body line in
                     // let a contraction ("it's here $(cat .env)") open a quote
                     // state that suppressed the very substitution the
                     // carry-forward exists to surface (#475).
-                    carried.extend(substitution_spans(body));
-                }
-                i += 1;
-            }
-            if found {
-                for c in carried {
-                    line.push(' ');
-                    line.push_str(&c);
+                    //
+                    // Extracted over the WHOLE body at once, not line by line.
+                    // A substitution's boundary is its closing delimiter, not a
+                    // newline — `` `cmd ⏎ cmd` `` is one substitution running
+                    // two commands — so a per-line extractor found no closer,
+                    // emitted nothing, and (having replaced the old
+                    // carry-the-whole-line behavior) left NOTHING for the
+                    // splitter to see. Same lesson as [`take_logical_line`]:
+                    // the unit is the construct, never the physical line.
+                    for span in substitution_spans(&body_lines.join("\n")) {
+                        line.push(' ');
+                        line.push_str(&span);
+                    }
                 }
             } else {
                 // Terminator never matched — keep every consumed line as-is so
@@ -1096,18 +1105,25 @@ fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
     line
 }
 
-/// Command-substitution spans in a heredoc body line, returned with their
-/// `$(…)` / `` `…` `` delimiters intact so they can be spliced onto the
+/// Command-substitution spans in an expanding heredoc's body, returned with
+/// their `$(…)` / `` `…` `` delimiters intact so they can be spliced onto the
 /// introducing line and re-parsed downstream.
 ///
-/// Deliberately quote-BLIND, which is what separates it from
-/// [`substitution_bodies`]. Inside an expanding heredoc body there is no
-/// quoting: `'` and `"` are ordinary characters and a substitution runs
-/// regardless of how many apostrophes precede it. Reusing the quote-aware
-/// scanner here made an ordinary contraction suppress the substitution.
-/// Backslash still escapes, so `\$(` is literal and produces no span.
-fn substitution_spans(line: &str) -> Vec<String> {
-    let chars: Vec<char> = line.chars().collect();
+/// **Pass the WHOLE body, not one line.** A substitution ends at its closing
+/// delimiter, and a newline is not one — `` `cmd ⏎ cmd` `` is a single
+/// substitution running two commands, exactly as the shell reads it. Scanning
+/// per physical line found no closer on either half and emitted nothing, which
+/// (having replaced the older carry-the-whole-line behavior) left the splitter
+/// with no trace of the commands at all.
+///
+/// **Quoting is tracked inside a span and ignored outside one**, which looks
+/// inconsistent and is not. Body prose is data: its apostrophes are ordinary
+/// characters, so a contraction must not suppress a substitution that follows.
+/// The text within `$( … )` is shell code the shell will execute, so a `)`
+/// inside a quoted string there does not close the span. Backslash escapes in
+/// both places, so `\$(` is literal and produces no span.
+fn substitution_spans(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
     let mut spans = Vec::new();
     let mut i = 0;
     while i < chars.len() {
@@ -1119,11 +1135,34 @@ fn substitution_spans(line: &str) -> Vec<String> {
             let start = i;
             let mut depth = 1;
             let mut j = i + 2;
+            // Quote tracking flips ON here, and the asymmetry is the point: the
+            // prose OUTSIDE a substitution is heredoc data with no quoting, but
+            // the text INSIDE one is shell code the shell will run, so a `)` in
+            // a quoted string there does not close it. Counting blind ended the
+            // span early and dropped every command after the quoted paren.
+            let mut quoted: Option<char> = None;
             while j < chars.len() && depth > 0 {
-                match chars[j] {
-                    '(' => depth += 1,
-                    ')' => depth -= 1,
-                    _ => {}
+                let c = chars[j];
+                match quoted {
+                    Some(q) => {
+                        if c == '\\' && q == '"' {
+                            j += 2;
+                            continue;
+                        }
+                        if c == q {
+                            quoted = None;
+                        }
+                    }
+                    None => match c {
+                        '\'' | '"' => quoted = Some(c),
+                        '\\' => {
+                            j += 2;
+                            continue;
+                        }
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    },
                 }
                 j += 1;
             }
@@ -2696,6 +2735,67 @@ mod tests {
             out.iter()
                 .any(|s| s.contains("gh issue create") && s.contains("--body-file")),
             "continuation was suppressed by prose: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_surfaces_a_substitution_spanning_two_body_lines() {
+        // A substitution ends at its closing delimiter, not at a newline, so
+        // `` `cmd ⏎ cmd` `` is ONE substitution running two commands — bash
+        // treats the newline inside backticks as a separator and runs both.
+        // Extracting per physical line found no closer on either half and
+        // emitted nothing, so both commands vanished before any guard saw them.
+        let out = command_segments("cat <<EOF\nx `cat .env\nid -un`\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "multi-line substitution vanished: {out:?}"
+        );
+        assert!(
+            out.iter().any(|s| s.contains("id -un")),
+            "second command in the substitution vanished: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_surfaces_a_dollar_paren_spanning_two_body_lines() {
+        // Same boundary, the `$( … )` spelling.
+        let out = command_segments("cat <<EOF\nx $(cat .env\nid -un)\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "multi-line $() vanished: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_single_line_substitution_still_surfaces() {
+        // Discriminating control: the one-line shape worked before and must
+        // still work, so the two tests above are evidence about the line
+        // boundary rather than about carry-forward being broken outright.
+        let out = command_segments("cat <<EOF\nx `cat .env`\nEOF");
+        assert!(out.iter().any(|s| s.contains("cat .env")), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_quoted_paren_does_not_end_a_substitution_early() {
+        // Inside `$( … )` the text is shell code, so a `)` in a quoted string
+        // is content. Counting parens blind closed the span at that `)` and
+        // dropped everything after it.
+        let out = command_segments("cat <<EOF\nx $(echo \")\" ; cat .env)\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "quoted paren truncated the span: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_unclosed_substitution_carries_nothing() {
+        // Control for the two above: a substitution the shell would never run
+        // (no closer anywhere in the body) must still carry nothing, so the
+        // span extractor did not simply become permissive.
+        let out = command_segments("cat <<EOF\nx `cat .env\nEOF");
+        assert!(
+            !out.iter().any(|s| s.trim() == "cat .env"),
+            "unclosed substitution was carried as a command: {out:?}"
         );
     }
 
