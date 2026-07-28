@@ -1622,7 +1622,10 @@ fn shell_c_argument(segment: &str) -> Option<String> {
 /// **This set feeds a DETECTOR, and that is why it may be wider than
 /// [`TRANSPARENT`].** Expanding a wrapper only ADDS segments to the "every
 /// command that will actually execute" view, so an over-eager skip costs an
-/// extra segment to inspect; a missed one costs the inner script's visibility
+/// extra segment to inspect — and, where that segment reaches a block-capable
+/// guard, can manufacture a false block on something the shell would never run
+/// (see the bounded-not-free caveat below); a missed one costs the inner
+/// script's visibility
 /// to every guard that segments. `TRANSPARENT` is the opposite case — it is
 /// consumed by `enforce_worktree` and `guard_rm` to decide *which verb runs*,
 /// where a wrong skip resolves the wrong command word, so it excludes `sudo`
@@ -2649,6 +2652,12 @@ mod tests {
         // than risking a wrong resolution — same refusal as
         // skip_transparent_prefixes.
         assert!(!command_segments("sudo -u root bash -c 'cat .env'").contains(&inner));
+        // The row above does NOT discriminate: deleting the `starts_with('-')`
+        // guard leaves it passing, because peeling `sudo` lands on `-u`, which
+        // is not a shell either way. This is the shape that kills that mutant —
+        // `command_word` basenames on `/`, so without the guard `-u/bin/bash`
+        // resolves to `bash` and the segment expands into a false block.
+        assert!(!command_segments("sudo -u/bin/bash -c 'cat .env'").contains(&inner));
         // Still not a wrapper just because a prefix precedes it.
         assert!(!command_segments("sudo echo 'cat .env'").contains(&inner));
         // A word that merely starts with `sudo` is not `sudo`.
