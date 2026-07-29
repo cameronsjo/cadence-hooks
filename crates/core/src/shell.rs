@@ -598,6 +598,14 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
         // (`-t '#123'`). Treating that value as a comment stopped the scan and
         // let a PR number *after* it through unexamined — a selector smuggled
         // past the gate, which is the unsafe direction (security review).
+        //
+        // Largely defensive since [`strip_comments`] began removing comments
+        // before segmentation, so a bare `#` token rarely survives to here.
+        // Kept deliberately: this is an equality test on one token, NOT a
+        // second comment scanner, so it cannot drift from [`comment_spans`]'
+        // rules the way an inline re-implementation did (#490 follow-up). Its
+        // direction is also the safe one — returning true means "no PR
+        // selected", which makes the gate fire rather than fall silent.
         if token == "#" {
             return true;
         }
@@ -1234,6 +1242,18 @@ fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
     *i += 1;
     while *i < lines.len() {
         let probe = line.strip_suffix('\r').unwrap_or(&line);
+        // **bash does not continue a comment line.** A comment runs to the
+        // newline, so a trailing backslash sitting inside one is comment TEXT,
+        // not a continuation — the next line starts a new command. Joining
+        // anyway pulled that command up into the comment, where the strip pass
+        // then deleted the whole thing: `echo a #;\` + `rm -rf ~` collapsed to
+        // `echo a` and the deletion reached no guard, while bash ran it. The
+        // spellings that carry a separator inside the comment body (`#;\`,
+        // `#|\`) are the sharp ones, because those are exactly the ones a
+        // comment-blind splitter used to survive by splitting on the separator.
+        if !comment_spans(probe).is_empty() {
+            break;
+        }
         let trailing = probe.chars().rev().take_while(|&c| c == '\\').count();
         if trailing % 2 == 0 {
             break;
@@ -1630,6 +1650,18 @@ fn ends_with_unescaped_gt(text: &str) -> bool {
     before.chars().rev().take_while(|&c| c == '\\').count() % 2 == 0
 }
 
+/// Which delimiter an open expansion is waiting on, so a closer can pop only
+/// its own kind. One counter for both kinds is not enough: `${` and `$(` close
+/// on different characters, and the other character is ordinary data inside
+/// them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opener {
+    /// `${…}` — a parameter expansion, closed by `}`.
+    Brace,
+    /// `$(…)` and `$((…))` — command substitution or arithmetic, closed by `)`.
+    Paren,
+}
+
 /// Byte ranges of `#` comments in `text` — from the `#` up to (not including)
 /// the next newline, or to end of input.
 ///
@@ -1640,12 +1672,15 @@ fn ends_with_unescaped_gt(text: &str) -> bool {
 ///
 /// - **Not inside a quote.** `'…'`, `"…"` and `$'…'` all make `#` data.
 /// - **Not inside an expansion.** `${…}`, `$(…)`, `$((…))` and `` `…` `` are
-///   tracked by depth, because bash does not start a comment inside any of
-///   them. Without this, `echo ${x:- # } ; rm -rf ~` collapsed to
-///   `["echo ${x:-"]` — the `;` and the deletion behind it vanished from every
-///   guard, while bash ran them (#490 follow-up). A bare `(…)` subshell is NOT
-///   counted: `(` is not whitespace, so no boundary opens after it and the
-///   comment simply never fires there.
+///   tracked on a STACK of [`Opener`] kinds, because bash does not start a
+///   comment inside any of them. Without this, `echo ${x:- # } ; rm -rf ~`
+///   collapsed to `["echo ${x:-"]` — the `;` and the deletion behind it
+///   vanished from every guard, while bash ran them (#490 follow-up). The
+///   stack rather than a counter, because a `)` inside `${…}` is data: sharing
+///   one counter let it close the brace early and reopen the same bypass one
+///   character over. A bare `(…)` subshell pushes nothing: `(` is not
+///   whitespace, so no boundary opens after it and the comment never fires
+///   there anyway.
 /// - **After UNESCAPED whitespace, or at the very start.** `\ ` is an escaped
 ///   space: it joins two halves of one word, so `echo a\ #x && rm -rf ~` is a
 ///   single argument `a #x` and the `&&` still runs. Testing the raw preceding
@@ -1661,7 +1696,7 @@ fn ends_with_unescaped_gt(text: &str) -> bool {
 fn comment_spans(text: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut quote: Option<Quote> = None;
-    let mut depth: usize = 0;
+    let mut open: Vec<Opener> = Vec::new();
     let mut backticks = false;
     let mut boundary = true;
     let mut chars = text.char_indices().peekable();
@@ -1701,8 +1736,12 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 boundary = false;
             }
             '$' if matches!(chars.peek().map(|&(_, n)| n), Some('{' | '(')) => {
-                chars.next();
-                depth += 1;
+                let opener = chars.next().expect("peeked").1;
+                open.push(if opener == '{' {
+                    Opener::Brace
+                } else {
+                    Opener::Paren
+                });
                 boundary = false;
             }
             '\'' => {
@@ -1718,16 +1757,36 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
                 boundary = false;
             }
             // Only nested once an expansion is already open, so a bare
-            // `(subshell)` never drives the counter negative.
-            '(' | '{' if depth > 0 => {
-                depth += 1;
+            // `(subshell)` never pushes.
+            '(' if !open.is_empty() => {
+                open.push(Opener::Paren);
                 boundary = false;
             }
-            ')' | '}' if depth > 0 => {
-                depth -= 1;
+            '{' if !open.is_empty() => {
+                open.push(Opener::Brace);
                 boundary = false;
             }
-            '#' if boundary && depth == 0 && !backticks => {
+            // A closer pops ONLY its own opener. A `)` sitting inside `${…}` is
+            // DATA — bash never ends a parameter expansion on it — so treating
+            // the two kinds as one counter let `echo ${x:-a)b # c} ; rm -rf ~`
+            // reach zero mid-expansion, fire the comment rule, and drop the
+            // `;` and the deletion behind it. Reached through `:-` `:=` `:+`
+            // `:?` `%` `/` `//`, array subscripts, and `$()` nested in `${}`.
+            //
+            // A mismatched closer is IGNORED rather than treated as an error,
+            // and the direction is what makes that safe: leaving an opener on
+            // the stack keeps the scan inside an expansion, which DISABLES
+            // comment stripping and over-inspects. Every unbalanced-opener
+            // shape already fails that way and is measured to do so.
+            ')' if open.last() == Some(&Opener::Paren) => {
+                open.pop();
+                boundary = false;
+            }
+            '}' if open.last() == Some(&Opener::Brace) => {
+                open.pop();
+                boundary = false;
+            }
+            '#' if boundary && open.is_empty() && !backticks => {
                 let end = text[i..].find('\n').map_or(text.len(), |off| i + off);
                 spans.push((i, end));
                 while chars.peek().is_some_and(|&(j, _)| j < end) {
@@ -3321,6 +3380,109 @@ mod tests {
                 "{cmd:?} lost {want_tail:?}: {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn split_segments_data_paren_does_not_close_a_brace_expansion() {
+        // A `)` inside `${…}` is DATA — bash never ends a parameter expansion
+        // on it. Tracking both opener kinds on one counter let it reach zero
+        // mid-expansion, fire the comment rule, and drop the separator plus
+        // everything behind it. Each row was run with a canary in place of the
+        // payload and the second command DID execute.
+        for (cmd, want_tail) in [
+            (
+                "echo ${x:-a)b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x:=a)b # c} && rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x:+a)b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x%a)b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x//a)b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x:-a)b # c} | rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            // `$()` opens and closes cleanly INSIDE `${}`, then one further
+            // `)` must not pop the brace.
+            (
+                "echo ${x:-$(echo a))b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+        ] {
+            let out = split_segments(cmd);
+            assert!(
+                out.iter().any(|s| s.contains(want_tail)),
+                "{cmd:?} lost {want_tail:?}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_segments_unbalanced_opener_disables_stripping() {
+        // The direction that makes ignoring a mismatched closer safe: an
+        // opener left on the stack keeps the scan inside an expansion, so
+        // comment stripping is DISABLED and the text stays under inspection.
+        // Over-inspection is the tolerable failure; dropping is not.
+        let out = split_segments("echo $( foo # bar\nrm -rf ~/Documents");
+        assert!(
+            out.iter().any(|s| s.contains("rm -rf ~/Documents")),
+            "unbalanced opener dropped text: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_arithmetic_and_substitution_close_independently() {
+        // `$((` pushes two Parens and `))` pops both, so the scan is back
+        // outside afterwards and a real trailing comment still strips.
+        assert_eq!(
+            split_segments("echo $((1+2)) # note\nls"),
+            vec!["echo $((1+2))", "ls"]
+        );
+        // A brace expansion still closes on its own `}`.
+        assert_eq!(
+            split_segments("echo ${x:-y} # note\nls"),
+            vec!["echo ${x:-y}", "ls"]
+        );
+    }
+
+    #[test]
+    fn take_logical_line_does_not_continue_a_comment() {
+        // bash does not continue a COMMENT line: the trailing backslash is
+        // comment text, so the next line starts a new command. Joining pulled
+        // that command into the comment, where the strip pass deleted it —
+        // canary confirms bash runs it. The separator-bearing spellings are
+        // the sharp ones, since those are what a comment-blind splitter used
+        // to survive on.
+        for cmd in [
+            "echo a #;\\\nrm -rf ~/Documents",
+            "echo a #|\\\nrm -rf ~/Documents",
+            "echo a # see notes \\\nrm -rf ~/Documents",
+        ] {
+            let out = split_segments(cmd);
+            assert!(
+                out.iter().any(|s| s.contains("rm -rf ~/Documents")),
+                "{cmd:?} swallowed the next command: {out:?}"
+            );
+        }
+
+        // Discriminating control: a real continuation with NO comment must
+        // still join, or the fix degenerates into "never continue".
+        assert_eq!(
+            split_segments("gh issue create --repo o/r \\\n  --body-file b.md"),
+            vec!["gh issue create --repo o/r   --body-file b.md"]
+        );
     }
 
     #[test]
