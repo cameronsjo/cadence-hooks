@@ -302,13 +302,27 @@ fn xdg_cache_home() -> Option<PathBuf> {
 /// names neither `.claude/` nor a temp root, so `escapes_carveout` would
 /// bless it and this fixture would be created relative to the test binary's
 /// cwd instead of failing loudly.
+///
+/// An empty value is only the *narrowest* spelling of that hazard, though:
+/// any relative value (`XDG_CACHE_HOME=cache`) lands in the same place, for
+/// the same reason. So the rule is absoluteness, not non-emptiness — which is
+/// also what the XDG base-directory spec requires, where a relative value is
+/// to be ignored (#516 review).
+///
+/// Each candidate is filtered on its own rather than the chain being filtered
+/// once at the end: `a.or(b).filter(..)` would validate only whichever arm
+/// won, silently exempting the other. A relative `$XDG_CACHE_HOME` must fall
+/// through to the home-based path, and a non-absolute home must not sneak in
+/// behind it.
 fn xdg_cache_home_from(
     xdg_cache_home_var: Option<String>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    xdg_cache_home_var
+    let from_var = xdg_cache_home_var
         .map(PathBuf::from)
-        .or_else(|| home.map(|h| h.join(".cache")))
+        .filter(|p| p.is_absolute());
+    let from_home = home.map(|h| h.join(".cache")).filter(|p| p.is_absolute());
+    from_var.or(from_home)
 }
 
 impl Drop for Scratch {
@@ -670,13 +684,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(real_target);
     }
 
+    /// An absolute path on EVERY platform.
+    ///
+    /// A `/`-leading literal like `/Users/dev` is absolute on unix but NOT on
+    /// Windows, where `Path::is_absolute` demands a prefix (`C:\`). Since
+    /// `xdg_cache_home_from` now filters on absoluteness, feeding it unix
+    /// literals would make these tests fail on Windows only — the same shape
+    /// that took two CI rounds to find in #507. `temp_dir()` is absolute
+    /// everywhere, and nothing here touches the filesystem.
+    fn abs_for_test(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(tag)
+    }
+
     #[test]
     fn xdg_cache_home_from_prefers_the_env_var() {
+        let custom = abs_for_test("custom-cache-home");
         let dir = xdg_cache_home_from(
-            Some("/custom/cache/home".to_string()),
-            Some(PathBuf::from("/Users/dev")),
+            Some(custom.to_string_lossy().into_owned()),
+            Some(abs_for_test("dev-home")),
         );
-        assert_eq!(dir, Some(PathBuf::from("/custom/cache/home")));
+        assert_eq!(dir, Some(custom));
     }
 
     #[test]
@@ -686,8 +713,55 @@ mod tests {
         // that filtering is `non_empty_var`'s job (tested in `paths.rs`), not
         // this function's; this pins `xdg_cache_home_from`'s OWN composition
         // rule: `None` falls back to `home.join(".cache")`.
-        let dir = xdg_cache_home_from(None, Some(PathBuf::from("/Users/dev")));
-        assert_eq!(dir, Some(PathBuf::from("/Users/dev/.cache")));
+        let home = abs_for_test("dev-home");
+        let dir = xdg_cache_home_from(None, Some(home.clone()));
+        assert_eq!(dir, Some(home.join(".cache")));
+    }
+
+    #[test]
+    fn xdg_cache_home_from_ignores_a_relative_env_value() {
+        // #516 review. `non_empty_var` only strips the EMPTY spelling; a
+        // non-empty relative value (`XDG_CACHE_HOME=cache`) reaches here
+        // intact and would otherwise be taken as-is — resolving against the
+        // test binary's cwd, which is exactly the checkout-relative outcome
+        // this whole fallback exists to avoid. The XDG base-directory spec
+        // says to ignore a relative value; so does this.
+        let home = abs_for_test("dev-home");
+
+        // Positive control: an absolute value of the same shape IS taken, so
+        // the assertion below discriminates on absoluteness rather than
+        // passing for some unrelated reason.
+        let absolute = abs_for_test("cache");
+        assert_eq!(
+            xdg_cache_home_from(
+                Some(absolute.to_string_lossy().into_owned()),
+                Some(home.clone())
+            ),
+            Some(absolute),
+            "positive control: an absolute $XDG_CACHE_HOME is honored"
+        );
+
+        assert_eq!(
+            xdg_cache_home_from(Some("cache".to_string()), Some(home.clone())),
+            Some(home.join(".cache")),
+            "a relative $XDG_CACHE_HOME is ignored, falling through to home"
+        );
+    }
+
+    #[test]
+    fn xdg_cache_home_from_rejects_a_relative_home_too() {
+        // Each candidate is filtered on its own. Filtering the chain once at
+        // the end (`a.or(b).filter(..)`) would validate only the winning arm,
+        // so a relative env value falling through to an equally relative home
+        // would still yield a cwd-relative path. Both must be rejected.
+        let dir = xdg_cache_home_from(
+            Some("cache".to_string()),
+            Some(PathBuf::from("relative-home")),
+        );
+        assert_eq!(
+            dir, None,
+            "neither candidate is absolute, so there is no usable cache root"
+        );
     }
 
     #[test]

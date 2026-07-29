@@ -112,8 +112,9 @@ instead, so the guard's block/allow logic is still exercised for real
 once per test binary (`cargo test --workspace` runs several, each its own
 process), not once per fixture.
 
-If your machine has neither a usable `$XDG_CACHE_HOME` nor `$HOME` (a
-stripped-down sandbox), point fixtures at an explicit directory instead:
+If your machine has neither a usable `$XDG_CACHE_HOME` nor any resolvable home
+directory (a stripped-down sandbox), point fixtures at an explicit directory
+instead:
 
 ```bash
 export CADENCE_HOOKS_TEST_SCRATCH_ROOT=/some/carve-out-free/dir
