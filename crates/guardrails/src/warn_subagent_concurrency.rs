@@ -13,10 +13,18 @@
 //! `SubagentStart` and a matching `SubagentStop`, each carrying `event`,
 //! `agentId`, and `sessionId`. So the live count is the number of distinct
 //! `agentId`s that have a `SubagentStart` record and **no** matching
-//! `SubagentStop`. Records are scoped to the current session by `sessionId`; if
-//! no record matches the current session id (the parent-session stamping is a
-//! platform detail that may not line up), the count falls back to **all** live
-//! agents — the broader, safer estimate.
+//! `SubagentStop`. Records are scoped to the current session by `sessionId`;
+//! when at least one record carries the current session id, only matching
+//! records are considered.
+//!
+//! Two different "no match" cases must NOT collapse into one branch (#512):
+//! when the log is well-formed (some record carries *a* sessionId) but none
+//! carries *this* session's id, that's a real zero — the session just hasn't
+//! spawned anything yet — and the count must report 0, not every other
+//! session's agents. Only when the log carries **no** session-scoping data at
+//! all (empty, garbage, or a schema missing the `sessionId` field entirely) is
+//! the session genuinely unscopable, and the count falls back to **all** live
+//! agents — the broader, safer estimate for that case.
 //!
 //! FAIL-OPEN (ADR-0001): any failure to read or parse the log yields `allow()`.
 //! A missing log, garbage bytes, or an unreadable directory never blocks or
@@ -71,22 +79,63 @@ fn parse_limit(value: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_LIMIT)
 }
 
+/// A single parsed `subagents.jsonl` record: `(event, agentId, sessionId)`.
+type SubagentRecord = (String, String, Option<String>);
+
+/// How a target session resolves against the records in the log (#512).
+///
+/// The critical distinction is between a *real* zero and a genuinely
+/// unscopable log — both look like "nothing matched" to a naive check, but
+/// they demand opposite counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionScope {
+    /// At least one record carries the target session id — scope to those.
+    Matched,
+    /// The log carries session-scoping data (some record has *a* sessionId)
+    /// but none names this session. This session simply has zero rows —
+    /// report 0, not the other sessions' agents.
+    WellFormedNoMatch,
+    /// No record in the log carries any sessionId at all (empty, garbage, or
+    /// a schema missing the field entirely) — there is no scoping data to
+    /// trust. Genuinely unscopable: fall back to counting every live agent.
+    Unscopable,
+}
+
+/// Pure: resolve which [`SessionScope`] applies for `session_id` against
+/// `records`.
+fn resolve_session_scope(records: &[SubagentRecord], session_id: Option<&str>) -> SessionScope {
+    let Some(target) = session_id else {
+        return SessionScope::Unscopable;
+    };
+    let has_any_session_data = records.iter().any(|(_, _, sid)| sid.is_some());
+    if !has_any_session_data {
+        return SessionScope::Unscopable;
+    }
+    if records
+        .iter()
+        .any(|(_, _, sid)| sid.as_deref() == Some(target))
+    {
+        SessionScope::Matched
+    } else {
+        SessionScope::WellFormedNoMatch
+    }
+}
+
 /// Pure: count live subagents in `subagents.jsonl` content.
 ///
 /// A subagent is *live* when its `agentId` has a `SubagentStart` record and no
 /// matching `SubagentStop`. Reconciliation is by `agentId`.
 ///
-/// Session scoping: when `session_id` is `Some` **and** at least one record
-/// carries that `sessionId`, only matching records are considered. When no
-/// record matches (unknown session — the parent-session stamping is a platform
-/// detail that may not align), the count falls back to **all** records — the
-/// broader, safer estimate.
+/// Session scoping is resolved by [`resolve_session_scope`]: a session with
+/// zero rows in an otherwise well-formed log is a real zero, while a log with
+/// no session-scoping data at all falls back to counting every live agent.
+/// See the module-level doc comment for why these must not collapse (#512).
 ///
 /// Malformed or blank lines are skipped individually without panicking; records
 /// are guaranteed single-line JSON.
 fn count_live_subagents(jsonl: &str, session_id: Option<&str>) -> usize {
     // Parse (event, agentId, sessionId) triples from each well-formed line.
-    let records: Vec<(String, String, Option<String>)> = jsonl
+    let records: Vec<SubagentRecord> = jsonl
         .lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -104,17 +153,14 @@ fn count_live_subagents(jsonl: &str, session_id: Option<&str>) -> usize {
         })
         .collect();
 
-    // Session filter with count-all fallback: only narrow to the session when
-    // the log actually contains a record for it.
-    let session_present = session_id.is_some_and(|target| {
-        records
-            .iter()
-            .any(|(_, _, sid)| sid.as_deref() == Some(target))
+    let scope = resolve_session_scope(&records, session_id);
+    let scoped = records.iter().filter(|(_, _, sid)| match scope {
+        SessionScope::Matched => sid.as_deref() == session_id,
+        // Real zero: no rows for this session, but the log had scoping data
+        // to check that against. Nothing to reconcile.
+        SessionScope::WellFormedNoMatch => false,
+        SessionScope::Unscopable => true,
     });
-
-    let scoped = records
-        .iter()
-        .filter(|(_, _, sid)| !session_present || sid.as_deref() == session_id);
 
     // Reconcile Start/Stop by agentId. An agent is live iff it started and has
     // not stopped.
@@ -217,13 +263,56 @@ mod tests {
     }
 
     #[test]
-    fn unknown_session_falls_back_to_count_all() {
-        // No record carries session "sX" → fall back to counting all live agents
-        // across every session (a1 in s1, a2 in s2, both live → 2).
+    fn well_formed_log_with_no_rows_for_this_session_reports_real_zero() {
+        // a1 lives under s1, a2 lives under s2 — both rows carry a sessionId,
+        // so the log is well-formed for scoping purposes. Session "sX" has
+        // zero rows in it.
         let jsonl = "\
 {\"event\":\"SubagentStart\",\"agentId\":\"a1\",\"sessionId\":\"s1\"}
 {\"event\":\"SubagentStart\",\"agentId\":\"a2\",\"sessionId\":\"s2\"}";
-        assert_eq!(count_live_subagents(jsonl, Some("sX")), 2);
+
+        // Positive control: this exact input is capable of producing a
+        // nonzero count when scoping is dropped (session_id: None already
+        // takes the Unscopable/count-all path) — proving the test can
+        // discriminate, not just pass vacuously. This is the number the old,
+        // collapsed fallback would have returned for the unmatched "sX" too.
+        assert_eq!(
+            count_live_subagents(jsonl, None),
+            2,
+            "positive control: 2 agents are live when nothing scopes by session"
+        );
+
+        // Fixed behavior: "sX" is a real, well-formed absence — report 0, not
+        // the other sessions' 2 live agents.
+        assert_eq!(count_live_subagents(jsonl, Some("sX")), 0);
+    }
+
+    #[test]
+    fn schema_missing_session_id_field_is_unscopable_falls_back_to_count_all() {
+        // Both rows parse as valid JSON with event + agentId, but neither
+        // carries a sessionId field at all — there is no scoping data
+        // anywhere in the log to trust, so this is genuinely unscopable.
+        // Falls back to counting every live agent.
+        let jsonl = "\
+{\"event\":\"SubagentStart\",\"agentId\":\"a1\"}
+{\"event\":\"SubagentStart\",\"agentId\":\"a2\"}";
+        assert_eq!(count_live_subagents(jsonl, Some("s")), 2);
+    }
+
+    #[test]
+    fn mixed_valid_and_garbage_lines_trusts_the_valid_rows_scoping() {
+        // a1's row is well-formed with sessionId "other"; the second line is
+        // garbage and never parses into a record at all — it contributes
+        // neither a match nor scoping data. Because at least one *surviving*
+        // record carries a sessionId, the log is judged well-formed, so the
+        // non-matching session is a real zero, not a trigger for count-all.
+        // Safe direction: garbage lines must never launder an over-count back
+        // in by tipping a well-formed file into "unscopable" — they're simply
+        // dropped, same as always, and the rows that DO parse are trusted.
+        let jsonl = "\
+{\"event\":\"SubagentStart\",\"agentId\":\"a1\",\"sessionId\":\"other\"}
+not json at all";
+        assert_eq!(count_live_subagents(jsonl, Some("s")), 0);
     }
 
     #[test]
