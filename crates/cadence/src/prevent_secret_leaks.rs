@@ -310,6 +310,17 @@ fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
 /// and dropping `xargs` from the one shared set closed it here without a
 /// second edit.
 fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
+    // Case-sensitive on purpose, and deliberately NOT folded: real `find`'s
+    // predicates are themselves case-sensitive, so `-EXEC`/`-EXECDIR`/`-OK`/
+    // `-OKDIR` are unknown predicates that make `find` error out before
+    // executing anything, not a differently-spelled exec action. Before
+    // cadence-hooks#508, `tokens` arrived pre-lowered from the caller
+    // (`bash_leaks_secrets` lowercased the whole command upstream), so this
+    // match happened to work on any input case anyway — an incidental
+    // widening with no real-world payoff, since a genuinely uppercase `-EXEC`
+    // never reaches this point through a real shell. Since #508, `tokens`
+    // carries the operand's real case, and this match is what it always
+    // should have been: the same grammar `find` itself enforces.
     const EXEC_FLAGS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
     let action = tokens
         .iter()
@@ -609,14 +620,23 @@ fn peel_env_options<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
         // That letter consumes the rest of its own token as the value, or the
         // next token when it ends the cluster (`-uFOO` vs `-u FOO`).
         //
-        // Matched case-INSENSITIVELY because the caller hands us a fully
-        // lowercased command (`bash_leaks_secrets`), so `-C`/`-P`/`-S` arrive
-        // as `-c`/`-p`/`-s`. Testing the uppercase spelling alone silently
-        // failed to consume the value: `env -C /tmp printenv` peeled to
-        // `[/tmp, printenv]`, read `/tmp` as the verb, and lost a dump warning
-        // the previous leading-word check did catch. `env` has no lowercase
-        // `-c`/`-p`/`-s` option of its own, so accepting both cases collides
-        // with nothing.
+        // Matched case-INSENSITIVELY: `env`'s own flags are case-sensitive to
+        // `env` itself (`-C`/`-P`/`-S` are distinct from a nonexistent
+        // `-c`/`-p`/`-s`), but this function must accept BOTH spellings
+        // because its two callers disagree on what case they hand it.
+        // `command_dumps_env`'s caller still lowercases the whole command
+        // upstream, so `-C`/`-P`/`-S` arrive pre-folded as `-c`/`-p`/`-s`
+        // there. `env_prefix_len`'s caller (`unwrap_command_prefixes`, via
+        // `segment_env_reads`) does NOT — cadence-hooks#508 removed that
+        // upstream lowering to fix a sudo-flag bypass, so THIS arm now sees
+        // the genuinely mixed-case flag the user typed. One shared function
+        // serving both means the fold here is load-bearing for real
+        // mixed-case input, not merely defensive: testing the uppercase
+        // spelling alone would silently fail to consume the value —
+        // `env -C /tmp printenv` peeled to `[/tmp, printenv]`, read `/tmp` as
+        // the verb, and lost a dump warning the previous leading-word check
+        // did catch. `env` has no lowercase `-c`/`-p`/`-s` option of its own,
+        // so accepting both cases collides with nothing.
         match flag
             .char_indices()
             .find(|(_, c)| matches!(c.to_ascii_uppercase(), 'S' | 'U' | 'C' | 'P'))
