@@ -300,11 +300,15 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 ///   shell-wrapper arms; `guard_gh_write::token_is_gh`. Folding widens what
 ///   they find, which only ever ADDS a block, an ask, or a nudge.
 /// - **The one exemption** — `prevent_secret_leaks`' `METADATA_SAFE_COMMANDS`
-///   lookup, reached via that file's `resolve_command`. The fold is a provable
-///   **no-op** there: `bash_leaks_secrets` lowercases the entire command before
-///   any of it runs, so that consumer's input never contains an uppercase byte
-///   for this step to change. Its verdicts are identical before and after,
-///   which `verb_fold_cannot_widen_this_guards_exemption` asserts directly.
+///   lookup, reached via that file's `resolve_command`. `fold_verb` is an
+///   unconditional ASCII lowercase, so it folds identically whether its input
+///   arrived pre-lowered or not — the exemption's WIDTH cannot change either
+///   way, which `verb_fold_cannot_widen_this_guards_exemption` asserts
+///   directly. (Before cadence-hooks#508, `bash_leaks_secrets` additionally
+///   lowercased the whole command upstream of this fold, making the fold a
+///   provable allocation no-op there too — segmenting the un-lowered command
+///   to fix #508's sudo-flag bypass ended that upstream lowering, but the
+///   exemption lookup this fold feeds is unaffected either way.)
 ///
 /// **ASCII-only**, never [`str::to_lowercase`]. Every verb any caller gates on
 /// is ASCII, while Unicode folding maps the dotted-I family and assorted

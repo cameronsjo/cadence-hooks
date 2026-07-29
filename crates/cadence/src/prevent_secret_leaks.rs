@@ -164,13 +164,18 @@ fn env_prefix_len(rest: &[String]) -> Option<usize> {
 /// rides along because the caller that scans operands must scan the SAME
 /// resolved slice the head came from.
 ///
-/// The [`Cow`] is [`command_word`]'s ASCII case fold (cadence-hooks#488), and
-/// in this file it is **always** the borrowed variant: [`bash_leaks_secrets`]
-/// lowercases the whole command before any of this runs, so no uppercase byte
-/// ever reaches the fold. That matters beyond allocation — the head this
-/// resolves feeds [`METADATA_SAFE_COMMANDS`], the one *exemption* lookup among
+/// The [`Cow`] is [`command_word`]'s ASCII case fold (cadence-hooks#488). Since
+/// #508, segments are taken from the ORIGINAL (un-lowered) command, so a
+/// mixed-case head (`SUDO`, `LS`) really does reach this fold and the `Owned`
+/// arm really can fire — unlike before #508, when [`bash_leaks_secrets`]
+/// lowercased the whole command upstream and no uppercase byte ever reached
+/// here. That matters beyond allocation — the head this resolves feeds
+/// [`METADATA_SAFE_COMMANDS`], the one *exemption* lookup among
 /// `command_word`'s consumers, where matching more can only SUBTRACT blocks.
-/// The fold cannot widen it, because there is nothing left here to fold.
+/// `fold_verb` is an unconditional ASCII lowercase, so it folds identically
+/// whether its input arrives pre-lowered or not — the exemption's WIDTH is
+/// unchanged by #508, only the fold's allocation behavior is (see
+/// `verb_fold_cannot_widen_this_guards_exemption`).
 fn resolve_command<'a>(tokens: &'a [String]) -> Option<(Cow<'a, str>, &'a [String])> {
     let argv = unwrap_command_prefixes(tokens);
     Some((command_word(argv.first()?), argv))
@@ -659,11 +664,13 @@ fn command_changes_directory(lower: &str) -> bool {
 /// arms already resolve a pure direnv loader `.envrc` via [`envrc_read_allowed`];
 /// this mirrors that for a `.envrc` operand caught by [`segment_env_reads`].
 ///
-/// `resolve_token` is the operand in its ORIGINAL case (see
-/// [`original_case_token_at`]) — needed because the disk path may traverse
-/// mixed-case directories (`/Users/...`, a tempdir), and [`bash_leaks_secrets`]
-/// classifies against a fully-lowercased copy of the command. Only the final
-/// path component is compared against `.envrc` (case-insensitively). A relative
+/// `resolve_token` is the operand in its ORIGINAL case — [`segment_env_reads`]
+/// hands it back exactly as it appears in `command`, since #508 segments the
+/// UN-lowered command rather than a lowercased copy. That matters because the
+/// disk path may traverse mixed-case directories (`/Users/...`, a tempdir), and
+/// a case-insensitive filesystem would otherwise mask the wrong file being
+/// opened. Only the final path component is compared against `.envrc`
+/// (case-insensitively). A relative
 /// token resolves against `cwd`; an absolute token is used as-is (and is
 /// immune to `command_has_cd` — an absolute path's resolution never depends on
 /// the shell's working directory). Fails CLOSED (returns `false`, keeping the
@@ -695,50 +702,6 @@ fn envrc_bash_read_allowed(resolve_token: &str, cwd: Option<&str>, command_has_c
     };
 
     envrc_carveout_allows(".envrc", std::fs::read_to_string(&resolved).ok().as_deref())
-}
-
-/// Recover the original-case substring of `command` that a lowercased `token`
-/// (found within `lower`, `command`'s lowercased copy) corresponds to,
-/// searching from `search_from` rather than always the first occurrence.
-///
-/// [`bash_leaks_secrets`] classifies against a fully-lowercased command, but a
-/// disk read must use the real path — a mixed-case directory component
-/// (`/Users/...`, a tempdir) would otherwise fail to resolve on a
-/// case-sensitive filesystem.
-///
-/// The `search_from` cursor is load-bearing on a case-sensitive filesystem
-/// (Linux; not this repo's default macOS APFS, which collapses case
-/// variants): `cat .envrc .ENVRC` are two DISTINCT files there, but both
-/// lowercase to `.envrc` in `lower`. A first-occurrence-always lookup would
-/// recover the LOADER `.envrc` for both operands — reading the loader twice
-/// and clearing the carve-out for the secret `.ENVRC`, which is never
-/// examined. The caller threads a monotonic cursor across every operand in
-/// COMMAND ORDER (see call site), so the Nth lowercased-`.envrc` operand
-/// recovers the Nth actual occurrence.
-///
-/// Returns `None` — the caller MUST treat this as fail-closed (block), never
-/// fall back to the lowercased `token`, since reading it could hit the wrong
-/// file on a case-sensitive filesystem — when: `command` and `lower` diverge
-/// in byte length (non-ASCII lowering breaks the position-preserving
-/// assumption), or `token` cannot be found starting from `search_from`
-/// (including a wrapper-expanded segment whose extracted text doesn't appear
-/// in order — a rare over-block, never a leak). On success, also returns the
-/// cursor (the match's end offset) for the next call.
-fn original_case_token_at(
-    command: &str,
-    lower: &str,
-    token: &str,
-    search_from: usize,
-) -> Option<(String, usize)> {
-    if command.len() != lower.len() {
-        return None;
-    }
-    let haystack = lower.get(search_from..)?;
-    let rel_start = haystack.find(token)?;
-    let start = search_from + rel_start;
-    let end = start + token.len();
-    let original = command.get(start..end)?;
-    Some((original.to_string(), end))
 }
 
 /// Does an `echo`/`printf` segment expand a secret-shaped variable?
@@ -786,30 +749,38 @@ fn bash_leaks_secrets(command: &str, cwd: Option<&str>) -> Option<CheckResult> {
         // segment, since the shell's real cwd at read time can no longer be
         // trusted to equal `input.cwd`.
         let command_has_cd = command_changes_directory(&lower);
-        // Threaded across every operand in COMMAND ORDER (see
-        // original_case_token_at): recovers the Nth occurrence of a
-        // lowercased operand as the Nth actual occurrence, so two
-        // case-distinct files that collapse to the same lowercased token
-        // (`.envrc` / `.ENVRC` on a case-sensitive filesystem) resolve to
-        // their own real files rather than both reading the first one.
-        let mut search_from = 0usize;
-        for segment in command_segments(&lower) {
+        // #508: segmented from the ORIGINAL `command`, NOT `lower`.
+        // `command_segments`'s sudo-flag peel (`skip_sudo_no_argument_flags`)
+        // matches `SUDO_NO_ARGUMENT_SHORT_FLAGS` case-SENSITIVELY, on
+        // purpose — sudo's own grammar is case-load-bearing (`-P` takes no
+        // argument, `-p` takes a prompt string), so folding past the verb
+        // cannot represent that distinction (#503 already forbids widening
+        // that constant into a case-fold). Segmenting a pre-lowered command
+        // therefore folded `-A`/`-E`/`-H`/`-P` to `-a`/`-e`/`-h`/`-p`, none of
+        // which are in that allowlist, so the peel refused and
+        // `sudo -E bash -c 'cat .env'` never got its `bash -c` wrapper
+        // expanded into a segment this guard could see — five other guards
+        // caught it while this one alone read the unexpanded outer line.
+        // `-S` survived only by coincidence (it folds to `-s`, a distinct,
+        // also-argument-free allowlist member). This mirrors what the sibling
+        // `prevent_secret_writes::bash_targets_env_file` already does: `lower`
+        // still backs `command_may_reference_secret` and
+        // `command_changes_directory` above, and every downstream comparison
+        // that needs case-insensitivity (`command_word`'s verb fold,
+        // `is_dangerous_secret_token`, `METADATA_SAFE_COMMANDS`) folds at its
+        // own comparison site rather than depending on pre-lowered input.
+        for segment in command_segments(command) {
             // #307: a segment can carry MULTIPLE dangerous operands (`cat .envrc
             // .env`) — the carve-out below only `continue`s past an INDIVIDUAL
             // proven pure-loader `.envrc`; any other dangerous operand in the
             // same segment still falls through to the block below, exactly as
             // it did before the #193 carve-out existed.
             for (cmd_word, token) in segment_env_reads(&segment) {
-                let allowed = match original_case_token_at(command, &lower, &token, search_from) {
-                    Some((resolve_token, next_cursor)) => {
-                        search_from = next_cursor;
-                        envrc_bash_read_allowed(&resolve_token, cwd, command_has_cd)
-                    }
-                    // Fail closed: recovery couldn't prove which file this
-                    // operand names, so the carve-out must not fire.
-                    None => false,
-                };
-                if allowed {
+                // `token` is already the real, original-case substring of
+                // `command` — it was tokenized from an un-lowered segment —
+                // so it resolves the `.envrc` carve-out directly. No
+                // case-recovery step is needed (or correct) here anymore.
+                if envrc_bash_read_allowed(&token, cwd, command_has_cd) {
                     continue;
                 }
                 return Some(CheckResult::block(format!(
@@ -1033,15 +1004,22 @@ mod tests {
     fn verb_fold_cannot_widen_this_guards_exemption() {
         // This file is the ONE consumer of `core::shell::command_word` whose
         // lookup is an EXEMPTION (`METADATA_SAFE_COMMANDS`), where matching
-        // MORE can only SUBTRACT blocks. The verb fold added for #488 is a
-        // provable no-op here because `bash_leaks_secrets` already lowercases
-        // the whole command before any of this runs — so the exemption was
-        // already case-folded and the fold cannot widen it further.
+        // MORE can only SUBTRACT blocks. Before cadence-hooks#508,
+        // `bash_leaks_secrets` lowercased the whole command upstream of
+        // segmenting, so the verb fold added for #488 was a provable
+        // allocation no-op here — the exemption was already case-folded by
+        // the upstream lowercase, and this test was the tripwire named to
+        // fail the day that lowercase was removed.
         //
-        // These assertions therefore hold IDENTICALLY before and after the
-        // fold. That is the point: they are the tripwire that fails the day
-        // the upstream lowercase is removed or the fold starts reaching an
-        // exemption it did not before.
+        // #508 removed exactly that upstream lowercase (segmenting it hid a
+        // sudo-flag bypass, since `command_segments`'s flag-peel is
+        // deliberately case-sensitive) — the tripwire's named day arrived.
+        // These assertions still hold, for a different reason than before:
+        // `fold_verb` is an unconditional ASCII lowercase that folds
+        // identically whether its input is pre-lowered or genuinely
+        // mixed-case, so the exemption's WIDTH is unchanged either way. What
+        // changed is only which arm of the `Cow` fires (see
+        // [`resolve_command`]'s doc comment) — never the verdict.
         use cadence_hooks_core::Outcome;
         // Exempt, both cases — already true pre-fold.
         for cmd in ["ls .env", "LS .env", "git add .env", "GIT add .env"] {
@@ -1087,6 +1065,89 @@ mod tests {
                 .outcome,
             Outcome::Allow
         );
+    }
+
+    // ---------------------------------------------------------------
+    // #508: this file lowercased the WHOLE command before segmenting it
+    // (`command_segments(&lower)`), so `core::shell`'s sudo-flag peel
+    // (`skip_sudo_no_argument_flags`, matched against `SUDO_NO_ARGUMENT_
+    // SHORT_FLAGS = "AbEHiknPSs"` case-SENSITIVELY, on purpose — sudo's own
+    // grammar is case-load-bearing, `-P` takes no argument while `-p` takes a
+    // prompt string) never saw the flags the user actually typed. `-A` → `-a`,
+    // `-E` → `-e`, `-H` → `-h`, `-P` → `-p` are all ABSENT from that allowlist,
+    // so the peel refused, `command_segments` never expanded the `bash -c`
+    // wrapper, and the inner `cat .env` never became its own segment — this
+    // guard alone saw only the unexpanded outer line, whose single
+    // whitespace-bearing `-c` argument the false-positive firewall in
+    // `segment_env_reads` skips by design. `-S` → `-s` happens to survive:
+    // lowercase `s` is a SEPARATE, coincidentally-also-no-argument member of
+    // the same allowlist.
+    //
+    // Each of the four is a genuine positive control, not an assertion of
+    // convenience: run against this file before the #508 fix (segmenting the
+    // ORIGINAL command, matching `prevent_secret_writes::bash_targets_env_file`),
+    // every one of these four came back Allow — the bypass this test module
+    // now pins shut. `-S` is included as the coincidental-survivor control:
+    // it must have blocked before the fix and must keep blocking after.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn sudo_capital_a_bash_c_cat_env_now_blocks() {
+        // Pre-#508: Allow (the `-A`→`-a` fold left `-a` unrecognized, so the
+        // `bash -c` wrapper never expanded and the inner `cat .env` was
+        // invisible to this guard).
+        let result = SecretLeaksGuard.run(&make_bash_input("sudo -A bash -c 'cat .env'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn sudo_capital_e_bash_c_cat_env_now_blocks() {
+        // Pre-#508: Allow — the exact bypass named in the issue.
+        let result = SecretLeaksGuard.run(&make_bash_input("sudo -E bash -c 'cat .env'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn sudo_capital_h_bash_c_cat_env_now_blocks() {
+        // Pre-#508: Allow, same mechanism as `-A`/`-E`.
+        let result = SecretLeaksGuard.run(&make_bash_input("sudo -H bash -c 'cat .env'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn sudo_capital_p_bash_c_cat_env_now_blocks() {
+        // Pre-#508: Allow, same mechanism as `-A`/`-E`/`-H`.
+        let result = SecretLeaksGuard.run(&make_bash_input("sudo -P bash -c 'cat .env'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn sudo_capital_s_bash_c_cat_env_still_blocks() {
+        // `-S` folded to `-s` even before #508, and lowercase `s` is its own
+        // allowlist member (`--shell`) — coincidentally also argument-free —
+        // so this one blocked before the fix too. Kept as the control that
+        // discriminates the four real bypasses above from a flag that was
+        // never actually broken.
+        let result = SecretLeaksGuard.run(&make_bash_input("sudo -S bash -c 'cat .env'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn env_chdir_flag_exemption_survives_segment_before_fold() {
+        // The missing NARROWING direction: #508 fixes the bypass by
+        // segmenting the ORIGINAL (un-lowered) command, which means the
+        // exemption lookup (`METADATA_SAFE_COMMANDS`, reached through
+        // `unwrap_command_prefixes`'s local `env` peel) now runs against real
+        // mixed-case input for the first time — before #508 it only ever saw
+        // an already-lowered segment. `peel_env_options`'s short-flag match
+        // was WRITTEN to be case-insensitive for exactly this reason (its own
+        // doc comment says so), but that path was never exercised with
+        // genuinely un-lowered text until now. This pins that an env-wrapped
+        // exemption (`ENV -C /tmp LS .env` — chdir via env, then the
+        // metadata-safe `ls`) still resolves to Allow, so the fix does not
+        // silently narrow the exemption it must not touch either direction.
+        let result = SecretLeaksGuard.run(&make_bash_input("ENV -C /tmp LS .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     fn make_grep_input(path: &str) -> HookInput {
@@ -2956,13 +3017,15 @@ mod tests {
     // ---------------------------------------------------------------
     // Case-sensitive filesystem: `.envrc` and `.ENVRC` are two DISTINCT files
     // there (Linux; not this repo's default macOS APFS, which collapses case
-    // variants onto one inode). `bash_leaks_secrets` lowercases the whole
-    // command before classifying, so both operands become the lowercased
-    // token `.envrc` — recovering original case at the FIRST occurrence
-    // (the old `original_case_token`) resolved BOTH operands to the loader
-    // file, clearing the carve-out for a secret-bearing `.ENVRC` that was
-    // never actually read. `original_case_token_at`'s monotonic cursor fixes
-    // this by recovering the Nth occurrence for the Nth operand.
+    // variants onto one inode). Since #508, `bash_leaks_secrets` segments the
+    // ORIGINAL (un-lowered) command, so `segment_env_reads` hands back each
+    // operand in its real case directly — `.envrc` and `.ENVRC` resolve to
+    // their own real files with no recovery step needed. (Before #508,
+    // segments came from a fully-lowercased command, so both operands
+    // collapsed to the same token `.envrc`; a since-removed recovery function,
+    // `original_case_token_at`, threaded a monotonic cursor to recover the Nth
+    // occurrence for the Nth operand — necessary only because segmenting ran
+    // on the lowered copy in the first place.)
     //
     // These tests are meaningless on a filesystem that collapses the two
     // names (macOS APFS default), so they self-skip via a same-tempdir probe
