@@ -21,8 +21,8 @@ use crate::worktree::{is_claude_managed_dir, path_under_temp_root_with_canonical
 use std::path::{Path, PathBuf};
 
 /// Env var overriding [`resolve_scratch_dir`]'s fallback root, for the rare
-/// case where neither the caller's default nor `$CARGO_HOME`/`$HOME/.cargo`
-/// escapes a carve-out (e.g. a sandboxed runner with `$CARGO_HOME` itself
+/// case where neither the caller's default nor `$XDG_CACHE_HOME`/`$HOME/.cache`
+/// escapes a carve-out (e.g. a sandboxed runner with `$XDG_CACHE_HOME` itself
 /// under `/tmp`). Unset in the overwhelming common case. `pub(crate)`, not
 /// `pub` — no caller outside this crate needs the Rust constant; the env var
 /// itself is a shell-level contract (documented in `CONTRIBUTING.md`), set
@@ -66,16 +66,16 @@ impl Scratch {
         );
         let dir = resolve_scratch_dir(root, tag);
         let _ = std::fs::remove_dir_all(&dir);
-        // `escapes_carveout` is purely lexical — it blesses `$CARGO_HOME`
+        // `escapes_carveout` is purely lexical — it blesses `$XDG_CACHE_HOME`
         // (or the override) without checking it's writable. On a read-only
-        // or vendored cargo home this create would fail — name the escape
+        // or vendored cache home this create would fail — name the escape
         // hatch in the message rather than dying with a bare `Os { code: 30,
         // ReadOnlyFilesystem }` that never points at the fix (cadence-hooks#403
         // code review).
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
             panic!(
                 "failed to create fixture dir {}: {e} — if this is under \
-                 $CARGO_HOME/$HOME/.cargo and it's read-only or vendored, set \
+                 $XDG_CACHE_HOME/$HOME/.cache and it's read-only or vendored, set \
                  {SCRATCH_ROOT_OVERRIDE_ENV} to a writable, carve-out-free directory",
                 dir.display()
             )
@@ -100,7 +100,7 @@ pub(crate) fn resolve_scratch_dir(root: &Path, tag: &str) -> PathBuf {
         tag,
         std::env::var("TMPDIR").ok().as_deref(),
         override_root.as_deref(),
-        cargo_home().as_deref(),
+        xdg_cache_home().as_deref(),
     )
 }
 
@@ -117,9 +117,15 @@ pub(crate) fn resolve_scratch_dir(root: &Path, tag: &str) -> PathBuf {
 /// convention; cadence-hooks#403), `root` is under that same carve-out and no
 /// subdirectory of it can escape. In that case, fall back to a location
 /// outside the checkout entirely: `override_root`
-/// ([`SCRATCH_ROOT_OVERRIDE_ENV`]) if given, else `cargo_home`
-/// (`$CARGO_HOME`/`$HOME/.cargo`) — both of which exist on any machine that
-/// can run `cargo test` at all, and neither of which is checkout-relative.
+/// ([`SCRATCH_ROOT_OVERRIDE_ENV`]) if given, else `xdg_cache_home`
+/// (`$XDG_CACHE_HOME`/`$HOME/.cache`) — both of which exist on any machine
+/// that can run `cargo test` at all, and neither of which is
+/// checkout-relative. `$XDG_CACHE_HOME` over `$CARGO_HOME`
+/// (cadence-hooks#505): this data is disposable cache, not a cargo artifact,
+/// and a `$CARGO_HOME`-rooted path is never swept by `cargo clean` while
+/// `Scratch`'s `Drop` only reclaims the `{tag}-{pid}` leaf — the namespace
+/// parent accumulated forever. `$XDG_CACHE_HOME` is purpose-fit for
+/// disposable data and gets swept by normal cache conventions instead.
 /// Panics only if none of these escape the carve-out, which should never
 /// happen outside a deliberately broken environment.
 ///
@@ -130,7 +136,7 @@ fn resolve_scratch_dir_with(
     tag: &str,
     tmpdir: Option<&str>,
     override_root: Option<&Path>,
-    cargo_home: Option<&Path>,
+    xdg_cache_home: Option<&Path>,
 ) -> PathBuf {
     // `$TMPDIR` is invariant for the process — canonicalize once (a real
     // `realpath` syscall chain) and reuse it across all three candidates,
@@ -191,21 +197,27 @@ fn resolve_scratch_dir_with(
         return dir;
     }
 
-    if let Some(cargo_home) = cargo_home {
+    if let Some(xdg_cache_home) = xdg_cache_home {
+        // `cadence-hooks/test-scratch`: a proper XDG-style app subdirectory
+        // (`$XDG_CACHE_HOME/cadence-hooks/…`), not the old flat
+        // `cadence-hooks-test-scratch` hyphenation — leaves room for other
+        // cadence-hooks cache data to live alongside this without a naming
+        // collision.
         let dir = candidate(
-            &cargo_home
-                .join("cadence-hooks-test-scratch")
+            &xdg_cache_home
+                .join("cadence-hooks")
+                .join("test-scratch")
                 .join(&namespace),
         );
         if escapes_carveout(&dir) {
-            note_relocation_once(&format!("to $CARGO_HOME: {}", dir.display()));
+            note_relocation_once(&format!("to $XDG_CACHE_HOME: {}", dir.display()));
             return dir;
         }
     }
 
     panic!(
         "fixture root sits under a carve-out (.claude/ or temp), and no carve-out-free \
-         fallback was found ($CARGO_HOME/$HOME/.cargo also under one) — the checkout itself \
+         fallback was found ($XDG_CACHE_HOME/$HOME/.cache also under one) — the checkout itself \
          likely lives under a temp root (cadence-hooks#403): {}\n\
          Set ${SCRATCH_ROOT_OVERRIDE_ENV} to a carve-out-free directory to run the suite \
          from here.",
@@ -260,40 +272,43 @@ fn note_relocation_once(detail: &str) {
     });
 }
 
-/// `$CARGO_HOME`, falling back to the user's home directory joined with
-/// `.cargo` — both stable, checkout-independent locations that exist on any
+/// `$XDG_CACHE_HOME`, falling back to the user's home directory joined with
+/// `.cache` — both stable, checkout-independent locations that exist on any
 /// machine able to run `cargo test`. Reads real process env; see
-/// [`cargo_home_from`] for the injectable decision this wraps.
+/// [`xdg_cache_home_from`] for the injectable decision this wraps.
 ///
 /// Routes the fallback through [`crate::paths::user_home`] rather than
-/// reading `$HOME` directly (cadence-hooks#403 code review): `$HOME` is
-/// unix-only, and `CONTRIBUTING.md` documents Windows support, where a
-/// contributor has no `$HOME` at all — `user_home` already carries the
-/// `$USERPROFILE`/`$HOMEDRIVE`+`$HOMEPATH` chain.
-fn cargo_home() -> Option<PathBuf> {
-    cargo_home_from(
-        crate::paths::non_empty_var("CARGO_HOME"),
+/// reading `$HOME` directly (cadence-hooks#403 code review, carried forward
+/// in #505): `$HOME` is unix-only, and `CONTRIBUTING.md` documents Windows
+/// support, where a contributor has no `$HOME` at all — `user_home` already
+/// carries the `$USERPROFILE`/`$HOMEDRIVE`+`$HOMEPATH` chain.
+fn xdg_cache_home() -> Option<PathBuf> {
+    xdg_cache_home_from(
+        crate::paths::non_empty_var("XDG_CACHE_HOME"),
         crate::paths::user_home(),
     )
 }
 
-/// `cargo_home`'s decision, with `$CARGO_HOME` and the resolved home
-/// directory passed in rather than read live — so the empty-`$CARGO_HOME`
+/// `xdg_cache_home`'s decision, with `$XDG_CACHE_HOME` and the resolved home
+/// directory passed in rather than read live — so the empty-`$XDG_CACHE_HOME`
 /// rule is pinnable without mutating real process env (cadence-hooks#403
 /// code review: the rule was documented at length but had no test, and
 /// couldn't get one against the live-env version).
 ///
-/// `cargo_home_var` comes from [`crate::paths::non_empty_var`], which
+/// `xdg_cache_home_var` comes from [`crate::paths::non_empty_var`], which
 /// already treats an empty-but-set var as unset — without that,
-/// `CARGO_HOME=""` would make `PathBuf::from("")`, and `.join(".cargo")` on
-/// it resolves the *relative* path `.cargo`, which names neither `.claude/`
-/// nor a temp root, so `escapes_carveout` would bless it and this fixture
-/// would be created relative to the test binary's cwd instead of failing
-/// loudly.
-fn cargo_home_from(cargo_home_var: Option<String>, home: Option<PathBuf>) -> Option<PathBuf> {
-    cargo_home_var
+/// `XDG_CACHE_HOME=""` would make `PathBuf::from("")`, and joining
+/// `cadence-hooks/test-scratch` onto it resolves that *relative* path, which
+/// names neither `.claude/` nor a temp root, so `escapes_carveout` would
+/// bless it and this fixture would be created relative to the test binary's
+/// cwd instead of failing loudly.
+fn xdg_cache_home_from(
+    xdg_cache_home_var: Option<String>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    xdg_cache_home_var
         .map(PathBuf::from)
-        .or_else(|| home.map(|h| h.join(".cargo")))
+        .or_else(|| home.map(|h| h.join(".cache")))
 }
 
 impl Drop for Scratch {
@@ -366,7 +381,7 @@ mod tests {
         // pinned hermetically by the `resolve_*` tests below, against
         // `resolve_scratch_dir_with` directly — not here, and not by
         // constructing a real `Scratch` against a hardcoded carve-out root
-        // (that would relocate into this machine's REAL `$CARGO_HOME` on
+        // (that would relocate into this machine's REAL `$XDG_CACHE_HOME` on
         // every run, carve-out or not; see the comment above the
         // `resolve_*` tests). This test only pins what's true regardless of
         // which root wins: a real directory, named `{tag}-{pid}`.
@@ -444,7 +459,7 @@ mod tests {
     // reporting confusing failures.
     //
     // The fallback-chain branches (default escapes, override wins,
-    // `$CARGO_HOME` fallback, the final panic) are pinned against
+    // `$XDG_CACHE_HOME` fallback, the final panic) are pinned against
     // `resolve_scratch_dir_with` directly, with every env input passed as a
     // plain argument — NOT via a real `Scratch::new` call against a
     // hardcoded carve-out root. Two hazards rule that out: (1) `cargo test`
@@ -456,9 +471,11 @@ mod tests {
     // relocates on EVERY run, not just when the ambient checkout is actually
     // under one — which means every plain `cargo test` (not just a `/tmp`
     // worktree run) would create-then-partially-clean a directory under this
-    // machine's REAL `$CARGO_HOME` (`Drop` only removes the `{tag}-{pid}`
-    // leaf, so the `cadence-hooks-test-scratch` parent accumulates forever).
-    // Verified on this machine: it did (cadence-hooks#403 code review).
+    // machine's REAL `$XDG_CACHE_HOME` (`Drop` only removes the `{tag}-{pid}`
+    // leaf, so the `cadence-hooks/test-scratch` parent accumulates forever).
+    // Verified on this machine: it did (cadence-hooks#403 code review; the
+    // root moved from `$CARGO_HOME` to `$XDG_CACHE_HOME` in #505, but the
+    // same accumulation hazard applies to whichever root is live).
     //
     // The "this candidate must look carved-out" tests below anchor on
     // `std::env::temp_dir()`, not a hardcoded `/tmp/...` literal — a Unix
@@ -503,47 +520,47 @@ mod tests {
             &temp_carveout_root("override-wins"),
             "tag",
             Some(&tmpdir),
-            Some(Path::new("/Users/dev/.cargo/cadence-hooks-test-scratch")),
-            Some(Path::new("/Users/dev/.cargo/should-not-be-used")),
+            Some(Path::new("/Users/dev/.cache/cadence-hooks/test-scratch")),
+            Some(Path::new("/Users/dev/.cache/should-not-be-used")),
         );
         assert!(
-            dir.starts_with("/Users/dev/.cargo/cadence-hooks-test-scratch"),
-            "override must be tried before the $CARGO_HOME fallback: {}",
+            dir.starts_with("/Users/dev/.cache/cadence-hooks/test-scratch"),
+            "override must be tried before the $XDG_CACHE_HOME fallback: {}",
             dir.display()
         );
     }
 
     #[test]
-    fn resolve_falls_back_to_cargo_home_when_default_is_temp_and_no_override() {
+    fn resolve_falls_back_to_xdg_cache_home_when_default_is_temp_and_no_override() {
         let tmpdir = temp_carveout_tmpdir();
         let dir = resolve_scratch_dir_with(
-            &temp_carveout_root("cargo-home-fallback"),
+            &temp_carveout_root("xdg-cache-home-fallback"),
             "tag",
             Some(&tmpdir),
             None,
-            Some(Path::new("/Users/dev/.cargo")),
+            Some(Path::new("/Users/dev/.cache")),
         );
-        assert!(dir.starts_with("/Users/dev/.cargo/cadence-hooks-test-scratch"));
+        assert!(dir.starts_with("/Users/dev/.cache/cadence-hooks/test-scratch"));
     }
 
     #[test]
-    fn resolve_falls_back_to_cargo_home_when_default_is_claude_managed() {
+    fn resolve_falls_back_to_xdg_cache_home_when_default_is_claude_managed() {
         let dir = resolve_scratch_dir_with(
             Path::new("/Users/dev/checkout/.claude/scratch"),
             "tag",
             None,
             None,
-            Some(Path::new("/Users/dev/.cargo")),
+            Some(Path::new("/Users/dev/.cache")),
         );
         // `!is_claude_managed_dir(&dir)` alone would pass for ANY non-`.claude`
         // result, including a wrong branch that happened to land somewhere
-        // else entirely — it can't distinguish "took the $CARGO_HOME
+        // else entirely — it can't distinguish "took the $XDG_CACHE_HOME
         // fallback" from "went somewhere unrelated" (cadence-hooks#403 code
         // review). Mirror the sibling temp-root test's `starts_with` so this
         // actually pins the branch under test.
         assert!(
-            dir.starts_with("/Users/dev/.cargo/cadence-hooks-test-scratch"),
-            "must take the $CARGO_HOME fallback, not just land somewhere non-.claude: {}",
+            dir.starts_with("/Users/dev/.cache/cadence-hooks/test-scratch"),
+            "must take the $XDG_CACHE_HOME fallback, not just land somewhere non-.claude: {}",
             dir.display()
         );
         assert!(!is_claude_managed_dir(&dir));
@@ -578,20 +595,20 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "carve-out")]
-    fn resolve_panics_when_cargo_home_itself_is_carved_out_and_no_override() {
-        // A gap in the earlier fallback-chain tests: none of them passed a
-        // `cargo_home` that is ITSELF under a carve-out (as opposed to
+    fn resolve_panics_when_xdg_cache_home_itself_is_carved_out_and_no_override() {
+        // A gap in the earlier fallback-chain tests: none of them passed an
+        // `xdg_cache_home` that is ITSELF under a carve-out (as opposed to
         // `None`) — so the "nothing escapes" panic path was pinned only for
-        // a missing `$CARGO_HOME`, not a carved-out one. Both must panic;
+        // a missing `$XDG_CACHE_HOME`, not a carved-out one. Both must panic;
         // this exercises the other branch (cadence-hooks#403 code review).
         let tmpdir = temp_carveout_tmpdir();
-        let carved_out_cargo_home = temp_carveout_root("carved-out-cargo-home");
+        let carved_out_xdg_cache_home = temp_carveout_root("carved-out-xdg-cache-home");
         let _ = resolve_scratch_dir_with(
             &temp_carveout_root("default"),
             "tag",
             Some(&tmpdir),
             None,
-            Some(&carved_out_cargo_home),
+            Some(&carved_out_xdg_cache_home),
         );
     }
 
@@ -617,10 +634,11 @@ mod tests {
         // won't do, since it's checkout-relative and would itself be under
         // `/tmp` when this suite runs from a `/tmp` worktree (exactly the
         // scenario this fix targets), which would make the sanity assertion
-        // below fail for the wrong reason. `cargo_home()` is the one location
-        // this module already treats as reliably outside every carve-out.
-        let symlink_parent = cargo_home()
-            .expect("test environment must have $CARGO_HOME or a resolvable home directory")
+        // below fail for the wrong reason. `xdg_cache_home()` is the one
+        // location this module already treats as reliably outside every
+        // carve-out.
+        let symlink_parent = xdg_cache_home()
+            .expect("test environment must have $XDG_CACHE_HOME or a resolvable home directory")
             .join("git-fixtures-symlink-check");
         std::fs::create_dir_all(&symlink_parent).unwrap();
         let symlink_root = symlink_parent.join("symlink-checkout-check");
@@ -638,11 +656,11 @@ mod tests {
             "symlink-check",
             None,
             None,
-            Some(Path::new("/Users/dev/.cargo")),
+            Some(Path::new("/Users/dev/.cache")),
         );
         assert!(
-            dir.starts_with("/Users/dev/.cargo/cadence-hooks-test-scratch"),
-            "must relocate via the $CARGO_HOME fallback — the symlink resolves under /tmp \
+            dir.starts_with("/Users/dev/.cache/cadence-hooks/test-scratch"),
+            "must relocate via the $XDG_CACHE_HOME fallback — the symlink resolves under /tmp \
              even though its literal path doesn't: {}",
             dir.display()
         );
@@ -653,28 +671,28 @@ mod tests {
     }
 
     #[test]
-    fn cargo_home_from_prefers_the_env_var() {
-        let dir = cargo_home_from(
-            Some("/custom/cargo/home".to_string()),
+    fn xdg_cache_home_from_prefers_the_env_var() {
+        let dir = xdg_cache_home_from(
+            Some("/custom/cache/home".to_string()),
             Some(PathBuf::from("/Users/dev")),
         );
-        assert_eq!(dir, Some(PathBuf::from("/custom/cargo/home")));
+        assert_eq!(dir, Some(PathBuf::from("/custom/cache/home")));
     }
 
     #[test]
-    fn cargo_home_from_falls_back_to_home_when_env_var_is_none() {
-        // `None` here simulates `non_empty_var("CARGO_HOME")` having already
-        // turned an empty-but-set `$CARGO_HOME=""` into `None` — that
-        // filtering is `non_empty_var`'s job (tested in `paths.rs`), not
-        // this function's; this pins `cargo_home_from`'s OWN composition
-        // rule: `None` falls back to `home.join(".cargo")`.
-        let dir = cargo_home_from(None, Some(PathBuf::from("/Users/dev")));
-        assert_eq!(dir, Some(PathBuf::from("/Users/dev/.cargo")));
+    fn xdg_cache_home_from_falls_back_to_home_when_env_var_is_none() {
+        // `None` here simulates `non_empty_var("XDG_CACHE_HOME")` having
+        // already turned an empty-but-set `$XDG_CACHE_HOME=""` into `None` —
+        // that filtering is `non_empty_var`'s job (tested in `paths.rs`), not
+        // this function's; this pins `xdg_cache_home_from`'s OWN composition
+        // rule: `None` falls back to `home.join(".cache")`.
+        let dir = xdg_cache_home_from(None, Some(PathBuf::from("/Users/dev")));
+        assert_eq!(dir, Some(PathBuf::from("/Users/dev/.cache")));
     }
 
     #[test]
-    fn cargo_home_from_is_none_when_neither_is_available() {
-        let dir = cargo_home_from(None, None);
+    fn xdg_cache_home_from_is_none_when_neither_is_available() {
+        let dir = xdg_cache_home_from(None, None);
         assert_eq!(dir, None);
     }
 

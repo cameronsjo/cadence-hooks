@@ -75,9 +75,10 @@ pub fn marker_temp_dir() -> PathBuf {
 
 /// Read an environment variable, treating empty as unset.
 ///
-/// `pub(crate)`, not private: [`crate::git_fixtures::cargo_home`] reuses this
-/// for the identical empty-`$CARGO_HOME`-is-unset rule rather than
-/// hand-rolling it a second time (cadence-hooks#403 code review).
+/// `pub(crate)`, not private: [`crate::git_fixtures`]'s `xdg_cache_home`
+/// (née `cargo_home`, cadence-hooks#505) reuses this for the identical
+/// empty-var-is-unset rule rather than hand-rolling it a second time
+/// (cadence-hooks#403 code review).
 pub(crate) fn non_empty_var(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }

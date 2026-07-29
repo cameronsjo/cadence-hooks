@@ -106,14 +106,14 @@ diagnostics that have no value on trivial sessions.
 worktree docs recommend) works fine for `cargo test --workspace`: fixture
 directories that would otherwise land under the checkout's own `target/` —
 itself under `/tmp` in that layout, which `enforce-worktree`'s carve-out
-exempts — automatically relocate to `$CARGO_HOME` (or `$HOME/.cargo`) instead,
-so the guard's block/allow logic is still exercised for real
+exempts — automatically relocate to `$XDG_CACHE_HOME` (or `$HOME/.cache`)
+instead, so the guard's block/allow logic is still exercised for real
 (cadence-hooks#403). A one-line `note:` on stderr says when this happens —
 once per test binary (`cargo test --workspace` runs several, each its own
 process), not once per fixture.
 
-If your machine has neither a usable `$CARGO_HOME` nor `$HOME` (a stripped-down
-sandbox), point fixtures at an explicit directory instead:
+If your machine has neither a usable `$XDG_CACHE_HOME` nor `$HOME` (a
+stripped-down sandbox), point fixtures at an explicit directory instead:
 
 ```bash
 export CADENCE_HOOKS_TEST_SCRATCH_ROOT=/some/carve-out-free/dir
