@@ -1,7 +1,7 @@
 ---
 name: guard-design-decisions
 date: 2026-07-28
-status: awaiting-ruling
+status: partially-ruled
 ---
 
 # Three guard design decisions before build (#452, #282, #275)
@@ -20,6 +20,70 @@ status: awaiting-ruling
 > below was read in a clean worktree of that commit, not from the issue bodies.
 > Where an issue's claim survived verification it is marked *confirmed*; where
 > it did not, the correction is called out.
+>
+> **Ruling landed 2026-07-29** on #275 (allowlist writes are permanently
+> human-only — see the Ruling section below) and on tier posture across all
+> three guards (nudge first, block is a separate later step — see Shared tier
+> policy below). Four of the original twelve open questions are resolved
+> outright by that ruling, one more is resolved by the shared tier policy, and
+> one new question opens in its place. **Seven questions remain genuinely
+> open** — see Still open at the end.
+
+---
+
+## Ruling — #275: allowlist writes are permanently human-only
+
+**Settled 2026-07-29.** Claude may verify guardrails allowlist state doctor-side,
+but must never write it, at any scope, ever.
+
+**Rationale:** a mechanism that lets the guarded party widen its own allowlist
+is circular — the whole point of the guard is to constrain what Claude can do,
+so letting Claude expand the boundary that constrains it defeats the guard.
+This repo already treats bootstrap as the weakest link in the guard chain; a
+Claude-writable allowlist would make bootstrap the weakest link on an ongoing
+basis instead of a one-time exposure. The ruling also forecloses the
+project-scope hazard §3(d) below flagged as a question needing verification: a
+repo shipping its own `.claude/settings.json` `env` block could otherwise
+widen the guards' allowlist for anyone who clones it. With writing foreclosed
+at every scope, that hazard doesn't need Claude Code's project-`env` trust
+model resolved first — there is nothing to write regardless of scope.
+
+**This resolves outright:**
+
+- **May Claude write allowlist keys? No.** Human-only, permanently. (Was Q8.)
+- **May keys be written at project scope? Moot.** No writing at any scope, so
+  the scope question doesn't arise. (Was Q12.)
+- **Should a new subcommand be modelled on `migrate-config`, vs a `configure`
+  sub-step? Moot as a writer question.** Neither shape is needed because
+  nothing writes. If a read-only verifier subcommand is still wanted beyond
+  folding into `doctor` (Option 3 below), that's a separate ask this plan does
+  not currently call for. (Was Q10.)
+- **Ship doctor-side verification as an independent first slice? Yes — and
+  it is now this plan's lead deliverable for #275**, decoupled entirely from
+  the writer question: Option 3 below ships regardless of how, or whether,
+  writing ever gets solved. (Was Q11.)
+
+**This opens one new question in its place:** given human-only, does
+cadence#360 thin `guardrails-init` to an invoker, or retire it? See Q9 in
+Still open below — a directly relevant owner ruling on cadence#360 already
+exists and is folded into the recommendation there.
+
+---
+
+## Shared tier policy (applies to all three guards)
+
+**Ship at nudge tier first. Escalation to a block is a later, separately
+justified step**, not a default. Each guard section below references this
+policy rather than re-deriving its own answer:
+
+- **#452** is structurally nudge-only already — the polish-gate consumers
+  (`nudge_polish_before_pr.rs`, `log_polish_nudge.rs`) have no block path, so
+  this policy is a statement of the existing shape, not a new choice.
+- **#282** — see §2(c). The issue proposes a block; this policy is why the
+  recommendation ships nudge instead, with the polish gate's CP1→CP2 pattern
+  as the model for a later escalation.
+- **#275** has no guard tier as such (it's a config writer/verifier, not a
+  gate on an action) — noted here only for completeness.
 
 ---
 
@@ -151,7 +215,9 @@ Composable with Option 2.
 
 ### (c) Recommendation
 
-**Option 2 now; Option 3 only if the ledger justifies it.** Option 2 fixes
+**Option 2 now; Option 3 only if the ledger justifies it.** (Consistent with
+the shared tier policy above: this guard is nudge-only by construction, so no
+tier decision applies here — only which shapes it fires on.) Option 2 fixes
 every shape the issue actually measured, breaks no test, and preserves the
 `-R`-create nudge that the ecosystem's own dominant spelling depends on. Add
 Option 5 if the `ready` positional case is judged worth the extra branch.
@@ -268,14 +334,15 @@ someone enables it.
 
 **B2 as the predicate, with A2's segment test as the cheap pre-filter** — the
 segment test runs first and rejects almost everything at zero I/O cost; only a
-candidate hit pays for the manifest read. **Ship at nudge tier first, not
-block.**
+candidate hit pays for the manifest read. **Ship at nudge tier first, per the
+shared tier policy above.**
 
-The tier is a real decision, not a detail. The issue proposes a block, but the
-`.gitignore` and the `plugin-runtime-only` CI check already cover the *shipping*
-risk; this guard's value is local, pre-commit feedback. A nudge captures that
-at zero false-block cost, and escalation can follow the CP1→CP2 pattern the
-polish gate already documents (`nudge_polish_before_pr.rs:58-60`).
+The issue proposes a block, but the `.gitignore` and the `plugin-runtime-only`
+CI check already cover the *shipping* risk; this guard's value is local,
+pre-commit feedback. A nudge captures that at zero false-block cost, and
+escalation can follow the CP1→CP2 pattern the polish gate already documents
+(`nudge_polish_before_pr.rs:58-60`) — a later, separately justified step, not
+part of this slice.
 
 **Open sub-question:** the plugin *cache*
 (`~/.claude/plugins/cache/<marketplace>/<plugin>/`) is itself a
@@ -364,20 +431,25 @@ collision:
 4. A **composable return type** — `run() -> !` exits on every path, so a
    `configure guardrails` sub-step needs the signature reworked.
 
-**The governance collision is the actual decision.** `configure` is
-deliberately forbidden to Claude *because it edits settings*. Writing
-`CADENCE_ALLOWED_OWNERS` is **widening the guards' own allowlist** — the most
-self-modification-shaped write in the product. But the skill it would replace
-is invoked *by* Claude. So absorbing it either keeps the capability human-only
-— in which case cadence#360 cannot thin the skill to "a one-line invoker",
-because Claude cannot run the thing it would invoke — or it carves a hole in
-the Claude Code gate for precisely the write that gate exists to stop.
+**The governance collision was the actual decision, and it is now ruled** (see
+the Ruling section above). `configure` is deliberately forbidden to Claude
+*because it edits settings*. Writing `CADENCE_ALLOWED_OWNERS` is **widening
+the guards' own allowlist** — the most self-modification-shaped write in the
+product. But the skill it would replace is invoked *by* Claude. The ruling
+resolves this by keeping the capability human-only, permanently. That does
+**not** foreclose cadence#360 thinning the skill to a one-line invoker, as
+originally feared here — a thinned skill still refuses under Claude Code via
+the CLI's own existing gate (`main.rs:779-793`), so the invoker and the
+refusal live in one place instead of two. See Q9 in Still open below.
 
 ### (b) Design space
 
 **Option 1 — `configure guardrails` sub-step, human-only.** Keeps the existing
-gate intact. Forces cadence#360 to *retire* the skill and point at a documented
-terminal command rather than thin it.
+gate intact. Does **not** force cadence#360 to retire the skill — see Q9 in
+Still open below: cadence#360 already carries an owner ruling to thin, not
+retire, and this option is compatible with that ruling because the sub-step
+inherits `main.rs:779-793`'s existing refusal under Claude Code regardless of
+who invokes it.
 
 **Option 2 — a separate non-interactive subcommand**, e.g.
 `cadence-hooks configure-identity --owner <o> [--repo <o/r>]…`, modeled on
@@ -400,14 +472,18 @@ from the 2026-07-10 audit.
 
 ### (c) Recommendation
 
-**Option 3 now, Option 2's shape later if Cameron wants the skill retired.**
-Doctor-side verification is independently useful, unblocks drift visibility
-immediately, carries zero governance risk, and does not require answering the
-"may Claude write the allowlist" question to ship.
+**Option 3, now settled as the plan's lead deliverable per the ruling above —
+not conditional on anything else.** Doctor-side verification is independently
+useful, unblocks drift visibility immediately, carries zero governance risk,
+and ships regardless of how the writer question resolves, because per the
+ruling above there is no writer question left to resolve: writing is
+foreclosed at every scope, permanently.
 
-**Explicitly do not extend `configure` itself.** Its project-scoped resolver
-and `-> !` signature both fight the change, and the Claude Code gate makes
-cadence#360's desired outcome — a thin invoker — unreachable through that door.
+**Explicitly do not extend `configure` itself** to write these keys — that
+door is closed by the ruling, not just by the project-scoped resolver and
+`-> !` signature that already fought the change. Option 2 (a dedicated
+non-interactive subcommand) is moot as a *writer* — see the Ruling section
+above.
 
 ### (d) What breaks if we guess wrong
 
@@ -416,21 +492,44 @@ cadence#360's desired outcome — a thin invoker — unreachable through that do
   given key lands in, and the two keys in the module would obey different
   rules for no visible reason.
 - **A project-scoped allowlist write is a security question, not a style
-  question.** If `CADENCE_ALLOWED_OWNERS` can be written at project scope, then
-  a repo shipping its own `.claude/settings.json` `env` block could widen the
-  guards' allowlist for anyone who opens it. Claude Code's trust model for
-  project `env` blocks needs confirming before any project-scoped write of
-  these keys is allowed — this is stated as a question to verify, not as an
-  established exposure.
-- **Thinning the skill (cadence#360) before the gate is ruled on** loses the
-  working setup path and replaces it with a command Claude is forbidden to
-  run — a regression disguised as a cleanup.
+  question — this is why the ruling above forecloses it outright.** If
+  `CADENCE_ALLOWED_OWNERS` could be written at project scope, a repo shipping
+  its own `.claude/settings.json` `env` block could widen the guards'
+  allowlist for anyone who opens it. The ruling settles this by removing
+  writing at every scope, so Claude Code's project-`env` trust model no longer
+  needs confirming to close the hole — there's nothing left that could open
+  it.
+- **Retiring the skill instead of thinning it** would contradict the existing
+  cadence#360 owner ruling (2026-07-27: "thin it, do not retire it") without a
+  new ruling to justify the reversal, and would lose the discoverable setup
+  path in favor of a command a first-time user has no way to find.
 
 ---
 
-## Awaiting ruling
+## Resolved
 
-Each phrased so a sentence answers it.
+Five of the original twelve questions are settled and are not open questions
+anymore. Kept here, numbered as originally filed, for traceability — they do
+not appear again below.
+
+- **Q6 (#282 — nudge vs block tier)** — RESOLVED by the shared tier policy
+  above: nudge first, escalation later and separately justified.
+- **Q8 (#275 — may Claude write allowlist keys)** — RESOLVED by the ruling
+  above: no, permanently human-only.
+- **Q10 (#275 — subcommand modelled on `migrate-config`, or a `configure`
+  sub-step)** — RESOLVED by the ruling above: moot as a writer question.
+- **Q11 (#275 — ship doctor-side verification as a first slice, decoupled
+  from the writer decision)** — RESOLVED by the ruling above: yes, and it is
+  now the plan's lead deliverable for #275.
+- **Q12 (#275 — may allowlist keys be written at project scope)** — RESOLVED
+  by the ruling above: moot, no writing at any scope.
+
+---
+
+## Still open — 7 of the original 12
+
+Each phrased so a sentence answers it. One question (Q9) is new, opened by the
+ruling above; the rest carry over unresolved from the original plan.
 
 **#452 — polish-anchor retargeting**
 
@@ -450,21 +549,21 @@ Each phrased so a sentence answers it.
 
 5. Scope the guard by marketplace manifest, repo identity, bare structure, or
    an opt-in env var? *(Recommend manifest, with a segment-test pre-filter.)*
-6. Ship at nudge tier first with a CP1→CP2 escalation, or block immediately as
-   the issue proposes? *(Recommend nudge first.)*
 7. Is the plugin cache (`~/.claude/plugins/cache/`) in scope for this guard, a
    separate one, or out of scope?
 
 **#275 — configure identity**
 
-8. May Claude ever write the guardrails allowlist keys, or is identity setup
-   permanently human-only?
-9. If human-only: does cadence#360 thin `guardrails-init` to an invoker
-   (unreachable if Claude cannot run the target) or retire it for a documented
-   terminal command?
-10. A new non-interactive subcommand modeled on `migrate-config`, or a sub-step
-    of `configure`? *(Recommend the former.)*
-11. Ship doctor-side verification as a first slice, decoupled from the writer
-    decision? *(Recommend yes.)*
-12. May the allowlist keys ever be written at **project** scope, or user scope
-    only? *(Security-relevant — see §3(d).)*
+9. Given human-only (Q8, resolved above), does cadence#360 thin
+   `guardrails-init` to an invoker, or retire it for a documented terminal
+   command? *(Recommend thin, not retire. cadence#360 already carries an
+   owner ruling — 2026-07-27, decided item-by-item on a decision dashboard:
+   "Thin it, do not retire it… keep the familiar entry point, but have it call
+   the standalone program so configuration has exactly one owner." That ruling
+   predates today's human-only decision but is not in tension with it: the
+   subcommand the skill would invoke — Option 1's `configure guardrails`
+   sub-step, per `main.rs:779-793` — already refuses under Claude Code
+   regardless of who invokes it. Thinning the skill to a one-line invocation
+   of that subcommand doesn't reopen human-only; it centralizes the one
+   owning implementation in the CLI and lets the CLI's existing refusal do
+   the enforcement instead of duplicating it in skill prose.)*
