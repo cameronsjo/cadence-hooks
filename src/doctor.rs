@@ -1863,6 +1863,25 @@ fn orphan_findings(
     findings
 }
 
+/// Render an untrusted filesystem path without terminal control sequences.
+///
+/// Plugin-cache components can derive from third-party marketplace metadata,
+/// so prune output has the same terminal-injection boundary as a `Finding`
+/// field even though it is printed outside `Finding::render`.
+fn display_safe_path(path: &Path) -> String {
+    cadence_hooks_metrics::common::display_safe(&path.to_string_lossy())
+}
+
+/// One human-readable `doctor --prune` listing row.
+///
+/// Kept pure so the separate stdout path has a direct sanitizer regression
+/// test rather than relying on `Finding::render` tests that never reach it.
+fn render_orphan_dir_line(dir: &Path, size: u64, marked: bool) -> String {
+    let mib = size as f64 / (1024.0 * 1024.0);
+    let marker_note = if marked { " [marked .orphaned_at]" } else { "" };
+    format!("  {} (~{mib:.1} MiB){marker_note}", display_safe_path(dir))
+}
+
 /// Remove (or, when `apply` is false, merely size up) the given orphaned
 /// version directories. Returns `(removed_count, freed_bytes)` — in dry-run
 /// mode both reflect what *would* be removed, since nothing is deleted.
@@ -1887,8 +1906,8 @@ fn prune_orphans(dirs: &[PathBuf], apply: bool, cache_root: &Path) -> (usize, u6
         if !is_contained(dir, cache_root) {
             eprintln!(
                 "cadence-hooks doctor --prune: refusing to touch {} — outside the plugin cache root {}",
-                dir.display(),
-                cache_root.display()
+                display_safe_path(dir),
+                display_safe_path(cache_root)
             );
             continue;
         }
@@ -1915,7 +1934,7 @@ fn prune_orphans(dirs: &[PathBuf], apply: bool, cache_root: &Path) -> (usize, u6
             Err(e) => {
                 eprintln!(
                     "cadence-hooks doctor --prune: could not remove {}: {e}",
-                    dir.display()
+                    display_safe_path(dir)
                 );
             }
         }
@@ -1982,7 +2001,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
             if !root.exists() {
                 eprintln!(
                     "cadence-hooks doctor: scan root does not exist: {}",
-                    root.display()
+                    display_safe_path(root)
                 );
                 return 2;
             }
@@ -2004,7 +2023,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         if !quiet {
             println!(
                 "cadence-hooks doctor --prune: no installed-plugins manifest at {} — nothing to prune",
-                manifest.display()
+                display_safe_path(&manifest)
             );
         }
         return 0;
@@ -2021,17 +2040,14 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
     if !quiet {
         for dir in &dirs {
             let size = dir_size_bytes(dir);
-            let mib = size as f64 / (1024.0 * 1024.0);
             // `.orphaned_at` is written externally by Claude Code's own
             // plugin loader when it retires a version dir, not by anything
             // in this repo — surfacing it here is advisory ("this one was
             // already flagged upstream"), not a marker this codebase creates.
-            let marker_note = if dir.join(".orphaned_at").exists() {
-                " [marked .orphaned_at]"
-            } else {
-                ""
-            };
-            println!("  {} (~{mib:.1} MiB){marker_note}", dir.display());
+            println!(
+                "{}",
+                render_orphan_dir_line(dir, size, dir.join(".orphaned_at").exists())
+            );
         }
     }
 
@@ -4756,6 +4772,26 @@ mod tests {
     }
 
     // ── prune_orphans ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn prune_listing_sanitizes_hostile_cache_dir_path() {
+        let path = Path::new("/cache/\u{1b}[31mred\u{1b}[0m/\u{202e}evil\u{e0001}");
+        let rendered = render_orphan_dir_line(path, 1024 * 1024, true);
+
+        assert!(rendered.contains("/cache/"));
+        assert!(rendered.contains("(~1.0 MiB)"));
+        assert!(rendered.contains("[marked .orphaned_at]"));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\u{e0001}'));
+    }
+
+    #[test]
+    fn prune_listing_preserves_ordinary_path_text() {
+        let rendered =
+            render_orphan_dir_line(Path::new("/cache/marketplace/plugin/version"), 0, false);
+        assert_eq!(rendered, "  /cache/marketplace/plugin/version (~0.0 MiB)");
+    }
 
     #[test]
     fn prune_orphans_dry_run_deletes_nothing() {
