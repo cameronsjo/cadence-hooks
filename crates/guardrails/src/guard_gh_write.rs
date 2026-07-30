@@ -535,14 +535,59 @@ enum RepoResolution {
     TimedOut,
 }
 
+/// Resolve the host selected for one `gh` invocation.
+///
+/// `default_host()` sees the hook process environment, not an assignment that
+/// belongs to the command being judged. gh also lets an explicit
+/// `--hostname` override `GH_HOST`; ownership resolution must use the same
+/// precedence or it can approve an owner on github.com while the write is sent
+/// to another forge (#476).
+fn gh_command_host(command: &str) -> String {
+    let fallback = default_host();
+    let tokens = tokenize(command);
+    let Some(gh_index) = tokens.iter().position(|token| token_is_gh(token)) else {
+        return fallback;
+    };
+
+    let inline_host = tokens[..gh_index]
+        .iter()
+        .filter_map(|token| token.strip_prefix("GH_HOST="))
+        .rfind(|host| !host.is_empty())
+        .map(str::to_string);
+
+    let mut flag_host = None;
+    let mut index = gh_index + 1;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if token == "--" {
+            break;
+        }
+        if token == "--hostname" {
+            if let Some(host) = tokens.get(index + 1).filter(|host| !host.is_empty()) {
+                flag_host = Some(host.clone());
+                index += 2;
+                continue;
+            }
+        } else if let Some(host) = token
+            .strip_prefix("--hostname=")
+            .filter(|host| !host.is_empty())
+        {
+            flag_host = Some(host.to_string());
+        }
+        index += 1;
+    }
+
+    flag_host.or(inline_host).unwrap_or(fallback)
+}
+
 fn resolve_target_repo(
     command: &str,
     work_dir: &str,
     allowed_owners: &[AllowEntry],
 ) -> RepoResolution {
-    let dh = default_host();
+    let dh = gh_command_host(command);
 
-    // 1. Explicit -R / --repo flag (gh CLI always targets GH_HOST or github.com)
+    // 1. Explicit -R / --repo flag (targets the command-selected gh host).
     match repo_flag(command) {
         RepoFlag::Target(repo) => return RepoResolution::Resolved { host: dh, repo },
         RepoFlag::Ambiguous => return RepoResolution::AmbiguousFlags,
@@ -3534,6 +3579,66 @@ mod tests {
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
+    }
+
+    #[test]
+    fn api_hostname_flag_is_part_of_ownership_resolution() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "gh api --hostname evil.example.com repos/cameronsjo/x -X POST -f title=t",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        });
+    }
+
+    #[test]
+    fn inline_gh_host_is_part_of_ownership_resolution() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "GH_HOST=evil.example.com gh api repos/cameronsjo/x -X POST -f title=t",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        });
+    }
+
+    #[test]
+    fn hostname_flag_overrides_inline_gh_host() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "GH_HOST=github.com gh api --hostname evil.example.com repos/cameronsjo/x -X POST -f title=t",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Block));
+        });
+    }
+
+    #[test]
+    fn explicitly_allowed_host_and_owner_still_allow() {
+        with_env(
+            &[
+                (
+                    "CADENCE_ALLOWED_OWNERS",
+                    Some("evil.example.com/cameronsjo"),
+                ),
+                ("CADENCE_ALLOWED_REPOS", None),
+                ("CADENCE_EXTRA_HOSTS", Some("evil.example.com")),
+            ],
+            || {
+                let input = input_with(
+                    "gh api --hostname evil.example.com repos/cameronsjo/x -X POST -f title=t",
+                    "/tmp",
+                );
+                let result = GhWriteGuard.run(&input);
+                assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+            },
+        );
     }
 
     #[test]
