@@ -2392,6 +2392,15 @@ mod tests {
     }
 
     #[test]
+    fn trailing_backtick_is_unresolvable_not_a_silent_allow() {
+        // #509's second report is already fail-safe on current main:
+        // resolve_target treats every backtick-bearing operand as an
+        // unresolvable command substitution. Preserve that stronger result
+        // rather than stripping the delimiter into a guessed path.
+        assert_eq!(judge("rm -rf ~/Documents`", "/home"), Outcome::Ask);
+    }
+
+    #[test]
     fn single_file_still_asks_when_the_path_is_unresolvable() {
         assert_eq!(judge("rm $SOMEFILE", "/srv/project"), Outcome::Ask);
         assert_eq!(judge("rm ../sibling/x", "/srv/project"), Outcome::Ask);

@@ -18,15 +18,50 @@ use std::sync::LazyLock;
 static GH_REPO_DELETE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?i:gh)\s+repo\s+delete\b").expect("pattern should compile"));
 
-static EXEC_WRAPPER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?i:bash|sh|zsh)\s+-c\b").expect("pattern should compile"));
-
 /// Matches an API path at EXACTLY owner/repo depth: `repos/<owner>/<repo>`,
 /// with an optional leading or trailing slash. Sub-resource paths
 /// (`repos/o/r/issues/1`, `repos/o/r/git/refs/heads/x`) deliberately do not
 /// match — those DELETEs remove a sub-resource, not the repository itself.
 static API_REPO_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/?repos/[^/]+/[^/]+/?$").expect("pattern should compile"));
+
+/// True when a shell command ends inside a single- or double-quoted run.
+///
+/// This is deliberately narrower than tokenization: it exists only to keep a
+/// malformed quote from erasing a destructive command from the conservative
+/// fallback below. Backslashes escape the next character outside single
+/// quotes; inside single quotes they are literal, matching shell quote rules.
+fn has_unmatched_quote(command: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(ch),
+                _ => {}
+            },
+            _ => unreachable!("quote state is limited to shell delimiters"),
+        }
+    }
+    quote.is_some()
+}
 
 /// True when `tokens` carry an HTTP DELETE method flag in any Cobra spelling:
 /// the adjacent pair `-X delete` / `--method delete`, or a single token
@@ -72,18 +107,26 @@ impl Check for GhDangerousGuard {
             return CheckResult::allow();
         }
 
-        // Strip quoted strings to avoid false positives from prose
-        let stripped = strip_quotes(command);
-
-        // Pass 1: direct invocation (after stripping quotes)
-        if let Some(m) = GH_REPO_DELETE.find(&stripped) {
-            return CheckResult::block(crate::messages::repo_delete_blocked_message(
-                m.as_str().trim(),
-            ));
+        // Judge each executable segment, including shell-wrapper bodies,
+        // independently. Stripping quotes from the whole command let an
+        // unrelated unmatched apostrophe consume every later segment and hide
+        // a repo deletion (#509). Per-segment stripping retains the prose
+        // exemption without giving one well-formed quoted argument authority
+        // over a different segment.
+        let segments = command_segments(command);
+        for segment in &segments {
+            let stripped = strip_quotes(segment);
+            if let Some(m) = GH_REPO_DELETE.find(&stripped) {
+                return CheckResult::block(crate::messages::repo_delete_blocked_message(
+                    m.as_str().trim(),
+                ));
+            }
         }
-
-        // Pass 2: inside exec wrappers (bash -c "gh repo delete ...")
-        if EXEC_WRAPPER.is_match(&stripped)
+        // A malformed unmatched quote can still prevent the segmenter from
+        // exposing later operators. Such a command is not executable as
+        // written, so fail conservatively when its raw text names the exact
+        // irreversible operation. Balanced quoted prose never enters this arm.
+        if has_unmatched_quote(command)
             && let Some(m) = GH_REPO_DELETE.find(command)
         {
             return CheckResult::block(crate::messages::repo_delete_blocked_message(
@@ -91,11 +134,11 @@ impl Check for GhDangerousGuard {
             ));
         }
 
-        // Pass 3: the REST API form `gh api -X DELETE repos/<owner>/<repo>`.
+        // The REST API form `gh api -X DELETE repos/<owner>/<repo>`.
         // The subcommand-form regex above never sees this shape, so tokenize
         // every executable segment (chains and `sh -c` wrappers expanded) and
         // block iff it is a `gh api` DELETE targeting an exact owner/repo path.
-        for segment in command_segments(command) {
+        for segment in segments {
             let tokens = tokenize(&segment);
             let Some(first) = tokens.first() else {
                 continue;
@@ -133,6 +176,24 @@ mod tests {
     fn repo_delete_in_exec_wrapper_blocked() {
         let result = GhDangerousGuard.run(&make_bash("bash -c \"gh repo delete my-repo --yes\""));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn unrelated_unmatched_apostrophe_cannot_hide_repo_delete() {
+        let result = GhDangerousGuard.run(&make_bash("echo it's && gh repo delete my-repo --yes"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn clean_chain_repo_delete_control_still_blocks() {
+        let result = GhDangerousGuard.run(&make_bash("echo its && gh repo delete my-repo --yes"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn quoted_repo_delete_prose_stays_allowed() {
+        let result = GhDangerousGuard.run(&make_bash("echo \"gh repo delete is dangerous\""));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
