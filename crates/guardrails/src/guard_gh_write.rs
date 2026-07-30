@@ -544,8 +544,7 @@ enum RepoResolution {
 /// to another forge (#476).
 fn gh_command_host(command: &str) -> String {
     let fallback = default_host();
-    let tokens = tokenize(command);
-    let Some(gh_index) = tokens.iter().position(|token| token_is_gh(token)) else {
+    let Some((tokens, gh_index)) = gh_command_tokens(command) else {
         return fallback;
     };
 
@@ -553,7 +552,7 @@ fn gh_command_host(command: &str) -> String {
         .iter()
         .filter_map(|token| token.strip_prefix("GH_HOST="))
         .rfind(|host| !host.is_empty())
-        .map(str::to_string);
+        .map(str::to_ascii_lowercase);
 
     let mut flag_host = None;
     let mut index = gh_index + 1;
@@ -564,7 +563,7 @@ fn gh_command_host(command: &str) -> String {
         }
         if token == "--hostname" {
             if let Some(host) = tokens.get(index + 1).filter(|host| !host.is_empty()) {
-                flag_host = Some(host.clone());
+                flag_host = Some(host.to_ascii_lowercase());
                 index += 2;
                 continue;
             }
@@ -572,7 +571,17 @@ fn gh_command_host(command: &str) -> String {
             .strip_prefix("--hostname=")
             .filter(|host| !host.is_empty())
         {
-            flag_host = Some(host.to_string());
+            flag_host = Some(host.to_ascii_lowercase());
+        } else if api_flag_takes_separate_value(token) && !token.contains('=') {
+            // A following token is this flag's value, even when that value
+            // happens to be the literal `--hostname`.
+            index += 2;
+            continue;
+        } else if let Some(cluster) = token.strip_prefix('-')
+            && cluster_consumes_next(cluster, GH_API_FLAGS.value_shorts)
+        {
+            index += 2;
+            continue;
         }
         index += 1;
     }
@@ -928,24 +937,30 @@ fn api_flag_takes_separate_value(flag: &str) -> bool {
 ///    regexes covered. Requiring the command word would drop those to the
 ///    cwd-remote fallback — turning a named off-owner target into a guess.
 fn gh_argv(segment: &str) -> Option<Vec<String>> {
-    gh_argv_depth(segment, 0)
+    let (tokens, start) = gh_command_tokens(segment)?;
+    Some(tokens[start..].to_vec())
 }
 
-fn gh_argv_depth(segment: &str, depth: usize) -> Option<Vec<String>> {
+/// Tokenize the shell layer that directly invokes `gh`, retaining its prefix.
+///
+/// Keeping the prefix lets host resolution see an inline `GH_HOST` assignment;
+/// peeling `eval` here keeps that assignment and the argv on the same bounded,
+/// quote-aware path as every other target-resolution arm.
+fn gh_command_tokens(segment: &str) -> Option<(Vec<String>, usize)> {
+    gh_command_tokens_depth(segment, 0)
+}
+
+fn gh_command_tokens_depth(segment: &str, depth: usize) -> Option<(Vec<String>, usize)> {
     let tokens = tokenize(segment);
     if let Some(start) = tokens.iter().position(|tok| token_is_gh(tok)) {
-        return Some(tokens[start..].to_vec());
+        return Some((tokens, start));
     }
-    // `eval "<script>"` is the one wrapper `command_segments` does not unwrap,
-    // so its argument arrives as a single opaque token. Peel it exactly as
-    // `segment_invokes_gh` does, or an `eval`-wrapped write with a named target
-    // would silently fall through to the cwd remote.
     if depth < MAX_EVAL_DEPTH
         && tokens
             .first()
             .is_some_and(|t| t.rsplit('/').next().unwrap_or(t) == "eval")
     {
-        return gh_argv_depth(&tokens[1..].join(" "), depth + 1);
+        return gh_command_tokens_depth(&tokens[1..].join(" "), depth + 1);
     }
     None
 }
@@ -3584,13 +3599,15 @@ mod tests {
     #[test]
     fn api_hostname_flag_is_part_of_ownership_resolution() {
         with_env(&owners_env(), || {
-            let input = input_with(
+            for command in [
                 "gh api --hostname evil.example.com repos/cameronsjo/x -X POST -f title=t",
-                "/tmp",
-            );
-            let result = GhWriteGuard.run(&input);
-            let meta = result.block_metadata.expect("structured block");
-            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+                "gh api --hostname=evil.example.com repos/cameronsjo/x -X POST -f title=t",
+            ] {
+                let input = input_with(command, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            }
         });
     }
 
@@ -3639,6 +3656,49 @@ mod tests {
                 assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
             },
         );
+    }
+
+    #[test]
+    fn eval_wrapped_hostname_is_part_of_ownership_resolution() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                r#"eval "gh api --hostname evil.example.com repos/cameronsjo/x -X POST -f title=t""#,
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-unauthorized-target");
+        });
+    }
+
+    #[test]
+    fn command_host_comparison_folds_ascii_case() {
+        with_env(&owners_env(), || {
+            for command in [
+                "GH_HOST=GitHub.com gh api repos/cameronsjo/x -X POST -f title=t",
+                "gh api --hostname GitHub.com repos/cameronsjo/x -X POST -f title=t",
+                "GH_HOST=GitHub.com gh repo create x --public",
+            ] {
+                let input = input_with(command, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{command}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn flag_value_cannot_pose_as_hostname_selector() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "gh api repos/cameronsjo/x -X POST --jq --hostname --template '{{.x}}'",
+                "/tmp",
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
     }
 
     #[test]
