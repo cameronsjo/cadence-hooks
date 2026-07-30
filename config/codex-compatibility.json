@@ -28,6 +28,11 @@
       "applicable": false,
       "evidence": "Codex CLI has no Claude-in-Chrome MCP route"
     },
+    "inject-gh-context": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "cadence#658 retired the SessionStart registrar in favor of inject-gh-write-context"
+    },
     "warn-recommended-option": {
       "status": "unavailable",
       "applicable": false,

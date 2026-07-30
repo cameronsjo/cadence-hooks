@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "binaryVersion": "0.67.0",
+  "binaryVersion": "0.70.0",
   "minimumCodexVersion": "0.145.0",
   "privacy": {
     "rawHookInputsPersisted": false,
@@ -311,7 +311,42 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*git push*|*git commit*|*gh pr create*|*gh pr edit*|*gh issue create*|*gh issue comment*)",
+          "if": "Bash(*git push*)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*git commit*)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr create*)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr edit*)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh issue create*)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh issue comment*)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         }
       ]
@@ -331,7 +366,21 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr create*|*gh pr ready*)",
+          "if": "Bash(*gh pr create*)",
+          "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr ready*)",
+          "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr merge*)",
           "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
         }
       ]
@@ -371,7 +420,56 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr create*|*gh pr comment*|*gh pr edit*|*gh pr review*|*gh pr reopen*|*gh issue create*|*gh issue comment*|*gh issue edit*|*gh issue review*|*gh issue reopen*|*gh release create*|*gh release comment*|*gh release edit*|*gh release review*|*gh release reopen*|*gh gist create*|*gh gist comment*|*gh gist edit*|*gh gist review*|*gh gist reopen*|*gh discussion create*|*gh discussion comment*|*gh discussion edit*|*gh discussion review*|*gh discussion reopen*|*git commit*|*tea pr create*|*tea pr comment*|*tea pr edit*|*tea issue create*|*tea issue comment*|*tea issue edit*)",
+          "if": "Bash(*gh pr *)",
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh issue *)",
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh release *)",
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh gist *)",
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh discussion *)",
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*git commit*)",
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*tea pr *)",
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*tea issue *)",
           "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
         }
       ]
@@ -578,7 +676,14 @@
           "plugin": "cadence-guardrails",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*git checkout*|*git switch*)",
+          "if": "Bash(*git checkout*)",
+          "commandHash": "905be14c05b8d176305843c93695defc6626db3261d3ee13c1a491b9a00d0f93"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*git switch*)",
           "commandHash": "905be14c05b8d176305843c93695defc6626db3261d3ee13c1a491b9a00d0f93"
         }
       ]
@@ -680,6 +785,34 @@
           "matcher": "Bash",
           "if": "Bash(*rm*)",
           "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*unlink*)",
+          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*shred*)",
+          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*truncate*)",
+          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*find*)",
+          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
         }
       ]
     },
@@ -738,7 +871,14 @@
           "plugin": "cadence-guardrails",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh issue create*|*/issues*)",
+          "if": "Bash(*gh issue create*)",
+          "commandHash": "a5de2a56f1b7074663c0b0c6cc7dbfc2af05310d5ac4cd74d0bc7168c35b0ebf"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*/issues*)",
           "commandHash": "a5de2a56f1b7074663c0b0c6cc7dbfc2af05310d5ac4cd74d0bc7168c35b0ebf"
         }
       ]
@@ -758,7 +898,14 @@
           "plugin": "cadence-guardrails",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh repo create*|*gh repo edit*)",
+          "if": "Bash(*gh repo create*)",
+          "commandHash": "3a26a937ff7bbe7bc4bcca921a51860348f566ca4e776875555ccdfaa90ab9f8"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh repo edit*)",
           "commandHash": "3a26a937ff7bbe7bc4bcca921a51860348f566ca4e776875555ccdfaa90ab9f8"
         }
       ]
@@ -805,7 +952,14 @@
           "plugin": "cadence-guardrails",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*op item*|*op vault*)",
+          "if": "Bash(*op item*)",
+          "commandHash": "2295eae02a357d6139462e569e5057862ee55cb5795631b09c56da9eec1d670b"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*op vault*)",
           "commandHash": "2295eae02a357d6139462e569e5057862ee55cb5795631b09c56da9eec1d670b"
         }
       ]
@@ -885,7 +1039,42 @@
           "plugin": "cadence-guardrails",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*ls *|*find *|*cat *|*du *|*df *|*top *)",
+          "if": "Bash(*ls *)",
+          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*find *)",
+          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*cat *)",
+          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*du *)",
+          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*df *)",
+          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*top *)",
           "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
         }
       ]
@@ -917,16 +1106,28 @@
       "name": "inject-gh-context",
       "plugin": "guardrails",
       "protected": false,
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "cadence#658 retired the SessionStart registrar in favor of inject-gh-write-context",
+      "wiring": []
+    },
+    {
+      "criticality": "workflow",
+      "description": "Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write",
+      "event": "PreToolUse",
+      "name": "inject-gh-write-context",
+      "plugin": "guardrails",
+      "protected": false,
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
       "wiring": [
         {
-          "plugin": "cadence-canon",
-          "event": "SessionStart",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "55474a01dc2ed7d32dde1c29008374d33a1dafaea9d00a4f5f297cb0122d53b2"
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh *)",
+          "commandHash": "e9db420dfe2e3e41929e392bb9d9ccd6c7c9a64c8d25069b289714920e78c7f5"
         }
       ]
     },
@@ -1161,6 +1362,13 @@
           "matcher": "Bash",
           "if": "Bash(*gh pr ready*)",
           "commandHash": "6ef992f7fff1917ba682a7463866d94d5b44fa4bd88d5c74a9bf825e4acca427"
+        },
+        {
+          "plugin": "cadence-metrics",
+          "event": "PostToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr merge*)",
+          "commandHash": "6ef992f7fff1917ba682a7463866d94d5b44fa4bd88d5c74a9bf825e4acca427"
         }
       ]
     },
@@ -1233,7 +1441,7 @@
     },
     {
       "criticality": "workflow",
-      "description": "Register this session in the repo registry and disclose live peers",
+      "description": "Register this session, disclose live peers, and surface in-flight plans",
       "event": "SessionStart",
       "name": "start",
       "plugin": "session",
@@ -1286,7 +1494,28 @@
           "plugin": "cadence-canon",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*git checkout*|*git switch*|*git add*|*git commit*)",
+          "if": "Bash(*git checkout*)",
+          "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
+        },
+        {
+          "plugin": "cadence-canon",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*git switch*)",
+          "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
+        },
+        {
+          "plugin": "cadence-canon",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*git add*)",
+          "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
+        },
+        {
+          "plugin": "cadence-canon",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*git commit*)",
           "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
         },
         {
