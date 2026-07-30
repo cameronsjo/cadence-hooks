@@ -666,18 +666,24 @@ fn peel_env_options<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
 /// elsewhere before the read runs. `cd /elsewhere && cat .envrc` would
 /// classify `$cwd/.envrc` (a clean loader at the project root) while the
 /// shell actually reads `/elsewhere/.envrc` (a secret) — the guard proves the
-/// wrong file. Reuses [`is_executed_command`]'s per-segment, quote-aware
-/// executed-command check, so `cd`/`pushd`/`popd` as a path fragment or
-/// argument (`echo cd-something`) doesn't false-positive.
+/// wrong file.
 ///
-/// A subshell/brace-grouped `cd` (`(cd /x; cat .envrc)`, `{ cd /x; …`) is
-/// detected too: [`is_executed_command`] strips leading group punctuation
-/// before matching the command word, so grouping cannot hide a directory
-/// change from the carve-out.
-fn command_changes_directory(lower: &str) -> bool {
-    is_executed_command(lower, &["cd"])
-        || is_executed_command(lower, &["pushd"])
-        || is_executed_command(lower, &["popd"])
+/// Uses the same wrapper-expanded [`command_segments`] view as the operand
+/// scan. A non-expanding view would miss the `cd` in
+/// `bash -c 'cd /elsewhere; cat .envrc'`, prove the loader at `input.cwd`,
+/// and allow the child shell to read a different file. Segment text is folded
+/// only after expansion so case-sensitive wrapper flags such as `sudo -E`
+/// remain visible to the expander.
+///
+/// [`is_executed_command`] remains the quote-aware command-position check, so
+/// `cd`/`pushd`/`popd` as a path fragment or argument does not false-positive.
+fn command_changes_directory(command: &str) -> bool {
+    command_segments(command).into_iter().any(|segment| {
+        let lower = segment.to_ascii_lowercase();
+        is_executed_command(&lower, &["cd"])
+            || is_executed_command(&lower, &["pushd"])
+            || is_executed_command(&lower, &["popd"])
+    })
 }
 
 /// Content-aware `.envrc` carve-out for the Bash read path (#193): the Read/Grep
@@ -768,7 +774,7 @@ fn bash_leaks_secrets(command: &str, cwd: Option<&str>) -> Option<CheckResult> {
         // anywhere invalidates the RELATIVE-operand carve-out for every
         // segment, since the shell's real cwd at read time can no longer be
         // trusted to equal `input.cwd`.
-        let command_has_cd = command_changes_directory(&lower);
+        let command_has_cd = command_changes_directory(command);
         // #508: segmented from the ORIGINAL `command`, NOT `lower`.
         // `command_segments`'s sudo-flag peel (`skip_sudo_no_argument_flags`)
         // matches `SUDO_NO_ARGUMENT_SHORT_FLAGS` case-SENSITIVELY, on
@@ -2985,6 +2991,39 @@ mod tests {
             dir.path().to_str().unwrap(),
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_c_cd_then_cat_relative_envrc_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "bash -c 'cd /elsewhere; cat .envrc'",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn sudo_bash_c_cd_then_cat_relative_envrc_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "sudo -E bash -c 'cd /elsewhere; cat .envrc'",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_c_cat_relative_envrc_without_cd_stays_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "bash -c 'cat .envrc'",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
