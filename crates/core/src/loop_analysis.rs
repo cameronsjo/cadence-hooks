@@ -582,20 +582,27 @@ fn is_git_push_command(cmd: &SimpleCommand) -> bool {
 /// Extract `-R` or `--repo` flag value from a `gh` command's arguments.
 fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
     let words = suffix_words(cmd);
-    let mut iter = words.iter();
-    while let Some(word) = iter.next() {
-        if word == "-R" || word == "--repo" {
-            return iter.next().cloned();
+    let mut result = None;
+    let mut index = 0;
+    while index < words.len() {
+        let word = &words[index];
+        if (word == "-R" || word == "--repo")
+            && let Some(value) = words.get(index + 1)
+        {
+            result = Some(value.clone());
+            index += 2;
+            continue;
         }
         // Handle -Rowner/repo (no space)
         if let Some(repo) = word.strip_prefix("-R").filter(|r| !r.is_empty()) {
-            return Some(repo.to_string());
+            result = Some(repo.to_string());
         }
         if let Some(repo) = word.strip_prefix("--repo=") {
-            return Some(repo.to_string());
+            result = Some(repo.to_string());
         }
+        index += 1;
     }
-    None
+    result
 }
 
 /// Extract the explicit remote name from `git push <remote>` arguments.
@@ -622,6 +629,7 @@ fn suffix_words(cmd: &SimpleCommand) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             CommandPrefixOrSuffixItem::Word(w) => Some(w.value.clone()),
+            CommandPrefixOrSuffixItem::AssignmentWord(_, w) => Some(w.value.clone()),
             _ => None,
         })
         .collect()
@@ -858,6 +866,60 @@ mod tests {
                 assert_eq!(cmds.len(), 1);
             }
             other => panic!("expected AllTargetsExplicit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_repo_flag_wins_across_all_four_spellings() {
+        for (flags, expected) in [
+            ("-R first/a --repo second/b", "second/b"),
+            ("--repo first/a -Rsecond/b", "second/b"),
+            ("--repo=first/a -R second/b", "second/b"),
+            ("-Rfirst/a --repo=second/b", "second/b"),
+        ] {
+            let command = format!("for i in 1 2; do gh issue close $i {flags}; done");
+            match analyze_gh_loops(&command) {
+                LoopAnalysis::AllTargetsExplicit(cmds) => {
+                    assert_eq!(cmds[0].explicit_repo.as_deref(), Some(expected), "{flags}");
+                }
+                other => panic!("expected AllTargetsExplicit for {flags}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn repo_flag_value_is_not_reparsed_as_another_flag() {
+        let result = analyze_gh_loops(
+            "for i in 1 2; do gh issue close $i -R --repo=first/value -Rfinal/target; done",
+        );
+        match result {
+            LoopAnalysis::AllTargetsExplicit(cmds) => {
+                assert_eq!(cmds[0].explicit_repo.as_deref(), Some("final/target"));
+            }
+            other => panic!("expected AllTargetsExplicit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_suffix_preserves_assignment_shaped_api_fields() {
+        let result = analyze_gh_loops("for i in 1 2; do gh api graphql -f query=mutation{x}; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                assert!(
+                    cmds[0].args.contains(&"query=mutation{x}".to_string()),
+                    "assignment-shaped field was dropped: {:?}",
+                    cmds[0].args
+                );
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
+
+        let result = analyze_gh_loops("for i in 1 2; do gh api orgs/acme/repos -f name=x; done");
+        match result {
+            LoopAnalysis::MissingTargets(cmds) => {
+                assert!(cmds[0].args.contains(&"name=x".to_string()));
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
         }
     }
 
