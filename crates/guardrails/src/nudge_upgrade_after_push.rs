@@ -189,8 +189,9 @@ mod tests {
 
     #[test]
     fn push_from_cadence_hooks_repo_nudges() {
-        // Use the actual cadence-hooks repo directory
-        let input = make_bash_with_cwd("git push origin main", &repo_root());
+        // Stable regardless of the enclosing checkout's origin (#254).
+        let repo = crate::github_origin_repo();
+        let input = make_bash_with_cwd("git push origin main", &repo.path().to_string_lossy());
         let result = NudgeUpgradeAfterPush.run(&input);
         assert_eq!(
             result.outcome,
@@ -236,7 +237,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn push_with_cd_to_cadence_hooks_nudges() {
-        let cmd = format!("cd {} && git push origin main", repo_root());
+        let repo = crate::github_origin_repo();
+        let path = repo.path().to_string_lossy();
+        let cmd = format!("cd {path} && git push origin main");
         let input = make_bash_with_cwd(&cmd, "/tmp");
         let result = NudgeUpgradeAfterPush.run(&input);
         assert_eq!(
