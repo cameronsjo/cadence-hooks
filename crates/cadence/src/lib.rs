@@ -37,6 +37,9 @@ pub mod warn_docs_update;
 /// Nudge to audit about-to-ship content for personal-context overshare.
 pub mod warn_overshare;
 
-/// Shared test-only helpers for tests that write real marker files (#302).
-#[cfg(test)]
-pub(crate) mod test_support;
+// Tests that write real marker files (#302) sandbox them through
+// `cadence_hooks_core::test_builders::with_marker_dir` — the ONE helper, over
+// the one lock, for the `CADENCE_MARKER_DIR` global. This crate used to carry a
+// private `test_support` copy; two uncoordinated mutexes over a single env var
+// are the #446 race no critical section can fix, so it was deleted rather than
+// left beside the shared one.

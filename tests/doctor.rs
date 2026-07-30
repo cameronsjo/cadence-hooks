@@ -739,3 +739,179 @@ fn doctor_default_scan_falls_back_to_cache_walk_without_manifest() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ── Marketplace resolution (cameronsjo/cadence-hooks#474) ──────────────────
+//
+// Reproduces both misdiagnoses from the issue end-to-end through the real
+// default scan: a plugin removed from its marketplace upstream (case 1) and
+// a directory-sourced marketplace's plugin (case 2). Each test also carries
+// a positive control proving doctor still detects the REAL problem it must
+// keep detecting — a fix that just went silent everywhere would pass the
+// "no more false positive" half and fail the control.
+
+fn write_known_marketplaces(home: &std::path::Path, body: &serde_json::Value) {
+    std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+    std::fs::write(
+        home.join(".claude/plugins/known_marketplaces.json"),
+        serde_json::to_string(body).unwrap(),
+    )
+    .unwrap();
+}
+
+fn write_installed_plugins_v2(home: &std::path::Path, entries: &[(&str, &std::path::Path)]) {
+    let plugins: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        .map(|(label, install_path)| {
+            (
+                label.to_string(),
+                serde_json::json!([{ "scope": "user", "installPath": install_path.to_str().unwrap() }]),
+            )
+        })
+        .collect();
+    std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+    std::fs::write(
+        home.join(".claude/plugins/installed_plugins.json"),
+        serde_json::to_string(&serde_json::json!({ "version": 2, "plugins": plugins })).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn doctor_reports_removed_upstream_plugin_not_binary_skew() {
+    // Case 1: a plugin deleted from its marketplace, whose stale cached
+    // hooks.json still references a subcommand this binary doesn't know.
+    let home = tempfile::tempdir().unwrap();
+    let install_location = home.path().join("marketplaces/cadence-lab");
+    write_known_marketplaces(
+        home.path(),
+        &serde_json::json!({
+            "cadence-lab": {
+                "source": { "source": "github", "repo": "cameronsjo/cadence-lab" },
+                "installLocation": install_location.to_str().unwrap(),
+            }
+        }),
+    );
+    std::fs::create_dir_all(install_location.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        install_location.join(".claude-plugin/marketplace.json"),
+        r#"{"plugins":[{"name":"vibes","source":"./plugins/vibes"}]}"#,
+    )
+    .unwrap();
+
+    let removed_install = home
+        .path()
+        .join(".claude/plugins/cache/cadence-lab/persona/8f4df2542e4a");
+    write_cached_plugin_at(&removed_install, SKEW_HOOKS_JSON);
+    // Positive control: a plugin still listed in the marketplace, with a
+    // genuine version-skew hooks.json — must still be flagged as skew.
+    let live_install = home
+        .path()
+        .join(".claude/plugins/cache/cadence-lab/vibes/abc123");
+    write_cached_plugin_at(&live_install, SKEW_HOOKS_JSON);
+
+    write_installed_plugins_v2(
+        home.path(),
+        &[
+            ("persona@cadence-lab", &removed_install),
+            ("vibes@cadence-lab", &live_install),
+        ],
+    );
+
+    let metrics = tempfile::tempdir().unwrap();
+    let output = doctor_in_home(home.path(), metrics.path())
+        .output()
+        .expect("failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("persona@cadence-lab") && stdout.contains("removed upstream"),
+        "the removed plugin must report as removed upstream: {stdout}"
+    );
+    assert!(
+        stdout.contains("vibes@cadence-lab") && stdout.contains("not present in this binary"),
+        "the control plugin's real skew must still be reported: {stdout}"
+    );
+    // The misdiagnosis this issue exists to fix: a removed plugin must never
+    // be told to chase a binary upgrade for a retired subcommand.
+    let persona_section = stdout
+        .split("[persona@cadence-lab]")
+        .nth(1)
+        .unwrap_or_default();
+    let persona_line = persona_section.lines().next().unwrap_or_default();
+    assert!(
+        !persona_line.contains("not present in this binary"),
+        "removed plugin must not be misdiagnosed as binary skew: {stdout}"
+    );
+}
+
+/// Create `<dir>/hooks/hooks.json` with the given body, at whatever depth
+/// `dir` names (the caller controls cache-layout depth).
+fn write_cached_plugin_at(dir: &std::path::Path, hooks_json: &str) {
+    std::fs::create_dir_all(dir.join("hooks")).unwrap();
+    std::fs::write(dir.join("hooks/hooks.json"), hooks_json).unwrap();
+}
+
+#[test]
+fn doctor_exempts_directory_sourced_plugin_from_cache_dir_check() {
+    // Case 2: a directory-sourced marketplace's plugin has a recorded, but
+    // never populated, cache installPath — reinstalling it fixes nothing
+    // because nothing is broken.
+    let home = tempfile::tempdir().unwrap();
+    let plugin_source = home.path().join("dev/homelab");
+    std::fs::create_dir_all(&plugin_source).unwrap();
+    write_known_marketplaces(
+        home.path(),
+        &serde_json::json!({
+            "homelab": {
+                "source": { "source": "directory", "path": plugin_source.to_str().unwrap() },
+                "installLocation": plugin_source.to_str().unwrap(),
+            }
+        }),
+    );
+
+    // installPath under plugins/cache/ that is never created on disk — the
+    // exact #474 case 2 shape.
+    let never_populated = home
+        .path()
+        .join(".claude/plugins/cache/homelab/homelab/1.0.0");
+    write_installed_plugins_v2(home.path(), &[("homelab@homelab", &never_populated)]);
+
+    let metrics = tempfile::tempdir().unwrap();
+    let output = doctor_in_home(home.path(), metrics.path())
+        .output()
+        .expect("failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("pinned cache dir missing"),
+        "a directory-sourced plugin's never-populated cache path must not \
+         report as broken.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn doctor_still_flags_missing_cache_dir_for_non_directory_source() {
+    // Positive control for the test above: the exemption must not
+    // blanket-suppress the missing-dir check for a plugin whose marketplace
+    // ISN'T directory-sourced. Same missing-dir shape, no known_marketplaces
+    // entry at all — a genuinely broken cache must still report as broken.
+    let home = tempfile::tempdir().unwrap();
+    let missing = home
+        .path()
+        .join(".claude/plugins/cache/workbench/some-plugin/deadbeef");
+    write_installed_plugins_v2(home.path(), &[("some-plugin@workbench", &missing)]);
+
+    let metrics = tempfile::tempdir().unwrap();
+    let output = doctor_in_home(home.path(), metrics.path())
+        .output()
+        .expect("failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("pinned cache dir missing"),
+        "a genuinely broken (non-directory-sourced) cache entry must still \
+         report as broken.\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

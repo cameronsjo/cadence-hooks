@@ -62,10 +62,7 @@ pub fn marker_dir() -> PathBuf {
 /// under — [`harden_marker_dir`] still runs on the derived path, so an override
 /// never bypasses the `0700` lockdown.
 fn marker_dir_from(override_dir: Option<String>) -> PathBuf {
-    let base = match override_dir {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => paths::marker_temp_dir(),
-    };
+    let base = marker_base_from(override_dir);
     let mut hasher = DefaultHasher::new();
     paths::user_home_lossy_or_default().hash(&mut hasher);
     let dir = base.join(format!("cadence-hooks-{:x}", hasher.finish()));
@@ -74,6 +71,33 @@ fn marker_dir_from(override_dir: Option<String>) -> PathBuf {
     } else {
         base
     }
+}
+
+/// The base directory the per-user hashed subdir is created under: the
+/// `CADENCE_MARKER_DIR` override when set non-empty, else the shared
+/// [`paths::marker_temp_dir`].
+///
+/// Split out so [`marker_dir_is_private`] can recognize the fail-open result
+/// (which *is* this base) without re-deriving the naming scheme.
+fn marker_base_from(override_dir: Option<String>) -> PathBuf {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => paths::marker_temp_dir(),
+    }
+}
+
+/// True when [`marker_dir`] resolved to its hardened `0700` per-user directory,
+/// false when it failed open to the shared base.
+///
+/// The shared base is world-writable on a multi-user host, so a marker there is
+/// pre-plantable by a co-tenant. Presence-only markers tolerate that (the
+/// family's documented posture — [`write_marker`] still refuses to follow a
+/// symlink). A marker whose *content* decides whether a nudge is suppressed does
+/// not: a planted file with a guessable stamp would mute the nudge, and on a
+/// sticky `/tmp` the corrective rename fails, so the mute persists. Consumers
+/// that read marker content to gate output check this first and skip the gate.
+pub fn marker_dir_is_private() -> bool {
+    marker_dir() != marker_base_from(std::env::var("CADENCE_MARKER_DIR").ok())
 }
 
 /// Create the marker dir and lock it to `0700`, refusing a pre-planted symlink.
@@ -193,6 +217,74 @@ pub fn polish_marker_present(command: &str, cwd: Option<&str>) -> bool {
     polish_marker(&state.git_common_dir.to_string_lossy(), &branch).is_file()
 }
 
+/// The daily-gate marker path for `kind`: `<marker_dir>/daily-{kind}`.
+///
+/// Unlike [`session_marker`], `kind` is a compile-time-constant call-site string
+/// (`"platform-drift"`), never payload-derived, so it stays readable rather than
+/// hashed — a legible marker name is what makes the gate debuggable by hand. The
+/// name is still reduced to `[A-Za-z0-9_-]` so the primitive cannot escape
+/// [`marker_dir`] whatever a future call site passes.
+pub fn daily_marker(kind: &str) -> PathBuf {
+    let safe: String = kind
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    marker_dir().join(format!("daily-{safe}"))
+}
+
+/// True on the first sighting of `token` for `kind` today — the once-per-day
+/// nudge gate.
+///
+/// Stamps `"{local_date} {token}"` through the symlink-safe [`write_marker`] and
+/// returns `false` only when the marker already carries exactly that stamp. The
+/// key is *content*, not a bare date, inheriting the reasoning behind
+/// `warn-stale`'s `verdict_token`: a changed token re-fires the same day, so a
+/// partial upgrade gets reported when it happens instead of waiting for
+/// tomorrow.
+///
+/// **Local date, deliberately diverging from `warn-stale`'s UTC one.** This gate
+/// means "once per calendar day as the operator experiences it", matching the
+/// shell `notify_inert` precedent it generalizes; a UTC day boundary falls
+/// mid-afternoon or mid-evening in much of the world and would split one working
+/// day across two gate windows.
+///
+/// Fails open in **both** directions (ADR-0001): an unreadable marker fires (a
+/// repeated nudge beats a missed one), and a failed write still fires — the
+/// nudge is simply not suppressed next session either.
+///
+/// `CADENCE_NO_DAILY_GATE` (any non-empty value) disables the gate: every call
+/// fires and nothing is stamped, so a session debugging a nudge sees it every
+/// time.
+///
+/// The gate is also skipped whenever [`marker_dir_is_private`] is false. This is
+/// the first marker in the family whose *content* decides whether output is
+/// suppressed, so unlike the presence-only markers it cannot ride the shared
+/// fail-open base: a co-tenant could pre-plant the (fully static) filename with a
+/// guessable stamp and mute the nudge for the day. Degraded hardening therefore
+/// degrades toward nudging, which is the same direction every other failure path
+/// here takes.
+pub fn claim_today(kind: &str, token: &str) -> bool {
+    if std::env::var("CADENCE_NO_DAILY_GATE").is_ok_and(|v| !v.is_empty()) {
+        return true;
+    }
+    if !marker_dir_is_private() {
+        return true;
+    }
+    let path = daily_marker(kind);
+    let stamp = format!("{} {token}", crate::time::local_date());
+    if std::fs::read_to_string(&path).is_ok_and(|existing| existing.trim() == stamp) {
+        return false;
+    }
+    let _ = write_marker(&path, &stamp);
+    true
+}
+
 /// Write `contents` to a marker path symlink-safely.
 ///
 /// Stage to a uniquely-named `.{name}.{pid}.tmp` sibling with `create_new`
@@ -245,6 +337,9 @@ pub fn write_marker(path: &Path, contents: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The one shared marker-dir env helper (and its one lock) for the whole
+    // workspace — never mint a module-local sibling (#446).
+    use crate::test_builders::with_marker_dir;
 
     // --- marker_dir_from (pure resolver behind CADENCE_MARKER_DIR) ---
 
@@ -289,30 +384,6 @@ mod tests {
         );
     }
 
-    // --- crate-local env-mutating test serialization (mirrors the metrics
-    // crate's `common::ENV_LOCK` / per-module `with_metrics_dir`, #302) ---
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Run `f` with `CADENCE_MARKER_DIR` set to `dir`, serialized against every
-    /// other marker-dir-mutating test in this module via [`ENV_LOCK`] — keeps
-    /// `polish_marker_present_*` tests below from ever writing into the real
-    /// per-user production marker directory.
-    fn with_marker_dir<F: FnOnce()>(dir: &Path, f: F) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: serialized against every other env-mutating test in this
-        // module via ENV_LOCK.
-        unsafe {
-            std::env::set_var("CADENCE_MARKER_DIR", dir);
-        }
-        f();
-        // SAFETY: serialized against every other env-mutating test in this
-        // module via ENV_LOCK.
-        unsafe {
-            std::env::remove_var("CADENCE_MARKER_DIR");
-        }
-    }
-
     fn input_with_session(sid: &str) -> HookInput {
         HookInput {
             session_id: Some(sid.into()),
@@ -322,16 +393,27 @@ mod tests {
 
     #[test]
     fn session_marker_differs_per_session() {
-        let a = session_marker(&input_with_session("sid-a"), "kind", Some("/tmp/repo"));
-        let b = session_marker(&input_with_session("sid-b"), "kind", Some("/tmp/repo"));
-        assert_ne!(a, b, "distinct sessions must not share a marker");
+        // session_marker() reads marker_dir() (CADENCE_MARKER_DIR), so hold the
+        // shared lock via with_marker_dir even though the assertion only compares
+        // two markers — an unguarded read races a concurrent with_marker_dir
+        // test flipping the base mid-comparison (#373).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = session_marker(&input_with_session("sid-a"), "kind", Some("/tmp/repo"));
+            let b = session_marker(&input_with_session("sid-b"), "kind", Some("/tmp/repo"));
+            assert_ne!(a, b, "distinct sessions must not share a marker");
+        });
     }
 
     #[test]
     fn session_marker_differs_per_repo() {
-        let a = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-a"));
-        let b = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-b"));
-        assert_ne!(a, b, "distinct repos must not share a marker");
+        // See session_marker_differs_per_session: guard the marker_dir() read.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-a"));
+            let b = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-b"));
+            assert_ne!(a, b, "distinct repos must not share a marker");
+        });
     }
 
     #[test]
@@ -381,16 +463,25 @@ mod tests {
 
     #[test]
     fn polish_marker_differs_per_branch() {
-        let a = polish_marker("/tmp/repo", "branch-a");
-        let b = polish_marker("/tmp/repo", "branch-b");
-        assert_ne!(a, b, "distinct branches must not share a marker");
+        // polish_marker() reads marker_dir() (CADENCE_MARKER_DIR); guard the
+        // read the same way as session_marker_differs_per_session (#373).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = polish_marker("/tmp/repo", "branch-a");
+            let b = polish_marker("/tmp/repo", "branch-b");
+            assert_ne!(a, b, "distinct branches must not share a marker");
+        });
     }
 
     #[test]
     fn polish_marker_differs_per_repo() {
-        let a = polish_marker("/tmp/repo-a", "main");
-        let b = polish_marker("/tmp/repo-b", "main");
-        assert_ne!(a, b, "distinct repos must not share a marker");
+        // See polish_marker_differs_per_branch: guard the marker_dir() read.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = polish_marker("/tmp/repo-a", "main");
+            let b = polish_marker("/tmp/repo-b", "main");
+            assert_ne!(a, b, "distinct repos must not share a marker");
+        });
     }
 
     #[test]
@@ -583,5 +674,171 @@ mod tests {
             "gh pr create --title x",
             Some(tmp.path().to_str().unwrap())
         ));
+    }
+
+    // --- claim_today (the once-per-day nudge gate, #458) ---
+    //
+    // Every case runs under `with_marker_dir` so the stamps land in a fresh
+    // tempdir, never the real per-user marker directory (#302), and so the
+    // `CADENCE_NO_DAILY_GATE` mutation below is serialized by the same lock.
+
+    #[test]
+    fn claim_today_fires_on_first_sighting() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            assert!(
+                claim_today("test-gate", "tok"),
+                "an unstamped kind must fire"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_today_suppresses_same_token_same_day() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            assert!(claim_today("test-gate", "tok"));
+            assert!(
+                !claim_today("test-gate", "tok"),
+                "the same token must be silent for the rest of the day"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_today_refires_on_changed_token_same_day() {
+        // Content-keyed, not date-keyed: a partial upgrade changes the token and
+        // must be reported when it happens, not tomorrow.
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            assert!(claim_today("test-gate", "tok-a"));
+            assert!(
+                claim_today("test-gate", "tok-b"),
+                "a changed token must re-fire the same day"
+            );
+            assert!(
+                !claim_today("test-gate", "tok-b"),
+                "and then be gated itself"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_today_refires_and_restamps_on_stale_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let path = daily_marker("test-gate");
+            write_marker(&path, "2020-01-01 tok").unwrap();
+            assert!(
+                claim_today("test-gate", "tok"),
+                "yesterday's stamp must not gate today"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{} tok", crate::time::local_date()),
+                "the stale stamp must be replaced with today's"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_today_unreadable_marker_fires() {
+        // Fail-open (ADR-0001): a marker that cannot be read is not evidence
+        // the nudge already fired. A directory at the marker path makes
+        // `read_to_string` fail without making the path absent.
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            std::fs::create_dir_all(daily_marker("test-gate")).unwrap();
+            assert!(claim_today("test-gate", "tok"));
+        });
+    }
+
+    #[test]
+    fn claim_today_always_fires_under_escape_hatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            // SAFETY: `with_marker_dir` holds the one env lock for this whole
+            // closure, so this mutation is serialized against every other
+            // env-mutating test in the binary.
+            unsafe {
+                std::env::set_var("CADENCE_NO_DAILY_GATE", "1");
+            }
+            assert!(claim_today("test-gate", "tok"));
+            assert!(
+                claim_today("test-gate", "tok"),
+                "the escape hatch must fire every time, never stamping"
+            );
+            assert!(
+                !daily_marker("test-gate").exists(),
+                "a disabled gate must leave no marker behind"
+            );
+            // SAFETY: still inside the env lock held by `with_marker_dir`.
+            unsafe {
+                std::env::remove_var("CADENCE_NO_DAILY_GATE");
+            }
+        });
+    }
+
+    #[test]
+    fn daily_marker_never_escapes_the_private_dir() {
+        // `kind` is a call-site constant, so it is kept readable rather than
+        // hashed — but a traversal-shaped kind must still be inert.
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let p = daily_marker("../../evil");
+            assert_eq!(
+                p.parent(),
+                Some(marker_dir().as_path()),
+                "marker must be a direct child of the private dir: {p:?}"
+            );
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(
+                !name.contains('/') && !name.contains(".."),
+                "filename must carry no traversal: {name}"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_today_never_suppresses_from_the_shared_fail_open_base() {
+        // The shared base is pre-plantable by a co-tenant, and this marker's
+        // CONTENT decides suppression — so a planted stamp there must not be
+        // able to mute the nudge. Modelled by pointing CADENCE_MARKER_DIR at a
+        // path where the hashed subdir cannot be created (a regular FILE, so
+        // `create_dir_all` fails), which is exactly what makes `marker_dir()`
+        // fail open to the base.
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("occupied");
+        std::fs::write(&not_a_dir, "").unwrap();
+        with_marker_dir(&not_a_dir, || {
+            assert!(
+                !marker_dir_is_private(),
+                "precondition: this must be the fail-open path, or the test proves nothing"
+            );
+            assert!(claim_today("test-gate", "tok"));
+            assert!(
+                claim_today("test-gate", "tok"),
+                "a degraded marker dir must never suppress, however many times it is asked"
+            );
+        });
+    }
+
+    #[test]
+    fn marker_dir_is_private_when_hardening_succeeds() {
+        // The positive control for the test above: the same assertion against a
+        // usable base must report private, or `marker_dir_is_private` could be
+        // returning false unconditionally.
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            assert!(marker_dir_is_private());
+        });
+    }
+
+    #[test]
+    fn daily_marker_differs_per_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            assert_ne!(daily_marker("gate-a"), daily_marker("gate-b"));
+        });
     }
 }

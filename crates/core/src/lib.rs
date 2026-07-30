@@ -23,8 +23,18 @@ pub mod time;
 pub mod transcript;
 pub mod worktree;
 
-#[cfg(feature = "test-builders")]
+// Also compiled for this crate's own `#[cfg(test)]` modules, which share the
+// marker-dir env helper it carries — one global, one lock, one helper (#446).
+#[cfg(any(test, feature = "test-builders"))]
 pub mod test_builders;
+
+// Git-fixture builders (a `target/`-rooted `Scratch` plus `git_in`/`init_repo`)
+// live separately from `test_builders`'s `HookInput` builders — the two have
+// nothing in common beyond both being test-only, and folding fixtures that
+// spawn `git` subprocesses into the `HookInput`-builder module would make
+// every consumer of `make_bash`/`make_edit` compile that code too.
+#[cfg(any(test, feature = "test-builders"))]
+pub mod git_fixtures;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -184,6 +184,45 @@ pub fn utc_timestamp() -> String {
     cadence_hooks_core::time::utc_timestamp()
 }
 
+/// Today's UTC date, `YYYY-MM-DD` — the freshness half of a once-per-day alarm
+/// marker. Sliced from [`utc_timestamp`] so it shares the ledgers' clock rather
+/// than introducing a second one.
+pub fn today_utc() -> String {
+    utc_timestamp()[..10].to_string()
+}
+
+/// Claim today's slot for a once-per-day alarm, returning `true` when the
+/// caller should speak.
+///
+/// The marker is `<dir>/state/<filename>` and holds `<UTC date> <verdict>`. A
+/// caller whose exact `verdict` is already recorded for today gets `false` and
+/// stays silent; anyone else records the new pair and gets `true`. Keying on
+/// the verdict as well as the date is what lets an *escalation* speak the same
+/// day while a repeat of the same finding does not — so `verdict` should name
+/// the alarm's shape, never a count that drifts on every run.
+///
+/// Living under `state/` is deliberate: the marker is not a `*.jsonl`, and it
+/// sits outside the ledger dir proper, so writing it can never freshen the
+/// staleness signal [`crate::warn_stale`] reads.
+///
+/// Fail-open (ADR-0001): an unreadable marker is treated as absent, and a write
+/// error is swallowed. Both fail toward *speaking* — a repeated alarm beats a
+/// missed one.
+pub fn claim_daily_alarm(dir: &Path, filename: &str, verdict: &str) -> bool {
+    let marker = dir.join("state").join(filename);
+    let token = format!("{} {}", today_utc(), verdict);
+    if let Ok(existing) = std::fs::read_to_string(&marker)
+        && existing.trim() == token
+    {
+        return false;
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, &token);
+    true
+}
+
 /// Strip display-affecting characters from a file-sourced string before it is
 /// interpolated into terminal output or into the `additionalContext` blob a
 /// nudge injects into the agent's context.

@@ -9,7 +9,10 @@
 //!   `pathclass::CLAUDE_SCRATCH_DIRS`). The friction removed.
 //! - **BLOCK** (exit 2, disclosed message) — `/`, `$HOME`, a first-level home
 //!   child, inside `$OBSIDIAN_VAULT`, or a git repo root / any path with a
-//!   `.git` component.
+//!   `.git` component. A *symlink to* a repo root is not a repo here:
+//!   `rm`/`unlink` removes the link, so it classifies as scratch — but only
+//!   when the operand names the link ITSELF. A trailing slash, a glob, a bare
+//!   cwd sweep, and a literal `.git` component each keep the BLOCK (#402).
 //! - **ASK** ([`Outcome::Ask`], the prompt) — an unexpanded variable, a command
 //!   substitution, a `..`-bearing path, a brace list, durable `.claude` state,
 //!   or anything else not proven safe. This is the default, so nothing that
@@ -52,6 +55,11 @@
 //!   misread; the miss is intentional.
 //! - A `..`-bearing target resolves ambiguously (symlinks, escapes), so it
 //!   downgrades to ASK rather than a guessed BLOCK/ALLOW.
+//! - The symlink carve-out above is applied to every path *operand*, not only
+//!   `rm`/`unlink` ones, so a `find` reaches it through its search roots. The
+//!   dereferencing spellings are excluded rather than accepted: `find -L` and
+//!   `find -H` both follow a symlinked root, and both keep the BLOCK. `-P` and
+//!   the default do not follow, so those still judge the link itself.
 //! - Same-command variable expansion is deliberately **absent**. Resolving
 //!   `SP=/tmp/x; rm -rf "$SP"` was built and then withdrawn: three adversarial
 //!   review rounds found sixteen silent-ALLOW misses in it, and the last round
@@ -73,10 +81,12 @@
 
 use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, looks_absolute, resolve_cd_target,
-    skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers, tokenize,
+    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, fold_verb, looks_absolute,
+    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome, normalize_path};
+use std::borrow::Cow;
 use std::path::Path;
 
 /// Delete verbs whose leading command word marks a filesystem deletion.
@@ -87,22 +97,129 @@ use std::path::Path;
 const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 
 /// The command word `token` names, stripped to what the shell will actually
-/// run: `basename` so `/bin/rm` matches, and a leading `\` removed so the
-/// alias-bypass form `\rm` is still seen as `rm`.
+/// run: `basename` so `/bin/rm` matches, a leading `\` removed so the
+/// alias-bypass form `\rm` is still seen as `rm`, and ASCII case folded so `RM`
+/// is too.
 ///
-/// (Deliberate miss: `RM` on a case-insensitive volume — matching
-/// case-insensitively would be wrong on Linux. Mitigated: a settings
-/// `allow Bash(rm:*)` rule keys on the leading word too, so it defers, never
-/// silently auto-approves.)
-fn command_word(token: &str) -> &str {
-    basename(token).trim_start_matches('\\')
+/// The fold is cadence-hooks#488, and it tracks the shared
+/// [`cadence_hooks_core::shell::command_word`] deliberately — the same reason
+/// for the same measured hole. On a case-insensitive volume the shell resolves
+/// `RM` to the `rm` binary and deletes; this guard collected no target and
+/// returned a silent Allow. Every consumer of this function is a DETECTOR — the
+/// delete-verb set, the `find` arm, the shell-wrapper arm, and the
+/// transparent-prefix `Unresolvable` gate — so folding can only ADD an ask or a
+/// block, never subtract one. The old mitigation note (a settings
+/// `allow Bash(rm:*)` rule keys on the leading word, so the guard defers rather
+/// than auto-approving) applied to the *lowercase* spelling only; it never
+/// covered `RM`, which is why the miss was real rather than merely theoretical.
+///
+/// **Deliberately NOT the shared [`cadence_hooks_core::shell::command_word`],
+/// which the enforce-worktree verb gates moved onto (#450 review).** The two
+/// differ on one input: the shared one strips exactly ONE backslash, so `\\rm`
+/// normalizes to `\rm` and is not a delete verb — which is what the shell does,
+/// since it removes one backslash and then finds no command named `\rm`. The
+/// repeating strip here calls `\\rm` a deletion and blocks it. Converging would
+/// therefore *loosen* a block-capable guard on a spelling nobody has measured
+/// in the wild, so it is left alone and tracked separately rather than ridden
+/// in on a PR about three other issues. The two are consistent in the direction
+/// that matters: every spelling the shell really runs as `rm` is caught by both.
+fn command_word(token: &str) -> Cow<'_, str> {
+    fold_verb(basename(token).trim_start_matches('\\'))
 }
 
 /// `token` names one of the [`DELETE_VERBS`]. Shared by every site that has to
 /// recognize a delete verb, so the `\`-strip above lives in exactly one place —
 /// forgetting it at a new call site would silently re-open the alias bypass.
 fn is_delete_verb(token: &str) -> bool {
-    DELETE_VERBS.contains(&command_word(token))
+    DELETE_VERBS.contains(&command_word(token).as_ref())
+}
+
+/// Shell command words that take an inline script via `-c`. Mirrors the set
+/// [`child_scripts`] recognizes — the primitive exposes the *extraction* but
+/// not the membership test, and [`wrapper_script_deletes`] needs the latter to
+/// find a wrapper sitting behind a prefix rather than in command position.
+const SHELL_WRAPPERS: &[&str] = &["sh", "bash", "zsh", "dash"];
+
+/// These tokens name a deletion the shell will actually perform, in any of the
+/// spellings the flagged-prefix gate has to arm on.
+///
+/// A bare delete verb is the common case, but two spellings name no delete verb
+/// in the token stream at all: `find … -delete` never mentions one, and a
+/// `sh -c '…'` wrapper carries its whole script inside ONE token whose basename
+/// is the script's last path segment (`rm -rf /srv/repo` → `repo`). Behind a
+/// *flagged* transparent prefix neither is reachable any other way —
+/// `skip_transparent_prefixes` stops at the flag, so `collect_targets`'s own
+/// `find` branch never sees the command word and `child_scripts` never sees the
+/// wrapper. Both then collected nothing, which reads as "not a deletion": a
+/// silent ALLOW on `env -i find ~/Documents -delete` (#443).
+///
+/// `depth` bounds the wrapper recursion on the shared [`MAX_WRAPPER_DEPTH`]
+/// budget, so a nested `sh -c 'sh -c "rm -rf ~"'` terminates.
+fn mentions_deletion(tokens: &[String], depth: usize) -> bool {
+    // Bound the scan. `wrapper_script_deletes` is quadratic in token count — it
+    // copies the tail at each wrapper candidate — and measured ~1s at 8000
+    // tokens. Past the cap, report a deletion WITHOUT scanning: the gate emits
+    // an `Unresolvable` and the command ASKs.
+    //
+    // Failing toward the prompt is this guard's whole default posture — a
+    // command this large is emphatically not "structurally proven safe" — so
+    // the cap costs at most one prompt on a pathological input and cannot open
+    // a hole. Reachable only behind a flagged transparent prefix, which is a
+    // narrow slice of commands to begin with. Not a security bound: these are
+    // self-authored commands, so the concern is a stalled hook, not an attacker.
+    if tokens.len() > MAX_GATE_TOKENS {
+        return true;
+    }
+    tokens.iter().any(|t| is_delete_verb(t))
+        || destructive_find(tokens)
+        || wrapper_script_deletes(tokens, depth)
+}
+
+/// Token ceiling for the flagged-prefix deletion scan — past this,
+/// [`mentions_deletion`] reports a deletion unscanned and the command ASKs.
+/// Far above any hand-written command; sized to bound the quadratic wrapper
+/// scan, not to judge anything.
+const MAX_GATE_TOKENS: usize = 2048;
+
+/// These tokens run a `find` that deletes. Gated on a `find` command word so a
+/// stray `-delete` in an unrelated command cannot arm the gate on its own, then
+/// delegating the deletion test to [`find_is_destructive`] — the same predicate
+/// `collect_targets` uses when `find` IS in command position.
+///
+/// Scanned across the whole token list rather than from a command word, because
+/// the case this exists for is precisely the one where the command word is
+/// unreachable.
+fn destructive_find(tokens: &[String]) -> bool {
+    tokens.iter().any(|t| command_word(t) == "find") && find_is_destructive(tokens)
+}
+
+/// These tokens spawn a shell wrapper whose `-c` script names a deletion.
+///
+/// The wrapper is located anywhere in the stream, not just at token 0, since
+/// the whole point is a wrapper standing behind a prefix `argv` still leads
+/// with. Extraction reuses [`child_scripts`] (with an empty segment, so only
+/// the `-c` argument comes back and no substitution body is double-counted) —
+/// the `-c` grammar it implements, glued `-ec` forms included, stays in one
+/// place.
+fn wrapper_script_deletes(tokens: &[String], depth: usize) -> bool {
+    if depth >= MAX_WRAPPER_DEPTH {
+        return false;
+    }
+    tokens.iter().enumerate().any(|(i, tok)| {
+        if !SHELL_WRAPPERS.contains(&command_word(tok).as_ref()) {
+            return false;
+        }
+        // `child_scripts` recognizes the shell word with a bare `rsplit('/')`,
+        // while the membership test above goes through `command_word`, which
+        // also strips the alias-bypass `\`. Left unreconciled, `\sh` passes the
+        // test and then extracts nothing — one spelling short of the fix, and a
+        // silent ALLOW. Hand the normalized word over so both sides agree.
+        let mut normalized = tokens[i..].to_vec();
+        normalized[0] = command_word(&normalized[0]).to_string();
+        child_scripts(&normalized, "")
+            .iter()
+            .any(|script| mentions_deletion(&tokenize(script), depth + 1))
+    })
 }
 
 /// Does `flag` (in separate-token form) consume the following token as a value
@@ -237,7 +354,15 @@ struct RmContext<'a> {
 /// A deletion target extracted from the command, before classification.
 enum TargetToken {
     /// A path resolved against the effective cwd (a shell path string).
-    Path(String),
+    ///
+    /// `dereferences` records that the shell resolves *through* this path
+    /// rather than naming it. Two routes land here: a glob operand (`link/*`,
+    /// `link/.*`), which pathname expansion resolves through the link before
+    /// `rm` ever runs, and a bare cwd reference (`cd link && rm -rf *`, or a
+    /// literal `.`), which names the directory the sweep stands in. Both reduce
+    /// to the link's own path, so without this flag the #402 symlink demotion
+    /// would allow a delete that really does empty the repo.
+    Path { path: String, dereferences: bool },
     /// A file-scoped glob (`*.tgz`, `homebridge-*.tgz`) that names artifacts
     /// *within* `dir` rather than the directory itself. `recursive` records
     /// whether the invocation carried `-r`/`-R` — a recursive sweep is judged
@@ -251,7 +376,12 @@ enum TargetToken {
     /// Judged one step softer than [`Path`](TargetToken::Path), and only in the
     /// ambiguous middle. Every protected class still blocks, and durable
     /// `.claude` state has its own class precisely so it is not swept in here.
-    SingleFile(String),
+    ///
+    /// `dereferences` carries the same meaning as on [`Path`](TargetToken::Path).
+    /// Only the bare-cwd route can set it here — this class is glob-free by
+    /// construction — but it is tracked rather than assumed, so the demotion
+    /// rests on a computed fact instead of a comment.
+    SingleFile { path: String, dereferences: bool },
     /// An operand that could not be resolved (unexpanded var / substitution /
     /// `..`-bearing / brace list). Always ASK.
     Unresolvable,
@@ -340,10 +470,19 @@ fn collect_targets(
         // the shell-preserving list, so `eval rm -rf ~/Documents` matched no
         // delete verb in command position and collected nothing — the same
         // silent ALLOW, and an explicit row in #426's table.
+        //
+        // The deletion test is `mentions_deletion`, not a bare delete-verb
+        // token scan: `find … -delete` and a `sh -c '…'` wrapper name no delete
+        // verb anywhere in the stream, so both sailed through the same hole
+        // (#443). Widening the gate can only add an `Unresolvable` (ASK) to a
+        // segment whose own collection is already empty — reaching here means
+        // `argv` still leads with the prefix, so the delete/xargs/find branches
+        // below all miss — and `Outcome::merge` keeps the most severe verdict,
+        // so a BLOCK from an already-recursed child script still wins.
         if argv.first().is_some_and(|first| {
             let word = command_word(first);
-            TRANSPARENT.contains(&word) || word == "eval"
-        }) && tokens.iter().any(|t| is_delete_verb(t))
+            TRANSPARENT.contains(&word.as_ref()) || word == "eval"
+        }) && mentions_deletion(&tokens, 0)
         {
             out.push(TargetToken::Unresolvable);
             continue;
@@ -351,6 +490,7 @@ fn collect_targets(
 
         let Some(first) = argv.first() else { continue };
         let verb = command_word(first);
+        let verb = verb.as_ref();
         if DELETE_VERBS.contains(&verb) {
             let recursive = rm_is_recursive(argv, verb);
             let operands = delete_operands(argv, verb);
@@ -376,6 +516,7 @@ fn collect_targets(
                     dir_known,
                     recursive,
                     single_file,
+                    false,
                 ));
             }
         } else if verb == "xargs" && xargs_runs_delete(argv) {
@@ -393,6 +534,10 @@ fn collect_targets(
             // target → ASK, rather than a silent cwd default.
             match find_roots(argv) {
                 FindTargets::Paths(roots) => {
+                    // `-L`/`-H` make `find` follow a symlinked search root, so
+                    // the walk lands in the real tree and the #402 demotion must
+                    // not treat that root as "just a link" (#402 review).
+                    let follows = find_follows_symlinks(argv);
                     for root in roots {
                         // A destructive `find` recurses by nature — treat its
                         // roots conservatively (recursive = true).
@@ -402,6 +547,7 @@ fn collect_targets(
                             dir_known,
                             true,
                             false,
+                            follows,
                         ));
                     }
                 }
@@ -445,6 +591,18 @@ fn find_is_destructive(argv: &[String]) -> bool {
         }
     }
     false
+}
+
+/// This `find` will follow a symlink named on its command line. `-L` follows
+/// every symlink it meets; `-H` follows the ones in the arguments — and a
+/// search root IS an argument, so both dereference a symlinked root and walk
+/// the real tree behind it. `-P` (the default) does not.
+///
+/// Matters only to the #402 symlink demotion: without this, `find -H <link>
+/// -delete` classified on the link, demoted, and silently ALLOWed a delete that
+/// empties the repo the link points at.
+fn find_follows_symlinks(argv: &[String]) -> bool {
+    argv.iter().any(|t| t == "-L" || t == "-H")
 }
 
 /// Path operands of an `rm`/`unlink`/`shred`/`truncate` invocation: non-flag
@@ -536,12 +694,18 @@ fn find_roots(argv: &[String]) -> FindTargets {
 /// `recursive` records whether the invocation carried `-r`/`-R`; it rides along
 /// on a [`TargetToken::FileGlob`] so the judge can soften a flat artifact sweep
 /// but not a recursive one.
+///
+/// `caller_dereferences` lets the caller assert what only it can know: that
+/// this invocation follows a symlinked operand regardless of how the operand is
+/// spelled (`find -L`/`-H`). It is OR'd into the `dereferences` fact computed
+/// from the operand itself.
 fn resolve_target(
     operand: &str,
     effective_dir: &str,
     dir_known: bool,
     recursive: bool,
     single_file: bool,
+    caller_dereferences: bool,
 ) -> TargetToken {
     // Unexpanded variable / command substitution — can't prove anything. This
     // guard (with the `..` checks below) runs AHEAD of glob detection, so an
@@ -583,6 +747,19 @@ fn resolve_target(
     if !dir_known && !looks_absolute(literal) && !literal.starts_with('~') {
         return TargetToken::Unresolvable;
     }
+    // Does the shell resolve THROUGH this operand rather than name it? A glob
+    // is expanded by pathname resolution before `rm` runs, and a bare cwd
+    // reference names the directory the sweep stands in — either way a symlink
+    // at `resolved` is followed, so the #402 demotion must not apply. Computed
+    // from the operand, because by the time the judge sees a resolved path the
+    // three spellings are indistinguishable: `rm -rf link/*`, `rm -rf link/.*`,
+    // and `cd link && rm -rf *` all reduce to `link`.
+    // `caller_dereferences` carries what the operand string cannot show: a
+    // `find -L`/`-H` follows a symlinked root however plainly it is spelled.
+    let dereferences = caller_dereferences
+        || operand.contains(['*', '?', '['])
+        || literal.is_empty()
+        || literal == ".";
     // A bare glob-less cwd reference (`*` → "", or a literal `.`) is the
     // effective directory itself.
     let resolved = if literal.is_empty() || literal == "." {
@@ -615,9 +792,15 @@ fn resolve_target(
     // glob-metachar check is what keeps `rm *` out: that resolves to the
     // *directory* the sweep runs in, which is emphatically not one file.
     if single_file && !operand.contains(['*', '?', '[']) {
-        return TargetToken::SingleFile(resolved);
+        return TargetToken::SingleFile {
+            path: resolved,
+            dereferences,
+        };
     }
-    TargetToken::Path(resolved)
+    TargetToken::Path {
+        path: resolved,
+        dereferences,
+    }
 }
 
 /// True when `operand`'s final path segment is a glob that scopes to files
@@ -732,14 +915,87 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
     TargetClass::Unknown
 }
 
+/// Classify a deletion **operand** — a path the delete verb names directly.
+///
+/// Everything [`classify_path`] decides, plus the one fact that holds for an
+/// operand and fails for the directory a glob expands inside.
+fn classify_operand(
+    path: &str,
+    dereferences: bool,
+    ctx: &RmContext,
+    is_git_root: &dyn Fn(&str) -> bool,
+    is_symlink: &dyn Fn(&str) -> bool,
+) -> TargetClass {
+    match classify_path(path, ctx, is_git_root) {
+        // #402: `rm`/`unlink` on a symlink removes the LINK; the repo it points
+        // at is unreachable by that operation. It classified as `GitRepo` only
+        // because the git-root probe stats `<target>/.git`, which follows the
+        // link — so the block was about a repo the command could never touch.
+        //
+        // Three guards keep that rationale true, each closing a route where the
+        // link IS followed and the repo really is reachable:
+        //
+        // - `!dereferences` — a glob operand or a bare cwd sweep resolves
+        //   through the link (`rm -rf link/*`, `cd link && rm -rf *`). See
+        //   [`TargetToken::Path`].
+        // - `!path.ends_with(['/', '\\'])` — pathname resolution dereferences a
+        //   trailing slash, and BSD fts descends (`find link/` lists the
+        //   target's contents), so `rm -rf link/` keeps its verdict. BOTH
+        //   separators are checked because this reads the RAW path: `normalize`
+        //   would fold `\` to `/` but also strip the trailing separator, which
+        //   is the very signal being tested. Windows is a shipped target, so a
+        //   `/`-only test let `rm -rf C:\repo\link\` allow where its
+        //   forward-slash twin blocked.
+        // - `!has_git_component(...)` — `PathClass::GitRoot` has two halves,
+        //   `has_git_component(norm) || is_git_root(norm)`, and only the second
+        //   is the probe this rationale is about. A symlinked `.git` (the real
+        //   `repo/.git -> /store/repo.git` bare-repo layout) classifies from
+        //   the literal segment with no probe involved, so demoting it would
+        //   rest on a reason that never applied.
+        //
+        // Ordered cheapest-first: two field tests and one string scan run
+        // before the `lstat`, which is the only syscall in the chain.
+        //
+        // `GitRepo`-only by design: this is a statement about that one probe
+        // following the link, not a claim that symlinks are cheap. A symlink
+        // that is a home child or sits in the vault never reaches here.
+        //
+        // The arm does not check the verb, so `shred`/`truncate` reach it too —
+        // and those two DO follow a symlink. Harmless rather than overlooked:
+        // reaching `GitRepo` at all means `<target>/.git` resolved, so the
+        // dereferenced target is a directory, and both verbs fail on one.
+        TargetClass::GitRepo
+            if !dereferences
+                && !path.ends_with(['/', '\\'])
+                && !has_git_component(&pathclass::normalize(path))
+                && is_symlink(path) =>
+        {
+            TargetClass::Scratch
+        }
+        other => other,
+    }
+}
+
+/// True when any `/`-separated segment of `norm` is exactly `.git`.
+///
+/// Deliberately duplicates `pathclass`'s private predicate of the same name
+/// (this module's reuse ledger: promote when cheap, else duplicate with
+/// attribution). guard-rm needs to tell the two halves of `PathClass::GitRoot`
+/// apart, and the shared classifier answers only the union — exposing its
+/// internals to serve one consumer would couple the two without real reuse.
+fn has_git_component(norm: &str) -> bool {
+    norm.split('/').any(|seg| seg == ".git")
+}
+
 /// The decision core: collect targets, classify each, and keep the most severe
-/// verdict (Block > Ask > Allow). Pure — env and the git-root probe are
-/// injected.
+/// verdict (Block > Ask > Allow). Pure — env and both filesystem probes
+/// (git-root, symlink) are injected.
 fn judge_rm(
     command: &str,
     cwd: &str,
     ctx: &RmContext,
     is_git_root: &dyn Fn(&str) -> bool,
+    is_symlink: &dyn Fn(&str) -> bool,
 ) -> CheckResult {
     let mut targets = Vec::new();
     collect_targets(command, cwd, true, 0, &mut targets);
@@ -756,15 +1012,23 @@ fn judge_rm(
     for target in &targets {
         let class = match target {
             TargetToken::Unresolvable => TargetClass::Unresolvable,
-            TargetToken::Path(p) => classify_path(p, ctx, is_git_root),
+            TargetToken::Path { path, dereferences } => {
+                classify_operand(path, *dereferences, ctx, is_git_root, is_symlink)
+            }
             // One file, no recursion. Only the ambiguous middle softens: every
             // protected class keeps blocking, and `ClaudeState` is a separate
             // class precisely so it is not swept in here — a lone transcript is
             // still the only copy of that transcript.
-            TargetToken::SingleFile(p) => match classify_path(p, ctx, is_git_root) {
-                TargetClass::Unknown => TargetClass::Scratch,
-                other => other,
-            },
+            TargetToken::SingleFile { path, dereferences } => {
+                match classify_operand(path, *dereferences, ctx, is_git_root, is_symlink) {
+                    TargetClass::Unknown => TargetClass::Scratch,
+                    other => other,
+                }
+            }
+            // Deliberately `classify_path`, NOT `classify_operand`: a glob
+            // DEREFERENCES. `link/*` is resolved by pathname expansion, so the
+            // artifacts it names live in the target — the symlink demotion
+            // would soften a sweep that really does reach the repo.
             TargetToken::FileGlob { dir, recursive } => {
                 match classify_path(dir, ctx, is_git_root) {
                     // A flat artifact sweep in a git repo (`rm *.tgz`) is routine
@@ -853,7 +1117,13 @@ impl Check for GuardRm {
             vault: vault.as_deref(),
             tmpdir: tmpdir.as_deref(),
         };
-        judge_rm(command, cwd, &ctx, &is_git_root_on_disk)
+        judge_rm(
+            command,
+            cwd,
+            &ctx,
+            &is_git_root_on_disk,
+            &is_symlink_on_disk,
+        )
     }
 }
 
@@ -861,6 +1131,23 @@ impl Check for GuardRm {
 /// worktree whose `.git` is a *file*). One `stat` per target — no subprocess.
 fn is_git_root_on_disk(target: &str) -> bool {
     !target.is_empty() && Path::new(target).join(".git").exists()
+}
+
+/// Real symlink probe: `target` is ITSELF a symbolic link.
+///
+/// `symlink_metadata` is an `lstat` — it does not follow the final component,
+/// which is the entire point. `metadata` would report the directory the link
+/// points at, agree with the git-root probe, and answer the wrong question.
+/// One `lstat`, and only for a target already classified as a git repo.
+///
+/// An `Err` (unreadable, vanished, permission-denied) reads as "not a symlink",
+/// which keeps the caller's `GitRepo` verdict and therefore BLOCKs. That is the
+/// safe direction for *this* probe specifically: unlike the guard's usual
+/// fail-open posture (ADR-0001), the only thing a failure here can do is
+/// withhold a softening, never grant one.
+fn is_symlink_on_disk(target: &str) -> bool {
+    !target.is_empty()
+        && std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 #[cfg(test)]
@@ -879,17 +1166,29 @@ mod tests {
     /// A vault root independent of home and temp (so no ALLOW rule pre-empts it).
     const VAULT: &str = "/vaults/main";
 
-    /// Judge with the real home, a fixed vault, no tmpdir, and a git-root probe
-    /// that returns true only for the exact paths in `git_roots`.
-    fn judge_with(command: &str, cwd: &str, git_roots: &[&str]) -> Outcome {
+    /// Judge with the real home, a fixed vault, no tmpdir, and both filesystem
+    /// probes returning true only for the exact paths listed.
+    fn judge_with_symlinks(
+        command: &str,
+        cwd: &str,
+        git_roots: &[&str],
+        symlinks: &[&str],
+    ) -> Outcome {
         let home = home();
         let ctx = RmContext {
             home: &home,
             vault: Some(VAULT),
             tmpdir: None,
         };
-        let probe = |p: &str| git_roots.contains(&p);
-        judge_rm(command, cwd, &ctx, &probe).outcome
+        let git_probe = |p: &str| git_roots.contains(&p);
+        let link_probe = |p: &str| symlinks.contains(&p);
+        judge_rm(command, cwd, &ctx, &git_probe, &link_probe).outcome
+    }
+
+    /// Judge with a git-root probe that returns true only for the exact paths
+    /// in `git_roots`, and nothing on disk a symlink.
+    fn judge_with(command: &str, cwd: &str, git_roots: &[&str]) -> Outcome {
+        judge_with_symlinks(command, cwd, git_roots, &[])
     }
 
     /// Common case: no git roots on disk.
@@ -941,6 +1240,101 @@ mod tests {
             judge("nice -n 10 cargo build", "/private/tmp"),
             Outcome::Allow
         );
+    }
+
+    // --- #443: the flagged-prefix gate's deletion test ---
+
+    /// The gate armed on a token whose basename is a delete verb, and a
+    /// `find … -delete` names none — so the destructive `find` behind a flagged
+    /// prefix collected nothing and read as "not a deletion".
+    #[test]
+    fn flagged_prefix_hiding_a_destructive_find_is_unresolvable() {
+        for command in [
+            "env -i find /srv/repo -delete",
+            "nice -n 10 find ~/Documents -name '*.md' -delete",
+            "env -u FOO find /srv/repo -delete",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "a destructive find behind a flagged prefix must not be a silent allow: {command}"
+            );
+        }
+    }
+
+    /// A wrapper carries its whole script in ONE token, whose basename is the
+    /// script's last path segment (`rm -rf /srv/repo` → `repo`) — never a
+    /// delete verb, so the gate stayed silent.
+    #[test]
+    fn flagged_prefix_hiding_a_wrapper_delete_is_unresolvable() {
+        for command in [
+            "env -i sh -c 'rm -rf /srv/repo'",
+            "nice -n 10 bash -c 'rm -rf ~/Documents'",
+            "env -u FOO zsh -c 'find /srv/repo -delete'",
+            "eval sh -c 'rm -rf ~/Documents'",
+            // `\sh` bypasses a shell alias and is still `sh`. The membership
+            // test normalizes it, so extraction must too — otherwise this one
+            // spelling stays a silent ALLOW.
+            "env -i \\sh -c 'rm -rf ~/Documents'",
+            "nice -n 10 /bin/sh -c 'rm -rf ~/Documents'",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "a wrapped delete behind a flagged prefix must not be a silent allow: {command}"
+            );
+        }
+    }
+
+    /// The widening may only turn silent-ALLOW into ASK. Every spelling that
+    /// blocked before must still block — a gate that armed too eagerly would
+    /// short-circuit the segment and downgrade a real BLOCK to a prompt.
+    #[test]
+    fn widened_gate_preserves_every_block_spelling() {
+        for command in [
+            "rm -rf /",
+            "rm -rf ~",
+            "rm -rf ~/Documents",
+            "env rm -rf ~/Documents",
+            "command rm -rf ~",
+            "env FOO=1 rm -rf /",
+            "/bin/rm -rf /",
+            "\\rm -rf /",
+            "bash -lc 'rm -rf /'",
+            "sh -c 'rm -rf ~/Documents'",
+            "exec sh -c 'rm -rf ~/Documents'",
+            "(rm -rf /)",
+            "{ rm -rf ~/Desktop; }",
+            "echo $(rm -rf ~)",
+            "find ~/Documents -delete",
+            "find -L ~/Documents -delete",
+            "find ~/Documents -exec rm -rf {} +",
+            "rm -rf /vaults/main",
+            "rm ~/.zshrc",
+            "truncate -s 0 ~/Documents",
+            "rm -rf ~/.claude/.git",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Block,
+                "the widened gate must not downgrade a block: {command}"
+            );
+        }
+    }
+
+    /// Still gated on a deletion actually appearing — a wrapper or a `find`
+    /// that deletes nothing must stay silent, or every flagged prefix in the
+    /// session starts prompting.
+    #[test]
+    fn flagged_prefix_without_a_deletion_stays_silent() {
+        for command in [
+            "env -i sh -c 'ls -la /srv/repo'",
+            "nice -n 10 bash -c 'cargo build'",
+            "env -i find /srv/repo -name '*.md'",
+            "nice -n 10 find /srv/repo -exec cat {} +",
+        ] {
+            assert_eq!(judge(command, "/private/tmp"), Outcome::Allow, "{command}");
+        }
     }
 
     // --- #427: a `..` behind a glob metachar ---
@@ -1029,6 +1423,7 @@ mod tests {
             "/home",
             &ctx,
             &|_| true,
+            &|_| false,
         )
         .outcome;
         assert_eq!(out, Outcome::Allow);
@@ -1169,7 +1564,8 @@ mod tests {
             tmpdir: None,
         };
         // The same path is just an unknown middle path with no vault configured.
-        let out = judge_rm("rm -rf /vaults/main/x", "/home", &ctx, &|_| false).outcome;
+        let nothing = |_: &str| false;
+        let out = judge_rm("rm -rf /vaults/main/x", "/home", &ctx, &nothing, &nothing).outcome;
         assert_eq!(out, Outcome::Ask);
     }
 
@@ -1196,6 +1592,184 @@ mod tests {
                 &["/Users/cam/proj/myrepo"],
             ),
             Outcome::Block
+        );
+    }
+
+    // --- #402: a symlink operand names the LINK, not the repo it points at ---
+
+    /// The git-root probe stats `<target>/.git`, which FOLLOWS the link — so a
+    /// symlink pointing at a repo reported `GitRepo` and blocked, though the
+    /// `rm` could never reach that repo.
+    #[test]
+    fn symlink_to_a_repo_classifies_as_the_link() {
+        for command in ["rm -rf /srv/link", "rm /srv/link", "unlink /srv/link"] {
+            assert_eq!(
+                judge_with_symlinks(command, "/home", &["/srv/link"], &["/srv/link"]),
+                Outcome::Allow,
+                "removing a symlink cannot reach the repo it points at: {command}"
+            );
+        }
+    }
+
+    /// The load-bearing exception. Pathname resolution dereferences a trailing
+    /// slash and BSD fts descends (`find link/` lists the target's contents),
+    /// so this spelling really can reach the repo and must keep its verdict.
+    #[test]
+    fn trailing_slash_dereferences_and_keeps_the_block() {
+        assert_eq!(
+            judge_with_symlinks("rm -rf /srv/link/", "/home", &["/srv/link"], &["/srv/link"]),
+            Outcome::Block
+        );
+    }
+
+    /// The negative control: nothing changes for a real repo directory, and a
+    /// symlink probe firing on some OTHER path must not demote this one.
+    #[test]
+    fn a_real_repo_directory_still_blocks() {
+        assert_eq!(
+            judge_with_symlinks("rm -rf /srv/repo", "/home", &["/srv/repo"], &[]),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge_with_symlinks("rm -rf /srv/repo", "/home", &["/srv/repo"], &["/srv/other"]),
+            Outcome::Block
+        );
+    }
+
+    /// The demotion is `GitRepo`-only — it is a statement about the git-root
+    /// probe following the link, not a blanket "symlinks are cheap". A symlink
+    /// that is a home child, or lives in the vault, keeps its own verdict.
+    #[test]
+    fn symlink_demotion_does_not_reach_other_protected_classes() {
+        let home_link = format!("{}/link", home());
+        assert_eq!(
+            judge_with_symlinks("rm -rf ~/link", "/home", &[], &[&home_link]),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge_with_symlinks(
+                "rm -rf /vaults/main/link",
+                "/home",
+                &["/vaults/main/link"],
+                &["/vaults/main/link"],
+            ),
+            Outcome::Block
+        );
+    }
+
+    /// The security-review Critical. A BARE glob (`*`, `.*`, `?`) is NOT
+    /// file-scoped, so it never becomes a `FileGlob` — it reduces to the link's
+    /// own path as a plain `Path`, straight into the demotion arm. The shell
+    /// dereferences during pathname expansion, so these really do empty the
+    /// repo. Every spelling blocks on main and must keep blocking.
+    ///
+    /// The earlier negative control used `project-*`, which IS file-scoped and
+    /// therefore takes the `FileGlob` branch — it could never have caught this.
+    #[test]
+    fn a_bare_glob_through_a_symlink_still_blocks() {
+        for command in [
+            "rm -rf /srv/link/*",
+            "rm -rf /srv/link/.*",
+            "rm -rf /srv/link/?",
+        ] {
+            assert_eq!(
+                judge_with_symlinks(command, "/home", &["/srv/link"], &["/srv/link"]),
+                Outcome::Block,
+                "pathname expansion resolves through the link: {command}"
+            );
+        }
+    }
+
+    /// Same hole reached by standing IN the link. The operand carries no path
+    /// at all, so the resolved target is the effective directory — which is the
+    /// link, and the sweep runs inside the repo it points at.
+    #[test]
+    fn a_cwd_sweep_inside_a_symlink_still_blocks() {
+        for command in ["cd /srv/link && rm -rf *", "cd /srv/link && rm -rf ."] {
+            assert_eq!(
+                judge_with_symlinks(command, "/home", &["/srv/link"], &["/srv/link"]),
+                Outcome::Block,
+                "{command}"
+            );
+        }
+    }
+
+    /// The security-review Important. `PathClass::GitRoot` is
+    /// `has_git_component(norm) || is_git_root(norm)`, and only the second is a
+    /// probe. A symlinked `.git` (the real `repo/.git -> /store/repo.git`
+    /// bare-repo layout) classifies from the literal segment with NO probe, so
+    /// the demotion's "the probe followed the link" rationale never applied.
+    /// The empty git-roots list is the point: nothing here is probe-derived.
+    #[test]
+    fn a_symlinked_git_component_still_blocks() {
+        assert_eq!(
+            judge_with_symlinks("rm -rf /srv/repo/.git", "/home", &[], &["/srv/repo/.git"]),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge_with_symlinks("rm /srv/repo/.git", "/home", &[], &["/srv/repo/.git"]),
+            Outcome::Block
+        );
+    }
+
+    /// `find -L` follows every symlink; `find -H` follows the ones in its
+    /// arguments — and a search root IS an argument. Both walk the real tree
+    /// behind a symlinked root, so both must keep the BLOCK. The plain and
+    /// `-P` spellings do not follow, so those still judge the link itself.
+    #[test]
+    fn find_that_follows_symlinks_still_blocks() {
+        for command in [
+            "find -H /srv/link -delete",
+            "find -L /srv/link -delete",
+            "find -L /srv/link -name '*.md' -delete",
+            "find -H /srv/link -exec rm -rf {} +",
+        ] {
+            assert_eq!(
+                judge_with_symlinks(command, "/home", &["/srv/link"], &["/srv/link"]),
+                Outcome::Block,
+                "-L/-H dereference a symlinked search root: {command}"
+            );
+        }
+        // The control: without a following flag, `find` deletes the link.
+        for command in ["find /srv/link -delete", "find -P /srv/link -delete"] {
+            assert_eq!(
+                judge_with_symlinks(command, "/home", &["/srv/link"], &["/srv/link"]),
+                Outcome::Allow,
+                "no -L/-H means the link itself is the target: {command}"
+            );
+        }
+    }
+
+    /// The trailing-separator guard reads the RAW path — `normalize` would fold
+    /// `\` to `/` but also strip the separator, which is the signal. Windows is
+    /// a shipped target, so both spellings must behave the same.
+    #[test]
+    fn a_windows_trailing_separator_also_dereferences() {
+        assert_eq!(
+            judge_with_symlinks(
+                "rm -rf C:\\repo\\link\\",
+                "/home",
+                &["C:/repo/link"],
+                &["C:\\repo\\link\\"],
+            ),
+            Outcome::Block,
+            "a backslash-terminated path dereferences exactly as `link/` does"
+        );
+    }
+
+    /// A glob DEREFERENCES — `link/*` is resolved by pathname expansion, so the
+    /// artifacts it names live in the target. The demotion is operand-only, so
+    /// a recursive sweep through a symlinked repo keeps its Ask.
+    #[test]
+    fn symlink_demotion_does_not_reach_a_glob_sweep() {
+        assert_eq!(
+            judge_with_symlinks(
+                "rm -rf /srv/link/project-*",
+                "/home",
+                &["/srv/link"],
+                &["/srv/link"],
+            ),
+            Outcome::Ask
         );
     }
 
@@ -1567,6 +2141,39 @@ mod tests {
     }
 
     #[test]
+    fn case_folded_delete_verbs_detected() {
+        // cadence-hooks#488: on a case-insensitive volume the shell resolves
+        // `RM` to the `rm` binary and deletes, but the verb set was matched
+        // case-sensitively, so the whole guard collected no target — a silent
+        // Allow. Measured Allow before the fold.
+        for spelling in ["RM -rf /", "Rm -rf /", "\\RM -rf /", "/bin/RM -rf /"] {
+            assert_eq!(judge(spelling, "/home"), Outcome::Block, "{spelling}");
+        }
+        assert_eq!(judge("UNLINK /vaults/main/x", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn case_folded_verbs_reach_the_find_and_wrapper_arms() {
+        // The two spellings that name no delete verb in the token stream: an
+        // uppercase `find` and an uppercase shell wrapper. Both resolve their
+        // verb through the same normalization, so both fold with it.
+        assert_eq!(judge("FIND /vaults/main -delete", "/home"), Outcome::Block);
+        assert_eq!(
+            judge("SH -c 'rm -rf /vaults/main'", "/home"),
+            Outcome::Block
+        );
+    }
+
+    #[test]
+    fn case_folded_verbs_keep_distinct_words_apart() {
+        // The fold changes case, never shape: a longer word that merely
+        // contains a delete verb is still not one, and a benign command is
+        // still benign. Negative control for the two tests above.
+        assert_eq!(judge("LS -la /vaults/main", "/home"), Outcome::Allow);
+        assert_eq!(judge("RMDIR /vaults/main", "/home"), Outcome::Allow);
+    }
+
+    #[test]
     fn dot_segments_do_not_downgrade_block() {
         // Sec #4: a `.` segment must not slip a home child past the exact match.
         assert_eq!(judge("rm -rf ~/./Documents", "/home"), Outcome::Block);
@@ -1586,7 +2193,8 @@ mod tests {
             vault: Some("C:/vault"),
             tmpdir: None,
         };
-        let out = judge_rm("rm -rf C:/vault/notes", "/home", &ctx, &|_| false).outcome;
+        let nothing = |_: &str| false;
+        let out = judge_rm("rm -rf C:/vault/notes", "/home", &ctx, &nothing, &nothing).outcome;
         assert_eq!(out, Outcome::Block);
     }
 
@@ -1621,7 +2229,7 @@ mod tests {
             vault: Some(VAULT),
             tmpdir: None,
         };
-        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| false);
+        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| false, &|_| false);
         let msg = r.message.expect("block carries a message");
         assert!(msg.contains("filesystem root"));
         assert!(msg.contains("CADENCE_DISABLE=guard-rm"));
@@ -1636,7 +2244,7 @@ mod tests {
             vault: Some(VAULT),
             tmpdir: None,
         };
-        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| false);
+        let r = judge_rm("rm -rf /", "/home", &ctx, &|_| false, &|_| false);
         let msg = r.message.expect("block carries a message");
         // The recoverable alternative that never trips guard-rm.
         assert!(msg.contains("~/.Trash"));
@@ -1654,7 +2262,7 @@ mod tests {
             vault: None,
             tmpdir: None,
         };
-        let r = judge_rm("rm -rf $VAR", "/home", &ctx, &|_| false);
+        let r = judge_rm("rm -rf $VAR", "/home", &ctx, &|_| false, &|_| false);
         assert_eq!(r.outcome, Outcome::Ask);
         assert!(
             r.message

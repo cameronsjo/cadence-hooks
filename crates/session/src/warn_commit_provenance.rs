@@ -28,6 +28,7 @@
 
 use crate::identity;
 use crate::provenance;
+use cadence_hooks_core::paths;
 use cadence_hooks_core::shell::{strip_quotes, tokenize};
 use cadence_hooks_core::transcript;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
@@ -239,13 +240,14 @@ fn heredoc_delimiter(line: &str) -> Option<(&str, bool)> {
 /// Resolves a relative `path` against `cwd`; a missing `cwd` for a relative
 /// path, a missing/non-file/oversized target, or a read failure all collapse
 /// to `None` (silent allow) — never an error, never a guess.
+///
+/// The non-regular and size gates are [`paths::read_capped`]'s, so the
+/// [`MAX_MESSAGE_FILE_BYTES`] cap is enforced by the read itself rather than
+/// trusting `st_size` — a file that lies about its size (a `/proc`-style file
+/// on Linux) is rejected the same as an honestly oversized one (#361).
 fn read_message_file(path: &str, cwd: Option<&str>) -> Option<String> {
     let resolved = resolve_message_path(path, cwd)?;
-    let meta = std::fs::metadata(&resolved).ok()?;
-    if !meta.is_file() || meta.len() > MAX_MESSAGE_FILE_BYTES {
-        return None;
-    }
-    std::fs::read_to_string(&resolved).ok()
+    paths::read_capped(&resolved, MAX_MESSAGE_FILE_BYTES)
 }
 
 /// Resolve a `-F` path argument: absolute paths pass through; a relative
@@ -285,7 +287,7 @@ fn build_nudge(input: &HookInput, host: &str) -> String {
     }
     let transcript_content = input
         .transcript_path()
-        .and_then(|path| std::fs::read_to_string(path).ok());
+        .and_then(|path| transcript::read_tail(Path::new(path)));
     if let Some(model) = resolve_model(transcript_content.as_deref()) {
         lines.push(format!(
             "Model: {}",
@@ -547,6 +549,19 @@ mod tests {
         assert_eq!(extract_commit_message(&command, None), None);
     }
 
+    #[test]
+    fn extract_dash_f_at_exactly_the_cap_still_reads() {
+        // The boundary the oversize rejection sits on: a message file of
+        // exactly MAX_MESSAGE_FILE_BYTES is under the cap and must still be
+        // read. Guards an off-by-one in the take-then-check gate (#361).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("exact.txt");
+        let msg = "x".repeat(MAX_MESSAGE_FILE_BYTES as usize);
+        std::fs::write(&path, &msg).unwrap();
+        let command = format!("git commit -F {}", path.display());
+        assert_eq!(extract_commit_message(&command, None), Some(msg));
+    }
+
     // --- extraction: no message derivable ---
 
     #[test]
@@ -701,6 +716,40 @@ mod tests {
     }
 
     #[test]
+    fn nudge_resolves_the_tuple_from_a_transcript_past_the_tail_bound() {
+        // #361 behavior preservation. Bounding the read (`transcript::read_tail`)
+        // is only safe if the fields still resolve on the file shape the bound
+        // actually bites: a transcript past `TAIL_READ_MAX_BYTES`. Boundedness
+        // itself is proved in `core::transcript`'s unit tests — this asserts the
+        // caller did not LOSE resolution by adopting the bound.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript_path = tmp.path().join("sess.jsonl");
+        let mut content = String::new();
+        while (content.len() as u64) < cadence_hooks_core::transcript::TAIL_READ_MAX_BYTES * 2 {
+            content.push_str(r#"{"message":{"role":"user","content":"padding"}}"#);
+            content.push('\n');
+        }
+        content.push_str(
+            r#"{"version":"2.1.214","message":{"role":"assistant","model":"claude-fable-5"}}"#,
+        );
+        std::fs::write(&transcript_path, &content).unwrap();
+
+        with_marker_dir(tmp.path(), || {
+            let input = bash_input(
+                "git commit -m 'fix: thing'",
+                Some("cedar-session-id"),
+                None,
+                Some(&transcript_path.to_string_lossy()),
+            );
+            let result = run_warn_commit_provenance(&input, "sjomba.local");
+            assert_eq!(result.outcome, Outcome::Nudge);
+            let msg = result.message.unwrap();
+            assert!(msg.contains("Model: claude-fable-5"), "{msg}");
+            assert!(msg.contains("Harness: claude-code 2.1.214"), "{msg}");
+        });
+    }
+
+    #[test]
     fn nudge_omits_unresolvable_fields_but_still_fires() {
         // No session_id, no transcript, no AI_AGENT — only Machine: resolves.
         // The instructional sentence still mentions the backtick-wrapped
@@ -734,31 +783,18 @@ mod tests {
     // just a duplicate. `use super::*` brings both into scope in this module.
 
     // --- CADENCE_MARKER_DIR (process-global — serialized + restored) ---
-
-    /// Serializes tests that mutate `CADENCE_MARKER_DIR`, a separate lock from
-    /// `ENV_LOCK` above since the two env vars never race each other. Any test
-    /// that reaches the nudge point now also writes a session marker (#370) —
-    /// isolate it to a scratch tempdir so `cargo test` never writes into the
-    /// real per-user marker directory (the exact #302/#269 class of bug).
-    static MARKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_marker_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = MARKER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prior = std::env::var("CADENCE_MARKER_DIR").ok();
-        // SAFETY: serialized via MARKER_ENV_LOCK; restored below.
-        unsafe {
-            std::env::set_var("CADENCE_MARKER_DIR", dir);
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        // SAFETY: same lock still held; restoring prior state.
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("CADENCE_MARKER_DIR", v),
-                None => std::env::remove_var("CADENCE_MARKER_DIR"),
-            }
-        }
-        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
-    }
+    //
+    // Any test that reaches the nudge point also writes a session marker
+    // (#370), so it is isolated to a scratch tempdir and `cargo test` never
+    // writes into the real per-user marker directory (the #302/#269 class).
+    //
+    // This module used to carry its own `MARKER_ENV_LOCK` + `with_marker_dir`.
+    // Both are gone: `CADENCE_MARKER_DIR` is one process-global, so it gets ONE
+    // lock and ONE helper workspace-wide (#446) — a private copy here serializes
+    // only against this module and races every other crate's marker tests in the
+    // same binary. The panic-safe catch_unwind + restore-prior shape this copy
+    // pioneered was promoted into the shared helper rather than lost.
+    use cadence_hooks_core::test_builders::with_marker_dir;
 
     #[test]
     fn resolve_harness_falls_back_to_ai_agent_env_when_transcript_absent() {

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "redaction": {
+    "allowlist": [
+      "tool_input",
+      "tool_response"
+    ]
+  }
+}

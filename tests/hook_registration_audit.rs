@@ -240,6 +240,21 @@ const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("cadence-obsidian", "obsidian")];
 /// Currently empty: cadence-canon landed and wires the `session` group.
 const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 
+/// Individual hooks whose plugin group *is* wired but whose own hooks.json entry
+/// lands in a separate, later PR. Unlike [`PENDING_PLUGIN_GROUPS`], the exemption
+/// cannot key off directory existence — the plugin directory is present and
+/// wiring every other hook in the group — so each entry is held by hand and
+/// removed in the wiring PR named beside it.
+///
+/// A hook belongs here only while it is deliberately inert: registered in the
+/// binary so the wiring PR has something to point at, and reaching no event
+/// until that PR lands.
+/// (`<plugin> <subcommand>`, tracking_reference)
+const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[(
+    "guardrails inject-gh-write-context",
+    "cameronsjo/cadence#653",
+)];
+
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
 const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
@@ -260,10 +275,14 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
         "session persist-plan",
         "must ride the always-on cadence plugin; `session` is its clap namespace",
     ),
+    // Same rationale as its sibling above: the approval hook rides the
+    // always-on cadence plugin while `session` owns plan/session state.
+    // Wiring shipped in the cadence monorepo without this entry, leaving the
+    // audit red for any workspace with a current sibling checkout (#460).
     (
         "cadence",
         "session persist-plan-approval",
-        "same-session approval companion to persist-plan; must ride the always-on cadence plugin",
+        "must ride the always-on cadence plugin; `session` is its clap namespace",
     ),
     // Predates the monorepo consolidation (present in canon's manifest at the
     // subtree-add commit f61b5f6), canon is its only registrar anywhere, and it
@@ -541,6 +560,18 @@ fn settings_json_hooks() -> (Vec<String>, Vec<String>) {
     (shell_scripts, binary_dispatches)
 }
 
+/// Every `<plugin> <subcommand>` command any resolved plugin's `hooks.json`
+/// registers. Three tests built this identical set inline
+/// (`all_binary_subcommands_are_registered`, `pending_wiring_hooks_are_still_unwired`,
+/// `no_plugin_hooks_duplicated_in_settings_json`) — factored out so they
+/// can't quietly diverge.
+fn registered_commands(all_refs: &BTreeMap<String, Vec<HookRef>>) -> BTreeSet<&str> {
+    all_refs
+        .values()
+        .flat_map(|refs| refs.iter().map(|r| r.command.as_str()))
+        .collect()
+}
+
 // ---------- Tests ----------
 
 /// Skip the test unless **every** expected plugin hooks.json resolved.
@@ -594,10 +625,7 @@ fn all_binary_subcommands_are_registered() {
     let binary_cmds = binary_hooks();
     require_plugin_refs!(all_refs);
 
-    let registered: BTreeSet<String> = all_refs
-        .values()
-        .flat_map(|refs| refs.iter().map(|r| r.command.clone()))
-        .collect();
+    let registered = registered_commands(&all_refs);
 
     // Subcommands for plugins still using shell wrappers are expected to be unregistered.
     // They'll be migrated to binary dispatch later.
@@ -626,9 +654,18 @@ fn all_binary_subcommands_are_registered() {
         .map(|(group, _)| *group)
         .collect();
 
+    // Individually exempted hooks awaiting their own wiring PR. Keyed by full
+    // `<plugin> <subcommand>` rather than group, so the rest of a wired group
+    // stays audited while one hook is in flight.
+    let pending_wiring: BTreeSet<&str> = PENDING_WIRING_HOOKS
+        .iter()
+        .map(|(command, _)| *command)
+        .collect();
+
     let unregistered: Vec<&String> = binary_cmds
         .iter()
-        .filter(|cmd| !registered.contains(*cmd))
+        .filter(|cmd| !registered.contains(cmd.as_str()))
+        .filter(|cmd| !pending_wiring.contains(cmd.as_str()))
         .filter(|cmd| {
             let group = cmd.split_whitespace().next().unwrap_or("");
             !shell_plugin_groups.contains(group) && !pending_groups.contains(group)
@@ -639,6 +676,8 @@ fn all_binary_subcommands_are_registered() {
         unregistered.is_empty(),
         "registered hooks not wired in any hooks.json:\n{}\n\n\
          Note: {} plugin(s) still use shell wrappers and are excluded from this check.\n\
+         A hook whose wiring lands in a later PR goes in PENDING_WIRING_HOOKS with \
+         its tracking reference, and comes back out in that PR.\n\
          {STALE_CHECKOUT_HINT}",
         unregistered
             .iter()
@@ -646,6 +685,40 @@ fn all_binary_subcommands_are_registered() {
             .collect::<Vec<_>>()
             .join("\n"),
         SHELL_PLUGIN_DIRS.len()
+    );
+}
+
+/// #470 (split from #463): assert the COMPLEMENT of
+/// [`all_binary_subcommands_are_registered`]'s exemption. That test lets a
+/// `PENDING_WIRING_HOOKS` entry stay unregistered without failing; this one
+/// fails the moment an entry stops needing that exemption — i.e. the moment
+/// some hooks.json actually wires it. `PENDING_WIRING_HOOKS` is an allowlist
+/// of checks known-unwired *as of when they were added*; nothing previously
+/// checked that an entry was STILL unwired, so a wiring PR that forgot to
+/// remove its own exemption (or removed a different one) would leave a stale
+/// hole open indefinitely — and the next guard that is genuinely never wired
+/// inherits the same silent cover. This turns the allowlist self-expiring.
+#[test]
+fn pending_wiring_hooks_are_still_unwired() {
+    require_plugin_refs!(all_refs);
+
+    let registered = registered_commands(&all_refs);
+
+    let now_wired: Vec<&(&str, &str)> = PENDING_WIRING_HOOKS
+        .iter()
+        .filter(|(command, _)| registered.contains(*command))
+        .collect();
+
+    assert!(
+        now_wired.is_empty(),
+        "PENDING_WIRING_HOOKS entry now appears in a hooks.json — its wiring PR \
+         landed, so the exemption has served its purpose and must be removed:\n{}\n\n\
+         {STALE_CHECKOUT_HINT}",
+        now_wired
+            .iter()
+            .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -718,16 +791,13 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
     let (shell_scripts, binary_dispatches) = settings_json_hooks();
 
     // Collect all plugin-registered commands for comparison
-    let plugin_commands: BTreeSet<String> = all_refs
-        .values()
-        .flat_map(|refs| refs.iter().map(|r| r.command.clone()))
-        .collect();
+    let plugin_commands = registered_commands(&all_refs);
 
     let mut duplicates = Vec::new();
 
     // Check if settings.json dispatches any cadence-hooks subcommands already in plugins
     for dispatch in &binary_dispatches {
-        if plugin_commands.contains(dispatch) {
+        if plugin_commands.contains(dispatch.as_str()) {
             duplicates.push(format!(
                 "  settings.json dispatches `{dispatch}` (already registered in a plugin)"
             ));
@@ -1019,6 +1089,92 @@ fn namespace_list_matches_redact_check_sh() {
     );
 }
 
+/// Interpreters whose argv[0] — or the command that follows a leading `env`
+/// invocation — is never itself a checkable script path. The actual script is
+/// the interpreter's first NON-FLAG argument, not necessarily argv[1]:
+/// `python3 -u /path/hook.py` has a flag in between.
+const SCRIPT_INTERPRETERS: &[&str] = &[
+    "python3", "python", "bash", "sh", "zsh", "node", "ruby", "perl",
+];
+
+/// Skip a leading `env` invocation — and its own flags / `VAR=value`
+/// assignments — to the command it actually runs.
+///
+/// `/usr/bin/env python3 /path/hook.py` must be judged as a python3
+/// invocation, not as `env` itself: `env` isn't in [`SCRIPT_INTERPRETERS`], so
+/// without unwrapping it, `/usr/bin/env` (which always exists) would be the
+/// checked target and the audit would pass having never looked at the script
+/// at all (cadence-hooks#464 review — the same bug in a different spelling).
+fn skip_env_prefix(tokens: &[String]) -> &[String] {
+    let Some(first) = tokens.first() else {
+        return tokens;
+    };
+    if cadence_hooks_core::shell::basename(first) != "env" {
+        return tokens;
+    }
+    let mut i = 1;
+    while let Some(t) = tokens.get(i) {
+        if t.starts_with('-') || t.contains('=') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    &tokens[i..]
+}
+
+/// Pick the token in a settings.json hook `command` that names a script path
+/// to existence-check.
+///
+/// - `Some(Some(path))` — check `path` for existence.
+/// - `Some(None)` — an interpreter-led command (argv[0], or the command after
+///   unwrapping a leading `env`) with no resolvable non-flag script argument
+///   at all (`python3 -u -O`). This must FAIL the audit, not skip it — an
+///   interpreter invocation with nothing to check is cadence-hooks#464's bug
+///   in a different spelling: silently unaudited, not proven safe.
+/// - `None` — a bare, non-interpreter command with no path-shaped token
+///   (`bd prime`) — nothing to check, a legitimate skip.
+///
+/// A quoted interpreter+script command (`"/usr/bin/python3" "/path/hook.py"
+/// args`) naively PathBuf'd as one raw string never exists — quotes and args
+/// never form a real path. Tokenizing (quote-aware,
+/// [`cadence_hooks_core::shell::tokenize`]) splits it into argv first.
+fn script_check_target(command: &str) -> Option<Option<String>> {
+    let tokens = cadence_hooks_core::shell::tokenize(command);
+    let rest = skip_env_prefix(&tokens);
+    let first = rest.first()?;
+
+    let is_interpreter = SCRIPT_INTERPRETERS.contains(&cadence_hooks_core::shell::basename(first));
+
+    if is_interpreter {
+        let script = rest.iter().skip(1).find(|t| !t.starts_with('-'));
+        return Some(script.cloned());
+    }
+
+    if first.contains('/') || first.starts_with('~') {
+        Some(Some(first.clone()))
+    } else {
+        None
+    }
+}
+
+/// Does the script a settings.json hook `command` names exist on disk, after
+/// expanding a LEADING `~` against `home` (via
+/// [`cadence_hooks_core::paths::expand_tilde_with`] — never a blind
+/// `str::replace('~', home)`, which would mangle a real path like
+/// `/opt/a~b/hook.sh` into a false missing-script report)?
+///
+/// `None` — a bare command with no checkable path, a legitimate skip.
+/// `Some(false)` covers both "the script is missing" AND "an interpreter-led
+/// command resolved no script argument at all" — the latter must fail the
+/// audit, not silently pass (see [`script_check_target`]).
+fn shell_script_exists(command: &str, home: &str) -> Option<bool> {
+    match script_check_target(command)? {
+        Some(target) => Some(cadence_hooks_core::paths::expand_tilde_with(&target, home).exists()),
+        None => Some(false),
+    }
+}
+
 #[test]
 fn settings_json_shell_scripts_exist() {
     let (shell_scripts, _) = settings_json_hooks();
@@ -1034,12 +1190,7 @@ fn settings_json_shell_scripts_exist() {
 
     let mut missing = Vec::new();
     for script in &shell_scripts {
-        // Only check paths (contain / or ~), skip bare commands like "bd prime"
-        if !script.contains('/') && !script.starts_with('~') {
-            continue;
-        }
-        let expanded = script.replace('~', &home);
-        if !PathBuf::from(&expanded).exists() {
+        if shell_script_exists(script, &home) == Some(false) {
             missing.push(format!("  {script} (file not found)"));
         }
     }
@@ -1049,6 +1200,71 @@ fn settings_json_shell_scripts_exist() {
         "settings.json references shell scripts that don't exist:\n{}",
         missing.join("\n")
     );
+}
+
+#[test]
+fn shell_script_exists_quoted_interpreter_and_script() {
+    // Cargo.toml is a file this test binary already knows exists at compile
+    // time — no tempdir/write needed just to get an existing path.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("\"/usr/bin/python3\" \"{script_path}\" --flag value");
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_bare_path() {
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+
+    assert_eq!(shell_script_exists(script_path, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_interpreter_with_missing_script() {
+    let cmd = "\"/usr/bin/python3\" \"/definitely/does/not/exist/hook.py\" --flag";
+
+    assert_eq!(shell_script_exists(cmd, "/home/nobody"), Some(false));
+}
+
+#[test]
+fn shell_script_exists_none_for_bare_command() {
+    // "bd prime" has no `/` or `~` in either token — nothing to check.
+    assert_eq!(shell_script_exists("bd prime", "/home/nobody"), None);
+}
+
+#[test]
+fn shell_script_exists_interpreter_flag_before_script() {
+    // `python3 -u /path/hook.py`: the naive "argv[1] is the script" logic
+    // would pick `-u`, a flag, as the "script" and always report missing. The
+    // real script is the interpreter's first NON-FLAG argument.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("python3 -u {script_path}");
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_env_wrapped_interpreter() {
+    // `/usr/bin/env python3 /path/hook.py`: `env` is not in
+    // SCRIPT_INTERPRETERS, so without unwrapping it, `/usr/bin/env` itself —
+    // which always exists — would be the checked target, passing the audit
+    // having never touched the script.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("/usr/bin/env python3 {script_path}");
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_interpreter_no_resolvable_script_fails() {
+    // An interpreter-led command whose every argument is a flag has no
+    // resolvable script at all — this must FAIL the audit (Some(false)), not
+    // silently skip it (None). A skip here is the same #464 bug in a
+    // different spelling: a hook wired to an interpreter with nothing to
+    // check would go unaudited rather than flagged.
+    let cmd = "python3 -u -O";
+
+    assert_eq!(shell_script_exists(cmd, "/home/nobody"), Some(false));
 }
 
 // ---------- Resolver + parser unit tests ----------

@@ -270,6 +270,8 @@ enum GuardrailsCommands {
     GuardBrowserDevice,
     /// Inject the gh-write allowlist + `-R` rule on SessionStart
     InjectGhContext,
+    /// Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write
+    InjectGhWriteContext,
     /// Snooze warn-main-branch for this repo for the given duration
     DismissMainBranchWarn {
         /// Duration to snooze, e.g. `30m`, `2h`, `1d`. Capped at 24h.
@@ -438,6 +440,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             GuardrailsCommands::GuardBrowserDevice => "guard-browser-device",
             GuardrailsCommands::InjectGhContext => "inject-gh-context",
+            GuardrailsCommands::InjectGhWriteContext => "inject-gh-write-context",
             GuardrailsCommands::EnforceWorktree => "enforce-worktree",
             // The dismiss-* subcommands are CLI actions, not hooks —
             // they have no PreToolUse/PostToolUse wiring and aren't subject
@@ -1056,6 +1059,11 @@ fn main() {
             GuardrailsCommands::InjectGhContext => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::inject_gh_context::InjectGhContext,
                 session,
+                canonical_hook,
+            ),
+            GuardrailsCommands::InjectGhWriteContext => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::inject_gh_write_context::InjectGhWriteContext,
+                pre,
                 canonical_hook,
             ),
             GuardrailsCommands::EnforceWorktree => dispatch::run_logged_check(

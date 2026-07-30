@@ -5,8 +5,54 @@
 //! [dev-dependencies]
 //! cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 //! ```
+//!
+//! Also compiled for this crate's own `#[cfg(test)]` modules without the
+//! feature, so [`with_marker_dir`] can be the single marker-dir env helper
+//! everywhere — including `markers.rs`'s own tests (#446).
 
 use crate::{EditOperation, HookInput, ToolInput, ToolResponse};
+use std::path::Path;
+
+/// The single mutex serializing every test that mutates a process-global env
+/// var read by the marker family.
+///
+/// Test helpers that lock a process-global must be the *only* helper locking it
+/// — two uncoordinated mutexes over one global are a race no critical section
+/// can fix (#446). Every crate's marker-dir sandboxing goes through
+/// [`with_marker_dir`], never a locally-minted sibling lock.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` with `CADENCE_MARKER_DIR` set to `dir`, serialized against every
+/// other marker-dir-mutating test in the same test binary via [`ENV_LOCK`] —
+/// keeps marker-writing tests out of the real per-user production marker
+/// directory (#302) and off each other's state (#369).
+///
+/// **Panic-safe, and restores rather than clears.** A failing wrapped test
+/// unwinds, so a bare `set_var` … `f()` … `remove_var` sequence would skip the
+/// restore and leak `CADENCE_MARKER_DIR` into every test that ran afterward in
+/// the same binary — one red test silently redirecting the rest. `f` therefore
+/// runs under `catch_unwind` with the panic resumed after cleanup, and the
+/// *prior* value is put back (not merely removed), so a nested or outer
+/// override survives. Returning `T` lets a caller pass a value out of the
+/// critical section instead of smuggling it through a captured `Cell`.
+pub fn with_marker_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let prior = std::env::var("CADENCE_MARKER_DIR").ok();
+    // SAFETY: serialized against every other env-mutating test in this binary
+    // via ENV_LOCK; restored below on both the normal and unwinding exit.
+    unsafe {
+        std::env::set_var("CADENCE_MARKER_DIR", dir);
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    // SAFETY: the same lock is still held; this restores the prior state.
+    unsafe {
+        match prior {
+            Some(v) => std::env::set_var("CADENCE_MARKER_DIR", v),
+            None => std::env::remove_var("CADENCE_MARKER_DIR"),
+        }
+    }
+    result.unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
 
 /// Build a `HookInput` for a `Bash` tool invocation.
 pub fn make_bash(cmd: &str) -> HookInput {
@@ -198,3 +244,6 @@ pub fn make_user_prompt_submit(
         ..Default::default()
     }
 }
+
+// Git-fixture builders (`Scratch`, `git_in`, `init_repo`) live in the sibling
+// `git_fixtures` module — see there.

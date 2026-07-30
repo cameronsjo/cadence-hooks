@@ -57,6 +57,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
 | `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed |
 | `inject-gh-context` | SessionStart (startup, resume, compact) | Inject the gh-write allowlist + `-R owner/repo` rule into context |
+| `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target |
 
 `guard-browser-device` is a deliberate block (not a nudge): a nudge is exit 0,
 so the browser action would already have hit a device before the context
