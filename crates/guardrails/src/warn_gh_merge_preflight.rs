@@ -13,7 +13,7 @@
 //!    `gh pr view <n> --json mergedAt,mergeCommit` before retrying or assuming
 //!    failure.
 
-use cadence_hooks_core::shell::strip_quotes;
+use cadence_hooks_core::shell::{command_segments, command_word, strip_group_wrappers, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Nudges a pre-flight checklist on `gh pr merge`.
@@ -21,13 +21,18 @@ pub struct WarnGhMergePreflight;
 
 /// Returns true if `command` contains a `gh pr merge` token sequence.
 ///
-/// Token-based to avoid substring false positives (hyphenated script names,
-/// prose). Caller is expected to strip quotes first.
+/// Token- and segment-based to avoid substring false positives (hyphenated
+/// script names, prose) while recognizing shell-wrapper bodies. Only the
+/// command word folds; the `pr merge` subcommands remain case-sensitive.
 fn is_gh_pr_merge(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    tokens
-        .windows(3)
-        .any(|w| w[0] == "gh" && w[1] == "pr" && w[2] == "merge")
+    command_segments(command).into_iter().any(|segment| {
+        let tokens = tokenize(strip_group_wrappers(&segment));
+        tokens
+            .first()
+            .is_some_and(|first| command_word(first).as_ref() == "gh")
+            && tokens.get(1).map(String::as_str) == Some("pr")
+            && tokens.get(2).map(String::as_str) == Some("merge")
+    })
 }
 
 impl Check for WarnGhMergePreflight {
@@ -40,14 +45,7 @@ impl Check for WarnGhMergePreflight {
             return CheckResult::allow();
         };
 
-        if !command.contains("gh") {
-            return CheckResult::allow();
-        }
-
-        // Strip quoted strings so prose mentioning the command doesn't fire.
-        let stripped = strip_quotes(command);
-
-        if !is_gh_pr_merge(&stripped) {
+        if !is_gh_pr_merge(command) {
             return CheckResult::allow();
         }
 
@@ -113,6 +111,18 @@ mod tests {
     fn gh_pr_merge_nudges() {
         let result = WarnGhMergePreflight.run(&make_bash("gh pr merge 5 --squash"));
         assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn case_folded_gh_pr_merge_nudges() {
+        let result = WarnGhMergePreflight.run(&make_bash("GH pr merge 5 --squash"));
+        assert_eq!(result.outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn case_fold_does_not_fold_merge_subcommands() {
+        let result = WarnGhMergePreflight.run(&make_bash("GH PR merge 5 --squash"));
+        assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]

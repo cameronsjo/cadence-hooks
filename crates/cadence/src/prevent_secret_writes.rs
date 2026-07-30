@@ -9,7 +9,7 @@ use crate::secret_patterns::{
     command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token, is_safe_template, is_secret_scan_exempt, scan_secret_values,
 };
-use cadence_hooks_core::shell::{command_segments, redirect_targets, tokenize};
+use cadence_hooks_core::shell::{command_segments, command_word, redirect_targets, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Wrapper words that pass their argv through to the real command —
@@ -37,8 +37,8 @@ fn writer_targets(segment: &str) -> Vec<String> {
     let tokens = tokenize(segment);
     let mut start = 0;
     while let Some(first) = tokens.get(start) {
-        let word = first.rsplit('/').next().unwrap_or(first);
-        if COMMAND_WRAPPERS.contains(&word) {
+        let word = command_word(first);
+        if COMMAND_WRAPPERS.contains(&word.as_ref()) {
             start += 1;
             continue;
         }
@@ -47,7 +47,8 @@ fn writer_targets(segment: &str) -> Vec<String> {
     let Some(first) = tokens.get(start) else {
         return Vec::new();
     };
-    let mut cmd = first.rsplit('/').next().unwrap_or(first);
+    let command = command_word(first);
+    let mut cmd = command.as_ref();
     let mut args: &[String] = &tokens[start + 1..];
     if cmd == "git" && args.first().map(String::as_str) == Some("rm") {
         cmd = "rm";
@@ -145,8 +146,8 @@ fn find_writes(args: &[String]) -> bool {
         EXEC_FLAGS.contains(&a.as_str())
             && args
                 .get(i + 1)
-                .map(|s| s.rsplit('/').next().unwrap_or(s))
-                .is_some_and(|w| WRITER_VERBS.contains(&w))
+                .map(|s| command_word(s))
+                .is_some_and(|w| WRITER_VERBS.contains(&w.as_ref()))
     })
 }
 
@@ -327,6 +328,11 @@ mod tests {
     #[test]
     fn bash_rm_env_no_flag_blocked() {
         assert!(bash_targets_env_file("rm .env"));
+    }
+
+    #[test]
+    fn case_folded_rm_env_blocked() {
+        assert!(bash_targets_env_file("RM .env"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! Shells out to `git ls-files --others --exclude-standard` to detect
 //! files that might have been forgotten. Filters out build artifacts.
 
+use cadence_hooks_core::shell::{command_segments, command_word, strip_group_wrappers, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::Path;
 use std::process::Command;
@@ -33,6 +34,19 @@ pub fn filter_untracked(porcelain: &str) -> Vec<&str> {
         .collect()
 }
 
+/// True when any executable segment is `git add` or `git commit`.
+///
+/// Only the command word folds. Git subcommands remain case-sensitive.
+fn is_git_add_or_commit(command: &str) -> bool {
+    command_segments(command).into_iter().any(|segment| {
+        let tokens = tokenize(strip_group_wrappers(&segment));
+        tokens
+            .first()
+            .is_some_and(|first| command_word(first).as_ref() == "git")
+            && matches!(tokens.get(1).map(String::as_str), Some("add" | "commit"))
+    })
+}
+
 /// Warns when git commit runs with untracked files that may have been forgotten.
 pub struct WarnUntrackedFiles;
 
@@ -47,7 +61,7 @@ impl Check for WarnUntrackedFiles {
         };
 
         // Only trigger on git add/commit
-        if !command.starts_with("git add") && !command.starts_with("git commit") {
+        if !is_git_add_or_commit(command) {
             return CheckResult::allow();
         }
 
@@ -184,5 +198,25 @@ mod tests {
     fn git_status_allows() {
         let result = WarnUntrackedFiles.run(&make_bash("git status"));
         assert_eq!(result.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn case_folded_git_commit_nudges_end_to_end() {
+        use cadence_hooks_core::test_builders::make_bash_with_cwd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
+
+        for command in ["git commit -m x", "GIT commit -m x"] {
+            let result =
+                WarnUntrackedFiles.run(&make_bash_with_cwd(command, dir.path().to_str().unwrap()));
+            assert_eq!(result.outcome, Outcome::Nudge, "{command}");
+        }
     }
 }

@@ -6,7 +6,8 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    basename, clobber_redirect_targets, command_segments, looks_absolute, tokenize,
+    clobber_redirect_targets, command_segments, command_word, looks_absolute, strip_group_wrappers,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -16,20 +17,25 @@ use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 /// invocation (`/bin/unlink`) is caught while a path merely *containing* the
 /// word (`shredder.md`, `unlinked.md`) is not.
 fn is_destructive(command: &str) -> bool {
-    if command.contains("rm") {
-        return true;
-    }
-    let tokens = tokenize(command);
-    if tokens
-        .iter()
-        .any(|t| matches!(basename(t), "unlink" | "shred" | "truncate"))
-    {
-        return true;
-    }
-    // `find … -delete` — `find` alone is read-only; only `-delete` destroys.
-    // (`find … -exec rm …` is already caught by the `rm` branch above.)
-    if tokens.iter().any(|t| basename(t) == "find") && tokens.iter().any(|t| t == "-delete") {
-        return true;
+    for segment in command_segments(command) {
+        let tokens = tokenize(strip_group_wrappers(&segment));
+        if tokens.iter().any(|token| {
+            matches!(
+                command_word(token).as_ref(),
+                "rm" | "unlink" | "shred" | "truncate"
+            )
+        }) {
+            return true;
+        }
+        // `find … -delete` — `find` alone is read-only; only `-delete`
+        // destroys. (`find … -exec rm …` is caught by the writer scan above.)
+        if tokens
+            .iter()
+            .any(|token| command_word(token).as_ref() == "find")
+            && tokens.iter().any(|token| token == "-delete")
+        {
+            return true;
+        }
     }
     false
 }
@@ -252,6 +258,13 @@ mod tests {
     fn rm_inside_vault_blocked() {
         let result =
             check_destructive_in_vault("rm note.md", "/vault/notes", "/vault", &FakeFs::default());
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn case_folded_rm_inside_vault_blocked() {
+        let result =
+            check_destructive_in_vault("RM note.md", "/vault/notes", "/vault", &FakeFs::default());
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
