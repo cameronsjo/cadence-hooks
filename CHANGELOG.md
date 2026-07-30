@@ -214,7 +214,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
   **On attribution:** of the two tokenize escapes, only the second is new. The decoy-flag form predates this change — the previous `split_whitespace` scan resolved that same command to `cameronsjo/allowed\`, an allowed owner, so it was already a bypass on `main`. The swallowed-`-R` form is genuinely introduced by the move to `tokenize`, since `split_whitespace` had found the real `evil/target` and blocked. Both are fixed; the distinction is recorded because a review that mis-attributes a finding sends the next reader to the wrong commit.
 
-  The loop gate itself is still blind to `gh api` payloads; fixing core's `suffix_words` alone would hard-block every looped GraphQL *read* — re-creating #353 one layer up — so it must land together with a graphql-aware wrapper at those call sites. That is #471, with `debt:` markers at all three. Verified by differential throughout: the eleven original end-to-end cases were spliced onto the pre-change source, where eight fail and the three preservation regressions pass; the four first-round review cases were spliced onto the first fix, where the three bypasses fail and the positive control passes; the second round's eight were spliced onto the second, where the five bypasses fail and all three positive controls pass; the third round's five onto the third, where the two bypasses fail and the three controls — spaced repo prose, an eval-wrapped positional target, an eval-wrapped owned write — pass on both sides. Two existing `API_REPOS` tests were rewritten to read a parsed endpoint rather than a whole command string — they asserted the unanchored raw-text behavior this change exists to remove, and their intent (a `repos/` endpoint resolves, a query string does not break it) is preserved.
+  **Loop analysis now retains assignment-shaped `gh api` fields** (#471). The
+  loop gate classifies reconstructed API and GraphQL argv with the same policy
+  as the per-segment path: GraphQL reads and the two safe review-thread
+  mutations remain allowed, while unverifiable mutations block under the API
+  verdict instead of being mistaken for targetless repository writes.
 
 - **`guard-gh-write` stops blocking two commands that were correctly spelled** (cameronsjo/cadence-hooks#454, #457). Both are false BLOCKs on legitimate reads and writes, and each was reported alongside a workaround the operator had to find by trial.
 

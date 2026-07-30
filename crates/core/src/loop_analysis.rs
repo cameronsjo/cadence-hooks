@@ -608,15 +608,30 @@ fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
 /// Extract the explicit remote name from `git push <remote>` arguments.
 fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
     let words = suffix_words(cmd);
-    // Skip "push", then skip flags, take first positional arg
-    let after_push: Vec<&str> = words
-        .iter()
-        .skip_while(|w| *w != "push")
-        .skip(1) // skip "push" itself
-        .filter(|w| !w.starts_with('-'))
-        .map(|w| w.as_str())
-        .collect();
-    after_push.first().map(|s| s.to_string())
+    let mut index = words.iter().position(|word| word == "push")? + 1;
+    while index < words.len() {
+        let word = &words[index];
+        if word == "--" {
+            return words.get(index + 1).cloned();
+        }
+        if word == "-o" || word == "--push-option" {
+            // The option value may be parsed as an AssignmentWord (`key=value`);
+            // consume it so it cannot pose as the positional remote.
+            index += 2;
+            continue;
+        }
+        if word.starts_with("--push-option=")
+            || word
+                .strip_prefix("-o")
+                .is_some_and(|value| !value.is_empty())
+            || word.starts_with('-')
+        {
+            index += 1;
+            continue;
+        }
+        return Some(word.clone());
+    }
+    None
 }
 
 /// Extract word values from a command's suffix.
@@ -999,6 +1014,29 @@ mod tests {
             }
             other => panic!("expected AllTargetsExplicit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn push_option_value_cannot_pose_as_remote() {
+        for option in [
+            "-o ci.skip=1",
+            "-oci.skip=1",
+            "--push-option ci.skip=1",
+            "--push-option=ci.skip=1",
+        ] {
+            let command = format!("for b in feat1 feat2; do git push {option} origin $b; done");
+            match analyze_push_loops(&command) {
+                LoopAnalysis::AllTargetsExplicit(cmds) => {
+                    assert_eq!(cmds[0].explicit_repo.as_deref(), Some("origin"), "{option}");
+                }
+                other => panic!("expected AllTargetsExplicit for {option}, got {other:?}"),
+            }
+        }
+
+        assert!(matches!(
+            analyze_push_loops("for b in feat1 feat2; do git push -o ci.skip=1; done"),
+            LoopAnalysis::MissingTargets(_)
+        ));
     }
 
     #[test]
