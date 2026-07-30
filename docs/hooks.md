@@ -82,7 +82,7 @@ review, install the official `security-guidance` plugin
 
 | Hook | Event | What it does |
 |------|-------|--------------|
-| `trash-guard` | PreToolUse (Bash) | Block `rm` in Obsidian vault (use .trash/ instead) |
+| `trash-guard` | PreToolUse (Bash) | Block destructive vault operations (`rm`, `unlink`, `shred`, `truncate`, `find -delete`, and clobber redirects); use `.trash/` instead |
 
 ## metrics (cadence-metrics)
 

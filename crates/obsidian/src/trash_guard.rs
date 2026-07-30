@@ -6,35 +6,50 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    clobber_redirect_targets, command_segments, command_word, looks_absolute, strip_group_wrappers,
-    tokenize,
+    clobber_redirect_targets, command_segments, command_word, looks_absolute,
+    skip_transparent_prefixes, strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
 /// Destructive-command gate: shapes that delete or zero a vault file,
-/// bypassing Obsidian's `.trash/`. `rm` keeps its original loose substring
-/// match; the added verbs match on the token's basename so a path-qualified
-/// invocation (`/bin/unlink`) is caught while a path merely *containing* the
-/// word (`shredder.md`, `unlinked.md`) is not.
+/// bypassing Obsidian's `.trash/`. Verbs are matched only where the shell runs
+/// an executable: the segment head (after transparent wrappers) or a `find`
+/// exec-family action. A path-qualified invocation (`/bin/unlink`) is caught,
+/// while prose or a filename argument such as `echo RM` or `shredder.md` is not.
 fn is_destructive(command: &str) -> bool {
     for segment in command_segments(command) {
         let tokens = tokenize(strip_group_wrappers(&segment));
-        if tokens.iter().any(|token| {
-            matches!(
-                command_word(token).as_ref(),
-                "rm" | "unlink" | "shred" | "truncate"
-            )
-        }) {
+        let mut argv = skip_transparent_prefixes(&tokens);
+        while argv.len() > 1
+            && matches!(command_word(&argv[0]).as_ref(), "sudo" | "xargs")
+            && !argv[1].starts_with('-')
+        {
+            argv = skip_transparent_prefixes(&argv[1..]);
+        }
+        let Some(first) = argv.first() else {
+            continue;
+        };
+        let verb = command_word(first);
+        if matches!(verb.as_ref(), "rm" | "unlink" | "shred" | "truncate") {
             return true;
         }
         // `find … -delete` — `find` alone is read-only; only `-delete`
-        // destroys. (`find … -exec rm …` is caught by the writer scan above.)
-        if tokens
-            .iter()
-            .any(|token| command_word(token).as_ref() == "find")
-            && tokens.iter().any(|token| token == "-delete")
-        {
-            return true;
+        // destroys. Exec-family actions name another executable position, so
+        // inspect the word immediately after the action rather than every
+        // operand in the segment.
+        if verb == "find" {
+            if argv.iter().any(|token| token == "-delete") {
+                return true;
+            }
+            if argv.windows(2).any(|pair| {
+                matches!(pair[0].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
+                    && matches!(
+                        command_word(&pair[1]).as_ref(),
+                        "rm" | "unlink" | "shred" | "truncate"
+                    )
+            }) {
+                return true;
+            }
         }
     }
     false
@@ -223,6 +238,34 @@ impl Check for ObsidianTrashGuard {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_vault_env(f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let previous = std::env::var_os("OBSIDIAN_VAULT");
+        // SAFETY: every OBSIDIAN_VAULT mutation in this crate is serialized by
+        // ENV_LOCK and restored before the lock is released.
+        unsafe { std::env::set_var("OBSIDIAN_VAULT", "/vault") };
+        f();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("OBSIDIAN_VAULT", value) },
+            None => unsafe { std::env::remove_var("OBSIDIAN_VAULT") },
+        }
+    }
+
+    fn make_bash_with_cwd(command: &str, cwd: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Bash".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                command: Some(command.into()),
+                ..Default::default()
+            }),
+            cwd: Some(cwd.into()),
+            ..Default::default()
+        }
+    }
 
     /// Fake existence probe for redirect-truncation tests: reports a path as
     /// existing iff it was explicitly seeded, so tests never touch real disk.
@@ -266,6 +309,23 @@ mod tests {
         let result =
             check_destructive_in_vault("RM note.md", "/vault/notes", "/vault", &FakeFs::default());
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn case_folded_rm_runs_through_the_guard_entry_point() {
+        with_vault_env(|| {
+            let result = ObsidianTrashGuard.run(&make_bash_with_cwd("RM note.md", "/vault/notes"));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn destructive_word_as_an_argument_is_allowed() {
+        with_vault_env(|| {
+            let result =
+                ObsidianTrashGuard.run(&make_bash_with_cwd("echo RM note.md", "/vault/notes"));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+        });
     }
 
     #[test]
@@ -656,7 +716,7 @@ mod tests {
 
     #[test]
     fn find_exec_rm_inside_vault_blocked() {
-        // `find … -exec rm …` is caught by the `rm` substring branch.
+        // `find … -exec rm …` names a second executable position.
         let result = check_destructive_in_vault(
             "find . -name '*.md' -exec rm {} +",
             "/vault/notes",

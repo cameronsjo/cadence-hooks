@@ -68,7 +68,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
   **The pre-filters were the half of this that unit tests could not see.** Four of those guards open with a cheap lowercase-only `contains("gh")` fast path, which returned Allow *before* the folded patterns could run — so `GH pr create` still measured Allow against the built binary with `is_write_command` and `token_is_gh` both already green. A pre-filter stricter than the matcher behind it is a silent veto; they now share one allocation-free `contains_ignoring_ascii_case`, and the assertion goes through `Check::run` so the veto cannot hide behind a green unit test again. The verb fold itself is likewise spelled once (`core::shell::fold_verb`) rather than hand-rolled in each guard that keeps a divergent local command word.
 
-  **Not swept:** roughly ten further guards gate on a lowercase verb literal in the same way and are untouched here — notably `obsidian::trash_guard`'s `contains("rm")` and `guard_push_remote`'s `contains("git push")`, both block-capable. They are independent of this change rather than left half-fixed by it, and want their own issue and their own before/after measurements.
+  **The follow-up verb-gate sweep closes the remaining measured case gaps**
+  (#502). Push, secret-write, vault-scan, PR-context, untracked-file, and
+  Obsidian trash checks now fold only the executable word while leaving flags,
+  subcommands, and operands byte-for-byte. End-to-end controls run through each
+  guard's `Check::run` entry point so an earlier case-sensitive prefilter cannot
+  veto the shared normalization.
 
 - **`split_segments` honors backslash escapes, so a segment boundary means what the shell means by it (cameronsjo/cadence-hooks#475).** The splitter cut at every newline with no continuation awareness and toggled quote state on every `"` regardless of a preceding backslash — while `tokenize`, the parser that reads the resulting segment's words, does both correctly. Two parsers disagreeing about where a word ends is a boundary the shell does not have, and any guard that reasons per segment inherits it.
 

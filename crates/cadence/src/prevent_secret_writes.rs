@@ -273,6 +273,7 @@ impl Check for SecretWritesGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_hooks_core::test_builders::make_bash;
 
     #[test]
     fn env_files_blocked() {
@@ -333,6 +334,12 @@ mod tests {
     #[test]
     fn case_folded_rm_env_blocked() {
         assert!(bash_targets_env_file("RM .env"));
+    }
+
+    #[test]
+    fn case_folded_rm_runs_through_the_guard_entry_point() {
+        let result = SecretWritesGuard.run(&make_bash("RM .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
