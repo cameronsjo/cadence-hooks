@@ -777,7 +777,7 @@
       "protected": false,
       "status": "adapted",
       "applicable": true,
-      "evidence": "crates/core/src/lib.rs",
+      "evidence": "crates/guardrails/src/guard_rm.rs::patch_delete_of_a_protected_path_blocks",
       "wiring": [
         {
           "plugin": "cadence-guardrails",

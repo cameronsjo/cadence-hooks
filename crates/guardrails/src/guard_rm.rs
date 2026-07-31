@@ -1006,10 +1006,67 @@ fn judge_rm(
         // emits an Unresolvable for it, so it asks rather than falling through.
         return CheckResult::allow();
     }
+    judge_targets(&targets, ctx, is_git_root, is_symlink)
+}
 
+/// Judge a resolved deletion **path** that arrived without a command.
+///
+/// Codex's `apply_patch` is a native file-deletion primitive Claude Code has no
+/// equivalent for: Claude deletes through Bash `rm`, which is why every path arm
+/// below was previously reachable only from a parsed command string. Adding the
+/// harness added the primitive, and the guard did not know about it — a
+/// normalized patch delete carries `operation: "delete"` and no command, so
+/// [`GuardRm::run`]'s command gate returned an unconditional allow on all of
+/// them (see the `patch_delete_*` tests).
+///
+/// The path goes through the same [`resolve_target`] the command parser uses, so
+/// the two routes share one resolution policy: a `$`/backtick/brace operand or
+/// one carrying `..` is [`TargetToken::Unresolvable`] and ASKs rather than being
+/// judged on a path this parser cannot pin down. (`patch::clean_path`
+/// deliberately preserves `../` so a path guard can reject it; this is that
+/// rejection.)
+///
+/// The target is a [`TargetToken::SingleFile`] because that is what a patch
+/// delete is — one named entry, no recursion, no glob — which makes the verdict
+/// identical to `rm <path>` for every path. Asserted, not assumed:
+/// `patch_delete_matches_the_bash_rm_verdict_for_the_same_path`.
+fn judge_delete_path(
+    path: &str,
+    cwd: &str,
+    ctx: &RmContext,
+    is_git_root: &dyn Fn(&str) -> bool,
+    is_symlink: &dyn Fn(&str) -> bool,
+) -> CheckResult {
+    // `normalize_path("/")` is `""` (the trailing slash is trimmed), and
+    // `resolve_target` reads an empty operand as a bare cwd reference — the
+    // `rm *` case, where the sweep's target IS the directory it stands in. That
+    // rule belongs to command parsing: a *named* delete target that normalizes
+    // to empty is the filesystem root, and resolving it to the cwd would judge a
+    // completely different path (a workspace under `/tmp` reads as Temp → allow).
+    let target = if path.trim().is_empty() {
+        TargetToken::SingleFile {
+            path: "/".to_string(),
+            dereferences: false,
+        }
+    } else {
+        resolve_target(path, cwd, true, false, true, false)
+    };
+    judge_targets(&[target], ctx, is_git_root, is_symlink)
+}
+
+/// Classify every resolved target and keep the most severe verdict
+/// (Block > Ask > Allow). Shared by the command route ([`judge_rm`]) and the
+/// command-less delete route ([`judge_delete_path`]) so the two cannot drift
+/// into two policies wearing one guard's name.
+fn judge_targets(
+    targets: &[TargetToken],
+    ctx: &RmContext,
+    is_git_root: &dyn Fn(&str) -> bool,
+    is_symlink: &dyn Fn(&str) -> bool,
+) -> CheckResult {
     let mut worst = Outcome::Allow;
     let mut block_class: Option<TargetClass> = None;
-    for target in &targets {
+    for target in targets {
         let class = match target {
             TargetToken::Unresolvable => TargetClass::Unresolvable,
             TargetToken::Path { path, dereferences } => {
@@ -1102,8 +1159,27 @@ impl Check for GuardRm {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let Some(command) = input.command() else {
-            return CheckResult::allow();
+        // Two routes reach this guard. The Bash one carries a command to parse.
+        // The command-less one is a harness deletion primitive — Codex's
+        // `apply_patch` `*** Delete File:`, normalized to an `Edit` carrying
+        // `operation: "delete"` — where the target is already a resolved path
+        // and there is nothing to parse. Anything else command-less is not a
+        // deletion and stays a silent allow.
+        enum Route<'a> {
+            Command(&'a str),
+            DeletePath(String),
+        }
+        let route = match input.command() {
+            Some(command) => Route::Command(command),
+            None => {
+                let Some(path) = input
+                    .file_path()
+                    .filter(|_| input.operation() == Some("delete"))
+                else {
+                    return CheckResult::allow();
+                };
+                Route::DeletePath(path)
+            }
         };
         let home = normalize_path(&cadence_hooks_core::paths::user_home_lossy_or_default());
         let vault = std::env::var("OBSIDIAN_VAULT")
@@ -1117,13 +1193,18 @@ impl Check for GuardRm {
             vault: vault.as_deref(),
             tmpdir: tmpdir.as_deref(),
         };
-        judge_rm(
-            command,
-            cwd,
-            &ctx,
-            &is_git_root_on_disk,
-            &is_symlink_on_disk,
-        )
+        match route {
+            Route::Command(command) => judge_rm(
+                command,
+                cwd,
+                &ctx,
+                &is_git_root_on_disk,
+                &is_symlink_on_disk,
+            ),
+            Route::DeletePath(path) => {
+                judge_delete_path(&path, cwd, &ctx, &is_git_root_on_disk, &is_symlink_on_disk)
+            }
+        }
     }
 }
 
@@ -2420,5 +2501,101 @@ mod tests {
             judge("cd $UNKNOWN; rm -rf ~/Documents", "/private/tmp"),
             Outcome::Block
         );
+    }
+
+    // --- the command-less delete route (Codex `apply_patch`) ---
+
+    /// Codex's `apply_patch` is a native file-deletion primitive Claude Code has
+    /// no equivalent for — Claude deletes through Bash `rm`, which is why this
+    /// guard only ever read commands. A patch delete normalizes to an `Edit`
+    /// carrying `operation: "delete"` and NO command, so the guard's
+    /// `let Some(command) = … else { return allow() }` opened returned an
+    /// unconditional allow on every one of them.
+    ///
+    /// Driven through the real parse + normalization chain, because the point is
+    /// that the whole route reaches the guard, not that one helper agrees.
+    fn patch_delete_outcome(target: &str) -> Outcome {
+        let payload = format!(
+            r#"{{"tool_name":"apply_patch","cwd":"/private/tmp","tool_input":"*** Begin Patch\n*** Delete File: {target}\n*** End Patch"}}"#
+        );
+        let input =
+            cadence_hooks_core::HookInput::from_json(&payload).expect("parse patch payload");
+        let targets = input.normalized_inputs().expect("normalize patch");
+        assert_eq!(targets.len(), 1, "one delete operation, one target");
+        GuardRm.run(&targets[0]).outcome
+    }
+
+    #[test]
+    fn patch_delete_of_a_protected_path_blocks() {
+        let home = home();
+        assert_eq!(
+            patch_delete_outcome(&format!("{home}/.ssh")),
+            Outcome::Block,
+            "a patch delete of a top-level home entry must block"
+        );
+        assert_eq!(
+            patch_delete_outcome(&format!("{home}/Documents")),
+            Outcome::Block
+        );
+        assert_eq!(patch_delete_outcome("/"), Outcome::Block);
+    }
+
+    /// A patch path this parser cannot resolve must ASK, never silently allow.
+    /// `patch::clean_path` deliberately preserves `../` so the path guards can
+    /// reject it — this is the guard holding up its end.
+    #[test]
+    fn patch_delete_of_an_unresolvable_path_asks() {
+        assert_eq!(
+            patch_delete_outcome("../../../etc/hosts"),
+            Outcome::Ask,
+            "a traversal-bearing patch path must not be a silent allow"
+        );
+    }
+
+    /// The route must not become a blanket block: ordinary in-workspace source
+    /// deletion is the common case, and it is judged exactly as `rm <path>` is.
+    #[test]
+    fn patch_delete_of_ordinary_workspace_file_allows() {
+        assert_eq!(
+            patch_delete_outcome("/private/tmp/project/src/main.rs"),
+            Outcome::Allow
+        );
+    }
+
+    /// Parity with the Bash route, asserted rather than assumed: a patch delete
+    /// and `rm <same path>` must reach the same verdict, or the guard has two
+    /// policies wearing one name.
+    #[test]
+    fn patch_delete_matches_the_bash_rm_verdict_for_the_same_path() {
+        let home = home();
+        for target in [
+            format!("{home}/.ssh"),
+            format!("{home}/Documents"),
+            "/".to_string(),
+            "/private/tmp/project/src/main.rs".to_string(),
+        ] {
+            let via_bash = GuardRm
+                .run(&cadence_hooks_core::test_builders::make_bash_with_cwd(
+                    &format!("rm {target}"),
+                    "/private/tmp",
+                ))
+                .outcome;
+            assert_eq!(
+                patch_delete_outcome(&target),
+                via_bash,
+                "patch delete and `rm` disagree on {target}"
+            );
+        }
+    }
+
+    /// A command-less input that is NOT a delete stays a silent allow — the new
+    /// route must not turn every `Write` into a deletion judgement.
+    #[test]
+    fn command_less_non_delete_input_still_allows() {
+        let input = cadence_hooks_core::HookInput::from_json(
+            r#"{"tool_name":"Write","cwd":"/private/tmp","tool_input":{"file_path":"/","content":"x"}}"#,
+        )
+        .expect("parse write payload");
+        assert_eq!(GuardRm.run(&input).outcome, Outcome::Allow);
     }
 }
