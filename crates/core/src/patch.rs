@@ -27,6 +27,14 @@ fn clean_path(raw: &str) -> Result<String, &'static str> {
 
 /// Parse the patch envelope into create, update, delete, rename, and multi-file
 /// operations. Errors name only the schema condition, never patch content.
+///
+/// **`Update File` is not hunk-accurate.** Multiple `@@` hunks in one block are
+/// flattened into single `old`/`new` blobs with the hunk boundaries discarded,
+/// so `old`/`new` do NOT map 1:1 to a single hunk and the blobs are not a
+/// diff you could apply. That is deliberate and sufficient for the consumer this
+/// exists for — guards scan for the *presence* of content a patch introduces or
+/// removes, never reconstruct the file. A future consumer that needs to apply or
+/// locate a change must extend this to carry hunks, not reinterpret these fields.
 pub fn parse(raw: &str) -> Result<Vec<Operation>, &'static str> {
     let mut lines = raw.lines().peekable();
     if lines.next() != Some("*** Begin Patch") {
@@ -100,6 +108,20 @@ pub fn parse(raw: &str) -> Result<Vec<Operation>, &'static str> {
                         old.push(&next[1..]);
                         new.push(&next[1..]);
                     }
+                    // An EMPTY line is a blank context line, not a malformed
+                    // one. A unified diff spells one `" "` (a lone space), but a
+                    // producer that trims trailing whitespace — most editors,
+                    // most formatters — emits `""` instead, and `first()` on an
+                    // empty line is `None`. Falling to the reject arm below made
+                    // every such patch a hard block on all 13 security-critical
+                    // hooks under Codex, with a message saying the patch was
+                    // malformed. Fail-closed, so not a hole — but the likely
+                    // operator response ("Codex hooks are broken, unset
+                    // CADENCE_HARNESS") turns it into one.
+                    None => {
+                        old.push("");
+                        new.push("");
+                    }
                     _ => return Err("invalid update line prefix"),
                 }
             }
@@ -154,6 +176,51 @@ mod tests {
             vec![Operation::Delete {
                 path: "../../vault/x".to_string()
             }]
+        );
+    }
+
+    /// A blank context line is legal in a unified diff, and a producer that
+    /// trims trailing whitespace emits it as `""` rather than `" "`. Rejecting
+    /// it hard-blocked every security-critical hook under Codex on ordinary
+    /// edits.
+    #[test]
+    fn blank_context_line_in_a_hunk_is_not_a_schema_error() {
+        let operations = parse(
+            "*** Begin Patch\n*** Update File: a\n@@\n first\n\n-old\n+new\n last\n*** End Patch",
+        )
+        .expect("a blank context line is legal");
+        assert_eq!(
+            operations,
+            vec![Operation::Update {
+                path: "a".to_string(),
+                old: Some("first\n\nold\nlast".to_string()),
+                new: Some("first\n\nnew\nlast".to_string()),
+                move_to: None,
+            }]
+        );
+    }
+
+    /// The blank line lands on BOTH sides, exactly as a spaced context line
+    /// does — so a content guard scanning `new` sees the same document either
+    /// way, and the two spellings cannot disagree.
+    #[test]
+    fn blank_and_spaced_context_lines_parse_identically() {
+        let blank =
+            parse("*** Begin Patch\n*** Update File: a\n@@\n x\n\n y\n*** End Patch").unwrap();
+        let spaced =
+            parse("*** Begin Patch\n*** Update File: a\n@@\n x\n \n y\n*** End Patch").unwrap();
+        assert_eq!(blank, spaced);
+    }
+
+    /// The widening is scoped to *empty*: a line whose first byte is neither
+    /// `-`, `+`, nor a space is still a schema error, so the parser has not
+    /// become a "accept anything" reader.
+    #[test]
+    fn a_non_empty_unprefixed_line_is_still_rejected() {
+        assert_eq!(
+            parse("*** Begin Patch\n*** Update File: a\n@@\nUNPREFIXED\n*** End Patch")
+                .unwrap_err(),
+            "invalid update line prefix"
         );
     }
 
