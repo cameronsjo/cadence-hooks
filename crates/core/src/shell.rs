@@ -376,6 +376,35 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
         .trim_end_matches([')', '}', ';', ' ', '\t'])
 }
 
+/// Reserved words that occupy the head position of a segment without being the
+/// command. `for f in *.md; do rm $f; done` segments as `for f in *.md` /
+/// `do rm $f` / `done`, so a caller that gates on the segment head sees `do`
+/// and never examines the `rm` behind it — the same blindness
+/// [`strip_group_wrappers`] fixes for `(`/`{`, in a shape that punctuation
+/// stripping cannot reach.
+///
+/// Matched case-SENSITIVELY: the shell's reserved words are, so `DO rm x` runs
+/// a command named `DO` and stripping it would resolve a verb the shell never
+/// reaches.
+const LEADING_KEYWORDS: &[&str] = &["do", "then", "else", "elif", "while", "until", "if", "!"];
+
+/// Skip leading shell reserved words so the segment head is the real command.
+///
+/// **Detector direction only.** Skipping a keyword can only expose a verb that
+/// was already going to run, so this can add a block and never subtract one —
+/// the same argument [`skip_transparent_prefixes`] makes. Never reuse it to
+/// decide that something is *safe*.
+///
+/// A keyword that is the segment's ONLY word (`done`, a bare `!`) is left
+/// alone: there is no command behind it to expose.
+pub fn strip_leading_keywords(tokens: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < tokens.len() && LEADING_KEYWORDS.contains(&tokens[start].as_str()) {
+        start += 1;
+    }
+    &tokens[start..]
+}
+
 /// Words that stand in front of a real command without being the command.
 ///
 /// Shared by `enforce_worktree`, `guard_rm`, and the polish ship anchor, so the
@@ -2383,6 +2412,131 @@ fn skip_sudo_no_argument_flags(argv: &[String]) -> Option<&[String]> {
     None
 }
 
+/// `sudo` options that REQUIRE a value word, so the command is one token
+/// further along. Kept separate from the argument-free sets above because the
+/// two answer different questions: those decide whether the NEXT word is the
+/// command, these decide that it is a value and the command follows it.
+const SUDO_VALUE_SHORT_FLAGS: &str = "ug";
+const SUDO_VALUE_LONG_FLAGS: &[&str] = &["--user", "--group"];
+
+/// `xargs`' short options that take no argument of their own.
+const XARGS_NO_ARGUMENT_SHORT_FLAGS: &str = "0prtxo";
+
+/// `xargs`' short options that require a value, glued (`-n1`) or as the next
+/// word (`-n 1`). The optional-argument spellings (`-i`, `-l`, `-e`) are
+/// deliberately absent — with an optional argument nothing here can tell a
+/// value from the command, and guessing either way resolves the wrong word.
+const XARGS_VALUE_SHORT_FLAGS: &str = "nLIPdasE";
+
+/// `xargs`' long options that take no argument. The value-taking long
+/// spellings are reached only in their glued `--name=value` form (see the walk
+/// below); a bare one is refused, since GNU's optional-argument options
+/// (`--replace`, `--eof`, `--max-lines`) are spelled the same way as the
+/// required-argument ones and cannot be told apart here.
+const XARGS_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
+    "--null",
+    "--no-run-if-empty",
+    "--verbose",
+    "--exit",
+    "--interactive",
+    "--open-tty",
+];
+
+/// Walk a command runner's OWN options, returning the slice that begins at the
+/// command it will run — or `None` when a token cannot be classified, in which
+/// case the caller must not peel further. Supports `sudo` and `xargs`; any
+/// other verb returns `None`.
+///
+/// **Why this exists next to [`skip_sudo_no_argument_flags`] rather than
+/// replacing it.** That walk feeds `command_segments`, which *expands* a
+/// script into the "every command that will actually execute" view, and there
+/// an over-eager peel can manufacture a false block on a script the shell never
+/// runs — so it refuses every value-taking option rather than guess. This walk
+/// feeds a segment-HEAD detector, where the same peel only ever exposes a verb
+/// that was already going to run. That is what makes `-u root` safe to consume
+/// here and not there: the flag grammars of `sudo` and `xargs` are small and
+/// stable, and consuming a known value-taking flag WITH its value is knowledge,
+/// not a guess.
+///
+/// Bailing on the first `-` instead is what un-blocked `sudo -u me rm note.md`
+/// and `find … -print0 | xargs -0 rm` — the canonical safe-for-spaces delete
+/// idiom — when `obsidian-trash-guard` moved to a head scan (#528 review C1).
+pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [String]> {
+    let (no_arg_short, value_short, no_arg_long, value_long): (_, _, _, &[&str]) = match verb {
+        "sudo" => (
+            SUDO_NO_ARGUMENT_SHORT_FLAGS,
+            SUDO_VALUE_SHORT_FLAGS,
+            SUDO_NO_ARGUMENT_LONG_FLAGS,
+            SUDO_VALUE_LONG_FLAGS,
+        ),
+        "xargs" => (
+            XARGS_NO_ARGUMENT_SHORT_FLAGS,
+            XARGS_VALUE_SHORT_FLAGS,
+            XARGS_NO_ARGUMENT_LONG_FLAGS,
+            &[],
+        ),
+        _ => return None,
+    };
+
+    let mut i = 0;
+    while let Some(tok) = argv.get(i) {
+        // The first word that is not an option is the command being run.
+        if !tok.starts_with('-') {
+            return Some(&argv[i..]);
+        }
+        // `--` ends option parsing explicitly; the command follows it.
+        if tok == "--" {
+            return argv.get(i + 1..);
+        }
+        if tok.starts_with("--") {
+            if let Some((name, _)) = tok.split_once('=') {
+                // A glued value belongs to the flag either way, so both
+                // classes consume exactly this token.
+                if !no_arg_long.contains(&name) && !value_long.contains(&name) {
+                    return None;
+                }
+                i += 1;
+                continue;
+            }
+            if no_arg_long.contains(&tok.as_str()) {
+                i += 1;
+                continue;
+            }
+            if value_long.contains(&tok.as_str()) {
+                i += 2;
+                continue;
+            }
+            return None;
+        }
+        // A short cluster is one flag per character. A value-taking flag ends
+        // the cluster: whatever follows it inside the token is its glued value
+        // (`-n1`), and an empty remainder means the next word is (`-n 1`).
+        let cluster = &tok[1..];
+        if cluster.is_empty() {
+            return None;
+        }
+        let mut takes_next_word = false;
+        for (pos, c) in cluster.char_indices() {
+            if no_arg_short.contains(c) {
+                continue;
+            }
+            if value_short.contains(c) {
+                takes_next_word = pos + c.len_utf8() == cluster.len();
+                break;
+            }
+            // Unknown flag: nothing here can know whether it consumes the word
+            // after it, so refuse rather than resolve the wrong command word.
+            return None;
+        }
+        i += 1;
+        if takes_next_word {
+            i += 1;
+        }
+    }
+    // Options all the way to the end: there is no command here.
+    None
+}
+
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
 /// tokenized (and, in the guard's case, stripped transparent prefixes) can
 /// detect a wrapper without re-tokenizing.
@@ -2443,6 +2597,82 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- strip_leading_keywords / skip_runner_flags (#528 review C1) ---
+
+    fn words(command: &str) -> Vec<String> {
+        tokenize(command)
+    }
+
+    #[test]
+    fn strip_leading_keywords_exposes_the_verb_behind_a_keyword() {
+        for (segment, want_head) in [
+            ("do rm $f", "rm"),
+            ("then rm note.md", "rm"),
+            ("else rm note.md", "rm"),
+            ("elif rm note.md", "rm"),
+            ("while rm note.md", "rm"),
+            ("until rm note.md", "rm"),
+            ("if rm note.md", "rm"),
+            ("! rm note.md", "rm"),
+            ("do then rm note.md", "rm"),
+            // Not a keyword, and case-sensitive — `DO` is a command name.
+            ("DO rm note.md", "DO"),
+            ("cat note.md", "cat"),
+        ] {
+            let tokens = words(segment);
+            assert_eq!(
+                strip_leading_keywords(&tokens).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_leading_keywords_keeps_a_lone_keyword() {
+        // Nothing behind it to expose, so the slice must not empty out.
+        for segment in ["done", "fi", "!"] {
+            let tokens = words(segment);
+            assert_eq!(strip_leading_keywords(&tokens).len(), 1, "{segment}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_walks_sudo_and_xargs_options() {
+        for (command, want_head) in [
+            ("sudo rm note.md", Some("rm")),
+            ("sudo -u me rm note.md", Some("rm")),
+            ("sudo --user=me rm note.md", Some("rm")),
+            ("sudo --user me rm note.md", Some("rm")),
+            ("sudo -E -u me rm note.md", Some("rm")),
+            ("sudo --preserve-env rm note.md", Some("rm")),
+            ("sudo -- rm note.md", Some("rm")),
+            ("xargs -0 rm", Some("rm")),
+            ("xargs -n1 rm note.md", Some("rm")),
+            ("xargs -n 1 rm note.md", Some("rm")),
+            ("xargs -0 -I {} rm {}", Some("rm")),
+            // Unknown flags stay refused — nothing here can know whether one
+            // consumes the word after it.
+            ("sudo --nonesuch rm note.md", None),
+            ("xargs --replace rm", None),
+            // Options all the way to the end: no command to resolve.
+            ("sudo -E", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_refuses_verbs_it_does_not_model() {
+        let tokens = words("timeout 5 rm note.md");
+        assert!(skip_runner_flags("timeout", &tokens[1..]).is_none());
+    }
 
     // --- command_word (the one verb normalization) ---
 

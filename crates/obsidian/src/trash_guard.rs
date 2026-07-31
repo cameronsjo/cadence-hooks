@@ -7,31 +7,79 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    clobber_redirect_targets, command_segments, command_word, looks_absolute,
-    skip_transparent_prefixes, strip_group_wrappers, tokenize,
+    child_scripts, clobber_redirect_targets, command_segments, command_word, looks_absolute,
+    skip_runner_flags, skip_transparent_prefixes, strip_group_wrappers, strip_leading_keywords,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
+/// Verbs that delete or zero the file they are handed.
+const DESTRUCTIVE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
+
+/// `find` actions that name a second executable position.
+const EXEC_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
+
+/// How far the scan follows a command that runs another command it carries as
+/// an operand (`eval …`, `find … -exec sh -c '…'`). Bounded for the same
+/// reason `command_segments` bounds wrapper nesting: a self-referential
+/// spelling must not recurse without end.
+const MAX_NESTED_DEPTH: usize = 3;
+
 /// Destructive-command gate: shapes that delete or zero a vault file,
 /// bypassing Obsidian's `.trash/`. Verbs are matched only where the shell runs
-/// an executable: the segment head (after transparent wrappers) or a `find`
-/// exec-family action. A path-qualified invocation (`/bin/unlink`) is caught,
-/// while prose or a filename argument such as `echo RM` or `shredder.md` is not.
+/// an executable: the segment head (after shell keywords, transparent
+/// wrappers, and a command runner's own flags), a `find` exec-family action, or
+/// an operand a command re-executes (`eval`, `find … -exec sh -c`). A
+/// path-qualified invocation (`/bin/unlink`) is caught, while prose or a
+/// filename argument such as `echo RM` or `shredder.md` is not.
 fn is_destructive(command: &str) -> bool {
+    is_destructive_at(command, 0)
+}
+
+/// Worker for [`is_destructive`]; `depth` bounds the re-executed-operand walk.
+fn is_destructive_at(command: &str, depth: usize) -> bool {
     for segment in command_segments(command) {
         let tokens = tokenize(strip_group_wrappers(&segment));
-        let mut argv = skip_transparent_prefixes(&tokens);
-        while argv.len() > 1
-            && matches!(command_word(&argv[0]).as_ref(), "sudo" | "xargs")
-            && !argv[1].starts_with('-')
-        {
-            argv = skip_transparent_prefixes(&argv[1..]);
+        // Keywords first: `for f in *.md; do rm $f; done` segments as
+        // `do rm $f`, so without this the head word is `do` and the `rm`
+        // behind it is never examined.
+        let mut argv = skip_transparent_prefixes(strip_leading_keywords(&tokens));
+        // `sudo` and `xargs` run the command that follows their OWN options.
+        // Skipping those options (rather than bailing on the first `-`) is what
+        // keeps `sudo -u me rm note.md` and the canonical
+        // `find … -print0 | xargs -0 rm` idiom in view.
+        while let Some(first) = argv.first() {
+            let runner = command_word(first).into_owned();
+            if !matches!(runner.as_str(), "sudo" | "xargs") {
+                break;
+            }
+            let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
+                break;
+            };
+            // Each pass consumes at least the runner itself, so this ends.
+            argv = skip_transparent_prefixes(rest);
         }
         let Some(first) = argv.first() else {
             continue;
         };
         let verb = command_word(first);
-        if matches!(verb.as_ref(), "rm" | "unlink" | "shred" | "truncate") {
+        if DESTRUCTIVE_VERBS.contains(&verb.as_ref()) {
+            return true;
+        }
+        // `git rm` is judged as `rm` — it deletes the working-tree file the
+        // same way. Same alias, same case-SENSITIVE subcommand spelling, as
+        // `prevent_secret_writes::writer_targets`.
+        if verb == "git" && argv.get(1).map(String::as_str) == Some("rm") {
+            return true;
+        }
+        // `eval` re-executes its operand, so scan that operand as a command in
+        // its own right — the head word of the segment is `eval`, and the verb
+        // it runs is invisible to a head test.
+        if verb == "eval"
+            && depth < MAX_NESTED_DEPTH
+            && argv.len() > 1
+            && is_destructive_at(&argv[1..].join(" "), depth + 1)
+        {
             return true;
         }
         // `find … -delete` — `find` alone is read-only; only `-delete`
@@ -43,13 +91,27 @@ fn is_destructive(command: &str) -> bool {
                 return true;
             }
             if argv.windows(2).any(|pair| {
-                matches!(pair[0].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir")
-                    && matches!(
-                        command_word(&pair[1]).as_ref(),
-                        "rm" | "unlink" | "shred" | "truncate"
-                    )
+                EXEC_ACTIONS.contains(&pair[0].as_str())
+                    && DESTRUCTIVE_VERBS.contains(&command_word(&pair[1]).as_ref())
             }) {
                 return true;
+            }
+            // An exec action can name a shell instead of the verb itself
+            // (`-exec sh -c 'rm …'`). `command_segments` only unwraps a
+            // wrapper at the segment head, so the nested script is expanded
+            // here, from the action's own argument list.
+            if depth < MAX_NESTED_DEPTH {
+                for (i, token) in argv.iter().enumerate() {
+                    if !EXEC_ACTIONS.contains(&token.as_str()) {
+                        continue;
+                    }
+                    if child_scripts(&argv[i + 1..], "")
+                        .iter()
+                        .any(|script| is_destructive_at(script, depth + 1))
+                    {
+                        return true;
+                    }
+                }
             }
         }
     }
@@ -354,6 +416,163 @@ mod tests {
             let result = ObsidianTrashGuard.run(&make_bash_with_cwd("RM note.md", "/vault/notes"));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
         });
+    }
+
+    /// Drive a command through the guard's real entry point and report the
+    /// outcome, so the differential table below tests what a hook payload
+    /// actually reaches rather than a helper's internals.
+    fn outcome_in_vault(command: &str) -> cadence_hooks_core::Outcome {
+        let mut outcome = cadence_hooks_core::Outcome::Allow;
+        with_vault_env(|| {
+            outcome = ObsidianTrashGuard
+                .run(&make_bash_with_cwd(command, "/vault/notes"))
+                .outcome;
+        });
+        outcome
+    }
+
+    // --- Non-head deletion shapes (#528 security review C1) ---
+    //
+    // Every command here was measured deleting a real file through `bash`, and
+    // every one was BLOCK before this guard moved to a segment-head scan. They
+    // are driven through `Check::run` because the regression lived in the
+    // path from payload to verdict, not in any single helper.
+
+    #[test]
+    fn git_rm_inside_vault_blocked() {
+        assert_eq!(
+            outcome_in_vault("git rm note.md"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn sudo_with_user_flag_rm_inside_vault_blocked() {
+        // A flag on the peel prefix must not abort the peel.
+        assert_eq!(
+            outcome_in_vault("sudo -u me rm note.md"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn sudo_with_long_flag_rm_inside_vault_blocked() {
+        assert_eq!(
+            outcome_in_vault("sudo --preserve-env rm note.md"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn xargs_null_delimited_rm_inside_vault_blocked() {
+        // The canonical safe-for-spaces delete idiom.
+        assert_eq!(
+            outcome_in_vault("find . -name '*.md' -print0 | xargs -0 rm"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn xargs_with_glued_value_flag_rm_inside_vault_blocked() {
+        // `-n1` glues its value to the flag; `-n 1` spells it as the next word.
+        assert_eq!(
+            outcome_in_vault("xargs -n1 rm note.md"),
+            cadence_hooks_core::Outcome::Block
+        );
+        assert_eq!(
+            outcome_in_vault("xargs -n 1 rm note.md"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn for_loop_body_rm_inside_vault_blocked() {
+        // `do` occupies the segment head; the `rm` is behind it.
+        assert_eq!(
+            outcome_in_vault("for f in *.md; do rm $f; done"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn while_loop_body_rm_inside_vault_blocked() {
+        assert_eq!(
+            outcome_in_vault("while read f; do rm $f; done < list"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn if_branch_rm_inside_vault_blocked() {
+        assert_eq!(
+            outcome_in_vault("if true; then rm note.md; fi"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn eval_operand_rm_inside_vault_blocked() {
+        // `eval` re-executes its operand, quoted or not.
+        assert_eq!(
+            outcome_in_vault("eval rm note.md"),
+            cadence_hooks_core::Outcome::Block
+        );
+        assert_eq!(
+            outcome_in_vault("eval \"rm note.md\""),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn find_exec_nested_shell_rm_inside_vault_blocked() {
+        assert_eq!(
+            outcome_in_vault(r"find . -name x -exec sh -c 'rm note.md' \;"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    // --- Controls: false positives the head scan correctly removed ---
+    //
+    // These BLOCKED under the old whole-command `contains("rm")` scan and must
+    // stay ALLOW. They pin the fix in the other direction: restoring the shapes
+    // above must not restore the substring detector with them.
+
+    #[test]
+    fn npm_run_format_in_vault_stays_allowed() {
+        assert_eq!(
+            outcome_in_vault("npm run format"),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn terraform_destroy_in_vault_stays_allowed() {
+        assert_eq!(
+            outcome_in_vault("terraform destroy"),
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn keyword_and_runner_peels_do_not_invent_verbs() {
+        // Controls for the three new peels: a keyword with a harmless body, a
+        // runner whose command is not destructive, and a `git` subcommand that
+        // is not `rm` (case-sensitively — `git RM` is not a subcommand).
+        for command in [
+            "for f in *.md; do cat $f; done",
+            "sudo -u me ls",
+            "xargs -0 grep note",
+            "git status",
+            "git RM note.md",
+            "eval ls",
+            "find . -name x -exec sh -c 'cat note.md' \\;",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must stay allowed"
+            );
+        }
     }
 
     #[test]

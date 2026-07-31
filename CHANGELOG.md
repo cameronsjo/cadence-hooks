@@ -108,6 +108,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   guard's `Check::run` entry point so an earlier case-sensitive prefilter cannot
   veto the shared normalization.
 
+  **Three of those guards were also NARROWED in the same commit, and the fold
+  is not where that came from.** `obsidian-trash-guard`,
+  `warn-gh-merge-preflight`, and `warn-pr-issue-link` each opened with a
+  substring scan of the whole command (`command.contains("rm")`,
+  `contains("gh pr merge")`) and were rewritten to test the *segment head*
+  instead. That change is orthogonal to case and it only ever subtracts:
+  anything not in command-head position became invisible. Recorded explicitly
+  because the paragraph above, read alone, promises a monotone widening — a
+  reader diffing behavior against it would be misled about where every measured
+  regression in the #528 security review lives.
+
+  For the trash guard the removed shapes were real vault deletions, each one
+  confirmed deleting a file through `bash`: `git rm note.md`,
+  `sudo -u me rm note.md`, `find … -print0 | xargs -0 rm` (the canonical
+  safe-for-spaces delete idiom), `for f in *.md; do rm $f; done`,
+  `if true; then rm note.md; fi`, `eval rm note.md`, and
+  `find . -exec sh -c 'rm note.md' \;`. Nothing else caught them — `guard-rm`
+  gates dangerous *targets*, not vault recoverability. All are blocked again:
+  the head test now runs after `core::shell::strip_leading_keywords` (a
+  reserved word occupying the head position), after a `sudo`/`xargs` peel that
+  walks the runner's OWN flags via `core::shell::skip_runner_flags` rather than
+  bailing on the first `-`, with `git rm` aliased to `rm` exactly as
+  `prevent_secret_writes` already spells it, and with `eval`'s operand and a
+  nested `sh -c` under `find -exec` routed back through the same scan. Each row
+  is pinned by a differential test driven through `Check::run`.
+
+  **What stays removed is the false-positive class the narrowing was for.**
+  `npm run format` and `terraform destroy` inside a vault blocked under the old
+  substring scan and are measured Allow now; both are pinned as controls, so a
+  future widening cannot quietly restore the substring detector with them.
+
+  The two nudge-only guards keep the narrowing for now — `sudo gh pr merge`,
+  `GH_TOKEN=x gh pr create`, and the keyword-wrapped spellings no longer nudge,
+  which is a missed reminder rather than an unguarded write. Tracked separately
+  rather than fixed here, so the block-capable regression above lands on its
+  own.
+
 - **`split_segments` honors backslash escapes, so a segment boundary means what the shell means by it (cameronsjo/cadence-hooks#475).** The splitter cut at every newline with no continuation awareness and toggled quote state on every `"` regardless of a preceding backslash — while `tokenize`, the parser that reads the resulting segment's words, does both correctly. Two parsers disagreeing about where a word ends is a boundary the shell does not have, and any guard that reasons per segment inherits it.
 
   **A backslash-newline is a line continuation, not a boundary.** Cutting there put a command's verb in one segment and its own flags in the next, so a per-segment gate failed on the segment holding the payload and that command went unexamined end to end. This is the ordinary shape of a hand-written multi-line invocation — `gh issue create --repo o/r \` / `--title "…" \` / `--body-file body.md` — and every variant of it was affected: `\`-continued `--body`, the `--body "$(cat <<'EOF' … EOF)"` form, and the CRLF spelling. Both characters are now consumed and the command flows on, matching the shell. `\r\n` is handled; a lone `\<CR>` stays an ordinary escape.
