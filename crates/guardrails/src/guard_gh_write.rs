@@ -203,10 +203,14 @@ pub(crate) enum RepoFlag {
 
 /// Read the `-R`/`--repo` target out of a segment's `gh` invocation.
 ///
-/// Handles all four gh CLI forms: `-R x`, `-Rx`, `--repo x`, `--repo=x` —
-/// mirroring `loop_analysis::extract_repo_flag`, which does the same over
-/// parsed AST words. Values keep their quotes trimmed so `--repo "o/r"`
-/// resolves to `o/r`.
+/// Handles all four gh CLI forms: `-R x`, `-Rx`, `--repo x`, `--repo=x`.
+/// Values keep their quotes trimmed so `--repo "o/r"` resolves to `o/r`.
+///
+/// `loop_analysis::extract_repo_flag` reads the same flag over parsed AST words
+/// but does NOT mirror this one: it resolves last-wins, while this scan reports
+/// [`RepoFlag::Ambiguous`] when readings disagree. That divergence is
+/// deliberate — see the fail-closed note below — and it is why this function
+/// backstops the loop gate rather than agreeing with it.
 ///
 /// Reads [`gh_argv`], not the raw string, on both counts that matter. Quoted
 /// text is one token, so a `-R owner/repo` spelled inside another flag's value

@@ -580,12 +580,22 @@ fn is_git_push_command(cmd: &SimpleCommand) -> bool {
 }
 
 /// Extract `-R` or `--repo` flag value from a `gh` command's arguments.
+///
+/// Later readings win, which is what pflag does. The scan stops at `--`:
+/// cobra stops parsing flags there and treats every later token as positional,
+/// so a `-R` after it is an argument gh never reads as a repo. Scanning past it
+/// made this resolve a repository gh will not act on — and in the
+/// `-R evil/b -- -R owned/a` orientation that error points at ALLOW, leaving
+/// the block to `guard_gh_write::repo_flag`'s fail-closed backstop.
 fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
     let words = suffix_words(cmd);
     let mut result = None;
     let mut index = 0;
     while index < words.len() {
         let word = &words[index];
+        if word == "--" {
+            break;
+        }
         if (word == "-R" || word == "--repo")
             && let Some(value) = words.get(index + 1)
         {
@@ -606,6 +616,14 @@ fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
 }
 
 /// Extract the explicit remote name from `git push <remote>` arguments.
+///
+/// `-o`/`--push-option` values are consumed rather than returned. That matters
+/// because the value is often assignment-shaped (Gerrit's `-o topic=…`,
+/// `-o r=…`), which the parser hands back as an `AssignmentWord`; left
+/// unconsumed it poses as the positional remote, and the caller then judges a
+/// remote git never pushes to. `extract_push_remote` has no backstop —
+/// `guard-push-remote` consumes this answer directly on both its chain gate and
+/// its loop gate — so the option's own grammar has to be modelled here.
 fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
     let words = suffix_words(cmd);
     let mut index = words.iter().position(|word| word == "push")? + 1;
@@ -614,18 +632,27 @@ fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
         if word == "--" {
             return words.get(index + 1).cloned();
         }
-        if word == "-o" || word == "--push-option" {
-            // The option value may be parsed as an AssignmentWord (`key=value`);
-            // consume it so it cannot pose as the positional remote.
+        if word == "--push-option" {
             index += 2;
             continue;
         }
-        if word.starts_with("--push-option=")
-            || word
-                .strip_prefix("-o")
-                .is_some_and(|value| !value.is_empty())
-            || word.starts_with('-')
-        {
+        // A single-dash token is a short-option CLUSTER, and git's parse-options
+        // walks it letter by letter. `-o` is `git push`'s only value-taking
+        // shorthand (every other one is a boolean), so the walk reduces to where
+        // the FIRST `o` sits: last letter in the token means the value is the
+        // NEXT word, anywhere earlier means the rest of the token is the value.
+        // One rule covers `-o v`, `-ov` and `-qo v` alike. Matching only the
+        // first two let `-qo topic=x`'s value pose as the remote, which un-blocks
+        // a chained push to a second, unowned remote (verified against git
+        // 2.55.0, where `-oo a=1 <url>` likewise makes `a=1` the repository —
+        // so keying on the LAST letter instead of the first is wrong too).
+        if let Some(cluster) = word.strip_prefix('-').filter(|c| !c.starts_with('-')) {
+            let value_is_next_word =
+                matches!(cluster.find('o'), Some(pos) if pos + 1 == cluster.len());
+            index += if value_is_next_word { 2 } else { 1 };
+            continue;
+        }
+        if word.starts_with('-') {
             index += 1;
             continue;
         }
@@ -1037,6 +1064,102 @@ mod tests {
             analyze_push_loops("for b in feat1 feat2; do git push -o ci.skip=1; done"),
             LoopAnalysis::MissingTargets(_)
         ));
+    }
+
+    /// git walks a single-dash token letter by letter, so `-o` clustered behind
+    /// a boolean still takes the next word as its push-option value. All
+    /// spellings verified against git 2.55.0.
+    #[test]
+    fn clustered_push_option_value_cannot_pose_as_remote() {
+        for option in [
+            "-qo topic=x",   // `o` last: value is the next word
+            "-fo topic=x",   //
+            "-uo topic=x",   //
+            "-qov",          // `o` mid-cluster: value is the rest of the token
+            "-4o topic=x",   // a non-alphabetic boolean shorthand
+            "-qo ci.skip=1", // a non-assignment-shaped value, clustered
+        ] {
+            let command = format!("for b in feat1 feat2; do git push {option} origin $b; done");
+            match analyze_push_loops(&command) {
+                LoopAnalysis::AllTargetsExplicit(cmds) => {
+                    assert_eq!(cmds[0].explicit_repo.as_deref(), Some("origin"), "{option}");
+                }
+                other => panic!("expected AllTargetsExplicit for {option}, got {other:?}"),
+            }
+        }
+    }
+
+    /// When `o` is NOT the last letter of the cluster it consumes the REST of
+    /// the token, so the following word really is the positional remote.
+    /// `git push -oq topic=x /nonexistent/repo main` reports an invalid refspec
+    /// `/nonexistent/repo` on git 2.55.0 — proving `topic=x` was the repository.
+    #[test]
+    fn push_option_glued_into_cluster_leaves_next_word_as_remote() {
+        for option in ["-oq", "-oo", "-ooq"] {
+            let command = format!("for b in feat1 feat2; do git push {option} origin $b; done");
+            match analyze_push_loops(&command) {
+                LoopAnalysis::AllTargetsExplicit(cmds) => {
+                    assert_eq!(cmds[0].explicit_repo.as_deref(), Some("origin"), "{option}");
+                }
+                other => panic!("expected AllTargetsExplicit for {option}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The three Block-to-Allow flips a cluster-blind scan opened: a clustered
+    /// `-o` value posing as the remote made two different remotes read as one,
+    /// and made a bare looped push look like it named a target.
+    #[test]
+    fn clustered_push_option_does_not_mask_a_missing_or_second_remote() {
+        match analyze_push_loops("for b in feat1 feat2; do git push -qo topic=x; done") {
+            LoopAnalysis::MissingTargets(cmds) => {
+                assert_eq!(cmds[0].explicit_repo, None);
+            }
+            other => panic!("expected MissingTargets, got {other:?}"),
+        }
+
+        for (command, second) in [
+            (
+                "git push -qo topic=x origin main && git push -qo topic=x evilremote main",
+                "evilremote",
+            ),
+            (
+                "git push -qo r=someone origin main && git push -qo r=someone https://github.com/evil/x.git main",
+                "https://github.com/evil/x.git",
+            ),
+        ] {
+            match analyze_push_chain(command) {
+                ChainAnalysis::DifferentRemotes(cmds) => {
+                    let remotes: Vec<&str> = cmds
+                        .iter()
+                        .filter_map(|c| c.explicit_repo.as_deref())
+                        .collect();
+                    assert_eq!(remotes, vec!["origin", second], "{command}");
+                }
+                other => panic!("expected DifferentRemotes for {command}, got {other:?}"),
+            }
+        }
+    }
+
+    /// cobra stops parsing flags at `--`, so a later `-R` is positional and gh
+    /// never reads it as a repo. Scanning past it resolved a repository gh will
+    /// not act on — and in the second orientation it resolved an OWNED one for
+    /// a command targeting an unowned repo.
+    #[test]
+    fn repo_flag_scan_stops_at_double_dash() {
+        for (flags, expected) in [
+            ("-R cameronsjo/a -- -R evil/b", "cameronsjo/a"),
+            ("-R evil/b -- -R cameronsjo/a", "evil/b"),
+            ("-R cameronsjo/a -- --repo=evil/b", "cameronsjo/a"),
+        ] {
+            let command = format!("for i in 1 2; do gh issue close $i {flags}; done");
+            match analyze_gh_loops(&command) {
+                LoopAnalysis::AllTargetsExplicit(cmds) => {
+                    assert_eq!(cmds[0].explicit_repo.as_deref(), Some(expected), "{flags}");
+                }
+                other => panic!("expected AllTargetsExplicit for {flags}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
