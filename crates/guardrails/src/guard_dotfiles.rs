@@ -64,7 +64,7 @@ impl Check for GuardDotfiles {
 
     fn run(&self, input: &HookInput) -> CheckResult {
         // Only applies to Edit and Write tools
-        let tool = input.tool_name().unwrap_or("");
+        let tool = input.normalized_tool_name().unwrap_or("");
         if tool != "Edit" && tool != "Write" {
             return CheckResult::allow();
         }

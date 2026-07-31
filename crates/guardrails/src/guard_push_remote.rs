@@ -875,10 +875,12 @@ mod tests {
 
     #[test]
     fn push_named_remote_unchanged() {
-        // A named remote still resolves through git and validates its URL:
-        // origin → github.com/cameronsjo/cadence-hooks (owned) → allow.
+        // A named remote still resolves through git and validates its URL.
+        // The fixture pins that URL instead of trusting the enclosing clone.
         with_env(&owners_only(), || {
-            let result = PushRemoteGuard.run(&make_bash_with_cwd("git push origin main", REPO_DIR));
+            let repo = crate::github_origin_repo();
+            let cwd = repo.path().to_string_lossy();
+            let result = PushRemoteGuard.run(&make_bash_with_cwd("git push origin main", &cwd));
             assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
     }
