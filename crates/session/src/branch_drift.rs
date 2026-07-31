@@ -36,7 +36,7 @@ impl Check for WarnBranchDrift {
 
     fn run(&self, input: &HookInput) -> CheckResult {
         // Phase 1: only `git commit` on Bash reaches the comparison.
-        if input.tool_name() != Some("Bash") {
+        if input.normalized_tool_name() != Some("Bash") {
             return CheckResult::allow();
         }
         let Some(command) = input.command() else {

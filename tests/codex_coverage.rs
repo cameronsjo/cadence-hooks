@@ -203,18 +203,18 @@ fn paired_harness_fixtures_cover_and_normalize_every_route() {
             }
             let input = HookInput::from_json(&raw).unwrap();
             if harness == "codex" && matches!(route, "shell" | "unified-exec") {
-                assert_eq!(input.tool_name(), Some("Bash"));
+                assert_eq!(input.normalized_tool_name(), Some("Bash"));
                 assert!(input.command().is_some());
             }
             if harness == "codex" && route == "subagents" {
-                assert_eq!(input.tool_name(), Some("Agent"));
+                assert_eq!(input.normalized_tool_name(), Some("Agent"));
             }
             if harness == "codex" && route == "mcp-filesystem-write" {
-                assert_eq!(input.tool_name(), Some("Write"));
+                assert_eq!(input.normalized_tool_name(), Some("Write"));
                 assert_eq!(input.operation(), Some("create"));
             }
             if harness == "codex" && route == "mcp-functions" {
-                assert_eq!(input.tool_name(), Some("Read"));
+                assert_eq!(input.normalized_tool_name(), Some("Read"));
                 assert_eq!(input.operation(), Some("read"));
             }
             if harness == "codex" && route == "apply-patch" {

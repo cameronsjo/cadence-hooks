@@ -208,6 +208,31 @@ pub fn normalize_path(path: &str) -> String {
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct HookInput {
     pub tool_name: Option<String>,
+    /// The harness-neutral view of [`Self::tool_name`], derived at parse time by
+    /// [`Self::from_json`] — never deserialized from the payload.
+    ///
+    /// A Codex `exec_command` and a Claude `Bash` are the same operation as far
+    /// as a guard is concerned, and so are `mcp__filesystem__write_file` and
+    /// `Write`. Guards that gate on *what the operation does* read this via
+    /// [`Self::normalized_tool_name`]; guards that gate on *which tool the
+    /// harness actually named* keep reading [`Self::tool_name`].
+    ///
+    /// Kept as a SEPARATE field rather than overwriting `tool_name`, because
+    /// overwriting silently unhooked `guard-browser-device`: it matches
+    /// `mcp__claude-in-chrome__*`, and four of those names (`read_page`,
+    /// `read_console_messages`, `read_network_requests`, `tabs_create_mcp`)
+    /// classify as `Read`/`Write`, so the rewritten name no longer matched the
+    /// prefix and the first browser action of a session ran against an
+    /// unconfirmed device. Preserving the literal name is the durable shape:
+    /// it holds even if Codex later grows a Claude-in-Chrome route, which a
+    /// harness gate on the rewrite would not.
+    ///
+    /// `#[serde(skip)]` is load-bearing. This field steers enforcement, so a
+    /// payload must not be able to supply it — a hand-set `"normalized_tool":
+    /// "Read"` on a write payload would talk every content guard out of
+    /// scanning. It is derived, or it is `None`.
+    #[serde(skip)]
+    pub normalized_tool: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub tool_input: Option<ToolInput>,
     /// The tool response (stdout, stderr) from the tool execution.
@@ -412,17 +437,19 @@ impl HookInput {
         {
             tool_input.command = tool_input.cmd.take();
         }
+        // Every alias below writes `normalized_tool`, never `tool_name` — see
+        // that field's doc comment for why the literal name has to survive.
         if matches!(
             input.tool_name.as_deref(),
             Some("exec_command" | "unified_exec" | "shell")
         ) {
-            input.tool_name = Some("Bash".to_string());
+            input.normalized_tool = Some("Bash".to_string());
         }
         if matches!(
             input.tool_name.as_deref(),
             Some("spawn_agent" | "spawn_agents_on_csv" | "multi_agents")
         ) {
-            input.tool_name = Some("Agent".to_string());
+            input.normalized_tool = Some("Agent".to_string());
         }
         if let Some(name) = input.tool_name.as_deref()
             && name.starts_with("mcp__")
@@ -451,7 +478,7 @@ impl HookInput {
                 None
             };
             if let Some((tool, operation)) = operation {
-                input.tool_name = Some(tool.to_string());
+                input.normalized_tool = Some(tool.to_string());
                 if let Some(tool_input) = input.tool_input.as_mut() {
                     tool_input.operation = Some(operation.to_string());
                 }
@@ -549,7 +576,10 @@ impl HookInput {
         new: Option<String>,
     ) -> Self {
         let mut result = self.clone();
-        result.tool_name = Some(tool_name.to_string());
+        // The synthesized per-target view is a *normalized* one — the literal
+        // harness tool is still `apply_patch` (or the MCP rename tool), and the
+        // denial ledger records that rather than a shape this binary invented.
+        result.normalized_tool = Some(tool_name.to_string());
         result.tool_input = Some(ToolInput {
             file_path: Some(path),
             operation: Some(operation.to_string()),
@@ -710,9 +740,31 @@ impl HookInput {
         None
     }
 
-    /// The tool name (Write, Edit, Bash, etc.)
+    /// The tool name **exactly as the harness sent it** (`Write`, `Edit`,
+    /// `Bash`, `exec_command`, `mcp__claude-in-chrome__read_page`, …).
+    ///
+    /// Use this when the guard's question is "which tool is this?" — a
+    /// fully-qualified MCP name, a Claude-only tool with no Codex counterpart
+    /// (`AskUserQuestion`, `ExitPlanMode`, `CronCreate`), or an audit record of
+    /// what actually ran. Use [`Self::normalized_tool_name`] when the question
+    /// is "what does this operation do?".
     pub fn tool_name(&self) -> Option<&str> {
         self.tool_name.as_deref()
+    }
+
+    /// The harness-neutral tool name: [`Self::normalized_tool`] when the parse
+    /// derived one, otherwise [`Self::tool_name`] unchanged.
+    ///
+    /// Under Claude Code the two agree for every native tool, so a guard that
+    /// switches to this reads identically there; under Codex (and for MCP
+    /// filesystem servers on either harness) it is what lets a `Write` gate see
+    /// `mcp__filesystem__write_file`. Every guard gating on a Claude tool name
+    /// — `Bash`, `Agent`/`Task`, `Edit`/`Write`/`MultiEdit`/`NotebookEdit`,
+    /// `Read`, `Grep` — wants this one.
+    pub fn normalized_tool_name(&self) -> Option<&str> {
+        self.normalized_tool
+            .as_deref()
+            .or(self.tool_name.as_deref())
     }
 
     /// The Claude Code session id, if present (SessionStart and some payloads).
@@ -1419,11 +1471,13 @@ mod tests {
             r#"{"tool_name":"exec_command","tool_input":{"cmd":"git status"}}"#,
         )
         .unwrap();
-        assert_eq!(shell.tool_name(), Some("Bash"));
+        assert_eq!(shell.tool_name(), Some("exec_command"));
+        assert_eq!(shell.normalized_tool_name(), Some("Bash"));
         assert_eq!(shell.command(), Some("git status"));
 
         let agent = HookInput::from_json(r#"{"tool_name":"spawn_agent","tool_input":{}}"#).unwrap();
-        assert_eq!(agent.tool_name(), Some("Agent"));
+        assert_eq!(agent.tool_name(), Some("spawn_agent"));
+        assert_eq!(agent.normalized_tool_name(), Some("Agent"));
     }
 
     #[test]
@@ -1432,7 +1486,7 @@ mod tests {
             r#"{"tool_name":"mcp__filesystem__write_file","tool_input":{"path":"a","content":"x"}}"#,
         )
         .unwrap();
-        assert_eq!(write.tool_name(), Some("Write"));
+        assert_eq!(write.normalized_tool_name(), Some("Write"));
         assert_eq!(write.operation(), Some("create"));
         assert_eq!(write.file_path().as_deref(), Some("a"));
 
@@ -1440,14 +1494,14 @@ mod tests {
             r#"{"tool_name":"mcp__filesystem__delete_file","tool_input":{"path":"a"}}"#,
         )
         .unwrap();
-        assert_eq!(delete.tool_name(), Some("Edit"));
+        assert_eq!(delete.normalized_tool_name(), Some("Edit"));
         assert_eq!(delete.operation(), Some("delete"));
 
         let read = HookInput::from_json(
             r#"{"tool_name":"mcp__filesystem__read_file","tool_input":{"path":".env"}}"#,
         )
         .unwrap();
-        assert_eq!(read.tool_name(), Some("Read"));
+        assert_eq!(read.normalized_tool_name(), Some("Read"));
         assert_eq!(read.operation(), Some("read"));
 
         let rename = HookInput::from_json(
@@ -1474,7 +1528,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(paths, ["a", "b", "c", "d"]);
         assert_eq!(
-            targets.iter().map(HookInput::tool_name).collect::<Vec<_>>(),
+            targets
+                .iter()
+                .map(HookInput::normalized_tool_name)
+                .collect::<Vec<_>>(),
             [Some("Write"), Some("Edit"), Some("Write"), Some("Edit")]
         );
     }
