@@ -45,9 +45,19 @@ fmt-check:
 
 ## CI ──────────────────────────────────────────
 
+.PHONY: report
+## Regenerate the Codex compatibility report
+report: build
+	@python3 scripts/generate-codex-report.py
+
+.PHONY: report-check
+## Fail if the checked-in Codex compatibility report is stale
+report-check: build
+	@python3 scripts/generate-codex-report.py --check
+
 .PHONY: ci
-## Run all CI checks (fmt, clippy, test)
-ci: fmt-check clippy test
+## Run all CI checks (fmt, clippy, test, report freshness)
+ci: fmt-check clippy test report-check
 
 ## Release ────────────────────────────────────
 

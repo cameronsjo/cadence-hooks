@@ -17,7 +17,12 @@ permissions:
 
 jobs:
   doctor:
-    runs-on: ubuntu-latest
+    # Self-hosted, because a reusable workflow's runner minutes bill the CALLER,
+    # and every caller here is a private plugin repo. `ubuntu-latest` meant this
+    # gate consumed GitHub-hosted minutes on their accounts even though this
+    # repo is public and its own CI is free — enough to stop the job starting
+    # once a caller's Actions budget was reached.
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

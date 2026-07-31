@@ -70,7 +70,7 @@ impl Check for WarnCommitProvenance {
 /// [`provenance::machine_digest`] derivation without depending on the
 /// process's actual hostname.
 pub fn run_warn_commit_provenance(input: &HookInput, host: &str) -> CheckResult {
-    if input.tool_name() != Some("Bash") {
+    if input.normalized_tool_name() != Some("Bash") {
         return CheckResult::allow();
     }
     let Some(command) = input.command() else {

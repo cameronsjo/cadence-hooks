@@ -7,7 +7,7 @@
 //! stdin.
 
 use cadence_hooks_core::HookEvent;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::process;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,6 +128,13 @@ enum Commands {
     /// List all hooks with events, descriptions, and disable status
     List,
 
+    /// Emit the complete hook registry as a machine-readable compatibility manifest
+    Manifest {
+        /// Output format
+        #[arg(long, value_enum, default_value_t = ManifestFormat::Json)]
+        format: ManifestFormat,
+    },
+
     /// Interactively configure which hooks to disable for this project
     Configure {
         /// Print current configuration without interactive mode
@@ -153,6 +160,11 @@ enum Commands {
 
     /// Convert legacy .claude/{redaction,terminology}.json into the unified .claude/cadence.json (#153)
     MigrateConfig,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ManifestFormat {
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -476,6 +488,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         }),
         Commands::Try { .. }
         | Commands::List
+        | Commands::Manifest { .. }
         | Commands::Configure { .. }
         | Commands::Doctor { .. }
         | Commands::MigrateConfig => None,
@@ -537,6 +550,40 @@ fn print_hook_list() {
     }
 }
 
+fn print_hook_manifest(format: ManifestFormat) {
+    match format {
+        ManifestFormat::Json => {
+            let hooks = HOOKS
+                .iter()
+                .map(|hook| {
+                    serde_json::json!({
+                        "name": hook.name,
+                        "description": hook.description,
+                        "plugin": hook.plugin,
+                        "event": hook.event.map(|event| event.name()).unwrap_or("logger"),
+                        "criticality": if registry::is_security_critical(hook.name) {
+                            "security-critical"
+                        } else if hook.event.is_none() {
+                            "telemetry"
+                        } else {
+                            "workflow"
+                        },
+                        "protected": PROTECTED_GUARDS.contains(&hook.name),
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "binaryVersion": env!("CARGO_PKG_VERSION"),
+                    "hooks": hooks,
+                })
+            );
+        }
+    }
+}
+
 fn main() {
     // Pin the main thread before anything can spawn — the panic hook's guard
     // test below is only meaningful once this is set. The `Result` is
@@ -561,7 +608,7 @@ fn main() {
     let bypass_exempt = matches!(
         (positional.next().as_deref(), positional.next().as_deref()),
         (
-            Some("list" | "configure" | "doctor" | "try" | "migrate-config"),
+            Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
             _
         ) | (Some("session"), Some("declare" | "status"))
     );
@@ -774,6 +821,10 @@ fn main() {
         }
         Commands::List => {
             print_hook_list();
+            process::exit(0);
+        }
+        Commands::Manifest { format } => {
+            print_hook_manifest(format);
             process::exit(0);
         }
         Commands::Configure { list } => {

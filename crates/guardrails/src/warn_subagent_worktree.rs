@@ -177,7 +177,7 @@ impl Check for WarnSubagentWorktree {
         // the pre-2.1.63 name, kept for resilience. Every other tool call exits
         // here before any git spawn. (In production the hooks.json matcher
         // already filters to Agent|Task, so this is belt-and-suspenders.)
-        if !matches!(input.tool_name(), Some("Agent" | "Task")) {
+        if !matches!(input.normalized_tool_name(), Some("Agent" | "Task")) {
             return CheckResult::allow();
         }
 
