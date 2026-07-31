@@ -146,6 +146,83 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
+    /// Every claude-in-chrome MCP tool the extension exposes, as of 2026-07-30.
+    ///
+    /// The list is spelled out rather than sampled because the regression this
+    /// pins was *name-shaped*: `HookInput::from_json`'s harness-neutral alias
+    /// pass rewrote any `mcp__*` tool name it could classify, and the four names
+    /// carrying `read` plus the two carrying `create` were rewritten to
+    /// `Read`/`Write` — so the guard's `starts_with(CHROME_TOOL_PREFIX)` test
+    /// failed and the first browser action of a session executed against an
+    /// unconfirmed device. A sampled list would have missed exactly the names
+    /// that broke.
+    const ALL_CHROME_TOOLS: &[&str] = &[
+        "browser_batch",
+        "computer",
+        "file_upload",
+        "find",
+        "form_input",
+        "get_page_text",
+        "gif_creator",
+        "javascript_tool",
+        "list_connected_browsers",
+        "navigate",
+        "read_console_messages",
+        "read_network_requests",
+        "read_page",
+        "resize_window",
+        "select_browser",
+        "shortcuts_execute",
+        "shortcuts_list",
+        "switch_browser",
+        "tabs_close_mcp",
+        "tabs_context_mcp",
+        "tabs_create_mcp",
+        "upload_image",
+    ];
+
+    /// Every claude-in-chrome tool must still reach this guard as a block on the
+    /// session's first call — driven through the real `HookInput::from_json`
+    /// parse path, which is where the alias rewrite lives.
+    #[test]
+    fn every_chrome_tool_reaches_the_guard_through_from_json() {
+        assert_eq!(ALL_CHROME_TOOLS.len(), 22, "tool roster changed");
+        let mut escaped = Vec::new();
+        for (index, tool) in ALL_CHROME_TOOLS.iter().enumerate() {
+            let payload = format!(
+                r#"{{"tool_name":"mcp__claude-in-chrome__{tool}","session_id":"guard-bd-roster-{index}","tool_input":{{}}}}"#
+            );
+            let input = HookInput::from_json(&payload).expect("parse chrome payload");
+            let marker = GuardBrowserDevice::marker_path(&input);
+            let _ = std::fs::remove_file(&marker);
+            if GuardBrowserDevice.run(&input).outcome != Outcome::Block {
+                escaped.push(*tool);
+            }
+            let _ = std::fs::remove_file(&marker);
+        }
+        assert!(
+            escaped.is_empty(),
+            "these claude-in-chrome tools escaped the device handshake: {escaped:?}"
+        );
+    }
+
+    /// The harness-neutral view may still classify a chrome tool — that is what
+    /// makes the *separate* field load-bearing. This pins the two apart so a
+    /// future edit cannot quietly go back to overwriting `tool_name`.
+    #[test]
+    fn chrome_tool_keeps_its_name_while_the_normalized_view_may_differ() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"mcp__claude-in-chrome__read_page","tool_input":{}}"#,
+        )
+        .expect("parse chrome payload");
+        assert_eq!(
+            input.tool_name(),
+            Some("mcp__claude-in-chrome__read_page"),
+            "the literal harness tool name must survive normalization"
+        );
+        assert_eq!(input.normalized_tool_name(), Some("Read"));
+    }
+
     #[test]
     fn marker_path_differs_per_session() {
         let a = GuardBrowserDevice::marker_path(&make_mcp(

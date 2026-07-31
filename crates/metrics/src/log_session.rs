@@ -10,9 +10,8 @@
 
 use crate::common;
 use crate::compute_cost::compute_cost_by_model;
-use crate::model_breakdown::{by_model_json, unpriced_models};
 use crate::prices::Prices;
-use crate::scan_tokens::{ScanResult, scan_tokens};
+use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -63,13 +62,23 @@ impl Logger for LogSession {
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
         };
-        // Whole transcript, no marker. `None` scan → nothing to price → skip.
-        let Some(scan) = scan_tokens(&transcript, None) else {
-            return;
+        let usage = match scan_transcript(&transcript, None, common::harness()) {
+            TranscriptScan::Usage(usage) => usage,
+            TranscriptScan::Diagnostic(diagnostic) => {
+                common::append_transcript_diagnostic(
+                    diagnostic.harness,
+                    diagnostic.source_format,
+                    diagnostic.code,
+                    "sessions",
+                );
+                return;
+            }
+            TranscriptScan::Empty => return,
         };
 
         let prices = Prices::load(self.prices_path.as_deref());
-        let cost = compute_cost_by_model(&scan.by_model, &prices);
+        let cost = (usage.harness == "claude")
+            .then(|| compute_cost_by_model(&usage.scan.by_model, &prices));
 
         let branch = common::branch(input.cwd.as_deref());
         let repo = common::repo_basename(input.cwd.as_deref());
@@ -79,8 +88,7 @@ impl Logger for LogSession {
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let commits_path = dir.join("commits.jsonl");
-        let commits = std::fs::read_to_string(&commits_path)
+        let commits = std::fs::read_to_string(dir.join("commits.jsonl"))
             .ok()
             .map(|contents| count_commits(&contents, session_id))
             .unwrap_or(0);
@@ -91,7 +99,7 @@ impl Logger for LogSession {
             session_id,
             &branch,
             &repo,
-            &scan,
+            &usage,
             cost,
             &prices,
             start_ts.as_deref(),
@@ -150,18 +158,21 @@ fn build_session_record(
     session_id: &str,
     branch: &str,
     repo: &str,
-    scan: &ScanResult,
-    cost: f64,
+    usage: &UsageScan,
+    cost: Option<f64>,
     prices: &Prices,
     start_ts: Option<&str>,
     commits: u64,
 ) -> Value {
-    let by_model = by_model_json(&scan.by_model, prices);
-    let unpriced = unpriced_models(&scan.by_model, prices);
+    let scan = &usage.scan;
+    let (by_model, unpriced) = usage.priced_breakdown(prices);
     let duration_ms = session_duration_ms(start_ts, ts);
 
-    json!({
+    let mut record = json!({
+        "schemaVersion": common::TOKEN_RECORD_SCHEMA_VERSION,
         "ts": ts,
+        "harness": usage.harness,
+        "sourceFormat": usage.source_format,
         "sessionId": session_id,
         "transcriptPath": input.transcript_path,
         "repo": repo,
@@ -178,21 +189,30 @@ fn build_session_record(
             "cacheCreate": scan.tokens.cache_create,
             "cacheRead": scan.tokens.cache_read,
             "output": scan.tokens.output,
+            "reasoningOutput": usage.reasoning_output,
+            "total": usage.total_tokens,
         },
-        "costUsd": cost,
         "byModel": by_model,
         "unpricedModels": unpriced,
         "messagesScanned": scan.messages_scanned,
         "lastMessageId": scan.last_message_id,
         "agentId": input.agent_id,
         "parentSessionId": input.parent_session_id,
-    })
+    });
+    if usage.is_unpriced_harness() {
+        record["estimatedCostUsd"] = Value::Null;
+        record["pricingSource"] = Value::Null;
+        record["pricingVerifiedAt"] = Value::Null;
+    } else {
+        record["costUsd"] = json!(cost.unwrap_or(0.0));
+    }
+    record
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan_tokens::Tokens;
+    use crate::scan_tokens::{ScanResult, Tokens, scan_tokens};
 
     #[test]
     fn name_is_log_session() {
@@ -222,6 +242,10 @@ mod tests {
         }
     }
 
+    fn sample_usage() -> UsageScan {
+        UsageScan::claude(sample_scan())
+    }
+
     fn sample_input() -> MetricsInput {
         MetricsInput {
             session_id: Some("s1".into()),
@@ -244,8 +268,8 @@ mod tests {
             "s1",
             "feat/x",
             "myrepo",
-            &sample_scan(),
-            0.001234,
+            &sample_usage(),
+            Some(0.001234),
             &prices,
             None,
             2,
@@ -263,6 +287,9 @@ mod tests {
         assert_eq!(record["tokens"]["cacheRead"], 200);
         assert_eq!(record["tokens"]["output"], 30);
         assert_eq!(record["costUsd"], 0.001234);
+        assert_eq!(record["schemaVersion"], 2);
+        assert_eq!(record["harness"], "claude");
+        assert_eq!(record["tokens"]["total"], 380);
         assert_eq!(record["messagesScanned"], 3);
         assert_eq!(record["lastMessageId"], "m9");
         assert_eq!(record["agentId"], "a1");
@@ -290,8 +317,8 @@ mod tests {
             "s1",
             "",
             "myrepo",
-            &sample_scan(),
-            0.0,
+            &sample_usage(),
+            Some(0.0),
             &prices,
             None,
             0,
@@ -336,8 +363,8 @@ mod tests {
             "s1",
             "main",
             "r",
-            &scan,
-            0.0,
+            &UsageScan::claude(scan),
+            Some(0.0),
             &prices,
             None,
             0,
@@ -356,8 +383,8 @@ mod tests {
             "s1",
             "main",
             "r",
-            &sample_scan(),
-            0.0,
+            &sample_usage(),
+            Some(0.0),
             &prices,
             Some("2026-07-02T00:10:00Z"),
             5,
@@ -421,5 +448,28 @@ mod tests {
         // And the session's recorded tokens equal the whole-transcript sum.
         assert_eq!(whole.tokens.input, 600);
         assert_eq!(whole.tokens.output, 60);
+    }
+
+    #[test]
+    fn codex_session_cost_is_an_unverified_nullable_estimate() {
+        let mut usage = sample_usage();
+        usage.harness = "codex";
+        usage.source_format = "codex-rollout-v1";
+        let record = build_session_record(
+            "ts",
+            &sample_input(),
+            "s1",
+            "main",
+            "r",
+            &usage,
+            None,
+            &Prices::embedded(),
+            None,
+            0,
+        );
+        assert!(record.get("costUsd").is_none());
+        assert!(record["estimatedCostUsd"].is_null());
+        assert!(record["pricingSource"].is_null());
+        assert!(record["pricingVerifiedAt"].is_null());
     }
 }

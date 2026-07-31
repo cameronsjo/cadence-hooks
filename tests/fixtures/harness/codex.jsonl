@@ -1,0 +1,8 @@
+{"route":"shell","payload":{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"cmd":"git status"}}}
+{"route":"unified-exec","payload":{"hook_event_name":"PreToolUse","tool_name":"exec_command","tool_input":{"cmd":"pwd"}}}
+{"route":"apply-patch","payload":{"hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":"*** Begin Patch\n*** Add File: notes.md\n+ok\n*** End Patch"}}
+{"route":"mcp-functions","payload":{"hook_event_name":"PreToolUse","tool_name":"mcp__filesystem__read_file","tool_input":{"path":"README.md"}}}
+{"route":"mcp-filesystem-write","payload":{"hook_event_name":"PreToolUse","tool_name":"mcp__filesystem__write_file","tool_input":{"path":"notes.md","content":"ok"}}}
+{"route":"subagents","payload":{"hook_event_name":"PreToolUse","tool_name":"spawn_agent","tool_input":{"subagent_type":"reviewer"}}}
+{"route":"lifecycle-events","payload":{"hook_event_name":"SessionEnd","session_id":"fixture","transcript_path":null,"reason":"other","model":"gpt-5"}}
+{"route":"malformed","payloadRaw":"not-json"}

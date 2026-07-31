@@ -54,7 +54,7 @@ pub fn run_guard(input: &HookInput, peers: &[Peer]) -> CheckResult {
         .collect();
     let names = peer_names.join(", ");
 
-    match input.tool_name() {
+    match input.normalized_tool_name() {
         Some("Bash") => {
             let Some(command) = input.command() else {
                 return CheckResult::allow();
