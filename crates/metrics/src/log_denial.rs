@@ -31,27 +31,29 @@ use std::io::Write;
 /// `hook` is the canonical registry name threaded from the binary (e.g.
 /// `terminology`, not the `Check::name()` value `terminology-guard`).
 ///
-/// `targets` is how many normalized targets the invocation judged — 1 for an
-/// ordinary tool call, N for a Codex `apply_patch` carrying N file operations.
+/// `outcomes` carries EVERY normalized target's outcome — one element for an
+/// ordinary tool call, N for a Codex `apply_patch` with N file operations.
+///
 /// **Exactly one row is written per hook invocation regardless of N.** Writing
 /// per target made ledger volume proportional to an attacker-chosen patch body:
 /// one `apply_patch` with N operations wrote up to N rows per security-critical
-/// hook, into a file with no size cap, and distorted every rate computed off
-/// denial counts (nudge-fire rates are the denominator for every adherence
-/// measurement). The count is carried as a field instead, so the fan-out is still
-/// visible without being amplified.
-pub fn log_denial(
-    hook: &str,
-    event: HookEvent,
-    input: &HookInput,
-    outcome: Outcome,
-    targets: usize,
-) {
-    let Some(decision) = decision_for(outcome, nudges_enabled()) else {
+/// hook, into a file with no size cap.
+///
+/// One row must not mean one decision *remembered*, though. Passing only the
+/// strictest outcome deduplicated nothing — it deleted a different event class:
+/// a mixed invocation (one target blocks, eleven nudge) wrote a lone `deny` row
+/// with no trace that the nudges happened, and nudge-fire rates are the
+/// denominator for every adherence measurement. So the row carries a
+/// per-decision tally alongside the winning `decision`. `targets` stays the
+/// number *judged*, which is deliberately not recoverable from the tally: an
+/// `Allow` target is judged and never tallied.
+pub fn log_denial(hook: &str, event: HookEvent, input: &HookInput, outcomes: &[Outcome]) {
+    let nudges_on = nudges_enabled();
+    let Some(decision) = decision_for(strictest(outcomes), nudges_on) else {
         return;
     };
 
-    let record = build_denial_record(hook, event, input, decision, targets);
+    let record = build_denial_record(hook, event, input, decision, outcomes, nudges_on);
 
     let dir = common::metrics_dir();
     if std::fs::create_dir_all(&dir).is_err() {
@@ -117,12 +119,14 @@ fn build_denial_record(
     event: HookEvent,
     input: &HookInput,
     decision: &str,
-    targets: usize,
+    outcomes: &[Outcome],
+    nudges_on: bool,
 ) -> Value {
     json!({
         "ts": common::utc_timestamp(),
         "hook": hook,
         "event": event.name(),
+        // The strictest decision across targets — what the tool call got.
         "decision": decision,
         "tool": input.tool_name(),
         "repo": common::repo_basename(input.cwd.as_deref()),
@@ -130,8 +134,40 @@ fn build_denial_record(
         "agentId": input.agent_id(),
         // How many normalized targets one invocation judged. A path count, never
         // a path: it says how wide the operation was, not what it touched.
-        "targets": targets,
+        "targets": outcomes.len(),
+        // What each of them decided, so a mixed invocation stays countable per
+        // decision. Omits `Allow` (never logged) and, when nudges are opted out,
+        // `nudge` — so the tally holds exactly the rows a per-target ledger
+        // would have written, minus the row count.
+        "decisions": decision_tally(outcomes, nudges_on),
     })
+}
+
+/// The strictest outcome across every judged target, folded with the same
+/// [`Outcome::merge`] the dispatch aggregate uses — so the row's `decision` and
+/// what the tool call actually got cannot disagree.
+fn strictest(outcomes: &[Outcome]) -> Outcome {
+    outcomes
+        .iter()
+        .fold(Outcome::Allow, |merged, other| merged.merge(*other))
+}
+
+/// `{"deny": 1, "nudge": 11}` — one count per loggable decision, emitted in the
+/// fixed order `deny`/`ask`/`nudge` so rows stay diffable. Pure, and separate
+/// from the record builder so the tally rule is testable without a timestamp or
+/// a repo probe.
+fn decision_tally(outcomes: &[Outcome], nudges_on: bool) -> Value {
+    let mut tally = serde_json::Map::new();
+    for kind in ["deny", "ask", "nudge"] {
+        let count = outcomes
+            .iter()
+            .filter(|outcome| decision_for(**outcome, nudges_on) == Some(kind))
+            .count();
+        if count > 0 {
+            tally.insert(kind.to_string(), json!(count));
+        }
+    }
+    Value::Object(tally)
 }
 
 #[cfg(test)]
@@ -196,7 +232,8 @@ mod tests {
             HookEvent::PreToolUse,
             &edit_input(),
             "deny",
-            1,
+            &[Outcome::Block],
+            true,
         );
         assert_eq!(rec["hook"], "terminology");
         assert_eq!(rec["event"], "PreToolUse");
@@ -217,7 +254,8 @@ mod tests {
             HookEvent::PreToolUse,
             &edit_input(),
             "deny",
-            1,
+            &[Outcome::Block],
+            true,
         );
         let obj = rec.as_object().expect("record is an object");
         for forbidden in ["command", "file_path", "filePath", "content", "new_string"] {
@@ -255,7 +293,8 @@ mod tests {
             HookEvent::PreToolUse,
             &input,
             "deny",
-            1,
+            &[Outcome::Block],
+            true,
         );
         assert!(rec["agentId"].is_null());
     }
@@ -305,8 +344,7 @@ mod tests {
                 "terminology",
                 HookEvent::PreToolUse,
                 &edit_input(),
-                Outcome::Block,
-                1,
+                &[Outcome::Block],
             );
         });
         let rows = read_lines(tmp.path());
@@ -324,11 +362,78 @@ mod tests {
             HookEvent::PreToolUse,
             &edit_input(),
             "deny",
-            37,
+            &[Outcome::Block; 37],
+            true,
         );
         assert_eq!(rec["targets"], 37);
         // A count, not a path list — the privacy contract is unchanged.
         assert!(rec["targets"].is_number());
+    }
+
+    /// The regression this pins: one row must not mean one decision remembered.
+    /// Collapsing a mixed invocation to its strictest outcome erased the nudge
+    /// decisions entirely, and nudge-fire rates are the denominator for every
+    /// adherence measurement.
+    #[test]
+    fn record_tallies_every_decision_not_just_the_winner() {
+        let mut outcomes = vec![Outcome::Block];
+        outcomes.extend(std::iter::repeat_n(Outcome::Nudge, 11));
+
+        let rec = build_denial_record(
+            "prevent-secret-writes",
+            HookEvent::PreToolUse,
+            &edit_input(),
+            "deny",
+            &outcomes,
+            true,
+        );
+
+        assert_eq!(rec["decision"], "deny", "the tool call was blocked");
+        assert_eq!(rec["decisions"], json!({"deny": 1, "nudge": 11}));
+        assert_eq!(rec["targets"], 12);
+    }
+
+    /// `targets` counts what was JUDGED and the tally counts what was LOGGED, so
+    /// an all-Allow target set is deliberately not recoverable from the tally.
+    #[test]
+    fn tally_omits_allow_while_targets_still_counts_it() {
+        let outcomes = [Outcome::Block, Outcome::Allow, Outcome::Allow];
+        let rec = build_denial_record(
+            "guard-rm",
+            HookEvent::PreToolUse,
+            &edit_input(),
+            "deny",
+            &outcomes,
+            true,
+        );
+        assert_eq!(rec["decisions"], json!({"deny": 1}));
+        assert_eq!(rec["targets"], 3);
+    }
+
+    /// The tally honours the nudge opt-out the same way the row does — it holds
+    /// exactly the rows a per-target ledger would have written.
+    #[test]
+    fn tally_respects_the_nudge_opt_out() {
+        let outcomes = [Outcome::Block, Outcome::Nudge, Outcome::Ask];
+        assert_eq!(
+            decision_tally(&outcomes, true),
+            json!({"deny": 1, "ask": 1, "nudge": 1})
+        );
+        assert_eq!(
+            decision_tally(&outcomes, false),
+            json!({"deny": 1, "ask": 1}),
+            "an opted-out nudge is not written, so it is not tallied"
+        );
+    }
+
+    /// `strictest` must agree with the dispatch aggregate, or the row's
+    /// `decision` would describe a fate the tool call did not get.
+    #[test]
+    fn strictest_matches_outcome_merge() {
+        assert_eq!(strictest(&[Outcome::Nudge, Outcome::Block]), Outcome::Block);
+        assert_eq!(strictest(&[Outcome::Nudge, Outcome::Ask]), Outcome::Ask);
+        assert_eq!(strictest(&[Outcome::Allow, Outcome::Allow]), Outcome::Allow);
+        assert_eq!(strictest(&[]), Outcome::Allow);
     }
 
     /// One invocation writes exactly one row however many targets it judged.
@@ -342,8 +447,7 @@ mod tests {
                 "prevent-secret-writes",
                 HookEvent::PreToolUse,
                 &edit_input(),
-                Outcome::Block,
-                500,
+                &[Outcome::Block; 500],
             );
         });
         let rows = read_lines(tmp.path());
@@ -359,8 +463,7 @@ mod tests {
                 "terminology",
                 HookEvent::PreToolUse,
                 &edit_input(),
-                Outcome::Allow,
-                1,
+                &[Outcome::Allow],
             );
         });
         assert!(
@@ -379,8 +482,7 @@ mod tests {
                 "warn-main-branch",
                 HookEvent::PreToolUse,
                 &edit_input(),
-                Outcome::Nudge,
-                1,
+                &[Outcome::Nudge],
             );
         });
         let rows = read_lines(tmp.path());
@@ -398,8 +500,7 @@ mod tests {
                 "warn-main-branch",
                 HookEvent::PreToolUse,
                 &edit_input(),
-                Outcome::Nudge,
-                1,
+                &[Outcome::Nudge],
             );
         });
         assert_eq!(read_lines(tmp.path()).len(), 2);
@@ -414,8 +515,7 @@ mod tests {
                     "warn-main-branch",
                     HookEvent::PreToolUse,
                     &edit_input(),
-                    Outcome::Nudge,
-                    1,
+                    &[Outcome::Nudge],
                 );
             });
         }
@@ -429,8 +529,7 @@ mod tests {
                 "terminology",
                 HookEvent::PreToolUse,
                 &edit_input(),
-                Outcome::Block,
-                1,
+                &[Outcome::Block],
             );
         });
         let rows = read_lines(tmp.path());

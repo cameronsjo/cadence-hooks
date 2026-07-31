@@ -25,8 +25,8 @@
 //! guard — it is the unlogged path, with no telemetry tail to protect.
 
 use cadence_hooks_core::{
-    Check, CheckResult, HookEvent, HookInput, Logger, MetricsInput, Outcome, decide_check,
-    emit_and_exit, guard_interactive_terminal,
+    BypassProvenance, Check, CheckResult, HookEvent, HookInput, Logger, MetricsInput, Outcome,
+    decide_check, emit_and_exit, guard_interactive_terminal,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process;
@@ -216,24 +216,29 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
     match decided {
         // Effort-skipped → silent Allow, nothing to record.
         None => process::exit(Outcome::Allow.code()),
-        Some(result) => {
-            // The audit writes take the AGGREGATED outcome, once per hook
-            // invocation, against the payload the harness actually sent. Writing
-            // them inside the per-target loop above made ledger volume
-            // proportional to the patch body — one `apply_patch` with N
-            // operations wrote up to N rows per security-critical hook into an
-            // uncapped `denials.jsonl`, and skewed every rate computed off
-            // denial counts. The fan-out is carried as a `targets` count instead.
-            cadence_hooks_metrics::log_denial(
-                hook_name,
-                event,
-                &input,
-                result.outcome,
-                normalized_inputs.len(),
-            );
-            if let Some(prov) = &result.bypass {
+        Some(Aggregated {
+            result,
+            outcomes,
+            bypasses,
+        }) => {
+            // The audit writes run once per hook invocation, against the payload
+            // the harness actually sent. Writing them inside the per-target loop
+            // made denial volume proportional to the patch body — one
+            // `apply_patch` with N operations wrote up to N rows per
+            // security-critical hook into an uncapped `denials.jsonl`.
+            //
+            // But one row must not mean one decision *remembered*. `log_denial`
+            // takes every target's outcome and tallies them, so a mixed
+            // invocation (one Block, eleven Nudges) still records that eleven
+            // nudges fired — collapsing those into the winner would silently
+            // delete the denominator of every adherence rate. Bypasses are
+            // deduped rather than aggregated: they are a different event class
+            // with no strictest-wins ordering, and losing one loses the only
+            // record that a guardrail was stepped outside of.
+            cadence_hooks_metrics::log_denial(hook_name, event, &input, &outcomes);
+            for provenance in &bypasses {
                 cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::used(
-                    hook_name, &input, prov,
+                    hook_name, &input, provenance,
                 ));
             }
             // A Block/Ask outcome stopped the operation, so a timed-out probe
@@ -246,17 +251,54 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
     }
 }
 
-fn aggregate_results(mut results: Vec<CheckResult>) -> Option<CheckResult> {
+/// One invocation's decision, plus the two things the audit writes need that the
+/// winning [`CheckResult`] cannot carry.
+///
+/// The winner answers "what happened to the tool call", which is the only
+/// question `emit_and_exit` asks. The ledger asks two more — *which decisions
+/// were made* and *which guardrails were stepped outside of* — and both are
+/// properties of the whole target set. Folding them into the winner is what lost
+/// them: a Block winner discards the sibling Nudges (a different event class,
+/// and the denominator for every adherence rate) and every bypass ridden by a
+/// target that did not win.
+struct Aggregated {
+    /// The strictest result: what the tool call actually gets.
+    result: CheckResult,
+    /// Every judged target's outcome, in judge order. The denial row's
+    /// per-decision tally is computed from this, never from the winner alone.
+    outcomes: Vec<Outcome>,
+    /// Every DISTINCT bypass ridden across targets. Distinct rather than
+    /// per-target so the ledger keeps the volume cap that moved these writes out
+    /// of the loop: N targets riding one dismissal produce N identical
+    /// provenances and one row, while two different mechanisms still produce two.
+    bypasses: Vec<BypassProvenance>,
+}
+
+fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
     if results.is_empty() {
         return None;
     }
-    let outcome = results.iter().fold(Outcome::Allow, |merged, result| {
-        merged.merge(result.outcome)
-    });
+    let outcomes: Vec<Outcome> = results.iter().map(|result| result.outcome).collect();
+    let outcome = outcomes
+        .iter()
+        .fold(Outcome::Allow, |merged, other| merged.merge(*other));
     let mut messages = Vec::new();
     let mut block_metadata = None;
-    let mut bypass = None;
+    let mut winning_bypass = None;
+    let mut bypasses: Vec<BypassProvenance> = Vec::new();
     for result in &mut results {
+        // Harvested from EVERY result, not just the winners: a bypass ridden by
+        // a target whose Allow lost to a sibling Block is still a guardrail that
+        // was stepped outside of, and the row recording it is the whole point of
+        // `bypasses.jsonl`.
+        if let Some(bypass) = result.bypass.take() {
+            if result.outcome == outcome && winning_bypass.is_none() {
+                winning_bypass = Some(bypass.clone());
+            }
+            if !bypasses.contains(&bypass) {
+                bypasses.push(bypass);
+            }
+        }
         if result.outcome != outcome {
             continue;
         }
@@ -266,15 +308,18 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<CheckResult> {
         if block_metadata.is_none() {
             block_metadata = result.block_metadata.take();
         }
-        if bypass.is_none() {
-            bypass = result.bypass.take();
-        }
     }
-    Some(CheckResult {
-        outcome,
-        message: (!messages.is_empty()).then(|| messages.join("\n\n")),
-        block_metadata,
-        bypass,
+    Some(Aggregated {
+        result: CheckResult {
+            outcome,
+            message: (!messages.is_empty()).then(|| messages.join("\n\n")),
+            block_metadata,
+            // Unchanged from before: the winner carries a winner's bypass, so
+            // every existing consumer of this field sees what it always did.
+            bypass: winning_bypass,
+        },
+        outcomes,
+        bypasses,
     })
 }
 
@@ -411,7 +456,7 @@ fn log_deadline_degradation(hook_name: &str, namespace: Option<&'static str>, en
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadence_hooks_core::BlockMetadata;
+    use cadence_hooks_core::{BlockMetadata, BypassKind};
 
     #[test]
     fn aggregate_keeps_the_winning_blocks_message_and_metadata() {
@@ -429,19 +474,90 @@ mod tests {
         ])
         .expect("aggregate");
 
-        assert_eq!(result.outcome, Outcome::Block);
-        assert_eq!(result.message.as_deref(), Some("blocked"));
+        assert_eq!(result.result.outcome, Outcome::Block);
+        assert_eq!(result.result.message.as_deref(), Some("blocked"));
         assert_eq!(
             result
+                .result
                 .block_metadata
                 .as_ref()
                 .map(|metadata| metadata.fix.as_str()),
             Some("--safe")
         );
+        // Every judged target's outcome survives, in judge order — the denial
+        // ledger tallies from this, so a losing Nudge must still be here.
+        assert_eq!(result.outcomes, vec![Outcome::Nudge, Outcome::Block]);
     }
 
     #[test]
     fn aggregate_returns_none_when_every_target_is_effort_skipped() {
         assert!(aggregate_results(Vec::new()).is_none());
+    }
+
+    /// A bypass ridden by a target whose Allow LOST to a sibling Block must
+    /// still reach the ledger. Harvesting only from winners dropped it: the
+    /// aggregate is Block, the Allow is skipped, and the only record that a
+    /// guardrail was stepped outside of is gone.
+    #[test]
+    fn aggregate_harvests_a_bypass_from_a_losing_target() {
+        let mut allowed = CheckResult::allow();
+        allowed.bypass = Some(BypassProvenance {
+            kind: BypassKind::Dismissal,
+            mechanism: "dismiss-prevent-secret-writes".to_string(),
+            reason: Some("rotating the fixture".to_string()),
+            expires_at: None,
+            armed_by_session: None,
+        });
+
+        let aggregated =
+            aggregate_results(vec![allowed, CheckResult::block("blocked")]).expect("aggregate");
+
+        assert_eq!(aggregated.result.outcome, Outcome::Block);
+        assert_eq!(
+            aggregated
+                .bypasses
+                .iter()
+                .map(|provenance| provenance.mechanism.as_str())
+                .collect::<Vec<_>>(),
+            ["dismiss-prevent-secret-writes"],
+            "a losing target's bypass must survive aggregation"
+        );
+    }
+
+    /// Deduped, not accumulated: N targets riding ONE dismissal are one event,
+    /// so the write keeps the volume cap that moved it out of the per-target
+    /// loop. Two distinct mechanisms are two events and both survive.
+    #[test]
+    fn aggregate_dedupes_identical_bypasses_but_keeps_distinct_ones() {
+        let provenance = |mechanism: &str| BypassProvenance {
+            kind: BypassKind::Dismissal,
+            mechanism: mechanism.to_string(),
+            reason: None,
+            expires_at: None,
+            armed_by_session: None,
+        };
+        let carrying = |mechanism: &str| {
+            let mut result = CheckResult::allow();
+            result.bypass = Some(provenance(mechanism));
+            result
+        };
+
+        let aggregated = aggregate_results(vec![
+            carrying("dismiss-guard-rm"),
+            carrying("dismiss-guard-rm"),
+            carrying("dismiss-guard-rm"),
+            carrying("CADENCE_ALLOW_MAIN"),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(
+            aggregated
+                .bypasses
+                .iter()
+                .map(|provenance| provenance.mechanism.as_str())
+                .collect::<Vec<_>>(),
+            ["dismiss-guard-rm", "CADENCE_ALLOW_MAIN"],
+            "three rides of one dismissal are one event; a second mechanism is another"
+        );
     }
 }
