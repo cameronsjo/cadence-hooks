@@ -889,7 +889,7 @@ impl Check for SecretLeaksGuard {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        let tool = input.tool_name().unwrap_or("");
+        let tool = input.normalized_tool_name().unwrap_or("");
 
         match tool {
             "Read" => {

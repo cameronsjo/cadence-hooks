@@ -59,7 +59,10 @@ impl Check for WarnBranchIntent {
 
     fn run(&self, input: &HookInput) -> CheckResult {
         // Gate 1: only file mutations are "new work".
-        if !matches!(input.tool_name(), Some("Edit" | "Write" | "NotebookEdit")) {
+        if !matches!(
+            input.normalized_tool_name(),
+            Some("Edit" | "Write" | "NotebookEdit")
+        ) {
             return CheckResult::allow();
         }
 
