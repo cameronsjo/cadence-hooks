@@ -813,6 +813,13 @@
           "matcher": "Bash",
           "if": "Bash(*find*)",
           "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Edit|mcp__.*(delete|remove|move|rename).*",
+          "if": null,
+          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
         }
       ]
     },
@@ -1225,7 +1232,7 @@
         {
           "plugin": "cadence-obsidian",
           "event": "PreToolUse",
-          "matcher": "Bash|Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
+          "matcher": "Bash|Edit|mcp__.*(delete|remove|move|rename).*",
           "if": null,
           "commandHash": "aee750813d5d9e831abc921cfc6d3ff8ec170ca52158119f655ede783deadb5e"
         }
