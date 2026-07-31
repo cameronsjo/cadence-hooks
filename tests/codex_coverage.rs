@@ -450,6 +450,43 @@ fn codex_local_function_call_reaches_a_security_critical_guard() {
     assert!(stderr.contains("guard-rm"));
 }
 
+/// `ObsidianTrashGuard`'s delete-detection branch, driven through the binary.
+///
+/// The guard's new `operation() == Some("delete")` arm was unit-tested only at
+/// the `check_delete_in_vault` helper — the pre-existing-shaped half — so the
+/// dispatch wiring this PR actually changed (a patch normalizing into an `Edit`
+/// carrying `operation: "delete"`, reaching `run()`) was never exercised end to
+/// end.
+#[test]
+fn patch_delete_inside_a_vault_reaches_the_trash_guard() {
+    let vault = tempfile::tempdir().expect("temp vault");
+    let vault_path = vault.path().to_string_lossy().into_owned();
+    let patch =
+        format!("*** Begin Patch\n*** Delete File: {vault_path}/notes/todo.md\n*** End Patch");
+    let payload = serde_json::json!({
+        "tool_name": "apply_patch",
+        "cwd": &vault_path,
+        "tool_input": patch,
+    })
+    .to_string();
+
+    let (code, stderr) = run_hook(
+        &["obsidian", "trash-guard"],
+        &[("OBSIDIAN_VAULT", vault_path.as_str())],
+        &payload,
+    );
+    assert_eq!(code, Some(2), "a patch delete in the vault must block");
+    assert!(
+        stderr.contains(".trash"),
+        "block must point at the vault's trash: {stderr}"
+    );
+
+    // Control: the same patch with no vault configured passes, so the block
+    // above is the vault check deciding rather than the route erroring.
+    let (code, _) = run_hook(&["obsidian", "trash-guard"], &[], &payload);
+    assert_eq!(code, Some(0));
+}
+
 #[test]
 fn multi_file_patch_normalizes_all_targets() {
     let input = HookInput::from_json(

@@ -1483,14 +1483,61 @@ pub fn guard_interactive_terminal(
 }
 
 /// Run a single check from stdin. Convenience wrapper for subcommands.
+///
+/// Routes through [`HookInput::normalized_inputs`], so a harness payload that
+/// expands into several targets (a Codex `apply_patch` carrying N file
+/// operations) is judged per target and the strictest verdict wins — the same
+/// semantics the shipped binary gets from `dispatch::run_logged_check`.
+///
+/// It was left unnormalized when patch expansion landed, which made it a second,
+/// *weaker* entry point wearing the name "convenience wrapper": an `apply_patch`
+/// payload reached the check as one opaque input with no `file_path`, so every
+/// path- and content-scanning guard saw nothing to judge. Nothing shipped was
+/// exposed — every `src/main.rs` hook arm calls the dispatch wrapper — but this
+/// is public API, and the next caller to reach for the convenient one would have
+/// silently got less enforcement.
+///
+/// What it deliberately does NOT gain is the dispatch wrapper's telemetry tail
+/// (denial ledger, timing, panic guard) or its Codex fail-closed parse arm: those
+/// need the canonical registry hook name, which lives in the binary. So this
+/// stays the *unlogged* path, not a weaker one.
 pub fn run_check_from_stdin(check: &dyn Check, event: HookEvent) -> ! {
     guard_interactive_terminal(check.name(), Some(event), None);
-    match HookInput::from_stdin() {
-        Ok(input) => run_check(check, &input, event),
+    let input = match HookInput::from_stdin() {
+        Ok(input) => input,
         Err(e) => {
             eprintln!("cadence-hooks: {e}");
             process::exit(0); // Fail open on parse errors
         }
+    };
+    let targets = match input.normalized_inputs() {
+        Ok(targets) => targets,
+        Err(e) => {
+            eprintln!("cadence-hooks: {e}");
+            process::exit(0); // Fail open on normalization errors
+        }
+    };
+    // Strictest-wins, ties to the earlier target — the same rule as the binary's
+    // `aggregate_results`, kept here rather than shared because that function
+    // lives in the binary (which depends on core, not the reverse). This half
+    // does not join the losers' messages: the binary needs that for its denial
+    // ledger, an unlogged wrapper does not.
+    let mut merged: Option<CheckResult> = None;
+    for target in &targets {
+        let Some(result) = decide_check(check, target) else {
+            continue;
+        };
+        let strictest = match &merged {
+            None => true,
+            Some(previous) => previous.outcome.merge(result.outcome) != previous.outcome,
+        };
+        if strictest {
+            merged = Some(result);
+        }
+    }
+    match merged {
+        None => process::exit(Outcome::Allow.code()),
+        Some(result) => emit_and_exit(&result, event),
     }
 }
 
@@ -1653,6 +1700,57 @@ mod tests {
         assert_eq!(rename.len(), 2);
         assert_eq!(rename[0].file_path().as_deref(), Some("a"));
         assert_eq!(rename[1].file_path().as_deref(), Some("b"));
+    }
+
+    /// The `grep`/`search`/`find_file` and `get_file`/`fetch_file`/`load_file`
+    /// arms of the `mcp__` heuristic, which no test reached — only
+    /// `write_file`/`delete_file`/`read_file`/`move_file` were exercised, so
+    /// half the classifier was live-but-unpinned.
+    #[test]
+    fn remaining_mcp_heuristic_branches_classify() {
+        let cases = [
+            ("mcp__code__grep", "Grep", "search"),
+            ("mcp__notion__search_pages", "Grep", "search"),
+            ("mcp__fs__find_file", "Grep", "search"),
+            ("mcp__fs__get_file", "Read", "read"),
+            ("mcp__fs__fetch_file", "Read", "read"),
+            ("mcp__fs__load_file", "Read", "read"),
+        ];
+        for (tool, expected_tool, expected_operation) in cases {
+            let input =
+                HookInput::from_json(&format!(r#"{{"tool_name":"{tool}","tool_input":{{}}}}"#))
+                    .unwrap();
+            assert_eq!(input.normalized_tool_name(), Some(expected_tool), "{tool}");
+            assert_eq!(input.operation(), Some(expected_operation), "{tool}");
+            // And, per the C1 fix, the literal name always survives.
+            assert_eq!(input.tool_name(), Some(tool));
+        }
+    }
+
+    /// Precedence is fail-safe by construction: a name matching two arms takes
+    /// the more destructive one, so a mis-sniff over-blocks rather than
+    /// under-blocks. Pinned because the arm ORDER is the whole rule.
+    #[test]
+    fn mcp_heuristic_precedence_favours_the_destructive_reading() {
+        // `delete` is tested before `read`, so a "read-and-delete" tool is a
+        // delete.
+        let input = HookInput::from_json(
+            r#"{"tool_name":"mcp__fs__read_then_delete_file","tool_input":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(input.normalized_tool_name(), Some("Edit"));
+        assert_eq!(input.operation(), Some("delete"));
+
+        // An unclassifiable MCP tool gets no normalized view at all, and so
+        // reaches guards under its own name.
+        let unknown =
+            HookInput::from_json(r#"{"tool_name":"mcp__weather__forecast","tool_input":{}}"#)
+                .unwrap();
+        assert_eq!(
+            unknown.normalized_tool_name(),
+            Some("mcp__weather__forecast")
+        );
+        assert_eq!(unknown.operation(), None);
     }
 
     #[test]

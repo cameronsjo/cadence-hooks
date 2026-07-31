@@ -10,7 +10,6 @@
 
 use crate::common;
 use crate::compute_cost::compute_cost_by_model;
-use crate::model_breakdown::{by_model_json, by_model_unpriced_json, unpriced_models};
 use crate::prices::Prices;
 use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
 use cadence_hooks_core::{Logger, MetricsInput};
@@ -166,20 +165,7 @@ fn build_session_record(
     commits: u64,
 ) -> Value {
     let scan = &usage.scan;
-    let (by_model, unpriced) = if usage.harness == "codex" {
-        (
-            by_model_unpriced_json(&scan.by_model),
-            scan.by_model
-                .iter()
-                .map(|(model, _)| model.as_str())
-                .collect(),
-        )
-    } else {
-        (
-            by_model_json(&scan.by_model, prices),
-            unpriced_models(&scan.by_model, prices),
-        )
-    };
+    let (by_model, unpriced) = usage.priced_breakdown(prices);
     let duration_ms = session_duration_ms(start_ts, ts);
 
     let mut record = json!({
@@ -213,7 +199,7 @@ fn build_session_record(
         "agentId": input.agent_id,
         "parentSessionId": input.parent_session_id,
     });
-    if usage.harness == "codex" {
+    if usage.is_unpriced_harness() {
         record["estimatedCostUsd"] = Value::Null;
         record["pricingSource"] = Value::Null;
         record["pricingVerifiedAt"] = Value::Null;
@@ -256,22 +242,8 @@ mod tests {
         }
     }
 
-    fn claude_usage(scan: ScanResult) -> UsageScan {
-        let total_tokens = scan.tokens.input
-            + scan.tokens.cache_create
-            + scan.tokens.cache_read
-            + scan.tokens.output;
-        UsageScan {
-            scan,
-            harness: "claude",
-            source_format: "claude-transcript-v1",
-            reasoning_output: 0,
-            total_tokens,
-        }
-    }
-
     fn sample_usage() -> UsageScan {
-        claude_usage(sample_scan())
+        UsageScan::claude(sample_scan())
     }
 
     fn sample_input() -> MetricsInput {
@@ -391,7 +363,7 @@ mod tests {
             "s1",
             "main",
             "r",
-            &claude_usage(scan),
+            &UsageScan::claude(scan),
             Some(0.0),
             &prices,
             None,

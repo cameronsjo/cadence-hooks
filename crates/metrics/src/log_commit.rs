@@ -6,7 +6,6 @@
 
 use crate::common;
 use crate::compute_cost::compute_cost_by_model;
-use crate::model_breakdown::{by_model_json, by_model_unpriced_json, unpriced_models};
 use crate::prices::Prices;
 use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
 use cadence_hooks_core::{Logger, MetricsInput};
@@ -163,20 +162,7 @@ fn build_commit_record(
     // `log_session` so the two loggers' shapes cannot drift (see
     // `crate::model_breakdown`).
     let scan = &usage.scan;
-    let (by_model, unpriced) = if usage.harness == "codex" {
-        (
-            by_model_unpriced_json(&scan.by_model),
-            scan.by_model
-                .iter()
-                .map(|(model, _)| model.as_str())
-                .collect(),
-        )
-    } else {
-        (
-            by_model_json(&scan.by_model, prices),
-            unpriced_models(&scan.by_model, prices),
-        )
-    };
+    let (by_model, unpriced) = usage.priced_breakdown(prices);
 
     let mut record = json!({
         "schemaVersion": common::TOKEN_RECORD_SCHEMA_VERSION,
@@ -208,7 +194,7 @@ fn build_commit_record(
         "parentSessionId": input.parent_session_id,
         "parentAgentId": input.parent_agent_id,
     });
-    if usage.harness == "codex" {
+    if usage.is_unpriced_harness() {
         record["estimatedCostUsd"] = Value::Null;
         record["pricingSource"] = Value::Null;
         record["pricingVerifiedAt"] = Value::Null;
@@ -275,22 +261,8 @@ mod tests {
         }
     }
 
-    fn claude_usage(scan: ScanResult) -> UsageScan {
-        let total_tokens = scan.tokens.input
-            + scan.tokens.cache_create
-            + scan.tokens.cache_read
-            + scan.tokens.output;
-        UsageScan {
-            scan,
-            harness: "claude",
-            source_format: "claude-transcript-v1",
-            reasoning_output: 0,
-            total_tokens,
-        }
-    }
-
     fn sample_usage() -> UsageScan {
-        claude_usage(sample_scan())
+        UsageScan::claude(sample_scan())
     }
 
     fn sample_input() -> MetricsInput {
@@ -408,7 +380,7 @@ mod tests {
             "bbbb",
             "main",
             "myrepo",
-            &claude_usage(scan),
+            &UsageScan::claude(scan),
             Some(cost),
             "m0",
             &prices,
@@ -458,7 +430,7 @@ mod tests {
             "b",
             "main",
             "r",
-            &claude_usage(scan),
+            &UsageScan::claude(scan),
             Some(0.0),
             "m0",
             &prices,

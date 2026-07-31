@@ -4,8 +4,11 @@
 //! response, tool-call, and patch content are never represented in these
 //! types and therefore cannot be copied into metrics records.
 
+use crate::model_breakdown::{by_model_json, by_model_unpriced_json, unpriced_models};
+use crate::prices::Prices;
 use crate::scan_tokens::{ScanResult, Tokens, scan_tokens};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// A successful cross-harness usage scan.
@@ -16,6 +19,66 @@ pub struct UsageScan {
     pub source_format: &'static str,
     pub reasoning_output: u64,
     pub total_tokens: u64,
+}
+
+impl UsageScan {
+    /// True when this scan's harness publishes no token prices, so no cost may
+    /// be asserted from it. The single place the harness-vs-pricing question is
+    /// answered — `log_commit` and `log_session` both branch on it.
+    #[must_use]
+    pub fn is_unpriced_harness(&self) -> bool {
+        self.harness == "codex"
+    }
+
+    /// The `(byModel, unpricedModels)` pair for a token record.
+    ///
+    /// A priced harness gets per-model costs and only the models actually
+    /// missing a price listed as unpriced; an unpriced one gets a cost-free
+    /// breakdown with *every* model listed, because none of them can be priced.
+    ///
+    /// Lifted here from two verbatim copies in `log_commit::build_commit_record`
+    /// and `log_session::build_session_record`. They were identical, so nothing
+    /// was broken — but two independently-maintained copies of a pricing rule is
+    /// how a record shape drifts, and the copy had already spread to the
+    /// `claude_usage()` test helper in both modules.
+    #[must_use]
+    pub fn priced_breakdown(&self, prices: &Prices) -> (Vec<Value>, Vec<&str>) {
+        if self.is_unpriced_harness() {
+            (
+                by_model_unpriced_json(&self.scan.by_model),
+                self.scan
+                    .by_model
+                    .iter()
+                    .map(|(model, _)| model.as_str())
+                    .collect(),
+            )
+        } else {
+            (
+                by_model_json(&self.scan.by_model, prices),
+                unpriced_models(&self.scan.by_model, prices),
+            )
+        }
+    }
+
+    /// A Claude-harness scan wrapping `scan`, with `total_tokens` summed.
+    ///
+    /// Test-only, and shared: `log_commit` and `log_session` each carried a
+    /// byte-identical private copy, which is the same duplication that produced
+    /// the pricing branch above.
+    #[cfg(test)]
+    pub(crate) fn claude(scan: ScanResult) -> Self {
+        let total_tokens = scan.tokens.input
+            + scan.tokens.cache_create
+            + scan.tokens.cache_read
+            + scan.tokens.output;
+        Self {
+            scan,
+            harness: "claude",
+            source_format: "claude-transcript-v1",
+            reasoning_output: 0,
+            total_tokens,
+        }
+    }
 }
 
 /// Privacy-safe diagnostic for a transcript schema that cannot be priced.
@@ -239,6 +302,45 @@ fn scan_codex_rollout_v1(transcript: &str, marker: Option<&str>) -> TranscriptSc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pricing rule now has one home, so it gets one test — asserting the
+    /// two harnesses diverge in the way the record shapes depend on. Previously
+    /// this lived in neither copy.
+    #[test]
+    fn priced_breakdown_splits_on_the_harness() {
+        let scan = ScanResult {
+            tokens: Tokens::default(),
+            last_message_id: String::new(),
+            messages_scanned: 0,
+            model: "gpt-5.6-sol".to_string(),
+            by_model: vec![("gpt-5.6-sol".to_string(), Tokens::default())],
+        };
+        let prices = Prices::embedded();
+
+        let codex = UsageScan {
+            scan: scan.clone(),
+            harness: "codex",
+            source_format: "codex-rollout-v1",
+            reasoning_output: 0,
+            total_tokens: 0,
+        };
+        assert!(codex.is_unpriced_harness());
+        let (by_model, unpriced) = codex.priced_breakdown(&prices);
+        assert_eq!(unpriced, ["gpt-5.6-sol"], "no Codex model can be priced");
+        assert!(
+            by_model.iter().all(|entry| entry.get("costUsd").is_none()),
+            "an unpriced harness must not assert a cost: {by_model:?}"
+        );
+
+        let claude = UsageScan::claude(scan);
+        assert!(!claude.is_unpriced_harness());
+        let (_, unpriced) = claude.priced_breakdown(&prices);
+        assert_eq!(
+            unpriced,
+            ["gpt-5.6-sol"],
+            "a priced harness lists only the models actually missing a price"
+        );
+    }
 
     fn rollout(total_input: u64, cached: u64, output: u64) -> String {
         [
