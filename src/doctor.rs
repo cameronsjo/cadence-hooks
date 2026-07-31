@@ -64,10 +64,11 @@ impl Finding {
     /// is the only thing that writes it out, and it is a one-line wrapper,
     /// so no second path can bypass this sanitization.
     ///
-    /// **Scope: this covers `Finding` output only.** Other `doctor` print
-    /// sites outside the `Finding` path (e.g. the `--prune` directory
-    /// listing) are not covered by this guarantee and are tracked
-    /// separately.
+    /// **Scope: this covers `Finding` output only.** The `--prune` route,
+    /// the other `doctor` print path over third-party-influenced text, is
+    /// sanitized separately by [`display_safe_path`] to the same ceiling
+    /// (cameronsjo/cadence-hooks#498); a new print site outside both still
+    /// has to sanitize itself.
     ///
     /// [`print`]: Finding::print
     fn render(&self) -> String {
@@ -1863,6 +1864,78 @@ fn orphan_findings(
     findings
 }
 
+/// Render an untrusted filesystem path without terminal control sequences.
+///
+/// Plugin-cache components can derive from third-party marketplace metadata,
+/// so prune output has the same terminal-injection boundary as a `Finding`
+/// field even though it is printed outside `Finding::render`. Bounded with the
+/// same [`MAX_FINDING_FIELD_CHARS`] ceiling, for the same reason `Finding`
+/// bounds its own `location` (also a path): filtering constrains the character
+/// *set* and not the *length*, and each of the three attacker-influenceable
+/// path components can be 255 bytes of chosen text — enough to push the size
+/// figure and the `.orphaned_at` marker off the right edge of a non-wrapping
+/// pager, where a forged size planted earlier in the name reads as the real one.
+fn display_safe_path(path: &Path) -> String {
+    cadence_hooks_metrics::common::display_safe_bounded(
+        &path.to_string_lossy(),
+        MAX_FINDING_FIELD_CHARS,
+    )
+}
+
+/// Appended to a rendered path whose displayed text is not literally the path
+/// on disk. Deliberately prose rather than a substitution character: the note
+/// has to survive being read in a captured log by someone who cannot see the
+/// original bytes.
+const HIDDEN_CHARS_NOTE: &str = " [name contains hidden characters]";
+
+/// Whether sanitizing `path` for display changes its character content — i.e.
+/// the rendered string is not the name on disk.
+///
+/// `display_safe` is a filter: it **deletes** unsafe characters rather than
+/// substituting a placeholder, so two distinct directories can render to one
+/// identical line. That is the same non-injectivity `filename_safe`'s doc
+/// argues against, and it lands here at the worst moment — a deletion listing.
+/// Measured cases: a dir named `\u{200b}` + the active pinned SHA renders as
+/// the active pin, which prune never touches; a dir whose name is *entirely*
+/// strippable renders as its parent plugin directory. Flagging the line cannot
+/// restore the bytes, but it tells the operator the string is not the path,
+/// which is what a captured `--prune > log` otherwise loses.
+///
+/// Length is deliberately excluded — [`display_safe_bounded`] marks its own
+/// truncation with an ellipsis, so a merely long name is not "hidden".
+///
+/// [`display_safe_bounded`]: cadence_hooks_metrics::common::display_safe_bounded
+fn path_has_hidden_chars(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    cadence_hooks_metrics::common::display_safe(&raw) != raw
+}
+
+/// [`display_safe_path`] plus the [`HIDDEN_CHARS_NOTE`] marker when
+/// sanitization changed the name. The note sits adjacent to the path it
+/// describes rather than at the end of the line, so a message interpolating
+/// two paths stays unambiguous about which one was mangled.
+fn display_safe_path_flagged(path: &Path) -> String {
+    let shown = display_safe_path(path);
+    if path_has_hidden_chars(path) {
+        format!("{shown}{HIDDEN_CHARS_NOTE}")
+    } else {
+        shown
+    }
+}
+
+/// One human-readable `doctor --prune` listing row.
+///
+/// Kept pure so the separate stdout path has a direct sanitizer regression
+/// test rather than relying on `Finding::render` tests that never reach it.
+fn render_orphan_dir_line(dir: &Path, size: u64, marked: bool) -> String {
+    let mib = size as f64 / (1024.0 * 1024.0);
+    let marker_note = if marked { " [marked .orphaned_at]" } else { "" };
+    format!(
+        "  {} (~{mib:.1} MiB){marker_note}",
+        display_safe_path_flagged(dir)
+    )
+}
+
 /// Remove (or, when `apply` is false, merely size up) the given orphaned
 /// version directories. Returns `(removed_count, freed_bytes)` — in dry-run
 /// mode both reflect what *would* be removed, since nothing is deleted.
@@ -1887,8 +1960,8 @@ fn prune_orphans(dirs: &[PathBuf], apply: bool, cache_root: &Path) -> (usize, u6
         if !is_contained(dir, cache_root) {
             eprintln!(
                 "cadence-hooks doctor --prune: refusing to touch {} — outside the plugin cache root {}",
-                dir.display(),
-                cache_root.display()
+                display_safe_path_flagged(dir),
+                display_safe_path_flagged(cache_root)
             );
             continue;
         }
@@ -1915,7 +1988,7 @@ fn prune_orphans(dirs: &[PathBuf], apply: bool, cache_root: &Path) -> (usize, u6
             Err(e) => {
                 eprintln!(
                     "cadence-hooks doctor --prune: could not remove {}: {e}",
-                    dir.display()
+                    display_safe_path_flagged(dir)
                 );
             }
         }
@@ -1982,7 +2055,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
             if !root.exists() {
                 eprintln!(
                     "cadence-hooks doctor: scan root does not exist: {}",
-                    root.display()
+                    display_safe_path(root)
                 );
                 return 2;
             }
@@ -2004,7 +2077,7 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         if !quiet {
             println!(
                 "cadence-hooks doctor --prune: no installed-plugins manifest at {} — nothing to prune",
-                manifest.display()
+                display_safe_path(&manifest)
             );
         }
         return 0;
@@ -2021,17 +2094,14 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
     if !quiet {
         for dir in &dirs {
             let size = dir_size_bytes(dir);
-            let mib = size as f64 / (1024.0 * 1024.0);
             // `.orphaned_at` is written externally by Claude Code's own
             // plugin loader when it retires a version dir, not by anything
             // in this repo — surfacing it here is advisory ("this one was
             // already flagged upstream"), not a marker this codebase creates.
-            let marker_note = if dir.join(".orphaned_at").exists() {
-                " [marked .orphaned_at]"
-            } else {
-                ""
-            };
-            println!("  {} (~{mib:.1} MiB){marker_note}", dir.display());
+            println!(
+                "{}",
+                render_orphan_dir_line(dir, size, dir.join(".orphaned_at").exists())
+            );
         }
     }
 
@@ -4756,6 +4826,101 @@ mod tests {
     }
 
     // ── prune_orphans ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn prune_listing_sanitizes_hostile_cache_dir_path() {
+        let path = Path::new("/cache/\u{1b}[31mred\u{1b}[0m/\u{202e}evil\u{e0001}");
+        let rendered = render_orphan_dir_line(path, 1024 * 1024, true);
+
+        assert!(rendered.contains("/cache/"));
+        assert!(rendered.contains("(~1.0 MiB)"));
+        assert!(rendered.contains("[marked .orphaned_at]"));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\u{e0001}'));
+    }
+
+    #[test]
+    fn prune_listing_preserves_ordinary_path_text() {
+        let rendered =
+            render_orphan_dir_line(Path::new("/cache/marketplace/plugin/version"), 0, false);
+        assert_eq!(rendered, "  /cache/marketplace/plugin/version (~0.0 MiB)");
+    }
+
+    #[test]
+    fn prune_listing_keeps_paths_differing_only_by_stripped_char_distinct() {
+        // `display_safe` DELETES rather than substitutes, so without a marker
+        // these two on-disk directories render to one identical line — at a
+        // deletion prompt, where the operator's only record is this listing.
+        let plain = render_orphan_dir_line(Path::new("/cache/mp/plugin/08c0313deb23"), 0, false);
+        let hostile =
+            render_orphan_dir_line(Path::new("/cache/mp/plugin/08c0313deb23\u{200b}"), 0, false);
+
+        assert_ne!(
+            plain, hostile,
+            "two distinct cache dirs must not render to the same listing line"
+        );
+        assert!(
+            hostile.contains(HIDDEN_CHARS_NOTE),
+            "the mangled name must be flagged; got {hostile:?}"
+        );
+        assert!(
+            !plain.contains(HIDDEN_CHARS_NOTE),
+            "an ordinary name must carry no flag; got {plain:?}"
+        );
+        assert!(
+            !hostile.contains('\u{200b}'),
+            "the zero-width char must still be stripped from the output"
+        );
+    }
+
+    #[test]
+    fn prune_listing_flags_a_wholly_strippable_name() {
+        // Renders as the bare parent plugin dir, so the line would otherwise
+        // read as though the whole plugin were being removed.
+        let rendered = render_orphan_dir_line(
+            Path::new("/cache/mp/plugin/\u{200b}\u{200b}\u{feff}"),
+            1024 * 1024,
+            false,
+        );
+
+        assert!(
+            rendered.contains(HIDDEN_CHARS_NOTE),
+            "an entirely-invisible name must be flagged; got {rendered:?}"
+        );
+        assert_ne!(
+            rendered,
+            render_orphan_dir_line(Path::new("/cache/mp/plugin/"), 1024 * 1024, false),
+            "must not render identically to its own parent directory"
+        );
+    }
+
+    #[test]
+    fn prune_listing_bounds_an_overlong_path() {
+        let long = "x".repeat(MAX_FINDING_FIELD_CHARS + 250);
+        let rendered = render_orphan_dir_line(
+            &PathBuf::from(format!("/cache/mp/plugin/{long}")),
+            1024,
+            false,
+        );
+
+        // Bounded to the ceiling plus the ellipsis, the two-space indent, and
+        // the size suffix — nowhere near the ~700 chars the raw path implies.
+        assert!(
+            rendered.chars().count() < MAX_FINDING_FIELD_CHARS + 40,
+            "line should be bounded, got {} chars",
+            rendered.chars().count()
+        );
+        assert!(rendered.contains('…'), "truncation must be visible");
+        assert!(
+            rendered.contains("(~0.0 MiB)"),
+            "the size figure must survive bounding; got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(HIDDEN_CHARS_NOTE),
+            "length alone is not a hidden character — truncation marks itself"
+        );
+    }
 
     #[test]
     fn prune_orphans_dry_run_deletes_nothing() {
