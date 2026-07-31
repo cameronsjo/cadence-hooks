@@ -7,12 +7,25 @@
 use std::io::Write;
 use std::process::Command;
 
+/// Throwaway metrics root shared by every spawn in this file.
+///
+/// Held in a process-lifetime static so it cannot drop while a child is still
+/// running. Without it these spawns resolve `metrics_dir()` to the operator's
+/// real ledger and append test rows to it — running the suite silently edits
+/// production data.
+fn scratch_metrics_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("temp metrics dir"))
+        .path()
+}
+
 fn cadence_hooks() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cadence-hooks"));
     // Ensure tests don't inherit env vars from the test runner's session
     cmd.env_remove("CADENCE_BYPASS");
     cmd.env_remove("CADENCE_DISABLE");
     cmd.env_remove("CLAUDECODE");
+    cmd.env("CADENCE_METRICS_DIR", scratch_metrics_dir());
     cmd
 }
 

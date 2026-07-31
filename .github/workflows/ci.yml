@@ -38,3 +38,17 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      # The checked-in Codex compatibility report is ~1700 generated lines that
+      # external consumers read as "what Codex support actually covers", and the
+      # only test touching it compared hook *names*. Wiring, evidence strings,
+      # status/applicable overrides, and the capabilities array could all drift
+      # from the live registry without failing anything. The generator has
+      # supported `--check` all along; nothing called it.
+      #
+      # Linux only: a generated-artifact freshness check is platform-independent,
+      # so running it on both legs would buy nothing and add a `python3`
+      # dependency on the Windows runner.
+      - name: Check Codex compatibility report is fresh
+        if: matrix.os == 'ubuntu-latest'
+        run: make report-check

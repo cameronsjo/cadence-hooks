@@ -70,6 +70,27 @@ pub(crate) fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
     }
 }
 
+/// A single-commit repo whose `origin` has stable GitHub owner/repo identity.
+///
+/// Tests that assert ownership or repo-name behavior must not read the
+/// enclosing checkout's live remote: a local-path clone has no owner/repo and
+/// flips those assertions (#254).
+#[cfg(test)]
+pub(crate) fn github_origin_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("create hermetic git fixture");
+    cadence_hooks_core::git_fixtures::init_repo(repo.path());
+    cadence_hooks_core::git_fixtures::git_in(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/cameronsjo/cadence-hooks.git",
+        ],
+    );
+    repo
+}
+
 /// Per-repo snooze command + helper consumed by `enforce_worktree`.
 pub mod dismiss_enforce_worktree;
 /// Per-repo snooze command + helper consumed by `warn_main_branch`.

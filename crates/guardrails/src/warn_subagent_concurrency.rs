@@ -4,10 +4,10 @@
 //! Concurrency limits on heavy-context subagent fan-outs are an *observed*
 //! server-side throttle, not physics — a burst of ~simultaneous heavy agents
 //! hits request throttling well before any usage limit. This guard reads the
-//! live subagent count from the metrics `subagents.jsonl` lifecycle log and
-//! **nudges** (never blocks) on an `Agent`/`Task` spawn when the count is at or
-//! over `CADENCE_MAX_CONCURRENT_SUBAGENTS` (default 5). The nudge is advisory:
-//! the dispatch always proceeds.
+//! live subagent count from a bounded tail of the metrics `subagents.jsonl`
+//! lifecycle log and **nudges** (never blocks) on an `Agent`/`Task` spawn when
+//! the count is at or over `CADENCE_MAX_CONCURRENT_SUBAGENTS` (default 5). The
+//! nudge is advisory: the dispatch always proceeds.
 //!
 //! LIVE COUNT: `log_subagent` writes one line per lifecycle event — a
 //! `SubagentStart` and a matching `SubagentStop`, each carrying `event`,
@@ -31,12 +31,20 @@
 //! nudges — an observability gap must not impede dispatch.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Default concurrency cap when `CADENCE_MAX_CONCURRENT_SUBAGENTS` is unset or
 /// unparseable. Matches the steady-state ceiling observed before heavy-context
 /// bursts start throttling.
 const DEFAULT_LIMIT: usize = 5;
+
+/// Maximum lifecycle-log bytes parsed on one hot-path hook fire.
+///
+/// The persisted audit log remains append-only, but old sessions no longer make
+/// each dispatch progressively more expensive. A tail boundary may discard one
+/// partial JSONL record; [`cadence_hooks_core::transcript::read_tail_bounded`]
+/// deliberately drops that fragment and returns only complete UTF-8 lines.
+const SUBAGENT_LOG_TAIL_BYTES: u64 = 1024 * 1024;
 
 /// The metrics directory holding `subagents.jsonl`.
 ///
@@ -53,6 +61,11 @@ fn metrics_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     cadence_hooks_core::paths::claude_config_dir().join("metrics")
+}
+
+/// Read a bounded, whole-line tail of the append-only lifecycle log.
+fn read_subagent_log_tail(path: &Path) -> Option<String> {
+    cadence_hooks_core::transcript::read_tail_bounded(path, SUBAGENT_LOG_TAIL_BYTES)
 }
 
 /// The configured concurrency cap: `CADENCE_MAX_CONCURRENT_SUBAGENTS` parsed as
@@ -211,14 +224,14 @@ impl Check for WarnSubagentConcurrency {
         // Only subagent dispatches. `Agent` is current; `Task` is the pre-2.1.63
         // name, kept for resilience. Every other tool exits here. (The hooks.json
         // matcher already filters to Agent|Task in production — belt-and-suspenders.)
-        if !matches!(input.tool_name(), Some("Agent" | "Task")) {
+        if !matches!(input.normalized_tool_name(), Some("Agent" | "Task")) {
             return CheckResult::allow();
         }
 
         // Fail-open (ADR-0001): any read failure yields allow. A missing log is
         // the common early-session case — never nudge on it.
         let path = metrics_dir().join("subagents.jsonl");
-        let Ok(jsonl) = std::fs::read_to_string(&path) else {
+        let Some(jsonl) = read_subagent_log_tail(&path) else {
             return CheckResult::allow();
         };
 
@@ -271,16 +284,10 @@ mod tests {
 {\"event\":\"SubagentStart\",\"agentId\":\"a1\",\"sessionId\":\"s1\"}
 {\"event\":\"SubagentStart\",\"agentId\":\"a2\",\"sessionId\":\"s2\"}";
 
-        // Positive control: this exact input is capable of producing a
-        // nonzero count when scoping is dropped (session_id: None already
-        // takes the Unscopable/count-all path) — proving the test can
-        // discriminate, not just pass vacuously. This is the number the old,
-        // collapsed fallback would have returned for the unmatched "sX" too.
-        assert_eq!(
-            count_live_subagents(jsonl, None),
-            2,
-            "positive control: 2 agents are live when nothing scopes by session"
-        );
+        // Positive control: exercise the Matched branch on this exact input,
+        // not the separate Unscopable/count-all branch. This proves session
+        // scoping itself can recover a live agent before the no-match check.
+        assert_eq!(count_live_subagents(jsonl, Some("s1")), 1);
 
         // Fixed behavior: "sX" is a real, well-formed absence — report 0, not
         // the other sessions' 2 live agents.
@@ -339,6 +346,44 @@ not json at all
     #[test]
     fn empty_log_counts_zero() {
         assert_eq!(count_live_subagents("", Some("s")), 0);
+    }
+
+    #[test]
+    fn bounded_tail_excludes_old_history_but_keeps_recent_complete_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagents.jsonl");
+
+        let stale = "{\"event\":\"SubagentStart\",\"agentId\":\"stale\",\"sessionId\":\"s\"}\n";
+        let padding = "{\"event\":\"SubagentStop\",\"agentId\":\"padding\",\"sessionId\":\"s\"}\n";
+        let recent = "{\"event\":\"SubagentStart\",\"agentId\":\"recent\",\"sessionId\":\"s\"}\n";
+
+        let mut jsonl = String::with_capacity(SUBAGENT_LOG_TAIL_BYTES as usize + 4096);
+        jsonl.push_str(stale);
+        while jsonl.len() <= SUBAGENT_LOG_TAIL_BYTES as usize + padding.len() {
+            jsonl.push_str(padding);
+        }
+        jsonl.push_str(recent);
+        std::fs::write(&path, jsonl).unwrap();
+
+        let tail = read_subagent_log_tail(&path).expect("regular UTF-8 JSONL");
+        assert!(
+            !tail.contains("\"agentId\":\"stale\""),
+            "negative control: history before the fixed bound is not parsed"
+        );
+        assert!(
+            tail.contains("\"agentId\":\"recent\""),
+            "positive control: the newest complete record survives"
+        );
+        assert_eq!(count_live_subagents(&tail, Some("s")), 1);
+    }
+
+    #[test]
+    fn bounded_tail_keeps_a_short_log_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagents.jsonl");
+        let jsonl = "{\"event\":\"SubagentStart\",\"agentId\":\"a1\",\"sessionId\":\"s\"}\n";
+        std::fs::write(&path, jsonl).unwrap();
+        assert_eq!(read_subagent_log_tail(&path).as_deref(), Some(jsonl));
     }
 
     // --- assess_concurrency (pure decision) ---
