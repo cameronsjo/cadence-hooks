@@ -400,7 +400,10 @@ fn patch_add_file_carrying_a_secret_is_blocked() {
 /// judge.
 #[test]
 fn patch_target_reaches_guard_dotfiles() {
-    let home = std::env::var("HOME").expect("HOME");
+    // Not `std::env::var("HOME")` — that is unset on Windows, where the home
+    // directory comes from USERPROFILE. The guards resolve it through this
+    // helper, so the test asks the same way they do.
+    let home = cadence_hooks_core::paths::user_home_lossy_or_default();
     let patch =
         format!("*** Begin Patch\n*** Update File: {home}/.zshrc\n@@\n-old\n+new\n*** End Patch");
     let payload = serde_json::json!({
@@ -434,7 +437,10 @@ fn patch_target_reaches_guard_dotfiles() {
 /// asserted against the binary rather than restated as prose.
 #[test]
 fn codex_local_function_call_reaches_a_security_critical_guard() {
-    let home = std::env::var("HOME").expect("HOME");
+    // Not `std::env::var("HOME")` — that is unset on Windows, where the home
+    // directory comes from USERPROFILE. The guards resolve it through this
+    // helper, so the test asks the same way they do.
+    let home = cadence_hooks_core::paths::user_home_lossy_or_default();
     let payload = serde_json::json!({
         "tool_name": "exec_command",
         "cwd": "/private/tmp",

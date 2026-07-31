@@ -103,6 +103,21 @@ def build(binary: Path, workspace: Path) -> dict:
     }
 
 
+def _without_wiring(text: str) -> str:
+    """The report with every `wiring` array dropped, for comparison only.
+
+    Returns the input unchanged when it does not parse, so a corrupt
+    checked-in report still fails the comparison rather than passing it.
+    """
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    for hook in doc.get("hooks", []):
+        hook.pop("wiring", None)
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -121,10 +136,30 @@ def main() -> int:
         ensure_ascii=False,
     ) + "\n"
     if args.check:
-        if not args.output.exists() or args.output.read_text(encoding="utf-8") != rendered:
-            print("Codex compatibility report is stale", file=sys.stderr)
+        if not args.output.exists():
+            print("Codex compatibility report is missing", file=sys.stderr)
             return 1
-        return 0
+        checked_in = args.output.read_text(encoding="utf-8")
+        if checked_in == rendered:
+            return 0
+        # `wiring` is derived from the plugin repo's hooks.json files, which live
+        # in a SEPARATE, private checkout beside this one. CI has no sibling, so
+        # plugin_wiring() legitimately comes back empty there and every wiring
+        # array renders as []. Comparing those would fail by construction on
+        # every CI run and say "stale", which reads as a drifted report rather
+        # than an absent input. So when the workspace is unavailable, compare
+        # everything the binary itself determines — statuses, evidence,
+        # capabilities, the hook set — and exempt only the field CI cannot know.
+        if not (args.workspace.resolve() / "cadence" / "plugins").is_dir():
+            if _without_wiring(checked_in) == _without_wiring(rendered):
+                print(
+                    "Codex compatibility report is fresh "
+                    "(wiring unverified: no plugin checkout beside this repo)",
+                    file=sys.stderr,
+                )
+                return 0
+        print("Codex compatibility report is stale", file=sys.stderr)
+        return 1
     if args.stdout:
         print(rendered, end="")
         return 0
