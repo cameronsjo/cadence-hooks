@@ -666,18 +666,47 @@ fn peel_env_options<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
 /// elsewhere before the read runs. `cd /elsewhere && cat .envrc` would
 /// classify `$cwd/.envrc` (a clean loader at the project root) while the
 /// shell actually reads `/elsewhere/.envrc` (a secret) — the guard proves the
-/// wrong file. Reuses [`is_executed_command`]'s per-segment, quote-aware
-/// executed-command check, so `cd`/`pushd`/`popd` as a path fragment or
-/// argument (`echo cd-something`) doesn't false-positive.
+/// wrong file.
 ///
-/// A subshell/brace-grouped `cd` (`(cd /x; cat .envrc)`, `{ cd /x; …`) is
-/// detected too: [`is_executed_command`] strips leading group punctuation
-/// before matching the command word, so grouping cannot hide a directory
-/// change from the carve-out.
-fn command_changes_directory(lower: &str) -> bool {
-    is_executed_command(lower, &["cd"])
-        || is_executed_command(lower, &["pushd"])
-        || is_executed_command(lower, &["popd"])
+/// SEGMENTATION is aligned with the operand scan: both now run over the same
+/// wrapper-expanded [`command_segments`] view. A non-expanding view would miss
+/// the `cd` in `bash -c 'cd /elsewhere; cat .envrc'`, prove the loader at
+/// `input.cwd`, and allow the child shell to read a different file. Segment
+/// text is folded only after expansion so case-sensitive wrapper flags such as
+/// `sudo -E` remain visible to the expander.
+///
+/// COMMAND-WORD RESOLUTION is NOT aligned, and that gap is where the remaining
+/// misses live — do not read the sentence above as "this scan sees what the
+/// operand scan sees". [`segment_env_reads`] resolves a segment's command word
+/// with [`tokenize`] (quote-aware), [`unwrap_command_prefixes`]
+/// (`sudo`/`command`/`nohup`/`time`), [`command_word`] (leading-`\` strip) and a
+/// basename, across all of `argv`; [`is_executed_command`] below splits on bare
+/// whitespace and inspects `argv[0]` only. So `command cd /x && cat .envrc`,
+/// `eval cd /x`, `\cd /x`, `'cd' /x`, and every compound form that puts a
+/// reserved word in `argv[0]` (`if cd /x; then …`, `while`, `case`, a function
+/// body) leave the `.envrc` operand visible while the `cd` goes unseen —
+/// measured Allow, and each really does chdir in bash. Every one of them
+/// pre-dates this function's segmentation fix and none is introduced by it;
+/// resolution alignment (reusing `command_word`/`unwrap_command_prefixes` plus a
+/// reserved-word peel) is tracked as its own issue, with its own differential.
+///
+/// [`is_executed_command`] remains the quote-aware command-position check, so
+/// `cd`/`pushd`/`popd` as a path fragment or argument does not false-positive.
+///
+/// Known over-block, accepted deliberately: a `cd` inside `$(…)`/backticks runs
+/// in a substitution subshell and cannot move the parent's cwd, but
+/// [`command_segments`] splices that body into the flat segment stream, so this
+/// returns `true` and the carve-out closes anyway — precise per-scope cd
+/// tracking is the complexity that sank the earlier attempts at this widening,
+/// and the direction here fails CLOSED (a benign read is blocked, no secret is
+/// exposed).
+fn command_changes_directory(command: &str) -> bool {
+    command_segments(command).into_iter().any(|segment| {
+        let lower = segment.to_ascii_lowercase();
+        is_executed_command(&lower, &["cd"])
+            || is_executed_command(&lower, &["pushd"])
+            || is_executed_command(&lower, &["popd"])
+    })
 }
 
 /// Content-aware `.envrc` carve-out for the Bash read path (#193): the Read/Grep
@@ -768,7 +797,7 @@ fn bash_leaks_secrets(command: &str, cwd: Option<&str>) -> Option<CheckResult> {
         // anywhere invalidates the RELATIVE-operand carve-out for every
         // segment, since the shell's real cwd at read time can no longer be
         // trusted to equal `input.cwd`.
-        let command_has_cd = command_changes_directory(&lower);
+        let command_has_cd = command_changes_directory(command);
         // #508: segmented from the ORIGINAL `command`, NOT `lower`.
         // `command_segments`'s sudo-flag peel (`skip_sudo_no_argument_flags`)
         // matches `SUDO_NO_ARGUMENT_SHORT_FLAGS` case-SENSITIVELY, on
@@ -2985,6 +3014,64 @@ mod tests {
             dir.path().to_str().unwrap(),
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_c_cd_then_cat_relative_envrc_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "bash -c 'cd /elsewhere; cat .envrc'",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn sudo_bash_c_cd_then_cat_relative_envrc_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "sudo -E bash -c 'cd /elsewhere; cat .envrc'",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_c_cat_relative_envrc_without_cd_stays_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "bash -c 'cat .envrc'",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn heredoc_body_line_matching_delimiter_only_when_folded_stays_allowed() {
+        // Block -> Allow delta introduced by segmenting the UN-lowered command,
+        // pinned here because it moves in the normally-wrong direction and
+        // nothing else would catch a silent flip back.
+        //
+        // Bash's heredoc delimiters are CASE-SENSITIVE: `<<EOF` is terminated by
+        // a line reading `EOF`, never by one reading `eof`. So in the command
+        // below the `eof` and `cd /x` lines are heredoc BODY, the shell never
+        // chdir's, and `cat .envrc` reads the pure loader at input.cwd — Allow
+        // is the correct answer, confirmed by running the same shape in bash.
+        //
+        // The pre-fix Block was an artifact of lowering before segmenting: that
+        // folded the introducer to `<<eof`, which the body line `eof` then
+        // matched, ending the heredoc early and promoting `cd /x` to a live
+        // segment that bash never runs.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
+        let result = SecretLeaksGuard.run(&make_bash_with_cwd(
+            "cat <<EOF > /tmp/z\neof\ncd /x\nEOF\ncat .envrc",
+            dir.path().to_str().unwrap(),
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
