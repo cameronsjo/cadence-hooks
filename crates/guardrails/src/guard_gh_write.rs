@@ -3552,9 +3552,11 @@ mod tests {
 
     #[test]
     fn pr_create_owned_fallback_allows() {
-        // Non-api gh writes keep the cwd-remote fallback — routine work stays green.
+        // Non-api gh writes keep the cwd-remote fallback. Use a hermetic
+        // GitHub origin rather than inheriting the enclosing clone's remote.
         with_env(&owners_env(), || {
-            let input = input_with("gh pr create --title hi", OWNED_DIR);
+            let repo = crate::github_origin_repo();
+            let input = input_with("gh pr create --title hi", &repo.path().to_string_lossy());
             let result = GhWriteGuard.run(&input);
             assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
         });
