@@ -395,8 +395,10 @@ const LEADING_KEYWORDS: &[&str] = &["do", "then", "else", "elif", "while", "unti
 /// the same argument [`skip_transparent_prefixes`] makes. Never reuse it to
 /// decide that something is *safe*.
 ///
-/// A keyword that is the segment's ONLY word (`done`, a bare `!`) is left
-/// alone: there is no command behind it to expose.
+/// A keyword that is the segment's ONLY word — `!` is the one list member that
+/// can appear alone — is left alone: there is no command behind it to expose.
+/// A closing word (`done`, `fi`, `esac`) is not in the list at all, so it is
+/// never a candidate to strip in the first place.
 pub fn strip_leading_keywords(tokens: &[String]) -> &[String] {
     let mut start = 0;
     while start + 1 < tokens.len() && LEADING_KEYWORDS.contains(&tokens[start].as_str()) {
@@ -2442,27 +2444,87 @@ const XARGS_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
     "--open-tty",
 ];
 
-/// Walk a command runner's OWN options, returning the slice that begins at the
-/// command it will run — or `None` when a token cannot be classified, in which
-/// case the caller must not peel further. Supports `sudo` and `xargs`; any
-/// other verb returns `None`.
-///
-/// **Why this exists next to [`skip_sudo_no_argument_flags`] rather than
-/// replacing it.** That walk feeds `command_segments`, which *expands* a
-/// script into the "every command that will actually execute" view, and there
-/// an over-eager peel can manufacture a false block on a script the shell never
-/// runs — so it refuses every value-taking option rather than guess. This walk
-/// feeds a segment-HEAD detector, where the same peel only ever exposes a verb
-/// that was already going to run. That is what makes `-u root` safe to consume
-/// here and not there: the flag grammars of `sudo` and `xargs` are small and
-/// stable, and consuming a known value-taking flag WITH its value is knowledge,
-/// not a guess.
-///
-/// Bailing on the first `-` instead is what un-blocked `sudo -u me rm note.md`
-/// and `find … -print0 | xargs -0 rm` — the canonical safe-for-spaces delete
-/// idiom — when `obsidian-trash-guard` moved to a head scan (#528 review C1).
-pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [String]> {
-    let (no_arg_short, value_short, no_arg_long, value_long): (_, _, _, &[&str]) = match verb {
+/// As much of one runner's option grammar as the walk below needs to find the
+/// command word behind it. Every field is deliberately an exhaustive list
+/// rather than a heuristic: an unlisted token refuses the walk, so a grammar
+/// that is merely incomplete costs a block and never invents one.
+struct RunnerGrammar {
+    /// Short flags taking no argument of their own, one character per flag.
+    no_arg_short: &'static str,
+    /// Short flags requiring a value, glued (`-n1`) or as the next word.
+    value_short: &'static str,
+    no_arg_long: &'static [&'static str],
+    value_long: &'static [&'static str],
+    /// `nice -10` — an all-digit short cluster IS the value, with no flag
+    /// letter in front of it. True only where the runner accepts that spelling.
+    numeric_short_cluster: bool,
+    /// Positional words the runner consumes before the command, after its
+    /// options: `timeout 5 rm x` runs `rm`, not `5`.
+    operands_before_command: usize,
+}
+
+/// `nice`'s only command-relevant option. GNU also spells the adjustment as a
+/// bare `-10`, which `numeric_short_cluster` covers.
+const NICE_VALUE_SHORT_FLAGS: &str = "n";
+const NICE_VALUE_LONG_FLAGS: &[&str] = &["--adjustment"];
+
+/// `stdbuf`'s buffering options — all three take a value, glued (`-o0`) or as
+/// the next word (`-o 0`). It has no argument-free option that still runs a
+/// command.
+const STDBUF_VALUE_SHORT_FLAGS: &str = "ioe";
+const STDBUF_VALUE_LONG_FLAGS: &[&str] = &["--input", "--output", "--error"];
+
+/// `timeout`'s options. The DURATION operand is handled by
+/// `operands_before_command`, not here.
+const TIMEOUT_NO_ARGUMENT_SHORT_FLAGS: &str = "v";
+const TIMEOUT_VALUE_SHORT_FLAGS: &str = "ks";
+const TIMEOUT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--preserve-status", "--foreground", "--verbose"];
+const TIMEOUT_VALUE_LONG_FLAGS: &[&str] = &["--kill-after", "--signal"];
+
+/// `env`'s options. `-S`/`--split-string` is deliberately absent: it re-splits
+/// its value into the command line, so resolving a head word past it would be a
+/// guess. A bare `-` (an alias for `-i`) is likewise unmodelled — the walk
+/// refuses an empty short cluster.
+const ENV_NO_ARGUMENT_SHORT_FLAGS: &str = "i0v";
+const ENV_VALUE_SHORT_FLAGS: &str = "uC";
+const ENV_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ignore-environment", "--null", "--debug"];
+const ENV_VALUE_LONG_FLAGS: &[&str] = &["--unset", "--chdir"];
+
+/// `git`'s global options — the ones that sit between `git` and its
+/// subcommand. `-C`/`-c` take a separate value word (git itself rejects the
+/// glued spelling, and consuming one anyway only over-skips). The
+/// optional-value spellings (`--exec-path`) are listed as argument-free so
+/// their glued form parses; the bare form prints and exits without running a
+/// subcommand, so over-skipping there costs nothing.
+const GIT_NO_ARGUMENT_SHORT_FLAGS: &str = "Ppvh";
+const GIT_VALUE_SHORT_FLAGS: &str = "Cc";
+const GIT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
+    "--no-pager",
+    "--paginate",
+    "--bare",
+    "--exec-path",
+    "--no-replace-objects",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--no-optional-locks",
+    "--no-lazy-fetch",
+    "--no-advice",
+];
+const GIT_VALUE_LONG_FLAGS: &[&str] = &[
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--attr-source",
+    "--config-env",
+];
+
+/// The option grammar for a runner this walk models, or `None` for any other
+/// verb.
+fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
+    let (no_arg_short, value_short, no_arg_long, value_long) = match verb {
         "sudo" => (
             SUDO_NO_ARGUMENT_SHORT_FLAGS,
             SUDO_VALUE_SHORT_FLAGS,
@@ -2473,36 +2535,103 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
             XARGS_NO_ARGUMENT_SHORT_FLAGS,
             XARGS_VALUE_SHORT_FLAGS,
             XARGS_NO_ARGUMENT_LONG_FLAGS,
-            &[],
+            &[] as &[&str],
+        ),
+        "nice" => (
+            "",
+            NICE_VALUE_SHORT_FLAGS,
+            &[] as &[&str],
+            NICE_VALUE_LONG_FLAGS,
+        ),
+        "stdbuf" => (
+            "",
+            STDBUF_VALUE_SHORT_FLAGS,
+            &[] as &[&str],
+            STDBUF_VALUE_LONG_FLAGS,
+        ),
+        "timeout" => (
+            TIMEOUT_NO_ARGUMENT_SHORT_FLAGS,
+            TIMEOUT_VALUE_SHORT_FLAGS,
+            TIMEOUT_NO_ARGUMENT_LONG_FLAGS,
+            TIMEOUT_VALUE_LONG_FLAGS,
+        ),
+        "env" => (
+            ENV_NO_ARGUMENT_SHORT_FLAGS,
+            ENV_VALUE_SHORT_FLAGS,
+            ENV_NO_ARGUMENT_LONG_FLAGS,
+            ENV_VALUE_LONG_FLAGS,
+        ),
+        "git" => (
+            GIT_NO_ARGUMENT_SHORT_FLAGS,
+            GIT_VALUE_SHORT_FLAGS,
+            GIT_NO_ARGUMENT_LONG_FLAGS,
+            GIT_VALUE_LONG_FLAGS,
         ),
         _ => return None,
     };
+    Some(RunnerGrammar {
+        no_arg_short,
+        value_short,
+        no_arg_long,
+        value_long,
+        numeric_short_cluster: verb == "nice",
+        operands_before_command: usize::from(verb == "timeout"),
+    })
+}
+
+/// Walk a command runner's OWN options, returning the slice that begins at the
+/// command it will run — or `None` when a token cannot be classified, in which
+/// case the caller must not peel further. Modelled runners: `sudo`, `xargs`,
+/// `nice`, `stdbuf`, `timeout`, `env`, and `git` (whose "command" is its
+/// subcommand); any other verb returns `None`.
+///
+/// **Why this exists next to [`skip_sudo_no_argument_flags`] rather than
+/// replacing it.** That walk feeds `command_segments`, which *expands* a
+/// script into the "every command that will actually execute" view, and there
+/// an over-eager peel can manufacture a false block on a script the shell never
+/// runs — so it refuses every value-taking option rather than guess. This walk
+/// feeds a segment-HEAD detector, where the same peel only ever exposes a verb
+/// that was already going to run. That is what makes `-u root` safe to consume
+/// here and not there: the flag grammars above are small and stable, and
+/// consuming a known value-taking flag WITH its value is knowledge, not a
+/// guess.
+///
+/// Bailing on the first `-` instead is what un-blocked `sudo -u me rm note.md`
+/// and `find … -print0 | xargs -0 rm` — the canonical safe-for-spaces delete
+/// idiom — when `obsidian-trash-guard` moved to a head scan (#528 review C1).
+/// The `nice`/`stdbuf`/`timeout`/`env` arms close the "prefixes outside
+/// `TRANSPARENT`" half of that same finding: `TRANSPARENT` admits a prefix only
+/// while the next token is not an option, so `nice -n 10 rm x` and
+/// `env -i /bin/rm x` reached no verb gate at all (#528 review I1).
+pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [String]> {
+    let grammar = runner_grammar(verb)?;
 
     let mut i = 0;
-    while let Some(tok) = argv.get(i) {
+    let rest = loop {
+        let tok = argv.get(i)?;
         // The first word that is not an option is the command being run.
         if !tok.starts_with('-') {
-            return Some(&argv[i..]);
+            break &argv[i..];
         }
         // `--` ends option parsing explicitly; the command follows it.
         if tok == "--" {
-            return argv.get(i + 1..);
+            break argv.get(i + 1..)?;
         }
         if tok.starts_with("--") {
             if let Some((name, _)) = tok.split_once('=') {
                 // A glued value belongs to the flag either way, so both
                 // classes consume exactly this token.
-                if !no_arg_long.contains(&name) && !value_long.contains(&name) {
+                if !grammar.no_arg_long.contains(&name) && !grammar.value_long.contains(&name) {
                     return None;
                 }
                 i += 1;
                 continue;
             }
-            if no_arg_long.contains(&tok.as_str()) {
+            if grammar.no_arg_long.contains(&tok.as_str()) {
                 i += 1;
                 continue;
             }
-            if value_long.contains(&tok.as_str()) {
+            if grammar.value_long.contains(&tok.as_str()) {
                 i += 2;
                 continue;
             }
@@ -2515,12 +2644,17 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
         if cluster.is_empty() {
             return None;
         }
+        // `nice -10 rm x`: the adjustment with no flag letter in front of it.
+        if grammar.numeric_short_cluster && cluster.chars().all(|c| c.is_ascii_digit()) {
+            i += 1;
+            continue;
+        }
         let mut takes_next_word = false;
         for (pos, c) in cluster.char_indices() {
-            if no_arg_short.contains(c) {
+            if grammar.no_arg_short.contains(c) {
                 continue;
             }
-            if value_short.contains(c) {
+            if grammar.value_short.contains(c) {
                 takes_next_word = pos + c.len_utf8() == cluster.len();
                 break;
             }
@@ -2532,9 +2666,26 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
         if takes_next_word {
             i += 1;
         }
-    }
-    // Options all the way to the end: there is no command here.
-    None
+    };
+    // `timeout DURATION cmd` — a positional the runner consumes before the
+    // command. `get(0..)` on every other runner returns the slice unchanged.
+    rest.get(grammar.operands_before_command..)
+}
+
+/// Skip `git`'s global options so the slice begins at its SUBCOMMAND.
+///
+/// `git`'s globals sit in exactly the position a `argv[1] == "rm"` alias test
+/// reads, so without this `git -C . rm note.md` and `git --no-pager rm note.md`
+/// resolve their subcommand to `-C` and go unjudged while deleting the file
+/// (#528 review I2). Shared by `obsidian-trash-guard` and
+/// `prevent_secret_writes::writer_targets`, which had the identical gap.
+///
+/// Infallible by design: a token this cannot classify yields the argv it was
+/// handed, so a caller's plain `git rm` test keeps working unchanged. Both
+/// callers feed detectors, so an over-skip can only expose a subcommand that
+/// was already going to run.
+pub fn skip_git_global_options(argv: &[String]) -> &[String] {
+    skip_runner_flags("git", argv).unwrap_or(argv)
 }
 
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
@@ -2669,9 +2820,78 @@ mod tests {
     }
 
     #[test]
+    fn skip_runner_flags_walks_the_prefix_families_outside_transparent() {
+        // `TRANSPARENT` admits `nice`/`env` only while the next token is not an
+        // option, and does not model `timeout`/`stdbuf` at all (#528 review I1).
+        for (command, want_head) in [
+            ("nice -n 10 rm note.md", Some("rm")),
+            ("nice -n10 rm note.md", Some("rm")),
+            ("nice --adjustment=10 rm note.md", Some("rm")),
+            ("nice --adjustment 10 rm note.md", Some("rm")),
+            // GNU spells the adjustment with no flag letter at all.
+            ("nice -10 rm note.md", Some("rm")),
+            ("stdbuf -o0 rm note.md", Some("rm")),
+            ("stdbuf -o 0 rm note.md", Some("rm")),
+            ("stdbuf -i0 -o0 -e0 rm note.md", Some("rm")),
+            ("stdbuf --output=0 rm note.md", Some("rm")),
+            // The DURATION operand is consumed before the command.
+            ("timeout 5 rm note.md", Some("rm")),
+            ("timeout -k 1 5 rm note.md", Some("rm")),
+            ("timeout --preserve-status 5 rm note.md", Some("rm")),
+            ("timeout --signal=KILL 5 rm note.md", Some("rm")),
+            ("env -i /bin/rm note.md", Some("/bin/rm")),
+            ("env -u FOO rm note.md", Some("rm")),
+            ("env --unset=FOO rm note.md", Some("rm")),
+            ("env -i FOO=bar rm note.md", Some("FOO=bar")),
+            // `-S` re-splits its value into the command line; resolving a head
+            // word past it would be a guess, so the walk refuses.
+            ("env -S 'rm note.md'", None),
+            ("timeout 5", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_git_global_options_exposes_the_subcommand() {
+        for (command, want_head) in [
+            ("git rm note.md", "rm"),
+            ("git -C . rm note.md", "rm"),
+            ("git -C /vault/notes rm -r notes/", "rm"),
+            ("git --no-pager rm note.md", "rm"),
+            ("git -c core.pager=cat rm note.md", "rm"),
+            ("git --git-dir=.git rm note.md", "rm"),
+            ("git --git-dir .git rm note.md", "rm"),
+            ("git --work-tree=/vault rm note.md", "rm"),
+            ("git --namespace=ns rm note.md", "rm"),
+            ("git -P rm note.md", "rm"),
+            ("git -C . -c user.name=x --no-pager rm note.md", "rm"),
+            // Not a global option, so the slice is handed back untouched and a
+            // caller's subcommand test reads the same word it always did.
+            ("git status", "status"),
+            ("git -C . status", "status"),
+            ("git --nonesuch rm note.md", "--nonesuch"),
+        ] {
+            let tokens = words(command);
+            assert_eq!(
+                skip_git_global_options(&tokens[1..])
+                    .first()
+                    .map(String::as_str),
+                Some(want_head),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn skip_runner_flags_refuses_verbs_it_does_not_model() {
-        let tokens = words("timeout 5 rm note.md");
-        assert!(skip_runner_flags("timeout", &tokens[1..]).is_none());
+        let tokens = words("doas -u me rm note.md");
+        assert!(skip_runner_flags("doas", &tokens[1..]).is_none());
     }
 
     // --- command_word (the one verb normalization) ---

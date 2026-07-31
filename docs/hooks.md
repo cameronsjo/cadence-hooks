@@ -85,12 +85,16 @@ review, install the official `security-guidance` plugin
 | `trash-guard` | PreToolUse (Bash) | Block destructive vault operations (`rm`, `git rm`, `unlink`, `shred`, `truncate`, `find -delete`, and clobber redirects); use `.trash/` instead |
 
 A verb counts only where the shell runs an executable: the head of a segment
-(after reserved words like `do`/`then`, transparent wrappers, and a
-`sudo`/`xargs` runner's own flags), a `find` exec-family action, or an operand a
-command re-executes (`eval …`, `find … -exec sh -c '…'`). That is narrower than
-a scan of the whole command line, which is what this guard used before 0.70.0 —
-`echo rm` and `npm run format` no longer match, and neither does a verb reached
-by a spelling not listed above (`timeout 5 rm x`, `` `echo rm` x ``).
+(after reserved words like `do`/`then`, transparent wrappers, and a command
+runner's own flags — `sudo`, `xargs`, `nice`, `stdbuf`, `timeout`, `env`), a
+`git` subcommand behind git's global options (`git -C . rm x`), a `find`
+exec-family action, or an operand a command re-executes (`eval …`,
+`find … -exec sh -c '…'`). That is narrower than a scan of the whole command
+line, which is what this guard used before 0.70.0 — `echo rm` and
+`npm run format` no longer match, and neither does a verb reached by a spelling
+not listed above: one built by substitution (`` `echo rm` x ``, `$(echo rm) x`),
+one carried in a `trap`/`case` body, or a deleting binary outside the verb list
+(`srm x`).
 
 ## metrics (cadence-metrics)
 

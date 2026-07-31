@@ -9,7 +9,9 @@ use crate::secret_patterns::{
     command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token, is_safe_template, is_secret_scan_exempt, scan_secret_values,
 };
-use cadence_hooks_core::shell::{command_segments, command_word, redirect_targets, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, command_word, redirect_targets, skip_git_global_options, tokenize,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Wrapper words that pass their argv through to the real command —
@@ -50,9 +52,15 @@ fn writer_targets(segment: &str) -> Vec<String> {
     let command = command_word(first);
     let mut cmd = command.as_ref();
     let mut args: &[String] = &tokens[start + 1..];
-    if cmd == "git" && args.first().map(String::as_str) == Some("rm") {
-        cmd = "rm";
-        args = &args[1..];
+    if cmd == "git" {
+        // `git`'s global options sit between the verb and the subcommand, so
+        // reading `args[0]` alone misses `git -C . rm .env` and
+        // `git --no-pager rm .env` — both delete the file (#528 review I2).
+        let subcommand = skip_git_global_options(args);
+        if subcommand.first().map(String::as_str) == Some("rm") {
+            cmd = "rm";
+            args = &subcommand[1..];
+        }
     }
 
     match cmd {
@@ -607,6 +615,34 @@ mod tests {
     fn bash_git_rm_env_blocked() {
         // `git rm .env` deletes through git — preserved from the old scanner.
         assert!(bash_targets_env_file("git rm .env"));
+    }
+
+    #[test]
+    fn bash_git_rm_env_behind_a_global_option_blocked() {
+        // `git`'s globals sit where the `rm` subcommand test reads, so the
+        // alias missed every one of these while the file still deleted
+        // (#528 review I2 — the same gap the trash guard had).
+        for command in [
+            "git -C . rm .env",
+            "git --no-pager rm .env",
+            "git -c core.pager=cat rm .env",
+            "git --git-dir=.git rm .env",
+            "git -P rm .env",
+            "sudo git -C . rm .env",
+        ] {
+            assert!(bash_targets_env_file(command), "{command} must block");
+        }
+    }
+
+    #[test]
+    fn bash_benign_git_subcommand_behind_a_global_option_allowed() {
+        // Skipping globals must expose the subcommand, not blur it.
+        for command in ["git -C . status", "git --no-pager log .env"] {
+            assert!(
+                !bash_targets_env_file(command),
+                "{command} must stay allowed"
+            );
+        }
     }
 
     #[test]

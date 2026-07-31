@@ -141,14 +141,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   safe-for-spaces delete idiom), `for f in *.md; do rm $f; done`,
   `if true; then rm note.md; fi`, `eval rm note.md`, and
   `find . -exec sh -c 'rm note.md' \;`. Nothing else caught them — `guard-rm`
-  gates dangerous *targets*, not vault recoverability. All are blocked again:
-  the head test now runs after `core::shell::strip_leading_keywords` (a
-  reserved word occupying the head position), after a `sudo`/`xargs` peel that
-  walks the runner's OWN flags via `core::shell::skip_runner_flags` rather than
-  bailing on the first `-`, with `git rm` aliased to `rm` exactly as
-  `prevent_secret_writes` already spells it, and with `eval`'s operand and a
-  nested `sh -c` under `find -exec` routed back through the same scan. Each row
-  is pinned by a differential test driven through `Check::run`.
+  gates dangerous *targets*, not vault recoverability. Every one of those seven
+  is blocked again: the head test now runs after
+  `core::shell::strip_leading_keywords` (a reserved word occupying the head
+  position), after a runner peel that walks the runner's OWN flags via
+  `core::shell::skip_runner_flags` rather than bailing on the first `-`, with
+  `git rm` aliased to `rm` exactly as `prevent_secret_writes` already spells it,
+  and with `eval`'s operand and a nested `sh -c` under `find -exec` routed back
+  through the same scan. Each row is pinned by a differential test driven
+  through `Check::run`.
+
+  **Two measured gaps in that first fix, both found by re-reviewing it.** The
+  runner peel covered `sudo`/`xargs` while `TRANSPARENT` admits `nice` and `env`
+  only until their own options appear and models `timeout`/`stdbuf` not at all,
+  so `nice -n 10 rm x`, `stdbuf -o0 rm x`, `timeout 5 rm x`, and
+  `env -i /bin/rm x` still reached no verb gate. And the `git rm` alias tested
+  the word immediately after `git`, which is exactly where git's own global
+  options sit — `git -C . rm note.md`, `git --no-pager rm note.md`,
+  `git -c core.pager=cat rm note.md` and four more spellings deleted the file
+  unjudged. `skip_runner_flags` now carries a grammar per runner (`nice`'s bare
+  `-10` adjustment, `timeout`'s positional DURATION, `env`'s assignment words),
+  and `core::shell::skip_git_global_options` skips git's globals before any
+  subcommand test. `prevent_secret_writes::writer_targets` — the precedent the
+  alias was copied from — had the identical `git` gap and calls the same helper,
+  so the two cannot drift apart again.
+
+  **What stays open, so this list is not read as more than it is.** The head
+  model reaches a verb where the shell runs an executable; it does not reach a
+  verb built by substitution (`` `echo rm` x ``, `$(echo rm) x`), one carried in
+  a `trap`/`case`/`coproc`/`function` body, or a deleting binary outside the
+  gated verb set (`srm`, `perl -e 'unlink'`). Those are tracked separately —
+  each needs a decision about how far a head model should follow a shell, not
+  another peel arm. `docs/hooks.md` names the same boundary for the operator.
 
   **What stays removed is the false-positive class the narrowing was for.**
   `npm run format` and `terraform destroy` inside a vault blocked under the old
@@ -157,9 +181,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
   The two nudge-only guards keep the narrowing for now — `sudo gh pr merge`,
   `GH_TOKEN=x gh pr create`, and the keyword-wrapped spellings no longer nudge,
-  which is a missed reminder rather than an unguarded write. Tracked separately
-  rather than fixed here, so the block-capable regression above lands on its
-  own.
+  which is a missed reminder rather than an unguarded write. That has its own
+  tracking issue rather than being fixed here, so the block-capable regression
+  above lands on its own. `guard_push_remote`'s hand-rolled `(?i:\bgit)` verb
+  fold — a fourth normalization of "which verb is this?" beside `command_word`,
+  which the same review flagged — is likewise left alone and tracked as
+  cameronsjo/cadence-hooks#539.
 
 - **`split_segments` honors backslash escapes, so a segment boundary means what the shell means by it (cameronsjo/cadence-hooks#475).** The splitter cut at every newline with no continuation awareness and toggled quote state on every `"` regardless of a preceding backslash — while `tokenize`, the parser that reads the resulting segment's words, does both correctly. Two parsers disagreeing about where a word ends is a boundary the shell does not have, and any guard that reasons per segment inherits it.
 

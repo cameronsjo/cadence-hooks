@@ -8,13 +8,21 @@
 
 use cadence_hooks_core::shell::{
     child_scripts, clobber_redirect_targets, command_segments, command_word, looks_absolute,
-    skip_runner_flags, skip_transparent_prefixes, strip_group_wrappers, strip_leading_keywords,
-    tokenize,
+    skip_git_global_options, skip_runner_flags, skip_transparent_prefixes, strip_group_wrappers,
+    strip_leading_keywords, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
 /// Verbs that delete or zero the file they are handed.
 const DESTRUCTIVE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
+
+/// Verbs that run the command following their OWN options. `sudo` and `xargs`
+/// sit outside `core::shell::TRANSPARENT` by design; `nice` and `env` are in it
+/// but are admitted there only while the next token is not an option, and
+/// `timeout`/`stdbuf` are not modelled there at all. Each one's flag grammar is
+/// walked by `skip_runner_flags`, which is what keeps `sudo -u me rm note.md`,
+/// `nice -n 10 rm note.md`, and `env -i /bin/rm note.md` in view.
+const COMMAND_RUNNERS: &[&str] = &["sudo", "xargs", "nice", "stdbuf", "timeout", "env"];
 
 /// `find` actions that name a second executable position.
 const EXEC_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
@@ -44,13 +52,13 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         // `do rm $f`, so without this the head word is `do` and the `rm`
         // behind it is never examined.
         let mut argv = skip_transparent_prefixes(strip_leading_keywords(&tokens));
-        // `sudo` and `xargs` run the command that follows their OWN options.
+        // A command runner runs the command that follows its OWN options.
         // Skipping those options (rather than bailing on the first `-`) is what
         // keeps `sudo -u me rm note.md` and the canonical
         // `find … -print0 | xargs -0 rm` idiom in view.
         while let Some(first) = argv.first() {
             let runner = command_word(first).into_owned();
-            if !matches!(runner.as_str(), "sudo" | "xargs") {
+            if !COMMAND_RUNNERS.contains(&runner.as_str()) {
                 break;
             }
             let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
@@ -68,8 +76,15 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         }
         // `git rm` is judged as `rm` — it deletes the working-tree file the
         // same way. Same alias, same case-SENSITIVE subcommand spelling, as
-        // `prevent_secret_writes::writer_targets`.
-        if verb == "git" && argv.get(1).map(String::as_str) == Some("rm") {
+        // `prevent_secret_writes::writer_targets`. `git`'s global options sit
+        // between the verb and the subcommand, so `git -C . rm note.md` is read
+        // past them rather than resolving its subcommand to `-C` (#528 I2).
+        if verb == "git"
+            && skip_git_global_options(&argv[1..])
+                .first()
+                .map(String::as_str)
+                == Some("rm")
+        {
             return true;
         }
         // `eval` re-executes its operand, so scan that operand as a command in
@@ -529,6 +544,90 @@ mod tests {
             outcome_in_vault(r"find . -name x -exec sh -c 'rm note.md' \;"),
             cadence_hooks_core::Outcome::Block
         );
+    }
+
+    #[test]
+    fn git_rm_behind_a_global_option_inside_vault_blocked() {
+        // `git`'s own globals sit where the `rm` subcommand test reads, so an
+        // alias anchored at `argv[1]` missed every one of these (#528 I2).
+        // Each was measured deleting a real file through `bash`.
+        for command in [
+            "git -C . rm note.md",
+            "git -C . rm -r notes/",
+            "git --no-pager rm note.md",
+            "git -c core.pager=cat rm note.md",
+            "git --git-dir=.git rm note.md",
+            "git -P rm note.md",
+            "sudo git -C . rm note.md",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_git_subcommand_behind_a_global_option_stays_allowed() {
+        // The option skip must expose the subcommand, not blur it: a
+        // non-destructive `git` verb behind the same globals stays Allow.
+        for command in [
+            "git -C . status",
+            "git --no-pager log --oneline",
+            "git -c core.pager=cat diff",
+            "git -C . rm-cached note.md",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn runner_prefixes_outside_transparent_rm_inside_vault_blocked() {
+        // `TRANSPARENT` admits `nice`/`env` only while the next token is not an
+        // option, and does not model `timeout`/`stdbuf` at all, so each of
+        // these reached no verb gate (#528 review I1).
+        for command in [
+            "nice -n 10 rm note.md",
+            "nice -10 rm note.md",
+            "stdbuf -o0 rm note.md",
+            "timeout 5 rm note.md",
+            "timeout -k 1 5 rm note.md",
+            "env -i /bin/rm note.md",
+            "env -u FOO rm note.md",
+            "env -i FOO=bar rm note.md",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn runner_prefixes_outside_transparent_do_not_invent_verbs() {
+        // Controls for the four new runner arms: the same prefixes in front of
+        // a harmless command must stay Allow.
+        for command in [
+            "nice -n 10 ls",
+            "stdbuf -o0 cat note.md",
+            "timeout 5 npm run format",
+            "env -i /bin/ls",
+            // The DURATION operand is not the command: `timeout 5` alone runs
+            // nothing, and `rm` here is a filename argument to `grep`.
+            "timeout 5 grep -r rm .",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must stay allowed"
+            );
+        }
     }
 
     // --- Controls: false positives the head scan correctly removed ---
