@@ -261,6 +261,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   mutations remain allowed, while unverifiable mutations block under the API
   verdict instead of being mistaken for targetless repository writes.
 
+  **The loop-side repository flag now resolves last-wins, matching gh** (#477).
+  `loop_analysis::extract_repo_flag` took the *first* `-R`/`--repo` it found
+  while gh honors the last, so a command carrying two of them was judged
+  against a repository it would not act on. All four spellings (`-R x`, `-Rx`,
+  `--repo x`, `--repo=x`) are scanned and the last match wins, which is the
+  rule the per-segment `extract_repo_flag_str` already followed — the two
+  sides had silently disagreed.
+
+  **A push-option value can no longer pose as the push remote.** This is the
+  second-order cost of the #471 fix rather than a separate change: keeping
+  assignment-shaped words in `suffix_words` exposes `-o ci.skip=1`-style values
+  to `extract_push_remote`, which filtered only on a leading `-` and would have
+  read the option's value as the positional remote. It now understands the
+  option's own grammar across all four flag spellings, plus the `--` separator
+  and a bare flag with no remote following. `LoopedCommand::args` is shared
+  with `guard-push-remote`, so widening what it retains is never local to the
+  guard that asked for the widening.
+
 - **`guard-gh-write` stops blocking two commands that were correctly spelled** (cameronsjo/cadence-hooks#454, #457). Both are false BLOCKs on legitimate reads and writes, and each was reported alongside a workaround the operator had to find by trial.
 
   **An explicit `-X GET` is a read** (#454). `gh api -X GET search/issues -f q=… -f per_page=1` blocked as an unverifiable write while the identical request spelled as a query string was allowed — so the flag that states the method most plainly was the one that tripped the guard, and the block message talked about ownership rather than about the flag that actually fired it. **The issue's own diagnosis is refuted.** It supposes `-X`/`--method` is read as a write signal regardless of the verb; `API_WRITE_METHOD` matches only `POST|PUT|PATCH|DELETE` and never fired here. The block came from `API_FIELD_FLAGS`, because gh switches an otherwise-GET `gh api` to POST as soon as a parameter is added — which is precisely the switch `--method GET` cancels, and which gh documents as the way to send those parameters as a GET query string instead. The read-vs-write decision simply had no explicit-method override. It has one now, so the two spellings of that read agree.
