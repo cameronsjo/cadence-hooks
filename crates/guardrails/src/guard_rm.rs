@@ -1028,8 +1028,48 @@ fn judge_rm(
 ///
 /// The target is a [`TargetToken::SingleFile`] because that is what a patch
 /// delete is — one named entry, no recursion, no glob — which makes the verdict
-/// identical to `rm <path>` for every path. Asserted, not assumed:
-/// `patch_delete_matches_the_bash_rm_verdict_for_the_same_path`.
+/// identical to `rm <path>`. Asserted, not assumed:
+/// `patch_delete_matches_the_bash_rm_verdict_for_the_same_path`. The parity is
+/// exact for metachar-free paths; a path literally containing `*`/`?`/`[` is
+/// reduced by [`resolve_target`] to its literal prefix and judged as the parent
+/// directory, which errs strict — and errs identically on both routes, so the
+/// two still agree.
+///
+/// # What this deliberately does NOT judge: `rename-source`
+///
+/// `normalized_inputs` emits `operation: "rename-source"` — not `"delete"` — for
+/// the source half of `*** Update File: X` + `*** Move to: Y`, and for an
+/// `mcp__*move*`/`*rename*` call. A move empties `X` just as a delete does, so
+/// routing it here looks like the obvious completion. It is deliberately not
+/// routed, for two reasons that point the same way:
+///
+/// 1. **It would block this guard's own prescribed remedy.** Every block message
+///    this guard emits says *"To keep the file but get it out of the way, move it
+///    to the trash — guard-rm never fires on `mv`: • mv <target> ~/.Trash"*.
+///    Under Codex, `apply_patch` is the file primitive, so that remedy is spelled
+///    `*** Update File: ~/.ssh` + `*** Move to: ~/.Trash/ssh` — whose source is
+///    the very `HomeChild` path that blocked. Routing renames here would leave a
+///    Codex session with no non-bypass way to comply with the message it was just
+///    shown. `trash_guard` has the identical shape: its remedy is *"Move it into
+///    <vault>/.trash/"*, whose source is inside the vault.
+/// 2. **`mv` is out of scope on both harnesses, so this is an inherited scope
+///    limit, not a harness-introduced hole.** `DELETE_VERBS` is
+///    `rm`/`unlink`/`shred`/`truncate`; Bash `mv ~/.ssh /tmp/x` is allowed today
+///    and always has been. A patch rename is allowed for the same reason and to
+///    the same degree, so the two harnesses agree — which is the property the
+///    delete route exists to restore. The C2 gap was different in kind: `rm` was
+///    guarded and its patch equivalent was not.
+///
+/// The distinction the guard is drawing is **irrecoverable removal** versus
+/// relocation. A move leaves the bytes on disk under a new name, which is why
+/// `mv` is not merely unguarded here but actively recommended. A rename-source
+/// path is still judged by every *content* and *path* guard (`enforce-worktree`,
+/// `guard-dotfiles`, `prevent-secret-writes` all see the `Edit` at `X`); it is
+/// only not judged as a deletion.
+///
+/// Pinned by `patch_rename_of_a_protected_path_is_not_judged_as_a_delete` so the
+/// exclusion is an asserted property rather than an undocumented gap — changing
+/// it means changing that test, deliberately.
 fn judge_delete_path(
     path: &str,
     cwd: &str,
@@ -2538,6 +2578,53 @@ mod tests {
             Outcome::Block
         );
         assert_eq!(patch_delete_outcome("/"), Outcome::Block);
+    }
+
+    /// A patch rename is a MOVE, and this guard does not judge moves — see
+    /// `judge_delete_path`'s doc comment for the full reasoning. Pinned as an
+    /// asserted property rather than left as an undocumented gap: the exclusion
+    /// exists because every block message here prescribes `mv <target> ~/.Trash`,
+    /// and under Codex that remedy IS a patch rename whose source is the path
+    /// that just blocked.
+    #[test]
+    fn patch_rename_of_a_protected_path_is_not_judged_as_a_delete() {
+        let home = home();
+        let payload = format!(
+            r#"{{"tool_name":"apply_patch","cwd":"/private/tmp","tool_input":"*** Begin Patch\n*** Update File: {home}/.ssh\n*** Move to: {home}/.Trash/ssh\n@@\n-old\n+new\n*** End Patch"}}"#
+        );
+        let input =
+            cadence_hooks_core::HookInput::from_json(&payload).expect("parse patch payload");
+        let targets = input.normalized_inputs().expect("normalize patch");
+
+        // The source half is tagged `rename-source`, never `delete` — this is the
+        // fact the exclusion rests on, so assert it rather than assume it.
+        assert_eq!(targets[0].operation(), Some("rename-source"));
+        assert_eq!(
+            GuardRm.run(&targets[0]).outcome,
+            Outcome::Allow,
+            "a move must not be judged as a deletion — it is this guard's own \
+             prescribed remedy, and `mv` is out of scope on the Bash route too"
+        );
+
+        // Parity with the Bash route, which is the reason the exclusion is
+        // defensible: `mv` of the same path is allowed there and always has been.
+        assert_eq!(
+            GuardRm
+                .run(&cadence_hooks_core::test_builders::make_bash_with_cwd(
+                    &format!("mv {home}/.ssh {home}/.Trash/ssh"),
+                    "/private/tmp",
+                ))
+                .outcome,
+            Outcome::Allow,
+            "control: `mv` is out of guard-rm's command surface on both harnesses"
+        );
+
+        // And the delete spelling of the same path still blocks, so this test
+        // pins a scope boundary rather than a hole in the delete route.
+        assert_eq!(
+            patch_delete_outcome(&format!("{home}/.ssh")),
+            Outcome::Block
+        );
     }
 
     /// A patch path this parser cannot resolve must ASK, never silently allow.
