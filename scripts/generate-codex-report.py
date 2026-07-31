@@ -118,6 +118,23 @@ def _without_wiring(text: str) -> str:
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
+def _wiring_is_empty(text: str) -> bool:
+    """True when every hook in `text` renders an empty `wiring` array.
+
+    The exemption below rests on a claim — "this run could not determine wiring,
+    so wiring is the one field it must not compare". That claim is inferred from
+    an absent sibling directory; this asserts it against the output actually
+    produced. If a run somehow *did* render wiring while the sibling was absent,
+    the inference was wrong and dropping the field would hide a real diff, so the
+    exemption must not apply. Unparsable output is not empty wiring either.
+    """
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return all(not hook.get("wiring") for hook in doc.get("hooks", []))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -150,7 +167,14 @@ def main() -> int:
         # than an absent input. So when the workspace is unavailable, compare
         # everything the binary itself determines — statuses, evidence,
         # capabilities, the hook set — and exempt only the field CI cannot know.
-        if not (args.workspace.resolve() / "cadence" / "plugins").is_dir():
+        # The directory test says the input was absent; `_wiring_is_empty` says
+        # this run produced nothing for the field. Both must hold — otherwise the
+        # exemption is dropping a field that was in fact determined, and a
+        # hand-populated wiring array would ride through a green check.
+        if (
+            not (args.workspace.resolve() / "cadence" / "plugins").is_dir()
+            and _wiring_is_empty(rendered)
+        ):
             if _without_wiring(checked_in) == _without_wiring(rendered):
                 print(
                     "Codex compatibility report is fresh "

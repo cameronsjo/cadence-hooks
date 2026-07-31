@@ -156,17 +156,6 @@ impl Outcome {
     }
 }
 
-/// Whether this process is running under the Codex harness.
-///
-/// The single source of truth for the `CADENCE_HARNESS` check. Security
-/// behaviour keys off this (fail-closed parse denial, the `Ask` → `Block`
-/// conversion) and so does metrics tagging, so all callers must agree — a
-/// site that compared case-sensitively while another compared
-/// case-insensitively would fail **open** on `CADENCE_HARNESS=Codex` at
-/// exactly the moment metrics recorded the run as Codex.
-///
-/// Matching is case-insensitive: the value is set by shell wrappers, and a
-/// harness that announces itself at all should be honoured however it cased it.
 /// Set once this process parses a payload only the Codex harness produces.
 /// See [`is_codex_payload_shape`] for the sniff and [`is_codex_harness`] for why
 /// it exists.
