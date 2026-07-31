@@ -94,29 +94,66 @@ static API_REPO_PATH: LazyLock<Regex> =
 ///
 /// Deliberately narrower than tokenization otherwise: it exists only to keep a
 /// malformed quote from erasing a destructive command from the conservative
-/// fallback below. Backslashes escape the next character outside single
-/// quotes; inside single quotes they are literal, matching shell quote rules.
+/// fallback below. It does, however, distinguish all three quoting kinds the
+/// shell has — see [`QuoteRun`]. Folding `$'…'` into `'…'` is not a harmless
+/// simplification: it makes an escaped apostrophe close the run early, so a
+/// balanced command reads as unbalanced and the fallback blocks prose the
+/// shell runs cleanly.
 fn has_unmatched_quote(command: &str) -> bool {
     let command = strip_comments(&strip_heredoc_bodies(command));
     ends_inside_quote(&command)
 }
 
+/// Which kind of quoted run the scan is inside.
+///
+/// Mirrors `core::shell`'s private `Quote`, variant for variant, because the
+/// three kinds close on different rules and collapsing any two of them is a
+/// boundary the shell does not have. Kept local rather than promoted into
+/// `core::shell`: that file is concurrently gaining helpers on a sibling
+/// branch, and one shared scan is worth its own change rather than a conflict
+/// resolved under time pressure. Consolidating the three quote-tracking
+/// implementations in this repo is tracked separately.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuoteRun {
+    /// `'…'` — fully literal; the first `'` closes (POSIX). A backslash inside
+    /// is an ordinary character.
+    Posix,
+    /// `$'…'` — bash ANSI-C; `\` escapes whatever follows, **including `'`**.
+    /// Treating this as [`QuoteRun::Posix`] made a well-formed
+    /// `$'it\'s dangerous'` read as unbalanced, so the conservative fallback
+    /// fired on prose bash runs cleanly.
+    AnsiC,
+    /// `"…"` — `\` escapes `"` and `\`; other backslashes stay literal.
+    Double,
+}
+
 /// The raw quote-state scan [`has_unmatched_quote`] runs on its narrowed view.
 fn ends_inside_quote(command: &str) -> bool {
-    let mut quote = None;
+    let mut quote: Option<QuoteRun> = None;
     let mut escaped = false;
+    // A `'` opens an ANSI-C run only when the shell just read a `$` outside
+    // any quoting; anywhere else it opens a POSIX run.
+    let mut dollar_pending = false;
     for ch in command.chars() {
         if escaped {
             escaped = false;
+            dollar_pending = false;
             continue;
         }
         match quote {
-            Some('\'') => {
+            Some(QuoteRun::Posix) => {
                 if ch == '\'' {
                     quote = None;
                 }
             }
-            Some('"') => {
+            Some(QuoteRun::AnsiC) => {
+                if ch == '\\' {
+                    escaped = true;
+                } else if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(QuoteRun::Double) => {
                 if ch == '\\' {
                     escaped = true;
                 } else if ch == '"' {
@@ -125,14 +162,18 @@ fn ends_inside_quote(command: &str) -> bool {
             }
             None => match ch {
                 '\\' => escaped = true,
-                '\'' | '"' => quote = Some(ch),
+                '\'' => {
+                    quote = Some(if dollar_pending {
+                        QuoteRun::AnsiC
+                    } else {
+                        QuoteRun::Posix
+                    });
+                }
+                '"' => quote = Some(QuoteRun::Double),
                 _ => {}
             },
-            // Only the two delimiters above are ever stored, but a guard that
-            // panics is a fail-OPEN in a harness that reads exit codes — so
-            // this arm returns rather than aborting the check.
-            Some(_) => {}
         }
+        dollar_pending = ch == '$' && quote.is_none();
     }
     quote.is_some()
 }
@@ -363,6 +404,60 @@ mod tests {
     fn quoted_repo_delete_prose_stays_allowed() {
         let result = GhDangerousGuard.run(&make_bash("echo \"gh repo delete is dangerous\""));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    /// A bash ANSI-C string escapes its own delimiter, so `$'it\'s'` is
+    /// balanced and bash runs it. Scanning it under POSIX single-quote rules
+    /// closed the run at the escaped apostrophe, left the real closing quote
+    /// opening a second unterminated run, and fired the conservative fallback
+    /// on prose — measured Allow on main and Block on this branch before the
+    /// scan learned the third quoting kind.
+    #[test]
+    fn ansi_c_escaped_quote_prose_stays_allowed() {
+        let result = GhDangerousGuard.run(&make_bash(
+            r"echo $'gh repo delete: it\'s dangerous, don\'t'",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    /// Prose entirely inside an ANSI-C run, with the operation named at the
+    /// start rather than mid-string, so the fix is pinned independently of
+    /// where the escaped apostrophes fall.
+    #[test]
+    fn ansi_c_escaped_quote_prose_allows_regardless_of_position() {
+        let result = GhDangerousGuard.run(&make_bash(
+            r"echo $'talk about gh repo delete here: don\'t'",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    /// An ANSI-C string earlier in the command must not buy an exemption for a
+    /// LATER segment that names the operation in bare, unquoted words.
+    ///
+    /// Worth pinning because this shape reads like a regression and is not one.
+    /// It measures Allow on `main` — but only because main's whole-command
+    /// quote collapse erased the second segment outright, which is the #509
+    /// defect this guard is being fixed for. The Block here is the fix working,
+    /// not the ANSI-C scan over-reaching: unquoted `gh repo delete` matches the
+    /// per-segment pass on its own, with no quoting involved at all.
+    #[test]
+    fn ansi_c_string_does_not_exempt_bare_words_in_a_later_segment() {
+        let result = GhDangerousGuard.run(&make_bash(
+            r"echo $'it\'s fine' && echo gh repo delete discussion",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    /// Control in the dangerous direction: an ANSI-C run must not become a
+    /// place to hide a real deletion. A genuinely unbalanced `$'` still fires
+    /// the fallback, and an ANSI-C string sitting beside a live `gh repo
+    /// delete` must still block.
+    #[test]
+    fn ansi_c_string_cannot_shelter_a_live_repo_delete() {
+        let result = GhDangerousGuard.run(&make_bash(
+            r"echo $'it\'s fine' && gh repo delete my-repo --yes",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
