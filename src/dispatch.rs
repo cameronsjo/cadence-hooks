@@ -267,10 +267,17 @@ struct Aggregated {
     /// Every judged target's outcome, in judge order. The denial row's
     /// per-decision tally is computed from this, never from the winner alone.
     outcomes: Vec<Outcome>,
-    /// Every DISTINCT bypass ridden across targets. Distinct rather than
-    /// per-target so the ledger keeps the volume cap that moved these writes out
-    /// of the loop: N targets riding one dismissal produce N identical
-    /// provenances and one row, while two different mechanisms still produce two.
+    /// Every DISTINCT bypass ridden across targets — one row per distinct
+    /// provenance, bounded by the dismissals the user has already armed and
+    /// never by patch size. Distinct rather than per-target so the ledger keeps
+    /// the volume cap that moved these writes out of the loop: N targets riding
+    /// one dismissal produce N identical provenances and one row.
+    ///
+    /// The bound is armed dismissals, not mechanisms — equality spans
+    /// `reason`/`expires_at`/`armed_by_session` too, so a patch touching N repos
+    /// that each carry their own armed snooze does yield N rows. Those are N
+    /// genuinely distinct events a per-target ledger would also have recorded,
+    /// and none of it is attacker-chosen the way target count was.
     bypasses: Vec<BypassProvenance>,
 }
 

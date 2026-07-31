@@ -1041,24 +1041,29 @@ fn judge_rm(
 /// the source half of `*** Update File: X` + `*** Move to: Y`, and for an
 /// `mcp__*move*`/`*rename*` call. A move empties `X` just as a delete does, so
 /// routing it here looks like the obvious completion. It is deliberately not
-/// routed, for two reasons that point the same way:
+/// routed. One reason carries it, and a second supports it:
 ///
-/// 1. **It would block this guard's own prescribed remedy.** Every block message
-///    this guard emits says *"To keep the file but get it out of the way, move it
-///    to the trash — guard-rm never fires on `mv`: • mv <target> ~/.Trash"*.
-///    Under Codex, `apply_patch` is the file primitive, so that remedy is spelled
-///    `*** Update File: ~/.ssh` + `*** Move to: ~/.Trash/ssh` — whose source is
-///    the very `HomeChild` path that blocked. Routing renames here would leave a
-///    Codex session with no non-bypass way to comply with the message it was just
-///    shown. `trash_guard` has the identical shape: its remedy is *"Move it into
+/// 1. **`mv` is out of scope on both harnesses, so this is an inherited scope
+///    limit, not a harness-introduced hole.** This is the load-bearing argument.
+///    `DELETE_VERBS` is `rm`/`unlink`/`shred`/`truncate`; Bash `mv ~/.ssh /tmp/x`
+///    is allowed today and always has been. A patch rename is allowed for the
+///    same reason and to the same degree, so the two harnesses agree — which is
+///    the property the delete route exists to restore. The C2 gap was different
+///    in kind: `rm` was guarded and its patch equivalent was not.
+/// 2. **It would sit awkwardly against this guard's own prescribed remedy.**
+///    Every block message this guard emits says *"To keep the file but get it out
+///    of the way, move it to the trash — guard-rm never fires on `mv`: • mv
+///    <target> ~/.Trash"*. Under Codex, `apply_patch` is the primary file
+///    primitive, so a session following that advice may well spell it
+///    `*** Update File: X` + `*** Move to: ~/.Trash/…` — whose source is the very
+///    path that blocked. Stated precisely, because the stronger version of this
+///    claim is false: a Codex session also has a shell, where `mv` is allowed, so
+///    routing renames here would not leave it with *no* way to comply — only with
+///    a remedy it cannot spell in the primitive it reaches for first. Note too
+///    that `apply_patch` operates on files, so the directory move in the pinning
+///    test is a unit test of the normalizer rather than a spelling seen in the
+///    wild. `trash_guard` has the identical shape: its remedy is *"Move it into
 ///    <vault>/.trash/"*, whose source is inside the vault.
-/// 2. **`mv` is out of scope on both harnesses, so this is an inherited scope
-///    limit, not a harness-introduced hole.** `DELETE_VERBS` is
-///    `rm`/`unlink`/`shred`/`truncate`; Bash `mv ~/.ssh /tmp/x` is allowed today
-///    and always has been. A patch rename is allowed for the same reason and to
-///    the same degree, so the two harnesses agree — which is the property the
-///    delete route exists to restore. The C2 gap was different in kind: `rm` was
-///    guarded and its patch equivalent was not.
 ///
 /// The distinction the guard is drawing is **irrecoverable removal** versus
 /// relocation. A move leaves the bytes on disk under a new name, which is why

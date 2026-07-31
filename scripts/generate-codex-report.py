@@ -168,9 +168,20 @@ def main() -> int:
         # everything the binary itself determines — statuses, evidence,
         # capabilities, the hook set — and exempt only the field CI cannot know.
         # The directory test says the input was absent; `_wiring_is_empty` says
-        # this run produced nothing for the field. Both must hold — otherwise the
-        # exemption is dropping a field that was in fact determined, and a
-        # hand-populated wiring array would ride through a green check.
+        # this run produced nothing for the field. Both must hold, so a RENDERED
+        # wiring array cannot ride through the exemption.
+        #
+        # Today the second test cannot fail when the first passes:
+        # plugin_wiring() globs the same directory the first test checks, so an
+        # absent sibling makes empty wiring a certainty. It is kept as a
+        # drift-guard — if those two path computations ever diverge (a refactor,
+        # a different glob root), the exemption stops applying instead of
+        # silently widening.
+        #
+        # What this does NOT buy: a hand-edited `wiring` in the CHECKED-IN report
+        # still passes on CI, because CI has no sibling to compare it against.
+        # That gap is structural — the plugin repo is private — and the success
+        # message says so rather than implying the field was verified.
         if (
             not (args.workspace.resolve() / "cadence" / "plugins").is_dir()
             and _wiring_is_empty(rendered)

@@ -817,7 +817,7 @@
         {
           "plugin": "cadence-guardrails",
           "event": "PreToolUse",
-          "matcher": "Edit|mcp__.*(delete|remove|move|rename).*",
+          "matcher": "^Edit$|mcp__.*(delete|remove|move|rename).*",
           "if": null,
           "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
         }

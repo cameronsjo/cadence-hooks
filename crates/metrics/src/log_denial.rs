@@ -152,10 +152,13 @@ fn strictest(outcomes: &[Outcome]) -> Outcome {
         .fold(Outcome::Allow, |merged, other| merged.merge(*other))
 }
 
-/// `{"deny": 1, "nudge": 11}` — one count per loggable decision, emitted in the
-/// fixed order `deny`/`ask`/`nudge` so rows stay diffable. Pure, and separate
-/// from the record builder so the tally rule is testable without a timestamp or
-/// a repo probe.
+/// `{"deny": 1, "nudge": 11}` — one count per loggable decision, in a stable
+/// order so rows stay diffable. The insertion order below is `deny`/`ask`/
+/// `nudge`, but that is not what lands: serde_json is built here without
+/// `preserve_order`, so `Map` is a `BTreeMap` and the emitted keys are
+/// alphabetical. Stability is what the diffability claim needs, and a
+/// `BTreeMap` supplies it. Pure, and separate from the record builder so the
+/// tally rule is testable without a timestamp or a repo probe.
 fn decision_tally(outcomes: &[Outcome], nudges_on: bool) -> Value {
     let mut tally = serde_json::Map::new();
     for kind in ["deny", "ask", "nudge"] {
