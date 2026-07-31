@@ -30,12 +30,28 @@ use std::io::Write;
 ///
 /// `hook` is the canonical registry name threaded from the binary (e.g.
 /// `terminology`, not the `Check::name()` value `terminology-guard`).
-pub fn log_denial(hook: &str, event: HookEvent, input: &HookInput, outcome: Outcome) {
+///
+/// `targets` is how many normalized targets the invocation judged — 1 for an
+/// ordinary tool call, N for a Codex `apply_patch` carrying N file operations.
+/// **Exactly one row is written per hook invocation regardless of N.** Writing
+/// per target made ledger volume proportional to an attacker-chosen patch body:
+/// one `apply_patch` with N operations wrote up to N rows per security-critical
+/// hook, into a file with no size cap, and distorted every rate computed off
+/// denial counts (nudge-fire rates are the denominator for every adherence
+/// measurement). The count is carried as a field instead, so the fan-out is still
+/// visible without being amplified.
+pub fn log_denial(
+    hook: &str,
+    event: HookEvent,
+    input: &HookInput,
+    outcome: Outcome,
+    targets: usize,
+) {
     let Some(decision) = decision_for(outcome, nudges_enabled()) else {
         return;
     };
 
-    let record = build_denial_record(hook, event, input, decision);
+    let record = build_denial_record(hook, event, input, decision, targets);
 
     let dir = common::metrics_dir();
     if std::fs::create_dir_all(&dir).is_err() {
@@ -96,7 +112,13 @@ fn decision_for(outcome: Outcome, nudges_on: bool) -> Option<&'static str> {
 /// [`common::repo_basename`]. Reads only non-sensitive context off the input
 /// (tool name, session id, agent id, cwd→repo) — never the command, file path,
 /// or edited content.
-fn build_denial_record(hook: &str, event: HookEvent, input: &HookInput, decision: &str) -> Value {
+fn build_denial_record(
+    hook: &str,
+    event: HookEvent,
+    input: &HookInput,
+    decision: &str,
+    targets: usize,
+) -> Value {
     json!({
         "ts": common::utc_timestamp(),
         "hook": hook,
@@ -106,6 +128,9 @@ fn build_denial_record(hook: &str, event: HookEvent, input: &HookInput, decision
         "repo": common::repo_basename(input.cwd.as_deref()),
         "sessionId": input.session_id(),
         "agentId": input.agent_id(),
+        // How many normalized targets one invocation judged. A path count, never
+        // a path: it says how wide the operation was, not what it touched.
+        "targets": targets,
     })
 }
 
@@ -166,7 +191,13 @@ mod tests {
 
     #[test]
     fn record_has_expected_fields() {
-        let rec = build_denial_record("terminology", HookEvent::PreToolUse, &edit_input(), "deny");
+        let rec = build_denial_record(
+            "terminology",
+            HookEvent::PreToolUse,
+            &edit_input(),
+            "deny",
+            1,
+        );
         assert_eq!(rec["hook"], "terminology");
         assert_eq!(rec["event"], "PreToolUse");
         assert_eq!(rec["decision"], "deny");
@@ -181,7 +212,13 @@ mod tests {
     fn record_omits_sensitive_keys() {
         // Privacy by construction: the record must never carry command content,
         // file paths, or edited text — only which guard fired on which tool.
-        let rec = build_denial_record("git-safety", HookEvent::PreToolUse, &edit_input(), "deny");
+        let rec = build_denial_record(
+            "git-safety",
+            HookEvent::PreToolUse,
+            &edit_input(),
+            "deny",
+            1,
+        );
         let obj = rec.as_object().expect("record is an object");
         for forbidden in ["command", "file_path", "filePath", "content", "new_string"] {
             assert!(
@@ -213,7 +250,13 @@ mod tests {
             session_id: Some("s".into()),
             ..Default::default()
         };
-        let rec = build_denial_record("guard-push-remote", HookEvent::PreToolUse, &input, "deny");
+        let rec = build_denial_record(
+            "guard-push-remote",
+            HookEvent::PreToolUse,
+            &input,
+            "deny",
+            1,
+        );
         assert!(rec["agentId"].is_null());
     }
 
@@ -263,12 +306,49 @@ mod tests {
                 HookEvent::PreToolUse,
                 &edit_input(),
                 Outcome::Block,
+                1,
             );
         });
         let rows = read_lines(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["decision"], "deny");
         assert_eq!(rows[0]["hook"], "terminology");
+    }
+
+    /// The row carries the fan-out as a count, so a wide operation is still
+    /// visible in the ledger without being amplified into it.
+    #[test]
+    fn record_carries_the_target_count() {
+        let rec = build_denial_record(
+            "prevent-secret-writes",
+            HookEvent::PreToolUse,
+            &edit_input(),
+            "deny",
+            37,
+        );
+        assert_eq!(rec["targets"], 37);
+        // A count, not a path list — the privacy contract is unchanged.
+        assert!(rec["targets"].is_number());
+    }
+
+    /// One invocation writes exactly one row however many targets it judged.
+    /// The per-target write this replaces made ledger volume proportional to an
+    /// attacker-chosen patch body, into a file with no size cap.
+    #[test]
+    fn a_wide_invocation_still_writes_exactly_one_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_metrics_dir(tmp.path(), None, || {
+            log_denial(
+                "prevent-secret-writes",
+                HookEvent::PreToolUse,
+                &edit_input(),
+                Outcome::Block,
+                500,
+            );
+        });
+        let rows = read_lines(tmp.path());
+        assert_eq!(rows.len(), 1, "500 targets must not write 500 rows");
+        assert_eq!(rows[0]["targets"], 500);
     }
 
     #[test]
@@ -280,6 +360,7 @@ mod tests {
                 HookEvent::PreToolUse,
                 &edit_input(),
                 Outcome::Allow,
+                1,
             );
         });
         assert!(
@@ -299,6 +380,7 @@ mod tests {
                 HookEvent::PreToolUse,
                 &edit_input(),
                 Outcome::Nudge,
+                1,
             );
         });
         let rows = read_lines(tmp.path());
@@ -317,6 +399,7 @@ mod tests {
                 HookEvent::PreToolUse,
                 &edit_input(),
                 Outcome::Nudge,
+                1,
             );
         });
         assert_eq!(read_lines(tmp.path()).len(), 2);
@@ -332,6 +415,7 @@ mod tests {
                     HookEvent::PreToolUse,
                     &edit_input(),
                     Outcome::Nudge,
+                    1,
                 );
             });
         }
@@ -346,6 +430,7 @@ mod tests {
                 HookEvent::PreToolUse,
                 &edit_input(),
                 Outcome::Block,
+                1,
             );
         });
         let rows = read_lines(tmp.path());

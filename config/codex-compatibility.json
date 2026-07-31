@@ -12,13 +12,13 @@
     "memory-guard": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
     "terminology": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
     "orphaned-todos": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
-    "prevent-secret-writes": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "prevent-secret-writes": {"status": "adapted", "evidence": "tests/codex_coverage.rs::patch_add_file_carrying_a_secret_is_blocked"},
     "env-vars": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
     "line-endings": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
     "markdown-lint": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
     "warn-main-branch": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
-    "guard-dotfiles": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
-    "enforce-worktree": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "guard-dotfiles": {"status": "adapted", "evidence": "tests/codex_coverage.rs::patch_target_reaches_guard_dotfiles"},
+    "enforce-worktree": {"status": "adapted", "evidence": "crates/core/src/lib.rs::codex_patch_expands_every_target_and_rename_destination"},
     "warn-subagent-worktree": {"status": "adapted", "evidence": "crates/core/src/lib.rs"},
     "warn-subagent-concurrency": {"status": "adapted", "evidence": "crates/core/src/lib.rs"},
     "guard-rm": {"status": "adapted", "evidence": "crates/guardrails/src/guard_rm.rs::patch_delete_of_a_protected_path_blocks"},
@@ -83,13 +83,13 @@
       "id": "nested-function-calls",
       "status": "adapted",
       "criticality": "security-critical",
-      "evidence": "Codex local function tools traverse the common PreToolUse path"
+      "evidence": "tests/codex_coverage.rs::codex_local_function_call_reaches_a_security_critical_guard"
     },
     {
       "id": "apply-patch",
       "status": "adapted",
       "criticality": "security-critical",
-      "evidence": "crates/core/src/patch.rs"
+      "evidence": "crates/core/src/patch.rs::parses_create_update_delete_rename_and_multi_file"
     },
     {
       "id": "mcp-functions",
@@ -140,7 +140,7 @@
       "id": "ask-outcomes",
       "status": "adapted",
       "criticality": "security-critical",
-      "evidence": "crates/core/src/lib.rs::emit_and_exit converts Codex Ask to block"
+      "evidence": "tests/codex_coverage.rs::codex_ask_outcome_converts_to_a_block"
     },
     {
       "id": "filesystem-sandbox",

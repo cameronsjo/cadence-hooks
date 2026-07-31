@@ -28,13 +28,13 @@
       "id": "nested-function-calls",
       "status": "adapted",
       "criticality": "security-critical",
-      "evidence": "Codex local function tools traverse the common PreToolUse path"
+      "evidence": "tests/codex_coverage.rs::codex_local_function_call_reaches_a_security_critical_guard"
     },
     {
       "id": "apply-patch",
       "status": "adapted",
       "criticality": "security-critical",
-      "evidence": "crates/core/src/patch.rs"
+      "evidence": "crates/core/src/patch.rs::parses_create_update_delete_rename_and_multi_file"
     },
     {
       "id": "mcp-functions",
@@ -85,7 +85,7 @@
       "id": "ask-outcomes",
       "status": "adapted",
       "criticality": "security-critical",
-      "evidence": "crates/core/src/lib.rs::emit_and_exit converts Codex Ask to block"
+      "evidence": "tests/codex_coverage.rs::codex_ask_outcome_converts_to_a_block"
     },
     {
       "id": "filesystem-sandbox",
@@ -171,7 +171,7 @@
       "protected": true,
       "status": "adapted",
       "applicable": true,
-      "evidence": "crates/core/src/patch.rs",
+      "evidence": "tests/codex_coverage.rs::patch_add_file_carrying_a_secret_is_blocked",
       "wiring": [
         {
           "plugin": "cadence",
@@ -603,7 +603,7 @@
       "protected": false,
       "status": "adapted",
       "applicable": true,
-      "evidence": "crates/core/src/patch.rs",
+      "evidence": "crates/core/src/lib.rs::codex_patch_expands_every_target_and_rename_destination",
       "wiring": [
         {
           "plugin": "cadence-guardrails",
@@ -757,7 +757,7 @@
       "protected": true,
       "status": "adapted",
       "applicable": true,
-      "evidence": "crates/core/src/patch.rs",
+      "evidence": "tests/codex_coverage.rs::patch_target_reaches_guard_dotfiles",
       "wiring": [
         {
           "plugin": "cadence-guardrails",

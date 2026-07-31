@@ -185,12 +185,6 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                 let Some(result) = decide_check(check, target) else {
                     continue;
                 };
-                cadence_hooks_metrics::log_denial(hook_name, event, target, result.outcome);
-                if let Some(prov) = &result.bypass {
-                    cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::used(
-                        hook_name, target, prov,
-                    ));
-                }
                 results.push(result);
             }
             aggregate_results(results)
@@ -223,6 +217,25 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
         // Effort-skipped → silent Allow, nothing to record.
         None => process::exit(Outcome::Allow.code()),
         Some(result) => {
+            // The audit writes take the AGGREGATED outcome, once per hook
+            // invocation, against the payload the harness actually sent. Writing
+            // them inside the per-target loop above made ledger volume
+            // proportional to the patch body — one `apply_patch` with N
+            // operations wrote up to N rows per security-critical hook into an
+            // uncapped `denials.jsonl`, and skewed every rate computed off
+            // denial counts. The fan-out is carried as a `targets` count instead.
+            cadence_hooks_metrics::log_denial(
+                hook_name,
+                event,
+                &input,
+                result.outcome,
+                normalized_inputs.len(),
+            );
+            if let Some(prov) = &result.bypass {
+                cadence_hooks_metrics::log_bypass(cadence_hooks_metrics::BypassEvent::used(
+                    hook_name, &input, prov,
+                ));
+            }
             // A Block/Ask outcome stopped the operation, so a timed-out probe
             // did not degrade to fail-open — don't emit the plain deadline row
             // (Allow/Nudge let the tool proceed, so those still do).
