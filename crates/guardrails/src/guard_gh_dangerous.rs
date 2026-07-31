@@ -9,7 +9,8 @@
 //! you own, because there is no undo.
 
 use cadence_hooks_core::shell::{
-    command_segments, contains_ignoring_ascii_case, fold_verb, strip_quotes, tokenize,
+    command_segments, command_word, contains_ignoring_ascii_case, fold_verb, heredoc_introducers,
+    logical_lines, strip_comments, strip_heredoc_bodies, strip_quotes, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -18,13 +19,58 @@ use std::sync::LazyLock;
 static GH_REPO_DELETE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?i:gh)\s+repo\s+delete\b").expect("pattern should compile"));
 
-static EXEC_WRAPPER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(?i:bash|sh|zsh)\s+-c\b").expect("pattern should compile"));
+/// The shells this guard recognizes by name — **the single inventory**, shared
+/// by [`EXEC_WRAPPER`] and [`SHELL_CONSUMERS`] so the two passes cannot drift.
+/// They previously disagreed (`bash|sh|zsh` beside a seven-name list) with
+/// nothing explaining why, and the shorter list was the accidental one:
+/// `csh <<EOF` and `fish -c` execute a script just as `bash` does.
+const SHELLS: [&str; 9] = [
+    "bash", "sh", "zsh", "dash", "ksh", "ash", "csh", "tcsh", "fish",
+];
 
-/// Command words that read a script from stdin. A heredoc fed to one of these
-/// is the *program*, not data — the distinction [`has_shell_fed_heredoc`] turns
-/// on.
-const SHELL_CONSUMERS: [&str; 7] = ["bash", "sh", "zsh", "dash", "ksh", "source", "."];
+/// Builtins that read a script from stdin without being a shell themselves.
+/// They belong in [`SHELL_CONSUMERS`] but NOT in [`EXEC_WRAPPER`] — that is the
+/// one real asymmetry between the two passes, and it is a fact about the
+/// commands: `source` and `.` take a file operand, never `-c`.
+const STDIN_SOURCE_BUILTINS: [&str; 2] = ["source", "."];
+
+/// `<shell> -c` in any recognized spelling. Matched against quote-stripped
+/// text by the coarse wrapper pass.
+static EXEC_WRAPPER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"\b(?i:{})\s+-c\b", SHELLS.join("|"))).expect("pattern should compile")
+});
+
+/// True when `word` names a command that executes whatever it reads on stdin.
+/// A heredoc fed to one of these is the *program*, not data — the distinction
+/// [`has_shell_fed_heredoc`] turns on.
+fn is_shell_consumer(word: &str) -> bool {
+    // Path-qualified and case-folded via the shared primitive, so
+    // `/bin/bash` and `BASH` resolve like a bare `bash` (#488).
+    let resolved = command_word(word);
+    SHELLS.contains(&resolved.as_ref()) || STDIN_SOURCE_BUILTINS.contains(&resolved.as_ref())
+}
+
+/// True when `word` is a bare variable expansion (`$SHELL`, `${SHELL}`) — a
+/// command word whose value this guard cannot know.
+///
+/// `$SHELL <<EOF` is a portable idiom, not obfuscation, so an unresolvable name
+/// counts as a shell rather than as a non-shell. The direction is fail-CLOSED
+/// and the cost is bounded: the arm this feeds also requires the raw text to
+/// name `gh repo delete`. A word that merely CONTAINS an expansion
+/// (`$HOME/notes.md`) is not one — that is a path operand, and treating it as
+/// unknowable would block ordinary `cat <<EOF > $HOME/notes.md` writes.
+fn is_opaque_command_word(word: &str) -> bool {
+    let inner = match word.strip_prefix("${").and_then(|w| w.strip_suffix('}')) {
+        Some(inner) => inner,
+        None => match word.strip_prefix('$') {
+            Some(inner) => inner,
+            None => return false,
+        },
+    };
+    !inner.is_empty()
+        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !inner.starts_with(|c: char| c.is_ascii_digit())
+}
 
 /// Matches an API path at EXACTLY owner/repo depth: `repos/<owner>/<repo>`,
 /// with an optional leading or trailing slash. Sub-resource paths
@@ -33,13 +79,30 @@ const SHELL_CONSUMERS: [&str; 7] = ["bash", "sh", "zsh", "dash", "ksh", "source"
 static API_REPO_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/?repos/[^/]+/[^/]+/?$").expect("pattern should compile"));
 
-/// True when a shell command ends inside a single- or double-quoted run.
+/// True when a shell command ends inside a single- or double-quoted run **in a
+/// position the shell parses as quoting**.
 ///
-/// This is deliberately narrower than tokenization: it exists only to keep a
+/// Heredoc bodies and comments are removed first, because an apostrophe there
+/// is ordinary text. Scanning the raw command instead blocked three shapes bash
+/// runs cleanly — a `Don't` inside a `<<'EOF'` body, an `it's` inside an
+/// expanding body, and a `don't` in a trailing comment — each of which is
+/// plausible while documenting a `gh repo delete` procedure
+/// (cadence-hooks#543).
+///
+/// What survives that narrowing is genuinely unbalanced shell syntax. Such a
+/// command is not executable as written, so failing closed on it costs nothing.
+///
+/// Deliberately narrower than tokenization otherwise: it exists only to keep a
 /// malformed quote from erasing a destructive command from the conservative
 /// fallback below. Backslashes escape the next character outside single
 /// quotes; inside single quotes they are literal, matching shell quote rules.
 fn has_unmatched_quote(command: &str) -> bool {
+    let command = strip_comments(&strip_heredoc_bodies(command));
+    ends_inside_quote(&command)
+}
+
+/// The raw quote-state scan [`has_unmatched_quote`] runs on its narrowed view.
+fn ends_inside_quote(command: &str) -> bool {
     let mut quote = None;
     let mut escaped = false;
     for ch in command.chars() {
@@ -84,75 +147,59 @@ fn has_unmatched_quote(command: &str) -> bool {
 /// see the script; this predicate re-arms the conservative fallback for the
 /// executable case only.
 ///
-/// Like the rest of this file's fallback machinery, it is a **raw-string scan,
-/// not a shell parse**: a shell name on a body line that itself looks like an
-/// introducer counts. That direction is fail-CLOSED, and the arm it gates also
-/// requires the raw text to name `gh repo delete`, so the cost of a miscall is
-/// one blocked command naming an irreversible operation.
+/// It is a **name scan over the introducing line, not an execution model**: any
+/// shell named anywhere on that line counts, because a heredoc can be piped to
+/// one (`cat <<EOF | bash`) as readily as fed to one directly. That direction is
+/// fail-CLOSED, and the arm it gates also requires the raw text to name
+/// `gh repo delete`, so the cost of a miscall is one blocked command naming an
+/// irreversible operation.
+///
+/// **Built on the shared `core::shell` primitives, deliberately.** The first
+/// version of this predicate hand-rolled its own line joining, introducer
+/// detection and word splitting, and each of the three grew a soft edge that
+/// let a shell-fed heredoc through — `bash<<EOF`, `bash <\` ⏎ `<EOF`, and
+/// `$SHELL <<EOF` were all missed (cadence-hooks#543). The parsing now comes
+/// from the same functions the segmenter uses, so the two cannot disagree.
 fn has_shell_fed_heredoc(command: &str) -> bool {
-    // The shell joins backslash-newline continuations before it reads a
-    // heredoc introducer, so `bash \` + newline + `<<EOF` is one logical line.
-    let joined = command.replace("\\\n", " ");
-    joined
-        .lines()
-        .any(|line| introduces_heredoc(line) && invokes_shell(line))
+    logical_lines(command)
+        .iter()
+        .any(|line| line_feeds_a_shell(line))
 }
 
-/// True when `line` carries a heredoc introducer (`<<WORD`, `<<-WORD`,
-/// `<<'WORD'`) outside quotes. `<<<` is a here-string, not a heredoc, and a
-/// `<<` inside quotes is literal text.
-fn introduces_heredoc(line: &str) -> bool {
-    let chars: Vec<char> = line.chars().collect();
-    let mut quote: Option<char> = None;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None if c == '\'' || c == '"' => quote = Some(c),
-            None if c == '<' && chars.get(i + 1) == Some(&'<') => {
-                if chars.get(i + 2) == Some(&'<') {
-                    i += 3;
-                    continue;
-                }
-                return true;
-            }
-            None => {}
-        }
-        i += 1;
+/// True when one logical line both introduces a heredoc and names a shell
+/// outside the introducer.
+fn line_feeds_a_shell(line: &str) -> bool {
+    // A commented-out introducer introduces nothing, and a shell named inside
+    // a comment consumes nothing: `cat <<EOF # run under bash` is one `cat`.
+    let line = strip_comments(line);
+    let introducers = heredoc_introducers(&line);
+    if introducers.is_empty() {
+        return false;
     }
-    false
-}
-
-/// True when `line` names a shell as a command word. Quoted runs are masked
-/// first: a shell name that appears only inside quotes is an argument or
-/// prose, not the heredoc's consumer.
-fn invokes_shell(line: &str) -> bool {
-    let mut masked = String::with_capacity(line.len());
-    let mut quote: Option<char> = None;
-    for ch in line.chars() {
-        match quote {
-            Some(q) => {
-                if ch == q {
-                    quote = None;
-                }
-                masked.push(' ');
-            }
-            None if ch == '\'' || ch == '"' => {
-                quote = Some(ch);
-                masked.push(' ');
-            }
-            None => masked.push(ch),
-        }
+    // Blank the introducer constructs before reading command words. The
+    // delimiter word is a terminator, not a command — `cat <<bash` names no
+    // shell — and a command word glued to the operator only separates once the
+    // operator is gone (`bash<<EOF`).
+    let mut masked: String = line.clone();
+    for introducer in introducers {
+        masked.replace_range(
+            introducer.start..introducer.end,
+            &" ".repeat(introducer.end - introducer.start),
+        );
     }
-    masked.split_whitespace().any(|word| {
-        let base = word.rsplit('/').next().unwrap_or(word);
-        SHELL_CONSUMERS.contains(&fold_verb(base).as_ref())
-    })
+    // `strip_quotes` DROPS quoted runs, the same masking Pass 1 and Pass 2 in
+    // this file rely on: a shell name that appears only inside quotes is prose
+    // or an argument, so `grep 'bash' <<EOF` names no consumer. Splitting on
+    // shell metacharacters as well as whitespace is what makes `{ bash; }` and
+    // `cat <<EOF | bash` yield the word `bash`.
+    //
+    // Braces are NOT separators: bash requires a blank after `{` and a
+    // terminator before `}`, so `;` and whitespace already cut a group open,
+    // while splitting on `{`/`}` would shred `${SHELL}` into `$` and `SHELL`
+    // and lose the one shape [`is_opaque_command_word`] exists to catch.
+    strip_quotes(&masked)
+        .split(|c: char| c.is_whitespace() || ";&|<>()`".contains(c))
+        .any(|word| !word.is_empty() && (is_shell_consumer(word) || is_opaque_command_word(word)))
 }
 
 /// True when `tokens` carry an HTTP DELETE method flag in any Cobra spelling:
@@ -238,9 +285,11 @@ impl Check for GhDangerousGuard {
 
         // Conservative fallback for the two ways the segmenter can drop text
         // the shell would still execute:
-        //   * an unmatched quote keeps it from exposing later operators — such
-        //     a command is not executable as written, so failing closed costs
-        //     nothing;
+        //   * an unmatched quote keeps it from exposing later operators —
+        //     measured over a view with comments and heredoc bodies removed,
+        //     since an apostrophe in either is literal text in a command bash
+        //     runs cleanly (#543); what is left is unbalanced syntax the shell
+        //     refuses, so failing closed costs nothing;
         //   * a heredoc fed to a shell is a script, not the data that
         //     heredoc-stripping exists to discard.
         // Both arms additionally require the raw text to name the exact
@@ -683,9 +732,164 @@ mod tests {
             "cat <<EOF\ngh repo delete o/r --yes\nEOF",
             "cat > notes.md <<'EOF'\nnever gh repo delete anything\nEOF",
             "tee notes.md <<EOF\ngh repo delete o/r --yes\nEOF",
+            // Glued and continuation-spliced spellings of the same DATA
+            // heredocs — the fix for the shell-fed cases must not drag these
+            // in with them.
+            "cat<<EOF\ngh repo delete o/r --yes\nEOF",
+            "cat <\\\n<EOF\ngh repo delete o/r --yes\nEOF",
+            "wc -l <<EOF\ngh repo delete o/r --yes\nEOF",
+            // A redirect target naming a variable is a path operand, not an
+            // unresolvable command word.
+            "cat <<EOF > $HOME/notes.md\ngh repo delete o/r --yes\nEOF",
         ] {
             assert_eq!(outcome(cmd), cadence_hooks_core::Outcome::Allow, "{cmd}");
         }
+    }
+
+    // --- cadence-hooks#543: the three soft edges of the first
+    // `has_shell_fed_heredoc`, each measured Block-on-main → Allow-on-branch and
+    // each confirmed to invoke `gh repo delete` under real bash with a logging
+    // `gh` stub before it was fixed.
+
+    #[test]
+    fn shell_name_glued_to_heredoc_introducer_blocked() {
+        // A whitespace scan never saw `bash<<EOF` as the word `bash`. Nothing
+        // about that spelling is obfuscation — `cat<<EOF` is ordinary shell.
+        for cmd in [
+            "bash<<EOF\ngh repo delete o/r --yes\nEOF",
+            "sh<<EOF\ngh repo delete o/r --yes\nEOF",
+            "bash<<-EOF\n\tgh repo delete o/r --yes\nEOF",
+            "/bin/bash<<EOF\ngh repo delete o/r --yes\nEOF",
+            "{ bash; } <<EOF\ngh repo delete o/r --yes\nEOF",
+        ] {
+            assert_eq!(outcome(cmd), cadence_hooks_core::Outcome::Block, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn continuation_spliced_shell_fed_heredoc_blocked() {
+        // The shell REMOVES both characters of a backslash-newline. Joining
+        // with a space instead read `<` + `<` as `< <` and split a command word
+        // in half; `logical_lines` joins the way the shell does.
+        for cmd in [
+            "bash <\\\n<EOF\ngh repo delete o/r --yes\nEOF",
+            "sh <\\\n<EOF\ngh repo delete o/r --yes\nEOF",
+            "bash <\\\n<-EOF\n\tgh repo delete o/r --yes\nEOF",
+            "bas\\\nh <<EOF\ngh repo delete o/r --yes\nEOF",
+            "b\\\nash <<EOF\ngh repo delete o/r --yes\nEOF",
+            "s\\\nh <<EOF\ngh repo delete o/r --yes\nEOF",
+            // The shape the original comment was written for, which blocked
+            // either way — kept so a future join change cannot quietly drop it.
+            "bash \\\n<<EOF\ngh repo delete o/r --yes\nEOF",
+        ] {
+            assert_eq!(outcome(cmd), cadence_hooks_core::Outcome::Block, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn shell_missing_from_inventory_or_named_by_variable_blocked() {
+        // `$SHELL <<EOF` is a portable idiom, and the csh family executes a
+        // script exactly as bash does. The inventory omitted both.
+        for cmd in [
+            "csh <<EOF\ngh repo delete o/r --yes\nEOF",
+            "tcsh <<EOF\ngh repo delete o/r --yes\nEOF",
+            "/bin/csh <<EOF\ngh repo delete o/r --yes\nEOF",
+            "fish <<EOF\ngh repo delete o/r --yes\nEOF",
+            "ash <<EOF\ngh repo delete o/r --yes\nEOF",
+            "$SHELL <<EOF\ngh repo delete o/r --yes\nEOF",
+            "${SHELL} <<EOF\ngh repo delete o/r --yes\nEOF",
+        ] {
+            assert_eq!(outcome(cmd), cadence_hooks_core::Outcome::Block, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn bare_dot_operand_is_a_known_false_block() {
+        // `.` is the source builtin AND an ordinary path operand, and this
+        // predicate reads command words positionally-blind on purpose (a
+        // heredoc can be piped to a consumer anywhere on the line). So
+        // `docker build -f - .` reads as naming a source builtin. Blocked on
+        // main and on this branch alike — recorded so the disposition is
+        // visible rather than implied, since the cost is one blocked command
+        // that names an irreversible operation in its own text.
+        assert_eq!(
+            outcome("docker build -f - . <<EOF\ngh repo delete o/r --yes\nEOF"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn heredoc_piped_to_a_shell_blocked() {
+        // The consumer need not be the command the heredoc is attached to:
+        // `cat` reads the body and the pipe hands it to bash, which runs it.
+        assert_eq!(
+            outcome("cat <<EOF | bash\ngh repo delete o/r --yes\nEOF"),
+            cadence_hooks_core::Outcome::Block
+        );
+    }
+
+    #[test]
+    fn exec_wrapper_covers_the_same_shell_inventory() {
+        // `EXEC_WRAPPER` and `SHELL_CONSUMERS` are now derived from one list.
+        // They previously disagreed (`bash|sh|zsh` beside a seven-name array)
+        // with nothing explaining why, and these executed unblocked.
+        for shell in ["dash", "ksh", "ash", "csh", "tcsh", "fish"] {
+            let cmd = format!("{shell} -c 'gh repo delete o/r --yes'");
+            assert_eq!(outcome(&cmd), cadence_hooks_core::Outcome::Block, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn heredoc_delimiter_word_is_not_a_consumer() {
+        // The terminator is a word the shell matches against, never a command.
+        // Both spellings write data through `cat`.
+        for cmd in [
+            "cat <<bash\ngh repo delete o/r --yes\nbash",
+            "cat << bash\ngh repo delete o/r --yes\nbash",
+        ] {
+            assert_eq!(outcome(cmd), cadence_hooks_core::Outcome::Allow, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn shell_named_only_in_quotes_or_a_comment_is_not_a_consumer() {
+        // A shell name that is an argument, a pattern, or comment text consumes
+        // nothing — the over-block side of the predicate.
+        for cmd in [
+            "grep 'bash' <<EOF\ngh repo delete o/r --yes\nEOF",
+            "sed 's/bash//' <<EOF\ngh repo delete o/r --yes\nEOF",
+            "cat <<EOF # run under bash\ngh repo delete o/r --yes\nEOF",
+        ] {
+            assert_eq!(outcome(cmd), cadence_hooks_core::Outcome::Allow, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn apostrophe_a_shell_reads_as_literal_text_does_not_fail_closed() {
+        // cadence-hooks#543: the unmatched-quote arm's stated justification —
+        // "not executable as written, so failing closed costs nothing" — was
+        // false for an apostrophe inside a heredoc body or a comment. Bash runs
+        // all three cleanly and deletes nothing, and documenting a
+        // `gh repo delete` procedure this way is plausible work in this repo.
+        for cmd in [
+            "cat > README.md <<'EOF'\nDon't run gh repo delete\nEOF",
+            "cat <<EOF\nit's risky: gh repo delete\nEOF",
+            "echo ok # don't gh repo delete",
+        ] {
+            assert_eq!(outcome(cmd), cadence_hooks_core::Outcome::Allow, "{cmd}");
+        }
+        // The narrowing must not reach the arm's actual target: an apostrophe
+        // in COMMAND text is still unbalanced syntax hiding a real delete.
+        assert_eq!(
+            outcome("echo it's && gh repo delete my-repo --yes"),
+            cadence_hooks_core::Outcome::Block
+        );
+        // Nor the heredoc arm sitting beside it: a shell is reading this body,
+        // so the quoted prose inside it is a script line, not documentation.
+        assert_eq!(
+            outcome("bash <<EOF\necho \"gh repo delete is dangerous\"\nEOF"),
+            cadence_hooks_core::Outcome::Block
+        );
     }
 
     #[test]
