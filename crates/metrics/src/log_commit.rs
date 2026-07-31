@@ -6,9 +6,8 @@
 
 use crate::common;
 use crate::compute_cost::compute_cost_by_model;
-use crate::model_breakdown::{by_model_json, unpriced_models};
 use crate::prices::Prices;
-use crate::scan_tokens::{ScanResult, scan_tokens};
+use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -78,12 +77,24 @@ impl Logger for LogCommit {
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
         };
-        let Some(scan) = scan_tokens(&transcript, last_message_id.as_deref()) else {
-            return; // nothing new since the marker — skip rather than overcount
-        };
+        let usage =
+            match scan_transcript(&transcript, last_message_id.as_deref(), common::harness()) {
+                TranscriptScan::Usage(usage) => usage,
+                TranscriptScan::Diagnostic(diagnostic) => {
+                    common::append_transcript_diagnostic(
+                        diagnostic.harness,
+                        diagnostic.source_format,
+                        diagnostic.code,
+                        "commits",
+                    );
+                    return;
+                }
+                TranscriptScan::Empty => return,
+            };
 
         let prices = Prices::load(self.prices_path.as_deref());
-        let cost = compute_cost_by_model(&scan.by_model, &prices);
+        let cost = (usage.harness == "claude")
+            .then(|| compute_cost_by_model(&usage.scan.by_model, &prices));
 
         let since_marker = last_message_id.as_deref().unwrap_or("session-start");
         let branch = common::branch(input.cwd.as_deref());
@@ -96,7 +107,7 @@ impl Logger for LogCommit {
             &sha_after,
             &branch,
             &repo,
-            &scan,
+            &usage,
             cost,
             since_marker,
             &prices,
@@ -142,19 +153,22 @@ fn build_commit_record(
     sha_after: &str,
     branch: &str,
     repo: &str,
-    scan: &ScanResult,
-    cost: f64,
+    usage: &UsageScan,
+    cost: Option<f64>,
     since_marker: &str,
     prices: &Prices,
 ) -> Value {
     // Per-model breakdown + unpriced-model flags, shared verbatim with
     // `log_session` so the two loggers' shapes cannot drift (see
     // `crate::model_breakdown`).
-    let by_model = by_model_json(&scan.by_model, prices);
-    let unpriced = unpriced_models(&scan.by_model, prices);
+    let scan = &usage.scan;
+    let (by_model, unpriced) = usage.priced_breakdown(prices);
 
-    json!({
+    let mut record = json!({
+        "schemaVersion": common::TOKEN_RECORD_SCHEMA_VERSION,
         "ts": ts,
+        "harness": usage.harness,
+        "sourceFormat": usage.source_format,
         "sessionId": input.session_id,
         "transcriptPath": input.transcript_path,
         "commitHashBefore": sha_before,
@@ -167,8 +181,9 @@ fn build_commit_record(
             "cacheCreate": scan.tokens.cache_create,
             "cacheRead": scan.tokens.cache_read,
             "output": scan.tokens.output,
+            "reasoningOutput": usage.reasoning_output,
+            "total": usage.total_tokens,
         },
-        "costUsd": cost,
         "byModel": by_model,
         "unpricedModels": unpriced,
         "messagesScanned": scan.messages_scanned,
@@ -178,14 +193,22 @@ fn build_commit_record(
         "agentType": input.agent_type,
         "parentSessionId": input.parent_session_id,
         "parentAgentId": input.parent_agent_id,
-    })
+    });
+    if usage.is_unpriced_harness() {
+        record["estimatedCostUsd"] = Value::Null;
+        record["pricingSource"] = Value::Null;
+        record["pricingVerifiedAt"] = Value::Null;
+    } else {
+        record["costUsd"] = json!(cost.unwrap_or(0.0));
+    }
+    record
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::prices::Prices;
-    use crate::scan_tokens::Tokens;
+    use crate::scan_tokens::{ScanResult, Tokens};
 
     #[test]
     fn name_is_log_commit() {
@@ -238,6 +261,10 @@ mod tests {
         }
     }
 
+    fn sample_usage() -> UsageScan {
+        UsageScan::claude(sample_scan())
+    }
+
     fn sample_input() -> MetricsInput {
         MetricsInput {
             session_id: Some("s1".into()),
@@ -258,8 +285,8 @@ mod tests {
             "bbbb",
             "feat/x",
             "myrepo",
-            &sample_scan(),
-            0.001234,
+            &sample_usage(),
+            Some(0.001234),
             "m1",
             &prices,
         );
@@ -274,6 +301,10 @@ mod tests {
         assert_eq!(record["tokens"]["cacheRead"], 200);
         assert_eq!(record["tokens"]["output"], 30);
         assert_eq!(record["costUsd"], 0.001234);
+        assert_eq!(record["schemaVersion"], 2);
+        assert_eq!(record["harness"], "claude");
+        assert_eq!(record["sourceFormat"], "claude-transcript-v1");
+        assert_eq!(record["tokens"]["total"], 380);
         assert_eq!(record["messagesScanned"], 3);
         assert_eq!(record["lastMessageId"], "m9");
         assert_eq!(record["sinceMarker"], "m1");
@@ -296,8 +327,8 @@ mod tests {
             "bbbb",
             "",
             "myrepo",
-            &sample_scan(),
-            0.0,
+            &sample_usage(),
+            Some(0.0),
             "session-start",
             &prices,
         );
@@ -349,8 +380,8 @@ mod tests {
             "bbbb",
             "main",
             "myrepo",
-            &scan,
-            cost,
+            &UsageScan::claude(scan),
+            Some(cost),
             "m0",
             &prices,
         );
@@ -399,8 +430,8 @@ mod tests {
             "b",
             "main",
             "r",
-            &scan,
-            0.0,
+            &UsageScan::claude(scan),
+            Some(0.0),
             "m0",
             &prices,
         );
@@ -419,11 +450,37 @@ mod tests {
             "b",
             "main",
             "r",
-            &sample_scan(),
-            0.001,
+            &sample_usage(),
+            Some(0.001),
             "m1",
             &Prices::embedded(),
         );
         assert!(rec["unpricedModels"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_record_uses_nullable_estimate_without_cost_usd() {
+        let mut usage = sample_usage();
+        usage.harness = "codex";
+        usage.source_format = "codex-rollout-v1";
+        usage.reasoning_output = 20;
+        let rec = build_commit_record(
+            "ts",
+            &sample_input(),
+            "a",
+            "b",
+            "main",
+            "r",
+            &usage,
+            None,
+            "session-start",
+            &Prices::embedded(),
+        );
+        assert!(rec.get("costUsd").is_none());
+        assert!(rec["estimatedCostUsd"].is_null());
+        assert!(rec["pricingSource"].is_null());
+        assert!(rec["pricingVerifiedAt"].is_null());
+        assert_eq!(rec["tokens"]["reasoningOutput"], 20);
+        assert!(rec["byModel"][0].get("costUsd").is_none());
     }
 }

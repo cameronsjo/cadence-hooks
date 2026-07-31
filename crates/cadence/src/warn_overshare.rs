@@ -54,7 +54,7 @@ fn run_with_env(input: &HookInput, bypass: Option<&str>, vault: Option<&str>) ->
         return CheckResult::allow();
     }
 
-    match input.tool_name() {
+    match input.normalized_tool_name() {
         Some("Bash") => {
             let Some(command) = input.command() else {
                 return CheckResult::allow();

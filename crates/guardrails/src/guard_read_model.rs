@@ -157,7 +157,7 @@ impl Check for GuardReadModel {
 
     fn run(&self, input: &HookInput) -> CheckResult {
         // Only Read/Grep are gated; every other tool passes through.
-        let tool = input.tool_name().unwrap_or("");
+        let tool = input.normalized_tool_name().unwrap_or("");
         if tool != "Read" && tool != "Grep" {
             return CheckResult::allow();
         }

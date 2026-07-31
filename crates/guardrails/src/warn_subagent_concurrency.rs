@@ -224,7 +224,7 @@ impl Check for WarnSubagentConcurrency {
         // Only subagent dispatches. `Agent` is current; `Task` is the pre-2.1.63
         // name, kept for resilience. Every other tool exits here. (The hooks.json
         // matcher already filters to Agent|Task in production — belt-and-suspenders.)
-        if !matches!(input.tool_name(), Some("Agent" | "Task")) {
+        if !matches!(input.normalized_tool_name(), Some("Agent" | "Task")) {
             return CheckResult::allow();
         }
 

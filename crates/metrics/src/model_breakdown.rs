@@ -32,6 +32,28 @@ pub fn by_model_json(by_model: &[(String, Tokens)], prices: &Prices) -> Vec<Valu
         .collect()
 }
 
+/// Per-model usage buckets for Codex. Public API pricing is not subscription
+/// cost, so Codex rows omit `costUsd` rather than writing a misleading zero.
+pub fn by_model_unpriced_json(by_model: &[(String, Tokens)]) -> Vec<Value> {
+    by_model
+        .iter()
+        .map(|(model, tokens)| {
+            json!({
+                "model": model,
+                "tokens": {
+                    "input": tokens.input,
+                    "cacheCreate": tokens.cache_create,
+                    "cacheRead": tokens.cache_read,
+                    "output": tokens.output,
+                },
+                "estimatedCostUsd": null,
+                "pricingSource": null,
+                "pricingVerifiedAt": null,
+            })
+        })
+        .collect()
+}
+
 /// Models absent from the price table (#95). Such a model computes to `$0`
 /// silently, so recording it here makes the understated `costUsd` loud in the
 /// data — a non-empty array means a reprocessing pass can recompute once the
