@@ -1554,7 +1554,7 @@ fn mutation_nudge_message(repo_root: &str, path: &str) -> String {
 fn run_enforce(input: &HookInput, cfg: &EnvConfig) -> CheckResult {
     let mut repo_allow = RepoAllowMain::default();
     let mut probe = GitProbe::default();
-    match input.tool_name() {
+    match input.normalized_tool_name() {
         Some("Edit") | Some("Write") | Some("MultiEdit") => {
             if input.file_path().is_none() {
                 // No target file — nothing to assess, fail open.
