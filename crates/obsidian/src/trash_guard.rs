@@ -7,9 +7,8 @@
 //! vault directory and suggests `mv` to `.trash/` instead.
 
 use cadence_hooks_core::shell::{
-    child_scripts, clobber_redirect_targets, command_segments, command_word, looks_absolute,
-    peel_command_runners, skip_git_global_options, strip_group_wrappers, strip_leading_keywords,
-    tokenize,
+    child_scripts, clobber_redirect_targets, command_segments, command_word, executable_tokens,
+    looks_absolute, peel_command_runners, skip_git_global_options, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
@@ -61,11 +60,15 @@ fn head_deletes(argv: &[String]) -> bool {
 /// Worker for [`is_destructive`]; `depth` bounds the re-executed-operand walk.
 fn is_destructive_at(command: &str, depth: usize) -> bool {
     for segment in command_segments(command) {
-        let tokens = tokenize(strip_group_wrappers(&segment));
-        // Keywords first: `for f in *.md; do rm $f; done` segments as
-        // `do rm $f`, so without this the head word is `do` and the `rm`
-        // behind it is never examined.
-        let argv = peel_command_runners(strip_leading_keywords(&tokens));
+        // Compound scaffolding first: `for f in *.md; do rm $f; done` segments
+        // as `do rm $f`, `case x in x) rm $f;; esac` as `case x in x) rm $f`,
+        // and `f() { rm $f; }` as `f() { rm $f` — so without this the head word
+        // is `do`/`case`/`f()` and the `rm` behind it is never examined. The
+        // wrapper hunt inside `command_segments` runs the SAME
+        // `executable_tokens`, so a shell wrapper in those bodies is expanded
+        // rather than hidden (#528 review E).
+        let tokens = executable_tokens(&segment);
+        let argv = peel_command_runners(&tokens);
         if head_deletes(argv) {
             return true;
         }
@@ -755,6 +758,100 @@ mod tests {
                 outcome_in_vault(command),
                 cadence_hooks_core::Outcome::Block,
                 "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn compound_body_does_not_hide_a_shell_wrapper() {
+        // #528 review E. The verb gate stripped shell keywords and group
+        // punctuation before it peeled; the wrapper hunt inside
+        // `command_segments` did not. So the segment head stayed `then`/`do`/
+        // `(bash`, the hunt returned `None`, and the inner script reached no
+        // guard — `if true; then rm note.md; fi` blocked while
+        // `if true; then bash -c 'rm note.md'; fi` did not, on the same
+        // keyword the gate one position over already stripped. Every row here
+        // was measured deleting a real file through `bash`.
+        for command in [
+            "(bash -c 'rm note.md')",
+            "{ bash -c 'rm note.md'; }",
+            "if true; then bash -c 'rm note.md'; fi",
+            "for f in a; do bash -c 'rm note.md'; done",
+            "until false; do bash -c 'rm note.md'; done",
+            "case x in x) bash -c 'rm note.md';; esac",
+            "f() { bash -c 'rm note.md'; }",
+            // The remaining spellings of the same four shapes.
+            "while true; do bash -c 'rm note.md'; done",
+            "f () { bash -c 'rm note.md'; }",
+            "function f { bash -c 'rm note.md'; }",
+            // The multi-line `case` puts the arm on a segment of its own, so
+            // the label is the segment HEAD rather than mid-segment.
+            "case x in\n  x) bash -c 'rm note.md';;\nesac",
+            // Nesting, and a keyword in front of GLUED group punctuation —
+            // the string-level strip cannot reach the `(` until `do` is gone,
+            // which is why the two strips alternate.
+            "if true; then if true; then bash -c 'rm note.md'; fi; fi",
+            "{ { bash -c 'rm note.md'; }; }",
+            "for f in a; do (bash -c 'rm note.md'); done",
+            // Compound scaffolding stacked with a flagged runner and with a
+            // substitution — both other #528 arms must still compose.
+            "if true; then nice -n 10 bash -c 'rm note.md'; fi",
+            "for f in a; do env -i sh -c 'rm note.md'; done",
+            "{ sudo -u me bash -c 'rm note.md'; }",
+            "(stdbuf -o0 sh -c 'rm note.md')",
+            r#"{ bash -c 'echo hi' "$(rm note.md)"; }"#,
+            r#"if true; then echo "$(rm note.md)"; fi"#,
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn compound_head_strip_does_not_invent_verbs() {
+        // Controls for the compound strip. The scaffolding words themselves are
+        // not commands, a `case` arm and a function header in front of harmless
+        // work must stay silent, and a delete verb quoted as PROSE inside a
+        // compound statement is an argument, not an executable position.
+        for command in [
+            "if true; then npm run format; fi",
+            "for f in a; do echo \"$f\"; done",
+            "while read -r line; do echo \"$line\"; done",
+            "until curl -sf localhost:8080; do sleep 1; done",
+            "{ npm test; }",
+            "(cd /tmp && ls)",
+            "(git status)",
+            "case \"$1\" in start) npm start;; stop) npm stop;; esac",
+            "deploy() { npm run build; }",
+            "function deploy { npm run build; }",
+            "f() { git status; }",
+            "if [ -f note.md ]; then cat note.md; fi",
+            // Prose, not execution.
+            "echo 'case x in x) rm note.md;; esac'",
+            "echo \"if true; then rm note.md; fi\"",
+            "grep 'f()' src/main.rs",
+            "sed -n 's/x)/y)/p' file",
+            // A `)`-terminated head that is NOT a case label: a substitution
+            // must not read as a pattern, and a script whose own operand closes
+            // a paren must keep that operand.
+            "$(date) --version",
+            "bash -c 'echo hi)'",
+            // Bare scaffolding words, and truncated tails, must not panic or
+            // resolve a verb.
+            "esac",
+            "done",
+            "fi",
+            "case x in",
+            "f()",
+            "function",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must stay allowed"
             );
         }
     }

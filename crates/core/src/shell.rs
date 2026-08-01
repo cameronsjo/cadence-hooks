@@ -407,6 +407,183 @@ pub fn strip_leading_keywords(tokens: &[String]) -> &[String] {
     &tokens[start..]
 }
 
+/// Strip everything a compound statement or a definition puts in FRONT of the
+/// command it runs, so the head of the returned slice is the command word.
+///
+/// Four shapes, all of which park scaffolding where a gate expects a verb:
+///
+/// - a reserved word ([`strip_leading_keywords`]) — `then bash -c '…'`,
+///   `do bash -c '…'`
+/// - a group opener left standing as its own token — `{ bash -c '…'`
+/// - a `case` arm's pattern label — `case x in x) bash -c '…'`, and the
+///   idiomatic multi-line spelling whose segment begins AT the label
+///   (`x) bash -c '…'`)
+/// - a function definition header — `f() { … }`, `f () { … }`,
+///   `function f { … }`
+///
+/// Glued group punctuation cannot be reached from tokens — [`tokenize`] makes
+/// `(bash` ONE token — so a caller holding the raw segment wants
+/// [`executable_tokens`], which composes this with the string-level strips.
+/// Reach for this one only when the tokens are all you have.
+///
+/// **Detector direction only**, the same argument [`strip_leading_keywords`]
+/// makes: every word skipped here is scaffolding the shell does not execute, so
+/// skipping it can only expose a command that was already going to run. Never
+/// reuse it to decide that something is *safe*.
+///
+/// **One pre-processing model for every position that reads a command word.**
+/// The verb gate and the wrapper hunt in [`shell_c_argument_tokens`] both run
+/// this, because running different models is how each prior hole opened: the
+/// verb gate stripped `then`/`do` while the wrapper hunt did not, so
+/// `if true; then rm note.md; fi` was judged and
+/// `if true; then bash -c 'rm note.md'; fi` was not — the same divergence as
+/// #528's runner-flag findings, one layer over (#528 review E).
+pub fn strip_compound_heads(tokens: &[String]) -> &[String] {
+    let mut rest = tokens;
+    loop {
+        let before = rest.len();
+        rest = strip_leading_keywords(rest);
+        rest = strip_group_tokens(rest);
+        rest = strip_function_header(rest);
+        rest = strip_case_arm(rest);
+        // Each helper either shortens the slice or returns it untouched, so the
+        // length is a strictly decreasing measure and this terminates.
+        if rest.len() == before {
+            return rest;
+        }
+    }
+}
+
+/// One segment reduced to the tokens of the command the shell will actually
+/// run: group punctuation gone (glued or standalone), reserved words gone,
+/// `case` labels and function headers gone.
+///
+/// **This is the single pre-processing model every executable position reads.**
+/// The two halves have to compose and neither alone is enough: the string-level
+/// [`strip_group_wrappers`] is the only thing that can reach punctuation
+/// [`tokenize`] glues to a word (`(bash` is one token, and the closing `)` rides
+/// on the last one), while [`strip_compound_heads`] is the only thing that can
+/// reach a reserved word, a `case` label, or a function header. Run in one
+/// order only, they still miss the composition — `do (bash -c 'rm note.md')`
+/// keeps a glued `(` once `do` is gone — so this alternates until neither has
+/// anything left to take.
+///
+/// **Detector direction only**, inheriting [`strip_compound_heads`]' argument:
+/// nothing removed here is a word the shell executes.
+pub fn executable_tokens(segment: &str) -> Vec<String> {
+    let mut tokens = tokenize(strip_group_wrappers(segment));
+    loop {
+        let window = strip_compound_heads(&tokens);
+        // A group opener that survived because a keyword sat in front of it at
+        // string-strip time. Peeling one character per pass keeps `((cmd` in
+        // reach without a second string-level round trip.
+        if let Some(head) = window
+            .first()
+            .and_then(|head| head.strip_prefix(['(', '{']))
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_string)
+        {
+            let mut next = Vec::with_capacity(window.len());
+            next.push(head);
+            next.extend_from_slice(&window[1..]);
+            tokens = next;
+            continue;
+        }
+        // Every pass either drops a token or a character, so a pass that does
+        // neither is the fixpoint.
+        if window.len() == tokens.len() {
+            return tokens;
+        }
+        tokens = window.to_vec();
+    }
+}
+
+/// A group opener (or an empty parameter list) standing as its own token, left
+/// behind by `{ cmd; }`, `( cmd )`, and `function f () { … }`.
+fn strip_group_tokens(tokens: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < tokens.len() && matches!(tokens[start].as_str(), "(" | "{" | "()") {
+        start += 1;
+    }
+    &tokens[start..]
+}
+
+/// A shell function name: conservative on the first character (a leading `-`
+/// would make a flag look like a definition) and permissive on the rest, since
+/// bash accepts `-` and `.` in names.
+fn is_function_name(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The header of a function definition, in all three spellings. The body's
+/// opening `{` is left for [`strip_group_tokens`] on the next pass.
+fn strip_function_header(tokens: &[String]) -> &[String] {
+    match tokens {
+        [keyword, name, rest @ ..]
+            if keyword == "function" && !rest.is_empty() && is_function_name(name) =>
+        {
+            rest
+        }
+        [name, parens, rest @ ..]
+            if parens == "()" && !rest.is_empty() && is_function_name(name) =>
+        {
+            rest
+        }
+        [head, rest @ ..]
+            if !rest.is_empty() && head.strip_suffix("()").is_some_and(is_function_name) =>
+        {
+            rest
+        }
+        _ => tokens,
+    }
+}
+
+/// A `case` arm's pattern label — every token through the one that closes the
+/// label with `)`.
+///
+/// Two entries, because segmentation reaches the arm from either side:
+/// `case x in x) cmd` arrives whole on one segment, while the idiomatic
+/// multi-line spelling puts `x) cmd` on a segment of its own.
+///
+/// The label is required to be a SINGLE token ending in `)`, at a position the
+/// grammar puts it — right after `in`, or at the head of the segment. Scanning
+/// forward for any `)`-terminated token instead would eat a real command whose
+/// operand happens to close a paren (`bash -c 'echo hi)'`).
+///
+/// The bare form is the looser of the two, because a `)`-terminated head is
+/// also what a multi-segment subshell leaves behind (`(cd /x; ls) > out`
+/// segments as `ls) > out`, where `ls` is the command and not a label). Two
+/// refusals keep those apart: a label carrying `(`, `$` or a backtick is a
+/// subshell or a substitution rather than a pattern, and a label must be
+/// followed by something that can START a command — a redirect or a flag behind
+/// it means the `)` closed a subshell and the word in front of it was the verb.
+fn strip_case_arm(tokens: &[String]) -> &[String] {
+    let label = match tokens.first() {
+        Some(head) if head == "case" => match tokens.iter().position(|t| t == "in") {
+            Some(idx) => idx + 1,
+            None => return tokens,
+        },
+        Some(head) if !head.contains(['(', '$', '`']) => 0,
+        _ => return tokens,
+    };
+    let ends_the_label = tokens
+        .get(label)
+        .is_some_and(|token| token.ends_with(')') && token.len() > 1);
+    let body_starts_a_command = label > 0
+        || tokens.get(label + 1).is_some_and(|token| {
+            !token.starts_with(['-', '|', '&']) && !token.contains(['<', '>'])
+        });
+    if ends_the_label && body_starts_a_command && label + 1 < tokens.len() {
+        &tokens[label + 1..]
+    } else {
+        tokens
+    }
+}
+
 /// Words that stand in front of a real command without being the command.
 ///
 /// Shared by `enforce_worktree`, `guard_rm`, and the polish ship anchor, so the
@@ -2363,8 +2540,16 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
 /// or a path (`/bin/sh`). The `-c` may stand alone or appear in a short cluster
 /// such as `-lc` (login shell + command); the script is the token following the
 /// flag that carries `c`.
+///
+/// The segment goes through [`executable_tokens`], not a bare [`tokenize`]:
+/// [`tokenize`] glues `(` onto the word behind it and `)` onto the word in
+/// front, so `(bash -c 'rm note.md')` tokenizes as
+/// `["(bash", "-c", "rm note.md)"]` — a head no verb gate matches AND a script
+/// carrying a stray paren. Only a string-level strip fixes both, and only
+/// alternating it with the token-level one reaches `do (bash -c '…')`
+/// (#528 review E).
 fn shell_c_argument(segment: &str) -> Option<String> {
-    shell_c_argument_tokens(&tokenize(segment))
+    shell_c_argument_tokens(&executable_tokens(segment))
 }
 
 /// Verbs that run the command following their OWN options. `sudo` and `xargs`
@@ -2783,8 +2968,17 @@ pub fn skip_git_global_options(argv: &[String]) -> &[String] {
 /// correctly one position over at the verb gate (#528 review C-D1). The peel and
 /// the wrapper hunt disagreeing about the same grammar is the divergence this
 /// unification removes.
+///
+/// **[`strip_compound_heads`] runs first, for the same reason.** The verb gate
+/// strips shell keywords, `case` labels and function headers before it peels;
+/// this hunt did not, so a wrapper inside a compound body kept a segment head of
+/// `then`/`do`/`{`, the hunt returned `None`, and the inner script was never
+/// surfaced to any guard — `if true; then bash -c 'rm note.md'; fi`,
+/// `for f in a; do bash -c 'rm note.md'; done` and `(bash -c 'rm note.md')` all
+/// deleted a real file while the bare `rm` one position over blocked (#528
+/// review E). Idempotent, so a caller that already stripped loses nothing.
 fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
-    let tokens = peel_command_runners(tokens);
+    let tokens = peel_command_runners(strip_compound_heads(tokens));
     if !matches!(
         command_word(tokens.first()?).as_ref(),
         "sh" | "bash" | "zsh" | "dash"
@@ -2861,6 +3055,108 @@ mod tests {
         for segment in ["done", "fi", "!"] {
             let tokens = words(segment);
             assert_eq!(strip_leading_keywords(&tokens).len(), 1, "{segment}");
+        }
+    }
+
+    // --- executable_tokens / strip_compound_heads (#528 review E) ---
+
+    #[test]
+    fn executable_tokens_reaches_the_command_inside_a_compound_body() {
+        for (segment, want_head) in [
+            // Group punctuation, glued and standalone.
+            ("(bash -c 'rm note.md')", "bash"),
+            ("{ bash -c 'rm note.md'", "bash"),
+            ("{ { bash -c 'rm note.md'", "bash"),
+            ("((rm note.md))", "rm"),
+            // Reserved words.
+            ("then bash -c 'rm note.md'", "bash"),
+            ("do bash -c 'rm note.md'", "bash"),
+            ("then if true", "true"),
+            // A keyword in FRONT of glued punctuation — neither strip alone
+            // reaches this, which is why the two alternate.
+            ("do (bash -c 'rm note.md')", "bash"),
+            ("then ({ rm note.md", "rm"),
+            // `case` arms, mid-segment and as the segment head.
+            ("case x in x) bash -c 'rm note.md'", "bash"),
+            ("x) bash -c 'rm note.md'", "bash"),
+            ("case x in start) npm start", "npm"),
+            // Function headers, all three spellings, plus the body's brace.
+            ("f() { bash -c 'rm note.md'", "bash"),
+            ("f () { bash -c 'rm note.md'", "bash"),
+            ("function f { bash -c 'rm note.md'", "bash"),
+            ("function f () { rm note.md", "rm"),
+            ("my-deploy.v2() { rm note.md", "rm"),
+            // Nothing to strip.
+            ("rm note.md", "rm"),
+            ("git -C . status", "git"),
+        ] {
+            assert_eq!(
+                executable_tokens(segment).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_tokens_keeps_a_head_that_is_not_scaffolding() {
+        // The looser shapes must refuse rather than eat a real command word.
+        for (segment, want_head) in [
+            // A substitution is not a `case` pattern.
+            ("$(date) --version", "$(date)"),
+            // Nor is the tail of a subshell that spans two segments: in
+            // `(cd /x; ls) > out` the `)` closed the group and `ls` is the verb.
+            ("ls) > out", "ls)"),
+            ("ls) 2>&1", "ls)"),
+            ("x) --version", "x)"),
+            // A lone scaffolding word has nothing behind it to expose.
+            ("esac", "esac"),
+            ("done", "done"),
+            ("function", "function"),
+            // `strip_group_wrappers` trims the trailing `)` off a bare
+            // fragment; either spelling is a syntax fragment rather than a
+            // command, so what matters is that nothing resolves a verb.
+            ("f()", "f("),
+            ("case x in", "case"),
+            // `-c` is a flag, not a function name.
+            ("-c() { rm note.md", "-c()"),
+        ] {
+            assert_eq!(
+                executable_tokens(segment).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_tokens_keeps_the_operands_behind_the_head() {
+        // The strip must not eat a `)`-closing OPERAND while hunting a label:
+        // scanning forward for any `)`-terminated token would take the script.
+        assert_eq!(
+            executable_tokens("bash -c 'echo hi)'"),
+            vec!["bash".to_string(), "-c".into(), "echo hi)".into()]
+        );
+        // And the closing paren of a group must not ride along on the script.
+        assert_eq!(
+            executable_tokens("(bash -c 'rm note.md')"),
+            vec!["bash".to_string(), "-c".into(), "rm note.md".into()]
+        );
+    }
+
+    #[test]
+    fn strip_compound_heads_is_idempotent() {
+        // `child_scripts` hands in an already-stripped argv, so a second pass
+        // must be a no-op rather than eating the command word.
+        for segment in [
+            "do rm note.md",
+            "case x in x) rm note.md",
+            "f() { rm note.md",
+            "rm note.md",
+        ] {
+            let tokens = words(segment);
+            let once = strip_compound_heads(&tokens).to_vec();
+            assert_eq!(strip_compound_heads(&once), once.as_slice(), "{segment}");
         }
     }
 

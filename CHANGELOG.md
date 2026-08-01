@@ -254,20 +254,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **What stays open, so this list is not read as more than it is.** The head
   model reaches a verb where the shell runs an executable; it does not reach a
   verb built by substitution (`` `echo rm` x ``, `$(echo rm) x`), one carried in
-  a `trap`/`case`/`coproc`/`function` body, a deleting binary outside the gated
-  verb set (`srm`, `perl -e 'unlink'`), or one behind a runner option spelling
-  outside the modelled grammar — `env -S`, which re-splits its value into the
-  command line, is the deliberate case, and any unlisted option of any modelled
-  runner is the general one, since the walk refuses a token it cannot classify
-  rather than guess past it. That refusal is why an incomplete grammar costs a
-  block and never invents one, and it is why this boundary is a class rather
-  than a list: a spelling found later belongs to it already. Those are tracked
-  separately — each needs a decision about how far a head model should follow a
-  shell, not another peel arm. `docs/hooks.md` names the same boundary for the
-  operator. **That boundary describes the HEAD model only** — the wrapper hunt
-  behind it ran a weaker model of the same grammars, so options well inside this
-  list (`-n 10`, `-i`, `-u FOO`, `-P /bin`, `-o0`) still hid a `sh -c` until the
-  entry below unified the two.
+  a body the model does not treat as executed (a `trap` handler, a `coproc`), a
+  deleting binary outside the gated verb set (`srm`, `perl -e 'unlink'`), or one
+  behind a runner option spelling outside the modelled grammar — `env -S`, which
+  re-splits its value into the command line, is the deliberate case, and any
+  unlisted option of any modelled runner is the general one, since the walk
+  refuses a token it cannot classify rather than guess past it. That refusal is
+  why an incomplete grammar costs a block and never invents one, and it is why
+  this boundary is a class rather than a list: a spelling found later belongs to
+  it already. Those are tracked separately — each needs a decision about how far
+  a head model should follow a shell, not another peel arm. `docs/hooks.md`
+  names the same boundary for the operator. **That boundary describes the HEAD
+  model only** — the wrapper hunt behind it ran a weaker model of the same
+  grammars, so options well inside this list (`-n 10`, `-i`, `-u FOO`,
+  `-P /bin`, `-o0`) still hid a `sh -c`, and compound bodies well inside it
+  (`if`, `for`, `until`, `case`, `( )`, `{ }`, a function body) hid one too,
+  until the two entries below unified the models. This paragraph named `case`
+  and `function` as open while the verb gate already read `do`/`then`, which is
+  the shape of the confusion: the boundary belongs to a pre-processing model,
+  and there was more than one.
 
   **What stays removed is the false-positive class the narrowing was for.**
   `npm run format` and `terraform destroy` inside a vault blocked under the old
@@ -282,6 +287,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fold — a fourth normalization of "which verb is this?" beside `command_word`,
   which the same review flagged — is likewise left alone and tracked as
   cameronsjo/cadence-hooks#539.
+
+- **A shell wrapper inside a compound statement or a group is expanded, so `if`, `for`, `until`, `while`, `case`, `( )`, `{ }` and a function body stop hiding one.** The verb gate stripped shell scaffolding before it read a command word — `strip_group_wrappers` for `(`/`{`, `strip_leading_keywords` for `do`/`then` — so `if true; then rm note.md; fi` and `(rm note.md)` were judged. The wrapper hunt one position over, `core::shell::expand_segments` → `shell_c_argument_tokens`, stripped neither. So the segment head stayed `then` / `do` / `(bash`, the hunt returned `None`, and the inner script was never surfaced to any guard: `(bash -c 'rm note.md')`, `{ bash -c 'rm note.md'; }`, `if true; then bash -c 'rm note.md'; fi`, `for f in a; do bash -c 'rm note.md'; done`, `until`, `case x in x) …;; esac` and `f() { … }` were all `main` BLOCK → branch ALLOW, and every one was measured deleting a real file under `bash`. Two positions running two pre-processing models, on the same grammar — the identical shape as the runner-flag entry above, one layer over, and the fourth time this branch has closed it.
+
+  **The hunt is shared, so this was never trash-guard's alone, and for the other guards it was a hole on `main` too.** `(bash -c 'git reset --hard HEAD~3')` reached no `git-safety`; `{ sh -c 'gh pr merge …'; }` reached no `guard-gh-write`; `for f in a; do sh -c 'op item list'; done` reached no `guard-op-vault-scan`; `(bash -c 'cat .env')` reached no `prevent-secret-leaks`; and `if true; then nice -n 10 bash -c 'rm -rf ~/Documents'; fi` reached no `guard-rm` — which survived `( )` on its own group strip but not `if`/`then`. All five block now.
+
+  **One pre-processing model, in one function.** `core::shell::executable_tokens` reduces a segment to the tokens of the command that will run, and both positions call it. Neither half is sufficient alone and the order is not enough either: the string-level `strip_group_wrappers` is the only thing that can reach punctuation `tokenize` glues to a word (`(bash` is one token, and the closing `)` rides on the last one, so a token-level strip returns a script carrying a stray paren), while the new `strip_compound_heads` is the only thing that can reach a reserved word, a `case` arm's pattern label, or a function definition header. Run once each in either order they still miss the composition — `do (bash -c 'rm note.md')` keeps a glued `(` once `do` is gone — so `executable_tokens` alternates them to a fixpoint. `case` and function headers are new to the verb gate as well, since it now reads the same function; the two positions cannot drift again without changing one call.
+
+  **Widening a shared primitive, measured rather than argued.** Every consumer of `command_segments` / `child_scripts` / `shell_c_argument_tokens` was enumerated (`trash-guard`, `guard-rm`, `prevent-secret-leaks`, `prevent-secret-writes`, `git-safety`, `redact-external-content`, `guard-gh-dangerous`, `guard-gh-write`, `guard-op-vault-scan`, `warn-untracked`, `warn-pr-issue-link`, `warn-gh-merge-preflight`, `warn-going-public`, `inject-gh-write-context`, `enforce-worktree`) and driven differentially against an `origin/main` binary: 15 guards × 112 commands = 1,680 cells, **13 verdicts strengthened, 0 weakened by this change**, 0 non-0/2 exits. The inverted risk — a consumer using segments to satisfy an *exemption*, where more segments could subtract a block — was checked at `prevent_secret_leaks`' `.envrc` carve-out and `prevent_secret_writes`' exemptions and holds: both aggregate by OR, and `command_has_cd` is computed from the raw command string, so segmentation cannot change its input. A primitive-level differential over 156 commands confirms **0 segments and 0 substitution bodies lost**, 57 added — the `#528` substitution union is intact. The 6 rows still weaker than `main` all predate this change and are the deliberate narrowing (`npm run format`, `terraform destroy`, `git commit -m 'rm the old notes'`, and a delete verb quoted as prose).
+
+  **What the strip refuses, so widening a detector does not eat a command word.** A `case` label must be a single `)`-terminated token where the grammar puts one — after `in`, or at the segment head — because scanning forward for any `)`-terminated token takes the script out of `bash -c 'echo hi)'`. The bare head form additionally refuses a label carrying `(`, `$` or a backtick, and refuses one followed by a redirect or a flag: `(cd /x; ls) > out` segments as `ls) > out`, where the `)` closed a subshell and `ls` is the verb, not a pattern. A function header must have a name that starts with a letter or `_`, so `-c()` is a flag rather than a definition. Compound bodies the model still does not treat as executed — a `trap` handler, a `coproc` — stay open and are named as a class in the boundary above.
 
 - **`split_segments` honors backslash escapes, so a segment boundary means what the shell means by it (cameronsjo/cadence-hooks#475).** The splitter cut at every newline with no continuation awareness and toggled quote state on every `"` regardless of a preceding backslash — while `tokenize`, the parser that reads the resulting segment's words, does both correctly. Two parsers disagreeing about where a word ends is a boundary the shell does not have, and any guard that reasons per segment inherits it.
 
