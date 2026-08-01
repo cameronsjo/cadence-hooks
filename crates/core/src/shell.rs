@@ -4873,6 +4873,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn split_segments_subst_early_close_single_quote_should_not_swallow_rest() {
+        // `split_segments` has no `$()` depth — a `)` inside a quoted string
+        // is not a separator but the segmenter doesn't know that. The outer
+        // quote state then sees an unmatched `'` and swallows everything after
+        // it, including the `&&` and the real next command.
+        let out = split_segments("echo $(echo ') && cat .env");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "unmatched quote swallowed the second command: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_subst_early_close_double_quote_should_not_swallow_rest() {
+        // Same bug with a double quote. The `)` inside `"…"` closes the
+        // `$()` early (no depth tracking), the `"` stays open and swallows
+        // the rest of the line.
+        let out = split_segments(r#"echo $(echo "a) && cat .env"#);
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "unmatched double-quote swallowed the second command: {out:?}"
+        );
+    }
+
     // --- clobber_redirect_targets ---
 
     #[test]
@@ -4981,6 +5006,31 @@ mod tests {
         assert_eq!(
             redirect_targets(r#"echo "a > b" > c 2>> err.log"#),
             vec!["c", "err.log"]
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_ansi_c_escaped_quote_should_not_bypass() {
+        // An ANSI-C string with an escaped quote (`\'`) desyncs the redirect
+        // parser — it has no `$'…'` state, so the `\\'` looks like a close,
+        // the real `'` reopens a phantom string, and the `>` after it is
+        // swallowed. The real target (`.env`) is never seen.
+        let targets = clobber_redirect_targets(r"echo $'a\'b' > .env");
+        assert!(
+            targets.iter().any(|t| t == ".env"),
+            "ANSI-C escaped quote hid the clobber redirect: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_append_ansi_c_escaped_quote_should_not_bypass() {
+        // Same desync via the append-redirect path. `redirect_targets` has
+        // no `$'…'` state either — an escaped quote in a `$'…'` run closes
+        // the string early, the real `'` reopens it, and the `>>` is content.
+        let targets = redirect_targets(r"echo $'a\'b' >> .env");
+        assert!(
+            targets.iter().any(|t| t == ".env"),
+            "ANSI-C escaped quote hid the append redirect: {targets:?}"
         );
     }
 
