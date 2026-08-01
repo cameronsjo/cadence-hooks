@@ -131,8 +131,13 @@ enum QuoteRun {
 fn ends_inside_quote(command: &str) -> bool {
     let mut quote: Option<QuoteRun> = None;
     let mut escaped = false;
-    // A `'` opens an ANSI-C run only when the shell just read a `$` outside
-    // any quoting; anywhere else it opens a POSIX run.
+    // A `'` opens an ANSI-C run only when the run of `$` immediately before it
+    // is of ODD length: `$'` and `$$$'` are ANSI-C, while `$$'` is the `$$` PID
+    // expansion followed by an ordinary POSIX `'…'`. Toggling rather than
+    // setting is what encodes that parity — setting on every `$` read `$$'` as
+    // ANSI-C and diverged from bash. Verified against `bash -n` as an oracle
+    // over every string of length <= 5 in the quote alphabet: toggling
+    // diverges on 0 of 3,905, setting on 1.
     let mut dollar_pending = false;
     for ch in command.chars() {
         if escaped {
@@ -173,7 +178,7 @@ fn ends_inside_quote(command: &str) -> bool {
                 _ => {}
             },
         }
-        dollar_pending = ch == '$' && quote.is_none();
+        dollar_pending = ch == '$' && quote.is_none() && !dollar_pending;
     }
     quote.is_some()
 }
@@ -446,6 +451,29 @@ mod tests {
             r"echo $'it\'s fine' && echo gh repo delete discussion",
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    /// `$$'…'` is the `$$` PID expansion followed by a POSIX run, not ANSI-C —
+    /// bash opens ANSI-C only on an ODD run of `$`. Reading every `$` as an
+    /// opener made the backslash escape the closing quote, so a balanced
+    /// command scanned as unbalanced and blocked prose bash runs cleanly.
+    #[test]
+    fn even_dollar_run_before_a_quote_is_not_ansi_c() {
+        // Balanced under bash: `$$` expands, then `'gh repo delete it\'` is a
+        // POSIX run in which the backslash is literal and the second quote
+        // closes. Confirmed with `bash -n`. Reading the run as ANSI-C made the
+        // backslash escape that closing quote, so the scan saw an open run and
+        // the fallback blocked on the raw text.
+        let result = GhDangerousGuard.run(&make_bash(r"echo $$'gh repo delete it\'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    /// The odd-run side of the same parity, so the toggle is pinned in both
+    /// directions rather than only where it was wrong.
+    #[test]
+    fn odd_dollar_run_before_a_quote_is_ansi_c() {
+        let result = GhDangerousGuard.run(&make_bash(r"echo $$$'gh repo delete: it\'s prose'"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     /// Control in the dangerous direction: an ANSI-C run must not become a
