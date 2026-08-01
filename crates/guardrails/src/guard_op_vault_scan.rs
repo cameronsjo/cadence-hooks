@@ -16,7 +16,7 @@
 //! `list` anywhere after the command word, it's a scan. Intervening flags are
 //! just skipped tokens, value-flag or not.
 
-use cadence_hooks_core::shell::{command_segments, tokenize};
+use cadence_hooks_core::shell::{command_segments, command_word, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// Blocks `op item list` / `op vault list` vault enumeration; single-item reads
@@ -50,8 +50,7 @@ fn block_message(found: &str) -> String {
 fn vault_scan_keyword(segment: &str) -> Option<&'static str> {
     let tokens = tokenize(segment);
     let first = tokens.first()?;
-    let cmd = first.rsplit('/').next().unwrap_or(first);
-    if cmd != "op" {
+    if command_word(first).as_ref() != "op" {
         return None;
     }
     // Adjacent pairs strictly after the command word (token 0).
@@ -75,10 +74,6 @@ impl Check for OpVaultScanGuard {
         let Some(command) = input.command() else {
             return CheckResult::allow();
         };
-
-        if !command.contains("op") {
-            return CheckResult::allow();
-        }
 
         // `command_segments` splits chains/pipes AND expands shell wrappers
         // (`bash -c '…'`), so the wrapper case is structural — no separate pass.
@@ -145,6 +140,18 @@ mod tests {
     fn op_item_list_blocked() {
         let result = OpVaultScanGuard.run(&make_bash("op item list"));
         assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    #[test]
+    fn case_folded_op_item_list_blocked() {
+        let result = OpVaultScanGuard.run(&make_bash("OP item list"));
+        assert_eq!(result.outcome, Outcome::Block);
+    }
+
+    #[test]
+    fn case_fold_does_not_fold_op_subcommands() {
+        let result = OpVaultScanGuard.run(&make_bash("OP ITEM list"));
+        assert_eq!(result.outcome, Outcome::Allow);
     }
 
     #[test]

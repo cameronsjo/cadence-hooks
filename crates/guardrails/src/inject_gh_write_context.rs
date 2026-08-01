@@ -42,10 +42,6 @@ impl Check for InjectGhWriteContext {
             return CheckResult::allow();
         };
 
-        if !command.contains("gh") {
-            return CheckResult::allow();
-        }
-
         let needs_context = command_segments(command).into_iter().any(|segment| {
             segment_invokes_gh(&segment)
                 && is_write_command(&segment)
@@ -105,6 +101,16 @@ mod tests {
     #[test]
     fn gh_pr_create_without_target_nudges() {
         assert_eq!(outcome("gh pr create --title x"), Outcome::Nudge);
+    }
+
+    #[test]
+    fn case_folded_gh_pr_create_nudges() {
+        assert_eq!(outcome("GH pr create --title x"), Outcome::Nudge);
+    }
+
+    #[test]
+    fn case_fold_does_not_fold_gh_subcommands() {
+        assert_eq!(outcome("GH PR create --title x"), Outcome::Allow);
     }
 
     #[test]

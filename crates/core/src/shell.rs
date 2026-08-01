@@ -294,7 +294,7 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 /// `prevent_secret_leaks::COMMAND_WRAPPERS`). This function feeds both kinds,
 /// so every consumer was enumerated:
 ///
-/// - **Detectors** — [`skip_expansion_prefixes`] and [`shell_c_argument_tokens`]
+/// - **Detectors** — [`peel_command_runners`] and [`shell_c_argument_tokens`]
 ///   here; `enforce_worktree`'s commit gate, `is_package_mutation` and
 ///   `file_mutation_targets`; `guard_rm`'s delete-verb, `find`, and
 ///   shell-wrapper arms; `guard_gh_write::token_is_gh`. Folding widens what
@@ -374,6 +374,214 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
         .trim()
         .trim_start_matches(['(', '{', ' ', '\t'])
         .trim_end_matches([')', '}', ';', ' ', '\t'])
+}
+
+/// Reserved words that occupy the head position of a segment without being the
+/// command. `for f in *.md; do rm $f; done` segments as `for f in *.md` /
+/// `do rm $f` / `done`, so a caller that gates on the segment head sees `do`
+/// and never examines the `rm` behind it — the same blindness
+/// [`strip_group_wrappers`] fixes for `(`/`{`, in a shape that punctuation
+/// stripping cannot reach.
+///
+/// Matched case-SENSITIVELY: the shell's reserved words are, so `DO rm x` runs
+/// a command named `DO` and stripping it would resolve a verb the shell never
+/// reaches.
+const LEADING_KEYWORDS: &[&str] = &["do", "then", "else", "elif", "while", "until", "if", "!"];
+
+/// Skip leading shell reserved words so the segment head is the real command.
+///
+/// **Detector direction only.** Skipping a keyword can only expose a verb that
+/// was already going to run, so this can add a block and never subtract one —
+/// the same argument [`skip_transparent_prefixes`] makes. Never reuse it to
+/// decide that something is *safe*.
+///
+/// A keyword that is the segment's ONLY word — `!` is the one list member that
+/// can appear alone — is left alone: there is no command behind it to expose.
+/// A closing word (`done`, `fi`, `esac`) is not in the list at all, so it is
+/// never a candidate to strip in the first place.
+pub fn strip_leading_keywords(tokens: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < tokens.len() && LEADING_KEYWORDS.contains(&tokens[start].as_str()) {
+        start += 1;
+    }
+    &tokens[start..]
+}
+
+/// Strip everything a compound statement or a definition puts in FRONT of the
+/// command it runs, so the head of the returned slice is the command word.
+///
+/// Four shapes, all of which park scaffolding where a gate expects a verb:
+///
+/// - a reserved word ([`strip_leading_keywords`]) — `then bash -c '…'`,
+///   `do bash -c '…'`
+/// - a group opener left standing as its own token — `{ bash -c '…'`
+/// - a `case` arm's pattern label — `case x in x) bash -c '…'`, and the
+///   idiomatic multi-line spelling whose segment begins AT the label
+///   (`x) bash -c '…'`)
+/// - a function definition header — `f() { … }`, `f () { … }`,
+///   `function f { … }`
+///
+/// Glued group punctuation cannot be reached from tokens — [`tokenize`] makes
+/// `(bash` ONE token — so a caller holding the raw segment wants
+/// [`executable_tokens`], which composes this with the string-level strips.
+/// Reach for this one only when the tokens are all you have.
+///
+/// **Detector direction only**, the same argument [`strip_leading_keywords`]
+/// makes: every word skipped here is scaffolding the shell does not execute, so
+/// skipping it can only expose a command that was already going to run. Never
+/// reuse it to decide that something is *safe*.
+///
+/// **One pre-processing model for every position that reads a command word.**
+/// The verb gate and the wrapper hunt in [`shell_c_argument_tokens`] both run
+/// this, because running different models is how each prior hole opened: the
+/// verb gate stripped `then`/`do` while the wrapper hunt did not, so
+/// `if true; then rm note.md; fi` was judged and
+/// `if true; then bash -c 'rm note.md'; fi` was not — the same divergence as
+/// #528's runner-flag findings, one layer over (#528 review E).
+pub fn strip_compound_heads(tokens: &[String]) -> &[String] {
+    let mut rest = tokens;
+    loop {
+        let before = rest.len();
+        rest = strip_leading_keywords(rest);
+        rest = strip_group_tokens(rest);
+        rest = strip_function_header(rest);
+        rest = strip_case_arm(rest);
+        // Each helper either shortens the slice or returns it untouched, so the
+        // length is a strictly decreasing measure and this terminates.
+        if rest.len() == before {
+            return rest;
+        }
+    }
+}
+
+/// One segment reduced to the tokens of the command the shell will actually
+/// run: group punctuation gone (glued or standalone), reserved words gone,
+/// `case` labels and function headers gone.
+///
+/// **This is the single pre-processing model every executable position reads.**
+/// The two halves have to compose and neither alone is enough: the string-level
+/// [`strip_group_wrappers`] is the only thing that can reach punctuation
+/// [`tokenize`] glues to a word (`(bash` is one token, and the closing `)` rides
+/// on the last one), while [`strip_compound_heads`] is the only thing that can
+/// reach a reserved word, a `case` label, or a function header. Run in one
+/// order only, they still miss the composition — `do (bash -c 'rm note.md')`
+/// keeps a glued `(` once `do` is gone — so this alternates until neither has
+/// anything left to take.
+///
+/// **Detector direction only**, inheriting [`strip_compound_heads`]' argument:
+/// nothing removed here is a word the shell executes.
+pub fn executable_tokens(segment: &str) -> Vec<String> {
+    let mut tokens = tokenize(strip_group_wrappers(segment));
+    loop {
+        let window = strip_compound_heads(&tokens);
+        // A group opener that survived because a keyword sat in front of it at
+        // string-strip time. Peeling one character per pass keeps `((cmd` in
+        // reach without a second string-level round trip.
+        if let Some(head) = window
+            .first()
+            .and_then(|head| head.strip_prefix(['(', '{']))
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_string)
+        {
+            let mut next = Vec::with_capacity(window.len());
+            next.push(head);
+            next.extend_from_slice(&window[1..]);
+            tokens = next;
+            continue;
+        }
+        // Every pass either drops a token or a character, so a pass that does
+        // neither is the fixpoint.
+        if window.len() == tokens.len() {
+            return tokens;
+        }
+        tokens = window.to_vec();
+    }
+}
+
+/// A group opener (or an empty parameter list) standing as its own token, left
+/// behind by `{ cmd; }`, `( cmd )`, and `function f () { … }`.
+fn strip_group_tokens(tokens: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < tokens.len() && matches!(tokens[start].as_str(), "(" | "{" | "()") {
+        start += 1;
+    }
+    &tokens[start..]
+}
+
+/// A shell function name: conservative on the first character (a leading `-`
+/// would make a flag look like a definition) and permissive on the rest, since
+/// bash accepts `-` and `.` in names.
+fn is_function_name(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The header of a function definition, in all three spellings. The body's
+/// opening `{` is left for [`strip_group_tokens`] on the next pass.
+fn strip_function_header(tokens: &[String]) -> &[String] {
+    match tokens {
+        [keyword, name, rest @ ..]
+            if keyword == "function" && !rest.is_empty() && is_function_name(name) =>
+        {
+            rest
+        }
+        [name, parens, rest @ ..]
+            if parens == "()" && !rest.is_empty() && is_function_name(name) =>
+        {
+            rest
+        }
+        [head, rest @ ..]
+            if !rest.is_empty() && head.strip_suffix("()").is_some_and(is_function_name) =>
+        {
+            rest
+        }
+        _ => tokens,
+    }
+}
+
+/// A `case` arm's pattern label — every token through the one that closes the
+/// label with `)`.
+///
+/// Two entries, because segmentation reaches the arm from either side:
+/// `case x in x) cmd` arrives whole on one segment, while the idiomatic
+/// multi-line spelling puts `x) cmd` on a segment of its own.
+///
+/// The label is required to be a SINGLE token ending in `)`, at a position the
+/// grammar puts it — right after `in`, or at the head of the segment. Scanning
+/// forward for any `)`-terminated token instead would eat a real command whose
+/// operand happens to close a paren (`bash -c 'echo hi)'`).
+///
+/// The bare form is the looser of the two, because a `)`-terminated head is
+/// also what a multi-segment subshell leaves behind (`(cd /x; ls) > out`
+/// segments as `ls) > out`, where `ls` is the command and not a label). Two
+/// refusals keep those apart: a label carrying `(`, `$` or a backtick is a
+/// subshell or a substitution rather than a pattern, and a label must be
+/// followed by something that can START a command — a redirect or a flag behind
+/// it means the `)` closed a subshell and the word in front of it was the verb.
+fn strip_case_arm(tokens: &[String]) -> &[String] {
+    let label = match tokens.first() {
+        Some(head) if head == "case" => match tokens.iter().position(|t| t == "in") {
+            Some(idx) => idx + 1,
+            None => return tokens,
+        },
+        Some(head) if !head.contains(['(', '$', '`']) => 0,
+        _ => return tokens,
+    };
+    let ends_the_label = tokens
+        .get(label)
+        .is_some_and(|token| token.ends_with(')') && token.len() > 1);
+    let body_starts_a_command = label > 0
+        || tokens.get(label + 1).is_some_and(|token| {
+            !token.starts_with(['-', '|', '&']) && !token.contains(['<', '>'])
+        });
+    if ends_the_label && body_starts_a_command && label + 1 < tokens.len() {
+        &tokens[label + 1..]
+    } else {
+        tokens
+    }
 }
 
 /// Words that stand in front of a real command without being the command.
@@ -2115,6 +2323,30 @@ fn expand_segments(
         if let Some(pair) = segment_assignment(&segment) {
             assignments.push(pair);
         }
+        // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
+        // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
+        // substitution in the PARENT before it spawns bash at all, so a segment
+        // that is a wrapper still owes its substitution bodies. Selecting
+        // between them dropped those bodies from every wrapper segment, and the
+        // drop was invisible until the wrapper hunt widened: `bash -c 'echo hi'
+        // "$(rm note.md)"` deletes the file and reached no guard, and every
+        // runner spelling the peel newly sees would have inherited the same hole
+        // (#528 review C-D1). [`child_scripts`] already unions the two for the
+        // same reason (#228 review finding 2); this is `expand_segments`
+        // agreeing with it.
+        //
+        // Substitution recursion shares the wrapper-nesting budget, so three
+        // levels of `sh -c` nesting can exhaust it before a substitution is
+        // surfaced as its own segment. Accepted: the substitution text still
+        // appears as a substring of the pushed segment, and three levels is
+        // already generous.
+        if depth < MAX_WRAPPER_DEPTH {
+            for body in substitution_bodies(&segment) {
+                // A substitution is its own subshell too — snapshot.
+                let mut scope = assignments.clone();
+                expand_segments(&body, &mut scope, depth + 1, out);
+            }
+        }
         match shell_c_argument(&segment) {
             Some(inner) if depth < MAX_WRAPPER_DEPTH => {
                 out.push(segment);
@@ -2124,21 +2356,7 @@ fn expand_segments(
                 let mut scope = assignments.clone();
                 expand_segments(&inner, &mut scope, depth + 1, out);
             }
-            _ => {
-                // Substitution recursion shares the wrapper-nesting budget, so
-                // three levels of `sh -c` nesting can exhaust it before a
-                // substitution is surfaced as its own segment. Accepted: the
-                // substitution text still appears as a substring of the pushed
-                // wrapper segment, and three levels is already generous.
-                if depth < MAX_WRAPPER_DEPTH {
-                    for body in substitution_bodies(&segment) {
-                        // A substitution is its own subshell too — snapshot.
-                        let mut scope = assignments.clone();
-                        expand_segments(&body, &mut scope, depth + 1, out);
-                    }
-                }
-                out.push(segment);
-            }
+            _ => out.push(segment),
         }
     }
 }
@@ -2322,43 +2540,77 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
 /// or a path (`/bin/sh`). The `-c` may stand alone or appear in a short cluster
 /// such as `-lc` (login shell + command); the script is the token following the
 /// flag that carries `c`.
+///
+/// The segment goes through [`executable_tokens`], not a bare [`tokenize`]:
+/// [`tokenize`] glues `(` onto the word behind it and `)` onto the word in
+/// front, so `(bash -c 'rm note.md')` tokenizes as
+/// `["(bash", "-c", "rm note.md)"]` — a head no verb gate matches AND a script
+/// carrying a stray paren. Only a string-level strip fixes both, and only
+/// alternating it with the token-level one reaches `do (bash -c '…')`
+/// (#528 review E).
 fn shell_c_argument(segment: &str) -> Option<String> {
-    shell_c_argument_tokens(&tokenize(segment))
+    shell_c_argument_tokens(&executable_tokens(segment))
 }
 
-/// Prefix words skipped when hunting for a shell wrapper to EXPAND: everything
-/// [`skip_transparent_prefixes`] skips, plus `sudo`.
+/// Verbs that run the command following their OWN options. `sudo` and `xargs`
+/// sit outside [`TRANSPARENT`] by design; `nice` and `env` are in it but are
+/// admitted there only while the next token is not an option, and
+/// `timeout`/`stdbuf` are not modelled there at all. Each one's flag grammar is
+/// walked by [`skip_runner_flags`], which is what keeps `sudo -u me rm note.md`
+/// and `nice -n 10 bash -c '…'` in view.
 ///
-/// **This set feeds a DETECTOR, and that is why it may be wider than
-/// [`TRANSPARENT`].** Expanding a wrapper only ADDS segments to the "every
-/// command that will actually execute" view, so an over-eager skip costs an
-/// extra segment to inspect — and, where that segment reaches a block-capable
-/// guard, can manufacture a false block on something the shell would never run
-/// (see the bounded-not-free caveat below); a missed one costs the inner
-/// script's visibility
-/// to every guard that segments. `TRANSPARENT` is the opposite case — it is
-/// consumed by `enforce_worktree` and `guard_rm` to decide *which verb runs*,
+/// **`git` is deliberately absent even though [`skip_runner_flags`] models it.**
+/// A runner in this set runs an ARBITRARY command; `git` runs a subcommand from
+/// its own fixed set, so peeling `git`'s globals here would resolve a
+/// subcommand name into an executable position it never occupies. Callers that
+/// want that peel ask for it by name, via [`skip_git_global_options`].
+pub const COMMAND_RUNNERS: &[&str] = &["sudo", "xargs", "nice", "stdbuf", "timeout", "env"];
+
+/// Peel transparent prefixes and command runners off the front of an executable
+/// position, returning the slice that begins at the command that will run.
+///
+/// A command runner runs the command that follows its OWN options. Walking
+/// those options (rather than bailing on the first `-`) is what keeps
+/// `sudo -u me rm note.md`, the canonical `find … -print0 | xargs -0 rm` idiom,
+/// and `nice -n 10 bash -c 'rm note.md'` in view.
+///
+/// **One peel for every executable position cadence-hooks knows about** — a
+/// segment head, a `find` exec-family action, and the wrapper hunt in
+/// [`shell_c_argument_tokens`]. Those positions ran different models before, and
+/// each divergence was its own hole: the exec window read the literal next word,
+/// so `find … -exec git rm {} \;` went unjudged (#528 review I1); the wrapper
+/// hunt refused at a runner's first option, so `nice -n 10 bash -c 'rm note.md'`
+/// hid its shell while `nice -n 10 rm note.md` — the same flag, the same
+/// grammar, one position over — blocked (#528 review C-D1). A second copy of a
+/// peel is how each gap opened.
+///
+/// **This feeds DETECTORS in every position, which is what makes the walk safe
+/// to widen.** At a verb gate the peel exposes a verb that was already going to
+/// run. At the wrapper hunt it only ADDS segments to `command_segments`' "every
+/// command that will actually execute" view — an over-eager skip costs an extra
+/// segment to inspect, a missed one costs the inner script's visibility to every
+/// guard that segments. [`TRANSPARENT`] is the opposite case and must stay
+/// narrow: it decides *which verb runs* for `enforce_worktree` and `guard_rm`,
 /// where a wrong skip resolves the wrong command word, so it excludes `sudo`
-/// deliberately and must keep excluding it. Same question, different
-/// consequence: ask which one you are in before reusing either set.
+/// deliberately. Same question, different consequence — ask which one you are in
+/// before reusing either.
 ///
-/// The direction is not unconditional, which is why this stays a short list of
-/// words that genuinely exec their argument rather than every prefix-shaped
-/// token. `command_segments` feeds block-capable guards, so expanding a script
-/// the shell would NOT run could manufacture a false block — the cost of
-/// over-eagerness is bounded, not zero.
-///
-/// `sudo`'s own options are not parsed: the skip only fires when the next token
-/// is not a flag, so `sudo -u root bash -c '…'` stays unexpanded rather than
-/// risking a wrong resolution — the same refusal
-/// [`skip_transparent_prefixes`] makes, for the same reason.
-fn skip_expansion_prefixes(tokens: &[String]) -> &[String] {
+/// The direction is not unconditional, which is why [`COMMAND_RUNNERS`] stays a
+/// short list of words that genuinely exec their argument, and why
+/// [`skip_runner_flags`] refuses an unlisted option instead of guessing:
+/// expanding a script the shell would NOT run can manufacture a false block, so
+/// the cost of over-eagerness is bounded, not zero.
+pub fn peel_command_runners(tokens: &[String]) -> &[String] {
     let mut argv = skip_transparent_prefixes(tokens);
-    while argv.len() > 1 && command_word(&argv[0]) == "sudo" {
-        // Each pass consumes at least the `sudo` itself, so this terminates.
-        let Some(rest) = skip_sudo_no_argument_flags(&argv[1..]) else {
+    while let Some(first) = argv.first() {
+        let runner = command_word(first).into_owned();
+        if !COMMAND_RUNNERS.contains(&runner.as_str()) {
+            break;
+        }
+        let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
             break;
         };
+        // Each pass consumes at least the runner itself, so this ends.
         argv = skip_transparent_prefixes(rest);
     }
     argv
@@ -2392,54 +2644,297 @@ const SUDO_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
     "--shell",
 ];
 
-/// Walk `sudo`'s own options, returning the slice that begins at the command
-/// `sudo` will run — or `None` when a token cannot be classified, in which case
-/// the caller must not peel any further.
+/// `sudo` options that REQUIRE a value word, so the command is one token
+/// further along. Kept separate from the argument-free sets above because the
+/// two answer different questions: those decide whether the NEXT word is the
+/// command, these decide that it is a value and the command follows it.
+const SUDO_VALUE_SHORT_FLAGS: &str = "ug";
+const SUDO_VALUE_LONG_FLAGS: &[&str] = &["--user", "--group"];
+
+/// `xargs`' short options that take no argument of their own.
+const XARGS_NO_ARGUMENT_SHORT_FLAGS: &str = "0prtxo";
+
+/// `xargs`' short options that require a value, glued (`-n1`) or as the next
+/// word (`-n 1`). The optional-argument spellings (`-i`, `-l`, `-e`) are
+/// deliberately absent — with an optional argument nothing here can tell a
+/// value from the command, and guessing either way resolves the wrong word.
+const XARGS_VALUE_SHORT_FLAGS: &str = "nLIPdasE";
+
+/// `xargs`' long options that take no argument. The value-taking long
+/// spellings are reached only in their glued `--name=value` form (see the walk
+/// below); a bare one is refused, since GNU's optional-argument options
+/// (`--replace`, `--eof`, `--max-lines`) are spelled the same way as the
+/// required-argument ones and cannot be told apart here.
+const XARGS_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
+    "--null",
+    "--no-run-if-empty",
+    "--verbose",
+    "--exit",
+    "--interactive",
+    "--open-tty",
+];
+
+/// As much of one runner's option grammar as the walk below needs to find the
+/// command word behind it. Every field is deliberately an exhaustive list
+/// rather than a heuristic: an unlisted token refuses the walk, so a grammar
+/// that is merely incomplete costs a block and never invents one.
+struct RunnerGrammar {
+    /// Short flags taking no argument of their own, one character per flag.
+    no_arg_short: &'static str,
+    /// Short flags requiring a value, glued (`-n1`) or as the next word.
+    value_short: &'static str,
+    no_arg_long: &'static [&'static str],
+    value_long: &'static [&'static str],
+    /// `nice -10` / `nice --10` — an all-digit cluster IS the value, with no
+    /// flag letter in front of it, under either dash count. True only where the
+    /// runner accepts that spelling.
+    numeric_short_cluster: bool,
+    /// Positional words the runner consumes before the command, after its
+    /// options: `timeout 5 rm x` runs `rm`, not `5`.
+    operands_before_command: usize,
+}
+
+/// `nice`'s only command-relevant option. The adjustment is also spelled with
+/// no flag letter at all — GNU's bare `-10`, and BSD's doubled-dash `--10`,
+/// which `/usr/bin/nice` on macOS accepts and execs the utility behind (it
+/// warns `setpriority: Permission denied` for a negative adjustment and runs
+/// the command anyway). `numeric_short_cluster` covers both dash counts.
+const NICE_VALUE_SHORT_FLAGS: &str = "n";
+const NICE_VALUE_LONG_FLAGS: &[&str] = &["--adjustment"];
+
+/// `stdbuf`'s buffering options — all three take a value, glued (`-o0`) or as
+/// the next word (`-o 0`). It has no argument-free option that still runs a
+/// command.
+const STDBUF_VALUE_SHORT_FLAGS: &str = "ioe";
+const STDBUF_VALUE_LONG_FLAGS: &[&str] = &["--input", "--output", "--error"];
+
+/// `timeout`'s options. The DURATION operand is handled by
+/// `operands_before_command`, not here.
+const TIMEOUT_NO_ARGUMENT_SHORT_FLAGS: &str = "v";
+const TIMEOUT_VALUE_SHORT_FLAGS: &str = "ks";
+const TIMEOUT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--preserve-status", "--foreground", "--verbose"];
+const TIMEOUT_VALUE_LONG_FLAGS: &[&str] = &["--kill-after", "--signal"];
+
+/// `env`'s options, spanning both implementations: `-u -C -i -0 -v` are common,
+/// and `-P utilpath` is BSD-only — it is in `/usr/bin/env`'s own usage line on
+/// macOS (`env [-0iv] [-C workdir] [-P utilpath] [-S string] [-u name] …`) and
+/// absent from GNU's, where over-skipping it can only block an invocation GNU
+/// `env` rejects outright.
 ///
-/// **The refusal is the point, not a limitation.** Before this walk existed,
-/// ANY flag stopped the peel outright, so every flagged spelling hid the
-/// wrapper behind it — `sudo -E bash -c 'cat .env'` reached no guard while the
-/// unflagged form blocked (#497). Recognising the argument-free flags fixes
-/// that without giving up the never-guess property: an option that TAKES an
-/// argument makes the next word a value, not a command, so peeling past `-u`
-/// would resolve the wrong command word. `sudo -u root bash -c '…'` therefore
-/// stays unexpanded, and `-u/bin/bash` — which [`command_word`] would basename
-/// straight to `bash` — stays out of reach of a false block (#493).
+/// `-S`/`--split-string` is deliberately absent: it re-splits its value into
+/// the command line, so resolving a head word past it would be a guess. A bare
+/// `-` (an alias for `-i`) is likewise unmodelled — the walk refuses an empty
+/// short cluster.
+const ENV_NO_ARGUMENT_SHORT_FLAGS: &str = "i0v";
+const ENV_VALUE_SHORT_FLAGS: &str = "uCP";
+const ENV_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ignore-environment", "--null", "--debug"];
+const ENV_VALUE_LONG_FLAGS: &[&str] = &["--unset", "--chdir"];
+
+/// `git`'s global options — the ones that sit between `git` and its
+/// subcommand. `-C`/`-c` take a separate value word (git itself rejects the
+/// glued spelling, and consuming one anyway only over-skips). The
+/// optional-value spellings (`--exec-path`) are listed as argument-free so
+/// their glued form parses; the bare form prints and exits without running a
+/// subcommand, so over-skipping there costs nothing.
+const GIT_NO_ARGUMENT_SHORT_FLAGS: &str = "Ppvh";
+const GIT_VALUE_SHORT_FLAGS: &str = "Cc";
+const GIT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
+    "--no-pager",
+    "--paginate",
+    "--bare",
+    "--exec-path",
+    "--no-replace-objects",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--no-optional-locks",
+    "--no-lazy-fetch",
+    "--no-advice",
+];
+const GIT_VALUE_LONG_FLAGS: &[&str] = &[
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--attr-source",
+    "--config-env",
+];
+
+/// The option grammar for a runner this walk models, or `None` for any other
+/// verb.
+fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
+    let (no_arg_short, value_short, no_arg_long, value_long) = match verb {
+        "sudo" => (
+            SUDO_NO_ARGUMENT_SHORT_FLAGS,
+            SUDO_VALUE_SHORT_FLAGS,
+            SUDO_NO_ARGUMENT_LONG_FLAGS,
+            SUDO_VALUE_LONG_FLAGS,
+        ),
+        "xargs" => (
+            XARGS_NO_ARGUMENT_SHORT_FLAGS,
+            XARGS_VALUE_SHORT_FLAGS,
+            XARGS_NO_ARGUMENT_LONG_FLAGS,
+            &[] as &[&str],
+        ),
+        "nice" => (
+            "",
+            NICE_VALUE_SHORT_FLAGS,
+            &[] as &[&str],
+            NICE_VALUE_LONG_FLAGS,
+        ),
+        "stdbuf" => (
+            "",
+            STDBUF_VALUE_SHORT_FLAGS,
+            &[] as &[&str],
+            STDBUF_VALUE_LONG_FLAGS,
+        ),
+        "timeout" => (
+            TIMEOUT_NO_ARGUMENT_SHORT_FLAGS,
+            TIMEOUT_VALUE_SHORT_FLAGS,
+            TIMEOUT_NO_ARGUMENT_LONG_FLAGS,
+            TIMEOUT_VALUE_LONG_FLAGS,
+        ),
+        "env" => (
+            ENV_NO_ARGUMENT_SHORT_FLAGS,
+            ENV_VALUE_SHORT_FLAGS,
+            ENV_NO_ARGUMENT_LONG_FLAGS,
+            ENV_VALUE_LONG_FLAGS,
+        ),
+        "git" => (
+            GIT_NO_ARGUMENT_SHORT_FLAGS,
+            GIT_VALUE_SHORT_FLAGS,
+            GIT_NO_ARGUMENT_LONG_FLAGS,
+            GIT_VALUE_LONG_FLAGS,
+        ),
+        _ => return None,
+    };
+    Some(RunnerGrammar {
+        no_arg_short,
+        value_short,
+        no_arg_long,
+        value_long,
+        numeric_short_cluster: verb == "nice",
+        operands_before_command: usize::from(verb == "timeout"),
+    })
+}
+
+/// Walk a command runner's OWN options, returning the slice that begins at the
+/// command it will run — or `None` when a token cannot be classified, in which
+/// case the caller must not peel further. Modelled runners: `sudo`, `xargs`,
+/// `nice`, `stdbuf`, `timeout`, `env`, and `git` (whose "command" is its
+/// subcommand); any other verb returns `None`.
 ///
-/// Unknown flags are refused for the same reason: nothing here can know whether
-/// one consumes the word after it.
-fn skip_sudo_no_argument_flags(argv: &[String]) -> Option<&[String]> {
-    for (i, tok) in argv.iter().enumerate() {
+/// **This is now the ONLY runner walk, and the sudo-specific one it replaced is
+/// why that matters.** That walk (`skip_sudo_no_argument_flags`, removed here)
+/// fed `command_segments`' wrapper expansion and refused every value-taking
+/// option rather than guess, on the reasoning that an over-eager peel there can
+/// manufacture a false block on a script the shell never runs. The refusal cost
+/// more than it saved: a modelled runner carrying a flag hid the shell behind
+/// it, so `sudo -u me sh -c 'rm note.md'` and `nice -n 10 bash -c 'rm note.md'`
+/// were invisible to every guard that segments while the identical flags peeled
+/// correctly at the verb gate one position over — measured deleting real files
+/// (#528 review C-D1). Consuming a KNOWN value-taking flag with its value is
+/// knowledge, not a guess, and it is knowledge in both positions; what protects
+/// the expansion path is the refusal below on flags this does NOT model, which
+/// is unchanged.
+///
+/// Bailing on the first `-` instead is what un-blocked `sudo -u me rm note.md`
+/// and `find … -print0 | xargs -0 rm` — the canonical safe-for-spaces delete
+/// idiom — when `obsidian-trash-guard` moved to a head scan (#528 review C1).
+/// The `nice`/`stdbuf`/`timeout`/`env` arms close the "prefixes outside
+/// `TRANSPARENT`" half of that same finding: `TRANSPARENT` admits a prefix only
+/// while the next token is not an option, so `nice -n 10 rm x` and
+/// `env -i /bin/rm x` reached no verb gate at all (#528 review I1).
+pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [String]> {
+    let grammar = runner_grammar(verb)?;
+
+    let mut i = 0;
+    let rest = loop {
+        let tok = argv.get(i)?;
         // The first word that is not an option is the command being run.
         if !tok.starts_with('-') {
-            return Some(&argv[i..]);
+            break &argv[i..];
         }
         // `--` ends option parsing explicitly; the command follows it.
         if tok == "--" {
-            return argv.get(i + 1..);
+            break argv.get(i + 1..)?;
+        }
+        // `nice -10 rm x` / `nice --10 rm x`: the adjustment with no flag letter
+        // in front of it. Tested before the long-option branch because the
+        // doubled-dash spelling is not a long option — nothing follows the
+        // dashes but digits — and the branch below would refuse it as unknown.
+        if grammar.numeric_short_cluster {
+            let digits = tok.strip_prefix("--").unwrap_or(&tok[1..]);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                i += 1;
+                continue;
+            }
         }
         if tok.starts_with("--") {
-            // A glued value (`--preserve-env=PATH`) belongs to the flag, so the
-            // allowlist is tested against the name alone.
-            let name = tok.split_once('=').map_or(tok.as_str(), |(name, _)| name);
-            if !SUDO_NO_ARGUMENT_LONG_FLAGS.contains(&name) {
-                return None;
+            if let Some((name, _)) = tok.split_once('=') {
+                // A glued value belongs to the flag either way, so both
+                // classes consume exactly this token.
+                if !grammar.no_arg_long.contains(&name) && !grammar.value_long.contains(&name) {
+                    return None;
+                }
+                i += 1;
+                continue;
             }
-            continue;
-        }
-        // A short cluster is one flag per character; every one must be
-        // argument-free for the following word to still be the command.
-        let cluster = &tok[1..];
-        if cluster.is_empty()
-            || !cluster
-                .chars()
-                .all(|c| SUDO_NO_ARGUMENT_SHORT_FLAGS.contains(c))
-        {
+            if grammar.no_arg_long.contains(&tok.as_str()) {
+                i += 1;
+                continue;
+            }
+            if grammar.value_long.contains(&tok.as_str()) {
+                i += 2;
+                continue;
+            }
             return None;
         }
-    }
-    // Options all the way to the end: there is no command here to expand.
-    None
+        // A short cluster is one flag per character. A value-taking flag ends
+        // the cluster: whatever follows it inside the token is its glued value
+        // (`-n1`), and an empty remainder means the next word is (`-n 1`).
+        let cluster = &tok[1..];
+        if cluster.is_empty() {
+            return None;
+        }
+        let mut takes_next_word = false;
+        for (pos, c) in cluster.char_indices() {
+            if grammar.no_arg_short.contains(c) {
+                continue;
+            }
+            if grammar.value_short.contains(c) {
+                takes_next_word = pos + c.len_utf8() == cluster.len();
+                break;
+            }
+            // Unknown flag: nothing here can know whether it consumes the word
+            // after it, so refuse rather than resolve the wrong command word.
+            return None;
+        }
+        i += 1;
+        if takes_next_word {
+            i += 1;
+        }
+    };
+    // `timeout DURATION cmd` — a positional the runner consumes before the
+    // command. `get(0..)` on every other runner returns the slice unchanged.
+    rest.get(grammar.operands_before_command..)
+}
+
+/// Skip `git`'s global options so the slice begins at its SUBCOMMAND.
+///
+/// `git`'s globals sit in exactly the position a `argv[1] == "rm"` alias test
+/// reads, so without this `git -C . rm note.md` and `git --no-pager rm note.md`
+/// resolve their subcommand to `-C` and go unjudged while deleting the file
+/// (#528 review I2). Shared by `obsidian-trash-guard` and
+/// `prevent_secret_writes::writer_targets`, which had the identical gap.
+///
+/// Infallible by design: a token this cannot classify yields the argv it was
+/// handed, so a caller's plain `git rm` test keeps working unchanged. Both
+/// callers feed detectors, so an over-skip can only expose a subcommand that
+/// was already going to run.
+pub fn skip_git_global_options(argv: &[String]) -> &[String] {
+    skip_runner_flags("git", argv).unwrap_or(argv)
 }
 
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
@@ -2462,8 +2957,28 @@ fn skip_sudo_no_argument_flags(argv: &[String]) -> Option<&[String]> {
 /// The command word goes through [`command_word`] rather than a local
 /// basename, so `/bin/sh -c` keeps working and `\bash -c` starts working —
 /// same normalization every other verb gate uses.
+///
+/// **The prefix skip is [`peel_command_runners`] — the same peel the verb gates
+/// use, not a weaker local model.** It used to refuse at a runner's first
+/// option, so a modelled runner CARRYING A FLAG hid the shell behind it:
+/// `nice bash -c 'rm note.md'` expanded while `nice -n 10 bash -c 'rm note.md'`
+/// did not, and `env -i sh -c`, `sudo -u me sh -c`, `stdbuf -o0 sh -c` and
+/// `xargs -0 sh -c 'rm "$@"' _` were invisible the same way — every one of them
+/// measured deleting a real file, and every one of those flags already peeled
+/// correctly one position over at the verb gate (#528 review C-D1). The peel and
+/// the wrapper hunt disagreeing about the same grammar is the divergence this
+/// unification removes.
+///
+/// **[`strip_compound_heads`] runs first, for the same reason.** The verb gate
+/// strips shell keywords, `case` labels and function headers before it peels;
+/// this hunt did not, so a wrapper inside a compound body kept a segment head of
+/// `then`/`do`/`{`, the hunt returned `None`, and the inner script was never
+/// surfaced to any guard — `if true; then bash -c 'rm note.md'; fi`,
+/// `for f in a; do bash -c 'rm note.md'; done` and `(bash -c 'rm note.md')` all
+/// deleted a real file while the bare `rm` one position over blocked (#528
+/// review E). Idempotent, so a caller that already stripped loses nothing.
 fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
-    let tokens = skip_expansion_prefixes(tokens);
+    let tokens = peel_command_runners(strip_compound_heads(tokens));
     if !matches!(
         command_word(tokens.first()?).as_ref(),
         "sh" | "bash" | "zsh" | "dash"
@@ -2502,6 +3017,281 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- strip_leading_keywords / skip_runner_flags (#528 review C1) ---
+
+    fn words(command: &str) -> Vec<String> {
+        tokenize(command)
+    }
+
+    #[test]
+    fn strip_leading_keywords_exposes_the_verb_behind_a_keyword() {
+        for (segment, want_head) in [
+            ("do rm $f", "rm"),
+            ("then rm note.md", "rm"),
+            ("else rm note.md", "rm"),
+            ("elif rm note.md", "rm"),
+            ("while rm note.md", "rm"),
+            ("until rm note.md", "rm"),
+            ("if rm note.md", "rm"),
+            ("! rm note.md", "rm"),
+            ("do then rm note.md", "rm"),
+            // Not a keyword, and case-sensitive — `DO` is a command name.
+            ("DO rm note.md", "DO"),
+            ("cat note.md", "cat"),
+        ] {
+            let tokens = words(segment);
+            assert_eq!(
+                strip_leading_keywords(&tokens).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_leading_keywords_keeps_a_lone_keyword() {
+        // Nothing behind it to expose, so the slice must not empty out.
+        for segment in ["done", "fi", "!"] {
+            let tokens = words(segment);
+            assert_eq!(strip_leading_keywords(&tokens).len(), 1, "{segment}");
+        }
+    }
+
+    // --- executable_tokens / strip_compound_heads (#528 review E) ---
+
+    #[test]
+    fn executable_tokens_reaches_the_command_inside_a_compound_body() {
+        for (segment, want_head) in [
+            // Group punctuation, glued and standalone.
+            ("(bash -c 'rm note.md')", "bash"),
+            ("{ bash -c 'rm note.md'", "bash"),
+            ("{ { bash -c 'rm note.md'", "bash"),
+            ("((rm note.md))", "rm"),
+            // Reserved words.
+            ("then bash -c 'rm note.md'", "bash"),
+            ("do bash -c 'rm note.md'", "bash"),
+            ("then if true", "true"),
+            // A keyword in FRONT of glued punctuation — neither strip alone
+            // reaches this, which is why the two alternate.
+            ("do (bash -c 'rm note.md')", "bash"),
+            ("then ({ rm note.md", "rm"),
+            // `case` arms, mid-segment and as the segment head.
+            ("case x in x) bash -c 'rm note.md'", "bash"),
+            ("x) bash -c 'rm note.md'", "bash"),
+            ("case x in start) npm start", "npm"),
+            // Function headers, all three spellings, plus the body's brace.
+            ("f() { bash -c 'rm note.md'", "bash"),
+            ("f () { bash -c 'rm note.md'", "bash"),
+            ("function f { bash -c 'rm note.md'", "bash"),
+            ("function f () { rm note.md", "rm"),
+            ("my-deploy.v2() { rm note.md", "rm"),
+            // Nothing to strip.
+            ("rm note.md", "rm"),
+            ("git -C . status", "git"),
+        ] {
+            assert_eq!(
+                executable_tokens(segment).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_tokens_keeps_a_head_that_is_not_scaffolding() {
+        // The looser shapes must refuse rather than eat a real command word.
+        for (segment, want_head) in [
+            // A substitution is not a `case` pattern.
+            ("$(date) --version", "$(date)"),
+            // Nor is the tail of a subshell that spans two segments: in
+            // `(cd /x; ls) > out` the `)` closed the group and `ls` is the verb.
+            ("ls) > out", "ls)"),
+            ("ls) 2>&1", "ls)"),
+            ("x) --version", "x)"),
+            // A lone scaffolding word has nothing behind it to expose.
+            ("esac", "esac"),
+            ("done", "done"),
+            ("function", "function"),
+            // `strip_group_wrappers` trims the trailing `)` off a bare
+            // fragment; either spelling is a syntax fragment rather than a
+            // command, so what matters is that nothing resolves a verb.
+            ("f()", "f("),
+            ("case x in", "case"),
+            // `-c` is a flag, not a function name.
+            ("-c() { rm note.md", "-c()"),
+        ] {
+            assert_eq!(
+                executable_tokens(segment).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_tokens_keeps_the_operands_behind_the_head() {
+        // The strip must not eat a `)`-closing OPERAND while hunting a label:
+        // scanning forward for any `)`-terminated token would take the script.
+        assert_eq!(
+            executable_tokens("bash -c 'echo hi)'"),
+            vec!["bash".to_string(), "-c".into(), "echo hi)".into()]
+        );
+        // And the closing paren of a group must not ride along on the script.
+        assert_eq!(
+            executable_tokens("(bash -c 'rm note.md')"),
+            vec!["bash".to_string(), "-c".into(), "rm note.md".into()]
+        );
+    }
+
+    #[test]
+    fn strip_compound_heads_is_idempotent() {
+        // `child_scripts` hands in an already-stripped argv, so a second pass
+        // must be a no-op rather than eating the command word.
+        for segment in [
+            "do rm note.md",
+            "case x in x) rm note.md",
+            "f() { rm note.md",
+            "rm note.md",
+        ] {
+            let tokens = words(segment);
+            let once = strip_compound_heads(&tokens).to_vec();
+            assert_eq!(strip_compound_heads(&once), once.as_slice(), "{segment}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_walks_sudo_and_xargs_options() {
+        for (command, want_head) in [
+            ("sudo rm note.md", Some("rm")),
+            ("sudo -u me rm note.md", Some("rm")),
+            ("sudo --user=me rm note.md", Some("rm")),
+            ("sudo --user me rm note.md", Some("rm")),
+            ("sudo -E -u me rm note.md", Some("rm")),
+            ("sudo --preserve-env rm note.md", Some("rm")),
+            ("sudo -- rm note.md", Some("rm")),
+            ("xargs -0 rm", Some("rm")),
+            ("xargs -n1 rm note.md", Some("rm")),
+            ("xargs -n 1 rm note.md", Some("rm")),
+            ("xargs -0 -I {} rm {}", Some("rm")),
+            // Unknown flags stay refused — nothing here can know whether one
+            // consumes the word after it.
+            ("sudo --nonesuch rm note.md", None),
+            ("xargs --replace rm", None),
+            // Options all the way to the end: no command to resolve.
+            ("sudo -E", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_walks_the_prefix_families_outside_transparent() {
+        // `TRANSPARENT` admits `nice`/`env` only while the next token is not an
+        // option, and does not model `timeout`/`stdbuf` at all (#528 review I1).
+        for (command, want_head) in [
+            ("nice -n 10 rm note.md", Some("rm")),
+            ("nice -n10 rm note.md", Some("rm")),
+            ("nice --adjustment=10 rm note.md", Some("rm")),
+            ("nice --adjustment 10 rm note.md", Some("rm")),
+            // GNU spells the adjustment with no flag letter at all.
+            ("nice -10 rm note.md", Some("rm")),
+            ("stdbuf -o0 rm note.md", Some("rm")),
+            ("stdbuf -o 0 rm note.md", Some("rm")),
+            ("stdbuf -i0 -o0 -e0 rm note.md", Some("rm")),
+            ("stdbuf --output=0 rm note.md", Some("rm")),
+            // The DURATION operand is consumed before the command.
+            ("timeout 5 rm note.md", Some("rm")),
+            ("timeout -k 1 5 rm note.md", Some("rm")),
+            ("timeout --preserve-status 5 rm note.md", Some("rm")),
+            ("timeout --signal=KILL 5 rm note.md", Some("rm")),
+            ("env -i /bin/rm note.md", Some("/bin/rm")),
+            ("env -u FOO rm note.md", Some("rm")),
+            ("env --unset=FOO rm note.md", Some("rm")),
+            ("env -i FOO=bar rm note.md", Some("FOO=bar")),
+            // `-S` re-splits its value into the command line; resolving a head
+            // word past it would be a guess, so the walk refuses.
+            ("env -S 'rm note.md'", None),
+            ("timeout 5", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_walks_the_bsd_spellings_of_env_and_nice() {
+        // Both verified against the real tool on macOS rather than from memory:
+        // `-P utilpath` is in `/usr/bin/env`'s own usage line, and BSD `nice`
+        // takes the adjustment with a doubled dash (#528 review I2).
+        for (command, want_head) in [
+            ("env -P /bin rm note.md", Some("rm")),
+            ("env -P/bin rm note.md", Some("rm")),
+            ("env -iP /bin rm note.md", Some("rm")),
+            ("nice --10 rm note.md", Some("rm")),
+            ("nice --20 rm note.md", Some("rm")),
+            // A doubled-dash cluster that is not all digits is still an unknown
+            // long option, and an empty one is still the option terminator.
+            ("nice --wat rm note.md", None),
+            ("nice -- rm note.md", Some("rm")),
+            // Only `nice` spells an adjustment this way; the same shape on
+            // another runner must stay refused.
+            ("env --10 rm note.md", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_git_global_options_exposes_the_subcommand() {
+        for (command, want_head) in [
+            ("git rm note.md", "rm"),
+            ("git -C . rm note.md", "rm"),
+            ("git -C /vault/notes rm -r notes/", "rm"),
+            ("git --no-pager rm note.md", "rm"),
+            ("git -c core.pager=cat rm note.md", "rm"),
+            ("git --git-dir=.git rm note.md", "rm"),
+            ("git --git-dir .git rm note.md", "rm"),
+            ("git --work-tree=/vault rm note.md", "rm"),
+            ("git --namespace=ns rm note.md", "rm"),
+            ("git -P rm note.md", "rm"),
+            ("git -C . -c user.name=x --no-pager rm note.md", "rm"),
+            // Not a global option, so the slice is handed back untouched and a
+            // caller's subcommand test reads the same word it always did.
+            ("git status", "status"),
+            ("git -C . status", "status"),
+            ("git --nonesuch rm note.md", "--nonesuch"),
+        ] {
+            let tokens = words(command);
+            assert_eq!(
+                skip_git_global_options(&tokens[1..])
+                    .first()
+                    .map(String::as_str),
+                Some(want_head),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_refuses_verbs_it_does_not_model() {
+        let tokens = words("doas -u me rm note.md");
+        assert!(skip_runner_flags("doas", &tokens[1..]).is_none());
+    }
 
     // --- command_word (the one verb normalization) ---
 
@@ -4282,15 +5072,18 @@ mod tests {
             );
         }
 
-        // `sudo`'s own flags are not parsed, so this stays unexpanded rather
-        // than risking a wrong resolution — same refusal as
-        // skip_transparent_prefixes.
-        assert!(!command_segments("sudo -u root bash -c 'cat .env'").contains(&inner));
-        // The row above does NOT discriminate: deleting the `starts_with('-')`
-        // guard leaves it passing, because peeling `sudo` lands on `-u`, which
-        // is not a shell either way. This is the shape that kills that mutant —
-        // `command_word` basenames on `/`, so without the guard `-u/bin/bash`
-        // resolves to `bash` and the segment expands into a false block.
+        // `sudo`'s VALUE-taking flags are parsed now, so the wrapper behind one
+        // is expanded rather than hidden (#528 review C-D1) — sudo really does
+        // run it, and refusing here made `sudo -u me sh -c 'rm note.md'`
+        // invisible to every guard that segments.
+        assert!(command_segments("sudo -u root bash -c 'cat .env'").contains(&inner));
+        // The row above never discriminated on the `starts_with('-')` guard —
+        // peeling `sudo` lands on `-u`, which is not a shell either way. This
+        // is the shape that does: `command_word` basenames on `/`, so a peel
+        // that skipped `-u/bin/bash` without recognising it as `-u`'s GLUED
+        // VALUE would resolve `bash` and expand into a false block. Consuming
+        // it as a value lands on `-c`, which is not a shell — the same verdict
+        // for a better reason, and still the mutant-killing row.
         assert!(!command_segments("sudo -u/bin/bash -c 'cat .env'").contains(&inner));
         // Still not a wrapper just because a prefix precedes it.
         assert!(!command_segments("sudo echo 'cat .env'").contains(&inner));
@@ -4342,17 +5135,139 @@ mod tests {
             );
         }
 
-        // The never-guess property, preserved. `-u` TAKES an argument, so the
-        // word after it is a user name and peeling further would resolve the
-        // wrong command word. These are #493's discriminating negatives and
-        // they must stay red — an allowlist that degenerates into "skip
-        // anything starting with `-`" turns `-u/bin/bash` into a false block.
-        assert!(!command_segments("sudo -u root bash -c 'cat .env'").contains(&inner));
+        // `-u` TAKES an argument, and consuming a KNOWN value-taking flag WITH
+        // its value is knowledge, not a guess — so the wrapper behind it is
+        // expanded now (#528 review C-D1). The old refusal cost more than it
+        // saved: it hid `sudo -u me sh -c 'rm note.md'` from every guard that
+        // segments while `sudo -u me rm note.md` blocked at the verb gate one
+        // position over.
+        assert!(command_segments("sudo -u root bash -c 'cat .env'").contains(&inner));
+        // #493's discriminating negative, and still red: `-u/bin/bash` is `-u`
+        // with a GLUED value, so the command word is `-c` — not a shell. A peel
+        // that skipped the token without reading it as a value would basename
+        // it to `bash` and expand into a false block.
         assert!(!command_segments("sudo -u/bin/bash -c 'cat .env'").contains(&inner));
-        // An unknown flag is refused for the same reason: we cannot know
-        // whether it consumes the next word.
+        // An unknown flag is still refused: we cannot know whether it consumes
+        // the next word, and THAT is the never-guess property the widening
+        // above keeps intact.
         assert!(!command_segments("sudo -Z bash -c 'cat .env'").contains(&inner));
         assert!(!command_segments("sudo --unknown-flag bash -c 'cat .env'").contains(&inner));
+    }
+
+    #[test]
+    fn command_segments_expands_a_wrapper_behind_a_flagged_runner() {
+        // #528 review C-D1. The wrapper hunt refused at a modelled runner's
+        // first option while the verb gates walked that same option's grammar,
+        // so the shell behind it was invisible to every guard that segments —
+        // a one-token difference between `nice sh -c '…'` (expanded) and
+        // `nice -n 10 sh -c '…'` (not).
+        let inner = "cat .env".to_string();
+        for cmd in [
+            "nice -n 10 bash -c 'cat .env'",
+            "nice -10 bash -c 'cat .env'",
+            "nice --10 bash -c 'cat .env'",
+            "env -i sh -c 'cat .env'",
+            "env -u FOO sh -c 'cat .env'",
+            "env -P /bin sh -c 'cat .env'",
+            "stdbuf -o0 sh -c 'cat .env'",
+            "timeout 5 sh -c 'cat .env'",
+            "timeout -k 1 5 sh -c 'cat .env'",
+            "xargs -0 sh -c 'cat .env'",
+            "xargs -I{} sh -c 'cat .env'",
+            "sudo -u me sh -c 'cat .env'",
+            "nice -n 10 sudo -E bash -c 'cat .env'", // stacked
+        ] {
+            assert!(
+                command_segments(cmd).contains(&inner),
+                "{cmd:?} did not surface the inner script"
+            );
+        }
+
+        // Controls: an option OUTSIDE the modelled grammar still refuses the
+        // walk, which is the never-guess property the widening keeps. And a
+        // runner that reports without executing (`sudo -l`) must not have its
+        // operand expanded — the shell never runs it.
+        for cmd in [
+            "nice ---10 sh -c 'cat .env'",
+            "env -S 'sh -c \"cat .env\"'",
+            "sudo -Z sh -c 'cat .env'",
+            "sudo -l sh -c 'cat .env'",
+        ] {
+            assert!(
+                !command_segments(cmd).contains(&inner),
+                "{cmd:?} must not be expanded"
+            );
+        }
+    }
+
+    #[test]
+    fn peel_command_runners_resolves_the_command_behind_a_flagged_runner() {
+        for (command, want_head) in [
+            ("nice -n 10 bash", Some("bash")),
+            ("env -i /bin/sh", Some("/bin/sh")),
+            ("sudo -u me sh", Some("sh")),
+            ("stdbuf -o0 rm", Some("rm")),
+            ("timeout -k 1 5 rm", Some("rm")),
+            ("xargs -0 rm", Some("rm")),
+            ("nice -n 10 env -i sudo -u me rm", Some("rm")),
+            ("command nice -n 10 rm", Some("rm")),
+            ("FOO=1 nice -n 10 rm", Some("rm")),
+            // `git` is NOT a command runner: it runs a subcommand from its own
+            // fixed set, so peeling its globals here would drop a subcommand
+            // name into an executable position it never occupies.
+            ("git -C . rm note.md", Some("git")),
+            // Unmodelled option: refuse the walk rather than resolve a wrong
+            // head word. Refusing leaves the RUNNER as the head — `nice` is not
+            // a delete verb or a shell, so every gate downstream reads it as
+            // "nothing resolved here" rather than as `rm`.
+            ("nice -é rm", Some("nice")),
+            // Options all the way down — nothing to resolve, argv unchanged.
+            ("nice -n", Some("nice")),
+            ("sudo -u", Some("sudo")),
+        ] {
+            let tokens = words(command);
+            assert_eq!(
+                peel_command_runners(&tokens).first().map(String::as_str),
+                want_head,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_segments_keeps_substitutions_on_a_wrapper_segment() {
+        // A `$(…)` runs in the PARENT before the wrapper is spawned, so the two
+        // COEXIST — `expand_segments` selected between them and dropped the
+        // substitution from every wrapper segment. `child_scripts` already
+        // unioned them (#228 review finding 2); this pins the segmenter
+        // agreeing with it.
+        let inner = "rm note.md".to_string();
+        for cmd in [
+            r#"bash -c 'echo hi' "$(rm note.md)""#,
+            "bash -c 'echo hi' `rm note.md`",
+            r#"nice -n 10 bash -c 'echo hi' "$(rm note.md)""#,
+            r#"sudo -u me bash -c 'echo hi' "$(rm note.md)""#,
+        ] {
+            assert!(
+                command_segments(cmd).contains(&inner),
+                "{cmd:?} dropped its command substitution"
+            );
+        }
+
+        // The wrapper script is still surfaced alongside it, so the union adds
+        // rather than replaces.
+        let segments = command_segments(r#"bash -c 'cat .env' "$(rm note.md)""#);
+        assert!(segments.contains(&"cat .env".to_string()));
+        assert!(segments.contains(&inner));
+
+        // Control: single quotes suppress a substitution in the PARENT, so a
+        // non-wrapper segment must not surface one. (The wrapper spelling
+        // `bash -c 'echo $(rm note.md)'` is deliberately NOT this control — the
+        // quotes stop the parent from running it, and then the CHILD shell runs
+        // it, so surfacing that one is correct.)
+        assert!(!command_segments(r#"echo 'literal $(rm note.md)'"#).contains(&inner));
+        // And the wrapper spelling above does surface it, one level down.
+        assert!(command_segments(r#"bash -c 'echo $(rm note.md)'"#).contains(&inner));
     }
 
     #[test]

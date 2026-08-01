@@ -82,7 +82,38 @@ review, install the official `security-guidance` plugin
 
 | Hook | Event | What it does |
 |------|-------|--------------|
-| `trash-guard` | PreToolUse (Bash) | Block `rm` in Obsidian vault (use .trash/ instead) |
+| `trash-guard` | PreToolUse (Bash) | Block destructive vault operations (`rm`, `git rm`, `unlink`, `shred`, `truncate`, `find -delete`, and clobber redirects); use `.trash/` instead |
+
+A verb counts only where the shell runs an executable, and there are two such
+positions: the head of a segment, and a `find` exec-family action
+(`-exec`/`-execdir`/`-ok`/`-okdir`). Both are read the same way — past the
+scaffolding of a compound statement (reserved words like `do`/`then`, the `( )`
+and `{ }` of a group, a `case` arm's pattern label, a function definition
+header), past transparent wrappers, past a command runner's own flags (`sudo`,
+`xargs`, `nice`, `stdbuf`, `timeout`, `env`), and past git's global options to
+its subcommand — so `git -C . rm x` and `find . -exec nice -n 10 rm {} \;` both
+count. An operand a command re-executes (`eval …`, `find … -exec sh -c '…'`) is
+scanned as a command in its own right, including behind those same runner flags
+— `nice -n 10 sh -c 'rm x'` and `find … -exec env -i sh -c 'rm x' \;` are read,
+not just the unflagged spellings. A command substitution runs in the parent
+shell before any wrapper is spawned, so `bash -c '…' "$(rm x)"` is scanned on
+both halves.
+
+**The two combine.** Scaffolding and a re-executed operand are read by one
+model, so `if true; then bash -c 'rm x'; fi`, `for f in a; do sh -c 'rm x'; done`
+and `(bash -c 'rm x')` are scanned exactly as `bash -c 'rm x'` is. Until 0.70.0
+they were not: the verb gate stripped the keyword and the hunt for a wrapper did
+not, so the combination was the one spelling that escaped.
+
+That is narrower than a scan of the whole command line, which is what this guard
+used before 0.70.0 — `echo rm` and `npm run format` no longer match, and neither
+does a verb reached by a spelling not listed above: one built by substitution
+(`` `echo rm` x ``, `$(echo rm) x`), one carried in a body this model does not
+treat as executed (a `trap` handler, a `coproc`), a deleting binary outside the
+verb list (`srm x`), or one behind a runner option the grammar does not model
+(`env -S 'rm x'`). A runner option the grammar cannot classify stops the scan
+rather than being guessed past, so an unmodelled spelling costs a block here and
+never creates a spurious one.
 
 ## metrics (cadence-metrics)
 

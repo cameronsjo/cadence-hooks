@@ -147,7 +147,156 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
   **The pre-filters were the half of this that unit tests could not see.** Four of those guards open with a cheap lowercase-only `contains("gh")` fast path, which returned Allow *before* the folded patterns could run — so `GH pr create` still measured Allow against the built binary with `is_write_command` and `token_is_gh` both already green. A pre-filter stricter than the matcher behind it is a silent veto; they now share one allocation-free `contains_ignoring_ascii_case`, and the assertion goes through `Check::run` so the veto cannot hide behind a green unit test again. The verb fold itself is likewise spelled once (`core::shell::fold_verb`) rather than hand-rolled in each guard that keeps a divergent local command word.
 
-  **Not swept:** roughly ten further guards gate on a lowercase verb literal in the same way and are untouched here — notably `obsidian::trash_guard`'s `contains("rm")` and `guard_push_remote`'s `contains("git push")`, both block-capable. They are independent of this change rather than left half-fixed by it, and want their own issue and their own before/after measurements.
+  **The follow-up verb-gate sweep closes the remaining measured case gaps**
+  (#502). Push, secret-write, vault-scan, PR-context, untracked-file, and
+  Obsidian trash checks now fold only the executable word while leaving flags,
+  subcommands, and operands byte-for-byte. End-to-end controls run through each
+  guard's `Check::run` entry point so an earlier case-sensitive prefilter cannot
+  veto the shared normalization.
+
+  **Three of those guards were also NARROWED in the same commit, and the fold
+  is not where that came from.** `obsidian-trash-guard`,
+  `warn-gh-merge-preflight`, and `warn-pr-issue-link` each opened with a
+  substring scan of the whole command (`command.contains("rm")`,
+  `contains("gh pr merge")`) and were rewritten to test the *segment head*
+  instead. That change is orthogonal to case and it only ever subtracts:
+  anything not in command-head position became invisible. Recorded explicitly
+  because the paragraph above, read alone, promises a monotone widening — a
+  reader diffing behavior against it would be misled about where every measured
+  regression in the #528 security review lives.
+
+  For the trash guard the removed shapes were real vault deletions, each one
+  confirmed deleting a file through `bash`: `git rm note.md`,
+  `sudo -u me rm note.md`, `find … -print0 | xargs -0 rm` (the canonical
+  safe-for-spaces delete idiom), `for f in *.md; do rm $f; done`,
+  `if true; then rm note.md; fi`, `eval rm note.md`, and
+  `find . -exec sh -c 'rm note.md' \;`. Nothing else caught them — `guard-rm`
+  gates dangerous *targets*, not vault recoverability. Every one of those seven
+  is blocked again: the head test now runs after
+  `core::shell::strip_leading_keywords` (a reserved word occupying the head
+  position), after a runner peel that walks the runner's OWN flags via
+  `core::shell::skip_runner_flags` rather than bailing on the first `-`, with
+  `git rm` aliased to `rm` exactly as `prevent_secret_writes` already spells it,
+  and with `eval`'s operand and a nested `sh -c` under `find -exec` routed back
+  through the same scan. Each row is pinned by a differential test driven
+  through `Check::run`.
+
+  **Two measured gaps in that first fix, both found by re-reviewing it.** The
+  runner peel covered `sudo`/`xargs` while `TRANSPARENT` admits `nice` and `env`
+  only until their own options appear and models `timeout`/`stdbuf` not at all,
+  so `nice -n 10 rm x`, `stdbuf -o0 rm x`, `timeout 5 rm x`, and
+  `env -i /bin/rm x` still reached no verb gate. And the `git rm` alias tested
+  the word immediately after `git`, which is exactly where git's own global
+  options sit — `git -C . rm note.md`, `git --no-pager rm note.md`,
+  `git -c core.pager=cat rm note.md` and four more spellings deleted the file
+  unjudged. `skip_runner_flags` now carries a grammar per runner (`nice`'s bare
+  `-10` adjustment, `timeout`'s positional DURATION, `env`'s assignment words),
+  and `core::shell::skip_git_global_options` skips git's globals before any
+  subcommand test. `prevent_secret_writes::writer_targets` — the precedent the
+  alias was copied from — had the identical `git` gap and calls the same helper,
+  so the two cannot drift apart again.
+
+  **A third re-review found the peel was installed at one executable position
+  and not the other.** A `find` exec-family action names a command the same way
+  a segment head does, but the window there read the literal next word — so
+  `find … -exec git rm {} \;`, which is plain `git rm`, and the seven runner
+  spellings beside it deleted the file unjudged while the head position blocked
+  every one. The two positions now share a single peel rather than each carrying
+  a model, which is the drift that opened the gap. Separately, two of the runner
+  grammars were short a real spelling of their own tool on macOS: `env`'s
+  `-P utilpath`, which is in `/usr/bin/env`'s own usage line, and BSD `nice`'s
+  doubled-dash adjustment (`nice --10`), which execs the utility after warning
+  about the priority. Both are now modelled and both were checked against the
+  tools' own usage output rather than from memory.
+
+  **A fourth re-review found the peel fed the verb test and nothing else, so a
+  modelled runner CARRYING A FLAG hid a shell wrapper at both positions.** The
+  wrapper hunt (`core::shell`'s `shell_c_argument_tokens`, reached from
+  `command_segments` and `child_scripts`) ran its own weaker model that admitted
+  `nice`/`env` only while the next token was not an option and refused every
+  value-taking `sudo` flag. So the verdict turned on one token —
+  `nice bash -c 'rm note.md'` blocked, `nice -n 10 bash -c 'rm note.md'` did
+  not — with the same flag peeling correctly at the verb gate one position over.
+  Twenty-four rows were `main` BLOCK → branch ALLOW; sixteen were measured
+  deleting a real file under `bash`. **This was never trash-guard's alone:** the
+  wrapper hunt is shared, so `sudo -u me bash -c 'cat .env'`,
+  `env -i sh -c 'op item list'`, `stdbuf -o0 sh -c 'git checkout -- .'` and
+  `xargs -I{} bash -c 'gh repo delete …'` were invisible to
+  `prevent-secret-leaks`, `prevent-secret-writes`, `git-safety`, `guard-gh-write`
+  and `guard-op-vault-scan` in the same way. All three executable positions now
+  share ONE peel, `core::shell::peel_command_runners`; the sudo-only walk beside
+  it is gone. Consuming a KNOWN value-taking flag with its value is knowledge in
+  the expansion path exactly as it is at a verb gate — what protects expansion is
+  the refusal on flags the grammar does NOT model, which is unchanged, so
+  `sudo -Z bash -c '…'` and `nice ---10 sh -c '…'` still stop the walk.
+
+  **And widening the hunt exposed a subtraction underneath it: a segment that is
+  a wrapper was losing its command substitutions.** `expand_segments` treated
+  "has a `-c` script" and "has a `$(…)` body" as alternatives, but a
+  substitution runs in the PARENT before the wrapper is spawned, so both
+  execute — `bash -c 'echo hi' "$(rm note.md)"` deletes the file and reached no
+  guard, on `main` too. The two are unioned now, which is what `child_scripts`
+  had already done for the same reason (#228). Without it, every runner spelling
+  the widened peel newly recognizes would have inherited the hole, and the
+  change would have shipped a guard more permissive than the one it replaced in
+  exactly the shape it existed to fix.
+
+  **Measured, not argued.** Every guard consuming the changed primitive was
+  enumerated and driven differentially — three binaries (`origin/main`, the
+  branch before this change, after) × 15 guards × 160 commands = 2,400 rows per
+  tree. Result: 72 blocks added, **0 blocks removed**, 0 nudges removed, 0
+  non-0/2 exits. The 15 rows still weaker than `main` are all present before this
+  change and are the deliberate narrowing (`npm run format`, `terraform destroy`,
+  `echo rm` no longer match a substring scan) or commands that do not execute at
+  all (`sudo -l`, `nice -é`). Three `guard-rm` rows escalate `Ask` → `Block`,
+  pinned as their own test so a regression to a waveable prompt is a failure.
+
+  **What stays open, so this list is not read as more than it is.** The head
+  model reaches a verb where the shell runs an executable; it does not reach a
+  verb built by substitution (`` `echo rm` x ``, `$(echo rm) x`), one carried in
+  a body the model does not treat as executed (a `trap` handler, a `coproc`), a
+  deleting binary outside the gated verb set (`srm`, `perl -e 'unlink'`), or one
+  behind a runner option spelling outside the modelled grammar — `env -S`, which
+  re-splits its value into the command line, is the deliberate case, and any
+  unlisted option of any modelled runner is the general one, since the walk
+  refuses a token it cannot classify rather than guess past it. That refusal is
+  why an incomplete grammar costs a block and never invents one, and it is why
+  this boundary is a class rather than a list: a spelling found later belongs to
+  it already. Those are tracked separately — each needs a decision about how far
+  a head model should follow a shell, not another peel arm. `docs/hooks.md`
+  names the same boundary for the operator. **That boundary describes the HEAD
+  model only** — the wrapper hunt behind it ran a weaker model of the same
+  grammars, so options well inside this list (`-n 10`, `-i`, `-u FOO`,
+  `-P /bin`, `-o0`) still hid a `sh -c`, and compound bodies well inside it
+  (`if`, `for`, `until`, `case`, `( )`, `{ }`, a function body) hid one too,
+  until the two entries below unified the models. This paragraph named `case`
+  and `function` as open while the verb gate already read `do`/`then`, which is
+  the shape of the confusion: the boundary belongs to a pre-processing model,
+  and there was more than one.
+
+  **What stays removed is the false-positive class the narrowing was for.**
+  `npm run format` and `terraform destroy` inside a vault blocked under the old
+  substring scan and are measured Allow now; both are pinned as controls, so a
+  future widening cannot quietly restore the substring detector with them.
+
+  The two nudge-only guards keep the narrowing for now — `sudo gh pr merge`,
+  `GH_TOKEN=x gh pr create`, and the keyword-wrapped spellings no longer nudge,
+  which is a missed reminder rather than an unguarded write. That has its own
+  tracking issue rather than being fixed here, so the block-capable regression
+  above lands on its own. `guard_push_remote`'s hand-rolled `(?i:\bgit)` verb
+  fold — a fourth normalization of "which verb is this?" beside `command_word`,
+  which the same review flagged — is likewise left alone and tracked as
+  cameronsjo/cadence-hooks#539.
+
+- **A shell wrapper inside a compound statement or a group is expanded, so `if`, `for`, `until`, `while`, `case`, `( )`, `{ }` and a function body stop hiding one.** The verb gate stripped shell scaffolding before it read a command word — `strip_group_wrappers` for `(`/`{`, `strip_leading_keywords` for `do`/`then` — so `if true; then rm note.md; fi` and `(rm note.md)` were judged. The wrapper hunt one position over, `core::shell::expand_segments` → `shell_c_argument_tokens`, stripped neither. So the segment head stayed `then` / `do` / `(bash`, the hunt returned `None`, and the inner script was never surfaced to any guard: `(bash -c 'rm note.md')`, `{ bash -c 'rm note.md'; }`, `if true; then bash -c 'rm note.md'; fi`, `for f in a; do bash -c 'rm note.md'; done`, `until`, `case x in x) …;; esac` and `f() { … }` were all `main` BLOCK → branch ALLOW, and every one was measured deleting a real file under `bash`. Two positions running two pre-processing models, on the same grammar — the identical shape as the runner-flag entry above, one layer over, and the fourth time this branch has closed it.
+
+  **The hunt is shared, so this was never trash-guard's alone, and for the other guards it was a hole on `main` too.** `(bash -c 'git reset --hard HEAD~3')` reached no `git-safety`; `{ sh -c 'gh pr merge …'; }` reached no `guard-gh-write`; `for f in a; do sh -c 'op item list'; done` reached no `guard-op-vault-scan`; `(bash -c 'cat .env')` reached no `prevent-secret-leaks`; and `if true; then nice -n 10 bash -c 'rm -rf ~/Documents'; fi` reached no `guard-rm` — which survived `( )` on its own group strip but not `if`/`then`. All five block now.
+
+  **One pre-processing model, in one function.** `core::shell::executable_tokens` reduces a segment to the tokens of the command that will run, and both positions call it. Neither half is sufficient alone and the order is not enough either: the string-level `strip_group_wrappers` is the only thing that can reach punctuation `tokenize` glues to a word (`(bash` is one token, and the closing `)` rides on the last one, so a token-level strip returns a script carrying a stray paren), while the new `strip_compound_heads` is the only thing that can reach a reserved word, a `case` arm's pattern label, or a function definition header. Run once each in either order they still miss the composition — `do (bash -c 'rm note.md')` keeps a glued `(` once `do` is gone — so `executable_tokens` alternates them to a fixpoint. `case` and function headers are new to the verb gate as well, since it now reads the same function; the two positions cannot drift again without changing one call.
+
+  **Widening a shared primitive, measured rather than argued.** Every consumer of `command_segments` / `child_scripts` / `shell_c_argument_tokens` was enumerated (`trash-guard`, `guard-rm`, `prevent-secret-leaks`, `prevent-secret-writes`, `git-safety`, `redact-external-content`, `guard-gh-dangerous`, `guard-gh-write`, `guard-op-vault-scan`, `warn-untracked`, `warn-pr-issue-link`, `warn-gh-merge-preflight`, `warn-going-public`, `inject-gh-write-context`, `enforce-worktree`) and driven differentially against an `origin/main` binary: 15 guards × 112 commands = 1,680 cells, **13 verdicts strengthened, 0 weakened by this change**, 0 non-0/2 exits. The inverted risk — a consumer using segments to satisfy an *exemption*, where more segments could subtract a block — was checked at `prevent_secret_leaks`' `.envrc` carve-out and `prevent_secret_writes`' exemptions and holds: both aggregate by OR, and `command_has_cd` is computed from the raw command string, so segmentation cannot change its input. A primitive-level differential over 156 commands confirms **0 segments and 0 substitution bodies lost**, 57 added — the `#528` substitution union is intact. The 6 rows still weaker than `main` all predate this change and are the deliberate narrowing (`npm run format`, `terraform destroy`, `git commit -m 'rm the old notes'`, and a delete verb quoted as prose).
+
+  **What the strip refuses, so widening a detector does not eat a command word.** A `case` label must be a single `)`-terminated token where the grammar puts one — after `in`, or at the segment head — because scanning forward for any `)`-terminated token takes the script out of `bash -c 'echo hi)'`. The bare head form additionally refuses a label carrying `(`, `$` or a backtick, and refuses one followed by a redirect or a flag: `(cd /x; ls) > out` segments as `ls) > out`, where the `)` closed a subshell and `ls` is the verb, not a pattern. A function header must have a name that starts with a letter or `_`, so `-c()` is a flag rather than a definition. Compound bodies the model still does not treat as executed — a `trap` handler, a `coproc` — stay open and are named as a class in the boundary above.
 
 - **`split_segments` honors backslash escapes, so a segment boundary means what the shell means by it (cameronsjo/cadence-hooks#475).** The splitter cut at every newline with no continuation awareness and toggled quote state on every `"` regardless of a preceding backslash — while `tokenize`, the parser that reads the resulting segment's words, does both correctly. Two parsers disagreeing about where a word ends is a boundary the shell does not have, and any guard that reasons per segment inherits it.
 

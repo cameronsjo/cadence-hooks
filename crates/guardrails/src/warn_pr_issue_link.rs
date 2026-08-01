@@ -9,8 +9,21 @@
 //! is not false-flagged.
 
 use crate::issue_refs::has_closing_keyword;
-use cadence_hooks_core::shell::{strip_quotes, tokenize};
+use cadence_hooks_core::shell::{command_segments, command_word, strip_group_wrappers, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+
+/// True when an executable segment invokes the literal `pr create` subcommand
+/// on a `gh` command word. Only the command word folds.
+fn is_gh_pr_create(command: &str) -> bool {
+    command_segments(command).into_iter().any(|segment| {
+        let tokens = tokenize(strip_group_wrappers(&segment));
+        tokens
+            .first()
+            .is_some_and(|first| command_word(first).as_ref() == "gh")
+            && tokens.get(1).map(String::as_str) == Some("pr")
+            && tokens.get(2).map(String::as_str) == Some("create")
+    })
+}
 
 /// Extract the path argument from `--body-file <path>`, `--body-file=<path>`,
 /// or `-F <path>`.
@@ -49,9 +62,8 @@ pub(crate) enum BodyFile {
 /// Pure decision function. Returns `Some(nudge_message)` when the PR body has
 /// no closing keyword, `None` when it does (or when the check doesn't apply).
 pub(crate) fn judge_pr_create(command: &str, body_file: &BodyFile) -> Option<String> {
-    // Only guard `gh pr create`. Strip quoted regions first so text like
-    // `echo "gh pr create ..."` is treated as data, not a command.
-    if !strip_quotes(command).contains("gh pr create") {
+    // Only guard an executable `gh pr create`; quoted prose is one argument.
+    if !is_gh_pr_create(command) {
         return None;
     }
 
@@ -95,8 +107,8 @@ impl Check for WarnPrIssueLink {
             return CheckResult::allow();
         };
 
-        // Fast-path: not a gh pr create (quoted occurrences are data, not commands)
-        if !strip_quotes(command).contains("gh pr create") {
+        // Fast-path: not an executable gh pr create.
+        if !is_gh_pr_create(command) {
             return CheckResult::allow();
         }
 
@@ -377,6 +389,22 @@ mod tests {
             r#"gh pr create --title "my PR" --body "no issue link""#,
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn check_nudges_case_folded_pr_create_without_keyword() {
+        let result = WarnPrIssueLink.run(&make_bash(
+            r#"GH pr create --title "my PR" --body "no issue link""#,
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn check_does_not_fold_pr_subcommand() {
+        let result = WarnPrIssueLink.run(&make_bash(
+            r#"GH PR create --title "my PR" --body "no issue link""#,
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
