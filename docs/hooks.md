@@ -84,17 +84,23 @@ review, install the official `security-guidance` plugin
 |------|-------|--------------|
 | `trash-guard` | PreToolUse (Bash) | Block destructive vault operations (`rm`, `git rm`, `unlink`, `shred`, `truncate`, `find -delete`, and clobber redirects); use `.trash/` instead |
 
-A verb counts only where the shell runs an executable: the head of a segment
-(after reserved words like `do`/`then`, transparent wrappers, and a command
-runner's own flags — `sudo`, `xargs`, `nice`, `stdbuf`, `timeout`, `env`), a
-`git` subcommand behind git's global options (`git -C . rm x`), a `find`
-exec-family action, or an operand a command re-executes (`eval …`,
-`find … -exec sh -c '…'`). That is narrower than a scan of the whole command
-line, which is what this guard used before 0.70.0 — `echo rm` and
-`npm run format` no longer match, and neither does a verb reached by a spelling
-not listed above: one built by substitution (`` `echo rm` x ``, `$(echo rm) x`),
-one carried in a `trap`/`case` body, or a deleting binary outside the verb list
-(`srm x`).
+A verb counts only where the shell runs an executable, and there are two such
+positions: the head of a segment, and a `find` exec-family action
+(`-exec`/`-execdir`/`-ok`/`-okdir`). Both are read the same way — past reserved
+words like `do`/`then`, past transparent wrappers, past a command runner's own
+flags (`sudo`, `xargs`, `nice`, `stdbuf`, `timeout`, `env`), and past git's
+global options to its subcommand — so `git -C . rm x` and
+`find . -exec nice -n 10 rm {} \;` both count. An operand a command re-executes
+(`eval …`, `find … -exec sh -c '…'`) is scanned as a command in its own right.
+
+That is narrower than a scan of the whole command line, which is what this guard
+used before 0.70.0 — `echo rm` and `npm run format` no longer match, and neither
+does a verb reached by a spelling not listed above: one built by substitution
+(`` `echo rm` x ``, `$(echo rm) x`), one carried in a `trap`/`case` body, a
+deleting binary outside the verb list (`srm x`), or one behind a runner option
+the grammar does not model (`env -S 'rm x'`). A runner option the grammar
+cannot classify stops the scan rather than being guessed past, so an unmodelled
+spelling costs a block here and never creates a spurious one.
 
 ## metrics (cadence-metrics)
 

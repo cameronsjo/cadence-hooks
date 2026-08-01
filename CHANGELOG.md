@@ -166,13 +166,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   alias was copied from — had the identical `git` gap and calls the same helper,
   so the two cannot drift apart again.
 
+  **A third re-review found the peel was installed at one executable position
+  and not the other.** A `find` exec-family action names a command the same way
+  a segment head does, but the window there read the literal next word — so
+  `find … -exec git rm {} \;`, which is plain `git rm`, and the seven runner
+  spellings beside it deleted the file unjudged while the head position blocked
+  every one. The two positions now share a single peel rather than each carrying
+  a model, which is the drift that opened the gap. Separately, two of the runner
+  grammars were short a real spelling of their own tool on macOS: `env`'s
+  `-P utilpath`, which is in `/usr/bin/env`'s own usage line, and BSD `nice`'s
+  doubled-dash adjustment (`nice --10`), which execs the utility after warning
+  about the priority. Both are now modelled and both were checked against the
+  tools' own usage output rather than from memory.
+
   **What stays open, so this list is not read as more than it is.** The head
   model reaches a verb where the shell runs an executable; it does not reach a
   verb built by substitution (`` `echo rm` x ``, `$(echo rm) x`), one carried in
-  a `trap`/`case`/`coproc`/`function` body, or a deleting binary outside the
-  gated verb set (`srm`, `perl -e 'unlink'`). Those are tracked separately —
-  each needs a decision about how far a head model should follow a shell, not
-  another peel arm. `docs/hooks.md` names the same boundary for the operator.
+  a `trap`/`case`/`coproc`/`function` body, a deleting binary outside the gated
+  verb set (`srm`, `perl -e 'unlink'`), or one behind a runner option spelling
+  outside the modelled grammar — `env -S`, which re-splits its value into the
+  command line, is the deliberate case, and any unlisted option of any modelled
+  runner is the general one, since the walk refuses a token it cannot classify
+  rather than guess past it. That refusal is why an incomplete grammar costs a
+  block and never invents one, and it is why this boundary is a class rather
+  than a list: a spelling found later belongs to it already. Those are tracked
+  separately — each needs a decision about how far a head model should follow a
+  shell, not another peel arm. `docs/hooks.md` names the same boundary for the
+  operator.
 
   **What stays removed is the false-positive class the narrowing was for.**
   `npm run format` and `terraform destroy` inside a vault blocked under the old

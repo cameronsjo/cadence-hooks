@@ -2455,16 +2455,20 @@ struct RunnerGrammar {
     value_short: &'static str,
     no_arg_long: &'static [&'static str],
     value_long: &'static [&'static str],
-    /// `nice -10` — an all-digit short cluster IS the value, with no flag
-    /// letter in front of it. True only where the runner accepts that spelling.
+    /// `nice -10` / `nice --10` — an all-digit cluster IS the value, with no
+    /// flag letter in front of it, under either dash count. True only where the
+    /// runner accepts that spelling.
     numeric_short_cluster: bool,
     /// Positional words the runner consumes before the command, after its
     /// options: `timeout 5 rm x` runs `rm`, not `5`.
     operands_before_command: usize,
 }
 
-/// `nice`'s only command-relevant option. GNU also spells the adjustment as a
-/// bare `-10`, which `numeric_short_cluster` covers.
+/// `nice`'s only command-relevant option. The adjustment is also spelled with
+/// no flag letter at all — GNU's bare `-10`, and BSD's doubled-dash `--10`,
+/// which `/usr/bin/nice` on macOS accepts and execs the utility behind (it
+/// warns `setpriority: Permission denied` for a negative adjustment and runs
+/// the command anyway). `numeric_short_cluster` covers both dash counts.
 const NICE_VALUE_SHORT_FLAGS: &str = "n";
 const NICE_VALUE_LONG_FLAGS: &[&str] = &["--adjustment"];
 
@@ -2481,12 +2485,18 @@ const TIMEOUT_VALUE_SHORT_FLAGS: &str = "ks";
 const TIMEOUT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--preserve-status", "--foreground", "--verbose"];
 const TIMEOUT_VALUE_LONG_FLAGS: &[&str] = &["--kill-after", "--signal"];
 
-/// `env`'s options. `-S`/`--split-string` is deliberately absent: it re-splits
-/// its value into the command line, so resolving a head word past it would be a
-/// guess. A bare `-` (an alias for `-i`) is likewise unmodelled — the walk
-/// refuses an empty short cluster.
+/// `env`'s options, spanning both implementations: `-u -C -i -0 -v` are common,
+/// and `-P utilpath` is BSD-only — it is in `/usr/bin/env`'s own usage line on
+/// macOS (`env [-0iv] [-C workdir] [-P utilpath] [-S string] [-u name] …`) and
+/// absent from GNU's, where over-skipping it can only block an invocation GNU
+/// `env` rejects outright.
+///
+/// `-S`/`--split-string` is deliberately absent: it re-splits its value into
+/// the command line, so resolving a head word past it would be a guess. A bare
+/// `-` (an alias for `-i`) is likewise unmodelled — the walk refuses an empty
+/// short cluster.
 const ENV_NO_ARGUMENT_SHORT_FLAGS: &str = "i0v";
-const ENV_VALUE_SHORT_FLAGS: &str = "uC";
+const ENV_VALUE_SHORT_FLAGS: &str = "uCP";
 const ENV_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ignore-environment", "--null", "--debug"];
 const ENV_VALUE_LONG_FLAGS: &[&str] = &["--unset", "--chdir"];
 
@@ -2617,6 +2627,17 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
         if tok == "--" {
             break argv.get(i + 1..)?;
         }
+        // `nice -10 rm x` / `nice --10 rm x`: the adjustment with no flag letter
+        // in front of it. Tested before the long-option branch because the
+        // doubled-dash spelling is not a long option — nothing follows the
+        // dashes but digits — and the branch below would refuse it as unknown.
+        if grammar.numeric_short_cluster {
+            let digits = tok.strip_prefix("--").unwrap_or(&tok[1..]);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                i += 1;
+                continue;
+            }
+        }
         if tok.starts_with("--") {
             if let Some((name, _)) = tok.split_once('=') {
                 // A glued value belongs to the flag either way, so both
@@ -2643,11 +2664,6 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
         let cluster = &tok[1..];
         if cluster.is_empty() {
             return None;
-        }
-        // `nice -10 rm x`: the adjustment with no flag letter in front of it.
-        if grammar.numeric_short_cluster && cluster.chars().all(|c| c.is_ascii_digit()) {
-            i += 1;
-            continue;
         }
         let mut takes_next_word = false;
         for (pos, c) in cluster.char_indices() {
@@ -2847,6 +2863,34 @@ mod tests {
             // word past it would be a guess, so the walk refuses.
             ("env -S 'rm note.md'", None),
             ("timeout 5", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_walks_the_bsd_spellings_of_env_and_nice() {
+        // Both verified against the real tool on macOS rather than from memory:
+        // `-P utilpath` is in `/usr/bin/env`'s own usage line, and BSD `nice`
+        // takes the adjustment with a doubled dash (#528 review I2).
+        for (command, want_head) in [
+            ("env -P /bin rm note.md", Some("rm")),
+            ("env -P/bin rm note.md", Some("rm")),
+            ("env -iP /bin rm note.md", Some("rm")),
+            ("nice --10 rm note.md", Some("rm")),
+            ("nice --20 rm note.md", Some("rm")),
+            // A doubled-dash cluster that is not all digits is still an unknown
+            // long option, and an empty one is still the option terminator.
+            ("nice --wat rm note.md", None),
+            ("nice -- rm note.md", Some("rm")),
+            // Only `nice` spells an adjustment this way; the same shape on
+            // another runner must stay refused.
+            ("env --10 rm note.md", None),
         ] {
             let tokens = words(command);
             let verb = command_word(&tokens[0]).into_owned();

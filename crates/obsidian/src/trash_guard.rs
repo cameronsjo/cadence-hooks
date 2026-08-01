@@ -35,13 +35,65 @@ const MAX_NESTED_DEPTH: usize = 3;
 
 /// Destructive-command gate: shapes that delete or zero a vault file,
 /// bypassing Obsidian's `.trash/`. Verbs are matched only where the shell runs
-/// an executable: the segment head (after shell keywords, transparent
-/// wrappers, and a command runner's own flags), a `find` exec-family action, or
-/// an operand a command re-executes (`eval`, `find … -exec sh -c`). A
-/// path-qualified invocation (`/bin/unlink`) is caught, while prose or a
-/// filename argument such as `echo RM` or `shredder.md` is not.
+/// an executable, which is two positions — the segment head (after shell
+/// keywords) and a `find` exec-family action — read through the SAME
+/// [`peel_to_command`]/[`head_deletes`] pair, plus an operand a command
+/// re-executes (`eval`, `find … -exec sh -c`). A path-qualified invocation
+/// (`/bin/unlink`) is caught, while prose or a filename argument such as
+/// `echo RM` or `shredder.md` is not.
 fn is_destructive(command: &str) -> bool {
     is_destructive_at(command, 0)
+}
+
+/// Peel transparent prefixes and command runners off the front of an executable
+/// position, returning the slice that begins at the command that will run.
+///
+/// A command runner runs the command that follows its OWN options. Skipping
+/// those options (rather than bailing on the first `-`) is what keeps
+/// `sudo -u me rm note.md` and the canonical `find … -print0 | xargs -0 rm`
+/// idiom in view.
+///
+/// **One peel for every executable position this guard knows about** — the
+/// segment head and a `find` exec-family action. Those two ran different models
+/// before: the exec window read the literal next word, so
+/// `find … -exec git rm {} \;` — plain `git rm`, the first row of the finding
+/// this guard's head peel exists to close — went unjudged while deleting the
+/// file (#528 review I1). A second copy of a peel is how that gap opened.
+fn peel_to_command(argv: &[String]) -> &[String] {
+    let mut argv = skip_transparent_prefixes(argv);
+    while let Some(first) = argv.first() {
+        let runner = command_word(first).into_owned();
+        if !COMMAND_RUNNERS.contains(&runner.as_str()) {
+            break;
+        }
+        let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
+            break;
+        };
+        // Each pass consumes at least the runner itself, so this ends.
+        argv = skip_transparent_prefixes(rest);
+    }
+    argv
+}
+
+/// True when the command at the head of an already-peeled `argv` deletes or
+/// zeroes the file it is handed.
+///
+/// `git rm` is judged as `rm` — it deletes the working-tree file the same way.
+/// Same alias, same case-SENSITIVE subcommand spelling, as
+/// `prevent_secret_writes::writer_targets`. `git`'s global options sit between
+/// the verb and the subcommand, so `git -C . rm note.md` is read past them
+/// rather than resolving its subcommand to `-C` (#528 review I2).
+fn head_deletes(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    let verb = command_word(first);
+    DESTRUCTIVE_VERBS.contains(&verb.as_ref())
+        || (verb == "git"
+            && skip_git_global_options(&argv[1..])
+                .first()
+                .map(String::as_str)
+                == Some("rm"))
 }
 
 /// Worker for [`is_destructive`]; `depth` bounds the re-executed-operand walk.
@@ -51,42 +103,14 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         // Keywords first: `for f in *.md; do rm $f; done` segments as
         // `do rm $f`, so without this the head word is `do` and the `rm`
         // behind it is never examined.
-        let mut argv = skip_transparent_prefixes(strip_leading_keywords(&tokens));
-        // A command runner runs the command that follows its OWN options.
-        // Skipping those options (rather than bailing on the first `-`) is what
-        // keeps `sudo -u me rm note.md` and the canonical
-        // `find … -print0 | xargs -0 rm` idiom in view.
-        while let Some(first) = argv.first() {
-            let runner = command_word(first).into_owned();
-            if !COMMAND_RUNNERS.contains(&runner.as_str()) {
-                break;
-            }
-            let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
-                break;
-            };
-            // Each pass consumes at least the runner itself, so this ends.
-            argv = skip_transparent_prefixes(rest);
+        let argv = peel_to_command(strip_leading_keywords(&tokens));
+        if head_deletes(argv) {
+            return true;
         }
         let Some(first) = argv.first() else {
             continue;
         };
         let verb = command_word(first);
-        if DESTRUCTIVE_VERBS.contains(&verb.as_ref()) {
-            return true;
-        }
-        // `git rm` is judged as `rm` — it deletes the working-tree file the
-        // same way. Same alias, same case-SENSITIVE subcommand spelling, as
-        // `prevent_secret_writes::writer_targets`. `git`'s global options sit
-        // between the verb and the subcommand, so `git -C . rm note.md` is read
-        // past them rather than resolving its subcommand to `-C` (#528 I2).
-        if verb == "git"
-            && skip_git_global_options(&argv[1..])
-                .first()
-                .map(String::as_str)
-                == Some("rm")
-        {
-            return true;
-        }
         // `eval` re-executes its operand, so scan that operand as a command in
         // its own right — the head word of the segment is `eval`, and the verb
         // it runs is invisible to a head test.
@@ -99,33 +123,33 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         }
         // `find … -delete` — `find` alone is read-only; only `-delete`
         // destroys. Exec-family actions name another executable position, so
-        // inspect the word immediately after the action rather than every
-        // operand in the segment.
+        // inspect what follows the action rather than every operand in the
+        // segment.
         if verb == "find" {
             if argv.iter().any(|token| token == "-delete") {
                 return true;
             }
-            if argv.windows(2).any(|pair| {
-                EXEC_ACTIONS.contains(&pair[0].as_str())
-                    && DESTRUCTIVE_VERBS.contains(&command_word(&pair[1]).as_ref())
-            }) {
-                return true;
-            }
-            // An exec action can name a shell instead of the verb itself
-            // (`-exec sh -c 'rm …'`). `command_segments` only unwraps a
-            // wrapper at the segment head, so the nested script is expanded
-            // here, from the action's own argument list.
-            if depth < MAX_NESTED_DEPTH {
-                for (i, token) in argv.iter().enumerate() {
-                    if !EXEC_ACTIONS.contains(&token.as_str()) {
-                        continue;
-                    }
-                    if child_scripts(&argv[i + 1..], "")
+            for (i, token) in argv.iter().enumerate() {
+                if !EXEC_ACTIONS.contains(&token.as_str()) {
+                    continue;
+                }
+                // The action's argument list is an executable position like any
+                // other, so it gets the SAME peel the segment head gets —
+                // otherwise `-exec git rm {} \;` and `-exec nice -n 10 rm {} \;`
+                // read their verb as `git`/`nice` and go unjudged.
+                if head_deletes(peel_to_command(&argv[i + 1..])) {
+                    return true;
+                }
+                // An exec action can name a shell instead of the verb itself
+                // (`-exec sh -c 'rm …'`). `command_segments` only unwraps a
+                // wrapper at the segment head, so the nested script is expanded
+                // here, from the action's own argument list.
+                if depth < MAX_NESTED_DEPTH
+                    && child_scripts(&argv[i + 1..], "")
                         .iter()
                         .any(|script| is_destructive_at(script, depth + 1))
-                    {
-                        return true;
-                    }
+                {
+                    return true;
                 }
             }
         }
@@ -605,6 +629,72 @@ mod tests {
                 outcome_in_vault(command),
                 cadence_hooks_core::Outcome::Block,
                 "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn find_exec_action_peels_runners_and_git_inside_vault_blocked() {
+        // A `find` exec action is an executable position like the segment head,
+        // but read the literal next word until now — so every peel the head
+        // gained (runner flags, `git`'s globals) was absent one position in
+        // (#528 review I1). Each row was measured deleting a real file through
+        // `bash`; the first is plain `git rm`, the row this guard's alias
+        // exists for, reached through the exec position.
+        for command in [
+            r"find . -name note.md -exec git rm {} \;",
+            r"find . -name note.md -exec git -C . rm {} \;",
+            r"find . -name note.md -exec sudo rm {} \;",
+            r"find . -name note.md -exec nice -n 10 rm {} \;",
+            r"find . -name note.md -exec env -i /bin/rm {} \;",
+            r"find . -name note.md -exec stdbuf -o0 rm {} \;",
+            "find . -name note.md -exec nice -n 10 rm {} +",
+            r"find . -name note.md -execdir nice -n 10 rm {} \;",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_runner_option_spellings_rm_inside_vault_blocked() {
+        // Two spellings the runner grammars missed, both verified against the
+        // real tool on macOS — `-P utilpath` is in `/usr/bin/env`'s own usage
+        // line, and BSD `nice` accepts the doubled-dash adjustment (it warns
+        // `setpriority: Permission denied` and execs the utility anyway). Each
+        // was measured deleting a real file through `bash`.
+        for command in [
+            "env -P /bin rm note.md",
+            "env -P/bin rm note.md",
+            "nice --10 rm note.md",
+            "nice --20 rm note.md",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn find_exec_action_peels_do_not_invent_verbs() {
+        // Controls for the exec-position peel: the same shapes in front of a
+        // harmless command must stay Allow, so widening the exec window does
+        // not turn `find … -exec <anything> …` into a block.
+        for command in [
+            r"find . -name '*.md' -exec cat {} \;",
+            r"find . -name '*.md' -exec git status {} \;",
+            r"find . -name '*.md' -exec nice -n 10 cat {} \;",
+            r"find . -name '*.md' -exec env -i /bin/cat {} \;",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must stay allowed"
             );
         }
     }
