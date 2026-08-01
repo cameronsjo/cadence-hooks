@@ -209,6 +209,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   about the priority. Both are now modelled and both were checked against the
   tools' own usage output rather than from memory.
 
+  **A fourth re-review found the peel fed the verb test and nothing else, so a
+  modelled runner CARRYING A FLAG hid a shell wrapper at both positions.** The
+  wrapper hunt (`core::shell`'s `shell_c_argument_tokens`, reached from
+  `command_segments` and `child_scripts`) ran its own weaker model that admitted
+  `nice`/`env` only while the next token was not an option and refused every
+  value-taking `sudo` flag. So the verdict turned on one token —
+  `nice bash -c 'rm note.md'` blocked, `nice -n 10 bash -c 'rm note.md'` did
+  not — with the same flag peeling correctly at the verb gate one position over.
+  Twenty-four rows were `main` BLOCK → branch ALLOW; sixteen were measured
+  deleting a real file under `bash`. **This was never trash-guard's alone:** the
+  wrapper hunt is shared, so `sudo -u me bash -c 'cat .env'`,
+  `env -i sh -c 'op item list'`, `stdbuf -o0 sh -c 'git checkout -- .'` and
+  `xargs -I{} bash -c 'gh repo delete …'` were invisible to
+  `prevent-secret-leaks`, `prevent-secret-writes`, `git-safety`, `guard-gh-write`
+  and `guard-op-vault-scan` in the same way. All three executable positions now
+  share ONE peel, `core::shell::peel_command_runners`; the sudo-only walk beside
+  it is gone. Consuming a KNOWN value-taking flag with its value is knowledge in
+  the expansion path exactly as it is at a verb gate — what protects expansion is
+  the refusal on flags the grammar does NOT model, which is unchanged, so
+  `sudo -Z bash -c '…'` and `nice ---10 sh -c '…'` still stop the walk.
+
+  **And widening the hunt exposed a subtraction underneath it: a segment that is
+  a wrapper was losing its command substitutions.** `expand_segments` treated
+  "has a `-c` script" and "has a `$(…)` body" as alternatives, but a
+  substitution runs in the PARENT before the wrapper is spawned, so both
+  execute — `bash -c 'echo hi' "$(rm note.md)"` deletes the file and reached no
+  guard, on `main` too. The two are unioned now, which is what `child_scripts`
+  had already done for the same reason (#228). Without it, every runner spelling
+  the widened peel newly recognizes would have inherited the hole, and the
+  change would have shipped a guard more permissive than the one it replaced in
+  exactly the shape it existed to fix.
+
+  **Measured, not argued.** Every guard consuming the changed primitive was
+  enumerated and driven differentially — three binaries (`origin/main`, the
+  branch before this change, after) × 15 guards × 160 commands = 2,400 rows per
+  tree. Result: 72 blocks added, **0 blocks removed**, 0 nudges removed, 0
+  non-0/2 exits. The 15 rows still weaker than `main` are all present before this
+  change and are the deliberate narrowing (`npm run format`, `terraform destroy`,
+  `echo rm` no longer match a substring scan) or commands that do not execute at
+  all (`sudo -l`, `nice -é`). Three `guard-rm` rows escalate `Ask` → `Block`,
+  pinned as their own test so a regression to a waveable prompt is a failure.
+
   **What stays open, so this list is not read as more than it is.** The head
   model reaches a verb where the shell runs an executable; it does not reach a
   verb built by substitution (`` `echo rm` x ``, `$(echo rm) x`), one carried in
@@ -222,7 +264,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   than a list: a spelling found later belongs to it already. Those are tracked
   separately — each needs a decision about how far a head model should follow a
   shell, not another peel arm. `docs/hooks.md` names the same boundary for the
-  operator.
+  operator. **That boundary describes the HEAD model only** — the wrapper hunt
+  behind it ran a weaker model of the same grammars, so options well inside this
+  list (`-n 10`, `-i`, `-u FOO`, `-P /bin`, `-o0`) still hid a `sh -c` until the
+  entry below unified the two.
 
   **What stays removed is the false-positive class the narrowing was for.**
   `npm run format` and `terraform destroy` inside a vault blocked under the old

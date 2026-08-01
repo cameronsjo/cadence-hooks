@@ -310,14 +310,19 @@ impl Check for GhDangerousGuard {
         // Coarse wrapper pass, kept ALONGSIDE the per-segment loop rather than
         // replaced by it. `command_segments` expands a wrapper only when it can
         // classify every prefix flag it must peel past, and it deliberately
-        // refuses to guess (`shell.rs`, `skip_expansion_prefixes`) — so
-        // `sudo -u root bash -c '<delete>'`, `stdbuf -o0 bash -c '…'` and
-        // `xargs -I{} bash -c '…'` never reach the loop as segments even though
-        // bash executes the delete. That refusal is only safe because this
-        // coarser pass catches them anyway: a literal `bash -c` in the
+        // refuses to guess (`shell.rs`, `peel_command_runners`) — so a runner
+        // option spelling outside the modelled grammar (`env -S 'bash -c …'`,
+        // an unlisted flag) still never reaches the loop as a segment even
+        // though bash executes the delete. That refusal is only safe because
+        // this coarser pass catches them anyway: a literal `bash -c` in the
         // quote-stripped text plus `gh repo delete` in the raw text is enough,
-        // no peeling required (security review, PR #527). It only ever adds
-        // blocks; its one known false positive is
+        // no peeling required (security review, PR #527). The three spellings
+        // this comment used to name — `sudo -u root bash -c '<delete>'`,
+        // `stdbuf -o0 bash -c '…'`, `xargs -I{} bash -c '…'` — DO reach the loop
+        // now that the wrapper hunt walks the same runner grammars the verb
+        // gates do (#528 review C-D1); they are still pinned by test here,
+        // because this arm remains the one that holds when the peel refuses.
+        // It only ever adds blocks; its one known false positive is
         // `bash -c 'echo hi' '<delete>'`, where the extra argument becomes `$1`
         // and never runs — the accepted price for an irreversible operation.
         let stripped_command = strip_quotes(command);
@@ -661,6 +666,56 @@ mod tests {
 
     fn outcome(cmd: &str) -> cadence_hooks_core::Outcome {
         GhDangerousGuard.run(&make_bash(cmd)).outcome
+    }
+
+    #[test]
+    fn flagged_runner_wrapper_delete_reaches_the_segment_loop() {
+        // These three spellings used to be caught ONLY by the coarse wrapper
+        // pass, because the segmenter refused to peel a modelled runner's
+        // options. They reach the per-segment loop now (#528 review C-D1).
+        // Kept as tests rather than deleted alongside the comment that named
+        // them: the coarse arm is still the one that holds when the peel
+        // refuses, and these rows are how a regression in either arm surfaces.
+        for command in [
+            "sudo -u root bash -c 'gh repo delete owner/repo --yes'",
+            "stdbuf -o0 bash -c 'gh repo delete owner/repo --yes'",
+            "xargs -I{} bash -c 'gh repo delete owner/repo --yes'",
+            "nice -n 10 bash -c 'gh repo delete owner/repo --yes'",
+            "env -i sh -c 'gh repo delete owner/repo --yes'",
+        ] {
+            assert_eq!(
+                outcome(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn flagged_runner_widening_does_not_invent_a_repo_delete() {
+        // The same runners in front of a benign `gh` command must stay Allow —
+        // a widened peel produces more segments, and more segments must not
+        // become more matches on text that names no deletion.
+        for command in [
+            "sudo -u root bash -c 'gh repo view owner/repo'",
+            "stdbuf -o0 bash -c 'gh pr list'",
+            "nice -n 10 bash -c 'gh repo clone owner/repo'",
+            "env -i sh -c 'gh repo edit owner/repo --description x'",
+            "xargs -I{} bash -c 'gh repo rename newname'",
+            // Deliberately NOT a control here: any command whose raw text
+            // spells `gh repo delete`, even inside an `echo`, blocks on every
+            // tree including `origin/main` and with no wrapper at all. That is
+            // this guard's standing over-block on an irreversible operation
+            // named in raw text — measured identical across main, the branch
+            // before this change, and after — so it says nothing about the
+            // peel and would make a false control.
+        ] {
+            assert_eq!(
+                outcome(command),
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must stay allowed"
+            );
+        }
     }
 
     #[test]

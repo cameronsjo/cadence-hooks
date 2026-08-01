@@ -799,8 +799,9 @@ fn bash_leaks_secrets(command: &str, cwd: Option<&str>) -> Option<CheckResult> {
         // trusted to equal `input.cwd`.
         let command_has_cd = command_changes_directory(command);
         // #508: segmented from the ORIGINAL `command`, NOT `lower`.
-        // `command_segments`'s sudo-flag peel (`skip_sudo_no_argument_flags`)
-        // matches `SUDO_NO_ARGUMENT_SHORT_FLAGS` case-SENSITIVELY, on
+        // `command_segments`'s sudo-flag peel (`peel_command_runners` →
+        // `skip_runner_flags`) matches `SUDO_NO_ARGUMENT_SHORT_FLAGS`
+        // case-SENSITIVELY, on
         // purpose — sudo's own grammar is case-load-bearing (`-P` takes no
         // argument, `-p` takes a prompt string), so folding past the verb
         // cannot represent that distinction (#503 already forbids widening
@@ -1119,7 +1120,7 @@ mod tests {
     // ---------------------------------------------------------------
     // #508: this file lowercased the WHOLE command before segmenting it
     // (`command_segments(&lower)`), so `core::shell`'s sudo-flag peel
-    // (`skip_sudo_no_argument_flags`, matched against `SUDO_NO_ARGUMENT_
+    // (`peel_command_runners`, matched against `SUDO_NO_ARGUMENT_
     // SHORT_FLAGS = "AbEHiknPSs"` case-SENSITIVELY, on purpose — sudo's own
     // grammar is case-load-bearing, `-P` takes no argument while `-p` takes a
     // prompt string) never saw the flags the user actually typed. `-A` → `-a`,
@@ -2465,6 +2466,54 @@ mod tests {
         // `.envrc` stays dangerous (preserves today's coverage).
         let result = SecretLeaksGuard.run(&make_bash_input("cat .envrc"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn flagged_runner_no_longer_hides_a_wrapper_read() {
+        // This guard is a `command_segments` CONSUMER, and the segmenter's
+        // wrapper hunt used to refuse at a modelled runner's first option — so
+        // the read inside `nice -n 10 bash -c 'cat .env'` reached no guard at
+        // all, while the unflagged `nice bash -c 'cat .env'` blocked (#528
+        // review C-D1). Same shape as the #497 `sudo -E` finding, one flag
+        // class over.
+        for command in [
+            "nice -n 10 bash -c 'cat .env'",
+            "sudo -u me bash -c 'cat .env'",
+            "env -i sh -c 'cat .env'",
+            "stdbuf -o0 sh -c 'cat .env'",
+            "timeout 5 sh -c 'cat .env'",
+            "xargs -0 sh -c 'cat .env'",
+            "nice -n 10 sudo -E bash -c 'cat .env'",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(command)).outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn flagged_runner_widening_does_not_narrow_the_exemptions() {
+        // The direction check that matters for a SHARED primitive: this guard
+        // reaches its metadata-safe allowlist and its `.envrc` carve-out
+        // through the same segments. More segments must not buy an exemption —
+        // a metadata-only verb stays Allow behind a flagged runner for the
+        // reason it is Allow anywhere (it emits no contents), and a `cat` of a
+        // secret behind the same runner still blocks.
+        for command in [
+            "nice -n 10 bash -c 'ls -la .env'",
+            "sudo -u me sh -c 'stat .env'",
+            "env -i sh -c 'wc -l .env'",
+            "stdbuf -o0 sh -c 'direnv allow .envrc'",
+            "nice -n 10 bash -c 'cat settings.environment'",
+        ] {
+            assert_eq!(
+                SecretLeaksGuard.run(&make_bash_input(command)).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must stay allowed"
+            );
+        }
     }
 
     // ---------------------------------------------------------------

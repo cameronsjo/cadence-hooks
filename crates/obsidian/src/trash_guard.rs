@@ -8,21 +8,13 @@
 
 use cadence_hooks_core::shell::{
     child_scripts, clobber_redirect_targets, command_segments, command_word, looks_absolute,
-    skip_git_global_options, skip_runner_flags, skip_transparent_prefixes, strip_group_wrappers,
-    strip_leading_keywords, tokenize,
+    peel_command_runners, skip_git_global_options, strip_group_wrappers, strip_leading_keywords,
+    tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, normalize_path};
 
 /// Verbs that delete or zero the file they are handed.
 const DESTRUCTIVE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
-
-/// Verbs that run the command following their OWN options. `sudo` and `xargs`
-/// sit outside `core::shell::TRANSPARENT` by design; `nice` and `env` are in it
-/// but are admitted there only while the next token is not an option, and
-/// `timeout`/`stdbuf` are not modelled there at all. Each one's flag grammar is
-/// walked by `skip_runner_flags`, which is what keeps `sudo -u me rm note.md`,
-/// `nice -n 10 rm note.md`, and `env -i /bin/rm note.md` in view.
-const COMMAND_RUNNERS: &[&str] = &["sudo", "xargs", "nice", "stdbuf", "timeout", "env"];
 
 /// `find` actions that name a second executable position.
 const EXEC_ACTIONS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir"];
@@ -37,42 +29,12 @@ const MAX_NESTED_DEPTH: usize = 3;
 /// bypassing Obsidian's `.trash/`. Verbs are matched only where the shell runs
 /// an executable, which is two positions — the segment head (after shell
 /// keywords) and a `find` exec-family action — read through the SAME
-/// [`peel_to_command`]/[`head_deletes`] pair, plus an operand a command
+/// [`peel_command_runners`]/[`head_deletes`] pair, plus an operand a command
 /// re-executes (`eval`, `find … -exec sh -c`). A path-qualified invocation
 /// (`/bin/unlink`) is caught, while prose or a filename argument such as
 /// `echo RM` or `shredder.md` is not.
 fn is_destructive(command: &str) -> bool {
     is_destructive_at(command, 0)
-}
-
-/// Peel transparent prefixes and command runners off the front of an executable
-/// position, returning the slice that begins at the command that will run.
-///
-/// A command runner runs the command that follows its OWN options. Skipping
-/// those options (rather than bailing on the first `-`) is what keeps
-/// `sudo -u me rm note.md` and the canonical `find … -print0 | xargs -0 rm`
-/// idiom in view.
-///
-/// **One peel for every executable position this guard knows about** — the
-/// segment head and a `find` exec-family action. Those two ran different models
-/// before: the exec window read the literal next word, so
-/// `find … -exec git rm {} \;` — plain `git rm`, the first row of the finding
-/// this guard's head peel exists to close — went unjudged while deleting the
-/// file (#528 review I1). A second copy of a peel is how that gap opened.
-fn peel_to_command(argv: &[String]) -> &[String] {
-    let mut argv = skip_transparent_prefixes(argv);
-    while let Some(first) = argv.first() {
-        let runner = command_word(first).into_owned();
-        if !COMMAND_RUNNERS.contains(&runner.as_str()) {
-            break;
-        }
-        let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
-            break;
-        };
-        // Each pass consumes at least the runner itself, so this ends.
-        argv = skip_transparent_prefixes(rest);
-    }
-    argv
 }
 
 /// True when the command at the head of an already-peeled `argv` deletes or
@@ -103,7 +65,7 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
         // Keywords first: `for f in *.md; do rm $f; done` segments as
         // `do rm $f`, so without this the head word is `do` and the `rm`
         // behind it is never examined.
-        let argv = peel_to_command(strip_leading_keywords(&tokens));
+        let argv = peel_command_runners(strip_leading_keywords(&tokens));
         if head_deletes(argv) {
             return true;
         }
@@ -137,15 +99,25 @@ fn is_destructive_at(command: &str, depth: usize) -> bool {
                 // other, so it gets the SAME peel the segment head gets —
                 // otherwise `-exec git rm {} \;` and `-exec nice -n 10 rm {} \;`
                 // read their verb as `git`/`nice` and go unjudged.
-                if head_deletes(peel_to_command(&argv[i + 1..])) {
+                let action_argv = peel_command_runners(&argv[i + 1..]);
+                if head_deletes(action_argv) {
                     return true;
                 }
                 // An exec action can name a shell instead of the verb itself
                 // (`-exec sh -c 'rm …'`). `command_segments` only unwraps a
                 // wrapper at the segment head, so the nested script is expanded
                 // here, from the action's own argument list.
+                //
+                // The PEELED slice is handed over, so the verb test and the
+                // wrapper test read the same window. `child_scripts` peels
+                // again internally and the peel is idempotent, so this is
+                // belt-and-suspenders rather than the only guard rope — but it
+                // is the rope that does not depend on a callee's internals: a
+                // reader here can see that `-exec nice -n 10 sh -c '…'` reaches
+                // the wrapper hunt without going and checking what
+                // `child_scripts` happens to strip today.
                 if depth < MAX_NESTED_DEPTH
-                    && child_scripts(&argv[i + 1..], "")
+                    && child_scripts(action_argv, "")
                         .iter()
                         .any(|script| is_destructive_at(script, depth + 1))
                 {
@@ -676,6 +648,148 @@ mod tests {
                 outcome_in_vault(command),
                 cadence_hooks_core::Outcome::Block,
                 "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn modelled_runner_with_a_flag_does_not_hide_a_shell_wrapper() {
+        // #528 review C-D1. `peel_to_command` fed only the VERB test; the
+        // wrapper hunt ran its own weaker model that refused at a runner's
+        // first option — so the one-token difference between
+        // `nice bash -c 'rm note.md'` (Block) and
+        // `nice -n 10 bash -c 'rm note.md'` (Allow) decided whether a
+        // measured deletion was seen, even though `nice -n 10 rm note.md`
+        // blocked at the verb gate with the SAME flag. Every row below was
+        // measured deleting a real file through `bash`.
+        for command in [
+            "nice -n 10 bash -c 'rm note.md'",
+            "nice -n10 bash -c 'rm note.md'",
+            "nice -10 bash -c 'rm note.md'",
+            "nice --10 bash -c 'rm note.md'",
+            "nice --adjustment 10 bash -c 'rm note.md'",
+            "env -i sh -c 'rm note.md'",
+            "env -u FOO sh -c 'rm note.md'",
+            "env -P /bin sh -c 'rm note.md'",
+            "env -P/bin sh -c 'rm note.md'",
+            "env -0 sh -c 'rm note.md'",
+            "sudo -u me sh -c 'rm note.md'",
+            "sudo --user=me sh -c 'rm note.md'",
+            "stdbuf -o0 sh -c 'rm note.md'",
+            "stdbuf -o 0 sh -c 'rm note.md'",
+            "timeout 5 sh -c 'rm note.md'",
+            "timeout -k 1 5 sh -c 'rm note.md'",
+            // The canonical null-delimited idiom, wrapped: the script reads
+            // its operands from `"$@"`, so no delete verb is ever spelled at
+            // an executable position the head scan can see.
+            r#"xargs -0 sh -c 'rm "$@"' _"#,
+            "xargs -I{} sh -c 'rm note.md'",
+            "xargs -n1 sh -c 'rm note.md'",
+            // Stacked runners, and a runner mixed with a transparent prefix
+            // or an assignment word — the peel must survive every layer.
+            "nice -n 10 env -i sh -c 'rm note.md'",
+            "sudo -u me nice -n 10 sh -c 'rm note.md'",
+            "env -i sudo -u me sh -c 'rm note.md'",
+            "command nice -n 10 sh -c 'rm note.md'",
+            "exec nice -n 10 sh -c 'rm note.md'",
+            "FOO=1 nice -n 10 sh -c 'rm note.md'",
+            "nice -n 10 FOO=1 sh -c 'rm note.md'",
+            // Every shell spelling the wrapper hunt recognizes, behind a flag.
+            "nice -n 10 /bin/sh -c 'rm note.md'",
+            "nice -n 10 zsh -c 'rm note.md'",
+            "nice -n 10 dash -c 'rm note.md'",
+            "nice -n 10 bash -lc 'rm note.md'",
+            "nice -n 10 bash -c -- 'rm note.md'",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn find_exec_action_with_a_flagged_runner_does_not_hide_a_shell_wrapper() {
+        // The same finding at the second executable position. The exec window
+        // handed `child_scripts` the UNPEELED slice, so a flagged runner in
+        // front of the shell hid the script there too. Each row was measured
+        // deleting a real file through `bash`.
+        for command in [
+            r"find . -name note.md -exec nice -n 10 bash -c 'rm note.md' \;",
+            r"find . -name note.md -exec nice -10 bash -c 'rm note.md' \;",
+            r"find . -name note.md -exec nice --10 bash -c 'rm note.md' \;",
+            r"find . -name note.md -exec env -i sh -c 'rm note.md' \;",
+            r"find . -name note.md -exec env -u FOO sh -c 'rm note.md' \;",
+            r"find . -name note.md -exec env -P /bin sh -c 'rm note.md' \;",
+            r"find . -name note.md -exec stdbuf -o0 sh -c 'rm note.md' \;",
+            r"find . -name note.md -exec sudo -u me sh -c 'rm note.md' \;",
+            r"find . -name note.md -exec timeout 5 sh -c 'rm note.md' \;",
+            r"find . -name note.md -execdir nice -n 10 sh -c 'rm note.md' \;",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapper_segment_still_owes_its_command_substitutions() {
+        // A `$(…)` runs in the PARENT before the wrapper is spawned, so a
+        // segment can be a wrapper AND carry a substitution. `expand_segments`
+        // treated the two as alternatives and dropped the substitution from
+        // every wrapper segment — `bash -c 'echo hi' "$(rm note.md)"` deletes
+        // the file (measured through `bash`) and reached no guard, and each
+        // runner spelling the widened peel newly recognizes would have
+        // inherited the same hole.
+        for command in [
+            r#"bash -c 'echo hi' "$(rm note.md)""#,
+            r#"nice bash -c 'echo hi' "$(rm note.md)""#,
+            r#"nice -n 10 bash -c 'echo hi' "$(rm note.md)""#,
+            r#"sudo -u me bash -c 'echo hi' "$(rm note.md)""#,
+            "nice -n 10 bash -c 'echo hi' `rm note.md`",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_hunt_peel_does_not_invent_verbs() {
+        // Controls for the widened wrapper hunt, in three groups.
+        for command in [
+            // 1. The same flagged runners in front of a harmless script.
+            "nice -n 10 bash -c 'echo hello'",
+            "env -i sh -c 'ls -la'",
+            "sudo -u me sh -c 'cat README.md'",
+            "stdbuf -o0 sh -c 'npm run format'",
+            "timeout 5 sh -c 'terraform fmt'",
+            r#"xargs -0 sh -c 'echo "$@"' _"#,
+            // 2. Runner options the grammar does NOT model still refuse the
+            //    walk rather than resolving a wrong head word.
+            "nice -é rm note.md",
+            "env -é sh -c 'rm note.md'",
+            "nice ---10 sh -c 'rm note.md'",
+            "nice - rm note.md",
+            // 3. `sudo -l`/`-V` REPORT and never exec, so the script behind
+            //    them is not a command the shell runs — peeling there would
+            //    manufacture a block on something that cannot delete.
+            "sudo -l sh -c 'rm note.md'",
+            "sudo -V sh -c 'rm note.md'",
+            // Truncated tails must not panic or invent a verb.
+            "nice -n",
+            "env -i",
+            "sudo -u",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must stay allowed"
             );
         }
     }

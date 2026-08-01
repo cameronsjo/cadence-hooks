@@ -91,7 +91,11 @@ words like `do`/`then`, past transparent wrappers, past a command runner's own
 flags (`sudo`, `xargs`, `nice`, `stdbuf`, `timeout`, `env`), and past git's
 global options to its subcommand — so `git -C . rm x` and
 `find . -exec nice -n 10 rm {} \;` both count. An operand a command re-executes
-(`eval …`, `find … -exec sh -c '…'`) is scanned as a command in its own right.
+(`eval …`, `find … -exec sh -c '…'`) is scanned as a command in its own right,
+including behind those same runner flags — `nice -n 10 sh -c 'rm x'` and
+`find … -exec env -i sh -c 'rm x' \;` are read, not just the unflagged
+spellings. A command substitution runs in the parent shell before any wrapper
+is spawned, so `bash -c '…' "$(rm x)"` is scanned on both halves.
 
 That is narrower than a scan of the whole command line, which is what this guard
 used before 0.70.0 — `echo rm` and `npm run format` no longer match, and neither

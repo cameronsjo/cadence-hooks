@@ -1391,8 +1391,15 @@ mod tests {
     /// A wrapper carries its whole script in ONE token, whose basename is the
     /// script's last path segment (`rm -rf /srv/repo` → `repo`) — never a
     /// delete verb, so the gate stayed silent.
+    ///
+    /// The property asserted is "never a silent ALLOW", not a specific
+    /// non-Allow outcome: since the wrapper hunt walks the same runner
+    /// grammars the verb gates do (#528 review C-D1), a flagged runner no
+    /// longer hides the script, so the rows whose script names a PROTECTED
+    /// path now resolve all the way to Block instead of stopping at Ask.
+    /// Pinning `Ask` exactly would fail on a strictly stronger verdict.
     #[test]
-    fn flagged_prefix_hiding_a_wrapper_delete_is_unresolvable() {
+    fn flagged_prefix_hiding_a_wrapper_delete_is_never_a_silent_allow() {
         for command in [
             "env -i sh -c 'rm -rf /srv/repo'",
             "nice -n 10 bash -c 'rm -rf ~/Documents'",
@@ -1404,10 +1411,30 @@ mod tests {
             "env -i \\sh -c 'rm -rf ~/Documents'",
             "nice -n 10 /bin/sh -c 'rm -rf ~/Documents'",
         ] {
+            assert_ne!(
+                judge(command, "/private/tmp"),
+                Outcome::Allow,
+                "a wrapped delete behind a flagged prefix must not be a silent allow: {command}"
+            );
+        }
+    }
+
+    /// The escalation the wrapper-hunt widening bought, pinned as its own row
+    /// so a regression back to `Ask` is a test failure rather than an
+    /// unnoticed downgrade to a prompt the operator can wave through. Each
+    /// names a protected path INSIDE the wrapper script, reachable only once
+    /// the flagged runner is peeled (#528 review C-D1).
+    #[test]
+    fn flagged_prefix_hiding_a_protected_path_delete_now_blocks() {
+        for command in [
+            "nice -n 10 bash -c 'rm -rf ~/Documents'",
+            "env -i \\sh -c 'rm -rf ~/Documents'",
+            "nice -n 10 /bin/sh -c 'rm -rf ~/Documents'",
+        ] {
             assert_eq!(
                 judge(command, "/private/tmp"),
-                Outcome::Ask,
-                "a wrapped delete behind a flagged prefix must not be a silent allow: {command}"
+                Outcome::Block,
+                "{command} must reach the protected-path block, not stop at Ask"
             );
         }
     }
