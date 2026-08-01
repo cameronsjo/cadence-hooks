@@ -633,7 +633,16 @@ fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
 fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
     let words = suffix_words(cmd);
     let start = words.iter().position(|word| word == "push")? + 1;
-    crate::shell::push_repository_argument(&words[start..])
+    // **Positional only — deliberately NOT `--repo`.** These structural gates
+    // ask "did this command name a remote explicitly", and answering yes for a
+    // `--repo`-only push turned a hard block into a silent allow: it promoted
+    // `MissingTargets`/`MissingRemotes` (which block before any owner logic)
+    // into `AllTargetsExplicit`, whose per-iteration check looks the value up as
+    // a remote NAME, fails, and skips fail-open. Two independent reviews caught
+    // the same transition. `--repo`'s value is still ownership-validated — by
+    // `guard_push_remote`'s own destination arm, where the URL/name distinction
+    // is actually made.
+    crate::shell::push_repository_argument(&words[start..]).positional
 }
 
 /// Extract word values from a command's suffix.

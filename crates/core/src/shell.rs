@@ -2951,11 +2951,62 @@ pub fn skip_git_global_options(argv: &[String]) -> &[String] {
 /// (`git push --signed /nonexistent/repoD main` reports `/nonexistent/repoD` as
 /// the repository). Adding them would swallow the real target and false-block
 /// the ordinary `git push --signed origin main`.
-const PUSH_SEPARATE_VALUE_LONG_OPTS: &[&str] =
-    &["--push-option", "--repo", "--receive-pack", "--exec"];
+/// The COMPLETE set, not a sample. An exact-match list of four shipped in the
+/// first cut of this fix and an adversarial pass found `--recurse-submodules`
+/// missing — its value posed as the repository exactly like the others
+/// (`git push --recurse-submodules check <evil-url> main` measured Allow).
+const PUSH_SEPARATE_VALUE_LONG_OPTS: &[&str] = &[
+    "--push-option",
+    "--repo",
+    "--receive-pack",
+    "--exec",
+    "--recurse-submodules",
+];
 
-/// Resolve the repository `git push` will actually contact, from the words
-/// AFTER the `push` subcommand.
+/// Does this long-option NAME (the text after `--`, before any `=`) select an
+/// option whose value can be a separate following word?
+///
+/// **Matched by PREFIX, because git's parse-options resolves any unambiguous
+/// abbreviation.** An exact-match test let `--recu`, `--rep`, `--exe`,
+/// `--receiv`, `--pu` and `--push-op` through — each accepted by real git and
+/// each consuming its value, so the value posed as the repository. Where a
+/// prefix is ambiguous git errors out and never pushes, so treating it as
+/// value-taking cannot cost a real push.
+///
+/// No `git push` BOOLEAN shares a prefix with any of these five, so this cannot
+/// swallow the real target of an ordinary push: `--force`, `--follow-tags`,
+/// `--signed` and `--force-with-lease` all fail the test.
+fn long_option_takes_separate_value(name: &str) -> bool {
+    !name.is_empty()
+        && PUSH_SEPARATE_VALUE_LONG_OPTS
+            .iter()
+            .any(|opt| opt.trim_start_matches('-').starts_with(name))
+}
+
+/// Is this long-option name `--repo` (or an abbreviation of it)?
+fn is_repo_long_option(name: &str) -> bool {
+    !name.is_empty() && "repo".starts_with(name)
+}
+
+/// The explicitly-named push destinations found in a `git push` command.
+///
+/// Both fields are reported because validating only one is what the adversarial
+/// pass broke: git prefers the positional, so returning it alone discarded a
+/// recorded `--repo` URL whenever an unmodelled option's value posed as a
+/// positional — `git push --repo <evil-url> --recurse-submodules check` measured
+/// Block on `main` and Allow on the first cut of this fix, a regression. The
+/// caller validates every populated field, so a mis-parse of one cannot silence
+/// the other.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PushDestinations {
+    /// The first positional — git's repository argument when present.
+    pub positional: Option<String>,
+    /// `--repo`'s value, whichever spelling carried it.
+    pub repo_flag: Option<String>,
+}
+
+/// Resolve the destinations a `git push` names, from the words AFTER the `push`
+/// subcommand.
 ///
 /// This is the single model of `git push`'s option grammar. It exists because
 /// two callers previously kept their own: `loop_analysis::extract_push_remote`
@@ -2968,24 +3019,35 @@ const PUSH_SEPARATE_VALUE_LONG_OPTS: &[&str] =
 ///
 /// **`git push`'s FIRST positional is the repository**, not a refspec —
 /// `git push --repo=/nonexistent/EQ /nonexistent/POS HEAD:main` reports
-/// `/nonexistent/POS`, so a positional always wins over `--repo`.
+/// `/nonexistent/POS`, so git prefers the positional over `--repo`.
 ///
-/// **The `--repo` fallback is fail-closed by construction, not by measurement.**
-/// Whether a lone `--repo=<url>` (no positional) actually redirects the push
-/// could not be measured here: with no positional and no upstream, git fails on
-/// the refspec before it contacts any remote, and every attempt to supply a
-/// refspec makes that token the positional repository instead. So this returns
-/// `--repo`'s value only when there is no positional, which is safe under both
-/// answers — if git honors it we validate the URL git uses, and if git ignores
-/// it we validate a URL git won't contact, whose only cost is refusing a
-/// `git push --repo=<unowned-url>` that would have gone to an owned upstream.
-/// Erring the other way would mean validating the upstream while git pushed
-/// somewhere else, which is the bypass class this function exists to close.
+/// **Both destinations are returned rather than just git's preferred one.**
+/// Returning only the positional is what made the first cut of this fix
+/// *regress*: `git push --repo <evil-url> --recurse-submodules check` measured
+/// Block on `main` and Allow on the fix, because `--recurse-submodules` was
+/// unmodelled, its value `check` posed as the positional, and preferring the
+/// positional discarded the evil `--repo` URL. Reporting both lets the caller
+/// validate every named destination, so a mis-parse of one cannot silence the
+/// other — the guard blocks if EITHER is unowned. That is deliberately stricter
+/// than git's own precedence, and it costs only a refused
+/// `git push --repo=<unowned> <owned>`, a command with no legitimate reading.
 ///
-/// Returns `None` only when there is no positional and no `--repo` — a bare
-/// `git push`, where the caller's tracking-remote fallback is correct.
-pub fn push_repository_argument(words: &[String]) -> Option<String> {
-    let mut repo_flag_value: Option<String> = None;
+/// **git does honor a lone `--repo=<url>`, measured.** The trick is configuring
+/// an upstream first, so the refspec resolves and git actually contacts a
+/// remote: with `origin` set up and tracking configured,
+/// `git push --repo=/nonexistent/EVILTARGET` reports
+/// `fatal: '/nonexistent/EVILTARGET' does not appear to be a git repository`
+/// while a bare `git push` control reports `Everything up-to-date`. So
+/// validating `--repo`'s value is the *correct* behavior rather than a
+/// conservative guess. (An earlier draft of this comment called it unmeasurable,
+/// because without an upstream git fails on the refspec before contacting
+/// anything and every attempt to supply a refspec makes that token the
+/// positional repository instead.)
+///
+/// Both fields `None` means a bare `git push`, where the caller's
+/// tracking-remote fallback is correct.
+pub fn push_repository_argument(words: &[String]) -> PushDestinations {
+    let mut found = PushDestinations::default();
     let mut index = 0;
 
     while index < words.len() {
@@ -2993,26 +3055,26 @@ pub fn push_repository_argument(words: &[String]) -> Option<String> {
 
         // `--` ends option parsing; the next word is the repository.
         if word == "--" {
-            return words.get(index + 1).cloned().or(repo_flag_value);
+            found.positional = words.get(index + 1).cloned();
+            return found;
         }
 
         if let Some(rest) = word.strip_prefix("--") {
-            // `--opt=value` carries its value inline and consumes no word.
-            if let Some((name, value)) = rest.split_once('=') {
-                if name == "repo" {
-                    repo_flag_value = Some(value.to_string());
+            let (name, inline) = match rest.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (rest, None),
+            };
+            let takes_separate_value = inline.is_none() && long_option_takes_separate_value(name);
+
+            if is_repo_long_option(name) {
+                if let Some(value) = inline {
+                    found.repo_flag = Some(value.to_string());
+                } else if takes_separate_value {
+                    found.repo_flag = words.get(index + 1).cloned();
                 }
-                index += 1;
-                continue;
             }
-            if PUSH_SEPARATE_VALUE_LONG_OPTS.contains(&word) {
-                if word == "--repo" {
-                    repo_flag_value = words.get(index + 1).cloned();
-                }
-                index += 2;
-                continue;
-            }
-            index += 1;
+
+            index += if takes_separate_value { 2 } else { 1 };
             continue;
         }
 
@@ -3033,10 +3095,11 @@ pub fn push_repository_argument(words: &[String]) -> Option<String> {
         }
 
         // Not an option: the first positional is the repository.
-        return Some(words[index].clone());
+        found.positional = Some(words[index].clone());
+        return found;
     }
 
-    repo_flag_value
+    found
 }
 
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
@@ -6057,9 +6120,15 @@ mod tests {
     // pointing pushes at nonexistent local paths and reading which token git
     // named as the repository.
 
-    fn target(s: &str) -> Option<String> {
+    fn dests(s: &str) -> PushDestinations {
         let w: Vec<String> = s.split_whitespace().map(String::from).collect();
         push_repository_argument(&w)
+    }
+
+    /// The destination git itself would use: positional first, `--repo` after.
+    fn target(s: &str) -> Option<String> {
+        let d = dests(s);
+        d.positional.or(d.repo_flag)
     }
 
     #[test]
@@ -6155,6 +6224,75 @@ mod tests {
         assert_eq!(
             target("--repo https://github.com/evil/x.git"),
             Some("https://github.com/evil/x.git".into())
+        );
+    }
+
+    #[test]
+    fn push_target_recurse_submodules_consumes_its_value() {
+        // Found by an adversarial pass on the first cut of this fix: absent from
+        // the model, `check` posed as the repository. Measured against git
+        // 2.55.0 — `--recurse-submodules ZZZVAL /nonexistent/T main` reports
+        // `bad recurse-submodules argument: ZZZVAL`, so the value is consumed.
+        assert_eq!(
+            target("--recurse-submodules check https://github.com/evil/x.git main"),
+            Some("https://github.com/evil/x.git".into())
+        );
+    }
+
+    #[test]
+    fn push_target_unique_prefix_abbreviations_consume_values() {
+        // git's parse-options resolves any unambiguous abbreviation, so an
+        // exact-match list let each of these hide the real target.
+        for opt in [
+            "--recu",
+            "--recurse-s",
+            "--rep",
+            "--exe",
+            "--receiv",
+            "--pu",
+            "--push-op",
+        ] {
+            assert_eq!(
+                target(&format!("{opt} VAL https://github.com/evil/x.git main")),
+                Some("https://github.com/evil/x.git".into()),
+                "{opt} must consume its separate value"
+            );
+        }
+    }
+
+    #[test]
+    fn push_target_boolean_prefixes_do_not_consume() {
+        // No git push boolean shares a prefix with a value-taking option, so
+        // these must NOT swallow the target — a false block on an ordinary push.
+        for opt in ["--force", "--follow-tags", "--signed", "--force-with-lease"] {
+            assert_eq!(
+                target(&format!("{opt} origin main")),
+                Some("origin".into()),
+                "{opt} must not consume the target"
+            );
+        }
+    }
+
+    #[test]
+    fn push_repo_flag_reported_alongside_a_positional() {
+        // The regression the first cut shipped: `--recurse-submodules` was
+        // unmodelled, `check` posed as the positional, and preferring the
+        // positional discarded the evil --repo URL that main had caught.
+        // Both are now reported so the caller validates both.
+        let d = dests("--repo https://github.com/evil/x.git --recurse-submodules check");
+        assert_eq!(
+            d.repo_flag.as_deref(),
+            Some("https://github.com/evil/x.git")
+        );
+    }
+
+    #[test]
+    fn push_repo_flag_and_positional_both_reported() {
+        let d = dests("--repo=https://github.com/evil/x.git origin main");
+        assert_eq!(d.positional.as_deref(), Some("origin"));
+        assert_eq!(
+            d.repo_flag.as_deref(),
+            Some("https://github.com/evil/x.git")
         );
     }
 }

