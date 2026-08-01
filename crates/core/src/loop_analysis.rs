@@ -617,48 +617,23 @@ fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
 
 /// Extract the explicit remote name from `git push <remote>` arguments.
 ///
-/// `-o`/`--push-option` values are consumed rather than returned. That matters
-/// because the value is often assignment-shaped (Gerrit's `-o topic=…`,
-/// `-o r=…`), which the parser hands back as an `AssignmentWord`; left
-/// unconsumed it poses as the positional remote, and the caller then judges a
-/// remote git never pushes to. `extract_push_remote` has no backstop —
-/// `guard-push-remote` consumes this answer directly on both its chain gate and
-/// its loop gate — so the option's own grammar has to be modelled here.
+/// The option grammar itself lives in [`crate::shell::push_repository_argument`]
+/// — the single model shared with `guard_push_remote::extract_push_target`.
+/// Keeping a second copy here is what let the two functions disagree about what
+/// a remote is: this one modelled the short-option cluster walk and missed the
+/// three separate-value long options, while the other modelled no grammar at all
+/// (cadence-hooks#550).
+///
+/// Consuming option values rather than returning them matters because a value is
+/// often assignment-shaped (Gerrit's `-o topic=…`, `-o r=…`), which the parser
+/// hands back as an `AssignmentWord`; left unconsumed it poses as the positional
+/// remote, and the caller then judges a remote git never pushes to. This has no
+/// backstop — `guard-push-remote` consumes the answer directly on both its chain
+/// gate and its loop gate.
 fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
     let words = suffix_words(cmd);
-    let mut index = words.iter().position(|word| word == "push")? + 1;
-    while index < words.len() {
-        let word = &words[index];
-        if word == "--" {
-            return words.get(index + 1).cloned();
-        }
-        if word == "--push-option" {
-            index += 2;
-            continue;
-        }
-        // A single-dash token is a short-option CLUSTER, and git's parse-options
-        // walks it letter by letter. `-o` is `git push`'s only value-taking
-        // shorthand (every other one is a boolean), so the walk reduces to where
-        // the FIRST `o` sits: last letter in the token means the value is the
-        // NEXT word, anywhere earlier means the rest of the token is the value.
-        // One rule covers `-o v`, `-ov` and `-qo v` alike. Matching only the
-        // first two let `-qo topic=x`'s value pose as the remote, which un-blocks
-        // a chained push to a second, unowned remote (verified against git
-        // 2.55.0, where `-oo a=1 <url>` likewise makes `a=1` the repository —
-        // so keying on the LAST letter instead of the first is wrong too).
-        if let Some(cluster) = word.strip_prefix('-').filter(|c| !c.starts_with('-')) {
-            let value_is_next_word =
-                matches!(cluster.find('o'), Some(pos) if pos + 1 == cluster.len());
-            index += if value_is_next_word { 2 } else { 1 };
-            continue;
-        }
-        if word.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        return Some(word.clone());
-    }
-    None
+    let start = words.iter().position(|word| word == "push")? + 1;
+    crate::shell::push_repository_argument(&words[start..])
 }
 
 /// Extract word values from a command's suffix.

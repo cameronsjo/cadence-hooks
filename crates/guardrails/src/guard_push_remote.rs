@@ -118,10 +118,18 @@ fn extract_push_target(command: &str, work_dir: &str) -> PushTarget {
         return PushTarget::None;
     };
 
-    // Strip flags, take the first remaining word as the candidate target.
-    let Some(candidate) = segment.split_whitespace().find(|w| !w.starts_with('-')) else {
+    // Resolve the repository through git's own option grammar. Taking the first
+    // token not starting with `-` made any option's VALUE the candidate target,
+    // so the real URL was never ownership-validated: `git push -qo topic=x
+    // https://github.com/evil/x.git main` judged `topic=x`, found it neither a
+    // remote nor a URL, and fell back to validating the owned tracking remote
+    // (cadence-hooks#550). The grammar is shared with
+    // `loop_analysis::extract_push_remote` so the two cannot drift apart again.
+    let words: Vec<String> = segment.split_whitespace().map(String::from).collect();
+    let Some(candidate) = cadence_hooks_core::shell::push_repository_argument(&words) else {
         return PushTarget::None;
     };
+    let candidate = candidate.as_str();
 
     // A configured remote name routes through git's resolution (unchanged).
     // A timed-out remote listing (#271) would silently reclassify a named
