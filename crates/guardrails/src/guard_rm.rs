@@ -2518,6 +2518,23 @@ mod tests {
     }
 
     #[test]
+    fn trailing_backtick_is_unresolvable_not_a_silent_allow() {
+        // #509's second report reaches `Ask`, not a silent Allow:
+        // resolve_target treats every backtick-bearing operand as an
+        // unresolvable command substitution. Preserve that rather than
+        // stripping the delimiter into a guessed path.
+        //
+        // The claim is scoped to THIS spelling. `rm -rf ~/Documents\`` is a
+        // bash syntax error — nothing runs, so `Ask` costs nothing. Its
+        // executable siblings (`~/Documents\`\``, `~/Documents$()`,
+        // `~/Documents${EMPTY}`) also land on `Ask` while bash executes them
+        // identically to the bare `rm -rf ~/Documents` this guard Blocks. That
+        // Block→Ask downgrade is pre-existing, unchanged here, and filed
+        // separately; do not read this test as dispositioning it.
+        assert_eq!(judge("rm -rf ~/Documents`", "/home"), Outcome::Ask);
+    }
+
+    #[test]
     fn single_file_still_asks_when_the_path_is_unresolvable() {
         assert_eq!(judge("rm $SOMEFILE", "/srv/project"), Outcome::Ask);
         assert_eq!(judge("rm ../sibling/x", "/srv/project"), Outcome::Ask);

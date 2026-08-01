@@ -1151,7 +1151,7 @@ pub const MAX_WRAPPER_DEPTH: usize = 3;
 /// guard MISS, not a safe fail-open. Detection also suppresses inside double
 /// quotes (a `<<WORD` inside `"…"` is literal text), with the
 /// terminator-not-found rule as the backstop for cross-line quote state.
-fn strip_heredoc_bodies(command: &str) -> String {
+pub fn strip_heredoc_bodies(command: &str) -> String {
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -1175,8 +1175,8 @@ fn strip_heredoc_bodies(command: &str) -> String {
             Some(&(start, _)) => &line[..start],
             None => line.as_str(),
         };
-        let delims = heredoc_delimiters(scan);
-        for (word, expands) in delims {
+        let delims = heredoc_introducers(scan);
+        for HeredocIntroducer { word, expands, .. } in delims {
             // Scan ahead for the terminator without committing the drop. Only
             // if it is found do we replace the body with the carried-forward
             // substitution lines; otherwise the lines are restored untouched.
@@ -1249,6 +1249,29 @@ fn strip_heredoc_bodies(command: &str) -> String {
         out.push(line);
     }
     out.join("\n")
+}
+
+/// The LOGICAL lines of `command`: physical lines with backslash-newline
+/// continuations joined, the way the shell reads them before interpreting
+/// anything.
+///
+/// Both characters of the continuation pair are removed, as the shell removes
+/// them — so `bas\` ⏎ `h` is the one word `bash`, and `<\` ⏎ `<EOF` is the
+/// heredoc introducer `<<EOF`. A scanner that joined with a SPACE instead saw
+/// `< <EOF` and a word split in half, and missed both (cadence-hooks#543).
+///
+/// Heredoc bodies are NOT stripped: the caller decides whether a body is data
+/// (use [`strip_heredoc_bodies`]) or a script. Use this when you need the lines
+/// as the shell groups them; use [`split_segments`] when you need executable
+/// segments.
+pub fn logical_lines(command: &str) -> Vec<String> {
+    let lines: Vec<&str> = command.split('\n').collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        out.push(take_logical_line(&lines, &mut i));
+    }
+    out
 }
 
 /// Consume one logical line from `lines` starting at `*i`, joining
@@ -1427,14 +1450,45 @@ fn substitution_spans(body: &str) -> Vec<String> {
     spans
 }
 
-/// Find heredoc delimiters introduced on a single line, outside quotes.
-/// Returns `(delimiter_word, body_expands)` per heredoc: `body_expands` is
-/// false when the delimiter is quoted. `<<<` (here-string) is skipped. A `<<`
-/// inside a `'…'` or `"…"` string on this line is literal text and ignored;
-/// cross-line quote state is backstopped by the terminator-not-found rule in
-/// [`strip_heredoc_bodies`].
-fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+/// One heredoc introducer found on a logical line: the `<<WORD` construct
+/// itself, located by byte range, plus what it introduces.
+///
+/// The byte range spans the whole construct — the `<<`, any `-`, any
+/// whitespace, and the delimiter word with its quotes — so a caller can blank
+/// it out before reading the line's command words. Without that, the delimiter
+/// word reads as a bare word (`cat <<bash` looks like it names a shell) and a
+/// command word glued to the operator does not read as one at all
+/// (`bash<<EOF` is a single whitespace-delimited word).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeredocIntroducer {
+    /// Byte offset of the leading `<`.
+    pub start: usize,
+    /// Byte offset one past the end of the delimiter word.
+    pub end: usize,
+    /// The terminator word, quotes removed.
+    pub word: String,
+    /// False when the delimiter was quoted (`<<'EOF'`), which suppresses
+    /// expansion in the body.
+    pub expands: bool,
+}
+
+/// Find heredoc introducers on a single logical line, outside quotes.
+/// `<<<` (here-string) is skipped. A `<<` inside a `'…'` or `"…"` string on
+/// this line is literal text and ignored; cross-line quote state is backstopped
+/// by the terminator-not-found rule in [`strip_heredoc_bodies`].
+///
+/// Pair with [`logical_lines`] — an introducer split across a
+/// backslash-newline (`bash <\` ⏎ `<EOF`) is `<<` to the shell, which removes
+/// both characters of the pair, and only reads as one construct once the line
+/// has been joined.
+pub fn heredoc_introducers(line: &str) -> Vec<HeredocIntroducer> {
     let chars: Vec<char> = line.chars().collect();
+    // Char index → byte offset, so a range can be handed back for slicing.
+    let byte_of: Vec<usize> = line
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(line.len()))
+        .collect();
     let mut delims = Vec::new();
     let mut i = 0;
     let mut in_single = false;
@@ -1491,7 +1545,12 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
                 j += 1;
             }
             if !word.is_empty() {
-                delims.push((word, quote_char.is_none()));
+                delims.push(HeredocIntroducer {
+                    start: byte_of[i],
+                    end: byte_of[j.min(chars.len())],
+                    expands: quote_char.is_none(),
+                    word,
+                });
             }
             i = j;
             continue;
@@ -1837,7 +1896,7 @@ fn comment_spans(text: &str) -> Vec<(usize, usize)> {
 
 /// `command` with every [`comment_spans`] range removed. The newline that ends
 /// each comment is preserved, so the segment the comment trailed still flushes.
-fn strip_comments(command: &str) -> String {
+pub fn strip_comments(command: &str) -> String {
     let spans = comment_spans(command);
     if spans.is_empty() {
         return command.to_string();
@@ -3953,6 +4012,51 @@ mod tests {
             split_segments("echo ${x:-y} # note\nls"),
             vec!["echo ${x:-y}", "ls"]
         );
+    }
+
+    #[test]
+    fn logical_lines_removes_both_characters_of_a_continuation() {
+        // The shell deletes the backslash AND the newline. A consumer that
+        // joined with a SPACE instead saw `< <EOF` where bash sees the
+        // introducer `<<EOF`, and a word split mid-name never reassembled —
+        // both missed a shell-fed heredoc (cadence-hooks#543).
+        assert_eq!(logical_lines("bash <\\\n<EOF"), vec!["bash <<EOF"]);
+        assert_eq!(logical_lines("bas\\\nh <<EOF"), vec!["bash <<EOF"]);
+        assert_eq!(logical_lines("bash \\\n<<EOF"), vec!["bash <<EOF"]);
+        // Physical lines with no continuation stay separate.
+        assert_eq!(logical_lines("a\nb"), vec!["a", "b"]);
+        // An EVEN run of trailing backslashes is a literal backslash, not a
+        // continuation — the parity rule `take_logical_line` applies.
+        assert_eq!(logical_lines("a\\\\\nb"), vec!["a\\\\", "b"]);
+    }
+
+    #[test]
+    fn heredoc_introducers_span_the_whole_construct() {
+        // The byte range must cover the operator, any `-`, any whitespace, and
+        // the delimiter word with its quotes. A caller blanks that range before
+        // reading command words: without it `cat <<bash` reads as naming a
+        // shell, and `bash<<EOF` does not read as naming one at all.
+        for (line, start, end, word, expands) in [
+            ("bash<<EOF", 4, 9, "EOF", true),
+            ("cat <<bash", 4, 10, "bash", true),
+            ("cat << bash", 4, 11, "bash", true),
+            ("cat <<-EOF", 4, 10, "EOF", true),
+            ("cat <<'EOF'", 4, 11, "EOF", false),
+            ("cat <<\"EOF\"", 4, 11, "EOF", false),
+        ] {
+            let found = heredoc_introducers(line);
+            assert_eq!(found.len(), 1, "{line}");
+            assert_eq!(
+                &line[found[0].start..found[0].end],
+                &line[start..end],
+                "{line}"
+            );
+            assert_eq!(found[0].word, word, "{line}");
+            assert_eq!(found[0].expands, expands, "{line}");
+        }
+        // A here-string is not a heredoc, and a `<<` inside quotes is text.
+        assert!(heredoc_introducers("bash <<< 'x'").is_empty());
+        assert!(heredoc_introducers("echo '<<EOF'").is_empty());
     }
 
     #[test]
