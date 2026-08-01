@@ -203,10 +203,14 @@ pub(crate) enum RepoFlag {
 
 /// Read the `-R`/`--repo` target out of a segment's `gh` invocation.
 ///
-/// Handles all four gh CLI forms: `-R x`, `-Rx`, `--repo x`, `--repo=x` —
-/// mirroring `loop_analysis::extract_repo_flag`, which does the same over
-/// parsed AST words. Values keep their quotes trimmed so `--repo "o/r"`
-/// resolves to `o/r`.
+/// Handles all four gh CLI forms: `-R x`, `-Rx`, `--repo x`, `--repo=x`.
+/// Values keep their quotes trimmed so `--repo "o/r"` resolves to `o/r`.
+///
+/// `loop_analysis::extract_repo_flag` reads the same flag over parsed AST words
+/// but does NOT mirror this one: it resolves last-wins, while this scan reports
+/// [`RepoFlag::Ambiguous`] when readings disagree. That divergence is
+/// deliberate — see the fail-closed note below — and it is why this function
+/// backstops the loop gate rather than agreeing with it.
 ///
 /// Reads [`gh_argv`], not the raw string, on both counts that matter. Quoted
 /// text is one token, so a `-R owner/repo` spelled inside another flag's value
@@ -1609,6 +1613,44 @@ fn api_unverifiable_block(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopedWriteKind {
+    ReadOrAllowed,
+    RepoWrite,
+    ApiUnverifiable { undeterminable_query: bool },
+}
+
+/// Classify the reconstructed argv retained by loop analysis.
+///
+/// API calls without a repository-shaped endpoint cannot use `-R`, so they
+/// must not fall into the generic missing-target block. In particular,
+/// GraphQL reads and the two safe thread-metadata mutations remain allowed,
+/// while other mutations use the same unverifiable-API verdict as the
+/// per-segment path.
+fn looped_write_kind(command: &str) -> LoopedWriteKind {
+    if !is_write_command(command) {
+        return LoopedWriteKind::ReadOrAllowed;
+    }
+    let Some(endpoint) = gh_api_endpoint(command) else {
+        return LoopedWriteKind::RepoWrite;
+    };
+    if is_graphql_endpoint(&endpoint) {
+        let status = graphql_mutation_status(command);
+        if status == Some(false) || graphql_is_safe_mutation(command) {
+            return LoopedWriteKind::ReadOrAllowed;
+        }
+        return LoopedWriteKind::ApiUnverifiable {
+            undeterminable_query: status.is_none(),
+        };
+    }
+    if api_repos_target(&endpoint).is_none() {
+        return LoopedWriteKind::ApiUnverifiable {
+            undeterminable_query: false,
+        };
+    }
+    LoopedWriteKind::RepoWrite
+}
+
 /// Resolve and judge a single gh write segment's target. Returns `Some(block)`
 /// when the segment targets a repo outside the allowlist (or one that can't be
 /// resolved), `None` when it's allowed. Per-segment resolution is what stops a
@@ -1752,23 +1794,28 @@ impl Check for GhWriteGuard {
             LoopAnalysis::AllTargetsExplicit(cmds) => {
                 // Only writes are ownership-gated; reads (gh pr view, issue list) are
                 // owner-independent and safe against any repo — mirror the MissingTargets
-                // branch, which already gates on is_write_command (#158). -R targets are
+                // branch, which already gates on write kind (#158). -R targets are
                 // always on the default host (gh CLI convention).
+                for c in &cmds {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    if let LoopedWriteKind::ApiUnverifiable {
+                        undeterminable_query,
+                    } = looped_write_kind(&reconstructed)
+                    {
+                        return api_unverifiable_block(
+                            &reconstructed,
+                            undeterminable_query,
+                            &allowed_owners,
+                            &allowed_repos,
+                        );
+                    }
+                }
                 let dh = default_host();
-                // debt: `c.args` is lossy — core's `suffix_words` keeps only Word
-                // items, so an assignment-shaped suffix (`-f query=…`, `-f name=x`)
-                // is dropped and `gh api graphql -f query=<mutation>` reconstructs
-                // as `gh api graphql -f`, which `is_write_command` reads as a read.
-                // This loop gate is therefore blind to `gh api` payloads. Fixing
-                // core alone would hard-block looped graphql READS (re-creating
-                // #353 one layer up), so it must land with a graphql-aware wrapper
-                // here — #471. Mitigated today by the per-segment pass below, which
-                // judges these correctly now that `gh_argv` peels the `do` keyword.
                 let unowned_write_targets: Vec<&str> = cmds
                     .iter()
                     .filter(|c| {
                         let reconstructed = format!("gh {}", c.args.join(" "));
-                        is_write_command(&reconstructed)
+                        looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
                     })
                     .filter(|c| {
                         !c.explicit_repo
@@ -1797,14 +1844,23 @@ impl Check for GhWriteGuard {
             LoopAnalysis::MissingTargets(cmds) => {
                 // Only block if any looped gh command is a write — read-only
                 // commands (gh pr list, gh issue view) are safe without -R.
-                //
-                // debt: same lossy `c.args` reconstruction as the arm above — a
-                // looped `gh api … -f key=value` loses its payload and reads as a
-                // non-write here, so `has_write` is false and this gate declines
-                // to judge it. Pairs with a core `suffix_words` fix, #471.
+                for c in &cmds {
+                    let reconstructed = format!("gh {}", c.args.join(" "));
+                    if let LoopedWriteKind::ApiUnverifiable {
+                        undeterminable_query,
+                    } = looped_write_kind(&reconstructed)
+                    {
+                        return api_unverifiable_block(
+                            &reconstructed,
+                            undeterminable_query,
+                            &allowed_owners,
+                            &allowed_repos,
+                        );
+                    }
+                }
                 let has_write = cmds.iter().any(|c| {
                     let reconstructed = format!("gh {}", c.args.join(" "));
-                    is_write_command(&reconstructed)
+                    looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
                 });
                 if has_write {
                     // Relaxed-when-deterministic policy (#44): a loop whose
@@ -1825,15 +1881,13 @@ impl Check for GhWriteGuard {
                         &extra_hosts,
                     );
                     if let LoopWriteDecision::Block { suggestion } = decision {
-                        // debt: the same lossy `c.args` reconstruction (#471) —
-                        // here it only shapes the message's "Found:" list, so a
-                        // dropped `-f key=value` suffix omits a command from the
-                        // listing rather than changing the verdict.
                         let writes: Vec<String> = cmds
                             .iter()
                             .filter(|c| {
                                 let reconstructed = format!("gh {}", c.args.join(" "));
-                                c.explicit_repo.is_none() && is_write_command(&reconstructed)
+                                c.explicit_repo.is_none()
+                                    && looped_write_kind(&reconstructed)
+                                        == LoopedWriteKind::RepoWrite
                             })
                             .map(|c| format!("`gh {}`", c.args.join(" ")))
                             .collect();
@@ -2927,7 +2981,7 @@ mod tests {
                 // none of the looped commands are writes
                 let has_write = cmds.iter().any(|c| {
                     let reconstructed = format!("gh {}", c.args.join(" "));
-                    is_write_command(&reconstructed)
+                    looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
                 });
                 assert!(
                     !has_write,
@@ -2947,7 +3001,7 @@ mod tests {
             LoopAnalysis::MissingTargets(cmds) => {
                 let has_write = cmds.iter().any(|c| {
                     let reconstructed = format!("gh {}", c.args.join(" "));
-                    is_write_command(&reconstructed)
+                    looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
                 });
                 assert!(has_write, "write gh loop without -R should be blocked");
             }
@@ -2963,7 +3017,7 @@ mod tests {
             LoopAnalysis::MissingTargets(cmds) => {
                 let has_write = cmds.iter().any(|c| {
                     let reconstructed = format!("gh {}", c.args.join(" "));
-                    is_write_command(&reconstructed)
+                    looped_write_kind(&reconstructed) == LoopedWriteKind::RepoWrite
                 });
                 assert!(has_write, "mixed read/write loop should block on the write");
             }
@@ -4170,26 +4224,47 @@ mod tests {
     }
 
     #[test]
-    fn loop_gate_never_sees_the_gh_api_payload() {
-        // Pins the #471 debt the three `debt:` markers name, and refutes #353's
-        // own diagnosis: its suggested fix — apply the graphql downgrade at the
-        // three loop call sites — would be INERT, because `is_write_command`
-        // never returns true there to be downgraded. Core's `suffix_words`
-        // keeps only Word items, so `-f query=…` is dropped and the command
-        // reconstructs as a bare `gh api graphql -f`, which matches no write
-        // pattern. The real verdict comes from the per-segment pass instead.
-        let cmd = r#"for n in 1 2; do gh api graphql -f query="mutation { addComment(input: {}) { id } }"; done"#;
-        match analyze_gh_loops(cmd) {
-            LoopAnalysis::MissingTargets(cmds) => {
-                let reconstructed = format!("gh {}", cmds[0].args.join(" "));
-                assert_eq!(reconstructed, "gh api graphql -f");
-                assert!(
-                    !is_write_command(&reconstructed),
-                    "loop gate sees a mutation as a read — the payload was dropped"
-                );
-            }
-            other => panic!("expected MissingTargets, got {other:?}"),
-        }
+    fn looped_graphql_mutation_uses_api_unverifiable_verdict() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for n in 1 2; do gh api graphql -f query=mutation{x}; done",
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+            assert!(
+                !result
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("missing explicit repo"))
+            );
+        });
+    }
+
+    #[test]
+    fn looped_graphql_read_stays_allowed() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for n in 1 2; do gh api graphql -f query=query{viewer{login}}; done",
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            assert!(matches!(result.outcome, cadence_hooks_core::Outcome::Allow));
+        });
+    }
+
+    #[test]
+    fn looped_non_repo_api_field_write_uses_api_unverifiable_verdict() {
+        with_env(&owners_env(), || {
+            let input = input_with(
+                "for n in 1 2; do gh api orgs/evil/repos -f name=x; done",
+                OWNED_DIR,
+            );
+            let result = GhWriteGuard.run(&input);
+            let meta = result.block_metadata.expect("structured block");
+            assert_eq!(meta.rule_id, "gh-write-api-unverifiable");
+        });
     }
 
     // --- #463 review: quote-escape divergence and the raw-segment api gate ---

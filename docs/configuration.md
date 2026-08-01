@@ -139,6 +139,11 @@ For a single `gh` write, the target resolves in order: explicit `-R`/`--repo` fl
 
 **Loops** containing gh writes without `-R` follow a *relaxed-when-deterministic* policy: the write is allowed when the loop body provably never changes directory (no `cd`/`pushd`/`popd`/`eval`/`source`) **and** the working directory resolves to a single owned, non-fork repo. Under those conditions every iteration targets the same repo the guard verified — the same trust extended to single commands. Anything the analyzer cannot prove (directory changes inside the body, parse failures, forks, unowned directories) still blocks.
 
+Looped `gh api` calls use the API-specific verdict rather than the generic
+missing-`-R` message. GraphQL reads and the safe review-thread metadata
+mutations remain allowed; other GraphQL or non-repository API mutations block
+when their target cannot be ownership-verified.
+
 Set `CADENCE_GH_STRICT_LOOPS=1` to disable the relaxation and block every looped gh write that lacks `-R` (the pre-0.12 behavior). Block messages include the resolved `-R owner/repo` fix when the working directory is owned.
 
 ### The `configure` subcommand under Claude Code
