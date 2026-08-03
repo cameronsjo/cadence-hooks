@@ -1015,19 +1015,23 @@ mod tests {
     fn bare_harness_not_matched() {
         // #406/#564: the bare noun `harness` was deleted from the class —
         // mandated domain vocabulary in estate prose, zero true positives.
-        assert_eq!(
-            run("gh pr create --body \"the test harness needs work\"").outcome,
-            Outcome::Allow
-        );
+        // Hermetic cwd (empty config): a bare `run()` Allow-assertion would
+        // also pass if the term were merely allowlisted in the host repo's
+        // `.claude/cadence.json`, masking a reverted deletion.
+        let repo = temp_repo_with_config("{}");
+        let cmd = "gh pr create --body \"the test harness needs work\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
     }
 
     #[test]
     fn bare_transcript_not_matched() {
-        // Deleted alongside `harness` (predecessor defect: #318).
-        assert_eq!(
-            run("gh pr create --body \"parse the transcript correctly\"").outcome,
-            Outcome::Allow
-        );
+        // Deleted alongside `harness` (predecessor defect: #318). Hermetic
+        // cwd for the same reason as `bare_harness_not_matched`.
+        let repo = temp_repo_with_config("{}");
+        let cmd = "gh pr create --body \"parse the transcript correctly\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
     }
 
     #[test]
