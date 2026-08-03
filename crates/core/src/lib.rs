@@ -9,6 +9,7 @@
 //! entry points print usage guidance and exit 1 rather than blocking on a
 //! read that would never see EOF.
 
+pub mod branch_diff;
 pub mod config;
 pub mod deadline;
 pub mod display;

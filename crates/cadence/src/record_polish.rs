@@ -106,23 +106,67 @@ fn resolve(
     Some((repo_root, branch, head_sha))
 }
 
+/// Parse repeatable `--arm name=state` values into the roster, dropping (and
+/// naming, on stderr) any value without a `name=state` shape — fail-open, the
+/// rest of the record still lands (ADR-0001).
+fn parse_arms(raw: &[String]) -> Vec<(String, String)> {
+    raw.iter()
+        .filter_map(|entry| match entry.split_once('=') {
+            Some((name, state)) if !name.is_empty() && !state.is_empty() => {
+                Some((name.trim().to_string(), state.trim().to_string()))
+            }
+            _ => {
+                eprintln!(
+                    "cadence-hooks record-polish: ignoring malformed --arm {entry:?} \
+                     (expected name=state, e.g. security=ran)"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// Build the marker payload. Presence is what CP1 gates on; the fields are
 /// stored now so CP2's freshness/scope escalation needs no format change.
-fn marker_content(branch: &str, head_sha: &str, scope: &str) -> String {
-    json!({
+/// The `arms` roster (cadence-hooks#467) is **additive and optional**: absent
+/// on a roster-less record, so legacy readers and legacy markers both keep
+/// working — an absent roster reads as *unknown*, never as *skipped*.
+fn marker_content(branch: &str, head_sha: &str, scope: &str, arms: &[(String, String)]) -> String {
+    let mut v = json!({
         "branch": branch,
         "head_sha": head_sha,
         "recorded_at": utc_timestamp(),
         "scope": scope,
-    })
-    .to_string()
+    });
+    if !arms.is_empty() {
+        let roster: serde_json::Map<String, serde_json::Value> = arms
+            .iter()
+            .map(|(name, state)| (name.clone(), json!(state)))
+            .collect();
+        v["arms"] = serde_json::Value::Object(roster);
+    }
+    v.to_string()
 }
 
 /// One-line success verdict: the marker path (the payload a caller probes to
-/// confirm the pre-PR gate is satisfied) plus the (repo@branch, scope) key.
-fn record_verdict(repo_root: &str, branch: &str, scope: &str, path: &Path) -> String {
+/// confirm the pre-PR gate is satisfied) plus the (repo@branch, scope) key —
+/// and the arm roster when one was recorded, so the caller sees what the gate
+/// will see.
+fn record_verdict(
+    repo_root: &str,
+    branch: &str,
+    scope: &str,
+    arms: &[(String, String)],
+    path: &Path,
+) -> String {
+    let roster = if arms.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = arms.iter().map(|(n, s)| format!("{n}={s}")).collect();
+        format!(" arms={}", list.join(","))
+    };
     format!(
-        "recorded polish marker: {} ({repo_root}@{branch} scope={scope})",
+        "recorded polish marker: {} ({repo_root}@{branch} scope={scope}{roster})",
         path.display()
     )
 }
@@ -131,7 +175,12 @@ fn record_verdict(repo_root: &str, branch: &str, scope: &str, path: &Path) -> St
 /// current directory unless overridden. Fail-open: any missing context or write
 /// error prints one stderr line and returns without error — a CLI action must
 /// never fail the polish pass it is recording (ADR-0001).
-pub fn run_record(repo_root: Option<String>, branch: Option<String>, scope: Option<String>) {
+pub fn run_record(
+    repo_root: Option<String>,
+    branch: Option<String>,
+    scope: Option<String>,
+    arm: Vec<String>,
+) {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
@@ -146,10 +195,14 @@ pub fn run_record(repo_root: Option<String>, branch: Option<String>, scope: Opti
     };
 
     let scope = scope.unwrap_or_else(|| "full".to_string());
-    let content = marker_content(&branch, &head_sha, &scope);
+    let arms = parse_arms(&arm);
+    let content = marker_content(&branch, &head_sha, &scope, &arms);
     let path = polish_marker(&repo_root, &branch);
     match write_marker(&path, &content) {
-        Ok(()) => println!("{}", record_verdict(&repo_root, &branch, &scope, &path)),
+        Ok(()) => println!(
+            "{}",
+            record_verdict(&repo_root, &branch, &scope, &arms, &path)
+        ),
         Err(e) => eprintln!(
             "cadence-hooks record-polish: marker write failed ({e}) — pre-PR gate may re-nudge."
         ),
@@ -164,7 +217,7 @@ mod tests {
 
     #[test]
     fn marker_content_is_parseable_json_with_all_fields() {
-        let content = marker_content("feat/x", "abc123", "full");
+        let content = marker_content("feat/x", "abc123", "full", &[]);
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(v["branch"], "feat/x");
         assert_eq!(v["head_sha"], "abc123");
@@ -172,15 +225,61 @@ mod tests {
         // recorded_at is an ISO-8601 UTC instant (jiff `utc_timestamp`).
         let ts = v["recorded_at"].as_str().unwrap();
         assert!(ts.ends_with('Z'), "recorded_at should be UTC: {ts}");
+        // #467: a roster-less record carries NO arms key at all — absent, not
+        // empty — so legacy-shaped markers stay the common case on disk.
+        assert!(v.get("arms").is_none(), "no --arm flags → no arms key");
+    }
+
+    #[test]
+    fn marker_content_records_arm_roster_additively() {
+        // #467 RED: the roster rides an additive "arms" object.
+        let arms = vec![
+            ("security".to_string(), "ran".to_string()),
+            ("tests".to_string(), "skipped".to_string()),
+        ];
+        let content = marker_content("feat/x", "abc123", "code", &arms);
+        let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        assert_eq!(v["arms"]["security"], "ran");
+        assert_eq!(v["arms"]["tests"], "skipped");
+        assert_eq!(v["scope"], "code", "existing fields unchanged");
+    }
+
+    #[test]
+    fn parse_arms_accepts_name_state_and_drops_malformed() {
+        let raw = vec![
+            "security=ran".to_string(),
+            "bogus".to_string(),
+            "=x".to_string(),
+            "docs=skipped".to_string(),
+        ];
+        let arms = parse_arms(&raw);
+        assert_eq!(
+            arms,
+            vec![
+                ("security".to_string(), "ran".to_string()),
+                ("docs".to_string(), "skipped".to_string()),
+            ],
+            "malformed entries drop without failing the record"
+        );
     }
 
     #[test]
     fn record_verdict_names_path_repo_branch_and_scope() {
         let path = polish_marker("/tmp/repo", "feat/x");
-        let verdict = record_verdict("/tmp/repo", "feat/x", "full", &path);
+        let verdict = record_verdict("/tmp/repo", "feat/x", "full", &[], &path);
         assert!(verdict.contains(&path.display().to_string()));
         assert!(verdict.contains("/tmp/repo@feat/x"));
         assert!(verdict.contains("scope=full"));
+        assert!(!verdict.contains("arms="), "no roster → no arms clause");
+    }
+
+    #[test]
+    fn record_verdict_names_the_roster_when_present() {
+        // #467: the verdict shows the caller what the gate will see.
+        let path = polish_marker("/tmp/repo", "feat/x");
+        let arms = vec![("security".to_string(), "skipped".to_string())];
+        let verdict = record_verdict("/tmp/repo", "feat/x", "code", &arms, &path);
+        assert!(verdict.contains("arms=security=skipped"), "{verdict}");
     }
 
     #[test]
@@ -214,13 +313,20 @@ mod tests {
             let branch = "feat/record-polish-y";
             let path = polish_marker(repo, branch);
 
-            run_record(Some(repo.into()), Some(branch.into()), Some("code".into()));
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("code".into()),
+                vec!["security=ran".into()],
+            );
 
             assert!(path.is_file(), "marker should exist at {path:?}");
             let content = std::fs::read_to_string(&path).unwrap();
             let v: serde_json::Value = serde_json::from_str(&content).unwrap();
             assert_eq!(v["branch"], branch);
             assert_eq!(v["scope"], "code");
+            // #467: the roster round-trips through the written marker.
+            assert_eq!(v["arms"]["security"], "ran");
         });
     }
 
@@ -232,7 +338,7 @@ mod tests {
         // every other write-path test in this module.
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
-            run_record(None, None, Some("full".into()));
+            run_record(None, None, Some("full".into()), vec![]);
         });
     }
 
@@ -300,7 +406,7 @@ mod tests {
             let (repo_root, branch, head_sha) =
                 resolve(&wt_str, None, None).expect("worktree resolves repo/branch");
             assert_eq!(branch, "feat/thing");
-            let content = marker_content(&branch, &head_sha, "full");
+            let content = marker_content(&branch, &head_sha, "full", &[]);
             write_marker(&polish_marker(&repo_root, &branch), &content).unwrap();
 
             // Free the branch from the worktree and check it out on the primary —
@@ -396,7 +502,7 @@ mod tests {
                     .expect("resolves");
             write_marker(
                 &polish_marker(&repo_root, &branch),
-                &marker_content(&branch, &head_sha, "code"),
+                &marker_content(&branch, &head_sha, "code", &[]),
             )
             .unwrap();
 
