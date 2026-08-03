@@ -392,22 +392,194 @@ pub const CADENCE_CONFIG_REL: &str = ".claude/cadence.json";
 /// sections re-reads the file N times per tool event — acceptable at N≈2 with a
 /// 1 MiB cap, and it keeps each guard's read independent and fail-open.
 pub fn load_cadence_section<T: Default + DeserializeOwned>(root: &Path, section: &str) -> T {
+    load_cadence_section_lenient(root, section).config
+}
+
+/// A leniently loaded config section: the deserialized config plus warnings
+/// naming what was dropped or unrecognized on the way.
+pub struct SectionLoad<T> {
+    pub config: T,
+    /// Human-readable, one per anomaly — a malformed known key that was
+    /// dropped (the rest of the section still applied), or an unknown key
+    /// serde ignored. Empty on a clean load AND on a wholly absent
+    /// file/section (absence is the documented default, not an anomaly).
+    pub warnings: Vec<String>,
+}
+
+/// [`load_cadence_section`], but a malformed KEY no longer voids its whole
+/// SECTION — and the drop is named instead of silent (cadence-hooks#536: a
+/// bare-string `categories` entry silently discarded a valid `allowlist`
+/// sitting next to it, which reads as "the allowlist doesn't work").
+///
+/// Semantics, per failure class:
+/// - missing file / unreadable / invalid JSON / absent `section` → default,
+///   no warnings (unchanged fail-open, ADR-0001);
+/// - `section` present but not a JSON object → default + one warning;
+/// - object that deserializes cleanly → config + a warning per unknown key
+///   (detected via `serde_ignored` — adopted over a hand-rolled known-key
+///   registry because a generic `T` cannot enumerate its own fields, which
+///   would have forced a per-guard key-set trait);
+/// - object where strict deserialization fails → per-key retry: each key is
+///   probed as a single-key object (sound: serde derives deserialize struct
+///   fields independently), failing keys are dropped with a warning naming
+///   `<section>.<key>`, and the surviving subset is deserialized. If even the
+///   surviving subset fails (shouldn't happen — every key in it probed clean),
+///   fall back to default.
+///
+/// The caller owns the warning CHANNEL: the hook surfaces warnings on stdout
+/// (nudge — exit 0, lands in the transcript), a CLI subcommand surfaces them
+/// on stderr (its stdout may be parsed by consumers).
+pub fn load_cadence_section_lenient<T: Default + DeserializeOwned>(
+    root: &Path,
+    section: &str,
+) -> SectionLoad<T> {
+    let clean = |config| SectionLoad {
+        config,
+        warnings: Vec::new(),
+    };
     let path = root.join(CADENCE_CONFIG_REL);
     let Some(content) = read_untrusted_config(&path) else {
-        return T::default();
+        return clean(T::default());
     };
     let Some(value) = parse_jsonc(&content) else {
-        return T::default();
+        return clean(T::default());
     };
-    value
-        .get(section)
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default()
+    let Some(section_value) = value.get(section) else {
+        return clean(T::default());
+    };
+    let Some(obj) = section_value.as_object() else {
+        return SectionLoad {
+            config: T::default(),
+            warnings: vec![format!(
+                ".claude/cadence.json: `{section}` is not an object — section ignored"
+            )],
+        };
+    };
+
+    // Happy path: strict deserialize, with serde_ignored collecting unknown
+    // keys as informational warnings (they were silently ignored before too —
+    // now they're named, so a typo'd key no longer reads as a working one).
+    let mut unknown: Vec<String> = Vec::new();
+    let strict: Result<T, _> = serde_ignored::deserialize(section_value.clone(), |ignored_path| {
+        unknown.push(format!(
+            ".claude/cadence.json: unknown key `{section}.{ignored_path}` — ignored"
+        ));
+    });
+    if let Ok(config) = strict {
+        return SectionLoad {
+            config,
+            warnings: unknown,
+        };
+    }
+
+    // Per-key retry: drop (and name) each key that fails on its own; apply
+    // the surviving subset.
+    let mut warnings: Vec<String> = Vec::new();
+    let mut good = serde_json::Map::new();
+    for (key, val) in obj {
+        let probe =
+            serde_json::Value::Object(serde_json::Map::from_iter([(key.clone(), val.clone())]));
+        if serde_json::from_value::<T>(probe).is_ok() {
+            good.insert(key.clone(), val.clone());
+        } else {
+            warnings.push(format!(
+                ".claude/cadence.json: `{section}.{key}` has an invalid shape — key ignored, rest of the section applied"
+            ));
+        }
+    }
+    let config = serde_json::from_value(serde_json::Value::Object(good)).unwrap_or_default();
+    SectionLoad { config, warnings }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod lenient_section {
+        use super::super::*;
+        use serde::Deserialize;
+
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Demo {
+            #[serde(default)]
+            allowlist: Vec<String>,
+            #[serde(default)]
+            patterns: Vec<Entry>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Entry {
+            #[allow(dead_code)]
+            pattern: String,
+        }
+
+        fn root_with(config: &str) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+            std::fs::write(dir.path().join(".claude/cadence.json"), config).unwrap();
+            dir
+        }
+
+        #[test]
+        fn malformed_key_does_not_void_section() {
+            // #536: bare strings where the struct wants objects previously
+            // voided the WHOLE section — the valid allowlist beside it died.
+            let dir = root_with(r#"{"demo":{"allowlist":["harness"],"patterns":["zorblax"]}}"#);
+            let loaded: SectionLoad<Demo> = load_cadence_section_lenient(dir.path(), "demo");
+            assert_eq!(loaded.config.allowlist, vec!["harness"]);
+            assert!(loaded.config.patterns.is_empty());
+            assert_eq!(loaded.warnings.len(), 1);
+            assert!(
+                loaded.warnings[0].contains("demo.patterns"),
+                "warning must name the dropped key: {:?}",
+                loaded.warnings
+            );
+        }
+
+        #[test]
+        fn unknown_key_warns_but_config_applies() {
+            let dir = root_with(r#"{"demo":{"allowlist":["a"],"resolveVisibilty":true}}"#);
+            let loaded: SectionLoad<Demo> = load_cadence_section_lenient(dir.path(), "demo");
+            assert_eq!(loaded.config.allowlist, vec!["a"]);
+            assert_eq!(loaded.warnings.len(), 1);
+            assert!(loaded.warnings[0].contains("resolveVisibilty"));
+        }
+
+        #[test]
+        fn clean_section_no_warnings() {
+            let dir = root_with(r#"{"demo":{"allowlist":["a"],"patterns":[{"pattern":"x"}]}}"#);
+            let loaded: SectionLoad<Demo> = load_cadence_section_lenient(dir.path(), "demo");
+            assert_eq!(loaded.config.allowlist, vec!["a"]);
+            assert_eq!(loaded.config.patterns.len(), 1);
+            assert!(loaded.warnings.is_empty());
+        }
+
+        #[test]
+        fn absent_section_is_silent_default() {
+            let dir = root_with(r#"{"other":{}}"#);
+            let loaded: SectionLoad<Demo> = load_cadence_section_lenient(dir.path(), "demo");
+            assert!(loaded.config.allowlist.is_empty());
+            assert!(loaded.warnings.is_empty());
+        }
+
+        #[test]
+        fn non_object_section_warns_and_defaults() {
+            let dir = root_with(r#"{"demo":"nope"}"#);
+            let loaded: SectionLoad<Demo> = load_cadence_section_lenient(dir.path(), "demo");
+            assert!(loaded.config.allowlist.is_empty());
+            assert_eq!(loaded.warnings.len(), 1);
+            assert!(loaded.warnings[0].contains("not an object"));
+        }
+
+        #[test]
+        fn invalid_json_is_silent_default() {
+            let dir = root_with("{not json");
+            let loaded: SectionLoad<Demo> = load_cadence_section_lenient(dir.path(), "demo");
+            assert!(loaded.config.allowlist.is_empty());
+            assert!(loaded.warnings.is_empty());
+        }
+    }
 
     #[test]
     fn space_separated() {

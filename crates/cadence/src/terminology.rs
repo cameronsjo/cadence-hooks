@@ -289,8 +289,15 @@ fn glob_match(pattern: &str, rel_path: &str, basename: &str) -> bool {
 /// (fail-open, ADR-0001). The legacy `.claude/terminology.json` is no longer
 /// read — a hard cut; `cadence-hooks migrate-config` converts a repo and
 /// `cadence-hooks doctor` warns on an orphaned legacy file.
-fn load_terminology_config(root: &Path) -> TerminologyConfig {
-    cadence_hooks_core::config::load_cadence_section(root, "terminology")
+fn load_terminology_config(
+    root: &Path,
+) -> cadence_hooks_core::config::SectionLoad<TerminologyConfig> {
+    // Lenient (#536 family): the section's known key set is `exemptions`
+    // (entries: `paths`, `terms`, `mode`). A malformed key is dropped and
+    // named; the rest of the section applies. NB the fail direction here is
+    // already safe — dropped exemptions mean MORE blocking, never less — so
+    // the warning exists for legibility, not safety.
+    cadence_hooks_core::config::load_cadence_section_lenient(root, "terminology")
 }
 
 /// Apply per-repo `.claude/cadence.json` `terminology` softening to the accumulated
@@ -303,17 +310,18 @@ fn apply_exemptions(
     file_path: &str,
     blocks: &mut Vec<(String, String)>,
     nudges: &mut Vec<(String, String)>,
-) {
+) -> Vec<String> {
     let start_dir = Path::new(file_path)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
     let Some(root) = cadence_hooks_core::paths::find_git_root(&start_dir) else {
-        return;
+        return Vec::new();
     };
-    let config = load_terminology_config(&root);
+    let loaded = load_terminology_config(&root);
+    let config = loaded.config;
     if config.exemptions.is_empty() {
-        return;
+        return loaded.warnings;
     }
 
     let rel_path = Path::new(file_path)
@@ -349,6 +357,7 @@ fn apply_exemptions(
             nudges.push(d);
         }
     }
+    loaded.warnings
 }
 
 /// Blocks content containing prohibited terminology and suggests alternatives.
@@ -404,11 +413,25 @@ impl Check for TerminologyGuard {
         // violation to soften and we know the file path (so a clean edit never
         // touches disk). The hardcoded is_excluded_path() baseline above still
         // applies; this only ever removes or demotes a violation, never adds one.
+        let mut config_warnings: Vec<String> = Vec::new();
         if (!blocks.is_empty() || !nudges.is_empty())
             && let Some(ref path) = input.file_path()
         {
-            apply_exemptions(path, &mut blocks, &mut nudges);
+            config_warnings = apply_exemptions(path, &mut blocks, &mut nudges);
         }
+        // Render config anomalies (a dropped malformed key, an unknown key)
+        // as one appended block — #536 family: a dropped exemption key means
+        // MORE blocking here, so the user needs the drop named to understand
+        // why an exemption they wrote is not softening.
+        let warning_block = if config_warnings.is_empty() {
+            String::new()
+        } else {
+            let mut w = String::from("\nConfig anomalies in .claude/cadence.json:\n");
+            for line in &config_warnings {
+                w.push_str(&format!("  {line}\n"));
+            }
+            w
+        };
 
         // Tier 1: hard block
         if !blocks.is_empty() {
@@ -427,6 +450,7 @@ impl Check for TerminologyGuard {
             for (term, replacement) in &blocks {
                 msg.push_str(&format!("  {term} → {replacement}\n"));
             }
+            msg.push_str(&warning_block);
 
             return CheckResult::block(msg);
         }
@@ -442,8 +466,16 @@ impl Check for TerminologyGuard {
             for (term, replacement) in &nudges {
                 msg.push_str(&format!("  {term} → {replacement}\n"));
             }
+            msg.push_str(&warning_block);
 
             return CheckResult::nudge(msg);
+        }
+
+        if !warning_block.is_empty() {
+            // Every violation was exempted away, but the config that did (or
+            // failed to do) the softening has anomalies — name them rather
+            // than exiting silent.
+            return CheckResult::nudge(format!("⚠️  terminology-guard:{warning_block}"));
         }
 
         CheckResult::allow()
@@ -1419,14 +1451,14 @@ mod tests {
     #[test]
     fn load_terminology_config_missing_file_is_default() {
         let dir = tempfile::tempdir().unwrap();
-        let config = load_terminology_config(dir.path());
+        let config = load_terminology_config(dir.path()).config;
         assert!(config.exemptions.is_empty());
     }
 
     #[test]
     fn load_terminology_config_reads_exemptions() {
         let repo = temp_repo(r#"{"exemptions":[{"paths":["a.yml"]},{"paths":["b.yml"]}]}"#);
-        let config = load_terminology_config(repo.path());
+        let config = load_terminology_config(repo.path()).config;
         assert_eq!(config.exemptions.len(), 2);
     }
 
