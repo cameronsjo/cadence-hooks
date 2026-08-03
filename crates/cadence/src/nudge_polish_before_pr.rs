@@ -32,11 +32,17 @@
 //!
 //! Polish is mandatory before a PR ships, so this check reads a **branch-scoped
 //! marker** the polish skill records when it completes (`cadence-hooks cadence
-//! record-polish`), keyed on `(repo_root, branch)`. It routes a 2-way, fail-open
+//! record-polish`), keyed on `(repo_root, branch)`. It routes a fail-open
 //! outcome:
 //!
 //! - a polish marker exists for the PR's branch → **allow** (silent — no nag
-//!   after a real polish run);
+//!   after a real polish run) — unless the marker's own record affirmatively
+//!   says the **security arm did not run** (an `arms` roster entry
+//!   `security=skipped`, or a `scope: docs` pass, which never dispatches it)
+//!   *and* the branch's diff vs `origin/main` touches code by polish's own
+//!   definition → a distinct **security nudge** (cadence-hooks#467). An absent
+//!   roster is *unknown, never skipped* — every legacy roster-less marker keeps
+//!   allowing;
 //! - no marker for this branch (or the repo/branch can't be resolved) → **nudge**
 //!   (ADR-0001 fail-open; CP1 never blocks on our own missing data).
 //!
@@ -59,9 +65,27 @@
 //! CP2 escalates the absent-marker nudge to a block once the skill's marker
 //! write has propagated.
 
-use cadence_hooks_core::markers::polish_marker_present;
-use cadence_hooks_core::shell::is_polish_ship_anchor;
+use cadence_hooks_core::branch_diff::{branch_touches_code, changed_files};
+use cadence_hooks_core::markers::{polish_marker_present, read_polish_marker};
+use cadence_hooks_core::shell::{is_polish_ship_anchor, parse_work_dir};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
+
+/// What the branch-scoped polish marker says, as far as the gate can read it
+/// (cadence-hooks#467).
+///
+/// `security_ran: None` is *unknown* — a legacy roster-less marker, an
+/// unparseable body, or a degraded (non-private) marker dir — and unknown
+/// keeps allowing: the presence bool alone carries the verdict, exactly the
+/// pre-#467 behavior. Only an affirmative `Some(false)` (an explicit
+/// `security=skipped` roster entry, or a `scope: docs` pass, which never
+/// dispatches the security arm) can escalate to the security nudge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerState {
+    /// No polish marker for this branch (or repo/branch/cwd unresolved).
+    Absent,
+    /// A marker exists; `security_ran` per the roster/scope, `None` = unknown.
+    Present { security_ran: Option<bool> },
+}
 
 /// Gates `/polish` (cadence-forge:polish) before opening a PR — conditional on a
 /// branch-scoped polish marker recorded by a completed polish pass.
@@ -79,31 +103,57 @@ impl Check for NudgePolishBeforePr {
         // Only a ship anchor (`gh pr ready`, a non-draft `gh pr create`, or a
         // bare `gh pr merge`) pays the git-resolution cost; every other command
         // short-circuits to allow inside `decide`.
-        let marker_present =
-            is_polish_ship_anchor(command) && polish_marker_present(command, input.cwd.as_deref());
-        decide(command, marker_present)
+        let cwd = input.cwd.as_deref();
+        let marker = if is_polish_ship_anchor(command) && polish_marker_present(command, cwd) {
+            MarkerState::Present {
+                security_ran: read_polish_marker(command, cwd).and_then(|r| r.security_ran()),
+            }
+        } else {
+            MarkerState::Absent
+        };
+        // The diff subprocess is ordered LAST and runs only when the roster
+        // affirmatively says security was skipped — the common full-polish
+        // path (and every absent/unknown case) never pays for it. A timed-out
+        // or unspawnable git yields no evidence (`None`), which reads as
+        // "does not touch code" → allow (ADR-0001).
+        let touches_code = matches!(
+            marker,
+            MarkerState::Present {
+                security_ran: Some(false)
+            }
+        ) && cwd.is_some_and(|cwd| {
+            let dir = parse_work_dir(command, cwd);
+            changed_files(&dir).is_some_and(|files| branch_touches_code(&files))
+        });
+        decide(command, marker, touches_code)
     }
 }
 
-/// The pure 2-way conditional — no I/O, so the gate logic is unit-tested without
-/// the filesystem. `run()` resolves the marker and hands the boolean in.
+/// The pure conditional — no I/O, so the gate logic is unit-tested without the
+/// filesystem. `run()` resolves the marker and the branch diff, and hands both
+/// in.
 ///
 /// - non-ship-anchor (incl. a `--draft` create, and a `gh pr merge` that names
 ///   a PR or overrides the repo) → allow.
-/// - ship anchor + a branch-scoped polish marker present → allow (silent).
 /// - ship anchor + no marker (or unresolved repo/branch/cwd) → nudge
 ///   (fail-open floor, ADR-0001 — CP1 never blocks).
-fn decide(command: &str, marker_present: bool) -> CheckResult {
+/// - ship anchor + marker whose roster affirmatively says the security arm did
+///   not run, on a branch that touches code (polish's own definition — the
+///   caller computes it) → the security nudge (#467).
+/// - ship anchor + any other marker (security ran, or unknown — the legacy
+///   roster-less shape the whole estate carries) → allow (silent).
+fn decide(command: &str, marker: MarkerState, branch_touches_code: bool) -> CheckResult {
     if !is_polish_ship_anchor(command) {
         return CheckResult::allow();
     }
-    if marker_present {
-        // Polish recorded a marker for this branch — silent allow. Kills the
-        // nag-after-polish noise and honors every invocation shape.
-        CheckResult::allow()
-    } else {
-        // No marker for this branch — fail open to the soft nudge, never block.
-        CheckResult::nudge(nudge_message())
+    match marker {
+        MarkerState::Absent => CheckResult::nudge(nudge_message()),
+        MarkerState::Present {
+            security_ran: Some(false),
+        } if branch_touches_code => CheckResult::nudge(security_nudge_message()),
+        // Polish recorded a marker for this branch, and nothing affirmatively
+        // says the security arm was skipped on a code branch — silent allow.
+        MarkerState::Present { .. } => CheckResult::allow(),
     }
 }
 
@@ -123,6 +173,21 @@ fn nudge_message() -> String {
          records the marker when it completes. {SCOPE_CLAUSES} Skip ONLY for a \
          trivial one-liner or an already-polished branch — say so and why, don't \
          skip silently."
+    )
+}
+
+/// The #467 escalation: a polish DID run and record, but its roster says the
+/// security arm did not — and the branch touches code. Distinct from the
+/// no-marker nudge so the reader knows which gap to close (the arm, not the
+/// whole pass). Advisory, fail-open (ADR-0001), like everything here.
+fn security_nudge_message() -> String {
+    format!(
+        "Polish ran on this branch, but its record says the SECURITY arm did not \
+         (an explicit security=skipped, or a docs-scoped pass) — and this branch's \
+         diff vs origin/main touches code. Run the security arm before this PR \
+         ships: dispatch `cadence-forge:security-reviewer` (Opus) against the \
+         branch diff, then re-run `cadence-hooks cadence record-polish` with \
+         `--arm security=ran`. {SCOPE_CLAUSES}"
     )
 }
 
@@ -164,14 +229,73 @@ mod tests {
         nudge_msg_has_loophole_clauses(&msg);
     }
 
-    // --- decide(): the pure 2-way conditional (no filesystem) ---
+    // --- decide(): the pure conditional (no filesystem) ---
+
+    /// The legacy shape: a marker exists, roster unknown. Pre-#467 behavior
+    /// must hold for it everywhere a bare `true` used to.
+    const PRESENT_UNKNOWN: MarkerState = MarkerState::Present { security_ran: None };
+    const PRESENT_SECURITY_RAN: MarkerState = MarkerState::Present {
+        security_ran: Some(true),
+    };
+    const PRESENT_SECURITY_SKIPPED: MarkerState = MarkerState::Present {
+        security_ran: Some(false),
+    };
+
+    #[test]
+    fn decide_security_skipped_on_code_branch_nudges_distinctly() {
+        // #467 RED: a recorded polish whose roster says the security arm did
+        // not run, on a branch touching code, must nudge — with the security
+        // message, not the no-polish one.
+        let result = decide("gh pr create --title x", PRESENT_SECURITY_SKIPPED, true);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap_or_default();
+        assert!(
+            msg.contains("SECURITY arm"),
+            "the escalation must name the security arm: {msg}"
+        );
+        assert!(
+            msg.contains("--arm security=ran"),
+            "the escalation must name the re-record step: {msg}"
+        );
+        assert!(
+            !msg.contains("No polish recorded"),
+            "must not present as the no-polish nudge: {msg}"
+        );
+    }
+
+    #[test]
+    fn decide_security_skipped_on_docs_only_branch_allows() {
+        // #467 positive control (silent side): a docs-scoped polish on a
+        // branch whose diff touches no code is exactly right — no nudge.
+        let result = decide("gh pr create --title x", PRESENT_SECURITY_SKIPPED, false);
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn decide_security_ran_allows_regardless_of_code() {
+        assert_eq!(
+            decide("gh pr create --title x", PRESENT_SECURITY_RAN, true).outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn decide_legacy_roster_less_marker_allows_on_code_branch() {
+        // #467 RED: absent roster = UNKNOWN, not skipped — the whole estate
+        // carries roster-less markers, and every one must keep allowing even
+        // on a code branch.
+        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, true);
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(result.message.is_none());
+    }
 
     #[test]
     fn decide_pr_create_with_marker_allows_silently() {
         // A branch-scoped marker present → silent allow. #154 regression: this
         // holds with NO transcript involvement — a slash-command polish that
         // recorded a marker is honored.
-        let result = decide("gh pr create --title test", true);
+        let result = decide("gh pr create --title test", PRESENT_UNKNOWN, false);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(
             result.message.is_none(),
@@ -182,7 +306,7 @@ mod tests {
     #[test]
     fn decide_pr_create_without_marker_nudges() {
         // #146 RED (pure): no marker → nudge, never block. CP1 is fail-open.
-        let result = decide("gh pr create --title x", false);
+        let result = decide("gh pr create --title x", MarkerState::Absent, false);
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("/polish"));
@@ -193,22 +317,34 @@ mod tests {
     fn decide_non_ship_anchor_allows_regardless_of_marker() {
         // The matcher only scopes the process spawn; decide() still guards
         // against a non-anchor gh command slipping through.
-        assert_eq!(decide("gh pr list", false).outcome, Outcome::Allow);
-        assert_eq!(decide("git commit -m x", true).outcome, Outcome::Allow);
-        // A merge that NAMES a PR is excluded — it is the orchestrator shape,
-        // run from another cwd, where the branch would mis-resolve (#325). A
-        // bare merge is a ship anchor and nudges; pinned just below.
-        assert_eq!(decide("gh pr merge 12", false).outcome, Outcome::Allow);
         assert_eq!(
-            decide("gh --repo owner/r pr merge", false).outcome,
+            decide("gh pr list", MarkerState::Absent, false).outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("gh pr merge --squash", false).outcome,
+            decide("git commit -m x", PRESENT_UNKNOWN, false).outcome,
+            Outcome::Allow
+        );
+        // A merge that NAMES a PR is excluded — it is the orchestrator shape,
+        // run from another cwd, where the branch would mis-resolve (#325). A
+        // bare merge is a ship anchor and nudges; pinned just below.
+        assert_eq!(
+            decide("gh pr merge 12", MarkerState::Absent, false).outcome,
+            Outcome::Allow
+        );
+        assert_eq!(
+            decide("gh --repo owner/r pr merge", MarkerState::Absent, false).outcome,
+            Outcome::Allow
+        );
+        assert_eq!(
+            decide("gh pr merge --squash", MarkerState::Absent, false).outcome,
             Outcome::Nudge
         );
         // ...and stays silent once the branch carries a marker.
-        assert_eq!(decide("gh pr merge --squash", true).outcome, Outcome::Allow);
+        assert_eq!(
+            decide("gh pr merge --squash", PRESENT_UNKNOWN, false).outcome,
+            Outcome::Allow
+        );
     }
 
     #[test]
@@ -216,11 +352,11 @@ mod tests {
         // A `--draft` create is not the ship moment (#297) — an entry-posture
         // draft opens at zero diff, so it must allow even with no marker.
         assert_eq!(
-            decide("gh pr create --draft", false).outcome,
+            decide("gh pr create --draft", MarkerState::Absent, false).outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("gh pr create -d --title x", false).outcome,
+            decide("gh pr create -d --title x", MarkerState::Absent, false).outcome,
             Outcome::Allow
         );
     }
@@ -229,10 +365,10 @@ mod tests {
     fn decide_pr_ready_routes_like_create() {
         // `gh pr ready` (leaves draft) is the ship anchor: no marker → nudge,
         // marker present → silent allow.
-        let nudge = decide("gh pr ready 12", false);
+        let nudge = decide("gh pr ready 12", MarkerState::Absent, false);
         assert_eq!(nudge.outcome, Outcome::Nudge);
         nudge_msg_has_loophole_clauses(&nudge.message.unwrap_or_default());
-        let allow = decide("gh pr ready 12", true);
+        let allow = decide("gh pr ready 12", PRESENT_UNKNOWN, false);
         assert_eq!(allow.outcome, Outcome::Allow);
         assert!(allow.message.is_none());
     }
@@ -371,6 +507,141 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(NudgePolishBeforePr.run(&input).outcome, Outcome::Nudge);
+    }
+
+    // --- #467: security-arm roster, end to end through run() ---
+
+    /// [`init_repo_on_branch`] plus: a base commit mirrored to a synthetic
+    /// `origin/main` remote-tracking ref (merge-base needs only the ref, not a
+    /// remote), then `files` committed on the feature branch.
+    fn init_repo_with_origin_and_files(
+        branch: &str,
+        files: &[&str],
+    ) -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&["checkout", "-q", "-b", branch]);
+        for f in files {
+            let path = tmp.path().join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x\n").unwrap();
+            git(&["add", f]);
+        }
+        if !files.is_empty() {
+            git(&["commit", "-q", "-m", "branch work"]);
+        }
+        let state = GitState::resolve(tmp.path()).expect("temp repo resolves git state");
+        let root = state.git_common_dir.to_string_lossy().into_owned();
+        (tmp, root)
+    }
+
+    #[test]
+    fn run_docs_marker_on_code_branch_fires_security_nudge() {
+        // #467 RED (integration, positive control — FIRES): a docs-scoped
+        // marker means the security arm never ran; the branch touches a
+        // skill SKILL.md (code by polish's own definition) → security nudge.
+        let (tmp, root) =
+            init_repo_with_origin_and_files("feat/code", &["skills/arrange/SKILL.md"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/code"), r#"{"scope":"docs"}"#).unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(
+                result.outcome,
+                Outcome::Nudge,
+                "docs marker + code branch must nudge"
+            );
+            assert!(
+                result.message.unwrap_or_default().contains("SECURITY arm"),
+                "must be the security escalation, not the no-polish nudge"
+            );
+        });
+    }
+
+    #[test]
+    fn run_docs_marker_on_docs_only_branch_stays_silent() {
+        // #467 positive control (SILENT): docs-scoped marker + a branch whose
+        // diff is literal docs only → allow, no message.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/docs", &["docs/notes.md"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/docs"), r#"{"scope":"docs"}"#).unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(result.message.is_none());
+        });
+    }
+
+    #[test]
+    fn run_legacy_roster_less_marker_stays_silent_on_code_branch() {
+        // #467 positive control (SILENT): the estate's existing markers carry
+        // no roster and no scope worth reading ("{}") — unknown must keep
+        // allowing on a code branch, exactly the pre-#467 behavior.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/legacy", &["src/main.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/legacy"), "{}").unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(result.message.is_none());
+        });
+    }
+
+    #[test]
+    fn run_security_skipped_roster_on_code_branch_fires() {
+        // #467: the explicit-roster form of the docs-marker case — a full-scope
+        // marker whose roster says security=skipped, code branch → nudge.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/roster", &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/roster"),
+                r#"{"scope":"full","arms":{"security":"skipped"}}"#,
+            )
+            .unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            assert!(result.message.unwrap_or_default().contains("SECURITY arm"));
+        });
+    }
+
+    #[test]
+    fn run_garbled_marker_content_stays_silent() {
+        // #467: untrusted marker content — unparseable JSON degrades to
+        // unknown (never a panic, never a nudge); presence carries the allow.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/garbled", &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/garbled"), "not json {{{").unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+        });
     }
 
     // --- worktree-stable keying (cadence-hooks#324) ---

@@ -215,6 +215,11 @@ enum CadenceCommands {
         /// What the pass covered — `full`, `code`, or `docs` (default: full)
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
+        /// Per-arm outcome, repeatable — e.g. `--arm security=ran --arm
+        /// tests=skipped`. Recorded additively; a marker without a roster
+        /// reads as unknown, never as skipped (cadence-hooks#467)
+        #[arg(long = "arm", value_name = "NAME=STATE", action = clap::ArgAction::Append)]
+        arm: Vec<String>,
     },
 }
 
@@ -931,8 +936,9 @@ fn main() {
                 repo_root,
                 branch,
                 scope,
+                arm,
             } => {
-                cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope);
+                cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope, arm);
             }
         },
         Commands::Guardrails(cmd) => match cmd {
