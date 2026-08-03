@@ -546,6 +546,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
   Verified by differential in two rounds: the first round's cases spliced onto the pre-change source fail on exactly the ten that probe the two original defects, and this round's onto the first fix fail on exactly the nine that probe the escapes above — while every positive control passes on both sides (an ordinary leading `-R` in all three spellings, a boolean cluster with no method letter, an unknown cluster letter still failing closed, a graphql read and a safe graphql mutation, `gh repo edit` with no positional falling back to the cwd, a `--description some/thing` value not read as a target, an owned target after a flag, and the verb appearing only in quoted prose). Every proof-of-concept was additionally replayed end-to-end through the built binary, where all seventeen now block.
 
+## [0.70.1] - 2026-08-02
+
+### Changed
+
+- Test fixtures use RFC 2606 example domains (`ghe.example.com`) and placeholder identifiers.
+
 ## [0.70.0] - 2026-07-27
 
 ### Added
