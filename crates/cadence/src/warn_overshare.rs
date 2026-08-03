@@ -86,10 +86,18 @@ fn is_bypass_set(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
 
-/// True when `command` contains any of the six trigger token sequences.
+/// True when `command` contains any trigger token sequence, or any segment
+/// matches the redact engine's [`EXTERNAL_POST`] gate (cadence-hooks#385:
+/// overshare's hand-kept six-command list missed `gh pr comment`,
+/// `gh pr review`, `gh issue edit`, `gh release/gist/discussion`, and `tea` —
+/// every one an external-posting surface the leak scanner already gated).
+/// One gate, two consumers: a new posting verb added there is covered here
+/// for free.
 ///
-/// Token-based to avoid substring false positives (e.g. a branch name
-/// containing the literal `git-push` or quoted `git push` inside an echo).
+/// Token-based for the git verbs to avoid substring false positives (e.g. a
+/// branch name containing the literal `git-push` or quoted `git push` inside
+/// an echo); the EXTERNAL_POST arm quote-strips each segment for the same
+/// reason, mirroring the redact gate.
 fn is_bash_overshare_trigger(command: &str) -> bool {
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
@@ -102,11 +110,19 @@ fn is_bash_overshare_trigger(command: &str) -> bool {
         return true;
     }
 
-    tokens.windows(3).any(|w| {
+    let three_hit = tokens.windows(3).any(|w| {
         BASH_THREE_TOKEN_TRIGGERS
             .iter()
             .any(|t| w[0] == t[0] && w[1] == t[1] && w[2] == t[2])
-    })
+    });
+    if three_hit {
+        return true;
+    }
+
+    use cadence_hooks_core::shell::{command_segments, strip_quotes};
+    command_segments(command)
+        .iter()
+        .any(|seg| crate::redact_external_content::EXTERNAL_POST.is_match(&strip_quotes(seg)))
 }
 
 /// True when `path` is under the Obsidian vault.
@@ -235,6 +251,38 @@ mod tests {
         assert_eq!(
             run(&make_bash("gh issue comment 1 --body hi")).outcome,
             Outcome::Nudge
+        );
+    }
+
+    // --- EXTERNAL_POST-gated surfaces (#385): every posting verb the leak
+    // scanner gates now nudges here too. ---
+
+    #[test]
+    fn external_post_surfaces_nudge() {
+        for cmd in [
+            "gh pr comment 7 --body text",
+            "gh pr review 7 --approve --body lgtm",
+            "gh issue edit 9 --body updated",
+            "gh release create v1.0 --notes text",
+            "gh discussion create --title t --body b",
+            "tea pr create --title t --description d",
+            "tea issue comment 3 hello",
+        ] {
+            assert_eq!(
+                run(&make_bash(cmd)).outcome,
+                Outcome::Nudge,
+                "expected nudge for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_mention_of_posting_verb_does_not_nudge() {
+        // The EXTERNAL_POST arm quote-strips each segment, mirroring the
+        // redact gate — a body merely MENTIONING a posting command is prose.
+        assert_eq!(
+            run(&make_bash("echo 'docs: gh pr comment usage'")).outcome,
+            Outcome::Allow
         );
     }
 
