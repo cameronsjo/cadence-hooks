@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "binaryVersion": "0.70.1",
+  "binaryVersion": "0.71.0",
   "minimumCodexVersion": "0.145.0",
   "privacy": {
     "rawHookInputsPersisted": false,
@@ -105,15 +105,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/patch.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "5ddb8f61245c992f38f29989057dd940c6a6f6228f3e0362dc37e11d12520471"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -125,15 +117,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/patch.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "30a05a35f6d7251993bedae7c495480e56a1704e5e4593e502488a5d22d438d2"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -145,22 +129,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Read|Grep|mcp__.*(read|get_file|fetch_file|load_file|grep|search|find_file).*",
-          "if": null,
-          "commandHash": "017f4dfe35e5da82bbf4143e192fc4b3ecff0241d8790ac1e22216d425e9c51a"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": null,
-          "commandHash": "017f4dfe35e5da82bbf4143e192fc4b3ecff0241d8790ac1e22216d425e9c51a"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -172,22 +141,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "tests/codex_coverage.rs::patch_add_file_carrying_a_secret_is_blocked",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "adaec4e178ba352ecef1563c63367c934d412956eb4bba7f0c754de40e8007e1"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": null,
-          "commandHash": "adaec4e178ba352ecef1563c63367c934d412956eb4bba7f0c754de40e8007e1"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -199,15 +153,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/patch.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "2c71151a00dda962fb49921cce043d41ac6c88c92f668e2b1145bd29fb2c8842"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -219,15 +165,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": null,
-          "commandHash": "188138a70a135f1c9466f64842a5161050ba0fc970ee365efe35ce9777f7c6c2"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -239,15 +177,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/patch.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "25fb611d9d8e54202bbb709cdfeb71032498eabecc380f6e64dbcaff158d64aa"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -259,15 +189,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/patch.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "af876a0d6fe1aef861f9dc9225e4ef57c73d500aa0508bdceaee3e4dee7a6cf9"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -279,15 +201,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": null,
-          "commandHash": "e15b07bb515be10cba401611d5d1938e4fb187f9a8055ba602acc1421c8f7c8e"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -299,57 +213,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git push*)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git commit*)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr create*)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr edit*)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh issue create*)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh issue comment*)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -361,29 +225,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr create*)",
-          "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr ready*)",
-          "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr merge*)",
-          "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -395,15 +237,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/patch.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "a58b714a3c0dc0af16950ffec7640c06c0f6c2d016ba5f5295bdc94be9622f2b"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -415,64 +249,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh issue *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh release *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh gist *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh discussion *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git commit*)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*tea pr *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*tea issue *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -484,15 +261,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "SessionStart",
-          "matcher": "startup|resume|clear|compact",
-          "if": null,
-          "commandHash": "335f93eb496a7cd323000a6eb5709b30d04c39b39bc15bacf2ac02bc54274572"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -504,15 +273,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git push*)",
-          "commandHash": "601599927ec47fdca6792c8aedd183867832cf4ba238a1d21f7eff7d55f36b89"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -524,15 +285,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh repo delete*)",
-          "commandHash": "d5260da6466e5b1a72b410739e1abadcdf186077fd49311a7cffb888edabe516"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -544,15 +297,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh *)",
-          "commandHash": "b24865549595fb5058333e28d12bdecd19f932fcc615fa803942ad9d4e41c2c7"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -564,15 +309,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PostToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git init*)",
-          "commandHash": "13a35e7027a4f30ea91b7213188ffbcab7db1ba7ab61f9595913cfa0cabbc57a"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -584,15 +321,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/patch.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Edit|Write|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "5af37738290421c06260927fe63c99e82fcdfdc3443c91e2f5beda5a9fcad2e1"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -604,22 +333,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/lib.rs::codex_patch_expands_every_target_and_rename_destination",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Edit|Write|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "503a03e2377b6e96c2096b1fea7d988eb7fe1a3abdd5cd67aa547c604de56494"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git *commit*)",
-          "commandHash": "503a03e2377b6e96c2096b1fea7d988eb7fe1a3abdd5cd67aa547c604de56494"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -631,15 +345,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/lib.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Agent|Task",
-          "if": null,
-          "commandHash": "1cb467c502cea9293d5518ac0a2447dfd827e863d51d4431bb533ef38fb69e3e"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -651,15 +357,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/core/src/lib.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Agent|Task",
-          "if": null,
-          "commandHash": "116b0fb98af53440e7782112b86910d68c59e29888ebf975c06d264d7068807b"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -671,22 +369,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git checkout*)",
-          "commandHash": "905be14c05b8d176305843c93695defc6626db3261d3ee13c1a491b9a00d0f93"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git switch*)",
-          "commandHash": "905be14c05b8d176305843c93695defc6626db3261d3ee13c1a491b9a00d0f93"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -698,15 +381,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "CronCreate",
-          "if": null,
-          "commandHash": "a754f7907c477c12204a2a487f3abe890623c9795924b86ee19dc19d7a1a00fb"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -718,15 +393,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PostToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git push*)",
-          "commandHash": "706b81527ec2144a638815f8724a98144aa700c3dce387c041140eca7afc2bff"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -738,15 +405,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git commit*)",
-          "commandHash": "d40c261bc8a9f4a6c3c4e86ec107c06b8843f3c04d99601822e71d7cf41d0c7a"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -758,15 +417,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "tests/codex_coverage.rs::patch_target_reaches_guard_dotfiles",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Edit|Write|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "428f8e0b842d74c04cd940ebd59e94f14cc9ba24886402b2de0bc547184d4998"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -778,50 +429,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/guardrails/src/guard_rm.rs::patch_delete_of_a_protected_path_blocks",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*rm*)",
-          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*unlink*)",
-          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*shred*)",
-          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*truncate*)",
-          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*find*)",
-          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "^Edit$|mcp__.*(delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -833,15 +441,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Read|Grep|mcp__.*(read|get_file|fetch_file|load_file|grep|search|find_file).*",
-          "if": null,
-          "commandHash": "76e5475828f16b103cbfd90bc3ef4933d39a331154d985411f0d4233ff813434"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -853,15 +453,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr create*)",
-          "commandHash": "7017f639d7ace4afb9f9fc9e61a764b3490742033cf5eb729f291e113f7a96a3"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -873,22 +465,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh issue create*)",
-          "commandHash": "a5de2a56f1b7074663c0b0c6cc7dbfc2af05310d5ac4cd74d0bc7168c35b0ebf"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*/issues*)",
-          "commandHash": "a5de2a56f1b7074663c0b0c6cc7dbfc2af05310d5ac4cd74d0bc7168c35b0ebf"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -900,22 +477,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh repo create*)",
-          "commandHash": "3a26a937ff7bbe7bc4bcca921a51860348f566ca4e776875555ccdfaa90ab9f8"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh repo edit*)",
-          "commandHash": "3a26a937ff7bbe7bc4bcca921a51860348f566ca4e776875555ccdfaa90ab9f8"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -927,22 +489,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PostToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr create*)",
-          "commandHash": "98e4cf9589b4316674accf1dfa9540544b3dc84fcf1a41b7930e8771f0eb9b4e"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PostToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr merge*)",
-          "commandHash": "98e4cf9589b4316674accf1dfa9540544b3dc84fcf1a41b7930e8771f0eb9b4e"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -954,22 +501,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*op item*)",
-          "commandHash": "2295eae02a357d6139462e569e5057862ee55cb5795631b09c56da9eec1d670b"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*op vault*)",
-          "commandHash": "2295eae02a357d6139462e569e5057862ee55cb5795631b09c56da9eec1d670b"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -981,15 +513,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*curl *)",
-          "commandHash": "24a45b65f5e5a191ab4452c4f34d6e06585007d7b2ede8dc430c13e6e8b922e1"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1001,15 +525,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr merge*)",
-          "commandHash": "0c546023e8a25f9d700d83a8011d4760b1c985e174ef980421b24faf427680ec"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1021,15 +537,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*coderabbitai*)",
-          "commandHash": "d1b6168b47b813945a546720f1dea3c1147796b3be9620b174a2c70c2108074c"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1041,50 +549,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*ls *)",
-          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*find *)",
-          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*cat *)",
-          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*du *)",
-          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*df *)",
-          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
-        },
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*top *)",
-          "commandHash": "01d29f081f8e6656580bf709127fa6b4635408ef9f5e4c3d28d9489befc41601"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -1096,15 +561,7 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Codex CLI has no Claude-in-Chrome MCP route",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "mcp__claude-in-chrome__.*",
-          "if": null,
-          "commandHash": "3f42e03ccbc61d476c67156c4ebc9445368a725da981e6463a0200fcc9c50e54"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1128,15 +585,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh *)",
-          "commandHash": "e9db420dfe2e3e41929e392bb9d9ccd6c7c9a64c8d25069b289714920e78c7f5"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1148,15 +597,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-rules",
-          "event": "PreToolUse",
-          "matcher": "Edit|Write",
-          "if": null,
-          "commandHash": "885f4ef7260054387be2425c9c45d1684a133cb9d3d0af2ce2e4ca9ea00ec988"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1168,15 +609,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-rules",
-          "event": "PostToolUse",
-          "matcher": "Edit|Write",
-          "if": null,
-          "commandHash": "5833156282663d0b0caa663ec3f9f0ceeabbf83db34da32d7d463a4c28e19091"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1188,15 +621,7 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Claude AskUserQuestion stream has no Codex equivalent",
-      "wiring": [
-        {
-          "plugin": "cadence-rules",
-          "event": "PreToolUse",
-          "matcher": "AskUserQuestion",
-          "if": null,
-          "commandHash": "1f03d6a78cda71991a035074075c0bd09fec4f826a1c6349d617056debb240fd"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1208,15 +633,7 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Claude AskUserQuestion stream has no Codex equivalent",
-      "wiring": [
-        {
-          "plugin": "cadence-rules",
-          "event": "PostToolUse",
-          "matcher": "AskUserQuestion",
-          "if": null,
-          "commandHash": "506ab1ed93dfc94d073d8db90f679f76e4b73926b07bc3e00d9e05b16bcfb6b9"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "security-critical",
@@ -1228,15 +645,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/obsidian/src/trash_guard.rs::normalized_patch_delete_inside_vault_is_blocked",
-      "wiring": [
-        {
-          "plugin": "cadence-obsidian",
-          "event": "PreToolUse",
-          "matcher": "Bash|Edit|mcp__.*(delete|remove|move|rename).*",
-          "if": null,
-          "commandHash": "aee750813d5d9e831abc921cfc6d3ff8ec170ca52158119f655ede783deadb5e"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1248,15 +657,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git commit*)",
-          "commandHash": "0d3a5112d9a1e23c57d3ebfdf9f6596c3bc813edaa3ca1dd17d82cab795470d5"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1268,15 +669,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/metrics/src/transcript.rs::scan_codex_rollout_v1",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "PostToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git commit*)",
-          "commandHash": "fe8b6b71f18713607302afa6c25e9600d4c1894e5f5351d8bf95fe2b53a2a5d7"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1288,22 +681,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "SubagentStart",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "a1b9f630810b978a60d8ff0c1058443556d10bcc6cb886a7be0cb7ee9a60db5c"
-        },
-        {
-          "plugin": "cadence-metrics",
-          "event": "SubagentStop",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "a1b9f630810b978a60d8ff0c1058443556d10bcc6cb886a7be0cb7ee9a60db5c"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1315,15 +693,7 @@
       "status": "adapted",
       "applicable": true,
       "evidence": "crates/metrics/src/transcript.rs::scan_codex_rollout_v1",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "SessionEnd",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "1ebf765466095afa429d73fcc1f566bb23603d865cd5c823512e4fc3e1edf021"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1335,15 +705,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "SessionStart",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "b1c3eaa537ea148b83e1ef0cb153675eb6241553bc8d680ad690e92e1b8c1af3"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1355,29 +717,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "PostToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr create*)",
-          "commandHash": "6ef992f7fff1917ba682a7463866d94d5b44fa4bd88d5c74a9bf825e4acca427"
-        },
-        {
-          "plugin": "cadence-metrics",
-          "event": "PostToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr ready*)",
-          "commandHash": "6ef992f7fff1917ba682a7463866d94d5b44fa4bd88d5c74a9bf825e4acca427"
-        },
-        {
-          "plugin": "cadence-metrics",
-          "event": "PostToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr merge*)",
-          "commandHash": "6ef992f7fff1917ba682a7463866d94d5b44fa4bd88d5c74a9bf825e4acca427"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1389,22 +729,7 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Claude AskUserQuestion stream has no Codex equivalent",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "PreToolUse",
-          "matcher": "AskUserQuestion",
-          "if": null,
-          "commandHash": "1718adc084c388da12d862bf9897c5086b8cf13de40ccb0ae330df8dc23dd2ad"
-        },
-        {
-          "plugin": "cadence-metrics",
-          "event": "PostToolUse",
-          "matcher": "AskUserQuestion",
-          "if": null,
-          "commandHash": "1718adc084c388da12d862bf9897c5086b8cf13de40ccb0ae330df8dc23dd2ad"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1416,15 +741,7 @@
       "status": "degraded",
       "applicable": true,
       "evidence": "Codex skill invocation is not inferred from transcript prose",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "PostToolUse",
-          "matcher": "Skill",
-          "if": null,
-          "commandHash": "90688372f86caf60aa33a45663d9b4b3a1bc9d00331b0ec0ff0a5f786ea19295"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1436,15 +753,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-metrics",
-          "event": "SessionStart",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "a9029103545951e2675d7ee6f7467b760cb5eff1c4598eec3d7b84abe5ed969d"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1456,15 +765,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "SessionStart",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "0b6b80dc9997e94bb8bf355f18f7c17e73c0c12de095cb243282b249945e6912"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1476,15 +777,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "PostToolUse",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "e6aafeacecd82a152ec1ac48b27d50c492cf215f341fbefa139f1297b3be6d25"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1496,43 +789,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git checkout*)",
-          "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
-        },
-        {
-          "plugin": "cadence-canon",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git switch*)",
-          "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
-        },
-        {
-          "plugin": "cadence-canon",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git add*)",
-          "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
-        },
-        {
-          "plugin": "cadence-canon",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git commit*)",
-          "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
-        },
-        {
-          "plugin": "cadence-canon",
-          "event": "PreToolUse",
-          "matcher": "Edit|Write",
-          "if": null,
-          "commandHash": "fac0a5be307a53e810ba33275d0c35695eea38591d2ee8e75db5155cf03c935d"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1544,15 +801,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git commit*)",
-          "commandHash": "e28e10523130aef2e94bcc90479a6e7a2b78dae42131ffd3e1835ec68bf30c3e"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1564,15 +813,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "PreToolUse",
-          "matcher": "Edit|Write",
-          "if": null,
-          "commandHash": "4c97fee29bc74b9a146b917b4a034bf8f3217f5ce7b99f64ae67b497a012dc31"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1584,15 +825,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*git commit*)",
-          "commandHash": "41cf8ed7e3d92d71a18f1d237bfbd299dc206703c5929bc5020097caf1ad9a8a"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1604,15 +837,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "SessionEnd",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "93795d8a994b01391f6d6fc42270fe582ce9a47454b20cc509036925f9f744e4"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "telemetry",
@@ -1624,15 +849,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "SessionEnd",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "8d58c27bc81995489f8f47a68891475e48a9955cfc527f2d532dca128bc4fcba"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1644,15 +861,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-canon",
-          "event": "SessionStart",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "0e9d3f8cbee8c94f4876d0c81f85c69f8b50ee5b28b8952ba92f7e98758d96c6"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1664,15 +873,7 @@
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "UserPromptSubmit",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "b7a6e48b7e6f883899674c899e991bb289c0e65c7f4fcf00ee5ff602bb812ad0"
-        }
-      ]
+      "wiring": []
     },
     {
       "criticality": "workflow",
@@ -1684,15 +885,7 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Codex does not expose Claude ExitPlanMode approval events",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "PostToolUse",
-          "matcher": "ExitPlanMode",
-          "if": null,
-          "commandHash": "d1c0dd1503f638435e2ea9fdc2247f050838cc1abd886b95c7f2d3c182c154df"
-        }
-      ]
+      "wiring": []
     }
   ]
 }
