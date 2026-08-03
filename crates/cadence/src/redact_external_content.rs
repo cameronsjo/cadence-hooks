@@ -140,7 +140,10 @@ pub const NAMESPACES: &[&str] = &[
 /// actually publish content. `git commit` is included — commit messages ship to
 /// GitHub. Read/label-only variants (`gh pr edit` with no `--body`) extract no
 /// body and fall through to `allow()`.
-static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
+/// `pub(crate)`: `warn_overshare` shares this gate (cadence-hooks#385) so the
+/// overshare nudge covers exactly the posting surfaces the leak scan covers —
+/// one gate, no second hand-kept command list to drift.
+pub(crate) static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\bgh\s+(pr|issue|release|gist|discussion)\s+(create|comment|edit|review|reopen)\b|\bgit\s+commit\b|\btea\s+(pr|issue)\s+(create|comment|edit)\b",
     )
