@@ -5,7 +5,7 @@
 //! create/comment/edit, `git commit`, `tea pr/issue` — for vocabulary that is
 //! meaningful only inside this harness: skill/plugin IDs (`cadence:attune`),
 //! local filesystem paths (`/Users/…`, `~/.claude/…`), marketplace/cache paths,
-//! and bare harness nouns (`harness`, `transcript`, …). When it finds any, it
+//! and harness-shaped identifiers (`tool_input`, `tool_response`). When it finds any, it
 //! suggests rephrasing before the content ships to a public issue/PR/commit.
 //!
 //! ## Why a nudge, never a block (developing-guards "block vs nudge")
@@ -181,14 +181,15 @@ static LOCAL_PATH: LazyLock<Regex> = LazyLock::new(|| {
         .expect("local-path pattern should compile")
 });
 
-/// Category 4 — bare harness nouns. Word-boundary anchored so `transcription`
-/// and `harnessing` (and the code identifier `transcript_path`, where `_` is a
-/// word char) do NOT match — only the bare nouns do. `harness` is the noisiest
-/// term (legit "test harness"); nudge-mode plus the per-repo `allowlist` are the
-/// mitigation, not a tighter pattern.
+/// Category 4 — harness-shaped identifiers. Word-boundary anchored; `_` is a
+/// word char, so prose mentions and code identifiers embedding these tokens
+/// (`tool_input_schema`) do NOT match. The bare nouns `harness` and
+/// `transcript` were deleted from this class (cadence-hooks#406, #564):
+/// zero true positives across the class's life, while the words are mandated
+/// domain vocabulary in estate prose. Repos that want them back can add
+/// `additionalPatterns` entries with a per-entry `ceiling`.
 static HARNESS_NOUN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(harness|transcript|tool_input|tool_response)\b")
-        .expect("harness-noun pattern should compile")
+    Regex::new(r"\b(tool_input|tool_response)\b").expect("harness-noun pattern should compile")
 });
 
 /// Per-repo override, read from the `redaction` section of
@@ -547,10 +548,10 @@ fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
 /// swallows `cadence-forge:…`); for every other category (`local-path`,
 /// `marketplace`, `harness-noun`, `custom`) a colon-free entry has no
 /// namespace structure to prefix-match, so it suppresses a hit whose exact
-/// snippet equals it (#318: a repo whose own subject matter uses a harness
-/// noun as domain vocabulary — e.g. a transcript-viewer tool discussing
-/// "transcript" — can allowlist that literal term without suppressing the
-/// whole `harness-noun` category or a differently-worded hit like "harness").
+/// snippet equals it (#318: a repo whose own subject matter uses one of these
+/// identifiers as domain vocabulary — e.g. a tool-schema library discussing
+/// `tool_input` — can allowlist that literal term without suppressing the
+/// whole `harness-noun` category or a different hit like `tool_response`).
 fn is_allowlisted(hit: &Hit, allowlist: &[String]) -> bool {
     allowlist.iter().any(|entry| {
         if entry.contains(':') {
@@ -1000,10 +1001,37 @@ mod tests {
 
     #[test]
     fn category_harness_noun() {
-        assert_eq!(
-            run("gh pr create --body \"parse the transcript correctly\"").outcome,
-            Outcome::Nudge
-        );
+        // Hermetic cwd: the bare `run()` helper resolves base_dir from the
+        // process cwd, and THIS repo's own `.claude/cadence.json` allowlists
+        // `tool_input`/`tool_response` — a bare-run assertion here would test
+        // the host repo's config, not the engine.
+        let repo = temp_repo_with_config("{}");
+        let cmd = "gh pr create --body \"rename tool_input everywhere\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn bare_harness_not_matched() {
+        // #406/#564: the bare noun `harness` was deleted from the class —
+        // mandated domain vocabulary in estate prose, zero true positives.
+        // Hermetic cwd (empty config): a bare `run()` Allow-assertion would
+        // also pass if the term were merely allowlisted in the host repo's
+        // `.claude/cadence.json`, masking a reverted deletion.
+        let repo = temp_repo_with_config("{}");
+        let cmd = "gh pr create --body \"the test harness needs work\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn bare_transcript_not_matched() {
+        // Deleted alongside `harness` (predecessor defect: #318). Hermetic
+        // cwd for the same reason as `bare_harness_not_matched`.
+        let repo = temp_repo_with_config("{}");
+        let cmd = "gh pr create --body \"parse the transcript correctly\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
     }
 
     #[test]
@@ -1132,20 +1160,20 @@ mod tests {
     fn allowlist_bare_term_suppresses_matching_harness_noun() {
         // #318: a bare (non-namespace) allowlist entry that exactly matches a
         // harness-noun hit's own text suppresses that literal term — the
-        // repo's own domain vocabulary (e.g. a transcript-viewer tool
-        // discussing "transcript") shouldn't read as harness leakage.
-        let repo = temp_repo_with_config(r#"{"allowlist":["transcript"]}"#);
-        let cmd = "gh pr create --body \"parse the transcript correctly\"";
+        // repo's own domain vocabulary (e.g. a tool-schema library
+        // discussing `tool_input`) shouldn't read as harness leakage.
+        let repo = temp_repo_with_config(r#"{"allowlist":["tool_input"]}"#);
+        let cmd = "gh pr create --body \"rename tool_input everywhere\"";
         let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
     }
 
     #[test]
     fn allowlist_bare_term_does_not_suppress_a_different_harness_noun() {
-        // Allowlisting "transcript" must not blanket-suppress the whole
-        // harness-noun category — "harness" itself still flags.
-        let repo = temp_repo_with_config(r#"{"allowlist":["transcript"]}"#);
-        let cmd = "gh pr create --body \"the test harness needs work\"";
+        // Allowlisting "tool_input" must not blanket-suppress the whole
+        // harness-noun category — "tool_response" still flags.
+        let repo = temp_repo_with_config(r#"{"allowlist":["tool_input"]}"#);
+        let cmd = "gh pr create --body \"the tool_response payload changed\"";
         let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
     }
@@ -1216,7 +1244,7 @@ mod tests {
     #[test]
     fn never_blocks() {
         // Even a body full of every category stays a nudge.
-        let cmd = "gh pr create --body \"cadence:attune /Users/x ~/.claude/plugins/y transcript\"";
+        let cmd = "gh pr create --body \"cadence:attune /Users/x ~/.claude/plugins/y tool_input\"";
         assert_ne!(run(cmd).outcome, Outcome::Block);
         assert_eq!(run(cmd).outcome, Outcome::Nudge);
     }
@@ -1246,7 +1274,7 @@ mod tests {
 
     // One line per universal category, each firing exactly once.
     const BODY_ALL: &str = "Use cadence-forge:polish. File /Users/alice/x. \
-         Installed ~/.claude/plugins/cadence-forge/skill.json. The transcript records.";
+         Installed ~/.claude/plugins/cadence-forge/skill.json. The tool_input records.";
     const BODY_SKILL: &str = "Use cadence-forge:polish here.";
     const BODY_SKILL_PATH: &str = "Run cadence-forge:polish on /Users/alice/secret.txt now.";
     const BODY_ACME: &str = "Deploy for ACME-INC today.";
