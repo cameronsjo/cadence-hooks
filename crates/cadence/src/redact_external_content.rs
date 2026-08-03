@@ -334,14 +334,15 @@ impl Check for RedactExternalContent {
     }
 }
 
-/// Render config-load warnings as one nudge block.
+/// Render config-load warnings as one nudge block. NB this fires on every
+/// gated posting command (incl. `git commit`) until the config is fixed —
+/// accepted cost: the whole point is that the drop is no longer silent, and
+/// the fix is a one-time config edit the message names precisely.
 fn build_config_warning(warnings: &[String]) -> String {
-    let mut out =
-        String::from("⚠️  redact-external-content: config anomalies in .claude/cadence.json:\n");
-    for w in warnings {
-        out.push_str(&format!("  {w}\n"));
-    }
-    out
+    format!(
+        "⚠️  redact-external-content: config anomalies in .claude/cadence.json:\n{}",
+        cadence_hooks_core::config::render_config_warnings(warnings)
+    )
 }
 
 /// Resolve the directory to read `.claude/cadence.json` from and to resolve a

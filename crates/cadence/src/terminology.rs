@@ -426,11 +426,10 @@ impl Check for TerminologyGuard {
         let warning_block = if config_warnings.is_empty() {
             String::new()
         } else {
-            let mut w = String::from("\nConfig anomalies in .claude/cadence.json:\n");
-            for line in &config_warnings {
-                w.push_str(&format!("  {line}\n"));
-            }
-            w
+            format!(
+                "\nConfig anomalies in .claude/cadence.json:\n{}",
+                cadence_hooks_core::config::render_config_warnings(&config_warnings)
+            )
         };
 
         // Tier 1: hard block
