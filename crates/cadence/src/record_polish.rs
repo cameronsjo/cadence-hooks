@@ -107,18 +107,26 @@ fn resolve(
 }
 
 /// Parse repeatable `--arm name=state` values into the roster, dropping (and
-/// naming, on stderr) any value without a `name=state` shape — fail-open, the
-/// rest of the record still lands (ADR-0001).
+/// naming, on stderr, Debug-escaped) any value that is not `name=state` with
+/// both halves in `[A-Za-z0-9_-]+` — fail-open, the rest of the record still
+/// lands (ADR-0001). The charset bound is what keeps the roster safe to echo:
+/// the verdict line and the marker JSON both carry these strings, so ANSI or
+/// control bytes never survive to either surface.
 fn parse_arms(raw: &[String]) -> Vec<(String, String)> {
+    let sane = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
     raw.iter()
         .filter_map(|entry| match entry.split_once('=') {
-            Some((name, state)) if !name.is_empty() && !state.is_empty() => {
+            Some((name, state)) if sane(name.trim()) && sane(state.trim()) => {
                 Some((name.trim().to_string(), state.trim().to_string()))
             }
             _ => {
                 eprintln!(
                     "cadence-hooks record-polish: ignoring malformed --arm {entry:?} \
-                     (expected name=state, e.g. security=ran)"
+                     (expected name=state in [A-Za-z0-9_-], e.g. security=ran)"
                 );
                 None
             }

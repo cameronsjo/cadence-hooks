@@ -14,25 +14,38 @@
 //! naive `.md == docs` classifier would re-open exactly the loophole the gate's
 //! SCOPE_CLAUSES exist to close.
 
-use crate::shell::git_command;
+use crate::shell::{GitSpawn, git_command, run_git_bounded};
+use std::process::Command;
 
 /// Files changed on the branch at `dir`, from the merge base with
-/// `origin/main` (falling back to `origin/master`) to `HEAD`.
+/// `origin/main` (falling back to `origin/master`) to `HEAD`. The base refs
+/// are spelled fully qualified (`refs/remotes/origin/main`) so a hostile local
+/// branch literally named `origin/main` cannot shift the diff base.
 ///
 /// `None` when the repo, base ref, or diff can't be resolved — including a
-/// deadline timeout or spawn failure inside [`git_command`]. Callers gate on
-/// evidence, so `None` means "don't conclude anything", never "no files".
+/// deadline timeout or spawn failure. Callers gate on evidence, so `None`
+/// means "don't conclude anything" — and a **genuinely empty diff resolves to
+/// `Some(vec![])`**, never `None`: the diff subprocess runs raw through
+/// [`run_git_bounded`] rather than [`git_command`], whose empty-stdout-is-
+/// failure mapping would collapse "confirmed no changes" into "no evidence".
 pub fn changed_files(dir: &str) -> Option<Vec<String>> {
-    let base = git_command(dir, &["merge-base", "HEAD", "origin/main"])
-        .or_else(|| git_command(dir, &["merge-base", "HEAD", "origin/master"]))?;
-    let out = git_command(dir, &["diff", "--name-only", &base, "HEAD"])?;
-    Some(
-        out.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
+    let base = git_command(dir, &["merge-base", "HEAD", "refs/remotes/origin/main"])
+        .or_else(|| git_command(dir, &["merge-base", "HEAD", "refs/remotes/origin/master"]))?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(["diff", "--name-only", &base, "HEAD"]);
+    match run_git_bounded(&mut cmd) {
+        GitSpawn::Completed(output) if output.status.success() => Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        GitSpawn::Completed(_) | GitSpawn::SpawnFailed | GitSpawn::TimedOut => None,
+    }
 }
 
 /// True when any changed file is code under **polish's** definition.
@@ -49,9 +62,12 @@ pub fn branch_touches_code(files: &[String]) -> bool {
 /// pass's scope, and this predicate only ever feeds a nudge, so the
 /// conservative direction is toward counting.
 fn is_polish_code_path(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    if name.to_ascii_lowercase().ends_with(".md") {
-        return matches!(name, "CLAUDE.md" | "SKILL.md" | "AGENTS.md")
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    if name.ends_with(".md") {
+        // Sentinels compared case-insensitively: on a case-insensitive
+        // filesystem `claude.md` IS `CLAUDE.md`, and this predicate only
+        // feeds a nudge, so counting is the conservative direction.
+        return matches!(name.as_str(), "claude.md" | "skill.md" | "agents.md")
             || path
                 .split('/')
                 .any(|seg| matches!(seg, "skills" | "agents" | "commands" | "rules"));
@@ -151,6 +167,18 @@ mod tests {
         let tmp = init_repo_with_origin_main(&["src/a.rs", "README.md"]);
         let files = changed_files(tmp.path().to_str().unwrap()).expect("diff resolves");
         assert_eq!(files, s(&["README.md", "src/a.rs"]));
+    }
+
+    #[test]
+    fn changed_files_empty_diff_is_some_empty_not_none() {
+        // Review finding (this branch): `git_command` maps empty stdout to
+        // Failed, which would collapse "confirmed no changes" into "no
+        // evidence". A branch identical to origin/main must resolve to
+        // Some(vec![]) — a real verdict — not None.
+        let tmp = init_repo_with_origin_main(&[]);
+        let files = changed_files(tmp.path().to_str().unwrap())
+            .expect("an empty diff is evidence, not a failure");
+        assert!(files.is_empty());
     }
 
     #[test]

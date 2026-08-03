@@ -237,7 +237,10 @@ pub struct PolishRecord {
 impl PolishRecord {
     /// Did the security arm run, as far as this marker can say?
     ///
-    /// - roster names `security` → `Some(state == "ran")`;
+    /// - roster names `security` → `Some(state == "ran")` — deliberately
+    ///   closed-world: `"ran"` is the only truthy state, so an unrecognized
+    ///   or misspelled state reads as not-ran (the consequence is an extra
+    ///   advisory nudge, never a suppressed one — the safe direction here);
     /// - no roster, but `scope == "docs"` → `Some(false)` — a docs-only pass
     ///   never dispatches the security arm, so even a legacy marker settles it;
     /// - otherwise → `None` (unknown — a legacy full/code marker must keep
