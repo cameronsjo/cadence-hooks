@@ -6,9 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.71.0] - 2026-08-03
+
 ### Added
 
 - **`record-polish` gains a repeatable `--arm name=state` roster, and the pre-PR gate escalates a security-skipped polish on a code branch (cameronsjo/cadence-hooks#467).** The presence-only marker could not tell a full polish from a docs-scoped one, so a security arm that never ran on a code branch read as a clean gate. The marker's JSON now carries an additive `"arms"` object (`--arm security=ran --arm tests=skipped`; malformed entries drop with a stderr note, never failing the record), the verdict line names the roster, and a new `read_polish_marker` (core `markers`) parses marker content leniently — untrusted input via `from_str(..).ok()`, content trusted only from the private `0700` marker dir (the inverse of `claim_today`: this content *causes* a nudge rather than suppressing one, but a degraded shared base still degrades to unknown so a plantable roster can never manufacture output). `nudge-polish-before-pr`'s pure `decide` widens to `(command, MarkerState, branch_touches_code)` with a distinct security-nudge message; the diff subprocess (new core `branch_diff`: `changed_files` via bounded git + `branch_touches_code` under **polish's own** code definition — skill/agent/command/rule markdown and `CLAUDE.md`/`SKILL.md` are code, so a naive `.md == docs` reuse cannot re-open the loophole) runs only when the roster affirmatively says security was skipped, never on the common full-polish path. **Absent roster = unknown, never skipped**: every legacy roster-less marker keeps allowing, and a `scope: docs` marker settles the question even without a roster (a docs pass never dispatches the security arm). Nudge-only, fail-open throughout (ADR-0001) — TimedOut/SpawnFailed git yields no evidence and allows.
+
+
+## [0.70.1] - 2026-08-02
+
+### Added
 
 - **A SessionStart disclosure when the guard suite has recently been failing open (cameronsjo/cadence-hooks#277).** #271/PR #273 made a git-probe timeout loud in the ledger — `deadline` and `deadline_block_suppressed` rows in `failopen.jsonl`, plus a `doctor` latency scan — but both are **pull**. On the host that needs it nobody runs `doctor`, so the suite can sit mostly non-enforcing for days with nothing reaching the operator; #271's own reporter ran exactly that way, ~14 releases stale, and the #39 once-daily stderr notice did not reach them either. `session start` now reads the last 24 hours of the ledger and says it at session start instead of waiting to be asked.
 
@@ -30,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The per-model pricing branch has one home.** `log_commit::build_commit_record` and `log_session::build_session_record` carried a byte-identical harness branch choosing the breakdown and unpriced-model list, an identical cost-nulling branch, and an identical `claude_usage()` test helper. All three now live on `UsageScan` (`priced_breakdown`, `is_unpriced_harness`, and a test-only `UsageScan::claude`). Nothing was broken — the copies agreed — but a pricing rule maintained in two places is how a record shape drifts, and the duplication had already spread from the production code into the tests. The rule now has one test, which neither copy had.
 
 - **The `Scratch`/`git_in`/`init_repo` git-fixture trio, previously copy-pasted near-verbatim across `core::worktree`'s tests, `guardrails::enforce_worktree`'s tests, and `tests/deadline_failopen.rs`, is promoted into one `core::git_fixtures` module, feature-gated the same way as `core::test_builders` (cameronsjo/cadence-hooks#485).** Each copy carried its own carve-out assertion — a `target/`-rooted (never tempdir-rooted) scratch root, since `path_under_temp_root` exempts anything under the platform temp dir (#312) and a tempdir-rooted fixture would silently false-pass every blocked-path case — so a fix or a missed edge case in one copy never reached the other two. `Scratch::new` now takes the caller's own scratch root explicitly (each consumer's `env!("CARGO_MANIFEST_DIR")` is resolved at its own call site, not `git_fixtures`'s, so every crate's fixtures keep landing under its own `target/` exactly where they did before); `Scratch::path()` replaces the old direct `.0` field access at every call site. Kept as a module separate from `test_builders`'s plain `HookInput` builders (`make_bash`, `make_edit`, …), since folding in git-subprocess-spawning fixtures would make every consumer of those builders compile that code too. `Cargo.toml` grows a `cadence-hooks-core` dev-dependency (with the `test-builders` feature) on the top-level binary crate so `tests/deadline_failopen.rs` can reach it.
+- Test fixtures use RFC 2606 example domains (`ghe.example.com`) and placeholder identifiers.
 
 ### Fixed
 
@@ -547,12 +555,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **`gh repo edit` does not accept a bare name**, contrary to a review concern raised against this change: verified against gh 2.96.0, it rejects one outright (`expected the "[HOST/]OWNER/REPO" format`), unlike `gh repo view`, which infers the authenticated user. So there is no bare-name spelling of `gh repo edit` for the guard to resolve and no unsatisfiable shape hiding behind one; `create` remains the only verb whose bare name infers an owner, which the resolver already special-cases. Pinned by test so the concern is not re-raised from the `repo view` behavior.
 
   Verified by differential in two rounds: the first round's cases spliced onto the pre-change source fail on exactly the ten that probe the two original defects, and this round's onto the first fix fail on exactly the nine that probe the escapes above — while every positive control passes on both sides (an ordinary leading `-R` in all three spellings, a boolean cluster with no method letter, an unknown cluster letter still failing closed, a graphql read and a safe graphql mutation, `gh repo edit` with no positional falling back to the cwd, a `--description some/thing` value not read as a target, an owned target after a flag, and the verb appearing only in quoted prose). Every proof-of-concept was additionally replayed end-to-end through the built binary, where all seventeen now block.
-
-## [0.70.1] - 2026-08-02
-
-### Changed
-
-- Test fixtures use RFC 2606 example domains (`ghe.example.com`) and placeholder identifiers.
 
 ## [0.70.0] - 2026-07-27
 
