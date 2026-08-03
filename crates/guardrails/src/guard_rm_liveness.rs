@@ -27,22 +27,26 @@
 //! | an unexpanded `$VAR` operand | [`Outcome::Ask`] — unresolvable |
 //! | a `$(…)` substitution operand | [`Outcome::Ask`] — unresolvable |
 //! | a path under the temp root | [`Outcome::Allow`] — disposable |
+//! | a top-level entry under `$HOME` | [`Outcome::Block`] — protected |
 //!
 //! A verdict that disagrees means the classifier has regressed, and the nudge
 //! names which probe diverged. It separately reports when `guard-rm` is switched
 //! off by environment, which is the documented and advertised way to neuter it.
 //!
+//! None of the four writes to disk. The home probe names a basename that need
+//! not exist — the home classification is pure path logic — which is what makes
+//! a Block case reachable at all here. It is also the probe that catches a
+//! widened `$TMPDIR` swallowing real work; see [`home_block_probe`].
+//!
 //! # What it deliberately does NOT probe
 //!
-//! **The Block path** (git repo, vault, `$HOME`). Probing it needs a real
-//! `.git` on disk, and every writable fixture location is wrong: under the temp
-//! root the Temp classification is evaluated *first* and pre-empts the git-repo
-//! check (verified — `rm -rf /tmp/<dir-with-.git>` is a silent Allow), so a
-//! tempdir fixture would assert Block and get Allow, nudging falsely every
-//! session. The alternative — writing a fixture outside the temp roots at every
-//! SessionStart — is a worse hazard than the gap it would close. The Ask probes
-//! are the load-bearing ones regardless: an Ask-to-Allow regression is the
-//! silent one, and it is exactly what they catch.
+//! **The git-repo Block path.** Unlike the home case, it needs a real `.git` on
+//! disk, and every writable fixture location is wrong: under the temp root the
+//! Temp classification is evaluated *first* and pre-empts the git-repo check
+//! (verified — `rm -rf /tmp/<dir-with-.git>` is a silent Allow), so a tempdir
+//! fixture would assert Block, get Allow, and nudge falsely every session. The
+//! alternative — writing a fixture outside the temp roots at every SessionStart
+//! — is a worse hazard than the gap it would close.
 //!
 //! # What it structurally CANNOT see
 //!
@@ -92,7 +96,7 @@ struct Probe {
     classification: &'static str,
 }
 
-/// Probes covering the two verdicts reachable without writing to disk.
+/// Probes covering the verdicts reachable without writing to disk.
 ///
 /// The `$VAR` and `$(…)` cases resolve to `Unresolvable` on the operand alone —
 /// no `stat`, no `lstat`, no dependence on what exists. The temp case is a path
@@ -114,6 +118,41 @@ const PROBES: &[Probe] = &[
         classification: "temp root",
     },
 ];
+
+/// Basename for the home-directory Block probe. Never created or deleted — it
+/// only has to be a top-level entry under `$HOME` for the path classifier.
+const HOME_PROBE_BASENAME: &str = "cadence-guard-rm-liveness-probe";
+
+/// The Block probe: deleting a top-level entry in `$HOME` must be refused.
+///
+/// This is the one Block case reachable with no filesystem fixture — the home
+/// classification is pure path logic, so a non-existent basename classifies the
+/// same as a real one. (The git-repo Block case is *not* reachable; see the
+/// module header.)
+///
+/// It is also the probe that catches the widest real degradation. `guard-rm`
+/// resolves its temp roots partly from `$TMPDIR`, and a `$TMPDIR` pointing at a
+/// directory that contains real work silently converts that whole subtree to
+/// "disposable": with `TMPDIR` set to the home directory, `rm -rf ~/Documents`
+/// is a **silent Allow** (verified). The three probes above all still pass in
+/// that state, because none of their operands falls under the widened root —
+/// so without this one the check would report healthy while home protection was
+/// gone. Filed separately as a `guard-rm` defect; this probe is the detection.
+///
+/// Returns `None` when the home directory cannot be resolved, so the probe is
+/// skipped rather than failed — an unresolvable home is this check's own blind
+/// spot, not evidence about `guard-rm`.
+fn home_block_probe() -> Option<(String, Outcome, &'static str)> {
+    let home = cadence_hooks_core::paths::user_home()?;
+    // Built through the same resolver `guard-rm` itself uses, so the probe
+    // cannot disagree with the guard about where home is.
+    let target = home.join(HOME_PROBE_BASENAME);
+    Some((
+        format!("rm -rf {}", target.display()),
+        Outcome::Block,
+        "home directory",
+    ))
+}
 
 /// Build the `PreToolUse` payload `guard-rm` expects for `command`.
 ///
@@ -180,27 +219,41 @@ impl Check for GuardRmLiveness {
             ));
         }
 
+        // The static table plus the home Block probe, which is built at runtime
+        // because it needs the resolved home directory. A `None` home drops the
+        // probe rather than failing it — see `home_block_probe`.
+        let cases = PROBES
+            .iter()
+            .map(|probe| {
+                (
+                    probe.command.to_string(),
+                    probe.expected,
+                    probe.classification,
+                )
+            })
+            .chain(home_block_probe());
+
         // A probe that fails to build is this check's own bug, not evidence
         // about guard-rm — report it as such rather than implying the guard is
         // broken, and never let it read as a clean bill of health either.
         let mut divergences: Vec<String> = Vec::new();
-        for probe in PROBES {
-            let input = match probe_input(probe.command) {
+        let mut ran = 0usize;
+        for (command, expected, classification) in cases {
+            ran += 1;
+            let input = match probe_input(&command) {
                 Ok(input) => input,
                 Err(error) => {
                     divergences.push(format!(
-                        "{} — guard-rm-liveness could not build its own probe payload ({error}); \
-                         this check is broken, guard-rm's state is unknown",
-                        probe.classification
+                        "{classification} — guard-rm-liveness could not build its own probe \
+                         payload ({error}); this check is broken, guard-rm's state is unknown"
                     ));
                     continue;
                 }
             };
             let actual = GuardRm.run(&input).outcome;
-            if actual != probe.expected {
+            if actual != expected {
                 divergences.push(format!(
-                    "{} — expected {:?}, got {actual:?}",
-                    probe.classification, probe.expected
+                    "{classification} — expected {expected:?}, got {actual:?}"
                 ));
             }
         }
@@ -215,7 +268,7 @@ impl Check for GuardRmLiveness {
              blanket `rm -rf` / `rm -r` permission prompts were retired. Treat unexpected \
              deletes as unguarded until this is resolved.",
             divergences.len(),
-            PROBES.len(),
+            ran,
             divergences.join("\n  ")
         ))
     }
@@ -265,6 +318,48 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn home_block_probe_matches_guard_rm() {
+        with_switches_clear(|| {
+            let (command, expected, _) = home_block_probe().expect("HOME is set under test");
+            let input = probe_input(&command).expect("probe payload must parse");
+            assert_eq!(GuardRm.run(&input).outcome, expected);
+        });
+    }
+
+    #[test]
+    fn widened_tmpdir_that_swallows_home_is_caught() {
+        // The finding this probe exists for. guard-rm resolves temp roots partly
+        // from $TMPDIR; pointing TMPDIR at the home directory reclassifies that
+        // whole subtree as disposable, and `rm -rf ~/<anything>` becomes a
+        // silent Allow. The other three probes all still pass in that state —
+        // none of their operands falls under the widened root — so this asserts
+        // the check as a whole goes loud, not merely that one probe flips.
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        let Ok(home) = home else {
+            return; // no resolvable home on this platform; the probe self-skips
+        };
+        with_env(
+            &[
+                ("TMPDIR", Some(home.as_str())),
+                ("CADENCE_DISABLE", None),
+                ("CADENCE_BYPASS", None),
+            ],
+            || {
+                let result = GuardRmLiveness.run(&make_session("s1", "startup"));
+                assert_eq!(
+                    result.outcome,
+                    Outcome::Nudge,
+                    "a TMPDIR that swallows $HOME must not read as healthy"
+                );
+                assert!(
+                    result.message.unwrap().contains("home directory"),
+                    "the nudge must name the home-directory probe as the diverging one"
+                );
+            },
+        );
     }
 
     #[test]
