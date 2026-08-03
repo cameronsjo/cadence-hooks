@@ -113,10 +113,9 @@ fn ceiling_ord(s: &str) -> u8 {
 /// init. `mcp` is both a namespace and a prefix of `cadence-mcp`; the regex
 /// builder sorts longest-first so `cadence-mcp:x` is caught as `cadence-mcp:x`,
 /// not as `cadence` + leftover or bare `mcp`.
-/// `pub` (rather than crate-private) so the cross-sibling namespace-parity
-/// audit test (`tests/hook_registration_audit.rs`) can read it directly and
-/// diff it against the plugin-side `redact-check.sh` namespace list. Exposed
-/// for that in-repo test linkage only — not a supported public API.
+/// Since #390 this is the ONLY namespace list — the plugin's bash port
+/// (`redact-check.sh`) and its cross-sibling parity audit were deleted when
+/// the `redact-scan` CLI subcommand became the single engine.
 #[doc(hidden)]
 pub const NAMESPACES: &[&str] = &[
     "cadence",
@@ -612,6 +611,404 @@ fn build_message(hits: &[Hit]) -> String {
          replace local paths with a generic description.",
     );
     out
+}
+
+// ---------------------------------------------------------------------------
+// CLI action: `cadence-hooks cadence redact-scan` (cadence-hooks#390)
+//
+// The single engine behind the `redaction` skill's pre-post scan — replaces
+// the plugin-shipped `redact-check.sh`, whose separate bash port of these
+// regexes drifted (the script-clean/hook-nudge disagreement behind #406).
+//
+// Contract (OUTSIDE the hook contract, which reserves exit 2 for block —
+// this is a CLI subcommand and keeps the script's contract):
+//   exit 0  clean
+//   exit 1  one or more hits, printed to STDERR as `[<category>]:<line>:<snippet>`
+//   exit 2  usage / environment error
+// Stdout stays clean (parseable by consumers); hits AND warnings go to stderr.
+//
+// Parity rulings vs the deleted script (Rust semantics win, each pinned by a
+// test in the module below):
+//   - adjacent hits (`tool_input/tool_response`) both report — the script's
+//     boundary-consuming grep missed the second;
+//   - the same token twice on one line reports twice (real occurrences) —
+//     the script deduped by line+token text;
+//   - `--init` needs no jq, and re-emits an existing file via serde_json
+//     pretty-printing rather than jq's formatting (cosmetic divergence).
+// ---------------------------------------------------------------------------
+
+/// Entry for the `redact-scan` CLI action. Returns the process exit code.
+pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u8 {
+    // Audience validates BEFORE the --init branch — deliberate parity with
+    // the deleted script (`--init --audience bogus` is a usage error there
+    // too), not ordering to "fix".
+    if let Some(a) = audience.as_deref()
+        && !matches!(a, "owned-internal" | "private-external" | "public")
+    {
+        eprintln!(
+            "redact-scan: invalid --audience: {a} (expected owned-internal|private-external|public)"
+        );
+        return 2;
+    }
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".to_string());
+    let root = cadence_hooks_core::paths::find_git_root(&cwd)
+        .unwrap_or_else(|| std::path::PathBuf::from(&cwd));
+
+    if init {
+        return run_init(&root);
+    }
+
+    let input = match &file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("redact-scan: cannot read file: {path}");
+                return 2;
+            }
+        },
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            if std::io::stdin().read_to_string(&mut buf).is_err() {
+                eprintln!("redact-scan: stdin is not valid UTF-8");
+                return 2;
+            }
+            buf
+        }
+    };
+
+    // Legacy-config warning, ported from the script: a lingering
+    // .claude/redaction.json means its allowlist and additionalPatterns have
+    // silently stopped applying.
+    let legacy = root.join(".claude/redaction.json");
+    if legacy.symlink_metadata().is_ok() {
+        eprintln!(
+            "redact-scan: warning: legacy .claude/redaction.json is NO LONGER read — run 'cadence-hooks migrate-config' to fold it into .claude/cadence.json"
+        );
+    }
+
+    // Whole-file anomalies the lenient loader treats as silent fail-open
+    // (ADR-0001) are LOUD here — the deleted script's validate_config warned
+    // on an unparseable file and a non-object document, and SKILL.md
+    // documents that property; the CLI keeps it.
+    let cfg_path = root.join(".claude/cadence.json");
+    if let Ok(content) = std::fs::read_to_string(&cfg_path)
+        && serde_json::from_str::<serde_json::Value>(&content)
+            .map(|v| !v.is_object())
+            .unwrap_or(true)
+    {
+        eprintln!(
+            "redact-scan: warning: .claude/cadence.json is present but not a JSON object (comments are not allowed); ignoring it (fail-open)"
+        );
+    }
+
+    let loaded = cadence_hooks_core::config::load_cadence_section_lenient::<RedactionConfig>(
+        &root,
+        "redaction",
+    );
+    if !loaded.warnings.is_empty() {
+        eprint!(
+            "redact-scan: config anomalies in .claude/cadence.json:\n{}",
+            cadence_hooks_core::config::render_config_warnings(&loaded.warnings)
+        );
+    }
+    let config = loaded.config;
+
+    // Destination tier: --audience flag > CADENCE_AUDIENCE env > config
+    // originAudience > public — the env fallback keeps the CLI and the hook
+    // (which reads the same env) from disagreeing in the less-redaction
+    // direction when a session has the env set but a caller omits the flag.
+    // The flag was validated strictly above; an unknown env value falls
+    // safe-wide through dest_tier_ord, same as the hook.
+    let env_audience = std::env::var("CADENCE_AUDIENCE").ok();
+    let d = resolve_dest_tier(audience.as_deref().or(env_audience.as_deref()), &config);
+
+    let mut any = false;
+    for (idx, line) in input.lines().enumerate() {
+        let lineno = idx + 1;
+        for hit in scan_body(line, &config, d) {
+            any = true;
+            if hit.category == "custom" {
+                // The replacement is untrusted repo-config text landing on a
+                // surface the model reads — strip control chars, cap length.
+                let repl = match hit.replacement.as_deref() {
+                    Some("") | None => "[redacted]".to_string(),
+                    Some(r) => r
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(120)
+                        .collect::<String>(),
+                };
+                eprintln!("[custom]:{lineno}:{} (suggest: {repl})", hit.snippet);
+            } else {
+                eprintln!("[{}]:{lineno}:{}", hit.category, hit.snippet);
+            }
+        }
+    }
+    if any { 1 } else { 0 }
+}
+
+/// Port of the script's `--init`: scaffold the `redaction` section of
+/// `.claude/cadence.json` at the repo root. Creates the file (version: 1
+/// envelope) when absent; adds the section to an existing file only when
+/// missing (idempotent — other sections are never touched). Refuses to write
+/// through a symlinked `.claude` or config file; refuses (exit 2) an existing
+/// file that is unparseable or not a JSON object.
+fn run_init(root: &std::path::Path) -> u8 {
+    // Symlink refusals exit 2 — a refusal is not a success, and the deleted
+    // script's `return 0` here was the one parity choice the security review
+    // overturned (an exit-0 refusal is indistinguishable from a completed
+    // scaffold to any caller reading the code, not the message).
+    let claude = root.join(".claude");
+    let is_symlink = |p: &std::path::Path| {
+        p.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+    };
+    if is_symlink(&claude) {
+        eprintln!(
+            "redact-scan: {} is a symlink; refusing to write through it",
+            claude.display()
+        );
+        return 2;
+    }
+    if std::fs::create_dir_all(&claude).is_err() {
+        eprintln!("redact-scan: cannot create {}", claude.display());
+        return 2;
+    }
+    let cfg = claude.join("cadence.json");
+    if is_symlink(&cfg) {
+        eprintln!(
+            "redact-scan: {} is a symlink; refusing to write through it",
+            cfg.display()
+        );
+        return 2;
+    }
+    let starter = serde_json::json!({
+        "originAudience": "public",
+        "categories": {},
+        "additionalPatterns": [],
+        "allowlist": []
+    });
+    if !cfg.exists() {
+        let doc = serde_json::json!({ "version": 1, "redaction": starter });
+        return write_config_atomically(&claude, &cfg, &doc, "wrote starter redaction section");
+    }
+    // Existing regular file: add the section only when missing.
+    let Ok(content) = std::fs::read_to_string(&cfg) else {
+        eprintln!("redact-scan: cannot read {}", cfg.display());
+        return 2;
+    };
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+        eprintln!(
+            "redact-scan: {} exists but is not valid JSON; fix it before --init can add the redaction section",
+            cfg.display()
+        );
+        return 2;
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        eprintln!(
+            "redact-scan: {} is valid JSON but its top-level value is not an object; refusing to add the redaction section",
+            cfg.display()
+        );
+        return 2;
+    };
+    if obj.contains_key("redaction") {
+        eprintln!(
+            "redact-scan: {} already has a redaction section; leaving it unchanged",
+            cfg.display()
+        );
+        return 0;
+    }
+    obj.insert("redaction".to_string(), starter);
+    write_config_atomically(&claude, &cfg, &doc, "added starter redaction section")
+}
+
+/// Same-dir temp file + rename, mirroring the script's write discipline.
+///
+/// `tempfile::NamedTempFile` supplies the two properties the script got from
+/// `mktemp` and a naive port would lose: O_EXCL creation (never writes
+/// through a pre-placed symlink) and an unguessable name (a hostile repo can
+/// commit symlinks at predictable names — a PID-suffixed temp is enumerable —
+/// and turn the scaffold into an arbitrary-file overwrite). Mode 0600, too.
+fn write_config_atomically(
+    dir: &std::path::Path,
+    cfg: &std::path::Path,
+    doc: &serde_json::Value,
+    verb: &str,
+) -> u8 {
+    use std::io::Write;
+    let rendered = format!(
+        "{}\n",
+        serde_json::to_string_pretty(doc).expect("static JSON value renders")
+    );
+    let Ok(mut tmp) = tempfile::NamedTempFile::new_in(dir) else {
+        eprintln!(
+            "redact-scan: temp-file create failed in {}; nothing written",
+            dir.display()
+        );
+        return 2;
+    };
+    if tmp.write_all(rendered.as_bytes()).is_err() {
+        eprintln!(
+            "redact-scan: write failed in {}; nothing written",
+            dir.display()
+        );
+        return 2;
+    }
+    if tmp.persist(cfg).is_err() {
+        eprintln!("redact-scan: rename failed; {} unchanged", cfg.display());
+        return 2;
+    }
+    eprintln!("redact-scan: {verb} to {}", cfg.display());
+    0
+}
+
+#[cfg(test)]
+mod cli_scan_tests {
+    use super::*;
+
+    // --- run_scan CLI glue ---
+
+    #[test]
+    fn scan_invalid_audience_is_usage_error() {
+        assert_eq!(run_scan(None, Some("bogus".into()), false), 2);
+        // Also before --init (parity with the script's validation order).
+        assert_eq!(run_scan(None, Some("bogus".into()), true), 2);
+    }
+
+    #[test]
+    fn scan_unreadable_file_is_usage_error() {
+        assert_eq!(
+            run_scan(Some("/nonexistent/redact-scan-test".into()), None, false),
+            2
+        );
+    }
+
+    #[test]
+    fn scan_file_hits_exit_1_and_clean_exit_0() {
+        // Exercises the full glue: file read, per-line loop, exit
+        // aggregation. Uses a skill-id hit (this repo's own allowlist covers
+        // only the harness-noun identifiers, so skill-id is cwd-robust).
+        let dir = tempfile::tempdir().unwrap();
+        let hit = dir.path().join("hit.txt");
+        std::fs::write(&hit, "line one\nsee cadence:attune here\n").unwrap();
+        assert_eq!(
+            run_scan(hit.to_str().map(String::from), Some("public".into()), false),
+            1
+        );
+        let clean = dir.path().join("clean.txt");
+        std::fs::write(&clean, "nothing to see\n").unwrap();
+        assert_eq!(
+            run_scan(
+                clean.to_str().map(String::from),
+                Some("public".into()),
+                false
+            ),
+            0
+        );
+        // owned-internal destination: the default ceiling suppresses.
+        assert_eq!(
+            run_scan(
+                hit.to_str().map(String::from),
+                Some("owned-internal".into()),
+                false
+            ),
+            0
+        );
+    }
+
+    // --- Parity rulings vs the deleted redact-check.sh (Rust semantics win) ---
+
+    #[test]
+    fn ruling_adjacent_hits_both_report() {
+        // The script's boundary-consuming grep reported one hit for
+        // `tool_input/tool_response`; the Rust \b engine reports both.
+        let hits = scan_body("tool_input/tool_response", &RedactionConfig::default(), 3);
+        assert_eq!(hits.len(), 2, "both adjacent identifiers report");
+    }
+
+    #[test]
+    fn ruling_repeated_token_on_one_line_reports_each_occurrence() {
+        // The script deduped by line+token text; each occurrence is a real
+        // instance to rephrase, so the engine reports both offsets.
+        let hits = scan_body(
+            "tool_input here and tool_input there",
+            &RedactionConfig::default(),
+            3,
+        );
+        assert_eq!(hits.len(), 2);
+    }
+
+    // --- run_init port ---
+
+    #[test]
+    fn init_creates_starter_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(run_init(dir.path()), 0);
+        let content = std::fs::read_to_string(dir.path().join(".claude/cadence.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(doc["version"], 1);
+        assert_eq!(doc["redaction"]["originAudience"], "public");
+    }
+
+    #[test]
+    fn init_is_idempotent_and_preserves_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/cadence.json"),
+            r#"{"version":1,"kanban":{"x":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(run_init(dir.path()), 0);
+        let doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".claude/cadence.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc["kanban"]["x"], 1, "other sections preserved");
+        assert!(doc["redaction"].is_object());
+        // Second run: section present → unchanged, still exit 0.
+        assert_eq!(run_init(dir.path()), 0);
+    }
+
+    #[test]
+    fn init_refuses_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/cadence.json"), "{not json").unwrap();
+        assert_eq!(run_init(dir.path()), 2);
+    }
+
+    #[test]
+    fn init_refuses_non_object_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/cadence.json"), "[]").unwrap();
+        assert_eq!(run_init(dir.path()), 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".claude/cadence.json")).unwrap(),
+            "[]",
+            "refusal never rewrites the file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        let target = dir.path().join("elsewhere.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".claude/cadence.json")).unwrap();
+        assert_eq!(run_init(dir.path()), 2, "refusal is an error, not success");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "{}",
+            "symlink target untouched"
+        );
+    }
 }
 
 #[cfg(test)]

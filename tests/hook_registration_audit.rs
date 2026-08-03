@@ -1003,91 +1003,10 @@ fn hook_event_types_match_hooks_json() {
     );
 }
 
-/// Parse the `NS='...'` single-quoted pipe-alternation line out of the
-/// sibling plugin's `redact-check.sh`. Matched by the `NS='` prefix, never
-/// by line number, so the script can grow unrelated lines above or below it
-/// without breaking this parse.
-///
-/// Collects every matching line (rather than returning on the first) and
-/// asserts there is exactly one — a future unrelated line shaped like
-/// `NS='...'` (e.g. a comment or a second variable) would otherwise
-/// silently win by first-match instead of failing loudly.
-fn parse_redact_check_namespaces(content: &str) -> Vec<String> {
-    let matches: Vec<&str> = content
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("NS='"))
-        .filter_map(|rest| rest.strip_suffix('\''))
-        .collect();
-
-    assert_eq!(
-        matches.len(),
-        1,
-        "expected exactly one `NS='...'` line in redact-check.sh, found {}: {matches:?}",
-        matches.len()
-    );
-
-    matches[0].split('|').map(str::to_string).collect()
-}
-
-#[test]
-fn namespace_list_matches_redact_check_sh() {
-    // Sibling plugin script that carries a bash-side copy of the same
-    // namespace list used to build `redact_external_content::NAMESPACES`.
-    //
-    // The skip is keyed off the sibling's `skills/redaction` DIRECTORY
-    // existing, not the script file — mirroring how
-    // `all_binary_subcommands_are_registered` keys its exemption off plugin
-    // directory existence. That distinguishes two different situations:
-    // the sibling checkout genuinely isn't present alongside this repo
-    // (bare CI, no siblings — benign, silent skip), versus the checkout IS
-    // present but `redact-check.sh` has moved or been renamed underneath
-    // it (a real regression this test should fail loudly on, not swallow).
-    let skill_dir = workspace_root().join("cadence/plugins/cadence/skills/redaction");
-    if !skill_dir.is_dir() {
-        eprintln!(
-            "SKIPPED: sibling cadence plugin's redaction skill dir not found at {} \
-             (plugin dir not alongside workspace)",
-            skill_dir.display()
-        );
-        return;
-    }
-
-    let script_path = skill_dir.join("scripts/redact-check.sh");
-    assert!(
-        script_path.exists(),
-        "sibling redaction skill dir exists at {} but scripts/redact-check.sh is missing — \
-         has the script moved or been renamed? Update this test's expected path.",
-        skill_dir.display()
-    );
-
-    let content = std::fs::read_to_string(&script_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
-
-    let script_namespaces: BTreeSet<String> = parse_redact_check_namespaces(&content)
-        .into_iter()
-        .collect();
-
-    let rust_namespaces: BTreeSet<String> =
-        cadence_hooks_cadence::redact_external_content::NAMESPACES
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-    let missing_from_script: Vec<&String> =
-        rust_namespaces.difference(&script_namespaces).collect();
-    let missing_from_rust: Vec<&String> = script_namespaces.difference(&rust_namespaces).collect();
-
-    assert!(
-        missing_from_script.is_empty() && missing_from_rust.is_empty(),
-        "namespace list drift between Rust NAMESPACES and {}'s `NS=` line:\n\
-         in Rust but missing from redact-check.sh: {:?}\n\
-         in redact-check.sh but missing from Rust: {:?}",
-        script_path.display(),
-        missing_from_script,
-        missing_from_rust,
-    );
-}
+// The namespace-parity test against the plugin's `redact-check.sh` was
+// deleted with the script itself (cadence-hooks#390): the `redact-scan` CLI
+// subcommand is now the single engine, so there is no second namespace list
+// to drift.
 
 /// Interpreters whose argv[0] — or the command that follows a leading `env`
 /// invocation — is never itself a checkable script path. The actual script is
