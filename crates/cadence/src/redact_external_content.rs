@@ -300,7 +300,11 @@ impl Check for RedactExternalContent {
         }
 
         // Phase 3 — config (per-repo additional patterns + allowlist + tiers).
-        let config = load_redaction_config(&base_dir);
+        // Lenient (#536): a malformed key is dropped and NAMED, the rest of
+        // the section still applies — one bad `categories` shape no longer
+        // silently voids a valid `allowlist` beside it.
+        let loaded = load_redaction_config(&base_dir);
+        let config = loaded.config;
 
         // Phase 3.5 — resolve the destination-tier ordinal once. `CADENCE_AUDIENCE`
         // wins over the config's `originAudience`; both fall back to public.
@@ -313,12 +317,32 @@ impl Check for RedactExternalContent {
             hits.extend(scan_body(body, &config, d));
         }
 
-        if hits.is_empty() {
-            CheckResult::allow()
-        } else {
-            CheckResult::nudge(build_message(&hits))
+        // Config warnings ride the nudge channel (exit 0 / stdout → lands in
+        // the transcript). A clean scan with a broken config still nudges —
+        // otherwise the drop is exactly as silent as the #536 defect was.
+        let warnings = loaded.warnings;
+        match (hits.is_empty(), warnings.is_empty()) {
+            (true, true) => CheckResult::allow(),
+            (true, false) => CheckResult::nudge(build_config_warning(&warnings)),
+            (false, true) => CheckResult::nudge(build_message(&hits)),
+            (false, false) => CheckResult::nudge(format!(
+                "{}\n{}",
+                build_message(&hits),
+                build_config_warning(&warnings)
+            )),
         }
     }
+}
+
+/// Render config-load warnings as one nudge block. NB this fires on every
+/// gated posting command (incl. `git commit`) until the config is fixed —
+/// accepted cost: the whole point is that the drop is no longer silent, and
+/// the fix is a one-time config edit the message names precisely.
+fn build_config_warning(warnings: &[String]) -> String {
+    format!(
+        "⚠️  redact-external-content: config anomalies in .claude/cadence.json:\n{}",
+        cadence_hooks_core::config::render_config_warnings(warnings)
+    )
 }
 
 /// Resolve the directory to read `.claude/cadence.json` from and to resolve a
@@ -434,11 +458,16 @@ fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
 /// default (empty) config. The legacy `.claude/redaction.json` is no longer
 /// read (hard cut); `cadence-hooks migrate-config` converts a repo and
 /// `cadence-hooks doctor` warns on an orphaned legacy file.
-fn load_redaction_config(base_dir: &str) -> RedactionConfig {
+fn load_redaction_config(
+    base_dir: &str,
+) -> cadence_hooks_core::config::SectionLoad<RedactionConfig> {
     let Some(root) = cadence_hooks_core::paths::find_git_root(base_dir) else {
-        return RedactionConfig::default();
+        return cadence_hooks_core::config::SectionLoad {
+            config: RedactionConfig::default(),
+            warnings: Vec::new(),
+        };
     };
-    cadence_hooks_core::config::load_cadence_section(&root, "redaction")
+    cadence_hooks_core::config::load_cadence_section_lenient(&root, "redaction")
 }
 
 /// Resolve the destination-tier ordinal (PURE — env passed as an argument, never
@@ -1221,6 +1250,47 @@ mod tests {
         let cmd = "gh pr create --body \"see cadence:attune\"";
         let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn malformed_key_does_not_void_valid_allowlist() {
+        // #536's exact shape: bare strings under additionalPatterns (the
+        // struct wants objects) used to void the WHOLE redaction section, so
+        // the valid allowlist beside it went inert. Lenient loading drops
+        // only the malformed key; the allowlist still suppresses.
+        let repo = temp_repo_with_config(
+            r#"{"allowlist":["tool_input"],"additionalPatterns":["zorblax"]}"#,
+        );
+        let cmd = "gh pr create --body \"rename tool_input everywhere\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        let result = RedactExternalContent.run(&input);
+        // The suppression works (no harness-noun hit), and the drop is named
+        // in the transcript instead of silent: outcome is a Nudge carrying
+        // the config warning, not a clean Allow.
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.expect("config warning should surface");
+        assert!(
+            msg.contains("additionalPatterns"),
+            "warning must name the dropped key: {msg}"
+        );
+        assert!(
+            !msg.contains("[harness-noun]"),
+            "allowlist must still suppress the scan hit: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_warning_rides_along_with_scan_hits() {
+        // Broken key + a real hit: one nudge carries both the hit lines and
+        // the config-anomaly block.
+        let repo = temp_repo_with_config(r#"{"additionalPatterns":["zorblax"]}"#);
+        let cmd = "gh pr create --body \"see cadence:attune\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        let result = RedactExternalContent.run(&input);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap();
+        assert!(msg.contains("cadence:attune"));
+        assert!(msg.contains("additionalPatterns"));
     }
 
     #[cfg(unix)]
