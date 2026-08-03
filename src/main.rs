@@ -202,6 +202,21 @@ enum CadenceCommands {
         #[arg(long, value_name = "PATH")]
         baseline: Option<String>,
     },
+    /// Scan text (stdin or --file) for redaction hits at a destination
+    /// audience tier. CLI action — the single engine behind the redaction
+    /// skill's pre-post scan (exit 0 clean / 1 hits on stderr / 2 usage)
+    RedactScan {
+        /// Scan a file instead of stdin
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Destination tier: owned-internal | private-external | public
+        /// (default: config originAudience, else public)
+        #[arg(long, value_name = "TIER")]
+        audience: Option<String>,
+        /// Scaffold the redaction section of .claude/cadence.json and exit
+        #[arg(long)]
+        init: bool,
+    },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
     RecordPolish {
         /// Repository to record against (default: the current directory's).
@@ -414,10 +429,11 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::RedactExternalContent => "redact-external-content",
             CadenceCommands::PlatformDrift { .. } => "platform-drift",
-            // record-polish is a CLI action, not a hook — no hooks.json wiring
-            // and not subject to CADENCE_DISABLE (same treatment as declare /
-            // status / dismiss-*).
+            // record-polish and redact-scan are CLI actions, not hooks — no
+            // hooks.json wiring and not subject to CADENCE_DISABLE (same
+            // treatment as declare / status / dismiss-*).
             CadenceCommands::RecordPolish { .. } => return None,
+            CadenceCommands::RedactScan { .. } => return None,
         }),
         Commands::Guardrails(g) => Some(match g {
             GuardrailsCommands::GuardPushRemote => "guard-push-remote",
@@ -940,6 +956,16 @@ fn main() {
             } => {
                 cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope, arm);
             }
+            CadenceCommands::RedactScan {
+                file,
+                audience,
+                init,
+            } => {
+                process::exit(
+                    cadence_hooks_cadence::redact_external_content::run_scan(file, audience, init)
+                        .into(),
+                );
+            }
         },
         Commands::Guardrails(cmd) => match cmd {
             GuardrailsCommands::GuardPushRemote => dispatch::run_logged_check(
@@ -1304,6 +1330,7 @@ mod tests {
             "declare",
             "status",
             "record-polish",
+            "redact-scan",
         ];
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();
