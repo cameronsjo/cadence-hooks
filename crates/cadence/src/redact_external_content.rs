@@ -434,6 +434,15 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         .as_ref()
         .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()));
 
+    // The term source is exempt from its own scan. Without this, adding a term
+    // to the deny-list is "introducing" it and blocks — the file becomes
+    // unmaintainable through the harness, and the block message's own advice
+    // ("add an `allow` entry in the term source") names an edit the guard just
+    // refused. See `identity::is_term_source` for the fail direction.
+    if identity::is_term_source(file_path) {
+        return CheckResult::allow();
+    }
+
     let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
     for (new, old) in &fragments {
         // Scan only what the edit introduces. A term already present in `old`
@@ -2573,6 +2582,53 @@ term = "acmecorp"
             };
             assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
         });
+    }
+
+    #[test]
+    fn the_term_source_is_editable_ie_the_deny_list_stays_maintainable() {
+        // The self-lock this exemption exists to prevent: adding a term to the
+        // deny-list is "introducing" it under the introduced-only rule, so
+        // without the exemption the file cannot be maintained through the
+        // harness at all — and the block message's own advice ("add an allow
+        // entry in the term source") names the edit it just refused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redaction.toml");
+        std::fs::write(&path, FIXTURE).unwrap();
+
+        let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
+        unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", &path) };
+
+        let edit = |target: &str| HookInput {
+            tool_name: Some("Edit".into()),
+            tool_input: Some(cadence_hooks_core::ToolInput {
+                file_path: Some(target.into()),
+                old_string: Some("version = 1".into()),
+                new_string: Some("version = 1\n[[terms]]\nid = \"T9\"\nterm = \"acmecorp\"".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RedactExternalContent
+                .run(&edit(path.to_str().unwrap()))
+                .outcome,
+            Outcome::Allow,
+            "adding a term to the deny-list itself must be possible"
+        );
+
+        // The control that keeps the exemption honest: the identical content
+        // written to any OTHER path still blocks. Without this, an exemption
+        // that matched everything would look just as green.
+        let other = dir.path().join("notes.md");
+        assert_eq!(
+            RedactExternalContent
+                .run(&edit(other.to_str().unwrap()))
+                .outcome,
+            Outcome::Block,
+            "the exemption must be the term source alone, not any file"
+        );
     }
 
     #[test]
