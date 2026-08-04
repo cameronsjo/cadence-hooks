@@ -31,8 +31,18 @@ say ""
 
 command -v op >/dev/null 2>&1 || die "1Password CLI (op) not found. brew install 1password-cli"
 
+# `grep -c` PRINTS a count and exits 1 when it matches nothing, so the obvious
+# `|| echo 0` fallback appends a second zero and yields the string "0\n0" —
+# which makes the `-gt` test throw rather than compare, silently, since there is
+# no `set -e`. grep's own output is already the default we want.
+count_terms() {
+  local c
+  c=$(grep -c '^\[\[terms\]\]' "$1" 2>/dev/null)
+  printf '%s' "${c:-0}"
+}
+
 if [ -s "$TARGET" ]; then
-  n=$(grep -c '^\[\[terms\]\]' "$TARGET" 2>/dev/null || echo 0)
+  n=$(count_terms "$TARGET")
   if [ "$n" -gt 0 ]; then
     ok "Already armed — $n term(s) at $TARGET. Nothing to do."
     say ""
@@ -74,11 +84,16 @@ else
   umask 077
   printf '%s\n' "$BODY" > "$LEGACY" || die "Write failed: $LEGACY"
   python3 "$MIG" >/dev/null 2>&1 || die "Conversion failed. Run '$MIG' by hand to see why."
+  # Drop the intermediate. On a machine being provisioned there is no reason to
+  # leave a second copy of the deny-list on disk — the operator's ruling to keep
+  # the legacy file applied to the ORIGINAL machine mid-migration, not to a
+  # fresh one, and the 1Password item is the backup either way.
+  rm -f "$LEGACY" && ok "Removed the intermediate legacy file."
 fi
 
 chmod 600 "$TARGET" 2>/dev/null
 [ -s "$TARGET" ] || die "Wrote nothing to $TARGET"
-COUNT=$(grep -c '^\[\[terms\]\]' "$TARGET" 2>/dev/null || echo 0)
+COUNT=$(count_terms "$TARGET")
 [ "$COUNT" -gt 0 ] || die "Wrote $TARGET but it parses to ZERO terms — the tier would be inert. Inspect it by hand."
 ok "Wrote $COUNT term(s) to $TARGET (0600)."
 
