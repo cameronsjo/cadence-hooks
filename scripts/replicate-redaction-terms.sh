@@ -115,7 +115,25 @@ fi
 : < /dev/tty 2>/dev/null || die "No controlling terminal. Run this in a real terminal — 1Password cannot prompt without one."
 
 say "Preparing: fetching the backup from 1Password (it may prompt)…"
-BODY="$(op item get "$ITEM" --fields label=notesPlain --reveal 2>/dev/null)"
+# `--fields` alone returns the value CSV-QUOTED when it is multi-line: a literal
+# `"` is prepended and appended. That single character corrupted two
+# provisioning runs before anyone spotted it — on the legacy text format the
+# leading quote made the first comment line stop starting with `#`, so it
+# counted as a term (a machine came up with 19 instead of 18, one of them a
+# prose fragment and one real term displaced); on TOML it breaks parsing
+# outright with `invalid basic string`. Both failures look like a bad terms
+# file and send you to inspect the wrong thing.
+#
+# `--format json` returns the value unquoted and unescaped. Verified: the JSON
+# path parses clean and its term set matches the source exactly.
+BODY="$(op item get "$ITEM" --format json --fields label=notesPlain --reveal 2>/dev/null \
+  | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+v = d[0].get("value", "") if isinstance(d, list) else d.get("value", "")
+sys.stdout.write(v)' 2>/dev/null)"
 if [ -z "$BODY" ]; then
   # op exits 0 while yielding nothing in some auth states — treat empty as failure.
   die "Could not read 1Password item '$ITEM' (empty result). Sign in with 'op signin' and re-run."
@@ -161,6 +179,25 @@ MIN_EXPECTED=5
 if [ "$COUNT" -lt "$MIN_EXPECTED" ]; then
   warn "Only $COUNT term(s) — fewer than the $MIN_EXPECTED this normally carries."
   warn "A truncated fetch or the wrong 1Password item looks exactly like this. Compare against the source machine before trusting it."
+fi
+
+# PARSE the file, do not just count lines in it. Counting `[[terms]]` headers
+# proves headers exist; it says nothing about whether the TOML is valid, and a
+# file that does not parse leaves the tier completely inert. A CSV-quoting bug
+# in the fetch produced exactly that — 18 headers, 18 values, and a document
+# that failed on line 1 — and every line-counting check reported success.
+if command -v python3 >/dev/null 2>&1; then
+  if ! python3 -c 'import sys,tomllib; tomllib.load(open(sys.argv[1],"rb"))' "$TARGET" 2>/dev/null; then
+    # tomllib is 3.11+; distinguish "cannot check" from "checked and bad".
+    if python3 -c 'import tomllib' 2>/dev/null; then
+      die "$TARGET is not valid TOML — the tier would be inert. Do not trust this file."
+    fi
+    warn "python3 has no tomllib (needs 3.11+) — could not validate the TOML."
+  else
+    ok "TOML parses."
+  fi
+else
+  warn "python3 not found — could not validate the TOML."
 fi
 
 # Structural completeness: a fetch truncated mid-entry leaves a trailing
