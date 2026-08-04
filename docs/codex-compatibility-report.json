@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "binaryVersion": "0.72.0",
+  "binaryVersion": "0.72.1",
   "minimumCodexVersion": "0.145.0",
   "privacy": {
     "rawHookInputsPersisted": false,
@@ -437,6 +437,13 @@
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
       "wiring": [
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
+          "if": null,
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
