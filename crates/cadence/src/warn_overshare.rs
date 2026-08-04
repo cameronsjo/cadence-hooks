@@ -17,15 +17,14 @@
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
-/// Bash token sequences that surface about-to-ship content.
-const BASH_TWO_TOKEN_TRIGGERS: &[[&str; 2]] = &[["git", "push"], ["git", "commit"]];
-
-const BASH_THREE_TOKEN_TRIGGERS: &[[&str; 3]] = &[
-    ["gh", "pr", "create"],
-    ["gh", "pr", "edit"],
-    ["gh", "issue", "create"],
-    ["gh", "issue", "comment"],
-];
+/// Bash token sequences that surface about-to-ship content but are NOT
+/// external-posting verbs the shared [`EXTERNAL_POST`] gate covers. Only
+/// `git push` qualifies — the former `git commit` and four `gh` sequences
+/// were strict subsets of the gate and were pruned when it was adopted
+/// (#385): a second hand-kept list is exactly the drift this change kills.
+///
+/// [`EXTERNAL_POST`]: crate::redact_external_content::EXTERNAL_POST
+const BASH_TWO_TOKEN_TRIGGERS: &[[&str; 2]] = &[["git", "push"]];
 
 const FIELD_REPORTS_MARKER: &str = "/docs/field-reports/";
 
@@ -54,7 +53,7 @@ fn run_with_env(input: &HookInput, bypass: Option<&str>, vault: Option<&str>) ->
         return CheckResult::allow();
     }
 
-    match input.tool_name() {
+    match input.normalized_tool_name() {
         Some("Bash") => {
             let Some(command) = input.command() else {
                 return CheckResult::allow();
@@ -86,27 +85,36 @@ fn is_bypass_set(value: Option<&str>) -> bool {
     matches!(value, Some("1"))
 }
 
-/// True when `command` contains any of the six trigger token sequences.
+/// True when `command` carries `git push`, or any segment matches the redact
+/// engine's [`EXTERNAL_POST`] gate (cadence-hooks#385: overshare's hand-kept
+/// six-command list missed `gh pr comment`, `gh pr review`, `gh issue edit`,
+/// `gh release/gist/discussion`, and `tea` — every one an external-posting
+/// surface the leak scanner already gated). One gate, two consumers: a new
+/// posting verb added there is covered here for free.
 ///
-/// Token-based to avoid substring false positives (e.g. a branch name
-/// containing the literal `git-push` or quoted `git push` inside an echo).
+/// Precision caveat, accepted: quote-stripping each segment keeps a QUOTED
+/// mention (`echo 'docs: gh pr comment usage'`) from tripping, but an
+/// unquoted prose mention (`echo run gh pr comment 5 later`) still nudges —
+/// same over-trigger the old token arm had for `echo git commit foo`. This
+/// is an advisory nudge; false-fire costs a line of noise, and the extraction
+/// step that gives the redact hook full mention-immunity has no meaning here
+/// (there is no body to extract — the command shape IS the signal).
 fn is_bash_overshare_trigger(command: &str) -> bool {
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
-    let two_hit = tokens.windows(2).any(|w| {
+    let push_hit = tokens.windows(2).any(|w| {
         BASH_TWO_TOKEN_TRIGGERS
             .iter()
             .any(|t| w[0] == t[0] && w[1] == t[1])
     });
-    if two_hit {
+    if push_hit {
         return true;
     }
 
-    tokens.windows(3).any(|w| {
-        BASH_THREE_TOKEN_TRIGGERS
-            .iter()
-            .any(|t| w[0] == t[0] && w[1] == t[1] && w[2] == t[2])
-    })
+    use cadence_hooks_core::shell::{command_segments, strip_quotes};
+    command_segments(command)
+        .iter()
+        .any(|seg| crate::redact_external_content::EXTERNAL_POST.is_match(&strip_quotes(seg)))
 }
 
 /// True when `path` is under the Obsidian vault.
@@ -234,6 +242,53 @@ mod tests {
     fn gh_issue_comment_nudges() {
         assert_eq!(
             run(&make_bash("gh issue comment 1 --body hi")).outcome,
+            Outcome::Nudge
+        );
+    }
+
+    // --- EXTERNAL_POST-gated surfaces (#385): every posting verb the leak
+    // scanner gates now nudges here too. ---
+
+    #[test]
+    fn external_post_surfaces_nudge() {
+        for cmd in [
+            "gh pr comment 7 --body text",
+            "gh pr review 7 --approve --body lgtm",
+            "gh issue edit 9 --body updated",
+            "gh release create v1.0 --notes text",
+            "gh gist create notes.md --desc d",
+            "gh discussion create --title t --body b",
+            "gh issue reopen 4 --comment back",
+            "tea pr create --title t --description d",
+            "tea issue comment 3 hello",
+            "cd subdir && gh pr comment 1 --body compound",
+        ] {
+            assert_eq!(
+                run(&make_bash(cmd)).outcome,
+                Outcome::Nudge,
+                "expected nudge for: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_mention_of_posting_verb_does_not_nudge() {
+        // The EXTERNAL_POST arm quote-strips each segment, mirroring the
+        // redact gate — a QUOTED mention of a posting command is prose.
+        assert_eq!(
+            run(&make_bash("echo 'docs: gh pr comment usage'")).outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn unquoted_mention_still_nudges_accepted_imprecision() {
+        // Pins the documented precision caveat: an UNQUOTED prose mention
+        // trips the gate (same over-trigger the old token arm had for
+        // `echo git commit foo`). Advisory nudge — accepted cost, and this
+        // test is the tripwire if anyone later claims full mention-immunity.
+        assert_eq!(
+            run(&make_bash("echo run gh pr comment 5 later")).outcome,
             Outcome::Nudge
         );
     }

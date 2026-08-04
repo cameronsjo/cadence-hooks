@@ -1,0 +1,8 @@
+{"route":"shell","payload":{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status"}}}
+{"route":"unified-exec","payload":{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"pwd"}}}
+{"route":"apply-patch","payload":{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"notes.md","content":"ok"}}}
+{"route":"mcp-functions","payload":{"hook_event_name":"PreToolUse","tool_name":"mcp__filesystem__read_file","tool_input":{"path":"README.md"}}}
+{"route":"mcp-filesystem-write","payload":{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"notes.md","content":"ok"}}}
+{"route":"subagents","payload":{"hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{"subagent_type":"reviewer"}}}
+{"route":"lifecycle-events","payload":{"hook_event_name":"SessionEnd","session_id":"fixture","transcript_path":null,"reason":"other"}}
+{"route":"malformed","payloadRaw":"not-json"}

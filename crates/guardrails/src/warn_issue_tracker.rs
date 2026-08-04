@@ -14,7 +14,7 @@
 
 use cadence_hooks_core::config::{self, default_host, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::shell::{
-    git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
+    contains_ignoring_ascii_case, git_command, host_and_repo_from_url, parse_work_dir, strip_quotes,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -63,26 +63,43 @@ fn trackers() -> Vec<String> {
 
 /// Matches `gh api /?repos/OWNER/REPO/issues` where `/issues` is the final
 /// path segment (no issue number, comments, or other sub-resource after it).
+///
+/// The four patterns here fold their leading `gh` and nothing else
+/// (cadence-hooks#488): `GH` is a spelling the shell runs on a case-insensitive
+/// volume, while `api` and the method values are gh's own and stay
+/// case-sensitive where gh is. These are deliberate LOCAL copies of
+/// `guard_gh_write`'s same-named patterns, so folding one file's set does not
+/// reach the other's — each has to be done on its own.
 static API_ISSUES_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api\s[^\n]*/?repos/([^/\s]+/[^/\s]+)/issues(?:\s|$|[?#])")
+    Regex::new(r"(?i:gh)\s+api\s[^\n]*/?repos/([^/\s]+/[^/\s]+)/issues(?:\s|$|[?#])")
         .expect("pattern should compile")
 });
 
 /// Detects a `gh api` call with an explicit write method flag.
 static API_WRITE_METHOD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
+    Regex::new(r"(?i:gh)\s+api.*(-X|--method)\s+(?i)(POST|PUT|PATCH|DELETE)")
         .expect("pattern should compile")
 });
 
 /// Detects a `gh api` call with field flags (implies a write).
 static API_FIELD_FLAGS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"gh\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
+    Regex::new(r"(?i:gh)\s+api.*\s(-f[\s\S]|--field[\s=]|-F[\s\S]|--raw-field[\s=])")
         .expect("pattern should compile")
 });
 
+/// Matches `gh issue create` with only the VERB folded.
+///
+/// A plain `contains_ignoring_ascii_case` here folded the whole phrase, so
+/// `gh ISSUE CREATE` nudged — but gh rejects a capitalized subcommand, so that
+/// fires on text the shell cannot run. `guard_gh_write` refuses to call the
+/// same string a write, and two guards disagreeing about one input is the
+/// defect. Verb-only keeps the #488 invariant this file's other patterns hold.
+static GH_ISSUE_CREATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i:gh)\s+issue\s+create").expect("pattern should compile"));
+
 /// Detects a `gh api` call with `--input` (implies a write).
 static API_INPUT_FLAG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"gh\s+api.*\s--input\s").expect("pattern should compile"));
+    LazyLock::new(|| Regex::new(r"(?i:gh)\s+api.*\s--input\s").expect("pattern should compile"));
 
 /// Extract a `-R`/`--repo` flag value from a raw command string.
 ///
@@ -115,7 +132,7 @@ fn extract_repo_flag(command: &str) -> Option<String> {
 /// - `gh issue create` (after quote-stripping, so quoted occurrences are data)
 /// - `gh api .../repos/OWNER/REPO/issues` path with a write method or field flags
 fn is_issue_create(stripped: &str) -> bool {
-    if stripped.contains("gh issue create") {
+    if GH_ISSUE_CREATE.is_match(stripped) {
         return true;
     }
     API_ISSUES_PATH.is_match(stripped)
@@ -214,9 +231,15 @@ impl Check for WarnIssueTracker {
             return CheckResult::allow();
         };
 
-        // Fast-path: skip commands that can't possibly match.
+        // Fast-path: skip commands that can't possibly match. Folded, like
+        // the matcher behind it — a lowercase-only pre-filter is a silent veto
+        // over a case-folded matcher (cadence-hooks#488). The `API_*` method
+        // patterns this guard shares with `guard_gh_write` fold their `gh`, so
+        // these two tests must too or the `gh api` arm stays half-folded.
         let stripped = strip_quotes(command);
-        if !stripped.contains("gh issue create") && !stripped.contains("gh api") {
+        if !contains_ignoring_ascii_case(&stripped, "gh issue create")
+            && !contains_ignoring_ascii_case(&stripped, "gh api")
+        {
             return CheckResult::allow();
         }
 
@@ -241,43 +264,15 @@ mod tests {
     use cadence_hooks_core::test_builders::make_bash;
     // make_bash_with_cwd is only used by the non-windows cwd test below; gate the
     // import to match, or clippy's -D unused-imports fails the Windows build.
+    use crate::with_env;
     #[cfg(not(windows))]
     use cadence_hooks_core::test_builders::make_bash_with_cwd;
     use std::path::PathBuf;
 
-    // Serialize tests that mutate CADENCE_ALLOWED_OWNERS / CADENCE_ISSUE_TRACKER(S)
-    // so they don't race each other.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prior: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
-            .collect();
-        for (k, v) in vars {
-            // SAFETY: serialized via ENV_LOCK; restored in the block below.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        for (k, v) in prior {
-            // SAFETY: same lock still held; restoring prior state.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(&k, val),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
-    }
+    // Tests that mutate CADENCE_ALLOWED_OWNERS / CADENCE_ISSUE_TRACKER(S)
+    // serialize via the crate-shared with_env/CADENCE_ENV_TEST_LOCK so they
+    // don't race each other or the same globals mutated in guard_push_remote
+    // / guard_gh_write (#446).
 
     fn workdir(path: &str) -> PathBuf {
         PathBuf::from(path)
@@ -372,6 +367,57 @@ mod tests {
                     &workdir("/tmp"),
                 );
                 assert_eq!(result, Some("cameronsjo/workbench".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn case_folded_gh_verb_nudges() {
+        // cadence-hooks#488. This guard shares the `API_*` method patterns with
+        // `guard_gh_write`, and those fold their `gh` — so its own `gh issue
+        // create` / `gh api` tests had to fold too, or the `gh api` arm would
+        // be half-folded: the method matched, the invocation didn't.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                for cmd in [
+                    "GH issue create -R cameronsjo/workbench --title x",
+                    "Gh issue create -R cameronsjo/workbench --title x",
+                    "GH api repos/cameronsjo/workbench/issues -X POST -f title=x",
+                ] {
+                    assert_eq!(
+                        judge_issue_target(cmd, &workdir("/tmp")),
+                        Some("cameronsjo/workbench".to_string()),
+                        "{cmd}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn only_the_gh_verb_folds_not_the_subcommand() {
+        // The fold must stop at the verb. `gh` rejects `ISSUE CREATE`, so a
+        // capitalized subcommand names a command the shell cannot run —
+        // matching it fires on text that will never execute, which is the
+        // shape #489 turned into a net weakening. `guard_gh_write` already
+        // refuses to call this string a write; the two guards must agree.
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+            ],
+            || {
+                for cmd in [
+                    "gh ISSUE CREATE -R cameronsjo/workbench --title x",
+                    "gh issue CREATE -R cameronsjo/workbench --title x",
+                    "gh ISSUE create -R cameronsjo/workbench --title x",
+                ] {
+                    assert_eq!(judge_issue_target(cmd, &workdir("/tmp")), None, "{cmd}");
+                }
             },
         );
     }
@@ -668,7 +714,8 @@ mod tests {
 
     // ---- nudge message format ----
     // These tests call canonical() which reads CADENCE_ISSUE_TRACKER — serialize
-    // with ENV_LOCK and clear the var so concurrent env-mutating tests don't race.
+    // with CADENCE_ENV_TEST_LOCK (via with_env) and clear the var so
+    // concurrent env-mutating tests don't race.
 
     #[test]
     fn nudge_message_names_the_check() {

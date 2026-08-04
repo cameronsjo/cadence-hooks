@@ -19,9 +19,12 @@
 //! `*arr` regex) with `CADENCE_GOING_PUBLIC_IGNORE`.
 
 use cadence_hooks_core::config::env_list;
-use cadence_hooks_core::shell::{command_segments, tokenize};
+use cadence_hooks_core::shell::{
+    command_segments, contains_ignoring_ascii_case, fold_verb, tokenize,
+};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 /// Publicly-known OSS app names that read as a home-media / piracy stack.
@@ -106,11 +109,15 @@ fn find_match(haystack: &str, terms: &[String], ignore: &[String]) -> Option<Str
     None
 }
 
-/// Basename-aware command word: `/opt/homebrew/bin/gh` → `gh`.
-fn command_word(tokens: &[String]) -> Option<&str> {
+/// Basename-aware command word, ASCII case folded: `/opt/homebrew/bin/GH` →
+/// `gh`. The fold is cadence-hooks#488 — a case-insensitive volume resolves
+/// `GH` to the `gh` binary and runs it, so the caller's `== "gh"` test silenced
+/// the whole check on a spelling that works. Feeds a nudge, the most forgiving
+/// direction there is.
+fn command_word(tokens: &[String]) -> Option<Cow<'_, str>> {
     tokens
         .first()
-        .map(|first| first.rsplit('/').next().unwrap_or(first))
+        .map(|first| fold_verb(first.rsplit('/').next().unwrap_or(first)))
 }
 
 /// The first positional token immediately after the subcommand (index 3), if it
@@ -171,7 +178,10 @@ impl Check for GoingPublicGuard {
         };
 
         // Fast pre-filter: nothing to do without a `gh repo` invocation.
-        if !command.contains("gh repo") {
+        // Folded, because `GH repo` is a spelling the shell runs — a
+        // lowercase-only test here silently defeated the folded command word
+        // below by rejecting the command before it ran (cadence-hooks#488).
+        if !contains_ignoring_ascii_case(command, "gh repo") {
             return CheckResult::allow();
         }
 
@@ -183,7 +193,7 @@ impl Check for GoingPublicGuard {
         // real invocation later in a chain still does.
         for segment in command_segments(command) {
             let tokens = tokenize(&segment);
-            if command_word(&tokens) != Some("gh") {
+            if command_word(&tokens).as_deref() != Some("gh") {
                 continue;
             }
             if tokens.get(1).map(String::as_str) != Some("repo") {
@@ -225,42 +235,13 @@ fn nudge_message(term: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::with_env;
     use cadence_hooks_core::test_builders::make_bash;
 
-    // Serialize tests that mutate CADENCE_GOING_PUBLIC_TERMS / _IGNORE so they
-    // don't race each other (env is process-global). Per-file ENV_LOCK, matching
-    // the pattern on origin/main.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_env(vars: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prior: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))
-            .collect();
-        for (k, v) in vars {
-            // SAFETY: serialized via ENV_LOCK; restored in the block below.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        for (k, v) in prior {
-            // SAFETY: same lock still held; restoring prior state.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(&k, val),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
-    }
+    // Tests that mutate CADENCE_GOING_PUBLIC_TERMS / _IGNORE serialize via the
+    // crate-shared with_env/CADENCE_ENV_TEST_LOCK so they don't race each
+    // other (env is process-global) or the globals mutated elsewhere in this
+    // crate (#446).
 
     fn outcome(cmd: &str) -> cadence_hooks_core::Outcome {
         GoingPublicGuard.run(&make_bash(cmd)).outcome
@@ -273,6 +254,27 @@ mod tests {
         assert_eq!(
             outcome("gh repo create sonarr-cfg --public"),
             cadence_hooks_core::Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn case_folded_gh_verb_still_nudges() {
+        // cadence-hooks#488. This guard's local command word is a bare
+        // `rsplit('/')`, so a capitalized `GH` — which the shell resolves and
+        // runs on a case-insensitive volume — failed the `== "gh"` test and
+        // the whole check went silent.
+        assert_eq!(
+            outcome("GH repo create sonarr-cfg --public"),
+            cadence_hooks_core::Outcome::Nudge
+        );
+        assert_eq!(
+            outcome("/opt/homebrew/bin/GH repo create sonarr-cfg --public"),
+            cadence_hooks_core::Outcome::Nudge
+        );
+        // The fold changes case, not shape — a longer word is still not `gh`.
+        assert_eq!(
+            outcome("GHQ repo create sonarr-cfg --public"),
+            cadence_hooks_core::Outcome::Allow
         );
     }
 

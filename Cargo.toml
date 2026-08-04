@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.70.0"
+version = "0.71.0"
 edition = "2024"
 license-file = "LICENSE"
 authors = ["Cameron Sjo"]
@@ -12,6 +12,7 @@ repository = "https://github.com/cameronsjo/cadence-hooks"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_ignored = "0.1"
 regex = "1"
 clap = { version = "4", features = ["derive"] }
 brush-parser = "0.3"
@@ -44,6 +45,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 serde_json.workspace = true
+cadence-hooks-core = { workspace = true, features = ["test-builders"] }
 
 [dependencies]
 clap.workspace = true

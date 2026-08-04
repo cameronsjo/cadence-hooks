@@ -4,6 +4,7 @@
 //! running git commands, and resolving working directories from `cd` chains.
 
 use regex::Regex;
+use std::borrow::Cow;
 use std::process::Command;
 use std::sync::LazyLock;
 
@@ -38,6 +39,23 @@ pub fn strip_quotes(s: &str) -> String {
     result
 }
 
+/// How a shell parser reads the quoted run it is currently inside.
+///
+/// Shared by [`tokenize`] and [`split_segments_with_ops`] on purpose. The two
+/// answer different questions — where a WORD ends versus where a COMMAND ends —
+/// but they must agree on where a quoted run ends, because a disagreement is a
+/// boundary the shell does not have and every guard that segments inherits it
+/// (cameronsjo/cadence-hooks#475).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    /// `'…'` — fully literal; the first `'` closes (POSIX).
+    Single,
+    /// `"…"` — `\` escapes `"` and `\`; other backslashes stay literal.
+    Double,
+    /// `$'…'` — bash ANSI-C; `\` escapes whatever follows, including `'`.
+    AnsiC,
+}
+
 /// Split a shell command into whitespace-separated tokens, honoring quotes.
 ///
 /// Content inside matching `'` or `"` pairs stays in one token with the quotes
@@ -64,6 +82,10 @@ pub fn strip_quotes(s: &str) -> String {
 /// (`C:\Users\x`) survives intact — consuming those would corrupt the very
 /// targets the destructive-command guards compare.
 ///
+/// The three modes live in [`Quote`], shared with [`split_segments_with_ops`]
+/// so the tokenizer and the segmenter cannot drift apart on what a quoted run
+/// is — a divergence between them is a boundary the shell does not have.
+///
 /// **Three quoting modes, because `'…'` and `$'…'` are not the same thing.**
 /// Plain single quotes get no escape processing, matching POSIX: a backslash is
 /// literal and the first `'` always closes. But bash's ANSI-C form `$'…'` DOES
@@ -73,17 +95,6 @@ pub fn strip_quotes(s: &str) -> String {
 /// rest of the command, `-R evil/target` included. `$'…'` is therefore its own
 /// mode where a backslash consumes the character after it.
 pub fn tokenize(command: &str) -> Vec<String> {
-    /// How the tokenizer reads the run it is currently inside.
-    #[derive(Clone, Copy)]
-    enum Quote {
-        /// `'…'` — fully literal; the first `'` closes (POSIX).
-        Single,
-        /// `"…"` — `\` escapes `"` and `\`; other backslashes stay literal.
-        Double,
-        /// `$'…'` — bash ANSI-C; `\` escapes whatever follows, including `'`.
-        AnsiC,
-    }
-
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
@@ -180,6 +191,157 @@ pub fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
+/// ASCII-fold a resolved verb so a capitalized spelling matches the gate
+/// (cadence-hooks#488). Borrows unless the fold changes something, so the
+/// common already-lowercase verb costs no allocation.
+///
+/// **The one place the verb fold is spelled**, shared by
+/// [`command_word`] and by the two guards that keep a deliberately divergent
+/// local command word (`guard_rm`, which repeats the backslash strip;
+/// `warn_going_public`, which is basename-only). Those divergences are about
+/// the *path/escape* handling and are documented where they live — the fold is
+/// not one of them, and three hand-rolled copies of it would be four
+/// normalizations of "which verb is this?" all over again, which is exactly
+/// what #450 consolidated away.
+///
+/// ASCII, never [`str::to_lowercase`]: every verb a guard gates on is ASCII,
+/// while Unicode folding maps the dotted-I family and assorted homoglyphs onto
+/// ASCII letters, inventing verbs no shell would run.
+pub fn fold_verb(word: &str) -> Cow<'_, str> {
+    if word.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(word.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(word)
+    }
+}
+
+/// Case-insensitive (ASCII) substring test, allocation-free.
+///
+/// For the cheap `contains` **pre-filters** that guards open with before
+/// running their real patterns. Those filters exist to avoid work, so folding
+/// them by allocating a lowercased copy of the whole command works against
+/// their only purpose; this walks byte windows instead.
+///
+/// It earns its place by being the fix for a measured defect rather than a
+/// tidiness: `guard_gh_write`, `guard_gh_dangerous`, and `warn_going_public`
+/// each opened with a lowercase-only `contains("gh")`, which returned Allow on
+/// `GH pr create` **before** their case-folded verb patterns could run — so the
+/// folds read as correct in unit tests while the built binary still allowed the
+/// write (cadence-hooks#488). A pre-filter that is stricter than the matcher
+/// behind it is a silent veto, and having one spelling of it makes that
+/// invariant greppable.
+pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// The command word `token` names, normalized to the verb the shell will
+/// actually run: the path segment, one leading alias-bypass backslash removed,
+/// and a Windows `.exe` suffix dropped.
+///
+/// The single normalization for "which verb is this?", so a guard that gates on
+/// a verb cannot miss a spelling because its call site forgot a step. Four
+/// divergent copies existed before (cadence-hooks#450 review) and they
+/// disagreed on both the order of the two operations and whether the backslash
+/// strip repeated — differences that decide real verdicts, not style.
+///
+/// Three steps, and the ORDER is load-bearing:
+///
+/// 1. **Path segment.** Always split on `/`. Split on `\` too, but ONLY for a
+///    drive-prefixed token (`C:\…`): on a POSIX shell a backslash is an escape
+///    character, not a separator, so splitting on it unconditionally would
+///    reduce `\\git` to `git` — see step 2.
+/// 2. **Remove exactly ONE leading backslash** — [`str::strip_prefix`], never
+///    `trim_start_matches`. `\git` is the standard way past a `git` alias and
+///    IS git; `\\git` is a *different* word, because the shell removes one
+///    backslash and looks up `\git`, which is not a command. A repeating strip
+///    collapses the two (the bug caught in cadence-hooks#442's review).
+///    Applied AFTER the path split so `/opt/\git` — which the shell runs as
+///    `/opt/git` — normalizes correctly; strip-then-split would miss it.
+/// 3. **Drop a trailing `.exe`**, case-insensitively, so a Windows spelling
+///    (`…/git.exe`, `C:\Program Files\Git\cmd\git.exe`) matches the same verb
+///    as the POSIX one. No verb any caller gates on legitimately ends in
+///    `.exe`, so this cannot collapse two distinct verbs together.
+/// 4. **Fold ASCII case**, LAST, so it composes with all three steps above.
+///
+/// # The case fold (cadence-hooks#488)
+///
+/// On a case-insensitive volume — APFS, the macOS default — the shell resolves
+/// `GIT` to the `git` binary and runs it. Every gate here compared against a
+/// lowercase literal, so `GIT commit` produced no commit target and `RM -rf`
+/// named no delete verb: measured silent Allows, and the `enforce_worktree`
+/// commit gate has no settings-rule mitigation behind it the way `guard_rm`
+/// does.
+///
+/// **Unconditional, not filesystem-aware.** Deciding "will the shell find
+/// `GIT`?" honestly means probing the case-sensitivity of whichever `$PATH`
+/// volume holds the binary — not the cwd, which is usually a different
+/// filesystem — for every verb, in a hook that runs on every Bash call. A
+/// `cfg!(target_os)` shortcut is simply wrong in both directions: macOS
+/// supports case-sensitive APFS volumes, and Linux supports case-insensitive
+/// mounts (ext4 casefold, ciopfs, NTFS/exFAT). So the fold is unconditional,
+/// and the cost of over-eagerness on a case-sensitive host is one spurious
+/// block on a command that would have failed as `command not found` anyway.
+/// That trade only holds because of the direction argument below.
+///
+/// **Why folding here cannot turn a BLOCK into an ALLOW.** A normalization
+/// copied into a DETECTOR may be over-eager safely — it can only add blocks.
+/// Copied into an EXEMPTION it can only subtract them, and over-eagerness is a
+/// vulnerability (the `xargs` bypass recorded in
+/// `prevent_secret_leaks::COMMAND_WRAPPERS`). This function feeds both kinds,
+/// so every consumer was enumerated:
+///
+/// - **Detectors** — [`peel_command_runners`] and [`shell_c_argument_tokens`]
+///   here; `enforce_worktree`'s commit gate, `is_package_mutation` and
+///   `file_mutation_targets`; `guard_rm`'s delete-verb, `find`, and
+///   shell-wrapper arms; `guard_gh_write::token_is_gh`. Folding widens what
+///   they find, which only ever ADDS a block, an ask, or a nudge.
+/// - **The one exemption** — `prevent_secret_leaks`' `METADATA_SAFE_COMMANDS`
+///   lookup, reached via that file's `resolve_command`. `fold_verb` is an
+///   unconditional ASCII lowercase, so it folds identically whether its input
+///   arrived pre-lowered or not — the exemption's WIDTH cannot change either
+///   way, which `verb_fold_cannot_widen_this_guards_exemption` asserts
+///   directly. (Before cadence-hooks#508, `bash_leaks_secrets` additionally
+///   lowercased the whole command upstream of this fold, making the fold a
+///   provable allocation no-op there too — segmenting the un-lowered command
+///   to fix #508's sudo-flag bypass ended that upstream lowering, but the
+///   exemption lookup this fold feeds is unaffected either way.)
+///
+/// **ASCII-only**, never [`str::to_lowercase`]. Every verb any caller gates on
+/// is ASCII, while Unicode folding maps the dotted-I family and assorted
+/// homoglyphs onto ASCII letters — widening matching in ways no filesystem
+/// does, and inventing verbs the shell would never run.
+///
+/// Only the VERB folds. Folding a whole command string is what regressed
+/// `-C`/`-P`/`-S` in cadence-hooks#489 and silenced `env -C /tmp printenv`: a
+/// hardening change that net-weakened a guard. Flags are case-sensitive to the
+/// programs that receive them, and path operands are case-sensitive in content
+/// even on a case-insensitive volume.
+///
+/// Deliberate misses, shared by every caller: a command word behind a
+/// substitution (`$(which git)`) or a variable, and a mid-path escape
+/// (`/usr/bin/\git`).
+pub fn command_word(token: &str) -> Cow<'_, str> {
+    let has_drive_prefix = {
+        let mut chars = token.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) && chars.next() == Some(':')
+    };
+    let segment = if has_drive_prefix {
+        token.rsplit(['/', '\\']).next().unwrap_or(token)
+    } else {
+        basename(token)
+    };
+    let segment = segment.strip_prefix('\\').unwrap_or(segment);
+    let segment = match segment.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => stem,
+        _ => segment,
+    };
+    fold_verb(segment)
+}
+
 /// True when `p` is absolute — POSIX (`/foo`) or a Windows drive-absolute path
 /// spelled with EITHER separator (`C:/foo` or `C:\foo`). Lets a guard
 /// distinguish an explicit path argument from a flag (`-rf`) or a bare
@@ -212,6 +374,214 @@ pub fn strip_group_wrappers(segment: &str) -> &str {
         .trim()
         .trim_start_matches(['(', '{', ' ', '\t'])
         .trim_end_matches([')', '}', ';', ' ', '\t'])
+}
+
+/// Reserved words that occupy the head position of a segment without being the
+/// command. `for f in *.md; do rm $f; done` segments as `for f in *.md` /
+/// `do rm $f` / `done`, so a caller that gates on the segment head sees `do`
+/// and never examines the `rm` behind it — the same blindness
+/// [`strip_group_wrappers`] fixes for `(`/`{`, in a shape that punctuation
+/// stripping cannot reach.
+///
+/// Matched case-SENSITIVELY: the shell's reserved words are, so `DO rm x` runs
+/// a command named `DO` and stripping it would resolve a verb the shell never
+/// reaches.
+const LEADING_KEYWORDS: &[&str] = &["do", "then", "else", "elif", "while", "until", "if", "!"];
+
+/// Skip leading shell reserved words so the segment head is the real command.
+///
+/// **Detector direction only.** Skipping a keyword can only expose a verb that
+/// was already going to run, so this can add a block and never subtract one —
+/// the same argument [`skip_transparent_prefixes`] makes. Never reuse it to
+/// decide that something is *safe*.
+///
+/// A keyword that is the segment's ONLY word — `!` is the one list member that
+/// can appear alone — is left alone: there is no command behind it to expose.
+/// A closing word (`done`, `fi`, `esac`) is not in the list at all, so it is
+/// never a candidate to strip in the first place.
+pub fn strip_leading_keywords(tokens: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < tokens.len() && LEADING_KEYWORDS.contains(&tokens[start].as_str()) {
+        start += 1;
+    }
+    &tokens[start..]
+}
+
+/// Strip everything a compound statement or a definition puts in FRONT of the
+/// command it runs, so the head of the returned slice is the command word.
+///
+/// Four shapes, all of which park scaffolding where a gate expects a verb:
+///
+/// - a reserved word ([`strip_leading_keywords`]) — `then bash -c '…'`,
+///   `do bash -c '…'`
+/// - a group opener left standing as its own token — `{ bash -c '…'`
+/// - a `case` arm's pattern label — `case x in x) bash -c '…'`, and the
+///   idiomatic multi-line spelling whose segment begins AT the label
+///   (`x) bash -c '…'`)
+/// - a function definition header — `f() { … }`, `f () { … }`,
+///   `function f { … }`
+///
+/// Glued group punctuation cannot be reached from tokens — [`tokenize`] makes
+/// `(bash` ONE token — so a caller holding the raw segment wants
+/// [`executable_tokens`], which composes this with the string-level strips.
+/// Reach for this one only when the tokens are all you have.
+///
+/// **Detector direction only**, the same argument [`strip_leading_keywords`]
+/// makes: every word skipped here is scaffolding the shell does not execute, so
+/// skipping it can only expose a command that was already going to run. Never
+/// reuse it to decide that something is *safe*.
+///
+/// **One pre-processing model for every position that reads a command word.**
+/// The verb gate and the wrapper hunt in [`shell_c_argument_tokens`] both run
+/// this, because running different models is how each prior hole opened: the
+/// verb gate stripped `then`/`do` while the wrapper hunt did not, so
+/// `if true; then rm note.md; fi` was judged and
+/// `if true; then bash -c 'rm note.md'; fi` was not — the same divergence as
+/// #528's runner-flag findings, one layer over (#528 review E).
+pub fn strip_compound_heads(tokens: &[String]) -> &[String] {
+    let mut rest = tokens;
+    loop {
+        let before = rest.len();
+        rest = strip_leading_keywords(rest);
+        rest = strip_group_tokens(rest);
+        rest = strip_function_header(rest);
+        rest = strip_case_arm(rest);
+        // Each helper either shortens the slice or returns it untouched, so the
+        // length is a strictly decreasing measure and this terminates.
+        if rest.len() == before {
+            return rest;
+        }
+    }
+}
+
+/// One segment reduced to the tokens of the command the shell will actually
+/// run: group punctuation gone (glued or standalone), reserved words gone,
+/// `case` labels and function headers gone.
+///
+/// **This is the single pre-processing model every executable position reads.**
+/// The two halves have to compose and neither alone is enough: the string-level
+/// [`strip_group_wrappers`] is the only thing that can reach punctuation
+/// [`tokenize`] glues to a word (`(bash` is one token, and the closing `)` rides
+/// on the last one), while [`strip_compound_heads`] is the only thing that can
+/// reach a reserved word, a `case` label, or a function header. Run in one
+/// order only, they still miss the composition — `do (bash -c 'rm note.md')`
+/// keeps a glued `(` once `do` is gone — so this alternates until neither has
+/// anything left to take.
+///
+/// **Detector direction only**, inheriting [`strip_compound_heads`]' argument:
+/// nothing removed here is a word the shell executes.
+pub fn executable_tokens(segment: &str) -> Vec<String> {
+    let mut tokens = tokenize(strip_group_wrappers(segment));
+    loop {
+        let window = strip_compound_heads(&tokens);
+        // A group opener that survived because a keyword sat in front of it at
+        // string-strip time. Peeling one character per pass keeps `((cmd` in
+        // reach without a second string-level round trip.
+        if let Some(head) = window
+            .first()
+            .and_then(|head| head.strip_prefix(['(', '{']))
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_string)
+        {
+            let mut next = Vec::with_capacity(window.len());
+            next.push(head);
+            next.extend_from_slice(&window[1..]);
+            tokens = next;
+            continue;
+        }
+        // Every pass either drops a token or a character, so a pass that does
+        // neither is the fixpoint.
+        if window.len() == tokens.len() {
+            return tokens;
+        }
+        tokens = window.to_vec();
+    }
+}
+
+/// A group opener (or an empty parameter list) standing as its own token, left
+/// behind by `{ cmd; }`, `( cmd )`, and `function f () { … }`.
+fn strip_group_tokens(tokens: &[String]) -> &[String] {
+    let mut start = 0;
+    while start + 1 < tokens.len() && matches!(tokens[start].as_str(), "(" | "{" | "()") {
+        start += 1;
+    }
+    &tokens[start..]
+}
+
+/// A shell function name: conservative on the first character (a leading `-`
+/// would make a flag look like a definition) and permissive on the rest, since
+/// bash accepts `-` and `.` in names.
+fn is_function_name(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The header of a function definition, in all three spellings. The body's
+/// opening `{` is left for [`strip_group_tokens`] on the next pass.
+fn strip_function_header(tokens: &[String]) -> &[String] {
+    match tokens {
+        [keyword, name, rest @ ..]
+            if keyword == "function" && !rest.is_empty() && is_function_name(name) =>
+        {
+            rest
+        }
+        [name, parens, rest @ ..]
+            if parens == "()" && !rest.is_empty() && is_function_name(name) =>
+        {
+            rest
+        }
+        [head, rest @ ..]
+            if !rest.is_empty() && head.strip_suffix("()").is_some_and(is_function_name) =>
+        {
+            rest
+        }
+        _ => tokens,
+    }
+}
+
+/// A `case` arm's pattern label — every token through the one that closes the
+/// label with `)`.
+///
+/// Two entries, because segmentation reaches the arm from either side:
+/// `case x in x) cmd` arrives whole on one segment, while the idiomatic
+/// multi-line spelling puts `x) cmd` on a segment of its own.
+///
+/// The label is required to be a SINGLE token ending in `)`, at a position the
+/// grammar puts it — right after `in`, or at the head of the segment. Scanning
+/// forward for any `)`-terminated token instead would eat a real command whose
+/// operand happens to close a paren (`bash -c 'echo hi)'`).
+///
+/// The bare form is the looser of the two, because a `)`-terminated head is
+/// also what a multi-segment subshell leaves behind (`(cd /x; ls) > out`
+/// segments as `ls) > out`, where `ls` is the command and not a label). Two
+/// refusals keep those apart: a label carrying `(`, `$` or a backtick is a
+/// subshell or a substitution rather than a pattern, and a label must be
+/// followed by something that can START a command — a redirect or a flag behind
+/// it means the `)` closed a subshell and the word in front of it was the verb.
+fn strip_case_arm(tokens: &[String]) -> &[String] {
+    let label = match tokens.first() {
+        Some(head) if head == "case" => match tokens.iter().position(|t| t == "in") {
+            Some(idx) => idx + 1,
+            None => return tokens,
+        },
+        Some(head) if !head.contains(['(', '$', '`']) => 0,
+        _ => return tokens,
+    };
+    let ends_the_label = tokens
+        .get(label)
+        .is_some_and(|token| token.ends_with(')') && token.len() > 1);
+    let body_starts_a_command = label > 0
+        || tokens.get(label + 1).is_some_and(|token| {
+            !token.starts_with(['-', '|', '&']) && !token.contains(['<', '>'])
+        });
+    if ends_the_label && body_starts_a_command && label + 1 < tokens.len() {
+        &tokens[label + 1..]
+    } else {
+        tokens
+    }
 }
 
 /// Words that stand in front of a real command without being the command.
@@ -248,7 +618,15 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
     let mut start = 0;
     while start + 1 < tokens.len() {
         let tok = tokens[start].as_str();
-        if (TRANSPARENT.contains(&tok) && !tokens[start + 1].starts_with('-'))
+        // Membership is tested on the FOLDED word (cadence-hooks#488). `guard_rm`
+        // already folded before its own `TRANSPARENT` test, so a raw test here
+        // made the two disagree: `COMMAND rm -rf ~` kept `COMMAND` as the
+        // leading word and the delete verb behind it was never reached.
+        // Detector direction — skipping more prefixes only exposes more verbs
+        // to the gates downstream, so this can add blocks and never subtract.
+        // The flag refusal below is unchanged, so a prefix's own options are
+        // still never parsed.
+        if (TRANSPARENT.contains(&fold_verb(tok).as_ref()) && !tokens[start + 1].starts_with('-'))
             || is_assignment_word(tok)
         {
             start += 1;
@@ -263,7 +641,13 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
 /// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
 /// `==` comparisons — is not skipped, so this can only widen the leading-word
 /// gate past words the shell itself treats as environment prefixes.
-fn is_assignment_word(token: &str) -> bool {
+///
+/// Public so guards that peel a prefix themselves agree with
+/// [`skip_transparent_prefixes`] on what counts as an assignment — the
+/// `prevent-secret-leaks` `env`-operand peel (#411) needs the same rule but
+/// cannot reuse that function, which stops at any `-`-leading token and so
+/// refuses exactly the `env -u FOO cmd` shape it must see through.
+pub fn is_assignment_word(token: &str) -> bool {
     match token.split_once('=') {
         Some((name, _)) if !name.is_empty() => {
             name.chars()
@@ -426,6 +810,14 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
         // (`-t '#123'`). Treating that value as a comment stopped the scan and
         // let a PR number *after* it through unexamined — a selector smuggled
         // past the gate, which is the unsafe direction (security review).
+        //
+        // Largely defensive since [`strip_comments`] began removing comments
+        // before segmentation, so a bare `#` token rarely survives to here.
+        // Kept deliberately: this is an equality test on one token, NOT a
+        // second comment scanner, so it cannot drift from [`comment_spans`]'
+        // rules the way an inline re-implementation did (#490 follow-up). Its
+        // direction is also the safe one — returning true means "no PR
+        // selected", which makes the gate fire rather than fall silent.
         if token == "#" {
             return true;
         }
@@ -898,8 +1290,21 @@ pub fn resolve_cd_target(target: &str, effective: &str) -> String {
 /// which reuses [`child_scripts`] on the same budget.
 pub const MAX_WRAPPER_DEPTH: usize = 3;
 
-/// Strip heredoc bodies from a command so their prose never reaches the
-/// segment splitter.
+/// Reduce a command to the logical lines the shell will execute: join
+/// backslash-newline continuations, and strip heredoc bodies so their prose
+/// never reaches the segment splitter.
+///
+/// The two jobs are interleaved rather than sequential because they depend on
+/// each other. A heredoc body begins on the line after the *logical* line that
+/// introduces it, so continuations must be joined first — otherwise the body is
+/// measured from the wrong line, and an introducer ending in a backslash leaves
+/// that backslash dangling in front of whatever followed the terminator, which
+/// then absorbs a command the shell runs separately. But the joining must not
+/// run as a pre-pass over the whole command either: body text is data, exempt
+/// from shell quoting, and a quote-tracking pre-pass desynchronized on the
+/// first apostrophe in ordinary prose ("it's") and suppressed every later
+/// continuation. Assembling one logical line at a time and reading each body
+/// raw ([`take_logical_line`]) is what satisfies both (#475).
 ///
 /// A heredoc body (`cmd <<WORD` … `WORD`) is data, not commands — but its
 /// newlines would otherwise make [`split_segments`] turn each body line into a
@@ -923,23 +1328,37 @@ pub const MAX_WRAPPER_DEPTH: usize = 3;
 /// guard MISS, not a safe fail-open. Detection also suppresses inside double
 /// quotes (a `<<WORD` inside `"…"` is literal text), with the
 /// terminator-not-found rule as the backstop for cross-line quote state.
-fn strip_heredoc_bodies(command: &str) -> String {
-    if !command.contains("<<") {
-        return command.to_string();
-    }
+pub fn strip_heredoc_bodies(command: &str) -> String {
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let mut line = lines[i].to_string();
-        let delims = heredoc_delimiters(lines[i]);
-        i += 1;
-        for (word, expands) in delims {
+        // Assemble the LOGICAL line first: the shell joins backslash-newline
+        // continuations before it interprets anything, and a heredoc body
+        // begins on the line after the logical line that introduces it. Doing
+        // this per line — rather than as a pre-pass over the whole command —
+        // is what keeps body lines out of it: a body is read raw below, so a
+        // stray apostrophe in prose can never desynchronize a quote tracker
+        // and suppress a later continuation (#475).
+        let mut line = take_logical_line(&lines, &mut i);
+        // A commented-out introducer introduces nothing. `echo hi # cat <<EOF`
+        // is one `echo` to bash: the `<<EOF` is inside a comment, so the lines
+        // after it are ordinary commands, not a body. Detecting the delimiter
+        // there consumed them as a body and dropped them — including a
+        // `rm -rf ~` that bash runs. Only the delimiter SCAN uses the trimmed
+        // view; `line` itself is emitted whole, and the comment pass in
+        // [`split_segments_with_ops`] removes the text later.
+        let scan = match comment_spans(&line).first() {
+            Some(&(start, _)) => &line[..start],
+            None => line.as_str(),
+        };
+        let delims = heredoc_introducers(scan);
+        for HeredocIntroducer { word, expands, .. } in delims {
             // Scan ahead for the terminator without committing the drop. Only
             // if it is found do we replace the body with the carried-forward
             // substitution lines; otherwise the lines are restored untouched.
             let body_start = i;
-            let mut carried: Vec<String> = Vec::new();
+            let mut body_lines: Vec<&str> = Vec::new();
             let mut found = false;
             while i < lines.len() {
                 let body = lines[i];
@@ -948,21 +1367,59 @@ fn strip_heredoc_bodies(command: &str) -> String {
                     found = true;
                     break;
                 }
-                if expands && (body.contains("$(") || body.contains('`')) {
-                    carried.push(body.to_string());
-                }
+                body_lines.push(body);
                 i += 1;
             }
             if found {
-                for c in carried {
-                    line.push(' ');
-                    line.push_str(&c);
+                if expands {
+                    // Carry the substitution SPANS, never the prose around
+                    // them. A heredoc body is data: its apostrophes are
+                    // ordinary characters, but everything downstream reads a
+                    // segment as shell syntax, so splicing a whole body line in
+                    // let a contraction ("it's here $(cat .env)") open a quote
+                    // state that suppressed the very substitution the
+                    // carry-forward exists to surface (#475).
+                    //
+                    // Extracted over the WHOLE body at once, not line by line.
+                    // A substitution's boundary is its closing delimiter, not a
+                    // newline — `` `cmd ⏎ cmd` `` is one substitution running
+                    // two commands — so a per-line extractor found no closer,
+                    // emitted nothing, and (having replaced the old
+                    // carry-the-whole-line behavior) left NOTHING for the
+                    // splitter to see. Same lesson as [`take_logical_line`]:
+                    // the unit is the construct, never the physical line.
+                    //
+                    // Each span is appended behind a NEWLINE, never a space.
+                    // The introducing line can carry a trailing comment, and a
+                    // space glued the span into it — `cat <<EOF # note` plus a
+                    // body span became `cat <<EOF # note $(rm -rf ~)`, which
+                    // the comment rule in [`split_segments_with_ops`] then
+                    // discarded whole, manufacturing a fresh miss out of a fix
+                    // (#490/#499). A newline keeps the span a segment of its
+                    // own, out of the comment's reach; this function already
+                    // joins its output on `\n`, so the span still reaches
+                    // `substitution_bodies` and `child_scripts` unchanged.
+                    for span in substitution_spans(&body_lines.join("\n")) {
+                        line.push('\n');
+                        line.push_str(&span);
+                    }
                 }
             } else {
                 // Terminator never matched — keep every consumed line as-is so
                 // a command bash would execute is never silently dropped.
                 out.push(line);
                 out.extend(lines[body_start..].iter().map(|l| l.to_string()));
+                // Verbatim is necessary but no longer sufficient. These lines
+                // are heredoc BODY — data, where a `#` is an ordinary
+                // character — yet they are handed on as shell syntax, so the
+                // comment pass reads a `#` in the prose as a comment and drops
+                // the rest of the line. `cat <<EOF ⏎ prose # $(rm -rf ~)` lost
+                // the substitution that way, and bash runs it (the `#` sits
+                // BEFORE the `$(`, so expansion-depth tracking cannot see it).
+                // Carrying the spans separately means the payload survives
+                // whatever happens to the prose around it.
+                let rest = lines[body_start..].join("\n");
+                out.extend(substitution_spans(&rest));
                 return out.join("\n");
             }
         }
@@ -971,14 +1428,244 @@ fn strip_heredoc_bodies(command: &str) -> String {
     out.join("\n")
 }
 
-/// Find heredoc delimiters introduced on a single line, outside quotes.
-/// Returns `(delimiter_word, body_expands)` per heredoc: `body_expands` is
-/// false when the delimiter is quoted. `<<<` (here-string) is skipped. A `<<`
-/// inside a `'…'` or `"…"` string on this line is literal text and ignored;
-/// cross-line quote state is backstopped by the terminator-not-found rule in
-/// [`strip_heredoc_bodies`].
-fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+/// The LOGICAL lines of `command`: physical lines with backslash-newline
+/// continuations joined, the way the shell reads them before interpreting
+/// anything.
+///
+/// Both characters of the continuation pair are removed, as the shell removes
+/// them — so `bas\` ⏎ `h` is the one word `bash`, and `<\` ⏎ `<EOF` is the
+/// heredoc introducer `<<EOF`. A scanner that joined with a SPACE instead saw
+/// `< <EOF` and a word split in half, and missed both (cadence-hooks#543).
+///
+/// Heredoc bodies are NOT stripped: the caller decides whether a body is data
+/// (use [`strip_heredoc_bodies`]) or a script. Use this when you need the lines
+/// as the shell groups them; use [`split_segments`] when you need executable
+/// segments.
+pub fn logical_lines(command: &str) -> Vec<String> {
+    let lines: Vec<&str> = command.split('\n').collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        out.push(take_logical_line(&lines, &mut i));
+    }
+    out
+}
+
+/// Consume one logical line from `lines` starting at `*i`, joining
+/// backslash-newline continuations and advancing `*i` past every physical line
+/// absorbed. The backslash and the newline are both removed, as the shell
+/// removes them.
+///
+/// A trailing backslash continues the line only when it is not itself escaped,
+/// so the count of trailing backslashes decides it: odd continues, even is a
+/// literal backslash ending the line. `\r\n` sources are handled by testing the
+/// line with any trailing `\r` removed.
+///
+/// **Quoting is deliberately not tracked, and that is safe for segmentation.**
+/// Inside `'…'` the shell keeps a backslash-newline literal, so joining there
+/// diverges — but only in the CONTENT of a quoted string, never in where a
+/// segment ends: the characters removed are a backslash and a newline, neither
+/// of which is a quote character, and a newline inside quotes was never a
+/// boundary to begin with. The earlier attempt to be faithful here tracked
+/// quotes in a pre-pass and desynchronized on the first apostrophe in heredoc
+/// prose ("it's"), suppressing every later continuation and splitting commands
+/// the shell keeps whole — a guard MISS traded for a cosmetic fidelity point.
+/// Joining unconditionally can only merge text INSIDE a quoted value, which
+/// makes a scan see more, never less.
+fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
+    let mut line = lines[*i].to_string();
+    *i += 1;
+    while *i < lines.len() {
+        let probe = line.strip_suffix('\r').unwrap_or(&line);
+        // **bash does not continue a comment line.** A comment runs to the
+        // newline, so a trailing backslash sitting inside one is comment TEXT,
+        // not a continuation — the next line starts a new command. Joining
+        // anyway pulled that command up into the comment, where the strip pass
+        // then deleted the whole thing: `echo a #;\` + `rm -rf ~` collapsed to
+        // `echo a` and the deletion reached no guard, while bash ran it. The
+        // spellings that carry a separator inside the comment body (`#;\`,
+        // `#|\`) are the sharp ones, because those are exactly the ones a
+        // comment-blind splitter used to survive by splitting on the separator.
+        if !comment_spans(probe).is_empty() {
+            break;
+        }
+        let trailing = probe.chars().rev().take_while(|&c| c == '\\').count();
+        if trailing % 2 == 0 {
+            break;
+        }
+        line.truncate(probe.len() - 1); // drop the continuing backslash (and any `\r`)
+        line.push_str(lines[*i]);
+        *i += 1;
+    }
+    line
+}
+
+/// Command-substitution spans in an expanding heredoc's body, returned with
+/// their `$(…)` / `` `…` `` delimiters intact so they can be spliced onto the
+/// introducing line and re-parsed downstream.
+///
+/// **Pass the WHOLE body, not one line.** A substitution ends at its closing
+/// delimiter, and a newline is not one — `` `cmd ⏎ cmd` `` is a single
+/// substitution running two commands, exactly as the shell reads it. Scanning
+/// per physical line found no closer on either half and emitted nothing, which
+/// (having replaced the older carry-the-whole-line behavior) left the splitter
+/// with no trace of the commands at all.
+///
+/// **Quoting is tracked inside a span and ignored outside one**, which looks
+/// inconsistent and is not. Body prose is data: its apostrophes are ordinary
+/// characters, so a contraction must not suppress a substitution that follows.
+/// The text within `$( … )` is shell code the shell will execute, so a `)`
+/// inside a quoted string there does not close the span. Backslash escapes in
+/// both places, so `\$(` is literal and produces no span.
+///
+/// **The backtick form gets no quote tracking, and that is fidelity rather than
+/// an omission.** Bash ends a `` `…` `` substitution at the first UNESCAPED
+/// backtick — quoting does not protect one — so teaching this arm about quotes
+/// would diverge from the shell instead of matching it. Verified directly, not
+/// reasoned: ``echo `echo 'a`b'` `` fails with *unmatched single quote*, which
+/// can only arise if the substitution was truncated at the backtick inside
+/// those quotes, and ``echo `echo abc` 'd`e'`` prints ``abc d`e``, pinning the
+/// truncation point. A backslash still escapes it. Do not "fix" the asymmetry
+/// between this arm and the `$( … )` arm above; it is load-bearing.
+fn substitution_spans(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
+            let start = i;
+            let mut depth = 1;
+            let mut j = i + 2;
+            // Quote tracking flips ON here, and the asymmetry is the point: the
+            // prose OUTSIDE a substitution is heredoc data with no quoting, but
+            // the text INSIDE one is shell code the shell will run, so a `)` in
+            // a quoted string there does not close it. Counting blind ended the
+            // span early and dropped every command after the quoted paren.
+            // Same [`Quote`] modes the tokenizer and the segmenter use. Rolling
+            // a private two-state tracker here is exactly what produced the
+            // earlier desyncs: `$'a\'b'` inside a substitution closed on the
+            // ESCAPED quote, the real one reopened a string that ate the
+            // closing paren, and every command after it was dropped — bash runs
+            // them (checked directly).
+            let mut quoted: Option<Quote> = None;
+            while j < chars.len() && depth > 0 {
+                let c = chars[j];
+                match quoted {
+                    Some(q) => {
+                        let escapes = match q {
+                            Quote::Double => matches!(chars.get(j + 1), Some('"' | '\\')),
+                            Quote::AnsiC => chars.get(j + 1).is_some(),
+                            Quote::Single => false,
+                        };
+                        if c == '\\' && escapes {
+                            j += 2;
+                            continue;
+                        }
+                        let closes = match q {
+                            Quote::Single | Quote::AnsiC => c == '\'',
+                            Quote::Double => c == '"',
+                        };
+                        if closes {
+                            quoted = None;
+                        }
+                    }
+                    None => match c {
+                        // `$'` opens ANSI-C; `$(` is a nested substitution and
+                        // falls through so the `(` bumps depth next pass.
+                        '$' if chars.get(j + 1) == Some(&'\'') => {
+                            quoted = Some(Quote::AnsiC);
+                            j += 2;
+                            continue;
+                        }
+                        '\'' => quoted = Some(Quote::Single),
+                        '"' => quoted = Some(Quote::Double),
+                        '\\' => {
+                            j += 2;
+                            continue;
+                        }
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    },
+                }
+                j += 1;
+            }
+            // An unclosed `$(` is not a substitution the shell would run; skip
+            // the `$` and keep scanning rather than carrying a truncated span.
+            if depth == 0 {
+                spans.push(chars[start..j].iter().collect());
+                i = j;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if chars[i] == '`' {
+            let start = i;
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '`' {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+            }
+            if j < chars.len() {
+                spans.push(chars[start..=j].iter().collect());
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// One heredoc introducer found on a logical line: the `<<WORD` construct
+/// itself, located by byte range, plus what it introduces.
+///
+/// The byte range spans the whole construct — the `<<`, any `-`, any
+/// whitespace, and the delimiter word with its quotes — so a caller can blank
+/// it out before reading the line's command words. Without that, the delimiter
+/// word reads as a bare word (`cat <<bash` looks like it names a shell) and a
+/// command word glued to the operator does not read as one at all
+/// (`bash<<EOF` is a single whitespace-delimited word).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeredocIntroducer {
+    /// Byte offset of the leading `<`.
+    pub start: usize,
+    /// Byte offset one past the end of the delimiter word.
+    pub end: usize,
+    /// The terminator word, quotes removed.
+    pub word: String,
+    /// False when the delimiter was quoted (`<<'EOF'`), which suppresses
+    /// expansion in the body.
+    pub expands: bool,
+}
+
+/// Find heredoc introducers on a single logical line, outside quotes.
+/// `<<<` (here-string) is skipped. A `<<` inside a `'…'` or `"…"` string on
+/// this line is literal text and ignored; cross-line quote state is backstopped
+/// by the terminator-not-found rule in [`strip_heredoc_bodies`].
+///
+/// Pair with [`logical_lines`] — an introducer split across a
+/// backslash-newline (`bash <\` ⏎ `<EOF`) is `<<` to the shell, which removes
+/// both characters of the pair, and only reads as one construct once the line
+/// has been joined.
+pub fn heredoc_introducers(line: &str) -> Vec<HeredocIntroducer> {
     let chars: Vec<char> = line.chars().collect();
+    // Char index → byte offset, so a range can be handed back for slicing.
+    let byte_of: Vec<usize> = line
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(line.len()))
+        .collect();
     let mut delims = Vec::new();
     let mut i = 0;
     let mut in_single = false;
@@ -1035,7 +1722,12 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
                 j += 1;
             }
             if !word.is_empty() {
-                delims.push((word, quote_char.is_none()));
+                delims.push(HeredocIntroducer {
+                    start: byte_of[i],
+                    end: byte_of[j.min(chars.len())],
+                    expands: quote_char.is_none(),
+                    word,
+                });
             }
             i = j;
             continue;
@@ -1054,11 +1746,28 @@ fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
 /// Quote characters are preserved within each segment; segments are trimmed and
 /// empty segments dropped.
 ///
+/// Backslash escapes in `'…'`, `"…"`, and unquoted context are honored the way
+/// [`tokenize`] honors them, because a splitter that disagrees with the
+/// tokenizer hands a guard a boundary the shell does not have (#475). Two
+/// consequences: a backslash-newline is a line continuation, so the command
+/// flows across it into ONE segment rather than being cut in two (`\r\n` too);
+/// and an escaped quote is a literal character, so `-m "he said \" && x"` stays
+/// one segment holding one argument instead of splitting at a `&&` the shell
+/// keeps inside the string.
+///
+/// ANSI-C quoting is included, via the same [`Quote`] modes [`tokenize`] uses.
+/// `$'…'` honors `\'`, so it cannot be read as a plain `'…'`: doing that closed
+/// the string on the escaped quote, and the real closing `'` then reopened a
+/// phantom string that swallowed the rest of the line — `$'a\'b' && rm -rf /x`
+/// collapsed into ONE segment with the deletion nowhere in command position.
+/// That is the divergence #463 hardened `tokenize` against, and leaving it here
+/// meant a guard could still be handed the wrong command list.
+///
 /// Heredoc bodies are stripped first ([`strip_heredoc_bodies`]) so their prose
 /// does not become fake segments. This is otherwise syntactic splitting, not
-/// shell execution: it does not expand subshells (`$(…)`, backticks) or honor
-/// backslash escapes (consistent with [`tokenize`]). To also see inside
-/// `sh -c '…'` wrappers and command substitutions, use [`command_segments`].
+/// shell execution: it does not expand subshells (`$(…)`, backticks). To also
+/// see inside `sh -c '…'` wrappers and command substitutions, use
+/// [`command_segments`].
 pub fn split_segments(command: &str) -> Vec<String> {
     split_segments_with_ops(command)
         .into_iter()
@@ -1071,24 +1780,83 @@ pub fn split_segments(command: &str) -> Vec<String> {
 /// flow between segments — e.g. a `cd` immediately before `||` only takes
 /// effect on the failure path, so it must not redirect what comes after.
 pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static str>)> {
+    // Continuations are resolved inside [`strip_heredoc_bodies`], interleaved
+    // with the body scan, because the shell reads one logical line and only
+    // then begins a heredoc body on the line after it (#475).
     let command = strip_heredoc_bodies(command);
+    // Comments are removed as a pass, not as an arm in the loop below. The
+    // condition is not "the previous character was a space" — it also depends
+    // on quote state, on `${…}`/`$(…)`/`` `…` `` nesting, and on whether that
+    // space was escaped. Encoding it inline once here and again in
+    // [`strip_heredoc_bodies`] gave two scanners that could disagree, and the
+    // permissive one discards commands bash executes. [`comment_spans`] is the
+    // single implementation both callers share.
+    let command = strip_comments(&command);
     let command = command.as_str();
     let mut segments: Vec<(String, Option<&'static str>)> = Vec::new();
     let mut current = String::new();
-    let mut quote: Option<char> = None;
+    let mut quote: Option<Quote> = None;
     let mut chars = command.chars().peekable();
 
     while let Some(c) = chars.next() {
         if let Some(q) = quote {
+            // Inside `"…"`, `\` escapes `"` and `\`; inside `$'…'` it escapes
+            // ANYTHING, `'` included. Either way the escaped character is
+            // content and does not close the string. [`tokenize`] already reads
+            // both that way; when this parser disagreed, an escaped quote ended
+            // a value here that the shell keeps open, so a `&&`/`;`/`|` still
+            // inside that one argument became a fake segment boundary and the
+            // text after it was handed to guards as a separate command (#475).
+            // Plain `'…'` takes no escapes at all, so it is excluded.
+            let escapes = match q {
+                Quote::Double => matches!(chars.peek(), Some('"' | '\\')),
+                Quote::AnsiC => chars.peek().is_some(),
+                Quote::Single => false,
+            };
+            if c == '\\' && escapes {
+                current.push(c);
+                current.push(chars.next().expect("peeked"));
+                continue;
+            }
             current.push(c);
-            if c == q {
+            let closes = match q {
+                Quote::Single | Quote::AnsiC => c == '\'',
+                Quote::Double => c == '"',
+            };
+            if closes {
                 quote = None;
             }
             continue;
         }
         match c {
-            '\'' | '"' => {
-                quote = Some(c);
+            // Outside quotes a backslash escapes the next character: it opens
+            // no string and starts no operator, so both are consumed together
+            // and `\"`/`\'`/`\&`/`\;` stay ordinary text (#475).
+            //
+            // A newline is the exception and is deliberately NOT swallowed.
+            // Every continuation the shell would join is already gone by now
+            // ([`take_logical_line`] ran first), so a backslash-newline
+            // surviving to here means the two parsers disagree — and the safe
+            // direction for a guard is always MORE segments, never fewer.
+            '\\' if chars.peek().is_some_and(|&n| n != '\n') => {
+                current.push('\\');
+                current.push(chars.next().expect("peeked"));
+            }
+            // `$'` opens ANSI-C quoting. The `$` is part of the syntax, but
+            // unlike [`tokenize`] — which is building a token VALUE — segments
+            // keep their text verbatim, so both characters are pushed. A `$`
+            // before anything else (`$VAR`, `$(…)`) is ordinary text.
+            '$' if chars.peek() == Some(&'\'') => {
+                current.push(c);
+                current.push(chars.next().expect("peeked"));
+                quote = Some(Quote::AnsiC);
+            }
+            '\'' => {
+                quote = Some(Quote::Single);
+                current.push(c);
+            }
+            '"' => {
+                quote = Some(Quote::Double);
                 current.push(c);
             }
             '&' => {
@@ -1104,7 +1872,7 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
             '|' => {
                 // `>|` is the force-clobber redirect operator, not a pipe —
                 // keep it joined to its segment so the target stays attached.
-                if current.trim_end().ends_with('>') {
+                if ends_with_unescaped_gt(current.trim_end()) {
                     current.push('|');
                 } else {
                     // `||` and `|` are both separators; consume the second `|`.
@@ -1127,6 +1895,197 @@ pub fn split_segments_with_ops(command: &str) -> Vec<(String, Option<&'static st
         segments.push((trimmed.to_string(), None));
     }
     segments
+}
+
+/// Whether `text` ends in a `>` that the shell reads as a redirect operator
+/// rather than as a literal character — i.e. a `>` not consumed by a preceding
+/// backslash escape.
+///
+/// Parity decides it, the same rule [`take_logical_line`] applies to a trailing
+/// backslash: after removing the `>`, an EVEN number of trailing backslashes
+/// leaves the `>` unescaped (each backslash escaped its neighbour), while an
+/// ODD number means the last one escaped the `>` itself.
+///
+/// Both directions are load-bearing and they are one character apart (#491).
+/// `echo hi \>| rm -rf ~` is a literal `>` followed by a real PIPE — bash
+/// prints `hi >` through it — so the deletion behind it is its own command and
+/// must be segmented as one; gluing the pipe on hid it from every guard. But
+/// `echo hi \\>| /tmp/f` is a literal BACKSLASH followed by a genuine
+/// `>|` clobber redirect — bash creates the file — so splitting there would
+/// tear a redirect target off its command. A check that treats any preceding
+/// backslash as an escape gets the second case wrong.
+fn ends_with_unescaped_gt(text: &str) -> bool {
+    let Some(before) = text.strip_suffix('>') else {
+        return false;
+    };
+    before.chars().rev().take_while(|&c| c == '\\').count() % 2 == 0
+}
+
+/// Which delimiter an open expansion is waiting on, so a closer can pop only
+/// its own kind. One counter for both kinds is not enough: `${` and `$(` close
+/// on different characters, and the other character is ordinary data inside
+/// them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opener {
+    /// `${…}` — a parameter expansion, closed by `}`.
+    Brace,
+    /// `$(…)` and `$((…))` — command substitution or arithmetic, closed by `)`.
+    Paren,
+}
+
+/// Byte ranges of `#` comments in `text` — from the `#` up to (not including)
+/// the next newline, or to end of input.
+///
+/// **A `#` opens a comment only where a new word could begin, and only in
+/// executed context.** Getting that condition wrong in the permissive direction
+/// discards text the shell RUNS, which is a guard miss manufactured out of a
+/// fix, so each clause below is load-bearing:
+///
+/// - **Not inside a quote.** `'…'`, `"…"` and `$'…'` all make `#` data.
+/// - **Not inside an expansion.** `${…}`, `$(…)`, `$((…))` and `` `…` `` are
+///   tracked on a STACK of [`Opener`] kinds, because bash does not start a
+///   comment inside any of them. Without this, `echo ${x:- # } ; rm -rf ~`
+///   collapsed to `["echo ${x:-"]` — the `;` and the deletion behind it
+///   vanished from every guard, while bash ran them (#490 follow-up). The
+///   stack rather than a counter, because a `)` inside `${…}` is data: sharing
+///   one counter let it close the brace early and reopen the same bypass one
+///   character over. A bare `(…)` subshell pushes nothing: `(` is not
+///   whitespace, so no boundary opens after it and the comment never fires
+///   there anyway.
+/// - **After UNESCAPED whitespace, or at the very start.** `\ ` is an escaped
+///   space: it joins two halves of one word, so `echo a\ #x && rm -rf ~` is a
+///   single argument `a #x` and the `&&` still runs. Testing the raw preceding
+///   character saw an ordinary space and ate the rest of the line.
+///
+/// Separators (`\n ; & |`) also open a boundary, matching bash. Where this is
+/// narrower than bash — after `(` and `)` — the effect is that a comment is
+/// *not* recognized, so more text stays under inspection. That direction is
+/// safe; the reverse is the bug this function exists to prevent.
+///
+/// State carries across newlines, so a quote opened on one line still suppresses
+/// a `#` on the next.
+fn comment_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut quote: Option<Quote> = None;
+    let mut open: Vec<Opener> = Vec::new();
+    let mut backticks = false;
+    let mut boundary = true;
+    let mut chars = text.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = quote {
+            let escapes = match q {
+                Quote::Double => matches!(chars.peek().map(|&(_, n)| n), Some('"' | '\\')),
+                Quote::AnsiC => chars.peek().is_some(),
+                Quote::Single => false,
+            };
+            if c == '\\' && escapes {
+                chars.next();
+                continue;
+            }
+            let closes = match q {
+                Quote::Single | Quote::AnsiC => c == '\'',
+                Quote::Double => c == '"',
+            };
+            if closes {
+                quote = None;
+            }
+            boundary = false;
+            continue;
+        }
+        match c {
+            // An escaped character is ordinary text — including an escaped
+            // space, which is why the flag is cleared rather than recomputed
+            // from the character itself.
+            '\\' if chars.peek().is_some_and(|&(_, n)| n != '\n') => {
+                chars.next();
+                boundary = false;
+            }
+            '$' if chars.peek().map(|&(_, n)| n) == Some('\'') => {
+                chars.next();
+                quote = Some(Quote::AnsiC);
+                boundary = false;
+            }
+            '$' if matches!(chars.peek().map(|&(_, n)| n), Some('{' | '(')) => {
+                let opener = chars.next().expect("peeked").1;
+                open.push(if opener == '{' {
+                    Opener::Brace
+                } else {
+                    Opener::Paren
+                });
+                boundary = false;
+            }
+            '\'' => {
+                quote = Some(Quote::Single);
+                boundary = false;
+            }
+            '"' => {
+                quote = Some(Quote::Double);
+                boundary = false;
+            }
+            '`' => {
+                backticks = !backticks;
+                boundary = false;
+            }
+            // Only nested once an expansion is already open, so a bare
+            // `(subshell)` never pushes.
+            '(' if !open.is_empty() => {
+                open.push(Opener::Paren);
+                boundary = false;
+            }
+            '{' if !open.is_empty() => {
+                open.push(Opener::Brace);
+                boundary = false;
+            }
+            // A closer pops ONLY its own opener. A `)` sitting inside `${…}` is
+            // DATA — bash never ends a parameter expansion on it — so treating
+            // the two kinds as one counter let `echo ${x:-a)b # c} ; rm -rf ~`
+            // reach zero mid-expansion, fire the comment rule, and drop the
+            // `;` and the deletion behind it. Reached through `:-` `:=` `:+`
+            // `:?` `%` `/` `//`, array subscripts, and `$()` nested in `${}`.
+            //
+            // A mismatched closer is IGNORED rather than treated as an error,
+            // and the direction is what makes that safe: leaving an opener on
+            // the stack keeps the scan inside an expansion, which DISABLES
+            // comment stripping and over-inspects. Every unbalanced-opener
+            // shape already fails that way and is measured to do so.
+            ')' if open.last() == Some(&Opener::Paren) => {
+                open.pop();
+                boundary = false;
+            }
+            '}' if open.last() == Some(&Opener::Brace) => {
+                open.pop();
+                boundary = false;
+            }
+            '#' if boundary && open.is_empty() && !backticks => {
+                let end = text[i..].find('\n').map_or(text.len(), |off| i + off);
+                spans.push((i, end));
+                while chars.peek().is_some_and(|&(j, _)| j < end) {
+                    chars.next();
+                }
+            }
+            '\n' | ';' | '&' | '|' => boundary = true,
+            other => boundary = other.is_whitespace(),
+        }
+    }
+    spans
+}
+
+/// `command` with every [`comment_spans`] range removed. The newline that ends
+/// each comment is preserved, so the segment the comment trailed still flushes.
+pub fn strip_comments(command: &str) -> String {
+    let spans = comment_spans(command);
+    if spans.is_empty() {
+        return command.to_string();
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        out.push_str(&command[cursor..start]);
+        cursor = end;
+    }
+    out.push_str(&command[cursor..]);
+    out
 }
 
 /// Push `current` (trimmed) onto `segments` paired with the operator that
@@ -1327,47 +2286,77 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
 ///    counts) are extracted and segmented too, so `echo $(cat .env)` and
 ///    `curl -d "$(cat .env)" …` surface the inner read.
 /// 3. **Visible assignments** — a `VAR=value` / `export VAR=value` assignment
-///    present in the command resolves later `$VAR`/`${VAR}` references, so
+///    resolves `$VAR`/`${VAR}` references in the segments that FOLLOW it, so
 ///    `OP_CMD=op; $OP_CMD item list` is seen as `op item list`. An
 ///    environment-sourced variable stays unresolved (fail open).
+///
+///    Order matters and is honored: an assignment reaches only later segments,
+///    never earlier ones and never its own. `cmd $F || F=/etc/passwd` leaves
+///    `$F` literal, because the shell running that line would too — expanding
+///    it invented an operand for `cmd`, and a guard that opens a file named by
+///    such an operand performs I/O the real command never would.
 ///
 /// The wrapper/substitution source segment is still included, so a guard sees
 /// both the literal invocation and the command(s) it will run. This is the
 /// "every command that will actually execute" view.
 pub fn command_segments(command: &str) -> Vec<String> {
-    let assignments = collect_assignments(command);
     let mut out = Vec::new();
-    expand_segments(command, &assignments, 0, &mut out);
+    let mut assignments: Vec<(String, String)> = Vec::new();
+    expand_segments(command, &mut assignments, 0, &mut out);
     out
 }
 
-/// Recursive worker for [`command_segments`].
+/// Recursive worker for [`command_segments`]. `assignments` accumulates in
+/// execution order as segments are walked, so each segment only ever sees the
+/// assignments that precede it.
 fn expand_segments(
     command: &str,
-    assignments: &[(String, String)],
+    assignments: &mut Vec<(String, String)>,
     depth: usize,
     out: &mut Vec<String>,
 ) {
     for segment in split_segments(command) {
         let segment = apply_assignments(&segment, assignments);
+        // Recorded AFTER this segment is expanded: a shell expands a word
+        // before the assignment on that same line takes effect, so `F=new cmd
+        // $F` passes the OLD `$F`.
+        if let Some(pair) = segment_assignment(&segment) {
+            assignments.push(pair);
+        }
+        // A substitution and a `-c` wrapper COEXIST — they are not two shapes a
+        // segment picks between. `bash -c 'echo hi' "$(rm note.md)"` runs the
+        // substitution in the PARENT before it spawns bash at all, so a segment
+        // that is a wrapper still owes its substitution bodies. Selecting
+        // between them dropped those bodies from every wrapper segment, and the
+        // drop was invisible until the wrapper hunt widened: `bash -c 'echo hi'
+        // "$(rm note.md)"` deletes the file and reached no guard, and every
+        // runner spelling the peel newly sees would have inherited the same hole
+        // (#528 review C-D1). [`child_scripts`] already unions the two for the
+        // same reason (#228 review finding 2); this is `expand_segments`
+        // agreeing with it.
+        //
+        // Substitution recursion shares the wrapper-nesting budget, so three
+        // levels of `sh -c` nesting can exhaust it before a substitution is
+        // surfaced as its own segment. Accepted: the substitution text still
+        // appears as a substring of the pushed segment, and three levels is
+        // already generous.
+        if depth < MAX_WRAPPER_DEPTH {
+            for body in substitution_bodies(&segment) {
+                // A substitution is its own subshell too — snapshot.
+                let mut scope = assignments.clone();
+                expand_segments(&body, &mut scope, depth + 1, out);
+            }
+        }
         match shell_c_argument(&segment) {
             Some(inner) if depth < MAX_WRAPPER_DEPTH => {
                 out.push(segment);
-                expand_segments(&inner, assignments, depth + 1, out);
+                // A child shell inherits what is set so far, but its own
+                // assignments die with the subshell — recurse on a snapshot so
+                // they cannot reach the parent's later segments.
+                let mut scope = assignments.clone();
+                expand_segments(&inner, &mut scope, depth + 1, out);
             }
-            _ => {
-                // Substitution recursion shares the wrapper-nesting budget, so
-                // three levels of `sh -c` nesting can exhaust it before a
-                // substitution is surfaced as its own segment. Accepted: the
-                // substitution text still appears as a substring of the pushed
-                // wrapper segment, and three levels is already generous.
-                if depth < MAX_WRAPPER_DEPTH {
-                    for body in substitution_bodies(&segment) {
-                        expand_segments(&body, assignments, depth + 1, out);
-                    }
-                }
-                out.push(segment);
-            }
+            _ => out.push(segment),
         }
     }
 }
@@ -1484,28 +2473,20 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
     bodies
 }
 
-/// Collect `VAR=value` and `export VAR=value` assignments visible in the
-/// command — both standalone segments and the leading assignment of a command
-/// (`VAR=value cmd …`). The value's surrounding quotes are stripped via
-/// [`tokenize`]. Later [`apply_assignments`] substitutes these.
-fn collect_assignments(command: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for segment in split_segments(command) {
-        let tokens = tokenize(&segment);
-        let mut idx = 0;
-        if tokens.first().map(String::as_str) == Some("export") {
-            idx = 1;
-        }
-        if let Some(tok) = tokens.get(idx)
-            && let Some((name, value)) = tok.split_once('=')
-            && !name.is_empty()
-            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && !value.is_empty()
-        {
-            out.push((name.to_string(), value.to_string()));
-        }
+/// The `VAR=value` / `export VAR=value` assignment ONE segment makes — either a
+/// standalone segment or the leading assignment of a command (`VAR=value cmd
+/// …`). The value's surrounding quotes are stripped via [`tokenize`].
+/// [`expand_segments`] walks segments in order and feeds these to
+/// [`apply_assignments`], so an assignment is visible only downstream of itself.
+fn segment_assignment(segment: &str) -> Option<(String, String)> {
+    let tokens = tokenize(segment);
+    let idx = usize::from(tokens.first().map(String::as_str) == Some("export"));
+    let (name, value) = tokens.get(idx)?.split_once('=')?;
+    if name.is_empty() || value.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
     }
-    out
+    Some((name.to_string(), value.to_string()))
 }
 
 /// Replace `$VAR` / `${VAR}` references with their collected assignment values,
@@ -1538,8 +2519,10 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
             if braced && chars.get(j) == Some(&'}') {
                 j += 1;
             }
+            // Newest wins: `assignments` is append-ordered, so a re-assignment
+            // must be found before the value it replaced.
             if !name.is_empty()
-                && let Some((_, value)) = assignments.iter().find(|(n, _)| *n == name)
+                && let Some((_, value)) = assignments.iter().rev().find(|(n, _)| *n == name)
             {
                 out.push_str(value);
                 i = j;
@@ -1557,23 +2540,629 @@ fn apply_assignments(segment: &str, assignments: &[(String, String)]) -> String 
 /// or a path (`/bin/sh`). The `-c` may stand alone or appear in a short cluster
 /// such as `-lc` (login shell + command); the script is the token following the
 /// flag that carries `c`.
+///
+/// The segment goes through [`executable_tokens`], not a bare [`tokenize`]:
+/// [`tokenize`] glues `(` onto the word behind it and `)` onto the word in
+/// front, so `(bash -c 'rm note.md')` tokenizes as
+/// `["(bash", "-c", "rm note.md)"]` — a head no verb gate matches AND a script
+/// carrying a stray paren. Only a string-level strip fixes both, and only
+/// alternating it with the token-level one reaches `do (bash -c '…')`
+/// (#528 review E).
 fn shell_c_argument(segment: &str) -> Option<String> {
-    shell_c_argument_tokens(&tokenize(segment))
+    shell_c_argument_tokens(&executable_tokens(segment))
+}
+
+/// Verbs that run the command following their OWN options. `sudo` and `xargs`
+/// sit outside [`TRANSPARENT`] by design; `nice` and `env` are in it but are
+/// admitted there only while the next token is not an option, and
+/// `timeout`/`stdbuf` are not modelled there at all. Each one's flag grammar is
+/// walked by [`skip_runner_flags`], which is what keeps `sudo -u me rm note.md`
+/// and `nice -n 10 bash -c '…'` in view.
+///
+/// **`git` is deliberately absent even though [`skip_runner_flags`] models it.**
+/// A runner in this set runs an ARBITRARY command; `git` runs a subcommand from
+/// its own fixed set, so peeling `git`'s globals here would resolve a
+/// subcommand name into an executable position it never occupies. Callers that
+/// want that peel ask for it by name, via [`skip_git_global_options`].
+pub const COMMAND_RUNNERS: &[&str] = &["sudo", "xargs", "nice", "stdbuf", "timeout", "env"];
+
+/// Peel transparent prefixes and command runners off the front of an executable
+/// position, returning the slice that begins at the command that will run.
+///
+/// A command runner runs the command that follows its OWN options. Walking
+/// those options (rather than bailing on the first `-`) is what keeps
+/// `sudo -u me rm note.md`, the canonical `find … -print0 | xargs -0 rm` idiom,
+/// and `nice -n 10 bash -c 'rm note.md'` in view.
+///
+/// **One peel for every executable position cadence-hooks knows about** — a
+/// segment head, a `find` exec-family action, and the wrapper hunt in
+/// [`shell_c_argument_tokens`]. Those positions ran different models before, and
+/// each divergence was its own hole: the exec window read the literal next word,
+/// so `find … -exec git rm {} \;` went unjudged (#528 review I1); the wrapper
+/// hunt refused at a runner's first option, so `nice -n 10 bash -c 'rm note.md'`
+/// hid its shell while `nice -n 10 rm note.md` — the same flag, the same
+/// grammar, one position over — blocked (#528 review C-D1). A second copy of a
+/// peel is how each gap opened.
+///
+/// **This feeds DETECTORS in every position, which is what makes the walk safe
+/// to widen.** At a verb gate the peel exposes a verb that was already going to
+/// run. At the wrapper hunt it only ADDS segments to `command_segments`' "every
+/// command that will actually execute" view — an over-eager skip costs an extra
+/// segment to inspect, a missed one costs the inner script's visibility to every
+/// guard that segments. [`TRANSPARENT`] is the opposite case and must stay
+/// narrow: it decides *which verb runs* for `enforce_worktree` and `guard_rm`,
+/// where a wrong skip resolves the wrong command word, so it excludes `sudo`
+/// deliberately. Same question, different consequence — ask which one you are in
+/// before reusing either.
+///
+/// The direction is not unconditional, which is why [`COMMAND_RUNNERS`] stays a
+/// short list of words that genuinely exec their argument, and why
+/// [`skip_runner_flags`] refuses an unlisted option instead of guessing:
+/// expanding a script the shell would NOT run can manufacture a false block, so
+/// the cost of over-eagerness is bounded, not zero.
+pub fn peel_command_runners(tokens: &[String]) -> &[String] {
+    let mut argv = skip_transparent_prefixes(tokens);
+    while let Some(first) = argv.first() {
+        let runner = command_word(first).into_owned();
+        if !COMMAND_RUNNERS.contains(&runner.as_str()) {
+            break;
+        }
+        let Some(rest) = skip_runner_flags(&runner, &argv[1..]) else {
+            break;
+        };
+        // Each pass consumes at least the runner itself, so this ends.
+        argv = skip_transparent_prefixes(rest);
+    }
+    argv
+}
+
+/// `sudo`'s short options that take NO argument of their own AND still run the
+/// command that follows — one character per flag as they appear in a cluster
+/// (`-EH`).
+///
+/// Two conditions, not one. Argument-free is what makes the next word a command
+/// rather than a value. *Runs the command* is why `-l` (`--list`), `-V`
+/// (`--version`), `-v` (`--validate`) and `-K` (`--remove-timestamp`) are
+/// absent: sudo reports or resets something and never executes, so expanding
+/// there inspects a script the shell will not run — over-inspection, and a
+/// false block is the only thing it can produce.
+const SUDO_NO_ARGUMENT_SHORT_FLAGS: &str = "AbEHiknPSs";
+
+/// The long spellings of the same options, one per short flag above. A value
+/// glued on with `=` is matched by name (see the walk below), so `--user=root`
+/// is still refused.
+const SUDO_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
+    "--askpass",
+    "--background",
+    "--preserve-env",
+    "--set-home",
+    "--login",
+    "--reset-timestamp",
+    "--non-interactive",
+    "--preserve-groups",
+    "--stdin",
+    "--shell",
+];
+
+/// `sudo` options that REQUIRE a value word, so the command is one token
+/// further along. Kept separate from the argument-free sets above because the
+/// two answer different questions: those decide whether the NEXT word is the
+/// command, these decide that it is a value and the command follows it.
+const SUDO_VALUE_SHORT_FLAGS: &str = "ug";
+const SUDO_VALUE_LONG_FLAGS: &[&str] = &["--user", "--group"];
+
+/// `xargs`' short options that take no argument of their own.
+const XARGS_NO_ARGUMENT_SHORT_FLAGS: &str = "0prtxo";
+
+/// `xargs`' short options that require a value, glued (`-n1`) or as the next
+/// word (`-n 1`). The optional-argument spellings (`-i`, `-l`, `-e`) are
+/// deliberately absent — with an optional argument nothing here can tell a
+/// value from the command, and guessing either way resolves the wrong word.
+const XARGS_VALUE_SHORT_FLAGS: &str = "nLIPdasE";
+
+/// `xargs`' long options that take no argument. The value-taking long
+/// spellings are reached only in their glued `--name=value` form (see the walk
+/// below); a bare one is refused, since GNU's optional-argument options
+/// (`--replace`, `--eof`, `--max-lines`) are spelled the same way as the
+/// required-argument ones and cannot be told apart here.
+const XARGS_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
+    "--null",
+    "--no-run-if-empty",
+    "--verbose",
+    "--exit",
+    "--interactive",
+    "--open-tty",
+];
+
+/// As much of one runner's option grammar as the walk below needs to find the
+/// command word behind it. Every field is deliberately an exhaustive list
+/// rather than a heuristic: an unlisted token refuses the walk, so a grammar
+/// that is merely incomplete costs a block and never invents one.
+struct RunnerGrammar {
+    /// Short flags taking no argument of their own, one character per flag.
+    no_arg_short: &'static str,
+    /// Short flags requiring a value, glued (`-n1`) or as the next word.
+    value_short: &'static str,
+    no_arg_long: &'static [&'static str],
+    value_long: &'static [&'static str],
+    /// `nice -10` / `nice --10` — an all-digit cluster IS the value, with no
+    /// flag letter in front of it, under either dash count. True only where the
+    /// runner accepts that spelling.
+    numeric_short_cluster: bool,
+    /// Positional words the runner consumes before the command, after its
+    /// options: `timeout 5 rm x` runs `rm`, not `5`.
+    operands_before_command: usize,
+}
+
+/// `nice`'s only command-relevant option. The adjustment is also spelled with
+/// no flag letter at all — GNU's bare `-10`, and BSD's doubled-dash `--10`,
+/// which `/usr/bin/nice` on macOS accepts and execs the utility behind (it
+/// warns `setpriority: Permission denied` for a negative adjustment and runs
+/// the command anyway). `numeric_short_cluster` covers both dash counts.
+const NICE_VALUE_SHORT_FLAGS: &str = "n";
+const NICE_VALUE_LONG_FLAGS: &[&str] = &["--adjustment"];
+
+/// `stdbuf`'s buffering options — all three take a value, glued (`-o0`) or as
+/// the next word (`-o 0`). It has no argument-free option that still runs a
+/// command.
+const STDBUF_VALUE_SHORT_FLAGS: &str = "ioe";
+const STDBUF_VALUE_LONG_FLAGS: &[&str] = &["--input", "--output", "--error"];
+
+/// `timeout`'s options. The DURATION operand is handled by
+/// `operands_before_command`, not here.
+const TIMEOUT_NO_ARGUMENT_SHORT_FLAGS: &str = "v";
+const TIMEOUT_VALUE_SHORT_FLAGS: &str = "ks";
+const TIMEOUT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--preserve-status", "--foreground", "--verbose"];
+const TIMEOUT_VALUE_LONG_FLAGS: &[&str] = &["--kill-after", "--signal"];
+
+/// `env`'s options, spanning both implementations: `-u -C -i -0 -v` are common,
+/// and `-P utilpath` is BSD-only — it is in `/usr/bin/env`'s own usage line on
+/// macOS (`env [-0iv] [-C workdir] [-P utilpath] [-S string] [-u name] …`) and
+/// absent from GNU's, where over-skipping it can only block an invocation GNU
+/// `env` rejects outright.
+///
+/// `-S`/`--split-string` is deliberately absent: it re-splits its value into
+/// the command line, so resolving a head word past it would be a guess. A bare
+/// `-` (an alias for `-i`) is likewise unmodelled — the walk refuses an empty
+/// short cluster.
+const ENV_NO_ARGUMENT_SHORT_FLAGS: &str = "i0v";
+const ENV_VALUE_SHORT_FLAGS: &str = "uCP";
+const ENV_NO_ARGUMENT_LONG_FLAGS: &[&str] = &["--ignore-environment", "--null", "--debug"];
+const ENV_VALUE_LONG_FLAGS: &[&str] = &["--unset", "--chdir"];
+
+/// `git`'s global options — the ones that sit between `git` and its
+/// subcommand. `-C`/`-c` take a separate value word (git itself rejects the
+/// glued spelling, and consuming one anyway only over-skips). The
+/// optional-value spellings (`--exec-path`) are listed as argument-free so
+/// their glued form parses; the bare form prints and exits without running a
+/// subcommand, so over-skipping there costs nothing.
+const GIT_NO_ARGUMENT_SHORT_FLAGS: &str = "Ppvh";
+const GIT_VALUE_SHORT_FLAGS: &str = "Cc";
+const GIT_NO_ARGUMENT_LONG_FLAGS: &[&str] = &[
+    "--no-pager",
+    "--paginate",
+    "--bare",
+    "--exec-path",
+    "--no-replace-objects",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--no-optional-locks",
+    "--no-lazy-fetch",
+    "--no-advice",
+];
+const GIT_VALUE_LONG_FLAGS: &[&str] = &[
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+    "--attr-source",
+    "--config-env",
+];
+
+/// The option grammar for a runner this walk models, or `None` for any other
+/// verb.
+fn runner_grammar(verb: &str) -> Option<RunnerGrammar> {
+    let (no_arg_short, value_short, no_arg_long, value_long) = match verb {
+        "sudo" => (
+            SUDO_NO_ARGUMENT_SHORT_FLAGS,
+            SUDO_VALUE_SHORT_FLAGS,
+            SUDO_NO_ARGUMENT_LONG_FLAGS,
+            SUDO_VALUE_LONG_FLAGS,
+        ),
+        "xargs" => (
+            XARGS_NO_ARGUMENT_SHORT_FLAGS,
+            XARGS_VALUE_SHORT_FLAGS,
+            XARGS_NO_ARGUMENT_LONG_FLAGS,
+            &[] as &[&str],
+        ),
+        "nice" => (
+            "",
+            NICE_VALUE_SHORT_FLAGS,
+            &[] as &[&str],
+            NICE_VALUE_LONG_FLAGS,
+        ),
+        "stdbuf" => (
+            "",
+            STDBUF_VALUE_SHORT_FLAGS,
+            &[] as &[&str],
+            STDBUF_VALUE_LONG_FLAGS,
+        ),
+        "timeout" => (
+            TIMEOUT_NO_ARGUMENT_SHORT_FLAGS,
+            TIMEOUT_VALUE_SHORT_FLAGS,
+            TIMEOUT_NO_ARGUMENT_LONG_FLAGS,
+            TIMEOUT_VALUE_LONG_FLAGS,
+        ),
+        "env" => (
+            ENV_NO_ARGUMENT_SHORT_FLAGS,
+            ENV_VALUE_SHORT_FLAGS,
+            ENV_NO_ARGUMENT_LONG_FLAGS,
+            ENV_VALUE_LONG_FLAGS,
+        ),
+        "git" => (
+            GIT_NO_ARGUMENT_SHORT_FLAGS,
+            GIT_VALUE_SHORT_FLAGS,
+            GIT_NO_ARGUMENT_LONG_FLAGS,
+            GIT_VALUE_LONG_FLAGS,
+        ),
+        _ => return None,
+    };
+    Some(RunnerGrammar {
+        no_arg_short,
+        value_short,
+        no_arg_long,
+        value_long,
+        numeric_short_cluster: verb == "nice",
+        operands_before_command: usize::from(verb == "timeout"),
+    })
+}
+
+/// Walk a command runner's OWN options, returning the slice that begins at the
+/// command it will run — or `None` when a token cannot be classified, in which
+/// case the caller must not peel further. Modelled runners: `sudo`, `xargs`,
+/// `nice`, `stdbuf`, `timeout`, `env`, and `git` (whose "command" is its
+/// subcommand); any other verb returns `None`.
+///
+/// **This is now the ONLY runner walk, and the sudo-specific one it replaced is
+/// why that matters.** That walk (`skip_sudo_no_argument_flags`, removed here)
+/// fed `command_segments`' wrapper expansion and refused every value-taking
+/// option rather than guess, on the reasoning that an over-eager peel there can
+/// manufacture a false block on a script the shell never runs. The refusal cost
+/// more than it saved: a modelled runner carrying a flag hid the shell behind
+/// it, so `sudo -u me sh -c 'rm note.md'` and `nice -n 10 bash -c 'rm note.md'`
+/// were invisible to every guard that segments while the identical flags peeled
+/// correctly at the verb gate one position over — measured deleting real files
+/// (#528 review C-D1). Consuming a KNOWN value-taking flag with its value is
+/// knowledge, not a guess, and it is knowledge in both positions; what protects
+/// the expansion path is the refusal below on flags this does NOT model, which
+/// is unchanged.
+///
+/// Bailing on the first `-` instead is what un-blocked `sudo -u me rm note.md`
+/// and `find … -print0 | xargs -0 rm` — the canonical safe-for-spaces delete
+/// idiom — when `obsidian-trash-guard` moved to a head scan (#528 review C1).
+/// The `nice`/`stdbuf`/`timeout`/`env` arms close the "prefixes outside
+/// `TRANSPARENT`" half of that same finding: `TRANSPARENT` admits a prefix only
+/// while the next token is not an option, so `nice -n 10 rm x` and
+/// `env -i /bin/rm x` reached no verb gate at all (#528 review I1).
+pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [String]> {
+    let grammar = runner_grammar(verb)?;
+
+    let mut i = 0;
+    let rest = loop {
+        let tok = argv.get(i)?;
+        // The first word that is not an option is the command being run.
+        if !tok.starts_with('-') {
+            break &argv[i..];
+        }
+        // `--` ends option parsing explicitly; the command follows it.
+        if tok == "--" {
+            break argv.get(i + 1..)?;
+        }
+        // `nice -10 rm x` / `nice --10 rm x`: the adjustment with no flag letter
+        // in front of it. Tested before the long-option branch because the
+        // doubled-dash spelling is not a long option — nothing follows the
+        // dashes but digits — and the branch below would refuse it as unknown.
+        if grammar.numeric_short_cluster {
+            let digits = tok.strip_prefix("--").unwrap_or(&tok[1..]);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                i += 1;
+                continue;
+            }
+        }
+        if tok.starts_with("--") {
+            if let Some((name, _)) = tok.split_once('=') {
+                // A glued value belongs to the flag either way, so both
+                // classes consume exactly this token.
+                if !grammar.no_arg_long.contains(&name) && !grammar.value_long.contains(&name) {
+                    return None;
+                }
+                i += 1;
+                continue;
+            }
+            if grammar.no_arg_long.contains(&tok.as_str()) {
+                i += 1;
+                continue;
+            }
+            if grammar.value_long.contains(&tok.as_str()) {
+                i += 2;
+                continue;
+            }
+            return None;
+        }
+        // A short cluster is one flag per character. A value-taking flag ends
+        // the cluster: whatever follows it inside the token is its glued value
+        // (`-n1`), and an empty remainder means the next word is (`-n 1`).
+        let cluster = &tok[1..];
+        if cluster.is_empty() {
+            return None;
+        }
+        let mut takes_next_word = false;
+        for (pos, c) in cluster.char_indices() {
+            if grammar.no_arg_short.contains(c) {
+                continue;
+            }
+            if grammar.value_short.contains(c) {
+                takes_next_word = pos + c.len_utf8() == cluster.len();
+                break;
+            }
+            // Unknown flag: nothing here can know whether it consumes the word
+            // after it, so refuse rather than resolve the wrong command word.
+            return None;
+        }
+        i += 1;
+        if takes_next_word {
+            i += 1;
+        }
+    };
+    // `timeout DURATION cmd` — a positional the runner consumes before the
+    // command. `get(0..)` on every other runner returns the slice unchanged.
+    rest.get(grammar.operands_before_command..)
+}
+
+/// Skip `git`'s global options so the slice begins at its SUBCOMMAND.
+///
+/// `git`'s globals sit in exactly the position a `argv[1] == "rm"` alias test
+/// reads, so without this `git -C . rm note.md` and `git --no-pager rm note.md`
+/// resolve their subcommand to `-C` and go unjudged while deleting the file
+/// (#528 review I2). Shared by `obsidian-trash-guard` and
+/// `prevent_secret_writes::writer_targets`, which had the identical gap.
+///
+/// Infallible by design: a token this cannot classify yields the argv it was
+/// handed, so a caller's plain `git rm` test keeps working unchanged. Both
+/// callers feed detectors, so an over-skip can only expose a subcommand that
+/// was already going to run.
+pub fn skip_git_global_options(argv: &[String]) -> &[String] {
+    skip_runner_flags("git", argv).unwrap_or(argv)
+}
+
+/// `git push` long options whose value is a SEPARATE following word.
+///
+/// Measured against git 2.55.0 by pointing pushes at nonexistent local paths and
+/// reading which token git named as the repository:
+/// `git push --receive-pack ZZZ /nonexistent/repoA main` reports
+/// `ZZZ '/nonexistent/repoA': ZZZ: command not found` — `ZZZ` was consumed as the
+/// option's value and `/nonexistent/repoA` is the repository. Same for `--exec`
+/// and `--repo`.
+///
+/// `--signed` and `--force-with-lease` are deliberately ABSENT: both take
+/// *optional* values and do NOT consume the next word
+/// (`git push --signed /nonexistent/repoD main` reports `/nonexistent/repoD` as
+/// the repository). Adding them would swallow the real target and false-block
+/// the ordinary `git push --signed origin main`.
+/// The COMPLETE set, not a sample. An exact-match list of four shipped in the
+/// first cut of this fix and an adversarial pass found `--recurse-submodules`
+/// missing — its value posed as the repository exactly like the others
+/// (`git push --recurse-submodules check <evil-url> main` measured Allow).
+const PUSH_SEPARATE_VALUE_LONG_OPTS: &[&str] = &[
+    "--push-option",
+    "--repo",
+    "--receive-pack",
+    "--exec",
+    "--recurse-submodules",
+];
+
+/// Does this long-option NAME (the text after `--`, before any `=`) select an
+/// option whose value can be a separate following word?
+///
+/// **Matched by PREFIX, because git's parse-options resolves any unambiguous
+/// abbreviation.** An exact-match test let `--recu`, `--rep`, `--exe`,
+/// `--receiv`, `--pu` and `--push-op` through — each accepted by real git and
+/// each consuming its value, so the value posed as the repository. Where a
+/// prefix is ambiguous git errors out and never pushes, so treating it as
+/// value-taking cannot cost a real push.
+///
+/// No `git push` BOOLEAN shares a prefix with any of these five, so this cannot
+/// swallow the real target of an ordinary push: `--force`, `--follow-tags`,
+/// `--signed` and `--force-with-lease` all fail the test.
+fn long_option_takes_separate_value(name: &str) -> bool {
+    !name.is_empty()
+        && PUSH_SEPARATE_VALUE_LONG_OPTS
+            .iter()
+            .any(|opt| opt.trim_start_matches('-').starts_with(name))
+}
+
+/// Is this long-option name `--repo` (or an abbreviation of it)?
+fn is_repo_long_option(name: &str) -> bool {
+    !name.is_empty() && "repo".starts_with(name)
+}
+
+/// The explicitly-named push destinations found in a `git push` command.
+///
+/// Both fields are reported because validating only one is what the adversarial
+/// pass broke: git prefers the positional, so returning it alone discarded a
+/// recorded `--repo` URL whenever an unmodelled option's value posed as a
+/// positional — `git push --repo <evil-url> --recurse-submodules check` measured
+/// Block on `main` and Allow on the first cut of this fix, a regression. The
+/// caller validates every populated field, so a mis-parse of one cannot silence
+/// the other.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PushDestinations {
+    /// The first positional — git's repository argument when present.
+    pub positional: Option<String>,
+    /// `--repo`'s value, whichever spelling carried it.
+    pub repo_flag: Option<String>,
+}
+
+/// Resolve the destinations a `git push` names, from the words AFTER the `push`
+/// subcommand.
+///
+/// This is the single model of `git push`'s option grammar. It exists because
+/// two callers previously kept their own: `loop_analysis::extract_push_remote`
+/// modelled the short-option cluster walk and nothing else, while
+/// `guard_push_remote::extract_push_target` modelled no grammar at all and took
+/// the first token not starting with `-`. Any option's *value* therefore posed
+/// as the remote, and the real URL was never ownership-validated
+/// (cadence-hooks#550). Two functions disagreeing about what a remote is, is the
+/// drift that produced the original Critical — so the grammar lives here once.
+///
+/// **`git push`'s FIRST positional is the repository**, not a refspec —
+/// `git push --repo=/nonexistent/EQ /nonexistent/POS HEAD:main` reports
+/// `/nonexistent/POS`, so git prefers the positional over `--repo`.
+///
+/// **Both destinations are returned rather than just git's preferred one.**
+/// Returning only the positional is what made the first cut of this fix
+/// *regress*: `git push --repo <evil-url> --recurse-submodules check` measured
+/// Block on `main` and Allow on the fix, because `--recurse-submodules` was
+/// unmodelled, its value `check` posed as the positional, and preferring the
+/// positional discarded the evil `--repo` URL. Reporting both lets the caller
+/// validate every named destination, so a mis-parse of one cannot silence the
+/// other — the guard blocks if EITHER is unowned. That is deliberately stricter
+/// than git's own precedence, and it costs only a refused
+/// `git push --repo=<unowned> <owned>`, a command with no legitimate reading.
+///
+/// **git does honor a lone `--repo=<url>`, measured.** The trick is configuring
+/// an upstream first, so the refspec resolves and git actually contacts a
+/// remote: with `origin` set up and tracking configured,
+/// `git push --repo=/nonexistent/EVILTARGET` reports
+/// `fatal: '/nonexistent/EVILTARGET' does not appear to be a git repository`
+/// while a bare `git push` control reports `Everything up-to-date`. So
+/// validating `--repo`'s value is the *correct* behavior rather than a
+/// conservative guess. (An earlier draft of this comment called it unmeasurable,
+/// because without an upstream git fails on the refspec before contacting
+/// anything and every attempt to supply a refspec makes that token the
+/// positional repository instead.)
+///
+/// Both fields `None` means a bare `git push`, where the caller's
+/// tracking-remote fallback is correct.
+pub fn push_repository_argument(words: &[String]) -> PushDestinations {
+    let mut found = PushDestinations::default();
+    let mut index = 0;
+
+    while index < words.len() {
+        let word = words[index].as_str();
+
+        // `--` ends option parsing; the next word is the repository.
+        if word == "--" {
+            found.positional = words.get(index + 1).cloned();
+            return found;
+        }
+
+        if let Some(rest) = word.strip_prefix("--") {
+            let (name, inline) = match rest.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (rest, None),
+            };
+            let takes_separate_value = inline.is_none() && long_option_takes_separate_value(name);
+
+            if is_repo_long_option(name) {
+                if let Some(value) = inline {
+                    found.repo_flag = Some(value.to_string());
+                } else if takes_separate_value {
+                    found.repo_flag = words.get(index + 1).cloned();
+                }
+            }
+
+            index += if takes_separate_value { 2 } else { 1 };
+            continue;
+        }
+
+        // A single-dash token is a short-option CLUSTER, and git's parse-options
+        // walks it letter by letter. `-o` is `git push`'s only value-taking
+        // shorthand (every other one is a boolean), so the walk reduces to where
+        // the FIRST `o` sits: last letter in the token means the value is the
+        // NEXT word, anywhere earlier means the rest of the token is the value.
+        // One rule covers `-o v`, `-ov` and `-qo v` alike. Matching only the
+        // first two let `-qo topic=x`'s value pose as the remote (#531), and
+        // keying on the LAST letter is wrong too — git 2.55.0 makes `a=1` the
+        // repository for `-oo a=1 <url>`.
+        if let Some(cluster) = word.strip_prefix('-').filter(|c| !c.is_empty()) {
+            let value_is_next_word =
+                matches!(cluster.find('o'), Some(pos) if pos + 1 == cluster.len());
+            index += if value_is_next_word { 2 } else { 1 };
+            continue;
+        }
+
+        // Not an option: the first positional is the repository.
+        found.positional = Some(words[index].clone());
+        return found;
+    }
+
+    found
 }
 
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
 /// tokenized (and, in the guard's case, stripped transparent prefixes) can
 /// detect a wrapper without re-tokenizing.
+///
+/// **Prefixes are skipped HERE, not left to the caller.** They used to be the
+/// caller's job, and the two entry points disagreed about whether it had been
+/// done: `child_scripts` handed in an already-stripped argv, while
+/// `expand_segments` called [`shell_c_argument`], which tokenizes the RAW
+/// segment. So a prefixed wrapper was expanded down one path and invisible
+/// down the other — `bash -c 'cat .env'` was seen while `sudo bash -c 'cat
+/// .env'` and `command sh -c 'cat .env'` were not, and the script survived as
+/// one whitespace-bearing token that `prevent-secret-leaks`' false-positive
+/// firewall skips by design, so the read inside it reached no guard at all.
+/// Skipping inside the shared function is what makes the two paths agree by
+/// construction. It is idempotent, so a caller that already stripped loses
+/// nothing.
+///
+/// The command word goes through [`command_word`] rather than a local
+/// basename, so `/bin/sh -c` keeps working and `\bash -c` starts working —
+/// same normalization every other verb gate uses.
+///
+/// **The prefix skip is [`peel_command_runners`] — the same peel the verb gates
+/// use, not a weaker local model.** It used to refuse at a runner's first
+/// option, so a modelled runner CARRYING A FLAG hid the shell behind it:
+/// `nice bash -c 'rm note.md'` expanded while `nice -n 10 bash -c 'rm note.md'`
+/// did not, and `env -i sh -c`, `sudo -u me sh -c`, `stdbuf -o0 sh -c` and
+/// `xargs -0 sh -c 'rm "$@"' _` were invisible the same way — every one of them
+/// measured deleting a real file, and every one of those flags already peeled
+/// correctly one position over at the verb gate (#528 review C-D1). The peel and
+/// the wrapper hunt disagreeing about the same grammar is the divergence this
+/// unification removes.
+///
+/// **[`strip_compound_heads`] runs first, for the same reason.** The verb gate
+/// strips shell keywords, `case` labels and function headers before it peels;
+/// this hunt did not, so a wrapper inside a compound body kept a segment head of
+/// `then`/`do`/`{`, the hunt returned `None`, and the inner script was never
+/// surfaced to any guard — `if true; then bash -c 'rm note.md'; fi`,
+/// `for f in a; do bash -c 'rm note.md'; done` and `(bash -c 'rm note.md')` all
+/// deleted a real file while the bare `rm` one position over blocked (#528
+/// review E). Idempotent, so a caller that already stripped loses nothing.
 fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
-    let first = tokens.first()?;
-    let cmd = first.rsplit('/').next().unwrap_or(first);
-    if !matches!(cmd, "sh" | "bash" | "zsh" | "dash") {
+    let tokens = peel_command_runners(strip_compound_heads(tokens));
+    if !matches!(
+        command_word(tokens.first()?).as_ref(),
+        "sh" | "bash" | "zsh" | "dash"
+    ) {
         return None;
     }
     for (i, tok) in tokens.iter().enumerate().skip(1) {
         let carries_c =
             tok == "-c" || (tok.starts_with('-') && !tok.starts_with("--") && tok.contains('c'));
         if carries_c {
+            // `--` ends the shell's own option parsing, so with it present the
+            // script is one token further along. Returning the `--` handed
+            // guards a segment of two dashes and left the real script inside a
+            // single whitespace-bearing token — the shape `prevent-secret-leaks`
+            // skips by design — so `bash -c -- 'cat .env'` reached no guard at
+            // all while the plain spelling blocked (#496).
+            if tokens.get(i + 1).is_some_and(|t| t == "--") {
+                return tokens.get(i + 2).cloned();
+            }
             return tokens.get(i + 1).cloned();
         }
         // First non-flag token without a `-c` means this isn't the `-c` form
@@ -1593,6 +3182,428 @@ pub static LOOP_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- strip_leading_keywords / skip_runner_flags (#528 review C1) ---
+
+    fn words(command: &str) -> Vec<String> {
+        tokenize(command)
+    }
+
+    #[test]
+    fn strip_leading_keywords_exposes_the_verb_behind_a_keyword() {
+        for (segment, want_head) in [
+            ("do rm $f", "rm"),
+            ("then rm note.md", "rm"),
+            ("else rm note.md", "rm"),
+            ("elif rm note.md", "rm"),
+            ("while rm note.md", "rm"),
+            ("until rm note.md", "rm"),
+            ("if rm note.md", "rm"),
+            ("! rm note.md", "rm"),
+            ("do then rm note.md", "rm"),
+            // Not a keyword, and case-sensitive — `DO` is a command name.
+            ("DO rm note.md", "DO"),
+            ("cat note.md", "cat"),
+        ] {
+            let tokens = words(segment);
+            assert_eq!(
+                strip_leading_keywords(&tokens).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_leading_keywords_keeps_a_lone_keyword() {
+        // Nothing behind it to expose, so the slice must not empty out.
+        for segment in ["done", "fi", "!"] {
+            let tokens = words(segment);
+            assert_eq!(strip_leading_keywords(&tokens).len(), 1, "{segment}");
+        }
+    }
+
+    // --- executable_tokens / strip_compound_heads (#528 review E) ---
+
+    #[test]
+    fn executable_tokens_reaches_the_command_inside_a_compound_body() {
+        for (segment, want_head) in [
+            // Group punctuation, glued and standalone.
+            ("(bash -c 'rm note.md')", "bash"),
+            ("{ bash -c 'rm note.md'", "bash"),
+            ("{ { bash -c 'rm note.md'", "bash"),
+            ("((rm note.md))", "rm"),
+            // Reserved words.
+            ("then bash -c 'rm note.md'", "bash"),
+            ("do bash -c 'rm note.md'", "bash"),
+            ("then if true", "true"),
+            // A keyword in FRONT of glued punctuation — neither strip alone
+            // reaches this, which is why the two alternate.
+            ("do (bash -c 'rm note.md')", "bash"),
+            ("then ({ rm note.md", "rm"),
+            // `case` arms, mid-segment and as the segment head.
+            ("case x in x) bash -c 'rm note.md'", "bash"),
+            ("x) bash -c 'rm note.md'", "bash"),
+            ("case x in start) npm start", "npm"),
+            // Function headers, all three spellings, plus the body's brace.
+            ("f() { bash -c 'rm note.md'", "bash"),
+            ("f () { bash -c 'rm note.md'", "bash"),
+            ("function f { bash -c 'rm note.md'", "bash"),
+            ("function f () { rm note.md", "rm"),
+            ("my-deploy.v2() { rm note.md", "rm"),
+            // Nothing to strip.
+            ("rm note.md", "rm"),
+            ("git -C . status", "git"),
+        ] {
+            assert_eq!(
+                executable_tokens(segment).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_tokens_keeps_a_head_that_is_not_scaffolding() {
+        // The looser shapes must refuse rather than eat a real command word.
+        for (segment, want_head) in [
+            // A substitution is not a `case` pattern.
+            ("$(date) --version", "$(date)"),
+            // Nor is the tail of a subshell that spans two segments: in
+            // `(cd /x; ls) > out` the `)` closed the group and `ls` is the verb.
+            ("ls) > out", "ls)"),
+            ("ls) 2>&1", "ls)"),
+            ("x) --version", "x)"),
+            // A lone scaffolding word has nothing behind it to expose.
+            ("esac", "esac"),
+            ("done", "done"),
+            ("function", "function"),
+            // `strip_group_wrappers` trims the trailing `)` off a bare
+            // fragment; either spelling is a syntax fragment rather than a
+            // command, so what matters is that nothing resolves a verb.
+            ("f()", "f("),
+            ("case x in", "case"),
+            // `-c` is a flag, not a function name.
+            ("-c() { rm note.md", "-c()"),
+        ] {
+            assert_eq!(
+                executable_tokens(segment).first().map(String::as_str),
+                Some(want_head),
+                "{segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_tokens_keeps_the_operands_behind_the_head() {
+        // The strip must not eat a `)`-closing OPERAND while hunting a label:
+        // scanning forward for any `)`-terminated token would take the script.
+        assert_eq!(
+            executable_tokens("bash -c 'echo hi)'"),
+            vec!["bash".to_string(), "-c".into(), "echo hi)".into()]
+        );
+        // And the closing paren of a group must not ride along on the script.
+        assert_eq!(
+            executable_tokens("(bash -c 'rm note.md')"),
+            vec!["bash".to_string(), "-c".into(), "rm note.md".into()]
+        );
+    }
+
+    #[test]
+    fn strip_compound_heads_is_idempotent() {
+        // `child_scripts` hands in an already-stripped argv, so a second pass
+        // must be a no-op rather than eating the command word.
+        for segment in [
+            "do rm note.md",
+            "case x in x) rm note.md",
+            "f() { rm note.md",
+            "rm note.md",
+        ] {
+            let tokens = words(segment);
+            let once = strip_compound_heads(&tokens).to_vec();
+            assert_eq!(strip_compound_heads(&once), once.as_slice(), "{segment}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_walks_sudo_and_xargs_options() {
+        for (command, want_head) in [
+            ("sudo rm note.md", Some("rm")),
+            ("sudo -u me rm note.md", Some("rm")),
+            ("sudo --user=me rm note.md", Some("rm")),
+            ("sudo --user me rm note.md", Some("rm")),
+            ("sudo -E -u me rm note.md", Some("rm")),
+            ("sudo --preserve-env rm note.md", Some("rm")),
+            ("sudo -- rm note.md", Some("rm")),
+            ("xargs -0 rm", Some("rm")),
+            ("xargs -n1 rm note.md", Some("rm")),
+            ("xargs -n 1 rm note.md", Some("rm")),
+            ("xargs -0 -I {} rm {}", Some("rm")),
+            // Unknown flags stay refused — nothing here can know whether one
+            // consumes the word after it.
+            ("sudo --nonesuch rm note.md", None),
+            ("xargs --replace rm", None),
+            // Options all the way to the end: no command to resolve.
+            ("sudo -E", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_walks_the_prefix_families_outside_transparent() {
+        // `TRANSPARENT` admits `nice`/`env` only while the next token is not an
+        // option, and does not model `timeout`/`stdbuf` at all (#528 review I1).
+        for (command, want_head) in [
+            ("nice -n 10 rm note.md", Some("rm")),
+            ("nice -n10 rm note.md", Some("rm")),
+            ("nice --adjustment=10 rm note.md", Some("rm")),
+            ("nice --adjustment 10 rm note.md", Some("rm")),
+            // GNU spells the adjustment with no flag letter at all.
+            ("nice -10 rm note.md", Some("rm")),
+            ("stdbuf -o0 rm note.md", Some("rm")),
+            ("stdbuf -o 0 rm note.md", Some("rm")),
+            ("stdbuf -i0 -o0 -e0 rm note.md", Some("rm")),
+            ("stdbuf --output=0 rm note.md", Some("rm")),
+            // The DURATION operand is consumed before the command.
+            ("timeout 5 rm note.md", Some("rm")),
+            ("timeout -k 1 5 rm note.md", Some("rm")),
+            ("timeout --preserve-status 5 rm note.md", Some("rm")),
+            ("timeout --signal=KILL 5 rm note.md", Some("rm")),
+            ("env -i /bin/rm note.md", Some("/bin/rm")),
+            ("env -u FOO rm note.md", Some("rm")),
+            ("env --unset=FOO rm note.md", Some("rm")),
+            ("env -i FOO=bar rm note.md", Some("FOO=bar")),
+            // `-S` re-splits its value into the command line; resolving a head
+            // word past it would be a guess, so the walk refuses.
+            ("env -S 'rm note.md'", None),
+            ("timeout 5", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_walks_the_bsd_spellings_of_env_and_nice() {
+        // Both verified against the real tool on macOS rather than from memory:
+        // `-P utilpath` is in `/usr/bin/env`'s own usage line, and BSD `nice`
+        // takes the adjustment with a doubled dash (#528 review I2).
+        for (command, want_head) in [
+            ("env -P /bin rm note.md", Some("rm")),
+            ("env -P/bin rm note.md", Some("rm")),
+            ("env -iP /bin rm note.md", Some("rm")),
+            ("nice --10 rm note.md", Some("rm")),
+            ("nice --20 rm note.md", Some("rm")),
+            // A doubled-dash cluster that is not all digits is still an unknown
+            // long option, and an empty one is still the option terminator.
+            ("nice --wat rm note.md", None),
+            ("nice -- rm note.md", Some("rm")),
+            // Only `nice` spells an adjustment this way; the same shape on
+            // another runner must stay refused.
+            ("env --10 rm note.md", None),
+        ] {
+            let tokens = words(command);
+            let verb = command_word(&tokens[0]).into_owned();
+            let head = skip_runner_flags(&verb, &tokens[1..])
+                .and_then(<[String]>::first)
+                .map(String::as_str);
+            assert_eq!(head, want_head, "{command}");
+        }
+    }
+
+    #[test]
+    fn skip_git_global_options_exposes_the_subcommand() {
+        for (command, want_head) in [
+            ("git rm note.md", "rm"),
+            ("git -C . rm note.md", "rm"),
+            ("git -C /vault/notes rm -r notes/", "rm"),
+            ("git --no-pager rm note.md", "rm"),
+            ("git -c core.pager=cat rm note.md", "rm"),
+            ("git --git-dir=.git rm note.md", "rm"),
+            ("git --git-dir .git rm note.md", "rm"),
+            ("git --work-tree=/vault rm note.md", "rm"),
+            ("git --namespace=ns rm note.md", "rm"),
+            ("git -P rm note.md", "rm"),
+            ("git -C . -c user.name=x --no-pager rm note.md", "rm"),
+            // Not a global option, so the slice is handed back untouched and a
+            // caller's subcommand test reads the same word it always did.
+            ("git status", "status"),
+            ("git -C . status", "status"),
+            ("git --nonesuch rm note.md", "--nonesuch"),
+        ] {
+            let tokens = words(command);
+            assert_eq!(
+                skip_git_global_options(&tokens[1..])
+                    .first()
+                    .map(String::as_str),
+                Some(want_head),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_runner_flags_refuses_verbs_it_does_not_model() {
+        let tokens = words("doas -u me rm note.md");
+        assert!(skip_runner_flags("doas", &tokens[1..]).is_none());
+    }
+
+    // --- command_word (the one verb normalization) ---
+
+    #[test]
+    fn command_word_normalizes_path_escape_and_exe() {
+        for (token, want) in [
+            ("git", "git"),
+            ("/usr/bin/git", "git"),
+            ("./git", "git"),
+            // The alias bypass: the shell removes one backslash and runs git.
+            ("\\git", "git"),
+            // A mid-path escape the shell also resolves to `/opt/git` — only
+            // caught because the strip runs AFTER the path split.
+            ("/opt/\\git", "git"),
+            // Windows spellings, both separators, with and without `.exe`.
+            ("/c/Program Files/Git/cmd/git.exe", "git"),
+            ("C:\\Program Files\\Git\\cmd\\git.exe", "git"),
+            ("C:/Program Files/Git/cmd/git.exe", "git"),
+            ("C:\\tools\\git", "git"),
+            ("git.EXE", "git"),
+            ("\\git.exe", "git"),
+        ] {
+            assert_eq!(command_word(token), want, "command_word({token:?})");
+        }
+    }
+
+    #[test]
+    fn command_word_keeps_distinct_verbs_apart() {
+        // `\\git` is NOT git: the shell removes exactly one backslash and looks
+        // up `\git`, which is not a command. A repeating strip would collapse
+        // it (cadence-hooks#442) and invent a verb the shell never runs.
+        assert_ne!(command_word("\\\\git"), "git");
+        assert_eq!(command_word("\\\\git"), "\\git");
+        // Longer names that merely END in the verb, and a DIRECTORY named for
+        // the verb, are not the verb.
+        for token in ["legit", "gitk", "/opt/git/bin/hub", "mygit", "git-lfs"] {
+            assert_ne!(command_word(token), "git", "command_word({token:?})");
+        }
+        // A backslash is not a path separator without a drive prefix — this is
+        // one POSIX filename, not a path ending in `git`.
+        assert_ne!(command_word("a\\b\\git"), "git");
+        // `.exe` stripping must not eat a bare dotfile-shaped name.
+        assert_eq!(command_word(".exe"), ".exe");
+    }
+
+    #[test]
+    fn command_word_folds_ascii_case() {
+        // On a case-insensitive volume the shell resolves `GIT` to the `git`
+        // binary and runs it, so a verb gate comparing against the literal
+        // `git` never fired (cadence-hooks#488). The fold is the LAST step, so
+        // it composes with the path split, the backslash strip, and `.exe`.
+        for (token, want) in [
+            ("GIT", "git"),
+            ("Git", "git"),
+            ("gIt", "git"),
+            ("RM", "rm"),
+            ("/usr/bin/GIT", "git"),
+            ("\\GIT", "git"),
+            ("/opt/\\GIT", "git"),
+            ("GIT.EXE", "git"),
+            ("C:\\Program Files\\Git\\cmd\\GIT.exe", "git"),
+        ] {
+            assert_eq!(command_word(token), want, "command_word({token:?})");
+        }
+    }
+
+    #[test]
+    fn command_word_fold_keeps_distinct_verbs_apart() {
+        // Folding must not collapse words that were never the same verb — it
+        // changes only the CASE of the resolved word, never its shape.
+        assert_eq!(command_word("\\\\GIT"), "\\git");
+        for token in ["LEGIT", "GITK", "MYGIT", "GIT-LFS"] {
+            assert_ne!(command_word(token), "git", "command_word({token:?})");
+        }
+        // ASCII-only. A non-ASCII character is left exactly as it arrived:
+        // Unicode lowercasing would fold homoglyphs and locale-specific pairs
+        // (the dotted-I family) into ASCII verbs the shell would never run,
+        // which WIDENS matching in a way no filesystem does.
+        assert_eq!(command_word("GİT"), "gİt");
+        assert_eq!(command_word("ⓖⓘⓣ"), "ⓖⓘⓣ");
+    }
+
+    #[test]
+    fn skip_transparent_prefixes_folds_the_prefix_verb() {
+        // `TRANSPARENT` was tested against the RAW token while `guard_rm`
+        // folded before its own `TRANSPARENT` test — the two disagreed, so
+        // `COMMAND rm -rf ~` resolved its leading word to `COMMAND` and the
+        // delete verb behind it was never reached (cadence-hooks#488).
+        // Detector direction: skipping more prefixes only exposes more verbs.
+        let toks = |s: &str| -> Vec<String> { tokenize(s) };
+        for cmd in [
+            "COMMAND git commit",
+            "NICE git commit",
+            "ENV git commit",
+            "EXEC git commit",
+            "Command git commit",
+        ] {
+            let t = toks(cmd);
+            assert_eq!(
+                skip_transparent_prefixes(&t).first().map(String::as_str),
+                Some("git"),
+                "{cmd}"
+            );
+        }
+        // The flag refusal survives the fold: a prefix's own options are still
+        // never parsed, so this stays a documented miss rather than a wrong
+        // resolution.
+        let t = toks("NICE -n 10 git commit");
+        assert_eq!(
+            skip_transparent_prefixes(&t).first().map(String::as_str),
+            Some("NICE")
+        );
+        // Folding changes case, not membership — a non-prefix stays put.
+        let t = toks("SUDO git commit");
+        assert_eq!(
+            skip_transparent_prefixes(&t).first().map(String::as_str),
+            Some("SUDO")
+        );
+    }
+
+    #[test]
+    fn fold_verb_borrows_unless_it_changes_something() {
+        // The allocation-free path is the point on a function that runs for
+        // every segment of every Bash call, so assert the variant, not just
+        // the value — `assert_eq!` alone passes either way.
+        assert!(matches!(fold_verb("git"), Cow::Borrowed("git")));
+        assert!(matches!(fold_verb(""), Cow::Borrowed("")));
+        assert!(matches!(fold_verb("GIT"), Cow::Owned(_)));
+        assert_eq!(fold_verb("GIT"), "git");
+    }
+
+    #[test]
+    fn contains_ignoring_ascii_case_matches_every_spelling() {
+        for hay in ["gh pr create", "GH pr create", "Gh pr create", "x GH y"] {
+            assert!(contains_ignoring_ascii_case(hay, "gh"), "{hay}");
+        }
+        // Multi-word needles (the `gh repo` pre-filter) and the boundaries.
+        assert!(contains_ignoring_ascii_case("GH REPO create", "gh repo"));
+        assert!(contains_ignoring_ascii_case("anything", ""));
+        assert!(!contains_ignoring_ascii_case("g", "gh"));
+        assert!(!contains_ignoring_ascii_case("", "gh"));
+        assert!(!contains_ignoring_ascii_case("git push", "gh"));
+        // Non-ASCII bytes must not panic or match — the windows walk is over
+        // bytes, so a multi-byte character can straddle a window.
+        assert!(!contains_ignoring_ascii_case("ⓖⓗ", "gh"));
+        assert!(contains_ignoring_ascii_case("é GH é", "gh"));
+    }
 
     // --- looks_absolute / resolve_cd_target (Windows path handling) ---
     // Platform-INDEPENDENT: `looks_absolute` decides absoluteness from the
@@ -2297,6 +4308,736 @@ mod tests {
         assert_eq!(split_segments("echo x | grep y"), vec!["echo x", "grep y"]);
     }
 
+    #[test]
+    fn split_segments_escaped_gt_before_pipe_is_a_real_pipe() {
+        // #491. `\>` is an ESCAPED `>` — a literal argument, not a redirect —
+        // so the `|` after it is an ordinary pipe and the command after it is
+        // a command. Testing the raw last character saw the `>` and glued the
+        // pipe on, hiding everything downstream inside one segment; every
+        // block-capable guard that segments then inspected only `echo`.
+        //
+        // Verified against bash: `echo hi \>| cat` prints `hi >` THROUGH the
+        // pipe, so the second half really is a separate command.
+        assert_eq!(
+            split_segments("echo hi \\>| rm -rf ~/Documents"),
+            vec!["echo hi \\>", "rm -rf ~/Documents"]
+        );
+
+        // The discriminating twin, and the reason parity is required rather
+        // than a blanket "a backslash before `>` means split": `\\` is an
+        // escaped BACKSLASH, so the `>|` behind it is a genuine clobber
+        // redirect and the target must stay attached. Verified against bash:
+        // `echo hi \\>| /tmp/f` creates the file (contents `hi \`). A fix that
+        // splits both cases is a regression, and a test carrying only the odd
+        // case cannot tell the two apart.
+        assert_eq!(
+            split_segments("echo hi \\\\>| /tmp/clobbered"),
+            vec!["echo hi \\\\>| /tmp/clobbered"]
+        );
+    }
+
+    // --- #490: `#` starts a comment at a word boundary ---
+
+    #[test]
+    fn split_segments_comment_does_not_swallow_the_next_line() {
+        // The headline bypass. An apostrophe inside a trailing comment opened
+        // a quote state that never closed, so the newline stopped being a
+        // boundary and the whole thing collapsed into ONE segment whose verb
+        // was `echo`. Six block-capable guards allowed the deletion behind it.
+        // bash discards the comment, so the deletion is a command in its own
+        // right and must be segmented as one.
+        assert_eq!(
+            split_segments("echo hi # it's fine\nrm -rf ~/Documents"),
+            vec!["echo hi", "rm -rf ~/Documents"]
+        );
+    }
+
+    #[test]
+    fn split_segments_comment_without_an_apostrophe_still_drops() {
+        // The shape that already segmented correctly — but only by accident,
+        // since the comment text rode along inside the first segment. Now the
+        // comment is dropped outright.
+        assert_eq!(
+            split_segments("echo hi # fine\nrm -rf ~/Documents"),
+            vec!["echo hi", "rm -rf ~/Documents"]
+        );
+    }
+
+    #[test]
+    fn split_segments_comment_at_start_of_a_segment() {
+        // `current` empty is a word boundary too — a whole-line comment, and a
+        // comment directly after a separator, both vanish without taking the
+        // following command with them.
+        assert_eq!(split_segments("# it's a note\nrm -rf ~"), vec!["rm -rf ~"]);
+        assert_eq!(
+            split_segments("echo hi;# it's a note\nrm -rf ~"),
+            vec!["echo hi", "rm -rf ~"]
+        );
+    }
+
+    #[test]
+    fn split_segments_hash_inside_an_expansion_is_not_a_comment() {
+        // The regression the first cut of the comment rule shipped. The
+        // boundary test looked only at the preceding character, while the
+        // splitter tracked quotes and nothing else — so a `#` inside
+        // `${…}`/`` `…` ``/`$(…)` discarded the rest of the line and every
+        // command on it vanished from every guard.
+        //
+        // bash is the oracle here, not a model of it: each row below was run
+        // with a `touch` canary in place of the payload and the file WAS
+        // created, so the second command really executes.
+        for (cmd, want_tail) in [
+            ("echo ${x:- # } ; rm -rf ~/Documents", "rm -rf ~/Documents"),
+            ("echo `date # x`; rm -rf ~/Documents", "rm -rf ~/Documents"),
+            ("echo ${B:-a # b} && git push --force", "git push --force"),
+            ("echo $((2 # 3)) ; rm -rf ~/Documents", "rm -rf ~/Documents"),
+        ] {
+            let out = split_segments(cmd);
+            assert!(
+                out.iter().any(|s| s.contains(want_tail)),
+                "{cmd:?} lost {want_tail:?}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_segments_data_paren_does_not_close_a_brace_expansion() {
+        // A `)` inside `${…}` is DATA — bash never ends a parameter expansion
+        // on it. Tracking both opener kinds on one counter let it reach zero
+        // mid-expansion, fire the comment rule, and drop the separator plus
+        // everything behind it. Each row was run with a canary in place of the
+        // payload and the second command DID execute.
+        for (cmd, want_tail) in [
+            (
+                "echo ${x:-a)b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x:=a)b # c} && rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x:+a)b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x%a)b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x//a)b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            (
+                "echo ${x:-a)b # c} | rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+            // `$()` opens and closes cleanly INSIDE `${}`, then one further
+            // `)` must not pop the brace.
+            (
+                "echo ${x:-$(echo a))b # c} ; rm -rf ~/Documents",
+                "rm -rf ~/Documents",
+            ),
+        ] {
+            let out = split_segments(cmd);
+            assert!(
+                out.iter().any(|s| s.contains(want_tail)),
+                "{cmd:?} lost {want_tail:?}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_segments_unbalanced_opener_disables_stripping() {
+        // The direction that makes ignoring a mismatched closer safe: an
+        // opener left on the stack keeps the scan inside an expansion, so
+        // comment stripping is DISABLED and the text stays under inspection.
+        // Over-inspection is the tolerable failure; dropping is not.
+        let out = split_segments("echo $( foo # bar\nrm -rf ~/Documents");
+        assert!(
+            out.iter().any(|s| s.contains("rm -rf ~/Documents")),
+            "unbalanced opener dropped text: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_arithmetic_and_substitution_close_independently() {
+        // `$((` pushes two Parens and `))` pops both, so the scan is back
+        // outside afterwards and a real trailing comment still strips.
+        assert_eq!(
+            split_segments("echo $((1+2)) # note\nls"),
+            vec!["echo $((1+2))", "ls"]
+        );
+        // A brace expansion still closes on its own `}`.
+        assert_eq!(
+            split_segments("echo ${x:-y} # note\nls"),
+            vec!["echo ${x:-y}", "ls"]
+        );
+    }
+
+    #[test]
+    fn logical_lines_removes_both_characters_of_a_continuation() {
+        // The shell deletes the backslash AND the newline. A consumer that
+        // joined with a SPACE instead saw `< <EOF` where bash sees the
+        // introducer `<<EOF`, and a word split mid-name never reassembled —
+        // both missed a shell-fed heredoc (cadence-hooks#543).
+        assert_eq!(logical_lines("bash <\\\n<EOF"), vec!["bash <<EOF"]);
+        assert_eq!(logical_lines("bas\\\nh <<EOF"), vec!["bash <<EOF"]);
+        assert_eq!(logical_lines("bash \\\n<<EOF"), vec!["bash <<EOF"]);
+        // Physical lines with no continuation stay separate.
+        assert_eq!(logical_lines("a\nb"), vec!["a", "b"]);
+        // An EVEN run of trailing backslashes is a literal backslash, not a
+        // continuation — the parity rule `take_logical_line` applies.
+        assert_eq!(logical_lines("a\\\\\nb"), vec!["a\\\\", "b"]);
+    }
+
+    #[test]
+    fn heredoc_introducers_span_the_whole_construct() {
+        // The byte range must cover the operator, any `-`, any whitespace, and
+        // the delimiter word with its quotes. A caller blanks that range before
+        // reading command words: without it `cat <<bash` reads as naming a
+        // shell, and `bash<<EOF` does not read as naming one at all.
+        for (line, start, end, word, expands) in [
+            ("bash<<EOF", 4, 9, "EOF", true),
+            ("cat <<bash", 4, 10, "bash", true),
+            ("cat << bash", 4, 11, "bash", true),
+            ("cat <<-EOF", 4, 10, "EOF", true),
+            ("cat <<'EOF'", 4, 11, "EOF", false),
+            ("cat <<\"EOF\"", 4, 11, "EOF", false),
+        ] {
+            let found = heredoc_introducers(line);
+            assert_eq!(found.len(), 1, "{line}");
+            assert_eq!(
+                &line[found[0].start..found[0].end],
+                &line[start..end],
+                "{line}"
+            );
+            assert_eq!(found[0].word, word, "{line}");
+            assert_eq!(found[0].expands, expands, "{line}");
+        }
+        // A here-string is not a heredoc, and a `<<` inside quotes is text.
+        assert!(heredoc_introducers("bash <<< 'x'").is_empty());
+        assert!(heredoc_introducers("echo '<<EOF'").is_empty());
+    }
+
+    #[test]
+    fn take_logical_line_does_not_continue_a_comment() {
+        // bash does not continue a COMMENT line: the trailing backslash is
+        // comment text, so the next line starts a new command. Joining pulled
+        // that command into the comment, where the strip pass deleted it —
+        // canary confirms bash runs it. The separator-bearing spellings are
+        // the sharp ones, since those are what a comment-blind splitter used
+        // to survive on.
+        for cmd in [
+            "echo a #;\\\nrm -rf ~/Documents",
+            "echo a #|\\\nrm -rf ~/Documents",
+            "echo a # see notes \\\nrm -rf ~/Documents",
+        ] {
+            let out = split_segments(cmd);
+            assert!(
+                out.iter().any(|s| s.contains("rm -rf ~/Documents")),
+                "{cmd:?} swallowed the next command: {out:?}"
+            );
+        }
+
+        // Discriminating control: a real continuation with NO comment must
+        // still join, or the fix degenerates into "never continue".
+        assert_eq!(
+            split_segments("gh issue create --repo o/r \\\n  --body-file b.md"),
+            vec!["gh issue create --repo o/r   --body-file b.md"]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_space_is_not_a_word_boundary() {
+        // `\ ` joins two halves of ONE word, so `a\ #x` is the single argument
+        // `a #x` and the `&&` after it still runs. Testing the raw preceding
+        // character saw an ordinary space and ate the rest of the line.
+        // Confirmed against bash with a canary: the second command executes.
+        let out = split_segments("echo a\\ #x && rm -rf ~/Documents");
+        assert!(
+            out.iter().any(|s| s.contains("rm -rf ~/Documents")),
+            "escaped space opened a bogus comment: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_quote_state_carries_across_lines_for_comments() {
+        // A `"` opened on one line still suppresses a `#` on the next, so the
+        // comment scan cannot be done per physical line.
+        let out = split_segments("git commit -m \"line one\nline two # not a comment\"");
+        assert_eq!(out.len(), 1, "quoted newline was split: {out:?}");
+        assert!(out[0].contains("# not a comment"), "{out:?}");
+    }
+
+    #[test]
+    fn split_segments_hash_without_a_word_boundary_is_not_a_comment() {
+        // The negative controls that keep the rule from eating live syntax.
+        // bash only starts a comment where a word could start, so a `#` glued
+        // to the preceding token is ordinary text — parameter expansions
+        // (`$#`, `${x#pre}`) and hash-bearing arguments must survive intact.
+        assert_eq!(split_segments("echo foo#bar"), vec!["echo foo#bar"]);
+        assert_eq!(split_segments("echo $#"), vec!["echo $#"]);
+        assert_eq!(split_segments("echo ${x#pre}"), vec!["echo ${x#pre}"]);
+        assert_eq!(
+            split_segments("git commit -m fix#123"),
+            vec!["git commit -m fix#123"]
+        );
+    }
+
+    #[test]
+    fn split_segments_quoted_hash_is_not_a_comment() {
+        // Inside a string a `#` is data, whatever precedes it. Losing this
+        // would truncate arguments — and, worse, drop a `&&`/`;` that lives
+        // inside the same quoted value.
+        assert_eq!(
+            split_segments("echo '# not a comment'"),
+            vec!["echo '# not a comment'"]
+        );
+        assert_eq!(
+            split_segments("echo \"# not a comment\""),
+            vec!["echo \"# not a comment\""]
+        );
+        assert_eq!(
+            split_segments("git commit -m 'fix # 12 && cleanup'"),
+            vec!["git commit -m 'fix # 12 && cleanup'"]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_hash_is_not_a_comment() {
+        // `\#` is a literal `#`; the backslash arm consumes the pair before
+        // the comment rule can see it.
+        assert_eq!(split_segments("echo hi \\# fine"), vec!["echo hi \\# fine"]);
+    }
+
+    // --- #475: backslash escapes must agree with `tokenize` ---
+
+    #[test]
+    fn split_segments_joins_backslash_newline_continuation() {
+        // The shell removes a backslash-newline and runs ONE command. Cutting
+        // there split a posting verb away from its own `--body-file` flag.
+        assert_eq!(
+            split_segments("gh issue create --repo o/r \\\n  --body-file /tmp/b.md"),
+            vec!["gh issue create --repo o/r   --body-file /tmp/b.md"]
+        );
+    }
+
+    #[test]
+    fn split_segments_joins_crlf_continuation() {
+        assert_eq!(
+            split_segments("gh pr create \\\r\n  --body hi"),
+            vec!["gh pr create   --body hi"]
+        );
+    }
+
+    #[test]
+    fn split_segments_bare_newline_still_splits() {
+        // Discriminating control for the two above: only a BACKSLASH-newline
+        // joins. A plain newline is still a segment boundary, so the joins are
+        // evidence of continuation handling, not of newline splitting breaking.
+        assert_eq!(
+            split_segments("gh pr create\n  --body hi"),
+            vec!["gh pr create", "--body hi"]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_backslash_before_newline_still_splits() {
+        // `\\` is an escaped backslash, so the newline after it is a real
+        // separator — the escape must be consumed as a pair, not read as the
+        // lead of a continuation.
+        assert_eq!(
+            split_segments("echo a\\\\\ngit status"),
+            vec!["echo a\\\\", "git status"]
+        );
+    }
+
+    #[test]
+    fn split_segments_continuation_inside_single_quotes_diverges_only_in_content() {
+        // KNOWN, DELIBERATE divergence. Bash keeps a backslash-newline literal
+        // inside `'…'` (verified: `printf '[%s]' 'a \<newline>b'` prints the
+        // backslash and the newline); the joiner is quote-blind and removes it.
+        // The trade is documented on `take_logical_line`: tracking quotes here
+        // is what desynchronized on an apostrophe in heredoc prose and split
+        // commands the shell keeps whole.
+        //
+        // What must hold is that the divergence is confined to the CONTENT of
+        // a quoted value and never moves a boundary, so this asserts the
+        // segment COUNT rather than pinning the joined text as if it were
+        // correct.
+        assert_eq!(split_segments("git commit -m 'a \\\n b'").len(), 1);
+    }
+
+    #[test]
+    fn split_segments_quoted_operator_survives_the_quote_blind_join() {
+        // The property the divergence above must not cost: an operator inside
+        // `'…'` is still text, not a boundary, even when a continuation was
+        // joined inside the same string. Removing a backslash and a newline
+        // cannot change which quote characters the splitter sees.
+        assert_eq!(
+            split_segments("git commit -m 'a \\\n && rm -rf ~'").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn split_segments_apostrophe_in_heredoc_prose_does_not_suppress_a_continuation() {
+        // Regression for the desync a quote-tracking pre-pass caused: an
+        // ordinary contraction in heredoc body text put the tracker in
+        // single-quote mode, so every LATER continuation went unjoined and the
+        // command was cut in half. Heredoc bodies are read raw, so prose
+        // cannot reach the continuation logic at all.
+        let out = split_segments(
+            "cat <<'EOF'\nit's fine\nEOF\ngh issue create --repo o/r \\\n  --body-file body.md",
+        );
+        assert!(
+            out.iter()
+                .any(|s| s.contains("gh issue create") && s.contains("--body-file")),
+            "continuation was suppressed by prose: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_surfaces_a_substitution_spanning_two_body_lines() {
+        // A substitution ends at its closing delimiter, not at a newline, so
+        // `` `cmd ⏎ cmd` `` is ONE substitution running two commands — bash
+        // treats the newline inside backticks as a separator and runs both.
+        // Extracting per physical line found no closer on either half and
+        // emitted nothing, so both commands vanished before any guard saw them.
+        let out = command_segments("cat <<EOF\nx `cat .env\nid -un`\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "multi-line substitution vanished: {out:?}"
+        );
+        assert!(
+            out.iter().any(|s| s.contains("id -un")),
+            "second command in the substitution vanished: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_surfaces_a_dollar_paren_spanning_two_body_lines() {
+        // Same boundary, the `$( … )` spelling.
+        let out = command_segments("cat <<EOF\nx $(cat .env\nid -un)\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "multi-line $() vanished: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_carried_span_survives_a_comment_on_the_introducing_line() {
+        // The carry site and the comment rule interact, and the order they
+        // landed in matters. Spans used to be appended to the introducing line
+        // separated by a SPACE, so a heredoc introduced on a line that also
+        // carries a comment collapsed to `cat <<EOF # note $(rm -rf ~)` — and
+        // the comment rule then swallowed the payload whole, manufacturing a
+        // brand-new miss out of a fix. bash really runs that deletion: the
+        // comment ends at the newline, and the body is a separate line.
+        //
+        // Appending each span behind a `'\n'` keeps it a segment of its own,
+        // out of the comment's reach. This test FAILS if the comment arm lands
+        // without the newline separator.
+        let out = command_segments("cat <<EOF # note\nprose $(rm -rf ~)\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("rm -rf ~")),
+            "carried span was swallowed by the comment: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_unterminated_heredoc_keeps_a_substitution_in_its_prose() {
+        // The terminator-never-matched fallback keeps body lines verbatim so a
+        // command bash executes is never dropped — but those lines are DATA
+        // being handed on as shell syntax, so the comment pass read the `#` in
+        // the prose as a comment and discarded the substitution behind it.
+        // bash runs it (canary confirmed). Expansion-depth tracking cannot help
+        // here: the `#` sits BEFORE the `$(`, at depth zero.
+        let out = command_segments("cat <<EOF\nprose # $(rm -rf ~/Documents)");
+        assert!(
+            out.iter().any(|s| s.contains("rm -rf ~/Documents")),
+            "substitution in unterminated-heredoc prose was dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_commented_out_heredoc_introducer_is_not_an_introducer() {
+        // `echo hi # cat <<EOF` is one `echo` to bash — the `<<EOF` is inside a
+        // comment, so the lines after it are ordinary commands. Detecting the
+        // delimiter there consumed them as a body and dropped them, including
+        // a deletion bash runs (canary confirmed). Pre-existing, but this file
+        // only learned about comments on one of its two passes.
+        let out = command_segments("echo hi # cat <<EOF\nrm -rf ~/Documents\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("rm -rf ~/Documents")),
+            "commented-out introducer still ate its 'body': {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_real_heredoc_introducer_still_strips_its_body() {
+        // Discriminating control for the row above: an UNcommented introducer
+        // must still consume its body, or the fix degenerates into "never
+        // detect a heredoc".
+        let out = command_segments("cat <<EOF\nplain prose\nEOF\necho after");
+        assert!(
+            !out.iter().any(|s| s.contains("plain prose")),
+            "body leaked as a segment: {out:?}"
+        );
+        assert!(out.iter().any(|s| s.contains("echo after")), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_single_line_substitution_still_surfaces() {
+        // Discriminating control: the one-line shape worked before and must
+        // still work, so the two tests above are evidence about the line
+        // boundary rather than about carry-forward being broken outright.
+        let out = command_segments("cat <<EOF\nx `cat .env`\nEOF");
+        assert!(out.iter().any(|s| s.contains("cat .env")), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_quoted_paren_does_not_end_a_substitution_early() {
+        // Inside `$( … )` the text is shell code, so a `)` in a quoted string
+        // is content. Counting parens blind closed the span at that `)` and
+        // dropped everything after it.
+        let out = command_segments("cat <<EOF\nx $(echo \")\" ; cat .env)\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "quoted paren truncated the span: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_ansi_c_inside_a_substitution_does_not_truncate_the_span() {
+        // `$'a\'b'` inside `$( … )` honors the escaped quote and closes at the
+        // real one, so the `;` command after it still runs and the `)` still
+        // closes the span. A private two-state quote tracker read the escaped
+        // quote as the closer, reopened a string on the real one, and swallowed
+        // the closing paren — dropping every command after it. Bash runs them.
+        let out = command_segments("cat <<EOF\nx $(echo $'a\\'b' ; cat .env)\nEOF");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "ANSI-C string truncated the span: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_substitution_scan_stops_at_the_terminator() {
+        // The mirror of the hidden-command bug: widening the scan to the whole
+        // body must not let it reach PAST the terminator and fabricate a
+        // command out of text the heredoc never contained. The body here holds
+        // an unclosed `$(`; the `cat .env` after the terminator is a real
+        // command in its own right and must appear as its own segment, never
+        // absorbed into a span from inside the body.
+        let out = command_segments("cat <<EOF\nx $(echo hi\nEOF\ncat .env");
+        assert!(
+            out.iter().any(|s| s.trim() == "cat .env"),
+            "post-terminator command lost: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|s| s.contains("$(echo hi") && s.contains("cat .env")),
+            "scan ran past the terminator and fabricated a span: {out:?}"
+        );
+    }
+
+    // --- backtick spans end at the first UNESCAPED backtick, quotes included ---
+    //
+    // Bash-verified, not reasoned. `echo `echo 'a`b'`` fails with an unmatched
+    // SINGLE QUOTE, which can only happen if the substitution was truncated at
+    // the backtick inside those quotes. This arm therefore gets no quote
+    // tracking on purpose — adding it would diverge from the shell.
+
+    #[test]
+    fn substitution_spans_backtick_closes_even_inside_single_quotes() {
+        // The span ends at the quoted backtick, so what is carried is the
+        // truncated substitution — matching where bash stops reading.
+        assert_eq!(
+            substitution_spans("x `echo 'a`b'`"),
+            vec!["`echo 'a`".to_string()]
+        );
+    }
+
+    #[test]
+    fn substitution_spans_escaped_backtick_does_not_close() {
+        // A backslash still escapes it, so the span runs to the real closer.
+        assert_eq!(
+            substitution_spans("x `echo a\\`b`"),
+            vec!["`echo a\\`b`".to_string()]
+        );
+    }
+
+    #[test]
+    fn substitution_spans_backtick_without_an_inner_backtick_control() {
+        // CONTROL — do not delete as redundant coverage. It is what makes the
+        // two assertions above attributable: the same shape with no inner
+        // backtick spans the whole quoted region, so their truncation is caused
+        // by the backtick rather than by the quoting or the surrounding text.
+        assert_eq!(
+            substitution_spans("x `echo 'aXb'`"),
+            vec!["`echo 'aXb'`".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_segments_unclosed_substitution_carries_nothing() {
+        // Control for the two above: a substitution the shell would never run
+        // (no closer anywhere in the body) must still carry nothing, so the
+        // span extractor did not simply become permissive.
+        let out = command_segments("cat <<EOF\nx `cat .env\nEOF");
+        assert!(
+            !out.iter().any(|s| s.trim() == "cat .env"),
+            "unclosed substitution was carried as a command: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_apostrophe_in_prose_does_not_hide_a_substitution() {
+        // Same desync reaching the unquoted-heredoc carry-forward: a body line
+        // holding a command substitution must still surface as its own segment
+        // when the prose around it contains an apostrophe.
+        //
+        // Asserted as its OWN segment, not as a substring: the carrier segment
+        // `echo <<EOF it's here $(cat .env)` contains the text either way, so a
+        // `contains` check passes even when the recursion never surfaced the
+        // read — which is precisely the miss being guarded against.
+        let out = command_segments("echo <<EOF\nit's here $(cat .env)\nEOF");
+        assert!(
+            out.iter().any(|s| s.trim() == "cat .env"),
+            "substitution never surfaced as its own segment: {out:?}"
+        );
+        // Control: the same command WITHOUT the apostrophe, so a failure above
+        // is attributable to the apostrophe rather than to carry-forward being
+        // broken outright.
+        let clean = command_segments("echo <<EOF\nsee $(cat .env)\nEOF");
+        assert!(
+            clean.iter().any(|s| s.trim() == "cat .env"),
+            "carry-forward is broken independently of the apostrophe: {clean:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_quote_does_not_end_the_value() {
+        // The laundering case: `\"` inside `"…"` is content, so the `&&` is
+        // still inside one argument and creates no boundary. Real bash passes
+        // `he said " && cadence:attune here` as a single `-m` value.
+        assert_eq!(
+            split_segments("git commit -m \"he said \\\" && cadence:attune here\""),
+            vec!["git commit -m \"he said \\\" && cadence:attune here\""]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_quote_hides_no_semicolon_or_pipe() {
+        for op in [";", "|"] {
+            let cmd = format!("git commit -m \"he said \\\" {op} secret\"");
+            assert_eq!(split_segments(&cmd), vec![cmd.clone()], "operator {op}");
+        }
+    }
+
+    #[test]
+    fn split_segments_escaped_backslash_inside_quotes_still_closes() {
+        // `\\` is an escaped backslash, so the `"` after it DOES close the
+        // string and the following `&&` is a real operator. Control proving the
+        // escape handling is selective rather than swallowing every backslash.
+        assert_eq!(
+            split_segments("echo \"a\\\\\" && git status"),
+            vec!["echo \"a\\\\\"", "git status"]
+        );
+    }
+
+    #[test]
+    fn split_segments_continuation_on_a_heredoc_line_does_not_swallow_the_next_command() {
+        // The merge hazard the continuation fix creates if it runs AFTER the
+        // line-based heredoc strip. Verified against bash: the continuation
+        // joins line 1 to `body`, the heredoc body is empty because `EOF`
+        // immediately terminates it, and `rm -rf /tmp/x` is a SEPARATE command.
+        // Joining first must not let the introducer's trailing backslash reach
+        // across the stripped body and absorb that command.
+        let out = split_segments("cat <<'EOF' \\\nbody\nEOF\nrm -rf /tmp/x");
+        assert!(
+            out.contains(&"rm -rf /tmp/x".to_string()),
+            "next command was swallowed into the heredoc segment: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_heredoc_without_continuation_still_drops_its_body() {
+        // Discriminating control: the ordinary heredoc (no continuation) must
+        // still have its prose body stripped, so the test above is evidence
+        // about continuation ordering rather than about heredoc handling
+        // having been disabled.
+        let out = split_segments("cat <<'EOF'\nsee the .env file\nEOF\nrm -rf /tmp/x");
+        assert!(
+            !out.iter().any(|s| s.contains(".env")),
+            "heredoc prose leaked into segments: {out:?}"
+        );
+        assert!(out.contains(&"rm -rf /tmp/x".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn split_segments_ansi_c_escaped_quote_does_not_hide_the_next_command() {
+        // The #463 divergence, one layer up. `$'…'` honors `\'`, so reading it
+        // as a plain `'…'` closed on the escaped quote and the real closing `'`
+        // reopened a phantom string that swallowed everything after it — the
+        // `rm -rf /tmp/x` here was absent from the segment list entirely, not
+        // merely misfiled, and so invisible to every guard that segments.
+        let out = split_segments(r"git commit -m $'msg with \' quote' && rm -rf /tmp/x");
+        assert_eq!(
+            out,
+            vec![r"git commit -m $'msg with \' quote'", "rm -rf /tmp/x"],
+            "ANSI-C string swallowed the operator"
+        );
+    }
+
+    #[test]
+    fn split_segments_ansi_c_agrees_with_tokenize_on_the_run() {
+        // The two parsers must end the quoted run at the same character. This
+        // asserts agreement directly rather than restating either side: the
+        // tokenizer sees one `-m` value, so the splitter must see one segment
+        // for that command plus the separate one after the operator.
+        let cmd = r"git commit -m $'a\'b' && rm -rf /tmp/x";
+        let tokens = tokenize(cmd);
+        assert_eq!(tokens.iter().filter(|t| *t == "&&").count(), 1);
+        assert_eq!(tokens[3], "a'b");
+        assert_eq!(split_segments(cmd).len(), 2);
+    }
+
+    #[test]
+    fn split_segments_plain_single_quote_still_takes_no_escapes() {
+        // Discriminating control: `'…'` is NOT ANSI-C. A backslash in it is
+        // literal and the first `'` closes, so the `'` after `\` ends the
+        // string and the `&&` that follows is a real operator. Proves the new
+        // mode is scoped to `$'…'` rather than applied to every single quote.
+        assert_eq!(
+            split_segments(r"echo 'a\' && rm -rf /tmp/x"),
+            vec![r"echo 'a\'", "rm -rf /tmp/x"]
+        );
+    }
+
+    #[test]
+    fn split_segments_dollar_outside_ansi_c_is_ordinary_text() {
+        // Mirrors `tokenize_dollar_outside_ansi_c_is_ordinary_text`: only `$'`
+        // opens the mode, so `$VAR` and `$(…)` are untouched.
+        assert_eq!(
+            split_segments("echo $HOME && echo $(id -u)"),
+            vec!["echo $HOME", "echo $(id -u)"]
+        );
+    }
+
+    #[test]
+    fn split_segments_escaped_quote_outside_quotes_opens_nothing() {
+        // Matches `tokenize_escaped_quote_outside_quotes_opens_nothing`: a
+        // `\"` in unquoted context is a literal character, so a later `&&` is
+        // still an operator rather than string content.
+        assert_eq!(
+            split_segments("echo \\\" && git status"),
+            vec!["echo \\\"", "git status"]
+        );
+    }
+
     // --- clobber_redirect_targets ---
 
     #[test]
@@ -2467,6 +5208,244 @@ mod tests {
         assert_eq!(command_segments("sh deploy.sh"), vec!["sh deploy.sh"]);
     }
 
+    /// A wrapper prefix must not hide `sh -c` from the expansion. The inner
+    /// script reached no guard when it did: it survived as ONE
+    /// whitespace-bearing token, which `prevent-secret-leaks`' false-positive
+    /// firewall skips by design, so `sudo bash -c 'cat .env'` was allowed
+    /// while the unprefixed spelling blocked.
+    ///
+    /// Every row asserts the inner script is surfaced as its own segment. The
+    /// unprefixed row is the positive control (it always worked); the
+    /// `sudo -u root` and non-wrapper rows are the negative controls that keep
+    /// this from degenerating into "expand anything".
+    #[test]
+    fn command_segments_expands_prefixed_shell_wrapper() {
+        let inner = "cat .env".to_string();
+        for cmd in [
+            "bash -c 'cat .env'",       // positive control: always worked
+            "sudo bash -c 'cat .env'",  // the reported bypass
+            "command sh -c 'cat .env'", // the reported bypass
+            "env sh -c 'cat .env'",
+            "exec bash -c 'cat .env'",
+            "sudo command bash -c 'cat .env'", // stacked prefixes
+            "sudo /bin/sh -c 'cat .env'",      // path-qualified behind a prefix
+            "sudo \\bash -c 'cat .env'",       // alias-bypass spelling
+        ] {
+            assert!(
+                command_segments(cmd).contains(&inner),
+                "{cmd:?} did not surface the inner script"
+            );
+        }
+
+        // `sudo`'s VALUE-taking flags are parsed now, so the wrapper behind one
+        // is expanded rather than hidden (#528 review C-D1) — sudo really does
+        // run it, and refusing here made `sudo -u me sh -c 'rm note.md'`
+        // invisible to every guard that segments.
+        assert!(command_segments("sudo -u root bash -c 'cat .env'").contains(&inner));
+        // The row above never discriminated on the `starts_with('-')` guard —
+        // peeling `sudo` lands on `-u`, which is not a shell either way. This
+        // is the shape that does: `command_word` basenames on `/`, so a peel
+        // that skipped `-u/bin/bash` without recognising it as `-u`'s GLUED
+        // VALUE would resolve `bash` and expand into a false block. Consuming
+        // it as a value lands on `-c`, which is not a shell — the same verdict
+        // for a better reason, and still the mutant-killing row.
+        assert!(!command_segments("sudo -u/bin/bash -c 'cat .env'").contains(&inner));
+        // Still not a wrapper just because a prefix precedes it.
+        assert!(!command_segments("sudo echo 'cat .env'").contains(&inner));
+        // A word that merely starts with `sudo` is not `sudo`.
+        assert!(!command_segments("sudoedit bash -c 'cat .env'").contains(&inner));
+    }
+
+    #[test]
+    fn command_segments_expands_shell_c_with_end_of_options() {
+        // #496. `--` ends the shell's own option parsing; the script is the
+        // token AFTER it. Returning the `--` itself handed guards a segment of
+        // two dashes and left the real script inside one whitespace-bearing
+        // token that the secret-leak firewall skips by design.
+        let inner = "rm -rf ~/Documents".to_string();
+        assert!(command_segments("bash -c -- 'rm -rf ~/Documents'").contains(&inner));
+        assert!(command_segments("sh -c -- 'rm -rf ~/Documents'").contains(&inner));
+        // Positive control: the plain spelling always worked and still does,
+        // so the rows above are evidence about `--`, not about `-c` at large.
+        assert!(command_segments("bash -c 'rm -rf ~/Documents'").contains(&inner));
+        // A `--` is only skipped where an option would go. `bash -c -- -- x`
+        // makes the second `--` the script, exactly as bash does.
+        assert_eq!(
+            shell_c_argument("bash -c -- -- echo"),
+            Some("--".to_string())
+        );
+    }
+
+    #[test]
+    fn command_segments_expands_sudo_with_no_argument_flags() {
+        // #497. `sudo`'s own options used to stop the peel outright, so every
+        // flagged spelling hid the wrapper behind it. Flags that take NO
+        // argument are unambiguous: the word after them is still the command,
+        // so peeling is safe.
+        let inner = "cat .env".to_string();
+        for cmd in [
+            "sudo -E bash -c 'cat .env'",
+            "sudo -H bash -c 'cat .env'",
+            "sudo -n bash -c 'cat .env'",
+            "sudo -i bash -c 'cat .env'",
+            "sudo -EH bash -c 'cat .env'", // clustered short flags
+            "sudo --preserve-env bash -c 'cat .env'",
+            "sudo --preserve-env=PATH bash -c 'cat .env'", // the `=` prefix form
+            "sudo -- bash -c 'cat .env'",                  // end of options
+            "sudo -E -- bash -c 'cat .env'",
+        ] {
+            assert!(
+                command_segments(cmd).contains(&inner),
+                "{cmd:?} did not surface the inner script"
+            );
+        }
+
+        // `-u` TAKES an argument, and consuming a KNOWN value-taking flag WITH
+        // its value is knowledge, not a guess — so the wrapper behind it is
+        // expanded now (#528 review C-D1). The old refusal cost more than it
+        // saved: it hid `sudo -u me sh -c 'rm note.md'` from every guard that
+        // segments while `sudo -u me rm note.md` blocked at the verb gate one
+        // position over.
+        assert!(command_segments("sudo -u root bash -c 'cat .env'").contains(&inner));
+        // #493's discriminating negative, and still red: `-u/bin/bash` is `-u`
+        // with a GLUED value, so the command word is `-c` — not a shell. A peel
+        // that skipped the token without reading it as a value would basename
+        // it to `bash` and expand into a false block.
+        assert!(!command_segments("sudo -u/bin/bash -c 'cat .env'").contains(&inner));
+        // An unknown flag is still refused: we cannot know whether it consumes
+        // the next word, and THAT is the never-guess property the widening
+        // above keeps intact.
+        assert!(!command_segments("sudo -Z bash -c 'cat .env'").contains(&inner));
+        assert!(!command_segments("sudo --unknown-flag bash -c 'cat .env'").contains(&inner));
+    }
+
+    #[test]
+    fn command_segments_expands_a_wrapper_behind_a_flagged_runner() {
+        // #528 review C-D1. The wrapper hunt refused at a modelled runner's
+        // first option while the verb gates walked that same option's grammar,
+        // so the shell behind it was invisible to every guard that segments —
+        // a one-token difference between `nice sh -c '…'` (expanded) and
+        // `nice -n 10 sh -c '…'` (not).
+        let inner = "cat .env".to_string();
+        for cmd in [
+            "nice -n 10 bash -c 'cat .env'",
+            "nice -10 bash -c 'cat .env'",
+            "nice --10 bash -c 'cat .env'",
+            "env -i sh -c 'cat .env'",
+            "env -u FOO sh -c 'cat .env'",
+            "env -P /bin sh -c 'cat .env'",
+            "stdbuf -o0 sh -c 'cat .env'",
+            "timeout 5 sh -c 'cat .env'",
+            "timeout -k 1 5 sh -c 'cat .env'",
+            "xargs -0 sh -c 'cat .env'",
+            "xargs -I{} sh -c 'cat .env'",
+            "sudo -u me sh -c 'cat .env'",
+            "nice -n 10 sudo -E bash -c 'cat .env'", // stacked
+        ] {
+            assert!(
+                command_segments(cmd).contains(&inner),
+                "{cmd:?} did not surface the inner script"
+            );
+        }
+
+        // Controls: an option OUTSIDE the modelled grammar still refuses the
+        // walk, which is the never-guess property the widening keeps. And a
+        // runner that reports without executing (`sudo -l`) must not have its
+        // operand expanded — the shell never runs it.
+        for cmd in [
+            "nice ---10 sh -c 'cat .env'",
+            "env -S 'sh -c \"cat .env\"'",
+            "sudo -Z sh -c 'cat .env'",
+            "sudo -l sh -c 'cat .env'",
+        ] {
+            assert!(
+                !command_segments(cmd).contains(&inner),
+                "{cmd:?} must not be expanded"
+            );
+        }
+    }
+
+    #[test]
+    fn peel_command_runners_resolves_the_command_behind_a_flagged_runner() {
+        for (command, want_head) in [
+            ("nice -n 10 bash", Some("bash")),
+            ("env -i /bin/sh", Some("/bin/sh")),
+            ("sudo -u me sh", Some("sh")),
+            ("stdbuf -o0 rm", Some("rm")),
+            ("timeout -k 1 5 rm", Some("rm")),
+            ("xargs -0 rm", Some("rm")),
+            ("nice -n 10 env -i sudo -u me rm", Some("rm")),
+            ("command nice -n 10 rm", Some("rm")),
+            ("FOO=1 nice -n 10 rm", Some("rm")),
+            // `git` is NOT a command runner: it runs a subcommand from its own
+            // fixed set, so peeling its globals here would drop a subcommand
+            // name into an executable position it never occupies.
+            ("git -C . rm note.md", Some("git")),
+            // Unmodelled option: refuse the walk rather than resolve a wrong
+            // head word. Refusing leaves the RUNNER as the head — `nice` is not
+            // a delete verb or a shell, so every gate downstream reads it as
+            // "nothing resolved here" rather than as `rm`.
+            ("nice -é rm", Some("nice")),
+            // Options all the way down — nothing to resolve, argv unchanged.
+            ("nice -n", Some("nice")),
+            ("sudo -u", Some("sudo")),
+        ] {
+            let tokens = words(command);
+            assert_eq!(
+                peel_command_runners(&tokens).first().map(String::as_str),
+                want_head,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_segments_keeps_substitutions_on_a_wrapper_segment() {
+        // A `$(…)` runs in the PARENT before the wrapper is spawned, so the two
+        // COEXIST — `expand_segments` selected between them and dropped the
+        // substitution from every wrapper segment. `child_scripts` already
+        // unioned them (#228 review finding 2); this pins the segmenter
+        // agreeing with it.
+        let inner = "rm note.md".to_string();
+        for cmd in [
+            r#"bash -c 'echo hi' "$(rm note.md)""#,
+            "bash -c 'echo hi' `rm note.md`",
+            r#"nice -n 10 bash -c 'echo hi' "$(rm note.md)""#,
+            r#"sudo -u me bash -c 'echo hi' "$(rm note.md)""#,
+        ] {
+            assert!(
+                command_segments(cmd).contains(&inner),
+                "{cmd:?} dropped its command substitution"
+            );
+        }
+
+        // The wrapper script is still surfaced alongside it, so the union adds
+        // rather than replaces.
+        let segments = command_segments(r#"bash -c 'cat .env' "$(rm note.md)""#);
+        assert!(segments.contains(&"cat .env".to_string()));
+        assert!(segments.contains(&inner));
+
+        // Control: single quotes suppress a substitution in the PARENT, so a
+        // non-wrapper segment must not surface one. (The wrapper spelling
+        // `bash -c 'echo $(rm note.md)'` is deliberately NOT this control — the
+        // quotes stop the parent from running it, and then the CHILD shell runs
+        // it, so surfacing that one is correct.)
+        assert!(!command_segments(r#"echo 'literal $(rm note.md)'"#).contains(&inner));
+        // And the wrapper spelling above does surface it, one level down.
+        assert!(command_segments(r#"bash -c 'echo $(rm note.md)'"#).contains(&inner));
+    }
+
+    #[test]
+    fn command_segments_sudo_flags_and_end_of_options_compose() {
+        // The two fixes live in different functions — the prefix peel and the
+        // `-c` argument walk — and neither subsumes the other. This spelling
+        // needs BOTH, so it pins the composition rather than either half.
+        assert!(
+            command_segments("sudo -E bash -c -- 'rm -rf ~/Documents'")
+                .contains(&"rm -rf ~/Documents".to_string())
+        );
+    }
+
     // --- heredoc stripping ---
 
     #[test]
@@ -2487,8 +5466,14 @@ mod tests {
     fn split_segments_unquoted_heredoc_carries_substitution() {
         // Unquoted delimiter: a body line with `$(` is re-appended so its
         // substitution still surfaces; prose lines are still dropped.
+        //
+        // The span comes back as its OWN segment rather than glued to the
+        // introducing line: a space put it within reach of a trailing comment
+        // on that line, which then discarded it (#490/#499). What the carry
+        // exists to guarantee is unchanged — the substitution reaches the
+        // splitter, and the prose does not.
         let segs = split_segments("cat <<EOF\nplain prose\n$(cat .env)\nEOF");
-        assert_eq!(segs, vec!["cat <<EOF $(cat .env)"]);
+        assert_eq!(segs, vec!["cat <<EOF", "$(cat .env)"]);
     }
 
     #[test]
@@ -2626,6 +5611,48 @@ mod tests {
         // Environment-sourced variable — no visible assignment, stays literal.
         let out = command_segments("$OP_CMD item list");
         assert!(out.contains(&"$OP_CMD item list".to_string()));
+    }
+
+    #[test]
+    fn command_segments_later_assignment_does_not_reach_back() {
+        // The shell expands `$F` before it ever reaches the `||` branch, so
+        // `$F` there is whatever the environment held — never `/etc/passwd`.
+        // Substituting it invented an operand the command never receives.
+        let out = command_segments("cat $F || F=/etc/passwd");
+        assert!(
+            out.contains(&"cat $F".to_string()),
+            "later assignment leaked backwards: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|s| s.contains("cat /etc/passwd")),
+            "later assignment leaked backwards: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_same_segment_assignment_does_not_self_resolve() {
+        // `F=new cmd $F` passes the OLD `$F`: the assignment takes effect for
+        // the command's environment, not for expanding its own words.
+        let out = command_segments("F=/etc/passwd cat $F");
+        assert!(
+            out.contains(&"F=/etc/passwd cat $F".to_string()),
+            "assignment resolved into its own segment: {out:?}"
+        );
+    }
+
+    #[test]
+    fn command_segments_reassignment_uses_the_newest_value() {
+        // Append-ordered lookup must find the replacement, not the original.
+        let out = command_segments("F=first; F=second; cat $F");
+        assert!(out.contains(&"cat second".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn command_segments_subshell_assignment_does_not_leak_out() {
+        // A `sh -c` script's own assignment dies with the subshell, so the
+        // parent's later `$F` stays unresolved.
+        let out = command_segments("sh -c 'F=/etc/passwd'; cat $F");
+        assert!(out.contains(&"cat $F".to_string()), "{out:?}");
     }
 
     #[test]
@@ -3085,5 +6112,187 @@ mod tests {
     fn for_in_word_boundary() {
         // "information" contains "for" but not as a word boundary
         assert!(!LOOP_PATTERN.is_match("echo information about this"));
+    }
+
+    // --- push_repository_argument: git push option grammar (#550) ---
+    //
+    // Every separate-value claim below was measured against git 2.55.0 by
+    // pointing pushes at nonexistent local paths and reading which token git
+    // named as the repository.
+
+    fn dests(s: &str) -> PushDestinations {
+        let w: Vec<String> = s.split_whitespace().map(String::from).collect();
+        push_repository_argument(&w)
+    }
+
+    /// The destination git itself would use: positional first, `--repo` after.
+    fn target(s: &str) -> Option<String> {
+        let d = dests(s);
+        d.positional.or(d.repo_flag)
+    }
+
+    #[test]
+    fn push_target_plain_positional() {
+        assert_eq!(target("origin main"), Some("origin".into()));
+    }
+
+    #[test]
+    fn push_target_bare_push_has_none() {
+        assert_eq!(target(""), None);
+    }
+
+    #[test]
+    fn push_target_boolean_flags_skipped() {
+        assert_eq!(target("--force origin main"), Some("origin".into()));
+        assert_eq!(target("-q origin main"), Some("origin".into()));
+    }
+
+    #[test]
+    fn push_target_short_cluster_value_is_next_word() {
+        // `-qo topic=x` — the `o` is last in the cluster, so its value is the
+        // NEXT word; the URL after it is the repository.
+        assert_eq!(
+            target("-qo topic=x https://github.com/evil/x.git main"),
+            Some("https://github.com/evil/x.git".into())
+        );
+        assert_eq!(
+            target("-o topic=x https://github.com/evil/x.git main"),
+            Some("https://github.com/evil/x.git".into())
+        );
+    }
+
+    #[test]
+    fn push_target_short_cluster_value_inline() {
+        // `-otopic=x` — `o` is not last, so the rest of the token is the value.
+        assert_eq!(target("-otopic=x origin main"), Some("origin".into()));
+    }
+
+    #[test]
+    fn push_target_separate_value_long_options() {
+        for opt in ["--receive-pack", "--exec", "--repo", "--push-option"] {
+            assert_eq!(
+                target(&format!("{opt} ZZZ origin main")),
+                Some("origin".into()),
+                "{opt} must consume its separate value"
+            );
+        }
+    }
+
+    #[test]
+    fn push_target_inline_value_long_options_consume_no_word() {
+        assert_eq!(
+            target("--receive-pack=ZZZ origin main"),
+            Some("origin".into())
+        );
+    }
+
+    #[test]
+    fn push_target_optional_value_options_do_not_consume() {
+        // Measured: `git push --signed /nonexistent/repoD main` reports
+        // /nonexistent/repoD as the repository. Consuming the next word here
+        // would swallow the real target and false-block an ordinary push.
+        assert_eq!(target("--signed origin main"), Some("origin".into()));
+        assert_eq!(
+            target("--force-with-lease origin main"),
+            Some("origin".into())
+        );
+    }
+
+    #[test]
+    fn push_target_double_dash_terminator() {
+        assert_eq!(target("-- origin main"), Some("origin".into()));
+    }
+
+    #[test]
+    fn push_target_positional_beats_repo_flag() {
+        // Measured: `git push --repo=/nonexistent/EQ /nonexistent/POS HEAD:main`
+        // reports /nonexistent/POS — the positional wins.
+        assert_eq!(
+            target("--repo=https://github.com/a/b.git origin main"),
+            Some("origin".into())
+        );
+    }
+
+    #[test]
+    fn push_target_repo_flag_used_when_no_positional() {
+        // Fail-closed fallback: with no positional, validate --repo's value
+        // rather than silently falling back to the owned tracking remote.
+        assert_eq!(
+            target("--repo=https://github.com/evil/x.git"),
+            Some("https://github.com/evil/x.git".into())
+        );
+        assert_eq!(
+            target("--repo https://github.com/evil/x.git"),
+            Some("https://github.com/evil/x.git".into())
+        );
+    }
+
+    #[test]
+    fn push_target_recurse_submodules_consumes_its_value() {
+        // Found by an adversarial pass on the first cut of this fix: absent from
+        // the model, `check` posed as the repository. Measured against git
+        // 2.55.0 — `--recurse-submodules ZZZVAL /nonexistent/T main` reports
+        // `bad recurse-submodules argument: ZZZVAL`, so the value is consumed.
+        assert_eq!(
+            target("--recurse-submodules check https://github.com/evil/x.git main"),
+            Some("https://github.com/evil/x.git".into())
+        );
+    }
+
+    #[test]
+    fn push_target_unique_prefix_abbreviations_consume_values() {
+        // git's parse-options resolves any unambiguous abbreviation, so an
+        // exact-match list let each of these hide the real target.
+        for opt in [
+            "--recu",
+            "--recurse-s",
+            "--rep",
+            "--exe",
+            "--receiv",
+            "--pu",
+            "--push-op",
+        ] {
+            assert_eq!(
+                target(&format!("{opt} VAL https://github.com/evil/x.git main")),
+                Some("https://github.com/evil/x.git".into()),
+                "{opt} must consume its separate value"
+            );
+        }
+    }
+
+    #[test]
+    fn push_target_boolean_prefixes_do_not_consume() {
+        // No git push boolean shares a prefix with a value-taking option, so
+        // these must NOT swallow the target — a false block on an ordinary push.
+        for opt in ["--force", "--follow-tags", "--signed", "--force-with-lease"] {
+            assert_eq!(
+                target(&format!("{opt} origin main")),
+                Some("origin".into()),
+                "{opt} must not consume the target"
+            );
+        }
+    }
+
+    #[test]
+    fn push_repo_flag_reported_alongside_a_positional() {
+        // The regression the first cut shipped: `--recurse-submodules` was
+        // unmodelled, `check` posed as the positional, and preferring the
+        // positional discarded the evil --repo URL that main had caught.
+        // Both are now reported so the caller validates both.
+        let d = dests("--repo https://github.com/evil/x.git --recurse-submodules check");
+        assert_eq!(
+            d.repo_flag.as_deref(),
+            Some("https://github.com/evil/x.git")
+        );
+    }
+
+    #[test]
+    fn push_repo_flag_and_positional_both_reported() {
+        let d = dests("--repo=https://github.com/evil/x.git origin main");
+        assert_eq!(d.positional.as_deref(), Some("origin"));
+        assert_eq!(
+            d.repo_flag.as_deref(),
+            Some("https://github.com/evil/x.git")
+        );
     }
 }

@@ -7,7 +7,7 @@
 //! stdin.
 
 use cadence_hooks_core::HookEvent;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::process;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,6 +128,13 @@ enum Commands {
     /// List all hooks with events, descriptions, and disable status
     List,
 
+    /// Emit the complete hook registry as a machine-readable compatibility manifest
+    Manifest {
+        /// Output format
+        #[arg(long, value_enum, default_value_t = ManifestFormat::Json)]
+        format: ManifestFormat,
+    },
+
     /// Interactively configure which hooks to disable for this project
     Configure {
         /// Print current configuration without interactive mode
@@ -153,6 +160,11 @@ enum Commands {
 
     /// Convert legacy .claude/{redaction,terminology}.json into the unified .claude/cadence.json (#153)
     MigrateConfig,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ManifestFormat {
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -190,6 +202,21 @@ enum CadenceCommands {
         #[arg(long, value_name = "PATH")]
         baseline: Option<String>,
     },
+    /// Scan text (stdin or --file) for redaction hits at a destination
+    /// audience tier. CLI action — the single engine behind the redaction
+    /// skill's pre-post scan (exit 0 clean / 1 hits on stderr / 2 usage)
+    RedactScan {
+        /// Scan a file instead of stdin
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Destination tier: owned-internal | private-external | public
+        /// (default: config originAudience, else public)
+        #[arg(long, value_name = "TIER")]
+        audience: Option<String>,
+        /// Scaffold the redaction section of .claude/cadence.json and exit
+        #[arg(long)]
+        init: bool,
+    },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
     RecordPolish {
         /// Repository to record against (default: the current directory's).
@@ -203,6 +230,11 @@ enum CadenceCommands {
         /// What the pass covered — `full`, `code`, or `docs` (default: full)
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
+        /// Per-arm outcome, repeatable — e.g. `--arm security=ran --arm
+        /// tests=skipped`. Recorded additively; a marker without a roster
+        /// reads as unknown, never as skipped (cadence-hooks#467)
+        #[arg(long = "arm", value_name = "NAME=STATE", action = clap::ArgAction::Append)]
+        arm: Vec<String>,
     },
 }
 
@@ -234,6 +266,8 @@ enum GuardrailsCommands {
     GuardDotfiles,
     /// Path-aware triage of rm-family deletes (allow temp/managed, block home/vault/repo, ask the rest)
     GuardRm,
+    /// SessionStart assertion that guard-rm is present and classifying deletes as contracted
+    GuardRmLiveness,
     /// Block Read/Grep by resolved session model (opt-in via CADENCE_READ_MODEL_GUARD_MODELS)
     GuardReadModel,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
@@ -397,10 +431,11 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::MarkdownLint => "markdown-lint",
             CadenceCommands::RedactExternalContent => "redact-external-content",
             CadenceCommands::PlatformDrift { .. } => "platform-drift",
-            // record-polish is a CLI action, not a hook — no hooks.json wiring
-            // and not subject to CADENCE_DISABLE (same treatment as declare /
-            // status / dismiss-*).
+            // record-polish and redact-scan are CLI actions, not hooks — no
+            // hooks.json wiring and not subject to CADENCE_DISABLE (same
+            // treatment as declare / status / dismiss-*).
             CadenceCommands::RecordPolish { .. } => return None,
+            CadenceCommands::RedactScan { .. } => return None,
         }),
         Commands::Guardrails(g) => Some(match g {
             GuardrailsCommands::GuardPushRemote => "guard-push-remote",
@@ -416,6 +451,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnUntracked => "warn-untracked",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
             GuardrailsCommands::GuardRm => "guard-rm",
+            GuardrailsCommands::GuardRmLiveness => "guard-rm-liveness",
             GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
@@ -476,6 +512,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
         }),
         Commands::Try { .. }
         | Commands::List
+        | Commands::Manifest { .. }
         | Commands::Configure { .. }
         | Commands::Doctor { .. }
         | Commands::MigrateConfig => None,
@@ -537,6 +574,40 @@ fn print_hook_list() {
     }
 }
 
+fn print_hook_manifest(format: ManifestFormat) {
+    match format {
+        ManifestFormat::Json => {
+            let hooks = HOOKS
+                .iter()
+                .map(|hook| {
+                    serde_json::json!({
+                        "name": hook.name,
+                        "description": hook.description,
+                        "plugin": hook.plugin,
+                        "event": hook.event.map(|event| event.name()).unwrap_or("logger"),
+                        "criticality": if registry::is_security_critical(hook.name) {
+                            "security-critical"
+                        } else if hook.event.is_none() {
+                            "telemetry"
+                        } else {
+                            "workflow"
+                        },
+                        "protected": PROTECTED_GUARDS.contains(&hook.name),
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "binaryVersion": env!("CARGO_PKG_VERSION"),
+                    "hooks": hooks,
+                })
+            );
+        }
+    }
+}
+
 fn main() {
     // Pin the main thread before anything can spawn — the panic hook's guard
     // test below is only meaningful once this is set. The `Result` is
@@ -561,7 +632,7 @@ fn main() {
     let bypass_exempt = matches!(
         (positional.next().as_deref(), positional.next().as_deref()),
         (
-            Some("list" | "configure" | "doctor" | "try" | "migrate-config"),
+            Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
             _
         ) | (Some("session"), Some("declare" | "status"))
     );
@@ -776,6 +847,10 @@ fn main() {
             print_hook_list();
             process::exit(0);
         }
+        Commands::Manifest { format } => {
+            print_hook_manifest(format);
+            process::exit(0);
+        }
         Commands::Configure { list } => {
             // Under Claude Code, refuse the interactive wizard — it edits settings.json
             // and would let the agent silently disable guardrails. `--list` is read-only
@@ -880,8 +955,19 @@ fn main() {
                 repo_root,
                 branch,
                 scope,
+                arm,
             } => {
-                cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope);
+                cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope, arm);
+            }
+            CadenceCommands::RedactScan {
+                file,
+                audience,
+                init,
+            } => {
+                process::exit(
+                    cadence_hooks_cadence::redact_external_content::run_scan(file, audience, init)
+                        .into(),
+                );
             }
         },
         Commands::Guardrails(cmd) => match cmd {
@@ -948,6 +1034,11 @@ fn main() {
             GuardrailsCommands::GuardRm => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_rm::GuardRm,
                 pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::GuardRmLiveness => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_rm_liveness::GuardRmLiveness,
+                session,
                 canonical_hook,
             ),
             GuardrailsCommands::GuardReadModel => dispatch::run_logged_check(
@@ -1247,6 +1338,7 @@ mod tests {
             "declare",
             "status",
             "record-polish",
+            "redact-scan",
         ];
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();

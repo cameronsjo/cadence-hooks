@@ -35,7 +35,7 @@ impl Check for MarkdownLint {
     fn run(&self, input: &HookInput) -> CheckResult {
         if !should_lint(
             input.file_path().as_deref(),
-            input.tool_name(),
+            input.normalized_tool_name(),
             input.content(),
         ) {
             return CheckResult::allow();

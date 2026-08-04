@@ -217,6 +217,81 @@ pub fn polish_marker_present(command: &str, cwd: Option<&str>) -> bool {
     polish_marker(&state.git_common_dir.to_string_lossy(), &branch).is_file()
 }
 
+/// Parsed content of a polish marker (cadence-hooks#467) — the record side's
+/// `marker_content` JSON, read back leniently.
+///
+/// Every field is optional because the estate is full of **legacy markers**
+/// (older `record-polish` versions, or the `"{}"` fixtures): absence means
+/// *unknown*, never *skipped*. Untrusted input discipline: the file lives in
+/// the marker dir and is parsed with `from_str(..).ok()` — a garbled or
+/// hostile body degrades to an all-`None` record, never a panic.
+#[derive(Debug, Default)]
+pub struct PolishRecord {
+    /// The recorded `scope` — `full`, `code`, or `docs`.
+    pub scope: Option<String>,
+    /// The per-arm outcome roster (`"security" -> "ran" | "skipped"`), absent
+    /// on markers recorded before the roster existed.
+    pub arms: Option<std::collections::BTreeMap<String, String>>,
+}
+
+impl PolishRecord {
+    /// Did the security arm run, as far as this marker can say?
+    ///
+    /// - roster names `security` → `Some(state == "ran")` — deliberately
+    ///   closed-world: `"ran"` is the only truthy state, so an unrecognized
+    ///   or misspelled state reads as not-ran (the consequence is an extra
+    ///   advisory nudge, never a suppressed one — the safe direction here);
+    /// - no roster, but `scope == "docs"` → `Some(false)` — a docs-only pass
+    ///   never dispatches the security arm, so even a legacy marker settles it;
+    /// - otherwise → `None` (unknown — a legacy full/code marker must keep
+    ///   allowing; the whole estate carries roster-less markers).
+    pub fn security_ran(&self) -> Option<bool> {
+        if let Some(arms) = &self.arms
+            && let Some(state) = arms.get("security")
+        {
+            return Some(state == "ran");
+        }
+        match self.scope.as_deref() {
+            Some("docs") => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// Content-reading sibling of [`polish_marker_present`]: the parsed
+/// [`PolishRecord`] for the `(repo, branch)` the command targets, or `None`
+/// when no marker resolves — same resolution rules as the presence bool.
+///
+/// **Privacy gate, inverse of the [`claim_today`] precedent.** `claim_today`
+/// skips its gate on a degraded (non-private) marker dir because its content
+/// *suppresses* output — a co-tenant could plant a stamp and mute the nudge.
+/// Here content only ever *causes* a nudge (a roster saying `security:
+/// skipped`), never suppresses one — the presence bool still carries the
+/// allow. But a planted roster on a shared base could still manufacture nudge
+/// noise on a fully-polished branch, so a non-private dir degrades the same
+/// way everything else does: `None` → roster unknown → the presence bool
+/// alone decides, exactly the pre-#467 behavior.
+pub fn read_polish_marker(command: &str, cwd: Option<&str>) -> Option<PolishRecord> {
+    if !marker_dir_is_private() {
+        return None;
+    }
+    let cwd = cwd?;
+    let dir = parse_work_dir(command, cwd);
+    let state = GitState::resolve(Path::new(&dir))?;
+    let branch = state.branch?;
+    let path = polish_marker(&state.git_common_dir.to_string_lossy(), &branch);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    Some(PolishRecord {
+        scope: v.get("scope").and_then(|s| s.as_str()).map(str::to_string),
+        arms: v.get("arms").and_then(|a| a.as_object()).map(|obj| {
+            obj.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        }),
+    })
+}
+
 /// The daily-gate marker path for `kind`: `<marker_dir>/daily-{kind}`.
 ///
 /// Unlike [`session_marker`], `kind` is a compile-time-constant call-site string
@@ -393,16 +468,27 @@ mod tests {
 
     #[test]
     fn session_marker_differs_per_session() {
-        let a = session_marker(&input_with_session("sid-a"), "kind", Some("/tmp/repo"));
-        let b = session_marker(&input_with_session("sid-b"), "kind", Some("/tmp/repo"));
-        assert_ne!(a, b, "distinct sessions must not share a marker");
+        // session_marker() reads marker_dir() (CADENCE_MARKER_DIR), so hold the
+        // shared lock via with_marker_dir even though the assertion only compares
+        // two markers — an unguarded read races a concurrent with_marker_dir
+        // test flipping the base mid-comparison (#373).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = session_marker(&input_with_session("sid-a"), "kind", Some("/tmp/repo"));
+            let b = session_marker(&input_with_session("sid-b"), "kind", Some("/tmp/repo"));
+            assert_ne!(a, b, "distinct sessions must not share a marker");
+        });
     }
 
     #[test]
     fn session_marker_differs_per_repo() {
-        let a = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-a"));
-        let b = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-b"));
-        assert_ne!(a, b, "distinct repos must not share a marker");
+        // See session_marker_differs_per_session: guard the marker_dir() read.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-a"));
+            let b = session_marker(&input_with_session("sid"), "kind", Some("/tmp/repo-b"));
+            assert_ne!(a, b, "distinct repos must not share a marker");
+        });
     }
 
     #[test]
@@ -452,16 +538,25 @@ mod tests {
 
     #[test]
     fn polish_marker_differs_per_branch() {
-        let a = polish_marker("/tmp/repo", "branch-a");
-        let b = polish_marker("/tmp/repo", "branch-b");
-        assert_ne!(a, b, "distinct branches must not share a marker");
+        // polish_marker() reads marker_dir() (CADENCE_MARKER_DIR); guard the
+        // read the same way as session_marker_differs_per_session (#373).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = polish_marker("/tmp/repo", "branch-a");
+            let b = polish_marker("/tmp/repo", "branch-b");
+            assert_ne!(a, b, "distinct branches must not share a marker");
+        });
     }
 
     #[test]
     fn polish_marker_differs_per_repo() {
-        let a = polish_marker("/tmp/repo-a", "main");
-        let b = polish_marker("/tmp/repo-b", "main");
-        assert_ne!(a, b, "distinct repos must not share a marker");
+        // See polish_marker_differs_per_branch: guard the marker_dir() read.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let a = polish_marker("/tmp/repo-a", "main");
+            let b = polish_marker("/tmp/repo-b", "main");
+            assert_ne!(a, b, "distinct repos must not share a marker");
+        });
     }
 
     #[test]
@@ -654,6 +749,93 @@ mod tests {
             "gh pr create --title x",
             Some(tmp.path().to_str().unwrap())
         ));
+    }
+
+    // --- read_polish_marker / PolishRecord (#467) ---
+
+    #[test]
+    fn polish_record_security_ran_resolves_from_roster_scope_and_absence() {
+        // #467 RED: roster wins; docs scope settles a roster-less marker;
+        // anything else is unknown — never "skipped".
+        let rec = |scope: Option<&str>, sec: Option<&str>| PolishRecord {
+            scope: scope.map(str::to_string),
+            arms: sec.map(|s| {
+                [("security".to_string(), s.to_string())]
+                    .into_iter()
+                    .collect()
+            }),
+        };
+        assert_eq!(rec(Some("full"), Some("ran")).security_ran(), Some(true));
+        assert_eq!(
+            rec(Some("full"), Some("skipped")).security_ran(),
+            Some(false)
+        );
+        // Roster beats scope: an explicit security=ran on a docs pass stands.
+        assert_eq!(rec(Some("docs"), Some("ran")).security_ran(), Some(true));
+        // Docs scope settles even a legacy roster-less marker.
+        assert_eq!(rec(Some("docs"), None).security_ran(), Some(false));
+        // Legacy full/code roster-less markers are UNKNOWN.
+        assert_eq!(rec(Some("full"), None).security_ran(), None);
+        assert_eq!(rec(None, None).security_ran(), None);
+    }
+
+    #[test]
+    fn read_polish_marker_parses_scope_and_arms() {
+        let (tmp, root) = init_repo_on_branch("feat/read");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/read"),
+                r#"{"scope":"code","arms":{"security":"ran","tests":"skipped"}}"#,
+            )
+            .unwrap();
+            let rec = read_polish_marker("gh pr create", Some(tmp.path().to_str().unwrap()))
+                .expect("marker reads");
+            assert_eq!(rec.scope.as_deref(), Some("code"));
+            assert_eq!(rec.security_ran(), Some(true));
+        });
+    }
+
+    #[test]
+    fn read_polish_marker_tolerates_garbage_without_panicking() {
+        // Untrusted content: from_str(..).ok(), never a panic — garbage reads
+        // as no record at all.
+        let (tmp, root) = init_repo_on_branch("feat/garbage");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(&polish_marker(&root, "feat/garbage"), "]]not json").unwrap();
+            assert!(
+                read_polish_marker("gh pr create", Some(tmp.path().to_str().unwrap())).is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn read_polish_marker_none_from_degraded_marker_dir() {
+        // #467: content is only trusted from the private 0700 dir. On the
+        // shared fail-open base a co-tenant could plant a roster, so a
+        // degraded dir reads as no record — the presence bool alone decides
+        // (content here CAUSES a nudge, the inverse of claim_today, but the
+        // degrade direction is the same: never act on plantable content).
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("occupied");
+        std::fs::write(&not_a_dir, "").unwrap();
+        with_marker_dir(&not_a_dir, || {
+            assert!(!marker_dir_is_private(), "precondition: fail-open path");
+            assert!(read_polish_marker("gh pr create", Some("/tmp")).is_none());
+        });
+    }
+
+    #[test]
+    fn read_polish_marker_none_when_no_marker_or_cwd() {
+        let (tmp, _root) = init_repo_on_branch("feat/none");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            assert!(
+                read_polish_marker("gh pr create", Some(tmp.path().to_str().unwrap())).is_none()
+            );
+            assert!(read_polish_marker("gh pr create", None).is_none());
+        });
     }
 
     // --- claim_today (the once-per-day nudge gate, #458) ---

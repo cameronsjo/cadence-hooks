@@ -4,31 +4,47 @@
 //! Concurrency limits on heavy-context subagent fan-outs are an *observed*
 //! server-side throttle, not physics — a burst of ~simultaneous heavy agents
 //! hits request throttling well before any usage limit. This guard reads the
-//! live subagent count from the metrics `subagents.jsonl` lifecycle log and
-//! **nudges** (never blocks) on an `Agent`/`Task` spawn when the count is at or
-//! over `CADENCE_MAX_CONCURRENT_SUBAGENTS` (default 5). The nudge is advisory:
-//! the dispatch always proceeds.
+//! live subagent count from a bounded tail of the metrics `subagents.jsonl`
+//! lifecycle log and **nudges** (never blocks) on an `Agent`/`Task` spawn when
+//! the count is at or over `CADENCE_MAX_CONCURRENT_SUBAGENTS` (default 5). The
+//! nudge is advisory: the dispatch always proceeds.
 //!
 //! LIVE COUNT: `log_subagent` writes one line per lifecycle event — a
 //! `SubagentStart` and a matching `SubagentStop`, each carrying `event`,
 //! `agentId`, and `sessionId`. So the live count is the number of distinct
 //! `agentId`s that have a `SubagentStart` record and **no** matching
-//! `SubagentStop`. Records are scoped to the current session by `sessionId`; if
-//! no record matches the current session id (the parent-session stamping is a
-//! platform detail that may not line up), the count falls back to **all** live
-//! agents — the broader, safer estimate.
+//! `SubagentStop`. Records are scoped to the current session by `sessionId`;
+//! when at least one record carries the current session id, only matching
+//! records are considered.
+//!
+//! Two different "no match" cases must NOT collapse into one branch (#512):
+//! when the log is well-formed (some record carries *a* sessionId) but none
+//! carries *this* session's id, that's a real zero — the session just hasn't
+//! spawned anything yet — and the count must report 0, not every other
+//! session's agents. Only when the log carries **no** session-scoping data at
+//! all (empty, garbage, or a schema missing the `sessionId` field entirely) is
+//! the session genuinely unscopable, and the count falls back to **all** live
+//! agents — the broader, safer estimate for that case.
 //!
 //! FAIL-OPEN (ADR-0001): any failure to read or parse the log yields `allow()`.
 //! A missing log, garbage bytes, or an unreadable directory never blocks or
 //! nudges — an observability gap must not impede dispatch.
 
 use cadence_hooks_core::{Check, CheckResult, HookInput};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Default concurrency cap when `CADENCE_MAX_CONCURRENT_SUBAGENTS` is unset or
 /// unparseable. Matches the steady-state ceiling observed before heavy-context
 /// bursts start throttling.
 const DEFAULT_LIMIT: usize = 5;
+
+/// Maximum lifecycle-log bytes parsed on one hot-path hook fire.
+///
+/// The persisted audit log remains append-only, but old sessions no longer make
+/// each dispatch progressively more expensive. A tail boundary may discard one
+/// partial JSONL record; [`cadence_hooks_core::transcript::read_tail_bounded`]
+/// deliberately drops that fragment and returns only complete UTF-8 lines.
+const SUBAGENT_LOG_TAIL_BYTES: u64 = 1024 * 1024;
 
 /// The metrics directory holding `subagents.jsonl`.
 ///
@@ -45,6 +61,11 @@ fn metrics_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     cadence_hooks_core::paths::claude_config_dir().join("metrics")
+}
+
+/// Read a bounded, whole-line tail of the append-only lifecycle log.
+fn read_subagent_log_tail(path: &Path) -> Option<String> {
+    cadence_hooks_core::transcript::read_tail_bounded(path, SUBAGENT_LOG_TAIL_BYTES)
 }
 
 /// The configured concurrency cap: `CADENCE_MAX_CONCURRENT_SUBAGENTS` parsed as
@@ -71,22 +92,63 @@ fn parse_limit(value: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_LIMIT)
 }
 
+/// A single parsed `subagents.jsonl` record: `(event, agentId, sessionId)`.
+type SubagentRecord = (String, String, Option<String>);
+
+/// How a target session resolves against the records in the log (#512).
+///
+/// The critical distinction is between a *real* zero and a genuinely
+/// unscopable log — both look like "nothing matched" to a naive check, but
+/// they demand opposite counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionScope {
+    /// At least one record carries the target session id — scope to those.
+    Matched,
+    /// The log carries session-scoping data (some record has *a* sessionId)
+    /// but none names this session. This session simply has zero rows —
+    /// report 0, not the other sessions' agents.
+    WellFormedNoMatch,
+    /// No record in the log carries any sessionId at all (empty, garbage, or
+    /// a schema missing the field entirely) — there is no scoping data to
+    /// trust. Genuinely unscopable: fall back to counting every live agent.
+    Unscopable,
+}
+
+/// Pure: resolve which [`SessionScope`] applies for `session_id` against
+/// `records`.
+fn resolve_session_scope(records: &[SubagentRecord], session_id: Option<&str>) -> SessionScope {
+    let Some(target) = session_id else {
+        return SessionScope::Unscopable;
+    };
+    let has_any_session_data = records.iter().any(|(_, _, sid)| sid.is_some());
+    if !has_any_session_data {
+        return SessionScope::Unscopable;
+    }
+    if records
+        .iter()
+        .any(|(_, _, sid)| sid.as_deref() == Some(target))
+    {
+        SessionScope::Matched
+    } else {
+        SessionScope::WellFormedNoMatch
+    }
+}
+
 /// Pure: count live subagents in `subagents.jsonl` content.
 ///
 /// A subagent is *live* when its `agentId` has a `SubagentStart` record and no
 /// matching `SubagentStop`. Reconciliation is by `agentId`.
 ///
-/// Session scoping: when `session_id` is `Some` **and** at least one record
-/// carries that `sessionId`, only matching records are considered. When no
-/// record matches (unknown session — the parent-session stamping is a platform
-/// detail that may not align), the count falls back to **all** records — the
-/// broader, safer estimate.
+/// Session scoping is resolved by [`resolve_session_scope`]: a session with
+/// zero rows in an otherwise well-formed log is a real zero, while a log with
+/// no session-scoping data at all falls back to counting every live agent.
+/// See the module-level doc comment for why these must not collapse (#512).
 ///
 /// Malformed or blank lines are skipped individually without panicking; records
 /// are guaranteed single-line JSON.
 fn count_live_subagents(jsonl: &str, session_id: Option<&str>) -> usize {
     // Parse (event, agentId, sessionId) triples from each well-formed line.
-    let records: Vec<(String, String, Option<String>)> = jsonl
+    let records: Vec<SubagentRecord> = jsonl
         .lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -104,17 +166,14 @@ fn count_live_subagents(jsonl: &str, session_id: Option<&str>) -> usize {
         })
         .collect();
 
-    // Session filter with count-all fallback: only narrow to the session when
-    // the log actually contains a record for it.
-    let session_present = session_id.is_some_and(|target| {
-        records
-            .iter()
-            .any(|(_, _, sid)| sid.as_deref() == Some(target))
+    let scope = resolve_session_scope(&records, session_id);
+    let scoped = records.iter().filter(|(_, _, sid)| match scope {
+        SessionScope::Matched => sid.as_deref() == session_id,
+        // Real zero: no rows for this session, but the log had scoping data
+        // to check that against. Nothing to reconcile.
+        SessionScope::WellFormedNoMatch => false,
+        SessionScope::Unscopable => true,
     });
-
-    let scoped = records
-        .iter()
-        .filter(|(_, _, sid)| !session_present || sid.as_deref() == session_id);
 
     // Reconcile Start/Stop by agentId. An agent is live iff it started and has
     // not stopped.
@@ -165,14 +224,14 @@ impl Check for WarnSubagentConcurrency {
         // Only subagent dispatches. `Agent` is current; `Task` is the pre-2.1.63
         // name, kept for resilience. Every other tool exits here. (The hooks.json
         // matcher already filters to Agent|Task in production — belt-and-suspenders.)
-        if !matches!(input.tool_name(), Some("Agent" | "Task")) {
+        if !matches!(input.normalized_tool_name(), Some("Agent" | "Task")) {
             return CheckResult::allow();
         }
 
         // Fail-open (ADR-0001): any read failure yields allow. A missing log is
         // the common early-session case — never nudge on it.
         let path = metrics_dir().join("subagents.jsonl");
-        let Ok(jsonl) = std::fs::read_to_string(&path) else {
+        let Some(jsonl) = read_subagent_log_tail(&path) else {
             return CheckResult::allow();
         };
 
@@ -217,13 +276,50 @@ mod tests {
     }
 
     #[test]
-    fn unknown_session_falls_back_to_count_all() {
-        // No record carries session "sX" → fall back to counting all live agents
-        // across every session (a1 in s1, a2 in s2, both live → 2).
+    fn well_formed_log_with_no_rows_for_this_session_reports_real_zero() {
+        // a1 lives under s1, a2 lives under s2 — both rows carry a sessionId,
+        // so the log is well-formed for scoping purposes. Session "sX" has
+        // zero rows in it.
         let jsonl = "\
 {\"event\":\"SubagentStart\",\"agentId\":\"a1\",\"sessionId\":\"s1\"}
 {\"event\":\"SubagentStart\",\"agentId\":\"a2\",\"sessionId\":\"s2\"}";
-        assert_eq!(count_live_subagents(jsonl, Some("sX")), 2);
+
+        // Positive control: exercise the Matched branch on this exact input,
+        // not the separate Unscopable/count-all branch. This proves session
+        // scoping itself can recover a live agent before the no-match check.
+        assert_eq!(count_live_subagents(jsonl, Some("s1")), 1);
+
+        // Fixed behavior: "sX" is a real, well-formed absence — report 0, not
+        // the other sessions' 2 live agents.
+        assert_eq!(count_live_subagents(jsonl, Some("sX")), 0);
+    }
+
+    #[test]
+    fn schema_missing_session_id_field_is_unscopable_falls_back_to_count_all() {
+        // Both rows parse as valid JSON with event + agentId, but neither
+        // carries a sessionId field at all — there is no scoping data
+        // anywhere in the log to trust, so this is genuinely unscopable.
+        // Falls back to counting every live agent.
+        let jsonl = "\
+{\"event\":\"SubagentStart\",\"agentId\":\"a1\"}
+{\"event\":\"SubagentStart\",\"agentId\":\"a2\"}";
+        assert_eq!(count_live_subagents(jsonl, Some("s")), 2);
+    }
+
+    #[test]
+    fn mixed_valid_and_garbage_lines_trusts_the_valid_rows_scoping() {
+        // a1's row is well-formed with sessionId "other"; the second line is
+        // garbage and never parses into a record at all — it contributes
+        // neither a match nor scoping data. Because at least one *surviving*
+        // record carries a sessionId, the log is judged well-formed, so the
+        // non-matching session is a real zero, not a trigger for count-all.
+        // Safe direction: garbage lines must never launder an over-count back
+        // in by tipping a well-formed file into "unscopable" — they're simply
+        // dropped, same as always, and the rows that DO parse are trusted.
+        let jsonl = "\
+{\"event\":\"SubagentStart\",\"agentId\":\"a1\",\"sessionId\":\"other\"}
+not json at all";
+        assert_eq!(count_live_subagents(jsonl, Some("s")), 0);
     }
 
     #[test]
@@ -250,6 +346,44 @@ not json at all
     #[test]
     fn empty_log_counts_zero() {
         assert_eq!(count_live_subagents("", Some("s")), 0);
+    }
+
+    #[test]
+    fn bounded_tail_excludes_old_history_but_keeps_recent_complete_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagents.jsonl");
+
+        let stale = "{\"event\":\"SubagentStart\",\"agentId\":\"stale\",\"sessionId\":\"s\"}\n";
+        let padding = "{\"event\":\"SubagentStop\",\"agentId\":\"padding\",\"sessionId\":\"s\"}\n";
+        let recent = "{\"event\":\"SubagentStart\",\"agentId\":\"recent\",\"sessionId\":\"s\"}\n";
+
+        let mut jsonl = String::with_capacity(SUBAGENT_LOG_TAIL_BYTES as usize + 4096);
+        jsonl.push_str(stale);
+        while jsonl.len() <= SUBAGENT_LOG_TAIL_BYTES as usize + padding.len() {
+            jsonl.push_str(padding);
+        }
+        jsonl.push_str(recent);
+        std::fs::write(&path, jsonl).unwrap();
+
+        let tail = read_subagent_log_tail(&path).expect("regular UTF-8 JSONL");
+        assert!(
+            !tail.contains("\"agentId\":\"stale\""),
+            "negative control: history before the fixed bound is not parsed"
+        );
+        assert!(
+            tail.contains("\"agentId\":\"recent\""),
+            "positive control: the newest complete record survives"
+        );
+        assert_eq!(count_live_subagents(&tail, Some("s")), 1);
+    }
+
+    #[test]
+    fn bounded_tail_keeps_a_short_log_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subagents.jsonl");
+        let jsonl = "{\"event\":\"SubagentStart\",\"agentId\":\"a1\",\"sessionId\":\"s\"}\n";
+        std::fs::write(&path, jsonl).unwrap();
+        assert_eq!(read_subagent_log_tail(&path).as_deref(), Some(jsonl));
     }
 
     // --- assess_concurrency (pure decision) ---
@@ -322,9 +456,9 @@ not json at all
     fn missing_log_fails_open() {
         // Point CADENCE_METRICS_DIR at an empty temp dir (no subagents.jsonl) →
         // read fails → allow. Serialized against other env-touching tests.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::CADENCE_ENV_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        // SAFETY: guarded by ENV_LOCK; restored below.
+        // SAFETY: guarded by CADENCE_ENV_TEST_LOCK; restored below.
         unsafe { std::env::set_var("CADENCE_METRICS_DIR", dir.path()) };
         let input = make_agent(Some("general-purpose"), None, "/tmp");
         let result = WarnSubagentConcurrency.run(&input);
@@ -336,7 +470,7 @@ not json at all
     fn garbage_bytes_fail_open() {
         // A subagents.jsonl full of non-JSON garbage → zero live → allow (below
         // the default cap). Never panics.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::CADENCE_ENV_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // Invalid UTF-8 bytes → read_to_string fails → fail-open; plus non-JSON
         // ASCII so even a lenient read yields zero live records.
@@ -345,7 +479,7 @@ not json at all
             b"\x00\xff garbage\nmore junk\n",
         )
         .unwrap();
-        // SAFETY: guarded by ENV_LOCK; restored below.
+        // SAFETY: guarded by CADENCE_ENV_TEST_LOCK; restored below.
         unsafe { std::env::set_var("CADENCE_METRICS_DIR", dir.path()) };
         let input = make_agent(Some("general-purpose"), None, "/tmp");
         let result = WarnSubagentConcurrency.run(&input);
@@ -353,6 +487,6 @@ not json at all
         assert_eq!(result.outcome, Outcome::Allow);
     }
 
-    // Serializes the two tests that mutate process-global env (`set_var`).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The two tests above that mutate process-global env (`set_var`) serialize
+    // via the crate-shared CADENCE_ENV_TEST_LOCK (#446).
 }

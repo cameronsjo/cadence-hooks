@@ -439,12 +439,12 @@ mod tests {
     // Case 5: parse_remote — enterprise GitHub HTTPS → host Some
     #[test]
     fn parse_remote_enterprise_https() {
-        let result = parse_remote("https://gecgithub01.walmart.com/c0s013l/foo.git");
+        let result = parse_remote("https://ghe.example.com/u123456/foo.git");
         assert_eq!(
             result,
             Some((
-                Some("gecgithub01.walmart.com".to_string()),
-                "c0s013l/foo".to_string()
+                Some("ghe.example.com".to_string()),
+                "u123456/foo".to_string()
             ))
         );
     }

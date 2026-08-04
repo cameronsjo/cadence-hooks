@@ -5,7 +5,7 @@
 //! create/comment/edit, `git commit`, `tea pr/issue` — for vocabulary that is
 //! meaningful only inside this harness: skill/plugin IDs (`cadence:attune`),
 //! local filesystem paths (`/Users/…`, `~/.claude/…`), marketplace/cache paths,
-//! and bare harness nouns (`harness`, `transcript`, …). When it finds any, it
+//! and harness-shaped identifiers (`tool_input`, `tool_response`). When it finds any, it
 //! suggests rephrasing before the content ships to a public issue/PR/commit.
 //!
 //! ## Why a nudge, never a block (developing-guards "block vs nudge")
@@ -17,21 +17,31 @@
 //! `.claude/cadence.json` `redaction.allowlist` is the escape hatch for the
 //! recurring legitimate case.
 //!
-//! ## Body extraction (not segment-based)
+//! ## Body extraction is scoped to the posting segment (#424)
 //!
-//! Bodies are pulled from flag VALUES via [`tokenize`] over the **raw** command
-//! — deliberately NOT via [`split_segments`]/`command_segments`, which strip
-//! heredoc bodies as "data" (the exact text we must scan). Because [`tokenize`]
-//! keeps a quoted value as one token, a heredoc carried in a quoted command
-//! substitution — `git commit -m "$(cat <<'EOF' … EOF)"` — rides into the `-m`
-//! value intact, so its body lines are scanned. Only flag values are scanned,
-//! so the command words/flags themselves never trip the blocklist.
+//! Gate and extraction run **per segment** ([`command_segments`]), never over
+//! the whole command line. A whole-line gate paired with whole-line extraction
+//! made one posting segment authorize extraction from every *sibling* segment,
+//! so `gh secret set N --body '…' && gh pr comment -b hi` scanned the secret's
+//! body (which never posts anywhere) and `gh api x --body-file f && git commit`
+//! *read the file* `gh api` named. A file named by a non-posting segment must
+//! never be opened, so the per-segment gate has to precede extraction rather
+//! than filter its results.
+//!
+//! Within a matching segment, bodies are pulled from flag VALUES via
+//! [`tokenize`] — deliberately not from a further re-split, since [`tokenize`]
+//! keeps a quoted value as one token. A heredoc carried in a quoted command
+//! substitution — `git commit -m "$(cat <<'EOF' … EOF)"` — survives
+//! segmentation intact (the heredoc sits inside quotes, so segment splitting
+//! never treats it as a top-level heredoc body) and rides into the `-m` value,
+//! so its body lines are still scanned. Only flag values are scanned, so the
+//! command words/flags themselves never trip the blocklist.
 //!
 //! Failure is silent (`allow()`): no recognized body flag, an unreadable
 //! `--body-file`, a parse miss, or no hits all proceed without a message. In
 //! nudge mode, silent failure beats false positives.
 
-use cadence_hooks_core::shell::{strip_quotes, tokenize};
+use cadence_hooks_core::shell::{command_segments, strip_quotes, tokenize};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
 use serde::Deserialize;
@@ -103,10 +113,9 @@ fn ceiling_ord(s: &str) -> u8 {
 /// init. `mcp` is both a namespace and a prefix of `cadence-mcp`; the regex
 /// builder sorts longest-first so `cadence-mcp:x` is caught as `cadence-mcp:x`,
 /// not as `cadence` + leftover or bare `mcp`.
-/// `pub` (rather than crate-private) so the cross-sibling namespace-parity
-/// audit test (`tests/hook_registration_audit.rs`) can read it directly and
-/// diff it against the plugin-side `redact-check.sh` namespace list. Exposed
-/// for that in-repo test linkage only — not a supported public API.
+/// Since #390 this is the ONLY namespace list — the plugin's bash port
+/// (`redact-check.sh`) and its cross-sibling parity audit were deleted when
+/// the `redact-scan` CLI subcommand became the single engine.
 #[doc(hidden)]
 pub const NAMESPACES: &[&str] = &[
     "cadence",
@@ -131,7 +140,10 @@ pub const NAMESPACES: &[&str] = &[
 /// actually publish content. `git commit` is included — commit messages ship to
 /// GitHub. Read/label-only variants (`gh pr edit` with no `--body`) extract no
 /// body and fall through to `allow()`.
-static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
+/// `pub(crate)`: `warn_overshare` shares this gate (cadence-hooks#385) so the
+/// overshare nudge covers exactly the posting surfaces the leak scan covers —
+/// one gate, no second hand-kept command list to drift.
+pub(crate) static EXTERNAL_POST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\bgh\s+(pr|issue|release|gist|discussion)\s+(create|comment|edit|review|reopen)\b|\bgit\s+commit\b|\btea\s+(pr|issue)\s+(create|comment|edit)\b",
     )
@@ -171,14 +183,15 @@ static LOCAL_PATH: LazyLock<Regex> = LazyLock::new(|| {
         .expect("local-path pattern should compile")
 });
 
-/// Category 4 — bare harness nouns. Word-boundary anchored so `transcription`
-/// and `harnessing` (and the code identifier `transcript_path`, where `_` is a
-/// word char) do NOT match — only the bare nouns do. `harness` is the noisiest
-/// term (legit "test harness"); nudge-mode plus the per-repo `allowlist` are the
-/// mitigation, not a tighter pattern.
+/// Category 4 — harness-shaped identifiers. Word-boundary anchored; `_` is a
+/// word char, so prose mentions and code identifiers embedding these tokens
+/// (`tool_input_schema`) do NOT match. The bare nouns `harness` and
+/// `transcript` were deleted from this class (cadence-hooks#406, #564):
+/// zero true positives across the class's life, while the words are mandated
+/// domain vocabulary in estate prose. Repos that want them back can add
+/// `additionalPatterns` entries with a per-entry `ceiling`.
 static HARNESS_NOUN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(harness|transcript|tool_input|tool_response)\b")
-        .expect("harness-noun pattern should compile")
+    Regex::new(r"\b(tool_input|tool_response)\b").expect("harness-noun pattern should compile")
 });
 
 /// Per-repo override, read from the `redaction` section of
@@ -272,21 +285,28 @@ impl Check for RedactExternalContent {
             return CheckResult::allow();
         };
 
-        // Gate: scan only commands that actually publish content. Quote-strip
-        // first so a body merely mentioning `gh pr create` can't self-trip.
-        if !EXTERNAL_POST.is_match(&strip_quotes(command)) {
-            return CheckResult::allow();
-        }
-
-        // Phase 2 — pull body text from flag values; silent allow if none.
+        // Phase 2 — gate and extract PER SEGMENT (#424). A segment that does
+        // not itself publish contributes no body, so its `--body-file` is never
+        // opened; only a segment that passes the gate has its flag values read.
+        // Quote-strip each segment first so a body merely mentioning `gh pr
+        // create` can't self-trip. Silent allow if no segment yields a body.
         let base_dir = resolve_base_dir(input);
-        let bodies = extract_bodies(command, &base_dir);
+        let mut bodies: Vec<String> = Vec::new();
+        for segment in command_segments(command) {
+            if EXTERNAL_POST.is_match(&strip_quotes(&segment)) {
+                bodies.extend(extract_bodies(&segment, &base_dir));
+            }
+        }
         if bodies.is_empty() {
             return CheckResult::allow();
         }
 
         // Phase 3 — config (per-repo additional patterns + allowlist + tiers).
-        let config = load_redaction_config(&base_dir);
+        // Lenient (#536): a malformed key is dropped and NAMED, the rest of
+        // the section still applies — one bad `categories` shape no longer
+        // silently voids a valid `allowlist` beside it.
+        let loaded = load_redaction_config(&base_dir);
+        let config = loaded.config;
 
         // Phase 3.5 — resolve the destination-tier ordinal once. `CADENCE_AUDIENCE`
         // wins over the config's `originAudience`; both fall back to public.
@@ -299,12 +319,32 @@ impl Check for RedactExternalContent {
             hits.extend(scan_body(body, &config, d));
         }
 
-        if hits.is_empty() {
-            CheckResult::allow()
-        } else {
-            CheckResult::nudge(build_message(&hits))
+        // Config warnings ride the nudge channel (exit 0 / stdout → lands in
+        // the transcript). A clean scan with a broken config still nudges —
+        // otherwise the drop is exactly as silent as the #536 defect was.
+        let warnings = loaded.warnings;
+        match (hits.is_empty(), warnings.is_empty()) {
+            (true, true) => CheckResult::allow(),
+            (true, false) => CheckResult::nudge(build_config_warning(&warnings)),
+            (false, true) => CheckResult::nudge(build_message(&hits)),
+            (false, false) => CheckResult::nudge(format!(
+                "{}\n{}",
+                build_message(&hits),
+                build_config_warning(&warnings)
+            )),
         }
     }
+}
+
+/// Render config-load warnings as one nudge block. NB this fires on every
+/// gated posting command (incl. `git commit`) until the config is fixed —
+/// accepted cost: the whole point is that the drop is no longer silent, and
+/// the fix is a one-time config edit the message names precisely.
+fn build_config_warning(warnings: &[String]) -> String {
+    format!(
+        "⚠️  redact-external-content: config anomalies in .claude/cadence.json:\n{}",
+        cadence_hooks_core::config::render_config_warnings(warnings)
+    )
 }
 
 /// Resolve the directory to read `.claude/cadence.json` from and to resolve a
@@ -322,7 +362,10 @@ fn resolve_base_dir(input: &HookInput) -> String {
         .unwrap_or_else(|| ".".to_string())
 }
 
-/// Extract body text from a posting command's flag values.
+/// Extract body text from the flag values of ONE gate-passing segment. Callers
+/// must apply the [`EXTERNAL_POST`] gate to the segment first — a file-body flag
+/// is read here, so handing this a non-posting segment performs I/O the guard
+/// has no business doing (#424).
 ///
 /// Literal-body flags (`--body`/`-b`/`-m`/`--message`, plus their `=`-joined and
 /// glued-short forms) contribute their value verbatim. File-body flags
@@ -331,8 +374,8 @@ fn resolve_base_dir(input: &HookInput) -> String {
 /// value as one token, so a heredoc inside `"$(cat <<EOF … EOF)"` rides into the
 /// value intact. `--title`/`-t` is deliberately out of scope (the spec scans
 /// bodies only).
-fn extract_bodies(command: &str, base_dir: &str) -> Vec<String> {
-    let tokens = tokenize(command);
+fn extract_bodies(segment: &str, base_dir: &str) -> Vec<String> {
+    let tokens = tokenize(segment);
     let mut bodies = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
@@ -417,11 +460,16 @@ fn read_body_file(path: &str, base_dir: &str) -> Option<String> {
 /// default (empty) config. The legacy `.claude/redaction.json` is no longer
 /// read (hard cut); `cadence-hooks migrate-config` converts a repo and
 /// `cadence-hooks doctor` warns on an orphaned legacy file.
-fn load_redaction_config(base_dir: &str) -> RedactionConfig {
+fn load_redaction_config(
+    base_dir: &str,
+) -> cadence_hooks_core::config::SectionLoad<RedactionConfig> {
     let Some(root) = cadence_hooks_core::paths::find_git_root(base_dir) else {
-        return RedactionConfig::default();
+        return cadence_hooks_core::config::SectionLoad {
+            config: RedactionConfig::default(),
+            warnings: Vec::new(),
+        };
     };
-    cadence_hooks_core::config::load_cadence_section(&root, "redaction")
+    cadence_hooks_core::config::load_cadence_section_lenient(&root, "redaction")
 }
 
 /// Resolve the destination-tier ordinal (PURE — env passed as an argument, never
@@ -531,10 +579,10 @@ fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
 /// swallows `cadence-forge:…`); for every other category (`local-path`,
 /// `marketplace`, `harness-noun`, `custom`) a colon-free entry has no
 /// namespace structure to prefix-match, so it suppresses a hit whose exact
-/// snippet equals it (#318: a repo whose own subject matter uses a harness
-/// noun as domain vocabulary — e.g. a transcript-viewer tool discussing
-/// "transcript" — can allowlist that literal term without suppressing the
-/// whole `harness-noun` category or a differently-worded hit like "harness").
+/// snippet equals it (#318: a repo whose own subject matter uses one of these
+/// identifiers as domain vocabulary — e.g. a tool-schema library discussing
+/// `tool_input` — can allowlist that literal term without suppressing the
+/// whole `harness-noun` category or a different hit like `tool_response`).
 fn is_allowlisted(hit: &Hit, allowlist: &[String]) -> bool {
     allowlist.iter().any(|entry| {
         if entry.contains(':') {
@@ -566,6 +614,404 @@ fn build_message(hits: &[Hit]) -> String {
          replace local paths with a generic description.",
     );
     out
+}
+
+// ---------------------------------------------------------------------------
+// CLI action: `cadence-hooks cadence redact-scan` (cadence-hooks#390)
+//
+// The single engine behind the `redaction` skill's pre-post scan — replaces
+// the plugin-shipped `redact-check.sh`, whose separate bash port of these
+// regexes drifted (the script-clean/hook-nudge disagreement behind #406).
+//
+// Contract (OUTSIDE the hook contract, which reserves exit 2 for block —
+// this is a CLI subcommand and keeps the script's contract):
+//   exit 0  clean
+//   exit 1  one or more hits, printed to STDERR as `[<category>]:<line>:<snippet>`
+//   exit 2  usage / environment error
+// Stdout stays clean (parseable by consumers); hits AND warnings go to stderr.
+//
+// Parity rulings vs the deleted script (Rust semantics win, each pinned by a
+// test in the module below):
+//   - adjacent hits (`tool_input/tool_response`) both report — the script's
+//     boundary-consuming grep missed the second;
+//   - the same token twice on one line reports twice (real occurrences) —
+//     the script deduped by line+token text;
+//   - `--init` needs no jq, and re-emits an existing file via serde_json
+//     pretty-printing rather than jq's formatting (cosmetic divergence).
+// ---------------------------------------------------------------------------
+
+/// Entry for the `redact-scan` CLI action. Returns the process exit code.
+pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u8 {
+    // Audience validates BEFORE the --init branch — deliberate parity with
+    // the deleted script (`--init --audience bogus` is a usage error there
+    // too), not ordering to "fix".
+    if let Some(a) = audience.as_deref()
+        && !matches!(a, "owned-internal" | "private-external" | "public")
+    {
+        eprintln!(
+            "redact-scan: invalid --audience: {a} (expected owned-internal|private-external|public)"
+        );
+        return 2;
+    }
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".to_string());
+    let root = cadence_hooks_core::paths::find_git_root(&cwd)
+        .unwrap_or_else(|| std::path::PathBuf::from(&cwd));
+
+    if init {
+        return run_init(&root);
+    }
+
+    let input = match &file {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("redact-scan: cannot read file: {path}");
+                return 2;
+            }
+        },
+        None => {
+            use std::io::Read;
+            let mut buf = String::new();
+            if std::io::stdin().read_to_string(&mut buf).is_err() {
+                eprintln!("redact-scan: stdin is not valid UTF-8");
+                return 2;
+            }
+            buf
+        }
+    };
+
+    // Legacy-config warning, ported from the script: a lingering
+    // .claude/redaction.json means its allowlist and additionalPatterns have
+    // silently stopped applying.
+    let legacy = root.join(".claude/redaction.json");
+    if legacy.symlink_metadata().is_ok() {
+        eprintln!(
+            "redact-scan: warning: legacy .claude/redaction.json is NO LONGER read — run 'cadence-hooks migrate-config' to fold it into .claude/cadence.json"
+        );
+    }
+
+    // Whole-file anomalies the lenient loader treats as silent fail-open
+    // (ADR-0001) are LOUD here — the deleted script's validate_config warned
+    // on an unparseable file and a non-object document, and SKILL.md
+    // documents that property; the CLI keeps it.
+    let cfg_path = root.join(".claude/cadence.json");
+    if let Ok(content) = std::fs::read_to_string(&cfg_path)
+        && serde_json::from_str::<serde_json::Value>(&content)
+            .map(|v| !v.is_object())
+            .unwrap_or(true)
+    {
+        eprintln!(
+            "redact-scan: warning: .claude/cadence.json is present but not a JSON object (comments are not allowed); ignoring it (fail-open)"
+        );
+    }
+
+    let loaded = cadence_hooks_core::config::load_cadence_section_lenient::<RedactionConfig>(
+        &root,
+        "redaction",
+    );
+    if !loaded.warnings.is_empty() {
+        eprint!(
+            "redact-scan: config anomalies in .claude/cadence.json:\n{}",
+            cadence_hooks_core::config::render_config_warnings(&loaded.warnings)
+        );
+    }
+    let config = loaded.config;
+
+    // Destination tier: --audience flag > CADENCE_AUDIENCE env > config
+    // originAudience > public — the env fallback keeps the CLI and the hook
+    // (which reads the same env) from disagreeing in the less-redaction
+    // direction when a session has the env set but a caller omits the flag.
+    // The flag was validated strictly above; an unknown env value falls
+    // safe-wide through dest_tier_ord, same as the hook.
+    let env_audience = std::env::var("CADENCE_AUDIENCE").ok();
+    let d = resolve_dest_tier(audience.as_deref().or(env_audience.as_deref()), &config);
+
+    let mut any = false;
+    for (idx, line) in input.lines().enumerate() {
+        let lineno = idx + 1;
+        for hit in scan_body(line, &config, d) {
+            any = true;
+            if hit.category == "custom" {
+                // The replacement is untrusted repo-config text landing on a
+                // surface the model reads — strip control chars, cap length.
+                let repl = match hit.replacement.as_deref() {
+                    Some("") | None => "[redacted]".to_string(),
+                    Some(r) => r
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(120)
+                        .collect::<String>(),
+                };
+                eprintln!("[custom]:{lineno}:{} (suggest: {repl})", hit.snippet);
+            } else {
+                eprintln!("[{}]:{lineno}:{}", hit.category, hit.snippet);
+            }
+        }
+    }
+    if any { 1 } else { 0 }
+}
+
+/// Port of the script's `--init`: scaffold the `redaction` section of
+/// `.claude/cadence.json` at the repo root. Creates the file (version: 1
+/// envelope) when absent; adds the section to an existing file only when
+/// missing (idempotent — other sections are never touched). Refuses to write
+/// through a symlinked `.claude` or config file; refuses (exit 2) an existing
+/// file that is unparseable or not a JSON object.
+fn run_init(root: &std::path::Path) -> u8 {
+    // Symlink refusals exit 2 — a refusal is not a success, and the deleted
+    // script's `return 0` here was the one parity choice the security review
+    // overturned (an exit-0 refusal is indistinguishable from a completed
+    // scaffold to any caller reading the code, not the message).
+    let claude = root.join(".claude");
+    let is_symlink = |p: &std::path::Path| {
+        p.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+    };
+    if is_symlink(&claude) {
+        eprintln!(
+            "redact-scan: {} is a symlink; refusing to write through it",
+            claude.display()
+        );
+        return 2;
+    }
+    if std::fs::create_dir_all(&claude).is_err() {
+        eprintln!("redact-scan: cannot create {}", claude.display());
+        return 2;
+    }
+    let cfg = claude.join("cadence.json");
+    if is_symlink(&cfg) {
+        eprintln!(
+            "redact-scan: {} is a symlink; refusing to write through it",
+            cfg.display()
+        );
+        return 2;
+    }
+    let starter = serde_json::json!({
+        "originAudience": "public",
+        "categories": {},
+        "additionalPatterns": [],
+        "allowlist": []
+    });
+    if !cfg.exists() {
+        let doc = serde_json::json!({ "version": 1, "redaction": starter });
+        return write_config_atomically(&claude, &cfg, &doc, "wrote starter redaction section");
+    }
+    // Existing regular file: add the section only when missing.
+    let Ok(content) = std::fs::read_to_string(&cfg) else {
+        eprintln!("redact-scan: cannot read {}", cfg.display());
+        return 2;
+    };
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+        eprintln!(
+            "redact-scan: {} exists but is not valid JSON; fix it before --init can add the redaction section",
+            cfg.display()
+        );
+        return 2;
+    };
+    let Some(obj) = doc.as_object_mut() else {
+        eprintln!(
+            "redact-scan: {} is valid JSON but its top-level value is not an object; refusing to add the redaction section",
+            cfg.display()
+        );
+        return 2;
+    };
+    if obj.contains_key("redaction") {
+        eprintln!(
+            "redact-scan: {} already has a redaction section; leaving it unchanged",
+            cfg.display()
+        );
+        return 0;
+    }
+    obj.insert("redaction".to_string(), starter);
+    write_config_atomically(&claude, &cfg, &doc, "added starter redaction section")
+}
+
+/// Same-dir temp file + rename, mirroring the script's write discipline.
+///
+/// `tempfile::NamedTempFile` supplies the two properties the script got from
+/// `mktemp` and a naive port would lose: O_EXCL creation (never writes
+/// through a pre-placed symlink) and an unguessable name (a hostile repo can
+/// commit symlinks at predictable names — a PID-suffixed temp is enumerable —
+/// and turn the scaffold into an arbitrary-file overwrite). Mode 0600, too.
+fn write_config_atomically(
+    dir: &std::path::Path,
+    cfg: &std::path::Path,
+    doc: &serde_json::Value,
+    verb: &str,
+) -> u8 {
+    use std::io::Write;
+    let rendered = format!(
+        "{}\n",
+        serde_json::to_string_pretty(doc).expect("static JSON value renders")
+    );
+    let Ok(mut tmp) = tempfile::NamedTempFile::new_in(dir) else {
+        eprintln!(
+            "redact-scan: temp-file create failed in {}; nothing written",
+            dir.display()
+        );
+        return 2;
+    };
+    if tmp.write_all(rendered.as_bytes()).is_err() {
+        eprintln!(
+            "redact-scan: write failed in {}; nothing written",
+            dir.display()
+        );
+        return 2;
+    }
+    if tmp.persist(cfg).is_err() {
+        eprintln!("redact-scan: rename failed; {} unchanged", cfg.display());
+        return 2;
+    }
+    eprintln!("redact-scan: {verb} to {}", cfg.display());
+    0
+}
+
+#[cfg(test)]
+mod cli_scan_tests {
+    use super::*;
+
+    // --- run_scan CLI glue ---
+
+    #[test]
+    fn scan_invalid_audience_is_usage_error() {
+        assert_eq!(run_scan(None, Some("bogus".into()), false), 2);
+        // Also before --init (parity with the script's validation order).
+        assert_eq!(run_scan(None, Some("bogus".into()), true), 2);
+    }
+
+    #[test]
+    fn scan_unreadable_file_is_usage_error() {
+        assert_eq!(
+            run_scan(Some("/nonexistent/redact-scan-test".into()), None, false),
+            2
+        );
+    }
+
+    #[test]
+    fn scan_file_hits_exit_1_and_clean_exit_0() {
+        // Exercises the full glue: file read, per-line loop, exit
+        // aggregation. Uses a skill-id hit (this repo's own allowlist covers
+        // only the harness-noun identifiers, so skill-id is cwd-robust).
+        let dir = tempfile::tempdir().unwrap();
+        let hit = dir.path().join("hit.txt");
+        std::fs::write(&hit, "line one\nsee cadence:attune here\n").unwrap();
+        assert_eq!(
+            run_scan(hit.to_str().map(String::from), Some("public".into()), false),
+            1
+        );
+        let clean = dir.path().join("clean.txt");
+        std::fs::write(&clean, "nothing to see\n").unwrap();
+        assert_eq!(
+            run_scan(
+                clean.to_str().map(String::from),
+                Some("public".into()),
+                false
+            ),
+            0
+        );
+        // owned-internal destination: the default ceiling suppresses.
+        assert_eq!(
+            run_scan(
+                hit.to_str().map(String::from),
+                Some("owned-internal".into()),
+                false
+            ),
+            0
+        );
+    }
+
+    // --- Parity rulings vs the deleted redact-check.sh (Rust semantics win) ---
+
+    #[test]
+    fn ruling_adjacent_hits_both_report() {
+        // The script's boundary-consuming grep reported one hit for
+        // `tool_input/tool_response`; the Rust \b engine reports both.
+        let hits = scan_body("tool_input/tool_response", &RedactionConfig::default(), 3);
+        assert_eq!(hits.len(), 2, "both adjacent identifiers report");
+    }
+
+    #[test]
+    fn ruling_repeated_token_on_one_line_reports_each_occurrence() {
+        // The script deduped by line+token text; each occurrence is a real
+        // instance to rephrase, so the engine reports both offsets.
+        let hits = scan_body(
+            "tool_input here and tool_input there",
+            &RedactionConfig::default(),
+            3,
+        );
+        assert_eq!(hits.len(), 2);
+    }
+
+    // --- run_init port ---
+
+    #[test]
+    fn init_creates_starter_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(run_init(dir.path()), 0);
+        let content = std::fs::read_to_string(dir.path().join(".claude/cadence.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(doc["version"], 1);
+        assert_eq!(doc["redaction"]["originAudience"], "public");
+    }
+
+    #[test]
+    fn init_is_idempotent_and_preserves_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/cadence.json"),
+            r#"{"version":1,"kanban":{"x":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(run_init(dir.path()), 0);
+        let doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".claude/cadence.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc["kanban"]["x"], 1, "other sections preserved");
+        assert!(doc["redaction"].is_object());
+        // Second run: section present → unchanged, still exit 0.
+        assert_eq!(run_init(dir.path()), 0);
+    }
+
+    #[test]
+    fn init_refuses_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/cadence.json"), "{not json").unwrap();
+        assert_eq!(run_init(dir.path()), 2);
+    }
+
+    #[test]
+    fn init_refuses_non_object_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/cadence.json"), "[]").unwrap();
+        assert_eq!(run_init(dir.path()), 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".claude/cadence.json")).unwrap(),
+            "[]",
+            "refusal never rewrites the file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        let target = dir.path().join("elsewhere.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".claude/cadence.json")).unwrap();
+        assert_eq!(run_init(dir.path()), 2, "refusal is an error, not success");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "{}",
+            "symlink target untouched"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -748,6 +1194,208 @@ mod tests {
         assert_eq!(run(&cmd).outcome, Outcome::Nudge);
     }
 
+    // --- #424: gate and extraction are scoped to the matching segment ---
+
+    #[test]
+    fn compound_line_does_not_scan_a_non_posting_sibling_body() {
+        // PoC 1: the secret's value never posts anywhere, but the sibling
+        // `gh pr comment` used to authorize extracting it. The posting segment
+        // here is clean, so the only possible hit is the secret's body.
+        assert_eq!(
+            run("gh secret set NAME --body 'cadence:attune' && gh pr comment 1 -b hello").outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn compound_line_does_not_read_a_non_posting_siblings_body_file() {
+        // PoC 2: `gh api --body-file` is not a post, so the file it names must
+        // never be opened. The fixture is loaded with a hit, so any read flips
+        // the outcome to Nudge and fails loudly — this asserts zero file I/O
+        // for the non-matching segment. The discriminating control is the test
+        // named below, which uses the same fixture shape on a POSTING segment
+        // and does nudge — so an Allow here is evidence of no read, not of a
+        // scan that could never have hit:
+        //   compound_line_reads_the_posting_segments_body_file
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canary.md");
+        std::fs::write(&path, "tripwire body naming cadence:attune").unwrap();
+        let cmd = format!(
+            "gh api repos/x --body-file {} && git commit -m hello",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn compound_line_still_scans_the_posting_segment() {
+        // Positive control for both PoCs: scoping must not stop a genuinely
+        // posting segment in a compound line from being scanned.
+        assert_eq!(
+            run("git status && gh pr comment 1 -b 'see cadence:attune'").outcome,
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn compound_line_reads_the_posting_segments_body_file() {
+        // Positive control specifically for the file-read path: the same
+        // compound shape as PoC 2, but the file belongs to the posting segment.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup mentioning cadence:polish here").unwrap();
+        let cmd = format!(
+            "git status && gh pr create --body-file {}",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn compound_line_with_two_posting_segments_scans_both() {
+        // Scoping is per segment, not first-match — a line where BOTH segments
+        // post must surface a hit from each.
+        let result =
+            run("gh pr comment 1 -b 'see cadence:attune' && git commit -m 'ref /Users/cameron/x'");
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let message = result.message.as_deref().unwrap();
+        assert!(
+            message.contains("[skill-id] cadence:attune"),
+            "expected the first segment's hit in: {message:?}"
+        );
+        assert!(
+            message.contains("[local-path] /Users/cameron/x"),
+            "expected the second segment's hit in: {message:?}"
+        );
+    }
+
+    #[test]
+    fn standalone_non_posting_body_flag_unchanged() {
+        // The issue's original premise, kept as a regression: a standalone
+        // non-posting command was already clean via the whole-command gate, and
+        // must stay clean now that the gate is per segment.
+        assert_eq!(
+            run("gh secret set NAME --body 'cadence:attune'").outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn standalone_non_posting_body_file_is_not_read() {
+        // Same premise on the file path: `gh api --body-file` standalone must
+        // not open the file it names.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canary.md");
+        std::fs::write(&path, "tripwire body naming cadence:attune").unwrap();
+        let cmd = format!("gh api repos/x --body-file {}", path.to_str().unwrap());
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    // --- Multi-line posting commands (#475) ---
+    //
+    // Per-segment scoping is only safe if a segment boundary means what the
+    // shell means by it. A backslash-newline is a continuation, not a
+    // boundary — cutting there put the posting verb in one segment and its
+    // `--body`/`--body-file` in the next, so the gate failed on the segment
+    // holding the body and nothing was scanned at all. Every case below is a
+    // shape a person writes by hand.
+
+    #[test]
+    fn continued_body_file_is_scanned() {
+        // The shape `cadence:creating-issue` MANDATES: `--body-file`, flags
+        // spread across continuation lines.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup naming cadence:attune").unwrap();
+        let cmd = format!(
+            "gh issue create --repo cameronsjo/cadence-hooks \\\n  --title \"issue title\" \\\n  --body-file {}",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn continued_literal_body_is_scanned() {
+        assert_eq!(
+            run("gh pr create \\\n  --title t \\\n  --body \"see cadence:attune\"").outcome,
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn continued_heredoc_in_substitution_is_scanned() {
+        // The `--body "$(cat <<'EOF' … EOF)"` form, reached over a
+        // continuation. The heredoc rides inside the quoted value, so
+        // segmentation must neither cut at the continuation nor at the body's
+        // own newlines.
+        let cmd = "gh pr create \\\n  --body \"$(cat <<'EOF'\nRefactored per cadence:attune today.\nEOF\n)\"";
+        assert_eq!(run(cmd).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn continued_body_with_crlf_is_scanned() {
+        assert_eq!(
+            run("gh pr create \\\r\n  --body \"see cadence:attune\"").outcome,
+            Outcome::Nudge
+        );
+    }
+
+    #[test]
+    fn bare_newline_between_commands_still_scopes_per_command() {
+        // Discriminating control for the four above: a plain newline IS a
+        // boundary, so the non-posting neighbour's body stays unscanned. Were
+        // continuations handled by simply not splitting on newlines, this
+        // would nudge.
+        assert_eq!(
+            run("gh secret set NAME --body 'cadence:attune'\ngh pr comment 1 -b hello").outcome,
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn escaped_quote_cannot_launder_a_body_past_the_gate() {
+        // `\"` inside `"…"` is content, so the operator after it is still
+        // inside the `-m` value and creates no segment boundary. When the
+        // splitter disagreed with the tokenizer, the text after the operator
+        // became its own non-posting segment and went unscanned.
+        for op in ["&&", ";", "|"] {
+            let cmd = format!("git commit -m \"he said \\\" {op} cadence:attune here\"");
+            assert_eq!(run(&cmd).outcome, Outcome::Nudge, "operator {op}");
+        }
+    }
+
+    #[test]
+    fn later_assignment_does_not_make_the_guard_read_a_file() {
+        // The shell expands `$F` before reaching the `||` branch, so this
+        // command never names the canary. The guard must not either. The
+        // fixture holds a hit, so any read flips the outcome and fails loudly;
+        // the discriminating control is the test named below, which reads the
+        // same fixture through an assignment that genuinely precedes its use:
+        //   preceding_assignment_still_resolves_the_body_file
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("canary.md");
+        std::fs::write(&path, "tripwire body naming cadence:attune").unwrap();
+        let cmd = format!(
+            "gh pr create --body-file $F || F={}",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn preceding_assignment_still_resolves_the_body_file() {
+        // Positive control: an assignment BEFORE the use is what the shell
+        // would expand, so the guard follows it and reads the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.md");
+        std::fs::write(&path, "writeup naming cadence:attune").unwrap();
+        let cmd = format!(
+            "F={} && gh pr create --body-file $F",
+            path.to_str().unwrap()
+        );
+        assert_eq!(run(&cmd).outcome, Outcome::Nudge);
+    }
+
     // --- One test per universal category ---
 
     #[test]
@@ -782,10 +1430,37 @@ mod tests {
 
     #[test]
     fn category_harness_noun() {
-        assert_eq!(
-            run("gh pr create --body \"parse the transcript correctly\"").outcome,
-            Outcome::Nudge
-        );
+        // Hermetic cwd: the bare `run()` helper resolves base_dir from the
+        // process cwd, and THIS repo's own `.claude/cadence.json` allowlists
+        // `tool_input`/`tool_response` — a bare-run assertion here would test
+        // the host repo's config, not the engine.
+        let repo = temp_repo_with_config("{}");
+        let cmd = "gh pr create --body \"rename tool_input everywhere\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
+    }
+
+    #[test]
+    fn bare_harness_not_matched() {
+        // #406/#564: the bare noun `harness` was deleted from the class —
+        // mandated domain vocabulary in estate prose, zero true positives.
+        // Hermetic cwd (empty config): a bare `run()` Allow-assertion would
+        // also pass if the term were merely allowlisted in the host repo's
+        // `.claude/cadence.json`, masking a reverted deletion.
+        let repo = temp_repo_with_config("{}");
+        let cmd = "gh pr create --body \"the test harness needs work\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn bare_transcript_not_matched() {
+        // Deleted alongside `harness` (predecessor defect: #318). Hermetic
+        // cwd for the same reason as `bare_harness_not_matched`.
+        let repo = temp_repo_with_config("{}");
+        let cmd = "gh pr create --body \"parse the transcript correctly\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
     }
 
     #[test]
@@ -914,20 +1589,20 @@ mod tests {
     fn allowlist_bare_term_suppresses_matching_harness_noun() {
         // #318: a bare (non-namespace) allowlist entry that exactly matches a
         // harness-noun hit's own text suppresses that literal term — the
-        // repo's own domain vocabulary (e.g. a transcript-viewer tool
-        // discussing "transcript") shouldn't read as harness leakage.
-        let repo = temp_repo_with_config(r#"{"allowlist":["transcript"]}"#);
-        let cmd = "gh pr create --body \"parse the transcript correctly\"";
+        // repo's own domain vocabulary (e.g. a tool-schema library
+        // discussing `tool_input`) shouldn't read as harness leakage.
+        let repo = temp_repo_with_config(r#"{"allowlist":["tool_input"]}"#);
+        let cmd = "gh pr create --body \"rename tool_input everywhere\"";
         let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
     }
 
     #[test]
     fn allowlist_bare_term_does_not_suppress_a_different_harness_noun() {
-        // Allowlisting "transcript" must not blanket-suppress the whole
-        // harness-noun category — "harness" itself still flags.
-        let repo = temp_repo_with_config(r#"{"allowlist":["transcript"]}"#);
-        let cmd = "gh pr create --body \"the test harness needs work\"";
+        // Allowlisting "tool_input" must not blanket-suppress the whole
+        // harness-noun category — "tool_response" still flags.
+        let repo = temp_repo_with_config(r#"{"allowlist":["tool_input"]}"#);
+        let cmd = "gh pr create --body \"the tool_response payload changed\"";
         let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
     }
@@ -977,6 +1652,47 @@ mod tests {
         assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Nudge);
     }
 
+    #[test]
+    fn malformed_key_does_not_void_valid_allowlist() {
+        // #536's exact shape: bare strings under additionalPatterns (the
+        // struct wants objects) used to void the WHOLE redaction section, so
+        // the valid allowlist beside it went inert. Lenient loading drops
+        // only the malformed key; the allowlist still suppresses.
+        let repo = temp_repo_with_config(
+            r#"{"allowlist":["tool_input"],"additionalPatterns":["zorblax"]}"#,
+        );
+        let cmd = "gh pr create --body \"rename tool_input everywhere\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        let result = RedactExternalContent.run(&input);
+        // The suppression works (no harness-noun hit), and the drop is named
+        // in the transcript instead of silent: outcome is a Nudge carrying
+        // the config warning, not a clean Allow.
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.expect("config warning should surface");
+        assert!(
+            msg.contains("additionalPatterns"),
+            "warning must name the dropped key: {msg}"
+        );
+        assert!(
+            !msg.contains("[harness-noun]"),
+            "allowlist must still suppress the scan hit: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_warning_rides_along_with_scan_hits() {
+        // Broken key + a real hit: one nudge carries both the hit lines and
+        // the config-anomaly block.
+        let repo = temp_repo_with_config(r#"{"additionalPatterns":["zorblax"]}"#);
+        let cmd = "gh pr create --body \"see cadence:attune\"";
+        let input = make_bash_with_cwd(cmd, repo.path().to_str().unwrap());
+        let result = RedactExternalContent.run(&input);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap();
+        assert!(msg.contains("cadence:attune"));
+        assert!(msg.contains("additionalPatterns"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn special_file_config_fails_open_and_does_not_hang() {
@@ -998,7 +1714,7 @@ mod tests {
     #[test]
     fn never_blocks() {
         // Even a body full of every category stays a nudge.
-        let cmd = "gh pr create --body \"cadence:attune /Users/x ~/.claude/plugins/y transcript\"";
+        let cmd = "gh pr create --body \"cadence:attune /Users/x ~/.claude/plugins/y tool_input\"";
         assert_ne!(run(cmd).outcome, Outcome::Block);
         assert_eq!(run(cmd).outcome, Outcome::Nudge);
     }
@@ -1028,7 +1744,7 @@ mod tests {
 
     // One line per universal category, each firing exactly once.
     const BODY_ALL: &str = "Use cadence-forge:polish. File /Users/alice/x. \
-         Installed ~/.claude/plugins/cadence-forge/skill.json. The transcript records.";
+         Installed ~/.claude/plugins/cadence-forge/skill.json. The tool_input records.";
     const BODY_SKILL: &str = "Use cadence-forge:polish here.";
     const BODY_SKILL_PATH: &str = "Run cadence-forge:polish on /Users/alice/secret.txt now.";
     const BODY_ACME: &str = "Deploy for ACME-INC today.";

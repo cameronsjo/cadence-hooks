@@ -192,6 +192,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "guard-rm-liveness",
+        description: "Assert at SessionStart that guard-rm is present and classifying as contracted",
+        plugin: "guardrails",
+        event: Some(HookEvent::SessionStart),
+    },
+    HookEntry {
         name: "guard-read-model",
         description: "Block Read/Grep by resolved session model (opt-in)",
         plugin: "guardrails",
@@ -438,6 +444,27 @@ pub fn plugin_for(name: &str) -> Option<&'static str> {
     HOOKS.iter().find(|h| h.name == name).map(|h| h.plugin)
 }
 
+const SECURITY_CRITICAL_HOOKS: &[&str] = &[
+    "prevent-secret-leaks",
+    "prevent-secret-writes",
+    "git-safety",
+    "guard-push-remote",
+    "guard-gh-dangerous",
+    "guard-gh-write",
+    "guard-op-vault-scan",
+    "guard-browser-device",
+    "guard-dotfiles",
+    "guard-rm",
+    "enforce-worktree",
+    "guard-read-model",
+    "trash-guard",
+];
+
+/// True for guards whose inability to parse a relevant operation must block.
+pub fn is_security_critical(name: &str) -> bool {
+    SECURITY_CRITICAL_HOOKS.contains(&name)
+}
+
 /// Per-hook sample payload overrides for `try` and the interactive-terminal
 /// guidance.
 ///
@@ -647,6 +674,23 @@ mod tests {
     #[test]
     fn entry_returns_none_for_unknown_pair() {
         assert!(entry("cadence", "guard-push-remote").is_none());
+    }
+
+    #[test]
+    fn security_critical_registry_covers_protected_guards() {
+        assert!(is_security_critical("guard-push-remote"));
+        assert!(is_security_critical("prevent-secret-writes"));
+        assert!(!is_security_critical("warn-main-branch"));
+    }
+
+    #[test]
+    fn every_security_critical_name_is_registered() {
+        for name in SECURITY_CRITICAL_HOOKS {
+            assert!(
+                HOOKS.iter().any(|hook| hook.name == *name),
+                "{name} is classified security-critical but is not registered"
+            );
+        }
     }
 
     #[test]

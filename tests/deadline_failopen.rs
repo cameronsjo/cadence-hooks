@@ -10,6 +10,7 @@
 //! wiring is exercised, not a unit seam.
 #![cfg(unix)]
 
+use cadence_hooks_core::git_fixtures::{Scratch, git_in};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output, Stdio};
@@ -30,14 +31,17 @@ fn write_hanging_git(dir: &std::path::Path) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Write an executable `git` into `dir` that appends one line to `count_file`
-/// per invocation, then delegates to the real git at `real_git`.
+/// Write an executable `git` into `dir` that appends its full argv (one line
+/// per invocation) to `count_file`, then delegates to the real git at
+/// `real_git`. Logging argv (not just a bare marker) lets a caller assert on
+/// exactly which commands ran, not merely how many — the difference between
+/// counting spawns and pinning them.
 fn write_counting_git(dir: &std::path::Path, count_file: &std::path::Path, real_git: &str) {
     let path = dir.join("git");
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\necho x >> \"{}\"\nexec {} \"$@\"\n",
+            "#!/bin/sh\necho \"$@\" >> \"{}\"\nexec {} \"$@\"\n",
             count_file.display(),
             real_git
         ),
@@ -368,5 +372,195 @@ fn enforce_worktree_edit_arm_spawns_no_git() {
         spawns, 0,
         "enforce-worktree Edit arm must spawn zero git (resolution is a GitState \
          filesystem walk); got {spawns} — a git probe crept back in"
+    );
+}
+
+/// This crate's own `target/`-relative scratch root for the mutation-nudge
+/// spawn-bound tests below — `env!` resolves at THIS call site, so the
+/// promoted `Scratch` still lands fixtures under
+/// `target/mutation-nudge-scratch/`, exactly where the pre-promotion local
+/// helper put them.
+fn scratch_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/mutation-nudge-scratch")
+}
+
+/// Two existing tracked files in DISTINCT subdirectories, so the mutation walk
+/// produces two genuinely distinct assess-paths (not deduped to one
+/// directory) — the fixture that actually exercises "N targets in one repo",
+/// not a single target trivially giving N=1.
+///
+/// Three `git` invocations, not five: the two `git config` calls fold into
+/// the commit as `-c user.email=… -c user.name=…` rather than their own
+/// spawns — this fixture setup runs with the real PATH (before the counting
+/// shim is installed for the actual test command below), so it costs nothing
+/// toward any spawn assertion, but there's no reason to pay 5 spawns when 3
+/// do the same job.
+fn init_mutation_nudge_repo(dir: &std::path::Path) {
+    git_in(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("root_file.txt"), "x").unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub").join("sub_file.txt"), "x").unwrap();
+    git_in(dir, &["add", "-A"]);
+    git_in(
+        dir,
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+    );
+}
+
+/// The real `git` on PATH — resolved once per test *binary* (not once per
+/// test) via `OnceLock`, since it never changes within a run. The counting
+/// shim installed on the child process's PATH delegates to this path.
+fn real_git() -> &'static str {
+    static REAL_GIT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REAL_GIT.get_or_init(|| {
+        let real_git = String::from_utf8(
+            Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert!(!real_git.is_empty(), "real git required for this test");
+        real_git
+    })
+}
+
+/// Full content the counting shim recorded — one line of argv per `git`
+/// invocation, in call order.
+fn spawn_log(count_file: &std::path::Path) -> String {
+    std::fs::read_to_string(count_file).unwrap_or_default()
+}
+
+/// Run the mutation-nudge scenario (`tee root_file.txt sub/sub_file.txt` in a
+/// fresh primary-repo `Scratch` fixture) through the real binary with an
+/// argv-recording `git` shim on PATH, returning `(stdout, spawn log)`.
+///
+/// `allow_main` toggles `CADENCE_ALLOW_MAIN` — the ONLY difference between the
+/// blocked-path and allow-path tests below, so the differential is exact.
+/// Nudge/denial logging is left at its default (ON) rather than special-cased
+/// off: the shim recording full argv lets each test assert on exactly which
+/// commands ran, so the metrics layer's own git spawn (found while writing
+/// this test — `repo_basename`'s `rev-parse --show-toplevel`, fired by the
+/// nudge/denial logger, cadence-hooks#292 review) is pinned by name rather
+/// than suppressed by a knob that could silently grow.
+fn run_mutation_nudge(tag: &str, allow_main: bool) -> (String, String) {
+    let scratch = Scratch::new(&scratch_root(), tag);
+    init_mutation_nudge_repo(scratch.path());
+
+    let shim = tempfile::tempdir().unwrap();
+    let counts = tempfile::tempdir().unwrap();
+    let count_file = counts.path().join("spawns");
+    write_counting_git(shim.path(), &count_file, real_git());
+    let metrics = tempfile::tempdir().unwrap();
+
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": "tee root_file.txt sub/sub_file.txt" },
+        "cwd": scratch.path().to_string_lossy(),
+    })
+    .to_string();
+
+    let mut cmd = cadence_hooks();
+    cmd.args(["guardrails", "enforce-worktree"]);
+    cmd.env("PATH", shim.path());
+    cmd.env("CADENCE_METRICS_DIR", metrics.path());
+    if allow_main {
+        cmd.env("CADENCE_ALLOW_MAIN", "true");
+    } else {
+        cmd.env_remove("CADENCE_ALLOW_MAIN");
+    }
+    cmd.env_remove("CADENCE_NO_ENFORCE_WORKTREE");
+    cmd.env_remove("CADENCE_DISABLE");
+    let out = run_with_payload(&mut cmd, &payload);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "enforce-worktree must exit 0 here (a nudge is advisory, and \
+         CADENCE_ALLOW_MAIN must allow): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    (stdout, spawn_log(&count_file))
+}
+
+#[test]
+fn enforce_worktree_mutation_nudge_blocked_path_spawns_one_git() {
+    // cadence-hooks#292's corrected premise: the issue as filed assumed
+    // GitState::resolve still spawned git (it's been a pure filesystem walk
+    // since #164 — deadline_failopen.rs's own edit-arm test above already
+    // pins that at zero) and that the mutation-nudge loop's spawn count scaled
+    // with the number of distinct mutation targets. It doesn't: `mutation_nudge`
+    // returns on the FIRST target whose containing repo would block, and
+    // `GitProbe::is_commitless` is memoized on repo_root regardless — so N
+    // distinct targets (here 2, in different subdirectories, so they aren't
+    // trivially deduped to one directory) in the SAME primary repo still cost
+    // exactly one `git` spawn from enforce-worktree itself (the `rev-list
+    // --count -n1 --all` bootstrap-exemption probe on the would-block path).
+    //
+    // A second, separate spawn is real and expected here: the nudge/denial
+    // logger resolves its own `repo` field via `repo_basename`'s `rev-parse
+    // --show-toplevel` on every guard's Nudge outcome — the metrics layer's
+    // cost, not enforce-worktree's, but genuinely on PATH in the DEFAULT
+    // (nudge-logging-on) configuration. Asserting on both by name, in order,
+    // pins the full default-config cost rather than hiding one behind a knob.
+    let (stdout, log) = run_mutation_nudge("blocked", false);
+
+    assert!(
+        stdout.contains("enforce-worktree: this command mutates"),
+        "expected the mutation nudge to fire in this primary-checkout fixture: {stdout}"
+    );
+
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected exactly 2 git invocations (enforce-worktree's is_commitless \
+         + the metrics logger's repo_basename); got: {lines:?}"
+    );
+    assert!(
+        lines[0].contains("rev-list") && lines[0].contains("--count") && lines[0].contains("-n1"),
+        "first spawn should be enforce-worktree's is_commitless bootstrap-exemption probe: {}",
+        lines[0]
+    );
+    assert_eq!(
+        lines[1].trim(),
+        "rev-parse --show-toplevel",
+        "second spawn should be the metrics logger's repo_basename lookup: {}",
+        lines[1]
+    );
+}
+
+#[test]
+fn enforce_worktree_mutation_nudge_allow_path_spawns_zero_git() {
+    // Differential control for the test above: the identical fixture and
+    // command, differing ONLY in CADENCE_ALLOW_MAIN — assess_dir never
+    // reaches the would-block branch, so is_commitless (enforce-worktree's one
+    // git spawn on the blocked path) is never called, GitState resolution is
+    // git-free regardless, and no Nudge outcome means the metrics logger's
+    // repo_basename spawn never fires either. Total: zero.
+    let (stdout, log) = run_mutation_nudge("allowed", true);
+
+    assert!(
+        !stdout.contains("enforce-worktree: this command mutates"),
+        "CADENCE_ALLOW_MAIN must suppress the nudge, not just the block: {stdout}"
+    );
+    assert_eq!(
+        log, "",
+        "an exempted primary checkout must spawn zero git on the mutation-nudge \
+         path; got: {log:?}"
     );
 }

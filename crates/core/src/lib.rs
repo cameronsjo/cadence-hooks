@@ -9,12 +9,14 @@
 //! entry points print usage guidance and exit 1 rather than blocking on a
 //! read that would never see EOF.
 
+pub mod branch_diff;
 pub mod config;
 pub mod deadline;
 pub mod display;
 pub mod gitstate;
 pub mod loop_analysis;
 pub mod markers;
+pub mod patch;
 pub mod pathclass;
 pub mod paths;
 pub mod shell;
@@ -26,6 +28,14 @@ pub mod worktree;
 // marker-dir env helper it carries — one global, one lock, one helper (#446).
 #[cfg(any(test, feature = "test-builders"))]
 pub mod test_builders;
+
+// Git-fixture builders (a `target/`-rooted `Scratch` plus `git_in`/`init_repo`)
+// live separately from `test_builders`'s `HookInput` builders — the two have
+// nothing in common beyond both being test-only, and folding fixtures that
+// spawn `git` subprocesses into the `HookInput`-builder module would make
+// every consumer of `make_bash`/`make_edit` compile that code too.
+#[cfg(any(test, feature = "test-builders"))]
+pub mod git_fixtures;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -147,6 +157,94 @@ impl Outcome {
     }
 }
 
+/// Set once this process parses a payload only the Codex harness produces.
+/// See [`is_codex_payload_shape`] for the sniff and [`is_codex_harness`] for why
+/// it exists.
+static CODEX_PAYLOAD_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tool names no Claude Code build sends and every Codex build does.
+///
+/// `spawn_agents_on_csv`/`multi_agents` are deliberately absent: they alias to
+/// `Agent` like `spawn_agent` does, but they are variant spellings this repo has
+/// not measured, and a sniff list is a place to be conservative rather than
+/// exhaustive — a name that turns out to exist on some other harness would start
+/// applying Codex strictness there.
+const CODEX_ONLY_TOOLS: &[&str] = &["apply_patch", "exec_command", "unified_exec", "spawn_agent"];
+
+/// Does this raw payload carry a shape only Codex produces?
+///
+/// Two signals, OR'd: a [`CODEX_ONLY_TOOLS`] tool name, or a string-valued
+/// `tool_input` (Codex's freeform-body form; Claude Code sends an object).
+///
+/// Pure, and public so the rule is testable without mutating process state.
+#[must_use]
+pub fn is_codex_payload_shape(value: &serde_json::Value) -> bool {
+    let codex_only_tool = value
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| CODEX_ONLY_TOOLS.contains(&name));
+    let freeform_tool_input = value
+        .get("tool_input")
+        .is_some_and(serde_json::Value::is_string);
+    codex_only_tool || freeform_tool_input
+}
+
+/// Whether this process is running under the Codex harness.
+///
+/// The single source of truth for the harness question. Security behaviour keys
+/// off this (fail-closed parse denial, the `Ask` → `Block` conversion) and so
+/// does metrics tagging, so all callers must agree — a site that compared
+/// case-sensitively while another compared case-insensitively would fail **open**
+/// on `CADENCE_HARNESS=Codex` at exactly the moment metrics recorded the run as
+/// Codex.
+///
+/// Two independent signals, OR'd:
+///
+/// 1. `CADENCE_HARNESS` — set by the Codex wrapper. Matching is case-insensitive:
+///    the value is set by shell wrappers, and a harness that announces itself at
+///    all should be honoured however it cased it.
+/// 2. A Codex-shaped payload already parsed by this process
+///    ([`is_codex_payload_shape`]).
+///
+/// The second exists because the *normalization* is unconditional while the
+/// *hardening* was conditional, which is the worst-shaped failure available: on a
+/// Codex session where the wrapper did not export the variable, payloads still
+/// normalize and guards still fire, so the integration looks healthy — while a
+/// malformed payload on a security-critical hook exits 0 instead of 2, and a
+/// guard returning `Ask` exits 0 with an envelope Codex cannot render, so the
+/// operation proceeds unconfirmed. The wrapper does export it today; this is the
+/// belt to that suspenders, and it is derivable from data the normalizer already
+/// inspects.
+///
+/// **The sniff can only ever ADD strictness, never subtract it.** Both directions
+/// were checked rather than assumed:
+///
+/// - A false *positive* under Claude Code costs nothing reachable. The only
+///   `Outcome::Ask` producer in the tree is `guard-rm`, and both of its routes
+///   need an object `tool_input` (a `command`, or a `file_path` plus
+///   `operation: "delete"`); a string-valued `tool_input` degrades to `None`, so
+///   such a payload returns Allow and there is no Ask to convert to a Block. The
+///   fail-closed parse arm is likewise unreachable — if stdin failed to parse,
+///   no payload was sniffed.
+/// - A false *negative* leaves exactly today's behaviour: the env check alone.
+///
+/// Spoofing is safe in the same direction: an attacker-set
+/// `CADENCE_HARNESS=codex`, or a payload crafted to look Codex-shaped, only makes
+/// this binary stricter. The danger was always *absence*.
+#[must_use]
+pub fn is_codex_harness() -> bool {
+    is_codex_harness_value(std::env::var("CADENCE_HARNESS").ok().as_deref())
+        || CODEX_PAYLOAD_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Pure resolver behind [`is_codex_harness`], so the matching rule is testable
+/// without mutating process environment shared by every parallel test.
+#[must_use]
+pub fn is_codex_harness_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("codex"))
+}
+
 /// Normalize a file path for consistent matching:
 /// - Replace backslashes with forward slashes (Windows compatibility)
 /// - Strip null bytes (C string truncation attack prevention)
@@ -173,9 +271,34 @@ pub fn normalize_path(path: &str) -> String {
 /// deserialize to `None` when absent, so existing Pre/Post hooks are unaffected.
 /// `Default` is derived so call sites can construct partial inputs via
 /// `..Default::default()`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct HookInput {
     pub tool_name: Option<String>,
+    /// The harness-neutral view of [`Self::tool_name`], derived at parse time by
+    /// [`Self::from_json`] — never deserialized from the payload.
+    ///
+    /// A Codex `exec_command` and a Claude `Bash` are the same operation as far
+    /// as a guard is concerned, and so are `mcp__filesystem__write_file` and
+    /// `Write`. Guards that gate on *what the operation does* read this via
+    /// [`Self::normalized_tool_name`]; guards that gate on *which tool the
+    /// harness actually named* keep reading [`Self::tool_name`].
+    ///
+    /// Kept as a SEPARATE field rather than overwriting `tool_name`, because
+    /// overwriting silently unhooked `guard-browser-device`: it matches
+    /// `mcp__claude-in-chrome__*`, and four of those names (`read_page`,
+    /// `read_console_messages`, `read_network_requests`, `tabs_create_mcp`)
+    /// classify as `Read`/`Write`, so the rewritten name no longer matched the
+    /// prefix and the first browser action of a session ran against an
+    /// unconfirmed device. Preserving the literal name is the durable shape:
+    /// it holds even if Codex later grows a Claude-in-Chrome route, which a
+    /// harness gate on the rewrite would not.
+    ///
+    /// `#[serde(skip)]` is load-bearing. This field steers enforcement, so a
+    /// payload must not be able to supply it — a hand-set `"normalized_tool":
+    /// "Read"` on a write payload would talk every content guard out of
+    /// scanning. It is derived, or it is `None`.
+    #[serde(skip)]
+    pub normalized_tool: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub tool_input: Option<ToolInput>,
     /// The tool response (stdout, stderr) from the tool execution.
@@ -208,11 +331,23 @@ pub struct HookInput {
 }
 
 /// Tool-specific fields from the hook input.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ToolInput {
     pub file_path: Option<String>,
     pub path: Option<String>,
+    #[serde(alias = "sourcePath", alias = "from")]
+    pub source: Option<String>,
+    #[serde(alias = "destinationPath", alias = "to")]
+    pub destination: Option<String>,
     pub command: Option<String>,
+    /// Codex unified-exec/function form; normalized to `command` at parse time.
+    pub cmd: Option<String>,
+    /// Codex `apply_patch` freeform body; expanded into per-target HookInputs
+    /// by [`HookInput::normalized_inputs`].
+    pub patch: Option<String>,
+    /// Harness-neutral operation kind for adapters that need deletion or
+    /// rename semantics beyond the legacy Write/Edit tool name.
+    pub operation: Option<String>,
     pub content: Option<String>,
     pub new_string: Option<String>,
     pub old_string: Option<String>,
@@ -238,7 +373,7 @@ pub struct ToolInput {
 }
 
 /// A single edit operation within a MultiEdit tool call.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct EditOperation {
     pub old_string: Option<String>,
     pub new_string: Option<String>,
@@ -246,7 +381,7 @@ pub struct EditOperation {
 }
 
 /// A single AskUserQuestion question and its answer options.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskQuestion {
     pub question: Option<String>,
@@ -256,7 +391,7 @@ pub struct AskQuestion {
 }
 
 /// A single answer option within an AskUserQuestion question.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct AskOption {
     pub label: Option<String>,
     pub description: Option<String>,
@@ -276,7 +411,7 @@ fn apply_edit(doc: &str, old: &str, new: &str, replace_all: bool) -> String {
 /// Claude Code sends the tool's stdout (and optionally stderr) back in the
 /// hook payload so post-processing hooks can inspect the result without
 /// re-running the command.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ToolResponse {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
@@ -336,7 +471,199 @@ impl HookInput {
         std::io::stdin()
             .read_to_string(&mut buf)
             .map_err(|e| format!("Failed to read stdin: {e}"))?;
-        serde_json::from_str(&buf).map_err(|e| format!("Failed to parse hook JSON: {e}"))
+        Self::from_json(&buf)
+    }
+
+    /// Parse a Claude or Codex hook payload and normalize harness aliases.
+    ///
+    /// Raw inputs are never retained beyond this value. In particular, a patch
+    /// body is parsed in memory and is not included in parse diagnostics.
+    pub fn from_json(raw: &str) -> Result<Self, String> {
+        let mut value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        // Sniffed on the RAW value, before the `apply_patch` rewrite below turns
+        // a string `tool_input` into an object and erases the second signal.
+        if is_codex_payload_shape(&value) {
+            CODEX_PAYLOAD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let tool_name = value
+            .get("tool_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if tool_name == "apply_patch" {
+            let patch = value
+                .get("tool_input")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("input").and_then(serde_json::Value::as_str))
+                .map(str::to_string);
+            if let Some(patch) = patch {
+                value["tool_input"] = serde_json::json!({"patch": patch});
+            }
+        }
+        let mut input: HookInput =
+            serde_json::from_value(value).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        if let Some(tool_input) = input.tool_input.as_mut()
+            && tool_input.command.is_none()
+        {
+            tool_input.command = tool_input.cmd.take();
+        }
+        // Every alias below writes `normalized_tool`, never `tool_name` — see
+        // that field's doc comment for why the literal name has to survive.
+        if matches!(
+            input.tool_name.as_deref(),
+            Some("exec_command" | "unified_exec" | "shell")
+        ) {
+            input.normalized_tool = Some("Bash".to_string());
+        }
+        if matches!(
+            input.tool_name.as_deref(),
+            Some("spawn_agent" | "spawn_agents_on_csv" | "multi_agents")
+        ) {
+            input.normalized_tool = Some("Agent".to_string());
+        }
+        if let Some(name) = input.tool_name.as_deref()
+            && name.starts_with("mcp__")
+        {
+            let lower = name.to_ascii_lowercase();
+            let operation = if lower.contains("delete") || lower.contains("remove") {
+                Some(("Edit", "delete"))
+            } else if lower.contains("write") || lower.contains("create") {
+                Some(("Write", "create"))
+            } else if lower.contains("edit") || lower.contains("update") {
+                Some(("Edit", "update"))
+            } else if lower.contains("move") || lower.contains("rename") {
+                Some(("Edit", "rename"))
+            } else if lower.contains("read")
+                || lower.contains("get_file")
+                || lower.contains("fetch_file")
+                || lower.contains("load_file")
+            {
+                Some(("Read", "read"))
+            } else if lower.contains("grep")
+                || lower.contains("search")
+                || lower.contains("find_file")
+            {
+                Some(("Grep", "search"))
+            } else {
+                None
+            };
+            if let Some((tool, operation)) = operation {
+                input.normalized_tool = Some(tool.to_string());
+                if let Some(tool_input) = input.tool_input.as_mut() {
+                    tool_input.operation = Some(operation.to_string());
+                }
+            }
+        }
+        Ok(input)
+    }
+
+    /// Expand a Codex `apply_patch` payload into one Claude-shaped input per
+    /// target operation. Non-patch payloads return a single clone.
+    pub fn normalized_inputs(&self) -> Result<Vec<Self>, String> {
+        if self.tool_name() != Some("apply_patch") {
+            if self.operation() == Some("rename")
+                && let Some(tool_input) = self.tool_input.as_ref()
+                && let (Some(source), Some(destination)) =
+                    (tool_input.source.clone(), tool_input.destination.clone())
+            {
+                return Ok(vec![
+                    self.file_operation("Edit", "rename-source", source, None, None),
+                    self.file_operation(
+                        "Write",
+                        "rename-destination",
+                        destination,
+                        None,
+                        tool_input.content.clone(),
+                    ),
+                ]);
+            }
+            return Ok(vec![self.clone()]);
+        }
+        let patch = self
+            .tool_input
+            .as_ref()
+            .and_then(|tool_input| tool_input.patch.as_deref())
+            .ok_or_else(|| "apply_patch payload omitted patch body".to_string())?;
+        let operations =
+            patch::parse(patch).map_err(|error| format!("apply_patch schema rejected: {error}"))?;
+        let mut inputs = Vec::new();
+        for operation in operations {
+            match operation {
+                patch::Operation::Create { path, content } => {
+                    inputs.push(self.file_operation("Write", "create", path, None, Some(content)));
+                }
+                patch::Operation::Update {
+                    path,
+                    old,
+                    new,
+                    move_to,
+                } => {
+                    let operation = if move_to.is_some() {
+                        "rename-source"
+                    } else {
+                        "update"
+                    };
+                    inputs.push(self.file_operation(
+                        "Edit",
+                        operation,
+                        path.clone(),
+                        old,
+                        new.clone(),
+                    ));
+                    if let Some(destination) = move_to {
+                        inputs.push(self.file_operation(
+                            "Write",
+                            "rename-destination",
+                            destination,
+                            None,
+                            new,
+                        ));
+                    }
+                }
+                patch::Operation::Delete { path } => {
+                    inputs.push(self.file_operation(
+                        "Edit",
+                        "delete",
+                        path,
+                        None,
+                        Some(String::new()),
+                    ));
+                }
+            }
+        }
+        if inputs.is_empty() {
+            return Err("apply_patch contained no file operations".to_string());
+        }
+        Ok(inputs)
+    }
+
+    fn file_operation(
+        &self,
+        tool_name: &str,
+        operation: &str,
+        path: String,
+        old: Option<String>,
+        new: Option<String>,
+    ) -> Self {
+        let mut result = self.clone();
+        // The synthesized per-target view is a *normalized* one — the literal
+        // harness tool is still `apply_patch` (or the MCP rename tool), and the
+        // denial ledger records that rather than a shape this binary invented.
+        result.normalized_tool = Some(tool_name.to_string());
+        result.tool_input = Some(ToolInput {
+            file_path: Some(path),
+            operation: Some(operation.to_string()),
+            old_string: old,
+            new_string: if tool_name == "Edit" {
+                new.clone()
+            } else {
+                None
+            },
+            content: if tool_name == "Write" { new } else { None },
+            ..ToolInput::default()
+        });
+        result
     }
 
     /// Resolved file path — checks file_path first, then path.
@@ -346,6 +673,11 @@ impl HookInput {
             .as_ref()
             .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()))
             .map(normalize_path)
+    }
+
+    /// Harness-neutral operation kind supplied by Codex adapters.
+    pub fn operation(&self) -> Option<&str> {
+        self.tool_input.as_ref()?.operation.as_deref()
     }
 
     /// The bash command, if this is a Bash tool invocation.
@@ -479,9 +811,31 @@ impl HookInput {
         None
     }
 
-    /// The tool name (Write, Edit, Bash, etc.)
+    /// The tool name **exactly as the harness sent it** (`Write`, `Edit`,
+    /// `Bash`, `exec_command`, `mcp__claude-in-chrome__read_page`, …).
+    ///
+    /// Use this when the guard's question is "which tool is this?" — a
+    /// fully-qualified MCP name, a Claude-only tool with no Codex counterpart
+    /// (`AskUserQuestion`, `ExitPlanMode`, `CronCreate`), or an audit record of
+    /// what actually ran. Use [`Self::normalized_tool_name`] when the question
+    /// is "what does this operation do?".
     pub fn tool_name(&self) -> Option<&str> {
         self.tool_name.as_deref()
+    }
+
+    /// The harness-neutral tool name: [`Self::normalized_tool`] when the parse
+    /// derived one, otherwise [`Self::tool_name`] unchanged.
+    ///
+    /// Under Claude Code the two agree for every native tool, so a guard that
+    /// switches to this reads identically there; under Codex (and for MCP
+    /// filesystem servers on either harness) it is what lets a `Write` gate see
+    /// `mcp__filesystem__write_file`. Every guard gating on a Claude tool name
+    /// — `Bash`, `Agent`/`Task`, `Edit`/`Write`/`MultiEdit`/`NotebookEdit`,
+    /// `Read`, `Grep` — wants this one.
+    pub fn normalized_tool_name(&self) -> Option<&str> {
+        self.normalized_tool
+            .as_deref()
+            .or(self.tool_name.as_deref())
     }
 
     /// The Claude Code session id, if present (SessionStart and some payloads).
@@ -1010,6 +1364,15 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
+    if result.outcome == Outcome::Ask && is_codex_harness() {
+        let reason = result.message.as_deref().unwrap_or("confirmation required");
+        eprintln!(
+            "{reason}\n\nBlocked because Codex hooks cannot hand an Ask decision to the user. \
+             Review the target, then use the documented scoped bypass or run the operation \
+             yourself outside the agent session."
+        );
+        process::exit(Outcome::Block.code());
+    }
     let rendered = render_output(
         result.outcome,
         result.message.as_deref(),
@@ -1110,14 +1473,61 @@ pub fn guard_interactive_terminal(
 }
 
 /// Run a single check from stdin. Convenience wrapper for subcommands.
+///
+/// Routes through [`HookInput::normalized_inputs`], so a harness payload that
+/// expands into several targets (a Codex `apply_patch` carrying N file
+/// operations) is judged per target and the strictest verdict wins — the same
+/// semantics the shipped binary gets from `dispatch::run_logged_check`.
+///
+/// It was left unnormalized when patch expansion landed, which made it a second,
+/// *weaker* entry point wearing the name "convenience wrapper": an `apply_patch`
+/// payload reached the check as one opaque input with no `file_path`, so every
+/// path- and content-scanning guard saw nothing to judge. Nothing shipped was
+/// exposed — every `src/main.rs` hook arm calls the dispatch wrapper — but this
+/// is public API, and the next caller to reach for the convenient one would have
+/// silently got less enforcement.
+///
+/// What it deliberately does NOT gain is the dispatch wrapper's telemetry tail
+/// (denial ledger, timing, panic guard) or its Codex fail-closed parse arm: those
+/// need the canonical registry hook name, which lives in the binary. So this
+/// stays the *unlogged* path, not a weaker one.
 pub fn run_check_from_stdin(check: &dyn Check, event: HookEvent) -> ! {
     guard_interactive_terminal(check.name(), Some(event), None);
-    match HookInput::from_stdin() {
-        Ok(input) => run_check(check, &input, event),
+    let input = match HookInput::from_stdin() {
+        Ok(input) => input,
         Err(e) => {
             eprintln!("cadence-hooks: {e}");
             process::exit(0); // Fail open on parse errors
         }
+    };
+    let targets = match input.normalized_inputs() {
+        Ok(targets) => targets,
+        Err(e) => {
+            eprintln!("cadence-hooks: {e}");
+            process::exit(0); // Fail open on normalization errors
+        }
+    };
+    // Strictest-wins, ties to the earlier target — the same rule as the binary's
+    // `aggregate_results`, kept here rather than shared because that function
+    // lives in the binary (which depends on core, not the reverse). This half
+    // does not join the losers' messages: the binary needs that for its denial
+    // ledger, an unlogged wrapper does not.
+    let mut merged: Option<CheckResult> = None;
+    for target in &targets {
+        let Some(result) = decide_check(check, target) else {
+            continue;
+        };
+        let strictest = match &merged {
+            None => true,
+            Some(previous) => previous.outcome.merge(result.outcome) != previous.outcome,
+        };
+        if strictest {
+            merged = Some(result);
+        }
+    }
+    match merged {
+        None => process::exit(Outcome::Allow.code()),
+        Some(result) => emit_and_exit(&result, event),
     }
 }
 
@@ -1171,6 +1581,198 @@ mod tests {
         assert_eq!(Outcome::Nudge.code(), 0);
         assert_eq!(Outcome::LoopBlock.code(), 0);
         assert_eq!(Outcome::Block.code(), 2);
+    }
+
+    // --- the payload-shape harness sniff (C3) ---
+
+    /// Both Codex signals are recognized. Asserted on the pure predicate so the
+    /// test says nothing about process-global state other tests may have set.
+    #[test]
+    fn codex_payload_shapes_are_recognized() {
+        for raw in [
+            r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\n*** End Patch"}"#,
+            r#"{"tool_name":"exec_command","tool_input":{"cmd":"ls"}}"#,
+            r#"{"tool_name":"unified_exec","tool_input":{"cmd":"ls"}}"#,
+            r#"{"tool_name":"spawn_agent","tool_input":{}}"#,
+            // The freeform-body signal on its own, with no Codex-only name.
+            r#"{"tool_name":"Read","tool_input":"/etc/hosts"}"#,
+        ] {
+            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert!(
+                is_codex_payload_shape(&value),
+                "should sniff as Codex: {raw}"
+            );
+        }
+    }
+
+    /// The other direction, which is the one that matters: an ordinary Claude
+    /// Code payload must NOT trip the sniff, or every session would silently
+    /// take the Codex hardening path.
+    #[test]
+    fn claude_payload_shapes_are_not_sniffed_as_codex() {
+        for raw in [
+            r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#,
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a","old_string":"x","new_string":"y"}}"#,
+            r#"{"tool_name":"Agent","tool_input":{"subagent_type":"explorer"}}"#,
+            r#"{"tool_name":"mcp__claude-in-chrome__read_page","tool_input":{}}"#,
+            r#"{"session_id":"s","source":"startup"}"#,
+            // Not a substring match: a Claude tool whose name merely contains a
+            // Codex-only name must not sniff.
+            r#"{"tool_name":"apply_patch_helper","tool_input":{}}"#,
+        ] {
+            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert!(
+                !is_codex_payload_shape(&value),
+                "should NOT sniff as Codex: {raw}"
+            );
+        }
+    }
+
+    /// End to end: parsing a Codex payload makes `is_codex_harness()` true with
+    /// `CADENCE_HARNESS` unset — the whole point of the fallback. Deliberately
+    /// one-directional: the flag is process-global and sticky by design, so a
+    /// "stays false" assertion here would be a race against every other test in
+    /// this binary. That direction is covered above, on the pure predicate.
+    #[test]
+    fn parsing_a_codex_payload_arms_the_harness_fallback() {
+        HookInput::from_json(r#"{"tool_name":"exec_command","tool_input":{"cmd":"ls"}}"#).unwrap();
+        assert!(
+            is_codex_harness(),
+            "a parsed Codex payload must arm the harness fallback without the env var"
+        );
+    }
+
+    #[test]
+    fn codex_shell_and_subagent_aliases_normalize() {
+        let shell = HookInput::from_json(
+            r#"{"tool_name":"exec_command","tool_input":{"cmd":"git status"}}"#,
+        )
+        .unwrap();
+        assert_eq!(shell.tool_name(), Some("exec_command"));
+        assert_eq!(shell.normalized_tool_name(), Some("Bash"));
+        assert_eq!(shell.command(), Some("git status"));
+
+        let agent = HookInput::from_json(r#"{"tool_name":"spawn_agent","tool_input":{}}"#).unwrap();
+        assert_eq!(agent.tool_name(), Some("spawn_agent"));
+        assert_eq!(agent.normalized_tool_name(), Some("Agent"));
+    }
+
+    #[test]
+    fn codex_filesystem_mcp_operations_normalize() {
+        let write = HookInput::from_json(
+            r#"{"tool_name":"mcp__filesystem__write_file","tool_input":{"path":"a","content":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(write.normalized_tool_name(), Some("Write"));
+        assert_eq!(write.operation(), Some("create"));
+        assert_eq!(write.file_path().as_deref(), Some("a"));
+
+        let delete = HookInput::from_json(
+            r#"{"tool_name":"mcp__filesystem__delete_file","tool_input":{"path":"a"}}"#,
+        )
+        .unwrap();
+        assert_eq!(delete.normalized_tool_name(), Some("Edit"));
+        assert_eq!(delete.operation(), Some("delete"));
+
+        let read = HookInput::from_json(
+            r#"{"tool_name":"mcp__filesystem__read_file","tool_input":{"path":".env"}}"#,
+        )
+        .unwrap();
+        assert_eq!(read.normalized_tool_name(), Some("Read"));
+        assert_eq!(read.operation(), Some("read"));
+
+        let rename = HookInput::from_json(
+            r#"{"tool_name":"mcp__filesystem__move_file","tool_input":{"source":"a","destination":"b"}}"#,
+        )
+        .unwrap()
+        .normalized_inputs()
+        .unwrap();
+        assert_eq!(rename.len(), 2);
+        assert_eq!(rename[0].file_path().as_deref(), Some("a"));
+        assert_eq!(rename[1].file_path().as_deref(), Some("b"));
+    }
+
+    /// The `grep`/`search`/`find_file` and `get_file`/`fetch_file`/`load_file`
+    /// arms of the `mcp__` heuristic, which no test reached — only
+    /// `write_file`/`delete_file`/`read_file`/`move_file` were exercised, so
+    /// half the classifier was live-but-unpinned.
+    #[test]
+    fn remaining_mcp_heuristic_branches_classify() {
+        let cases = [
+            ("mcp__code__grep", "Grep", "search"),
+            ("mcp__notion__search_pages", "Grep", "search"),
+            ("mcp__fs__find_file", "Grep", "search"),
+            ("mcp__fs__get_file", "Read", "read"),
+            ("mcp__fs__fetch_file", "Read", "read"),
+            ("mcp__fs__load_file", "Read", "read"),
+        ];
+        for (tool, expected_tool, expected_operation) in cases {
+            let input =
+                HookInput::from_json(&format!(r#"{{"tool_name":"{tool}","tool_input":{{}}}}"#))
+                    .unwrap();
+            assert_eq!(input.normalized_tool_name(), Some(expected_tool), "{tool}");
+            assert_eq!(input.operation(), Some(expected_operation), "{tool}");
+            // And, per the C1 fix, the literal name always survives.
+            assert_eq!(input.tool_name(), Some(tool));
+        }
+    }
+
+    /// Precedence is fail-safe by construction: a name matching two arms takes
+    /// the more destructive one, so a mis-sniff over-blocks rather than
+    /// under-blocks. Pinned because the arm ORDER is the whole rule.
+    #[test]
+    fn mcp_heuristic_precedence_favours_the_destructive_reading() {
+        // `delete` is tested before `read`, so a "read-and-delete" tool is a
+        // delete.
+        let input = HookInput::from_json(
+            r#"{"tool_name":"mcp__fs__read_then_delete_file","tool_input":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(input.normalized_tool_name(), Some("Edit"));
+        assert_eq!(input.operation(), Some("delete"));
+
+        // An unclassifiable MCP tool gets no normalized view at all, and so
+        // reaches guards under its own name.
+        let unknown =
+            HookInput::from_json(r#"{"tool_name":"mcp__weather__forecast","tool_input":{}}"#)
+                .unwrap();
+        assert_eq!(
+            unknown.normalized_tool_name(),
+            Some("mcp__weather__forecast")
+        );
+        assert_eq!(unknown.operation(), None);
+    }
+
+    #[test]
+    fn codex_patch_expands_every_target_and_rename_destination() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\n*** Add File: a\n+x\n*** Update File: b\n*** Move to: c\n@@\n-old\n+new\n*** Delete File: d\n*** End Patch"}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        let paths = targets
+            .iter()
+            .filter_map(HookInput::file_path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["a", "b", "c", "d"]);
+        assert_eq!(
+            targets
+                .iter()
+                .map(HookInput::normalized_tool_name)
+                .collect::<Vec<_>>(),
+            [Some("Write"), Some("Edit"), Some("Write"), Some("Edit")]
+        );
+    }
+
+    #[test]
+    fn malformed_codex_patch_diagnostic_does_not_echo_body() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\nTOP_SECRET\n*** End Patch"}"#,
+        )
+        .unwrap();
+        let error = input.normalized_inputs().unwrap_err();
+        assert!(error.contains("schema rejected"));
+        assert!(!error.contains("TOP_SECRET"));
     }
 
     // --- feedback footer ---
@@ -1598,6 +2200,32 @@ mod tests {
         // synthetic test inputs) deserialize to None, never an error.
         let input: HookInput = serde_json::from_str(r#"{"tool_name":"Bash"}"#).unwrap();
         assert_eq!(input.transcript_path(), None);
+    }
+
+    #[test]
+    fn codex_harness_match_is_case_insensitive() {
+        // The security paths (fail-closed parse denial, Ask -> Block) and the
+        // metrics harness tag all read this one rule. When they disagreed, a
+        // non-lowercase value tagged the run "codex" in metrics while both
+        // security paths silently treated it as Claude — failing open exactly
+        // when the ledger said Codex was driving.
+        for value in ["codex", "Codex", "CODEX", "cOdEx"] {
+            assert!(
+                is_codex_harness_value(Some(value)),
+                "{value} should be recognized as the Codex harness"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_harness_match_rejects_non_codex_values() {
+        for value in ["claude", "", "codexx", "co dex", "codex-cli"] {
+            assert!(
+                !is_codex_harness_value(Some(value)),
+                "{value} should not be recognized as the Codex harness"
+            );
+        }
+        assert!(!is_codex_harness_value(None));
     }
 
     #[test]

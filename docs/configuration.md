@@ -135,9 +135,26 @@ export CADENCE_ALLOWED_OWNERS="cameron git.sjo.lol/cameron"
 
 For a single `gh` write, the target resolves in order: explicit `-R`/`--repo` flag (all four forms: `-R x`, `-Rx`, `--repo x`, `--repo=x`) → positional `owner/repo` argument → `gh api repos/...` path → the working directory's git remotes. A resolved target is checked against the allowlists; an owned target proceeds without any flag.
 
+The target host follows the command itself, on any subcommand, in two spellings:
+an explicit `--hostname` (separate or `=` form) overrides an inline
+`GH_HOST=... gh ...` assignment prefixed to the same command, which overrides the
+hook process's `GH_HOST` and finally the `github.com` default. Host comparisons
+are case-insensitive.
+
+Only those two spellings are read. An assignment `export`ed in an earlier segment
+of the same command string (`export GH_HOST=... && gh ...`) reaches gh but is not
+yet tracked, so the guard judges the write against the default host. A bare
+`GH_HOST=...; gh ...` needs no tracking: without `export` it stays a shell
+variable that gh never sees, so the guard and gh already agree.
+
 **Forks** (a repo with both `origin` and `upstream` remotes) are allowed when **both** remotes belong to allowed owners — each judged against its own host. When either side is unowned, the write blocks and asks for an explicit `-R`.
 
 **Loops** containing gh writes without `-R` follow a *relaxed-when-deterministic* policy: the write is allowed when the loop body provably never changes directory (no `cd`/`pushd`/`popd`/`eval`/`source`) **and** the working directory resolves to a single owned, non-fork repo. Under those conditions every iteration targets the same repo the guard verified — the same trust extended to single commands. Anything the analyzer cannot prove (directory changes inside the body, parse failures, forks, unowned directories) still blocks.
+
+Looped `gh api` calls use the API-specific verdict rather than the generic
+missing-`-R` message. GraphQL reads and the safe review-thread metadata
+mutations remain allowed; other GraphQL or non-repository API mutations block
+when their target cannot be ownership-verified.
 
 Set `CADENCE_GH_STRICT_LOOPS=1` to disable the relaxation and block every looped gh write that lacks `-R` (the pre-0.12 behavior). Block messages include the resolved `-R owner/repo` fix when the working directory is owned.
 

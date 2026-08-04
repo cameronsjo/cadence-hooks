@@ -250,10 +250,13 @@ const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 /// binary so the wiring PR has something to point at, and reaching no event
 /// until that PR lands.
 /// (`<plugin> <subcommand>`, tracking_reference)
-const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[(
-    "guardrails inject-gh-write-context",
-    "cameronsjo/cadence#653",
-)];
+const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
+    (
+        "guardrails inject-gh-write-context",
+        "cameronsjo/cadence#653",
+    ),
+    ("guardrails guard-rm-liveness", "cameronsjo/cadence#760"),
+];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
@@ -560,6 +563,18 @@ fn settings_json_hooks() -> (Vec<String>, Vec<String>) {
     (shell_scripts, binary_dispatches)
 }
 
+/// Every `<plugin> <subcommand>` command any resolved plugin's `hooks.json`
+/// registers. Three tests built this identical set inline
+/// (`all_binary_subcommands_are_registered`, `pending_wiring_hooks_are_still_unwired`,
+/// `no_plugin_hooks_duplicated_in_settings_json`) — factored out so they
+/// can't quietly diverge.
+fn registered_commands(all_refs: &BTreeMap<String, Vec<HookRef>>) -> BTreeSet<&str> {
+    all_refs
+        .values()
+        .flat_map(|refs| refs.iter().map(|r| r.command.as_str()))
+        .collect()
+}
+
 // ---------- Tests ----------
 
 /// Skip the test unless **every** expected plugin hooks.json resolved.
@@ -613,10 +628,7 @@ fn all_binary_subcommands_are_registered() {
     let binary_cmds = binary_hooks();
     require_plugin_refs!(all_refs);
 
-    let registered: BTreeSet<String> = all_refs
-        .values()
-        .flat_map(|refs| refs.iter().map(|r| r.command.clone()))
-        .collect();
+    let registered = registered_commands(&all_refs);
 
     // Subcommands for plugins still using shell wrappers are expected to be unregistered.
     // They'll be migrated to binary dispatch later.
@@ -655,7 +667,7 @@ fn all_binary_subcommands_are_registered() {
 
     let unregistered: Vec<&String> = binary_cmds
         .iter()
-        .filter(|cmd| !registered.contains(*cmd))
+        .filter(|cmd| !registered.contains(cmd.as_str()))
         .filter(|cmd| !pending_wiring.contains(cmd.as_str()))
         .filter(|cmd| {
             let group = cmd.split_whitespace().next().unwrap_or("");
@@ -676,6 +688,40 @@ fn all_binary_subcommands_are_registered() {
             .collect::<Vec<_>>()
             .join("\n"),
         SHELL_PLUGIN_DIRS.len()
+    );
+}
+
+/// #470 (split from #463): assert the COMPLEMENT of
+/// [`all_binary_subcommands_are_registered`]'s exemption. That test lets a
+/// `PENDING_WIRING_HOOKS` entry stay unregistered without failing; this one
+/// fails the moment an entry stops needing that exemption — i.e. the moment
+/// some hooks.json actually wires it. `PENDING_WIRING_HOOKS` is an allowlist
+/// of checks known-unwired *as of when they were added*; nothing previously
+/// checked that an entry was STILL unwired, so a wiring PR that forgot to
+/// remove its own exemption (or removed a different one) would leave a stale
+/// hole open indefinitely — and the next guard that is genuinely never wired
+/// inherits the same silent cover. This turns the allowlist self-expiring.
+#[test]
+fn pending_wiring_hooks_are_still_unwired() {
+    require_plugin_refs!(all_refs);
+
+    let registered = registered_commands(&all_refs);
+
+    let now_wired: Vec<&(&str, &str)> = PENDING_WIRING_HOOKS
+        .iter()
+        .filter(|(command, _)| registered.contains(*command))
+        .collect();
+
+    assert!(
+        now_wired.is_empty(),
+        "PENDING_WIRING_HOOKS entry now appears in a hooks.json — its wiring PR \
+         landed, so the exemption has served its purpose and must be removed:\n{}\n\n\
+         {STALE_CHECKOUT_HINT}",
+        now_wired
+            .iter()
+            .map(|(command, tracking_ref)| format!("  `{command}` ({tracking_ref})"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -748,16 +794,13 @@ fn no_plugin_hooks_duplicated_in_settings_json() {
     let (shell_scripts, binary_dispatches) = settings_json_hooks();
 
     // Collect all plugin-registered commands for comparison
-    let plugin_commands: BTreeSet<String> = all_refs
-        .values()
-        .flat_map(|refs| refs.iter().map(|r| r.command.clone()))
-        .collect();
+    let plugin_commands = registered_commands(&all_refs);
 
     let mut duplicates = Vec::new();
 
     // Check if settings.json dispatches any cadence-hooks subcommands already in plugins
     for dispatch in &binary_dispatches {
-        if plugin_commands.contains(dispatch) {
+        if plugin_commands.contains(dispatch.as_str()) {
             duplicates.push(format!(
                 "  settings.json dispatches `{dispatch}` (already registered in a plugin)"
             ));
@@ -963,90 +1006,95 @@ fn hook_event_types_match_hooks_json() {
     );
 }
 
-/// Parse the `NS='...'` single-quoted pipe-alternation line out of the
-/// sibling plugin's `redact-check.sh`. Matched by the `NS='` prefix, never
-/// by line number, so the script can grow unrelated lines above or below it
-/// without breaking this parse.
+// The namespace-parity test against the plugin's `redact-check.sh` was
+// deleted with the script itself (cadence-hooks#390): the `redact-scan` CLI
+// subcommand is now the single engine, so there is no second namespace list
+// to drift.
+
+/// Interpreters whose argv[0] — or the command that follows a leading `env`
+/// invocation — is never itself a checkable script path. The actual script is
+/// the interpreter's first NON-FLAG argument, not necessarily argv[1]:
+/// `python3 -u /path/hook.py` has a flag in between.
+const SCRIPT_INTERPRETERS: &[&str] = &[
+    "python3", "python", "bash", "sh", "zsh", "node", "ruby", "perl",
+];
+
+/// Skip a leading `env` invocation — and its own flags / `VAR=value`
+/// assignments — to the command it actually runs.
 ///
-/// Collects every matching line (rather than returning on the first) and
-/// asserts there is exactly one — a future unrelated line shaped like
-/// `NS='...'` (e.g. a comment or a second variable) would otherwise
-/// silently win by first-match instead of failing loudly.
-fn parse_redact_check_namespaces(content: &str) -> Vec<String> {
-    let matches: Vec<&str> = content
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix("NS='"))
-        .filter_map(|rest| rest.strip_suffix('\''))
-        .collect();
-
-    assert_eq!(
-        matches.len(),
-        1,
-        "expected exactly one `NS='...'` line in redact-check.sh, found {}: {matches:?}",
-        matches.len()
-    );
-
-    matches[0].split('|').map(str::to_string).collect()
+/// `/usr/bin/env python3 /path/hook.py` must be judged as a python3
+/// invocation, not as `env` itself: `env` isn't in [`SCRIPT_INTERPRETERS`], so
+/// without unwrapping it, `/usr/bin/env` (which always exists) would be the
+/// checked target and the audit would pass having never looked at the script
+/// at all (cadence-hooks#464 review — the same bug in a different spelling).
+fn skip_env_prefix(tokens: &[String]) -> &[String] {
+    let Some(first) = tokens.first() else {
+        return tokens;
+    };
+    if cadence_hooks_core::shell::basename(first) != "env" {
+        return tokens;
+    }
+    let mut i = 1;
+    while let Some(t) = tokens.get(i) {
+        if t.starts_with('-') || t.contains('=') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    &tokens[i..]
 }
 
-#[test]
-fn namespace_list_matches_redact_check_sh() {
-    // Sibling plugin script that carries a bash-side copy of the same
-    // namespace list used to build `redact_external_content::NAMESPACES`.
-    //
-    // The skip is keyed off the sibling's `skills/redaction` DIRECTORY
-    // existing, not the script file — mirroring how
-    // `all_binary_subcommands_are_registered` keys its exemption off plugin
-    // directory existence. That distinguishes two different situations:
-    // the sibling checkout genuinely isn't present alongside this repo
-    // (bare CI, no siblings — benign, silent skip), versus the checkout IS
-    // present but `redact-check.sh` has moved or been renamed underneath
-    // it (a real regression this test should fail loudly on, not swallow).
-    let skill_dir = workspace_root().join("cadence/plugins/cadence/skills/redaction");
-    if !skill_dir.is_dir() {
-        eprintln!(
-            "SKIPPED: sibling cadence plugin's redaction skill dir not found at {} \
-             (plugin dir not alongside workspace)",
-            skill_dir.display()
-        );
-        return;
+/// Pick the token in a settings.json hook `command` that names a script path
+/// to existence-check.
+///
+/// - `Some(Some(path))` — check `path` for existence.
+/// - `Some(None)` — an interpreter-led command (argv[0], or the command after
+///   unwrapping a leading `env`) with no resolvable non-flag script argument
+///   at all (`python3 -u -O`). This must FAIL the audit, not skip it — an
+///   interpreter invocation with nothing to check is cadence-hooks#464's bug
+///   in a different spelling: silently unaudited, not proven safe.
+/// - `None` — a bare, non-interpreter command with no path-shaped token
+///   (`bd prime`) — nothing to check, a legitimate skip.
+///
+/// A quoted interpreter+script command (`"/usr/bin/python3" "/path/hook.py"
+/// args`) naively PathBuf'd as one raw string never exists — quotes and args
+/// never form a real path. Tokenizing (quote-aware,
+/// [`cadence_hooks_core::shell::tokenize`]) splits it into argv first.
+fn script_check_target(command: &str) -> Option<Option<String>> {
+    let tokens = cadence_hooks_core::shell::tokenize(command);
+    let rest = skip_env_prefix(&tokens);
+    let first = rest.first()?;
+
+    let is_interpreter = SCRIPT_INTERPRETERS.contains(&cadence_hooks_core::shell::basename(first));
+
+    if is_interpreter {
+        let script = rest.iter().skip(1).find(|t| !t.starts_with('-'));
+        return Some(script.cloned());
     }
 
-    let script_path = skill_dir.join("scripts/redact-check.sh");
-    assert!(
-        script_path.exists(),
-        "sibling redaction skill dir exists at {} but scripts/redact-check.sh is missing — \
-         has the script moved or been renamed? Update this test's expected path.",
-        skill_dir.display()
-    );
+    if first.contains('/') || first.starts_with('~') {
+        Some(Some(first.clone()))
+    } else {
+        None
+    }
+}
 
-    let content = std::fs::read_to_string(&script_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
-
-    let script_namespaces: BTreeSet<String> = parse_redact_check_namespaces(&content)
-        .into_iter()
-        .collect();
-
-    let rust_namespaces: BTreeSet<String> =
-        cadence_hooks_cadence::redact_external_content::NAMESPACES
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-    let missing_from_script: Vec<&String> =
-        rust_namespaces.difference(&script_namespaces).collect();
-    let missing_from_rust: Vec<&String> = script_namespaces.difference(&rust_namespaces).collect();
-
-    assert!(
-        missing_from_script.is_empty() && missing_from_rust.is_empty(),
-        "namespace list drift between Rust NAMESPACES and {}'s `NS=` line:\n\
-         in Rust but missing from redact-check.sh: {:?}\n\
-         in redact-check.sh but missing from Rust: {:?}",
-        script_path.display(),
-        missing_from_script,
-        missing_from_rust,
-    );
+/// Does the script a settings.json hook `command` names exist on disk, after
+/// expanding a LEADING `~` against `home` (via
+/// [`cadence_hooks_core::paths::expand_tilde_with`] — never a blind
+/// `str::replace('~', home)`, which would mangle a real path like
+/// `/opt/a~b/hook.sh` into a false missing-script report)?
+///
+/// `None` — a bare command with no checkable path, a legitimate skip.
+/// `Some(false)` covers both "the script is missing" AND "an interpreter-led
+/// command resolved no script argument at all" — the latter must fail the
+/// audit, not silently pass (see [`script_check_target`]).
+fn shell_script_exists(command: &str, home: &str) -> Option<bool> {
+    match script_check_target(command)? {
+        Some(target) => Some(cadence_hooks_core::paths::expand_tilde_with(&target, home).exists()),
+        None => Some(false),
+    }
 }
 
 #[test]
@@ -1064,12 +1112,7 @@ fn settings_json_shell_scripts_exist() {
 
     let mut missing = Vec::new();
     for script in &shell_scripts {
-        // Only check paths (contain / or ~), skip bare commands like "bd prime"
-        if !script.contains('/') && !script.starts_with('~') {
-            continue;
-        }
-        let expanded = script.replace('~', &home);
-        if !PathBuf::from(&expanded).exists() {
+        if shell_script_exists(script, &home) == Some(false) {
             missing.push(format!("  {script} (file not found)"));
         }
     }
@@ -1079,6 +1122,71 @@ fn settings_json_shell_scripts_exist() {
         "settings.json references shell scripts that don't exist:\n{}",
         missing.join("\n")
     );
+}
+
+#[test]
+fn shell_script_exists_quoted_interpreter_and_script() {
+    // Cargo.toml is a file this test binary already knows exists at compile
+    // time — no tempdir/write needed just to get an existing path.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("\"/usr/bin/python3\" \"{script_path}\" --flag value");
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_bare_path() {
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+
+    assert_eq!(shell_script_exists(script_path, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_interpreter_with_missing_script() {
+    let cmd = "\"/usr/bin/python3\" \"/definitely/does/not/exist/hook.py\" --flag";
+
+    assert_eq!(shell_script_exists(cmd, "/home/nobody"), Some(false));
+}
+
+#[test]
+fn shell_script_exists_none_for_bare_command() {
+    // "bd prime" has no `/` or `~` in either token — nothing to check.
+    assert_eq!(shell_script_exists("bd prime", "/home/nobody"), None);
+}
+
+#[test]
+fn shell_script_exists_interpreter_flag_before_script() {
+    // `python3 -u /path/hook.py`: the naive "argv[1] is the script" logic
+    // would pick `-u`, a flag, as the "script" and always report missing. The
+    // real script is the interpreter's first NON-FLAG argument.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("python3 -u {script_path}");
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_env_wrapped_interpreter() {
+    // `/usr/bin/env python3 /path/hook.py`: `env` is not in
+    // SCRIPT_INTERPRETERS, so without unwrapping it, `/usr/bin/env` itself —
+    // which always exists — would be the checked target, passing the audit
+    // having never touched the script.
+    let script_path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let cmd = format!("/usr/bin/env python3 {script_path}");
+
+    assert_eq!(shell_script_exists(&cmd, "/home/nobody"), Some(true));
+}
+
+#[test]
+fn shell_script_exists_interpreter_no_resolvable_script_fails() {
+    // An interpreter-led command whose every argument is a flag has no
+    // resolvable script at all — this must FAIL the audit (Some(false)), not
+    // silently skip it (None). A skip here is the same #464 bug in a
+    // different spelling: a hook wired to an interpreter with nothing to
+    // check would go unaudited rather than flagged.
+    let cmd = "python3 -u -O";
+
+    assert_eq!(shell_script_exists(cmd, "/home/nobody"), Some(false));
 }
 
 // ---------- Resolver + parser unit tests ----------

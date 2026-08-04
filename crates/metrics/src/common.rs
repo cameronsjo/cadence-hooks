@@ -2,6 +2,8 @@
 //! metrics directory resolution, and timestamps.
 
 use regex::Regex;
+use serde_json::json;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -28,15 +30,19 @@ pub fn is_git_commit(command: &str) -> bool {
 /// 1. `CADENCE_METRICS_DIR` — when set and non-empty, the value **is** the
 ///    metrics dir (JSONL files and the `state/` subdir live directly inside it).
 /// 2. `<config_dir>/metrics` — where `<config_dir>` honors `CLAUDE_CONFIG_DIR`
-///    (else `~/.claude`).
+///    and falls back to `~/.claude`.
+///
+/// Relocating this default is deliberately out of scope for cross-runtime work.
+/// Moving it stranded ten of twelve live ledgers on the first upgrade: only two
+/// call sites had a legacy read fallback, against roughly twenty that resolve
+/// this directly, and no step copied the existing data forward. A relocation
+/// needs its own change with a migration, not a side effect of a schema bump.
 pub fn metrics_dir() -> PathBuf {
     metrics_dir_from(std::env::var("CADENCE_METRICS_DIR").ok())
 }
 
 /// Pure resolver behind [`metrics_dir`]: takes the `CADENCE_METRICS_DIR` value
-/// explicitly (rather than reading process-global env) so the resolution order
-/// is unit-testable without `set_var`/`remove_var`. `None` or an empty string
-/// falls through to the `<config_dir>/metrics` default.
+/// so the precedence is testable without mutating process environment.
 fn metrics_dir_from(override_dir: Option<String>) -> PathBuf {
     if let Some(dir) = override_dir
         && !dir.is_empty()
@@ -44,6 +50,58 @@ fn metrics_dir_from(override_dir: Option<String>) -> PathBuf {
         return PathBuf::from(dir);
     }
     cadence_hooks_core::paths::claude_config_dir().join("metrics")
+}
+
+/// Harness stamped on schema-v2 rows.
+pub fn harness() -> &'static str {
+    if cadence_hooks_core::is_codex_harness() {
+        "codex"
+    } else {
+        "claude"
+    }
+}
+
+/// Append a schema-only transcript diagnostic. No transcript text, tool input,
+/// prompt, patch, or output is accepted by this API.
+pub fn append_transcript_diagnostic(harness: &str, source_format: &str, code: &str, stream: &str) {
+    let dir = metrics_dir();
+    append_transcript_diagnostic_to(&dir, harness, source_format, code, stream);
+}
+
+const MAX_DIAGNOSTICS_BYTES: u64 = 1_048_576;
+
+fn append_transcript_diagnostic_to(
+    dir: &Path,
+    harness: &str,
+    source_format: &str,
+    code: &str,
+    stream: &str,
+) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = dir.join("diagnostics.jsonl");
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= MAX_DIAGNOSTICS_BYTES) {
+        return;
+    }
+    let record = json!({
+        "schemaVersion": TOKEN_RECORD_SCHEMA_VERSION,
+        "ts": utc_timestamp(),
+        "harness": harness,
+        "sourceFormat": source_format,
+        "code": code,
+        "stream": stream,
+        "priced": false,
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let mut line = record.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 /// The per-session state directory: `<metrics_dir>/state`.
@@ -124,6 +182,45 @@ pub fn repo_basename(cwd: Option<&str>) -> String {
 /// logger shares one timestamp source (jiff-backed, portable to Windows).
 pub fn utc_timestamp() -> String {
     cadence_hooks_core::time::utc_timestamp()
+}
+
+/// Today's UTC date, `YYYY-MM-DD` — the freshness half of a once-per-day alarm
+/// marker. Sliced from [`utc_timestamp`] so it shares the ledgers' clock rather
+/// than introducing a second one.
+pub fn today_utc() -> String {
+    utc_timestamp()[..10].to_string()
+}
+
+/// Claim today's slot for a once-per-day alarm, returning `true` when the
+/// caller should speak.
+///
+/// The marker is `<dir>/state/<filename>` and holds `<UTC date> <verdict>`. A
+/// caller whose exact `verdict` is already recorded for today gets `false` and
+/// stays silent; anyone else records the new pair and gets `true`. Keying on
+/// the verdict as well as the date is what lets an *escalation* speak the same
+/// day while a repeat of the same finding does not — so `verdict` should name
+/// the alarm's shape, never a count that drifts on every run.
+///
+/// Living under `state/` is deliberate: the marker is not a `*.jsonl`, and it
+/// sits outside the ledger dir proper, so writing it can never freshen the
+/// staleness signal [`crate::warn_stale`] reads.
+///
+/// Fail-open (ADR-0001): an unreadable marker is treated as absent, and a write
+/// error is swallowed. Both fail toward *speaking* — a repeated alarm beats a
+/// missed one.
+pub fn claim_daily_alarm(dir: &Path, filename: &str, verdict: &str) -> bool {
+    let marker = dir.join("state").join(filename);
+    let token = format!("{} {}", today_utc(), verdict);
+    if let Ok(existing) = std::fs::read_to_string(&marker)
+        && existing.trim() == token
+    {
+        return false;
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, &token);
+    true
 }
 
 /// Strip display-affecting characters from a file-sourced string before it is
@@ -292,6 +389,9 @@ pub const SKILL_SCHEMA_VERSION: u32 = 1;
 /// `asked` and `answered` phases).
 pub const ASKUSERQUESTION_SCHEMA_VERSION: u32 = 1;
 
+/// Schema version for cross-harness commit and session token records.
+pub const TOKEN_RECORD_SCHEMA_VERSION: u32 = 2;
+
 /// Crate-wide serialization lock for env-mutating tests.
 ///
 /// `CADENCE_METRICS_DIR` and its siblings are process-global, so every test that
@@ -335,7 +435,21 @@ mod tests {
         let dir = metrics_dir_from(Some(String::new()));
         assert!(
             dir.to_string_lossy().contains("metrics"),
-            "empty override should fall through to default: {dir:?}"
+            "empty override should fall through to the default: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_diagnostics_stop_at_the_size_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("diagnostics.jsonl");
+        std::fs::write(&path, vec![b'x'; MAX_DIAGNOSTICS_BYTES as usize]).unwrap();
+
+        append_transcript_diagnostic_to(temp.path(), "codex", "unknown", "schema", "session");
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_DIAGNOSTICS_BYTES
         );
     }
 

@@ -1,0 +1,156 @@
+{
+  "schemaVersion": 1,
+  "minimumCodexVersion": "0.145.0",
+  "classifications": [
+    "native",
+    "adapted",
+    "degraded",
+    "unavailable"
+  ],
+  "defaultHookStatus": "native",
+  "hookOverrides": {
+    "memory-guard": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "terminology": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "orphaned-todos": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "prevent-secret-writes": {"status": "adapted", "evidence": "tests/codex_coverage.rs::patch_add_file_carrying_a_secret_is_blocked"},
+    "env-vars": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "line-endings": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "markdown-lint": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "warn-main-branch": {"status": "adapted", "evidence": "crates/core/src/patch.rs"},
+    "guard-dotfiles": {"status": "adapted", "evidence": "tests/codex_coverage.rs::patch_target_reaches_guard_dotfiles"},
+    "enforce-worktree": {"status": "adapted", "evidence": "crates/core/src/lib.rs::codex_patch_expands_every_target_and_rename_destination"},
+    "warn-subagent-worktree": {"status": "adapted", "evidence": "crates/core/src/lib.rs"},
+    "warn-subagent-concurrency": {"status": "adapted", "evidence": "crates/core/src/lib.rs"},
+    "guard-rm": {"status": "adapted", "evidence": "crates/guardrails/src/guard_rm.rs::patch_delete_of_a_protected_path_blocks"},
+    "guard-rm-liveness": {
+      "applicable": false,
+      "evidence": "registered in the binary but not yet invoked: the cadence-guardrails SessionStart wiring ships in a companion monorepo PR. Flip to applicable when that wiring merges."
+    },
+    "trash-guard": {"status": "adapted", "evidence": "crates/obsidian/src/trash_guard.rs::normalized_patch_delete_inside_vault_is_blocked"},
+    "guard-browser-device": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Codex CLI has no Claude-in-Chrome MCP route"
+    },
+    "inject-gh-context": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "cadence#658 retired the SessionStart registrar in favor of inject-gh-write-context"
+    },
+    "warn-recommended-option": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Claude AskUserQuestion stream has no Codex equivalent"
+    },
+    "warn-empty-answers": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Claude AskUserQuestion stream has no Codex equivalent"
+    },
+    "log-ask-user-question": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Claude AskUserQuestion stream has no Codex equivalent"
+    },
+    "log-skill": {
+      "status": "degraded",
+      "evidence": "Codex skill invocation is not inferred from transcript prose"
+    },
+    "log-commit": {
+      "status": "adapted",
+      "evidence": "crates/metrics/src/transcript.rs::scan_codex_rollout_v1"
+    },
+    "log-session": {
+      "status": "adapted",
+      "evidence": "crates/metrics/src/transcript.rs::scan_codex_rollout_v1"
+    },
+    "persist-plan-approval": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Codex does not expose Claude ExitPlanMode approval events"
+    }
+  },
+  "capabilities": [
+    {
+      "id": "shell",
+      "status": "native",
+      "criticality": "security-critical",
+      "evidence": "tests/codex_coverage.rs::every_security_route_has_native_hook_or_sandbox_control"
+    },
+    {
+      "id": "unified-exec",
+      "status": "native",
+      "criticality": "security-critical",
+      "evidence": "crates/core/src/lib.rs::codex_shell_and_subagent_aliases_normalize"
+    },
+    {
+      "id": "nested-function-calls",
+      "status": "adapted",
+      "criticality": "security-critical",
+      "evidence": "tests/codex_coverage.rs::codex_local_function_call_reaches_a_security_critical_guard"
+    },
+    {
+      "id": "apply-patch",
+      "status": "adapted",
+      "criticality": "security-critical",
+      "evidence": "crates/core/src/patch.rs::parses_create_update_delete_rename_and_multi_file"
+    },
+    {
+      "id": "mcp-functions",
+      "status": "native",
+      "criticality": "security-critical",
+      "evidence": "Codex MCP functions traverse the common PreToolUse path"
+    },
+    {
+      "id": "subagents",
+      "status": "adapted",
+      "criticality": "workflow",
+      "evidence": "spawn_agent aliases to Agent and lifecycle events are native"
+    },
+    {
+      "id": "lifecycle-events",
+      "status": "native",
+      "criticality": "workflow",
+      "evidence": "paired registry and plugin hook fixtures"
+    },
+    {
+      "id": "hosted-tools",
+      "status": "unavailable",
+      "applicable": false,
+      "criticality": "workflow",
+      "evidence": "hosted tools do not enter the local function hook path"
+    },
+    {
+      "id": "question-stream",
+      "status": "unavailable",
+      "applicable": false,
+      "criticality": "metrics",
+      "evidence": "Codex does not expose Claude AskUserQuestion events"
+    },
+    {
+      "id": "skill-tool-stream",
+      "status": "degraded",
+      "criticality": "metrics",
+      "evidence": "Skill invocation is not inferred from transcript prose"
+    },
+    {
+      "id": "plan-phase-stream",
+      "status": "unavailable",
+      "applicable": false,
+      "criticality": "metrics",
+      "evidence": "Codex does not expose Claude EnterPlanMode or ExitPlanMode tools"
+    },
+    {
+      "id": "ask-outcomes",
+      "status": "adapted",
+      "criticality": "security-critical",
+      "evidence": "tests/codex_coverage.rs::codex_ask_outcome_converts_to_a_block"
+    },
+    {
+      "id": "filesystem-sandbox",
+      "status": "native",
+      "criticality": "security-critical",
+      "evidence": "cadence/scripts/test-codex-sandbox.sh"
+    }
+  ]
+}

@@ -122,12 +122,6 @@ const PARENT_SCAN_MAX_FILES: usize = 20;
 /// (this scan is a plain `Check`, not a git-spawning probe).
 const PARENT_SCAN_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Cap on the EXECUTING session's own transcript before resolving its
-/// model/harness from it — same defensive posture and size as
-/// [`PARENT_SCAN_MAX_FILE_BYTES`]'s sibling-scan cap. Real transcripts run
-/// single-digit MB; this is generous headroom against a pathological file.
-const TRANSCRIPT_READ_MAX_BYTES: u64 = 32 * 1024 * 1024;
-
 /// Schema version stamped on every `plan-links.jsonl` row. A new stream
 /// (cadence#238 convention) — does not share `cadence_hooks_metrics::common`'s
 /// existing version constants; this one lives with its own writer. Bumped to
@@ -248,7 +242,7 @@ pub fn run_persist_plan(
     // (cameronsjo/cadence-hooks#396 review).
     let transcript_content = input
         .transcript_path()
-        .and_then(|tp| read_capped(Path::new(tp), TRANSCRIPT_READ_MAX_BYTES));
+        .and_then(|tp| cadence_hooks_core::transcript::read_tail(Path::new(tp)));
     let model = crate::warn_commit_provenance::resolve_model(transcript_content.as_deref())
         .or_else(|| parent.as_ref().and_then(|p| p.model.clone()));
     let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref())
@@ -352,7 +346,7 @@ pub fn run_persist_plan_approval(
     // sibling-transcript fallback needed.
     let transcript_content = input
         .transcript_path()
-        .and_then(|tp| read_capped(Path::new(tp), TRANSCRIPT_READ_MAX_BYTES));
+        .and_then(|tp| cadence_hooks_core::transcript::read_tail(Path::new(tp)));
     let model = crate::warn_commit_provenance::resolve_model(transcript_content.as_deref());
     let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref());
     let branch = current_branch(cwd);
@@ -413,18 +407,6 @@ fn canonical_plans_dir(repo_root: &Path) -> Option<(PathBuf, PathBuf)> {
     canonical_plans_dir
         .starts_with(&canonical_repo_root)
         .then_some((canonical_repo_root, canonical_plans_dir))
-}
-
-/// Read `path` capped at `max_bytes`: `None` when it can't be opened/read, or
-/// when its content exceeds the cap — the same take-then-check discipline
-/// [`file_matches_body`] uses, so a pathological transcript can't turn this
-/// hook's model/harness resolution into an unbounded read.
-fn read_capped(path: &Path, max_bytes: u64) -> Option<String> {
-    use std::io::Read as _;
-    let file = fs::File::open(path).ok()?;
-    let mut content = String::new();
-    file.take(max_bytes + 1).read_to_string(&mut content).ok()?;
-    (content.len() as u64 <= max_bytes).then_some(content)
 }
 
 // ---------------------------------------------------------------------------
