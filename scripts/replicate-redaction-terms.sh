@@ -101,20 +101,28 @@ ok "Wrote $COUNT term(s) to $TARGET (0600)."
 say ""
 if command -v cadence-hooks >/dev/null 2>&1; then
   say "Verifying with the binary:"
-  if cadence-hooks cadence redact-scan --status; then
-    say ""
-    say "VERDICT: ${G}armed${N} ($COUNT terms)"
-    exit 0
-  fi
+  # Capture the exit code DIRECTLY. An `if cmd; then …; fi` whose condition
+  # fails and has no else returns 0, so a trailing `rc=$?` reads 0 no matter
+  # what cmd did — which would have made the too-old branch below unreachable
+  # and misreported a healthy provisioning as a failure.
+  cadence-hooks cadence redact-scan --status
   rc=$?
   say ""
-  if [ "$rc" -eq 2 ]; then
-    warn "The installed cadence-hooks predates the identity tier (--status is unrecognized)."
-    say "VERDICT: terms-installed-but-binary-too-old ($COUNT terms) — run: brew upgrade cadence-hooks"
-    exit 0
-  fi
-  say "VERDICT: ${R}terms written but binary reports NOT ARMED${N} — inspect $TARGET"
-  exit 1
+  case "$rc" in
+    0)
+      say "VERDICT: ${G}armed${N} ($COUNT terms)"
+      exit 0
+      ;;
+    2)
+      warn "The installed cadence-hooks predates the identity tier (--status is unrecognized)."
+      say "VERDICT: terms-installed-but-binary-too-old ($COUNT terms) — run: brew upgrade cadence-hooks"
+      exit 0
+      ;;
+    *)
+      say "VERDICT: ${R}terms written but binary reports NOT ARMED${N} — inspect $TARGET"
+      exit 1
+      ;;
+  esac
 fi
 warn "cadence-hooks not installed here — cannot self-verify."
 say "VERDICT: terms-installed-unverified ($COUNT terms) — install cadence-hooks, then run: cadence-hooks cadence redact-scan --status"
