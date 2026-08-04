@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.72.1] - 2026-08-04
+
+### Fixed
+
+- **`replicate-redaction-terms.sh` mislabeled an out-of-date binary as a corrupt terms file (#587).** The verify step inferred "too old" from an exit code, assuming an unrecognized `--status` exits clap's 2 — but `cadence-hooks` intercepts unknown subcommands itself, with its own message and its own code, so the too-old case fell through to the alarming branch. A live M5 run reported "terms written but binary reports NOT ARMED" and pointed the operator at a perfectly good file. The check now compares `--version` against the first release carrying the identity tier, which is deterministic and says the useful thing. Two related holes closed alongside it: the already-armed early exit trusted a `[[terms]]` header count, which proves a header exists rather than that the file parses — so the one path a re-run exists for was the one that skipped verification — and a greater-than-zero term count accepted a one-line garbage paste or a fetch cut mid-entry.
+- **The 1Password fetch was CSV-quoting the terms file, and every check the script had was blind to it (#588).** `op item get --fields label=notesPlain` returns a multi-line value with a literal double quote prepended and appended. One character, two failures: on the legacy text format the leading quote stopped the first comment line from starting with `#`, so a prose fragment counted as a term and displaced a real one — a machine came up with 19 terms against the source's 18 and reported ARMED; on TOML it breaks parsing outright with `invalid basic string` and the tier is inert. Both read as a corrupt terms file. The fetch now uses `--format json`, which returns the value unquoted. The script also **parses** the written file rather than only counting lines in it — header count, term-value count, floor, and truncation were all line-counting checks, and every one of them passed on a document that failed to parse on line 1. Counting proves shape, not validity. `tomllib` is 3.11+, so its absence warns instead of silently skipping the validation.
+
 ## [0.72.0] - 2026-08-04
 
 ### Added
