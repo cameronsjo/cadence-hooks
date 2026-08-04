@@ -439,10 +439,23 @@ fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckR
         // Scan only what the edit introduces. A term already present in `old`
         // is pre-existing: it is not this edit's doing, and blocking on it
         // would make the removal edit impossible.
+        //
+        // Compare OCCURRENCE COUNTS, not presence. A bare `old.contains(…)`
+        // suppresses every match in `new` the moment `old` contains the term
+        // even once — so an edit that rewrites a paragraph and duplicates the
+        // term goes unflagged. That is an ordinary accidental edit, not an
+        // adversarial one, and it silently breaks the introduced-only property
+        // this function's whole contract rests on. (Both review seats found
+        // this independently.)
+        let mut by_snippet: HashMap<String, Vec<identity::IdentityHit>> = HashMap::new();
         for hit in identity::scan_identity(new, identity_list, file_path) {
-            if !old.contains(&hit.snippet) {
-                identity_hits.push(hit);
-            }
+            by_snippet.entry(hit.snippet.clone()).or_default().push(hit);
+        }
+        for (snippet, found) in by_snippet {
+            let already = old.matches(snippet.as_str()).count();
+            // Report only the surplus — the occurrences this edit added beyond
+            // what was already there.
+            identity_hits.extend(found.into_iter().skip(already));
         }
     }
     combine(&identity_hits, &[], &[], identity_list.mode)
@@ -531,6 +544,13 @@ fn build_identity_message(
     };
     let mut out = String::from(header);
     out.push('\n');
+    // Identity DEDUPS by (id, snippet); the shaped renderer deliberately does
+    // not (a ruled decision: repeated shaped hits are real occurrences worth
+    // seeing). The tiers diverge because the messages do different jobs. A
+    // shaped nudge is a list of places to edit, so repetition is information.
+    // An identity block is a stop sign — the operator needs to know WHICH term
+    // tripped it, and printing one term forty times because a doc discusses it
+    // buries that. Do not "fix" one to match the other.
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
     for hit in hits {
         if seen.insert((hit.id.as_str(), hit.snippet.as_str())) {
@@ -703,10 +723,7 @@ fn resolve_dest_tier(env_audience: Option<&str>, config: &RedactionConfig) -> u8
 /// without ever reading `config` — the repo's committed `categories` map has no
 /// path to it. That is not an exemption checked here; it is the descriptor's
 /// own declaration being honored.
-fn category_ceiling<'a>(config: &'a RedactionConfig, desc: &CategoryDescriptor) -> &'a str
-where
-    'static: 'a,
-{
+fn category_ceiling<'a>(config: &'a RedactionConfig, desc: &CategoryDescriptor) -> &'a str {
     if desc.config_scope == ConfigScope::SourceFileOnly {
         return desc.default_ceiling;
     }
@@ -2308,22 +2325,40 @@ mod tests {
 
     static TERMS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Removes the named env vars when dropped — including on unwind.
+    ///
+    /// An `assert!` inside a test closure panics, and a plain
+    /// set-call-remove sequence never reaches its remove. That leak is
+    /// currently harmless (every reader of these vars takes `TERMS_ENV_LOCK`
+    /// first, and the next locker overwrites), but it is harmless by
+    /// coincidence rather than by construction, and a test added outside this
+    /// helper would silently inherit a stale path.
+    struct EnvCleanup(&'static [&'static str]);
+    impl Drop for EnvCleanup {
+        fn drop(&mut self) {
+            for k in self.0 {
+                unsafe { std::env::remove_var(k) };
+            }
+        }
+    }
+
     /// Run `body` through the guard with a fixture term source. Returns the
     /// full result so a caller can assert on outcome, message, and bypass.
     fn with_terms<F, R>(toml_body: &str, f: F) -> R
     where
         F: FnOnce() -> R,
     {
-        let guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("redaction.toml");
         std::fs::write(&path, toml_body).unwrap();
-        // SAFETY-equivalent rationale: serialized by TERMS_ENV_LOCK above.
+        // Both vars are cleaned on unwind. CADENCE_ALLOW_SENSITIVE_TERMS is
+        // included because the bypass test sets it inside this closure —
+        // std's Mutex is not reentrant, so it cannot take its own guard.
+        let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS", "CADENCE_ALLOW_SENSITIVE_TERMS"]);
+        // Serialized by TERMS_ENV_LOCK, held for this whole scope.
         unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", &path) };
-        let out = f();
-        unsafe { std::env::remove_var("CADENCE_REDACTION_TERMS") };
-        drop(guard);
-        out
+        f()
     }
 
     const FIXTURE: &str = r#"
@@ -2357,11 +2392,10 @@ term = "acmecorp"
 
     #[test]
     fn absent_terms_file_is_inert_not_a_hard_failure() {
-        let guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
         unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", "/nonexistent/redaction.toml") };
         let r = run("git commit -m \"fix the acmecorp integration\"");
-        unsafe { std::env::remove_var("CADENCE_REDACTION_TERMS") };
-        drop(guard);
         // Fail-OPEN on the guard's own failure: a machine that never had the
         // file must still be able to commit. The SessionStart probe is what
         // keeps this from being silent.
@@ -2400,8 +2434,14 @@ term = "acmecorp"
 
     #[test]
     fn repo_config_cannot_soften_the_identity_tier() {
-        // The whole point of ConfigScope::SourceFileOnly. A repo that
-        // allowlists the term AND raises every ceiling still blocks.
+        // NB what this does and does not prove. It proves the end-to-end
+        // property — a repo that allowlists the term AND raises every ceiling
+        // still blocks — but it proves it via `scan_identity`'s signature
+        // blindness, NOT via ConfigScope: identity never flows through the
+        // category table, so this test passes with ConfigScope deleted (shown
+        // by mutation). The ConfigScope guards are covered by
+        // `source_file_only_*` above. Both are worth keeping: this one pins the
+        // behavior a user cares about, those pin the mechanism.
         with_terms(FIXTURE, || {
             let repo = temp_repo_with_config(
                 r#"{"allowlist":["acmecorp"],"originAudience":"owned-internal",
@@ -2440,10 +2480,9 @@ term = "acmecorp"
         with_terms(FIXTURE, || {
             // Already inside with_terms' lock — std Mutex is not reentrant, so
             // re-locking here would deadlock. The outer guard serializes both
-            // env vars.
+            // env vars, and its EnvCleanup removes this one even on unwind.
             unsafe { std::env::set_var("CADENCE_ALLOW_SENSITIVE_TERMS", "1") };
             let r = run("gh issue create --body \"acmecorp uses cadence:attune\"");
-            unsafe { std::env::remove_var("CADENCE_ALLOW_SENSITIVE_TERMS") };
             assert_eq!(r.outcome, Outcome::Nudge, "bypass downgrades the block");
             assert!(
                 r.bypass.is_some(),
@@ -2484,6 +2523,50 @@ term = "acmecorp"
                     file_path: Some("/tmp/notes.md".into()),
                     old_string: Some("we ship acmecorp tooling".into()),
                     new_string: Some("we ship the tooling".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn edit_duplicating_a_preexisting_term_still_blocks_the_new_copy() {
+        // The occurrence-count rule. A presence test (`old.contains`) would
+        // suppress BOTH matches here because `old` already held the term once,
+        // letting an ordinary rewrite-and-duplicate edit smuggle a new
+        // instance past an introduced-only guard.
+        with_terms(FIXTURE, || {
+            let input = HookInput {
+                tool_name: Some("Edit".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    file_path: Some("/tmp/notes.md".into()),
+                    old_string: Some("the acmecorp policy".into()),
+                    new_string: Some("the acmecorp policy, see also the acmecorp runbook".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                RedactExternalContent.run(&input).outcome,
+                Outcome::Block,
+                "the second occurrence is introduced by this edit"
+            );
+        });
+    }
+
+    #[test]
+    fn edit_preserving_one_preexisting_occurrence_does_not_block() {
+        // The other side of the same rule: carrying an existing occurrence
+        // through an unrelated edit is not an introduction.
+        with_terms(FIXTURE, || {
+            let input = HookInput {
+                tool_name: Some("Edit".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    file_path: Some("/tmp/notes.md".into()),
+                    old_string: Some("the acmecorp policy is old".into()),
+                    new_string: Some("the acmecorp policy is current".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

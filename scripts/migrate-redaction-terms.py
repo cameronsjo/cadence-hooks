@@ -16,9 +16,12 @@ Three properties this script exists to guarantee:
 2. **It never prints a term.** Progress output is counts and ids only. A
    migration log that echoes the deny-list defeats the deny-list.
 
-3. **It never deletes the source.** The original stays in place until the new
-   file is proven (operator's ruling, 2026-08-03); ``--remove-legacy`` is the
-   separate, deliberate second step.
+3. **It never deletes the source without verifying content.** The original
+   stays in place until the new file is proven (operator ruling, 2026-08-03);
+   ``--remove-legacy`` is a separate, deliberate second step, and it compares
+   the actual term SETS rather than counts — a count check would pass while a
+   hand-edit had changed a term, and this step removes the only other on-disk
+   copy.
 
 Refuses to overwrite an existing redaction.toml — re-running is safe.
 """
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -115,7 +119,7 @@ def main() -> int:
     ap.add_argument(
         "--remove-legacy",
         action="store_true",
-        help="delete the .txt AFTER verifying the .toml parses to the same term count",
+        help="delete the .txt AFTER verifying the .toml carries the identical term set",
     )
     args = ap.parse_args()
 
@@ -131,19 +135,27 @@ def main() -> int:
             print("OK: legacy file already gone")
             return 0
         legacy_terms, _ = parse_legacy(legacy)
-        # Verify by count, not by content: reading both into memory to diff
-        # would be the one place this script holds every term twice.
+        # Verify by CONTENT, not just count. A count check passes while the
+        # term set differs — a hand-edit between migration and removal that
+        # corrects or swaps a term keeps the count identical — and this step
+        # deletes the only other on-disk copy, so a false pass is unrecoverable
+        # from the filesystem. Compare the actual term sets; report the size of
+        # any mismatch without printing which terms differ.
         body = target.read_text(encoding="utf-8")
-        migrated = body.count("[[terms]]")
-        if migrated != len(legacy_terms):
+        migrated = set(re.findall(r'^\s*term\s*=\s*"((?:[^"\\]|\\.)*)"', body, re.MULTILINE))
+        migrated = {t.replace('\\"', '"').replace("\\\\", "\\") for t in migrated}
+        legacy_set = {t for _, t in legacy_terms}
+        if migrated != legacy_set:
+            only_legacy = len(legacy_set - migrated)
+            only_toml = len(migrated - legacy_set)
             print(
-                f"FAIL: term count differs (legacy {len(legacy_terms)}, toml {migrated}) "
-                "— not removing anything",
+                f"FAIL: term sets differ ({only_legacy} only in legacy, "
+                f"{only_toml} only in toml) — not removing anything",
                 file=sys.stderr,
             )
             return 1
         legacy.unlink()
-        print(f"OK: removed legacy file; {migrated} terms live in redaction.toml")
+        print(f"OK: removed legacy file; {len(migrated)} terms verified in redaction.toml")
         return 0
 
     if not legacy.is_file():

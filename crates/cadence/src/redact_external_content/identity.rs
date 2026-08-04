@@ -140,19 +140,37 @@ impl Status {
     }
 }
 
-/// Resolve the term-source path. `CADENCE_REDACTION_TERMS` overrides (the test
-/// seam, and an escape hatch for a non-standard home); otherwise
-/// `$XDG_CONFIG_HOME/cadence/redaction.toml`, else `~/.config/cadence/…`.
+/// Resolve the term-source path: `$HOME/.config/cadence/redaction.toml`, and
+/// nothing else.
+///
+/// # Why no environment override in production
+///
+/// An earlier revision honored `CADENCE_REDACTION_TERMS` and
+/// `XDG_CONFIG_HOME`. A security review caught what that costs: a project's
+/// `.claude/settings.json` `env` block reaches hook subprocesses, and this
+/// codebase already documents those blocks as attacker-influenceable
+/// (`crates/metrics/src/warn_stale.rs` — the reasoning that put `CADENCE_DISABLE`
+/// behind `PROTECTED_GUARDS`). So `{"env": {"CADENCE_REDACTION_TERMS":
+/// "/dev/null"}}` in a cloned repo would resolve to an absent file, load an
+/// empty list, and fail open — **a silent disarm through a door neither
+/// softening call site guards, because it sits upstream of both.**
+///
+/// That is the same disarm `PROTECTED_GUARDS` exists to prevent, arriving by a
+/// different variable, so it gets the same answer. It does not require an
+/// adversary either: a repo that sets `XDG_CONFIG_HOME` for its own unrelated
+/// reasons disarms the tier by accident, which is squarely inside this estate's
+/// threat model.
+///
+/// The cost is that a non-standard config location is unsupported. Accepted:
+/// the override's only real consumers were tests, and an escape hatch that a
+/// committed file can pull is not an escape hatch, it is a hole. If a genuine
+/// need appears, it must come from a source no repo can write.
 pub(crate) fn terms_path() -> Option<PathBuf> {
+    #[cfg(test)]
     if let Ok(p) = std::env::var("CADENCE_REDACTION_TERMS")
         && !p.is_empty()
     {
         return Some(PathBuf::from(p));
-    }
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
-        && !x.is_empty()
-    {
-        return Some(PathBuf::from(x).join("cadence").join("redaction.toml"));
     }
     std::env::var("HOME")
         .ok()
@@ -209,9 +227,10 @@ fn term_regex(term: &str) -> Option<Regex> {
     if t.is_empty() {
         return None;
     }
-    let escaped = regex::escape(t);
-    // Re-open the escaped literal spaces into a separator class.
-    let body = escaped.replace("\\ ", "[ _-]").replace(' ', "[ _-]");
+    // `regex::escape` leaves spaces untouched (they are not regex metachars),
+    // so a single replace on the bare space is the whole job — an earlier
+    // version also replaced `"\\ "`, which never matched anything.
+    let body = regex::escape(t).replace(' ', "[ _-]");
     let starts_word = t
         .chars()
         .next()
@@ -427,14 +446,25 @@ mod tests {
     }
 
     #[test]
-    fn scan_is_config_blind_by_signature() {
-        // A compile-time assertion in spirit: scan_identity's parameters are
-        // (text, list, path). If a RedactionConfig ever becomes reachable here,
-        // this test stops compiling — which is the point.
-        fn assert_signature(f: fn(&str, &IdentityList, Option<&str>) -> Vec<IdentityHit>) -> bool {
-            let _ = f;
-            true
-        }
-        assert!(assert_signature(scan_identity));
+    fn identity_ignores_a_term_the_repo_allowlist_would_suppress() {
+        // Replaces an earlier `assert_signature` test that only type-checked —
+        // it would have passed at runtime no matter what the function did,
+        // because a changed signature fails compilation rather than the test.
+        //
+        // This asserts the property behaviorally instead: the exact string that
+        // a repo's allowlist DOES suppress in a shaped category is still a hit
+        // here. The shaped-side half of the pair lives in the parent module's
+        // `allowlist_bare_term_suppresses_matching_harness_noun`, which proves
+        // the same entry genuinely suppresses there — so together they show the
+        // divergence is the identity pass ignoring config, not the term simply
+        // never matching anything.
+        let l = list_of(&[("T1", "tool_input")]);
+        let hits = scan_identity("the tool_input field", &l, None);
+        assert_eq!(
+            hits.len(),
+            1,
+            "identity must flag a term that repo config allowlists for shaped categories"
+        );
+        assert_eq!(hits[0].id, "T1");
     }
 }
