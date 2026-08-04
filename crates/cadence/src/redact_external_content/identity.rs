@@ -183,6 +183,49 @@ pub(crate) fn terms_path() -> Option<PathBuf> {
         })
 }
 
+/// Is this edit targeting the term source itself?
+///
+/// # Why this exemption has to exist
+///
+/// The term source contains every term, so writing a term into it is, by the
+/// introduced-only rule, "introducing" one — and the tier blocks. That makes
+/// the deny-list **unmaintainable through the harness**: adding a term is
+/// exactly the edit the guard refuses. Worse, the block message tells the
+/// operator to add an `allow` entry *in the term source*, which is the edit it
+/// just blocked. A perfectly circular instruction.
+///
+/// Writing terms into the deny-list is definitionally legitimate — it is what
+/// the file is for. Same reasoning that makes the removal edit possible: a
+/// guard that cannot be maintained gets bypassed or disabled, and then it
+/// protects nothing.
+///
+/// # Fail direction
+///
+/// Defaults to **false** (scan) whenever the answer is not certain. A false
+/// positive here would exempt an arbitrary file from the identity scan, which
+/// is the far worse error — so an unresolvable path is scanned, not skipped.
+/// Both the literal and canonicalized comparisons are tried, because the file
+/// may not exist yet (the first write that creates it) and because `HOME` is
+/// often a symlink.
+pub(crate) fn is_term_source(file_path: Option<&str>) -> bool {
+    let Some(fp) = file_path.filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    let Some(terms) = terms_path() else {
+        return false;
+    };
+    let target = std::path::Path::new(fp);
+    if target == terms {
+        return true;
+    }
+    // Canonicalize both when the paths exist — resolves symlinked HOME and the
+    // /tmp vs /private/tmp split. Any failure falls through to `false`.
+    match (target.canonicalize(), terms.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Load the term source, returning both the list and why it is what it is.
 ///
 /// Every failure yields an empty list — the guard's own failure is fail-open.
