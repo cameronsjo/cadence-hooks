@@ -325,28 +325,49 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr create*)",
+          "if": "Bash(*gh pr *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr edit*)",
+          "if": "Bash(*gh issue *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh issue create*)",
+          "if": "Bash(*gh release *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh issue comment*)",
+          "if": "Bash(*gh gist *)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh discussion *)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*tea pr *)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*tea issue *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         }
       ]
@@ -411,7 +432,7 @@
       "event": "PreToolUse",
       "name": "redact-external-content",
       "plugin": "cadence",
-      "protected": false,
+      "protected": true,
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
