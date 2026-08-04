@@ -824,6 +824,18 @@
       ]
     },
     {
+      "criticality": "workflow",
+      "description": "Assert at SessionStart that guard-rm is present and classifying as contracted",
+      "event": "SessionStart",
+      "name": "guard-rm-liveness",
+      "plugin": "guardrails",
+      "protected": false,
+      "status": "native",
+      "applicable": false,
+      "evidence": "registered in the binary but not yet invoked: the cadence-guardrails SessionStart wiring ships in a companion monorepo PR. Flip to applicable when that wiring merges.",
+      "wiring": []
+    },
+    {
       "criticality": "security-critical",
       "description": "Block Read/Grep by resolved session model (opt-in)",
       "event": "PreToolUse",

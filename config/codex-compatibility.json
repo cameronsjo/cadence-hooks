@@ -22,6 +22,10 @@
     "warn-subagent-worktree": {"status": "adapted", "evidence": "crates/core/src/lib.rs"},
     "warn-subagent-concurrency": {"status": "adapted", "evidence": "crates/core/src/lib.rs"},
     "guard-rm": {"status": "adapted", "evidence": "crates/guardrails/src/guard_rm.rs::patch_delete_of_a_protected_path_blocks"},
+    "guard-rm-liveness": {
+      "applicable": false,
+      "evidence": "registered in the binary but not yet invoked: the cadence-guardrails SessionStart wiring ships in a companion monorepo PR. Flip to applicable when that wiring merges."
+    },
     "trash-guard": {"status": "adapted", "evidence": "crates/obsidian/src/trash_guard.rs::normalized_patch_delete_inside_vault_is_blocked"},
     "guard-browser-device": {
       "status": "unavailable",

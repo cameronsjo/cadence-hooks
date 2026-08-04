@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`guard-rm-liveness`, a SessionStart assertion that `guard-rm` is actually arbitrating deletes (wiring tracked in cameronsjo/cadence#760).** The two blanket `permissions.ask` rows `Bash(rm -rf:*)` / `Bash(rm -r:*)` were retired in favor of `guard-rm`, which discriminates by filesystem classification where a literal prefix rule cannot — but those rows had been the belt under every path where the guard fails to run. With them gone, a `guard-rm` that silently does not run means `rm -rf` executes with no prompt anywhere, and that failure is invisible by construction: `Outcome::Allow` is a silent exit 0 and only denials reach `denials.jsonl`, so "inspected and allowed" and "never ran" are byte-identical after the fact. The check asserts the **mechanism**, not the absence of errors — it runs `guard-rm` against inputs whose verdicts are fixed by contract (an unexpanded `$VAR` and a `$(…)` substitution must both `Ask`; a temp-root path must `Allow`) and nudges naming the diverging probe, and separately reports `CADENCE_DISABLE=guard-rm` / `CADENCE_BYPASS=1`. Deliberately **no daily gate** (unlike `platform-drift`): what it reports is "your only remaining deletion guard is off or broken", which should be visible every session rather than suppressed for 23 hours. **Two limits are documented in the module rather than left to be rediscovered.** It ships in the same plugin and binary as the guard it watches, so it cannot see a bypassed session, a disabled plugin, inert wiring, an absent binary, or a delete-time timeout — silence means "the classifier is intact and not switched off", never "deletes are guarded". And it does not probe the Block path: the Temp classification is evaluated *before* the git-repo check, so `rm -rf /tmp/<dir-containing-.git>` is a silent Allow and a tempdir fixture would assert Block, get Allow, and nudge falsely every session. Nudge-only, fail-open throughout (ADR-0001).
+
+### Fixed
+
+- **The checked-in Codex compatibility report's `binaryVersion` had gone stale at 0.70.1**, leaving `make ci`'s `report-check` red on `main` from the 0.71.0 bump onward. The release procedure regenerates the platform baseline but not this report; the gap itself is filed separately.
+
 ## [0.71.0] - 2026-08-03
 
 ### Added

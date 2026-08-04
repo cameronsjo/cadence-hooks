@@ -266,6 +266,8 @@ enum GuardrailsCommands {
     GuardDotfiles,
     /// Path-aware triage of rm-family deletes (allow temp/managed, block home/vault/repo, ask the rest)
     GuardRm,
+    /// SessionStart assertion that guard-rm is present and classifying deletes as contracted
+    GuardRmLiveness,
     /// Block Read/Grep by resolved session model (opt-in via CADENCE_READ_MODEL_GUARD_MODELS)
     GuardReadModel,
     /// Nudge when `gh pr create` has no closing issue keyword in the body
@@ -449,6 +451,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnUntracked => "warn-untracked",
             GuardrailsCommands::GuardDotfiles => "guard-dotfiles",
             GuardrailsCommands::GuardRm => "guard-rm",
+            GuardrailsCommands::GuardRmLiveness => "guard-rm-liveness",
             GuardrailsCommands::GuardReadModel => "guard-read-model",
             GuardrailsCommands::WarnPrIssueLink => "warn-pr-issue-link",
             GuardrailsCommands::WarnIssueTracker => "warn-issue-tracker",
@@ -1031,6 +1034,11 @@ fn main() {
             GuardrailsCommands::GuardRm => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_rm::GuardRm,
                 pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::GuardRmLiveness => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_rm_liveness::GuardRmLiveness,
+                session,
                 canonical_hook,
             ),
             GuardrailsCommands::GuardReadModel => dispatch::run_logged_check(

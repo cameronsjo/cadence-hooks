@@ -192,6 +192,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "guard-rm-liveness",
+        description: "Assert at SessionStart that guard-rm is present and classifying as contracted",
+        plugin: "guardrails",
+        event: Some(HookEvent::SessionStart),
+    },
+    HookEntry {
         name: "guard-read-model",
         description: "Block Read/Grep by resolved session model (opt-in)",
         plugin: "guardrails",
