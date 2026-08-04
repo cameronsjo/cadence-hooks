@@ -41,15 +41,70 @@ count_terms() {
   printf '%s' "${c:-0}"
 }
 
+# Independent confirmation from the binary, not this script's own bookkeeping.
+# Factored out because the reentrant path needs it too: counting `[[terms]]`
+# headers proves a header exists, not that the file parses — a TOML truncated
+# mid-entry, or with a broken `mode`, has a header and is still inert.
+verify_with_binary() {
+  local count="$1"
+  say ""
+  if ! command -v cadence-hooks >/dev/null 2>&1; then
+    warn "cadence-hooks not installed here — cannot self-verify."
+    say "VERDICT: terms-installed-unverified ($count terms) — install cadence-hooks, then run: cadence-hooks cadence redact-scan --status"
+    exit 0
+  fi
+  # Check the VERSION before the status flag. An older binary rejects `--status`
+  # with its own message and its own exit code — NOT clap's 2, as an earlier
+  # version of this script assumed — so exit-code archaeology mislabeled a
+  # perfectly healthy provisioning as "binary reports NOT ARMED", which reads
+  # like a corrupt terms file and sends the operator to inspect the wrong thing.
+  # A version comparison is deterministic and needs no guessing.
+  local ver
+  ver=$(cadence-hooks --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  if [ -z "$ver" ]; then
+    warn "Could not read cadence-hooks --version."
+    say "VERDICT: terms-installed-unverified ($count terms) — check 'cadence-hooks cadence redact-scan --status' by hand"
+    exit 0
+  fi
+  # Sort-based compare: MIN_BINARY is the first release carrying the tier.
+  local MIN_BINARY="0.72.0"
+  if [ "$(printf '%s\n%s\n' "$MIN_BINARY" "$ver" | sort -V | head -1)" != "$MIN_BINARY" ]; then
+    warn "Installed cadence-hooks is $ver — the identity tier needs $MIN_BINARY or newer."
+    say "The terms are in place and correct; the binary simply cannot use them yet."
+    say ""
+    say "VERDICT: terms-installed-but-binary-too-old ($count terms, have $ver) — run: brew update && brew upgrade cadence-hooks"
+    exit 0
+  fi
+
+  say "Verifying with the binary ($ver):"
+  # Capture the exit code DIRECTLY. An `if cmd; then …; fi` whose condition
+  # fails and has no else returns 0, so a trailing `rc=$?` reads 0 regardless.
+  cadence-hooks cadence redact-scan --status
+  local rc=$?
+  say ""
+  if [ "$rc" -eq 0 ]; then
+    say "VERDICT: ${G}armed${N} ($count terms)"
+    exit 0
+  fi
+  say "VERDICT: ${R}terms present but binary $ver reports NOT ARMED${N} — inspect $TARGET"
+  exit 1
+}
+
 if [ -s "$TARGET" ]; then
   n=$(count_terms "$TARGET")
   if [ "$n" -gt 0 ]; then
-    ok "Already armed — $n term(s) at $TARGET. Nothing to do."
-    say ""
-    say "VERDICT: already-armed ($n terms)"
-    exit 0
+    ok "Already armed — $n term(s) at $TARGET."
+    # Still ask the binary. The whole point of this script is that a machine
+    # can look provisioned while the tier is inert; short-circuiting on our own
+    # header count would reproduce exactly that failure on the re-run path,
+    # which is the path a re-run is for.
+    verify_with_binary "$n"
   fi
-  warn "$TARGET exists but carries zero terms — will replace it."
+  warn "$TARGET exists but carries zero terms — replacing it."
+  # The migrate script refuses to overwrite an existing target, and its stderr
+  # is swallowed below — so without this removal the legacy path would die with
+  # a generic "conversion failed" and the "replacing it" promise would be a lie.
+  rm -f "$TARGET"
 fi
 
 # `op` needs a controlling terminal. Checked here rather than up top so an
@@ -91,39 +146,28 @@ else
   rm -f "$LEGACY" && ok "Removed the intermediate legacy file."
 fi
 
-chmod 600 "$TARGET" 2>/dev/null
+chmod 600 "$TARGET" 2>/dev/null || warn "Could not chmod 600 $TARGET — check its permissions by hand."
 [ -s "$TARGET" ] || die "Wrote nothing to $TARGET"
 COUNT=$(count_terms "$TARGET")
 [ "$COUNT" -gt 0 ] || die "Wrote $TARGET but it parses to ZERO terms — the tier would be inert. Inspect it by hand."
+
+# A count floor, because `> 0` accepts a truncated fetch or the wrong note
+# entirely: one garbage line still writes, still counts as a term, and would
+# very likely still satisfy the binary's own "parses, has terms" check. There
+# is no way to know the canonical count from a machine that has never had the
+# file, so this is a smell test, not a checksum — deliberately low, and a
+# warning rather than a failure so a genuinely short list still provisions.
+MIN_EXPECTED=5
+if [ "$COUNT" -lt "$MIN_EXPECTED" ]; then
+  warn "Only $COUNT term(s) — fewer than the $MIN_EXPECTED this normally carries."
+  warn "A truncated fetch or the wrong 1Password item looks exactly like this. Compare against the source machine before trusting it."
+fi
+
+# Structural completeness: a fetch truncated mid-entry leaves a trailing
+# `[[terms]]` header with no `term =` under it, which counts but never matches.
+if [ "$(grep -c '^[[:space:]]*term[[:space:]]*=' "$TARGET" 2>/dev/null || true)" -lt "$COUNT" ]; then
+  die "$TARGET has $COUNT [[terms]] header(s) but fewer term values — the fetch looks truncated. Not trusting it."
+fi
 ok "Wrote $COUNT term(s) to $TARGET (0600)."
 
-# Independent confirmation from the binary, not from this script's own bookkeeping.
-say ""
-if command -v cadence-hooks >/dev/null 2>&1; then
-  say "Verifying with the binary:"
-  # Capture the exit code DIRECTLY. An `if cmd; then …; fi` whose condition
-  # fails and has no else returns 0, so a trailing `rc=$?` reads 0 no matter
-  # what cmd did — which would have made the too-old branch below unreachable
-  # and misreported a healthy provisioning as a failure.
-  cadence-hooks cadence redact-scan --status
-  rc=$?
-  say ""
-  case "$rc" in
-    0)
-      say "VERDICT: ${G}armed${N} ($COUNT terms)"
-      exit 0
-      ;;
-    2)
-      warn "The installed cadence-hooks predates the identity tier (--status is unrecognized)."
-      say "VERDICT: terms-installed-but-binary-too-old ($COUNT terms) — run: brew upgrade cadence-hooks"
-      exit 0
-      ;;
-    *)
-      say "VERDICT: ${R}terms written but binary reports NOT ARMED${N} — inspect $TARGET"
-      exit 1
-      ;;
-  esac
-fi
-warn "cadence-hooks not installed here — cannot self-verify."
-say "VERDICT: terms-installed-unverified ($COUNT terms) — install cadence-hooks, then run: cadence-hooks cadence redact-scan --status"
-exit 0
+verify_with_binary "$COUNT"
