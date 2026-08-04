@@ -1,3 +1,22 @@
+---
+status: blocked
+branch: feat/single-dispatch
+pr: cameronsjo/cadence-hooks#596
+updated: 2026-08-04
+approved_session_id: ed99c6a8-17fe-4a32-b09e-55f6d22c4652
+approved_in: frost-rondo
+next: >-
+  BLOCKED on cameronsjo/cadence#783 — confirm whether Codex honours `if:`.
+  That answer decides the whole build: if Codex ignores filters, this plan is
+  right and one Bash call drops 61 processes to 5-6; if Codex honours them, the
+  correct fix is instead reverting cadence#596's PreToolUse half (318/318
+  duplicates, ~half a day, no release) plus the wrapper work in
+  cadence-hooks#595. Do not start Task 1 before that is settled.
+  Once unblocked: Task 1 (registry gains `matchers` as a LIST — seven checks are
+  wired under two matchers for the same event), then Task 2.6 (thread-safe panic
+  seam, cadence-hooks#593) which blocks all threading.
+---
+
 # Hook dispatch redesign — one process per (event × plugin × matcher)
 
 **Tracking:** cadence-hooks#276 · **Decided:** 2026-08-04 · **Driver: Codex, not latency.**
