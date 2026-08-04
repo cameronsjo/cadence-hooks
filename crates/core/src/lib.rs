@@ -1143,6 +1143,24 @@ impl CheckResult {
             bypass: Some(bypass),
         }
     }
+
+    /// Attach [`BypassProvenance`] to a result that is **not** a plain allow.
+    ///
+    /// [`allow_bypassed`](Self::allow_bypassed) covers the common shape — a
+    /// bypass turns a block into a silent allow. It does not cover a guard with
+    /// more than one severity tier, where a bypass downgrades the hard tier but
+    /// the soft tier still has something to say: dropping to `allow_bypassed`
+    /// would silently discard that message, and returning a bare `nudge` would
+    /// lose the provenance row in `bypasses.jsonl`.
+    ///
+    /// `redact-external-content` is the first such guard: with the identity
+    /// bypass armed and both an identity and a shaped hit present, the honest
+    /// result is a nudge carrying the shaped finding *and* the attribution that
+    /// a bypass suppressed the block.
+    pub fn with_bypass(mut self, bypass: BypassProvenance) -> Self {
+        self.bypass = Some(bypass);
+        self
+    }
 }
 
 /// A hook check that can be run against input.

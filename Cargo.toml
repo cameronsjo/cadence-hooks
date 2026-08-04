@@ -13,6 +13,7 @@ repository = "https://github.com/cameronsjo/cadence-hooks"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_ignored = "0.1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 regex = "1"
 clap = { version = "4", features = ["derive"] }
 brush-parser = "0.3"

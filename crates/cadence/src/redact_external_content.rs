@@ -42,7 +42,9 @@
 //! nudge mode, silent failure beats false positives.
 
 use cadence_hooks_core::shell::{command_segments, strip_quotes, tokenize};
-use cadence_hooks_core::{Check, CheckResult, HookInput};
+use cadence_hooks_core::{BypassKind, BypassProvenance, Check, CheckResult, HookInput};
+mod identity;
+
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -260,6 +262,43 @@ struct AdditionalPattern {
     ceiling: Option<String>,
 }
 
+/// Where a category's *softening* authority lives — the structural pin that
+/// makes config-blindness a property of the category table rather than a rule
+/// someone has to remember.
+///
+/// The governing principle (ADR-0041): **exemption authority follows
+/// term-source authority.** A category whose terms come from committed repo
+/// config may be softened by that same config. A category whose terms come from
+/// an out-of-repo source file may be softened only by that file.
+///
+/// This is deliberately *not* a runtime `if category == "identity"` check at
+/// each softening site. Two call sites read this field — [`category_ceiling`]
+/// and [`is_allowlisted`] — and a category added later inherits whichever
+/// authority its descriptor declares, including by accident. The failure mode
+/// being designed out: someone adds a third config-driven softening feature and
+/// forgets to exclude the fail-closed tier from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigScope {
+    /// The repo's committed `.claude/cadence.json` may raise this category's
+    /// ceiling and allowlist its hits.
+    RepoConfig,
+    /// Only the out-of-repo term source may soften this category. Repo config
+    /// is never consulted for it — no ceiling override, no allowlist entry.
+    SourceFileOnly,
+}
+
+/// One scanned category: its emitted name, its pattern, the ceiling it defaults
+/// to, and — load-bearing — who is allowed to soften it.
+struct CategoryDescriptor {
+    name: &'static str,
+    pattern: &'static Regex,
+    /// Ceiling used when no override applies. `always`(0) means "redact at
+    /// every destination" — the tier algebra's designed extreme, which is where
+    /// the fail-closed tier sits. It is not outside the algebra; it is its edge.
+    default_ceiling: &'static str,
+    config_scope: ConfigScope,
+}
+
 /// A single blocklist hit within one body. `offset` is the match start within
 /// that body, used only for cross-category offset dedup.
 struct Hit {
@@ -268,6 +307,9 @@ struct Hit {
     offset: usize,
     /// Replacement to surface (set only for `additionalPatterns` hits).
     replacement: Option<String>,
+    /// Carried from the producing category's descriptor so the allowlist check
+    /// can honor it without re-deriving the category→scope mapping.
+    config_scope: ConfigScope,
 }
 
 /// Flag against this nudge when it dispatches internal harness vocabulary to an
@@ -280,9 +322,16 @@ impl Check for RedactExternalContent {
     }
 
     fn run(&self, input: &HookInput) -> CheckResult {
-        // Phase 1 — early exit: only Bash carries a postable command.
+        // Phase 0 — the term source, loaded once. Every failure yields an empty
+        // list (fail-open on the guard's own failure); the SessionStart probe,
+        // not this call, is what keeps an absent file from being a silent
+        // disarm.
+        let (identity_list, _status) = identity::load();
+
+        // Phase 1 — route by surface. Only Bash carries a postable command; a
+        // Write/Edit runs the identity pass ONLY (see `run_edit`).
         let Some(command) = input.command() else {
-            return CheckResult::allow();
+            return run_edit(input, &identity_list);
         };
 
         // Phase 2 — gate and extract PER SEGMENT (#424). A segment that does
@@ -313,9 +362,16 @@ impl Check for RedactExternalContent {
         let env_audience = std::env::var("CADENCE_AUDIENCE").ok();
         let d = resolve_dest_tier(env_audience.as_deref(), &config);
 
-        // Phase 4 — scan each body, collect hits (gated on d > ceiling).
+        // Phase 4 — TWO passes over every body, deliberately without a
+        // short-circuit. An identity hit does not skip the shaped scan: a
+        // single post can carry both, and the operator fixing one should see
+        // the other in the same message rather than discovering it on the
+        // retry.
         let mut hits: Vec<Hit> = Vec::new();
+        let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
         for body in &bodies {
+            // Config-blind by signature — no config, no tier, no allowlist.
+            identity_hits.extend(identity::scan_identity(body, &identity_list, None));
             hits.extend(scan_body(body, &config, d));
         }
 
@@ -323,17 +379,151 @@ impl Check for RedactExternalContent {
         // the transcript). A clean scan with a broken config still nudges —
         // otherwise the drop is exactly as silent as the #536 defect was.
         let warnings = loaded.warnings;
-        match (hits.is_empty(), warnings.is_empty()) {
-            (true, true) => CheckResult::allow(),
-            (true, false) => CheckResult::nudge(build_config_warning(&warnings)),
-            (false, true) => CheckResult::nudge(build_message(&hits)),
-            (false, false) => CheckResult::nudge(format!(
-                "{}\n{}",
-                build_message(&hits),
-                build_config_warning(&warnings)
-            )),
+        combine(&identity_hits, &hits, &warnings, identity_list.mode)
+    }
+}
+
+/// The Write/Edit surface: the identity pass **only**, over introduced
+/// fragments.
+///
+/// Two deliberate narrowings, both load-bearing:
+///
+/// 1. **Shaped tiers never run here.** A local file edit has no audience, and
+///    `resolve_dest_tier`'s public(3) fallback would nudge on every `/Users/…`
+///    path written locally — a false-positive flood that would get the whole
+///    guard disabled, which is exactly the outcome the fail-closed tier exists
+///    to prevent.
+/// 2. **Introduced fragments, not the resulting document.** `edit_fragments()`
+///    yields what the edit *adds*; `effective_content()` would yield the whole
+///    file, so a pre-existing term anywhere in it would block every unrelated
+///    edit — including the edit that removes the term. (Its `None`-on-unreadable
+///    default is also self-locking, and its own docs warn blocking guards off
+///    it.)
+///
+/// The residual this accepts: content entering a file by some other route (a
+/// `sed -i`, an external editor) is not seen here. Named in ADR-0041; the
+/// periodic leak-ledger scan is its detection net.
+fn run_edit(input: &HookInput, identity_list: &identity::IdentityList) -> CheckResult {
+    if !identity_list.is_armed() {
+        return CheckResult::allow();
+    }
+    let Some(fragments) = input.edit_fragments() else {
+        return CheckResult::allow();
+    };
+    let file_path = input
+        .tool_input
+        .as_ref()
+        .and_then(|ti| ti.file_path.as_deref().or(ti.path.as_deref()));
+
+    let mut identity_hits: Vec<identity::IdentityHit> = Vec::new();
+    for (new, old) in &fragments {
+        // Scan only what the edit introduces. A term already present in `old`
+        // is pre-existing: it is not this edit's doing, and blocking on it
+        // would make the removal edit impossible.
+        for hit in identity::scan_identity(new, identity_list, file_path) {
+            if !old.contains(&hit.snippet) {
+                identity_hits.push(hit);
+            }
         }
     }
+    combine(&identity_hits, &[], &[], identity_list.mode)
+}
+
+/// Fold the two passes and any config warnings into one result.
+///
+/// Outcome is the max severity across the tiers ([`Outcome::merge`]), and the
+/// message carries the union — labeled, so BLOCKED findings are not read as
+/// advisory. Only the identity tier can produce a block, and only in
+/// [`identity::Mode::Enforce`].
+fn combine(
+    identity_hits: &[identity::IdentityHit],
+    hits: &[Hit],
+    warnings: &[String],
+    mode: identity::Mode,
+) -> CheckResult {
+    let bypass = std::env::var("CADENCE_ALLOW_SENSITIVE_TERMS")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0");
+
+    let mut sections: Vec<String> = Vec::new();
+    let identity_blocks = !identity_hits.is_empty() && mode == identity::Mode::Enforce;
+
+    if !identity_hits.is_empty() {
+        sections.push(build_identity_message(
+            identity_hits,
+            mode,
+            bypass.is_some(),
+        ));
+    }
+    if !hits.is_empty() {
+        sections.push(build_message(hits));
+    }
+    if !warnings.is_empty() {
+        sections.push(build_config_warning(warnings));
+    }
+    if sections.is_empty() {
+        return CheckResult::allow();
+    }
+    let message = sections.join("\n");
+
+    match (identity_blocks, bypass) {
+        // Blocking, no bypass — the fail-closed path.
+        (true, None) => CheckResult::block(message),
+        // Bypass armed. The block downgrades, but anything the shaped tiers or
+        // the config loader had to say still ships — and the provenance row is
+        // written either way, which is what makes the bypass auditable.
+        (true, Some(mechanism)) => {
+            let prov = BypassProvenance {
+                kind: BypassKind::EnvSwitch,
+                mechanism: format!("CADENCE_ALLOW_SENSITIVE_TERMS={mechanism}"),
+                reason: None,
+                expires_at: None,
+                armed_by_session: None,
+            };
+            CheckResult::nudge(message).with_bypass(prov)
+        }
+        // Warn mode, or shaped/config findings only.
+        (false, _) => CheckResult::nudge(message),
+    }
+}
+
+/// Render the identity findings.
+///
+/// **The term is named verbatim.** Ruled: the threat model is irrevocable
+/// public-facing artifacts, and a block that will not say what tripped it is a
+/// block the operator cannot act on — they retry, it blocks again, and the
+/// guard gets disabled. Transcripts are not the surface this protects.
+fn build_identity_message(
+    hits: &[identity::IdentityHit],
+    mode: identity::Mode,
+    bypassed: bool,
+) -> String {
+    let header = match (mode, bypassed) {
+        (identity::Mode::Enforce, false) => {
+            "⛔  redact-external-content: BLOCKED — work-identifiable terms in outgoing content:"
+        }
+        (identity::Mode::Enforce, true) => {
+            "⚠️  redact-external-content: work-identifiable terms found; block suppressed by \
+             CADENCE_ALLOW_SENSITIVE_TERMS (logged):"
+        }
+        (identity::Mode::Warn, _) => {
+            "⚠️  redact-external-content: work-identifiable terms found (warn mode — not blocking):"
+        }
+    };
+    let mut out = String::from(header);
+    out.push('\n');
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    for hit in hits {
+        if seen.insert((hit.id.as_str(), hit.snippet.as_str())) {
+            out.push_str(&format!("  [{}] {}\n", hit.id, hit.snippet));
+        }
+    }
+    out.push_str(
+        "Remove the term, or — if this context is genuinely benign — add an `allow` entry \
+         beside it in the term source (see `cadence-hooks cadence redact-scan --help`). \
+         Per-repo config cannot excuse these.",
+    );
+    out
 }
 
 /// Render config-load warnings as one nudge block. NB this fires on every
@@ -488,15 +678,24 @@ fn resolve_dest_tier(env_audience: Option<&str>, config: &RedactionConfig) -> u8
     }
 }
 
-/// Ceiling string for a universal category: the config `.categories` override or
-/// the default `owned-internal`. Returned as `&str` for a direct
-/// [`ceiling_ord`] call.
-fn category_ceiling<'a>(config: &'a RedactionConfig, category: &str) -> &'a str {
+/// Ceiling string for a scanned category. **Softening call site 1 of 2.**
+///
+/// A [`ConfigScope::SourceFileOnly`] category returns its declared default
+/// without ever reading `config` — the repo's committed `categories` map has no
+/// path to it. That is not an exemption checked here; it is the descriptor's
+/// own declaration being honored.
+fn category_ceiling<'a>(config: &'a RedactionConfig, desc: &CategoryDescriptor) -> &'a str
+where
+    'static: 'a,
+{
+    if desc.config_scope == ConfigScope::SourceFileOnly {
+        return desc.default_ceiling;
+    }
     config
         .categories
-        .get(category)
+        .get(desc.name)
         .and_then(|c| c.ceiling.as_deref())
-        .unwrap_or("owned-internal")
+        .unwrap_or(desc.default_ceiling)
 }
 
 /// Scan one body for blocklist hits, deduped by start offset across categories,
@@ -507,34 +706,62 @@ fn category_ceiling<'a>(config: &'a RedactionConfig, category: &str) -> &'a str 
 /// additional; the first to claim a start offset reports it (so a single
 /// `~/.claude/plugins/…` offset is reported once, as `marketplace`). An
 /// allowlisted hit pins its ceiling to public (never redacted here).
+///
+/// The category table. Order is load-bearing for offset-dedup: the first
+/// descriptor to claim a start offset reports it, so more specific patterns
+/// precede broader ones (`marketplace` before `local-path`).
+fn universal_categories() -> [CategoryDescriptor; 4] {
+    [
+        CategoryDescriptor {
+            name: "skill-id",
+            pattern: &SKILL_ID,
+            default_ceiling: "owned-internal",
+            config_scope: ConfigScope::RepoConfig,
+        },
+        CategoryDescriptor {
+            name: "marketplace",
+            pattern: &MARKETPLACE_PATH,
+            default_ceiling: "owned-internal",
+            config_scope: ConfigScope::RepoConfig,
+        },
+        CategoryDescriptor {
+            name: "local-path",
+            pattern: &LOCAL_PATH,
+            default_ceiling: "owned-internal",
+            config_scope: ConfigScope::RepoConfig,
+        },
+        CategoryDescriptor {
+            name: "harness-noun",
+            pattern: &HARNESS_NOUN,
+            default_ceiling: "owned-internal",
+            config_scope: ConfigScope::RepoConfig,
+        },
+    ]
+}
+
 fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
     let mut hits: Vec<Hit> = Vec::new();
     let mut claimed: HashSet<usize> = HashSet::new();
 
-    let universal: [(&'static str, &Regex); 4] = [
-        ("skill-id", &SKILL_ID),
-        ("marketplace", &MARKETPLACE_PATH),
-        ("local-path", &LOCAL_PATH),
-        ("harness-noun", &HARNESS_NOUN),
-    ];
-    for (category, regex) in universal {
-        for m in regex.find_iter(body) {
+    for desc in universal_categories() {
+        for m in desc.pattern.find_iter(body) {
             // Claim the offset when first seen (so a lower-priority category
             // never re-reports it), then decide whether the audience gate keeps
             // it.
             if claimed.insert(m.start()) {
                 let hit = Hit {
-                    category,
+                    category: desc.name,
                     snippet: m.as_str().to_string(),
                     offset: m.start(),
                     replacement: None,
+                    config_scope: desc.config_scope,
                 };
                 // Allowlisted → ceiling public (never redacts); else the
                 // category's configured/default ceiling. Retain iff d > c.
                 let ceiling = if is_allowlisted(&hit, &config.allowlist) {
                     "public"
                 } else {
-                    category_ceiling(config, category)
+                    category_ceiling(config, &desc)
                 };
                 if d > ceiling_ord(ceiling) {
                     hits.push(hit);
@@ -562,6 +789,9 @@ fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
                     snippet: m.as_str().to_string(),
                     offset: m.start(),
                     replacement: (!ap.replacement.is_empty()).then(|| ap.replacement.clone()),
+                    // Terms authored in repo config, so repo config softens
+                    // them — the principle running in the other direction.
+                    config_scope: ConfigScope::RepoConfig,
                 });
             }
         }
@@ -583,7 +813,15 @@ fn scan_body(body: &str, config: &RedactionConfig, d: u8) -> Vec<Hit> {
 /// identifiers as domain vocabulary — e.g. a tool-schema library discussing
 /// `tool_input` — can allowlist that literal term without suppressing the
 /// whole `harness-noun` category or a different hit like `tool_response`).
+///
+/// **Softening call site 2 of 2.** A hit from a [`ConfigScope::SourceFileOnly`]
+/// category is never allowlistable from repo config — the check short-circuits
+/// before reading a single entry. Its exemptions live in the same out-of-repo
+/// file its terms do.
 fn is_allowlisted(hit: &Hit, allowlist: &[String]) -> bool {
+    if hit.config_scope == ConfigScope::SourceFileOnly {
+        return false;
+    }
     allowlist.iter().any(|entry| {
         if entry.contains(':') {
             entry == &hit.snippet
@@ -639,6 +877,53 @@ fn build_message(hits: &[Hit]) -> String {
 //   - `--init` needs no jq, and re-emits an existing file via serde_json
 //     pretty-printing rather than jq's formatting (cosmetic divergence).
 // ---------------------------------------------------------------------------
+
+/// Entry for `redact-scan --status`. Returns the process exit code: 0 armed,
+/// 1 unarmed.
+///
+/// This exists because of an asymmetry: an armed guard announces itself every
+/// time it fires, but an *unarmed* one is indistinguishable from a clean repo.
+/// On a second machine where the term source was never replicated, every post
+/// would sail through and look exactly like success. The report goes to stdout
+/// so a SessionStart hook can surface it in the transcript.
+pub fn run_status() -> u8 {
+    let (list, status) = identity::load();
+    let path = identity::terms_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unresolvable: no HOME>".to_string());
+    let report = match &status {
+        identity::Status::Armed(n) => {
+            let mode = match list.mode {
+                identity::Mode::Enforce => "enforce (blocking)",
+                identity::Mode::Warn => "warn (advisory)",
+            };
+            format!("redaction identity tier: ARMED — {n} term(s), mode {mode} [{path}]")
+        }
+        identity::Status::Absent => format!(
+            "⚠️  redaction identity tier: NOT ARMED — no term source at {path}\n\
+             Work-identifiable terms will NOT be caught on this machine. \
+             Replicate the file (1Password: cadence-redaction-terms) to arm it."
+        ),
+        identity::Status::Unreadable => format!(
+            "⚠️  redaction identity tier: NOT ARMED — term source at {path} exists but \
+             could not be read (permissions, or not a regular file).\n\
+             This is reported exactly like an absent file on purpose: from the outcome \
+             alone the two are indistinguishable, and both mean nothing is being caught."
+        ),
+        identity::Status::ZeroTerms => format!(
+            "⚠️  redaction identity tier: NOT ARMED — term source at {path} parsed but \
+             carries zero terms."
+        ),
+        identity::Status::Malformed(e) => format!(
+            "⚠️  redaction identity tier: NOT ARMED — term source at {path} failed to \
+             parse: {e}\nFix the file to re-arm; nothing is being caught until then."
+        ),
+    };
+    println!("{report}");
+    // One source of truth for "is this a state the operator must be told
+    // about" — the exit code derives from it rather than restating it per arm.
+    u8::from(status.needs_notice())
+}
 
 /// Entry for the `redact-scan` CLI action. Returns the process exit code.
 pub fn run_scan(file: Option<String>, audience: Option<String>, init: bool) -> u8 {
@@ -1930,6 +2215,235 @@ mod tests {
                 resolve_dest_tier(Some("owned-internal"), &config)
             )
             .is_empty()
+        );
+    }
+
+    // --- The identity tier, at the guard level -----------------------------
+    //
+    // These drive the real `run()`, so they set `CADENCE_REDACTION_TERMS` and
+    // must not run concurrently with each other (process-wide env). Everything
+    // reachable without env goes in `identity::tests` instead.
+
+    static TERMS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `body` through the guard with a fixture term source. Returns the
+    /// full result so a caller can assert on outcome, message, and bypass.
+    fn with_terms<F, R>(toml_body: &str, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("redaction.toml");
+        std::fs::write(&path, toml_body).unwrap();
+        // SAFETY-equivalent rationale: serialized by TERMS_ENV_LOCK above.
+        unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", &path) };
+        let out = f();
+        unsafe { std::env::remove_var("CADENCE_REDACTION_TERMS") };
+        drop(guard);
+        out
+    }
+
+    const FIXTURE: &str = r#"
+version = 1
+[[terms]]
+id = "T1"
+term = "acmecorp"
+"#;
+
+    #[test]
+    fn identity_term_in_a_commit_message_blocks() {
+        with_terms(FIXTURE, || {
+            let r = run("git commit -m \"fix the acmecorp integration\"");
+            assert_eq!(r.outcome, Outcome::Block, "identity must block by default");
+            let msg = r.message.unwrap_or_default();
+            assert!(msg.contains("BLOCKED"), "labels the block: {msg}");
+            assert!(msg.contains("acmecorp"), "names the term verbatim: {msg}");
+            assert!(msg.contains("[T1]"), "names the authored id: {msg}");
+        });
+    }
+
+    #[test]
+    fn clean_body_still_allows_with_the_tier_armed() {
+        with_terms(FIXTURE, || {
+            assert_eq!(
+                run("git commit -m \"fix the parser\"").outcome,
+                Outcome::Allow
+            );
+        });
+    }
+
+    #[test]
+    fn absent_terms_file_is_inert_not_a_hard_failure() {
+        let guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("CADENCE_REDACTION_TERMS", "/nonexistent/redaction.toml") };
+        let r = run("git commit -m \"fix the acmecorp integration\"");
+        unsafe { std::env::remove_var("CADENCE_REDACTION_TERMS") };
+        drop(guard);
+        // Fail-OPEN on the guard's own failure: a machine that never had the
+        // file must still be able to commit. The SessionStart probe is what
+        // keeps this from being silent.
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
+
+    #[test]
+    fn malformed_terms_file_is_inert_not_a_hard_failure() {
+        with_terms("this is not [valid toml", || {
+            assert_eq!(
+                run("git commit -m \"fix the acmecorp integration\"").outcome,
+                Outcome::Allow,
+                "a broken term source must not brick every commit"
+            );
+        });
+    }
+
+    #[test]
+    fn zero_term_file_is_inert() {
+        with_terms("version = 1\n", || {
+            assert_eq!(run("git commit -m \"acmecorp\"").outcome, Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn warn_mode_nudges_instead_of_blocking() {
+        with_terms(
+            "version = 1\nmode = \"warn\"\n[[terms]]\nid = \"T1\"\nterm = \"acmecorp\"\n",
+            || {
+                let r = run("git commit -m \"the acmecorp thing\"");
+                assert_eq!(r.outcome, Outcome::Nudge);
+                assert!(r.message.unwrap_or_default().contains("warn mode"));
+            },
+        );
+    }
+
+    #[test]
+    fn repo_config_cannot_soften_the_identity_tier() {
+        // The whole point of ConfigScope::SourceFileOnly. A repo that
+        // allowlists the term AND raises every ceiling still blocks.
+        with_terms(FIXTURE, || {
+            let repo = temp_repo_with_config(
+                r#"{"allowlist":["acmecorp"],"originAudience":"owned-internal",
+                    "categories":{"identity":{"ceiling":"public"}}}"#,
+            );
+            let input = make_bash_with_cwd(
+                "git commit -m \"the acmecorp thing\"",
+                repo.path().to_str().unwrap(),
+            );
+            assert_eq!(
+                RedactExternalContent.run(&input).outcome,
+                Outcome::Block,
+                "committed config must have no path to the identity tier"
+            );
+        });
+    }
+
+    #[test]
+    fn identity_and_shaped_hits_both_appear_in_one_message() {
+        // No short-circuit: fixing one finding should not reveal the other on
+        // the retry.
+        with_terms(FIXTURE, || {
+            let r = run("gh issue create --body \"acmecorp uses cadence:attune\"");
+            assert_eq!(r.outcome, Outcome::Block);
+            let msg = r.message.unwrap_or_default();
+            assert!(msg.contains("acmecorp"), "identity finding present: {msg}");
+            assert!(
+                msg.contains("cadence:attune"),
+                "shaped finding present too: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn bypass_downgrades_the_block_but_keeps_the_message_and_logs_provenance() {
+        with_terms(FIXTURE, || {
+            // Already inside with_terms' lock — std Mutex is not reentrant, so
+            // re-locking here would deadlock. The outer guard serializes both
+            // env vars.
+            unsafe { std::env::set_var("CADENCE_ALLOW_SENSITIVE_TERMS", "1") };
+            let r = run("gh issue create --body \"acmecorp uses cadence:attune\"");
+            unsafe { std::env::remove_var("CADENCE_ALLOW_SENSITIVE_TERMS") };
+            assert_eq!(r.outcome, Outcome::Nudge, "bypass downgrades the block");
+            assert!(
+                r.bypass.is_some(),
+                "and still records provenance — an unlogged bypass is invisible"
+            );
+            let msg = r.message.unwrap_or_default();
+            assert!(
+                msg.contains("cadence:attune"),
+                "the shaped finding must survive the downgrade: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn write_of_an_introduced_term_blocks() {
+        with_terms(FIXTURE, || {
+            let input = HookInput {
+                tool_name: Some("Write".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    file_path: Some("/tmp/notes.md".into()),
+                    content: Some("we ship acmecorp tooling".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Block);
+        });
+    }
+
+    #[test]
+    fn edit_removing_a_preexisting_term_is_not_blocked() {
+        // The introduced-only rule, in its most load-bearing case: the
+        // remediation edit itself must be possible.
+        with_terms(FIXTURE, || {
+            let input = HookInput {
+                tool_name: Some("Edit".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    file_path: Some("/tmp/notes.md".into()),
+                    old_string: Some("we ship acmecorp tooling".into()),
+                    new_string: Some("we ship the tooling".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn write_of_a_local_path_does_not_nudge() {
+        // Shaped tiers never run on Write/Edit. Without this, every locally
+        // written /Users/… path would nudge — the FP flood that gets a guard
+        // turned off.
+        with_terms(FIXTURE, || {
+            let input = HookInput {
+                tool_name: Some("Write".into()),
+                tool_input: Some(cadence_hooks_core::ToolInput {
+                    file_path: Some("/tmp/notes.md".into()),
+                    content: Some("see /Users/alice/proj and cadence:attune".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(RedactExternalContent.run(&input).outcome, Outcome::Allow);
+        });
+    }
+
+    #[test]
+    fn an_allow_entry_in_the_term_source_does_excuse_the_hit() {
+        with_terms(
+            "version = 1\n[[terms]]\nid = \"T8\"\nterm = \"clarion\"\n\
+             [[terms.allow]]\npattern = \"(?i)clarion call\"\n",
+            || {
+                assert_eq!(
+                    run("git commit -m \"a clarion call for tests\"").outcome,
+                    Outcome::Allow
+                );
+                assert_eq!(
+                    run("git commit -m \"the clarion platform\"").outcome,
+                    Outcome::Block
+                );
+            },
         );
     }
 }

@@ -63,6 +63,13 @@ use registry::{HOOKS, HookEntry};
 const PROTECTED_GUARDS: &[&str] = &[
     "prevent-secret-leaks",
     "prevent-secret-writes",
+    // Carries the fail-closed identity tier. Protection is per-guard, so this
+    // also strips CADENCE_DISABLE from the same guard's *advisory* tiers —
+    // accepted deliberately (ruled 2026-08-03): the alternative was splitting
+    // one guard in two, and the remaining levers for a noisy nudge are the
+    // per-repo allowlist and originAudience, both config edits. Without this
+    // line, one environment variable silently disarms the leak protection.
+    "redact-external-content",
     "git-safety",
     "guard-push-remote",
     "guard-gh-dangerous",
@@ -216,6 +223,12 @@ enum CadenceCommands {
         /// Scaffold the redaction section of .claude/cadence.json and exit
         #[arg(long)]
         init: bool,
+        /// Report whether the identity tier is armed, and exit. Consumed by the
+        /// cadence plugin's SessionStart: an absent or unreadable term source
+        /// is a silent disarm on the machine you are not looking at, so it has
+        /// to announce itself once per session. Exit 0 armed / 1 unarmed.
+        #[arg(long)]
+        status: bool,
     },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
     RecordPolish {
@@ -963,7 +976,13 @@ fn main() {
                 file,
                 audience,
                 init,
+                status,
             } => {
+                if status {
+                    process::exit(
+                        cadence_hooks_cadence::redact_external_content::run_status().into(),
+                    );
+                }
                 process::exit(
                     cadence_hooks_cadence::redact_external_content::run_scan(file, audience, init)
                         .into(),
