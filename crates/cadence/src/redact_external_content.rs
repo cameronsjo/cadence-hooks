@@ -277,6 +277,25 @@ struct AdditionalPattern {
 /// authority its descriptor declares, including by accident. The failure mode
 /// being designed out: someone adds a third config-driven softening feature and
 /// forgets to exclude the fail-closed tier from it.
+///
+/// # Status: forward-looking, and honestly labelled
+///
+/// **No production category declares [`SourceFileOnly`](Self::SourceFileOnly)
+/// today.** The identity tier does not run through this table at all — it is a
+/// separate pass whose *signature* takes no config, which is a strictly
+/// stronger guarantee than a field consulted at two sites. That is what
+/// protects identity right now.
+///
+/// This field exists for the case the identity pass ever *is* folded into the
+/// category table, or a second out-of-repo term source is added — at which
+/// point the declaration is already required and cannot be forgotten.
+///
+/// Verified by mutation rather than assumed: deleting both guards leaves the
+/// whole suite green, because nothing production reaches them. So they are
+/// exercised directly by unit tests
+/// ([`tests::source_file_only_ceiling_ignores_repo_config`] and
+/// [`tests::source_file_only_hit_ignores_repo_allowlist`]) instead of being
+/// left as a mechanism no test can tell apart from absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigScope {
     /// The repo's committed `.claude/cadence.json` may raise this category's
@@ -2215,6 +2234,69 @@ mod tests {
                 resolve_dest_tier(Some("owned-internal"), &config)
             )
             .is_empty()
+        );
+    }
+
+    // --- ConfigScope, exercised directly -----------------------------------
+    //
+    // These two are the ONLY coverage of the SourceFileOnly guards, and they
+    // exist because a mutation test proved the guard-level tests do not touch
+    // them: deleting both guards left all 968 tests green, since no production
+    // category declares SourceFileOnly and identity bypasses the table
+    // entirely. Without these, `config_scope` would be a documented safety
+    // mechanism indistinguishable from its own absence.
+
+    #[test]
+    fn source_file_only_ceiling_ignores_repo_config() {
+        let config: RedactionConfig =
+            serde_json::from_str(r#"{"categories":{"probe":{"ceiling":"public"}}}"#)
+                .expect("config parses");
+
+        let repo_scoped = CategoryDescriptor {
+            name: "probe",
+            pattern: &HARNESS_NOUN,
+            default_ceiling: "owned-internal",
+            config_scope: ConfigScope::RepoConfig,
+        };
+        let source_only = CategoryDescriptor {
+            config_scope: ConfigScope::SourceFileOnly,
+            ..repo_scoped
+        };
+
+        // Same config, same category name — the ONLY difference is the scope.
+        assert_eq!(
+            category_ceiling(&config, &repo_scoped),
+            "public",
+            "a RepoConfig category takes the committed override"
+        );
+        assert_eq!(
+            category_ceiling(&config, &source_only),
+            "owned-internal",
+            "a SourceFileOnly category must ignore it and keep its default"
+        );
+    }
+
+    #[test]
+    fn source_file_only_hit_ignores_repo_allowlist() {
+        let allowlist = vec!["tool_input".to_string()];
+        let hit = |scope| Hit {
+            category: "harness-noun",
+            snippet: "tool_input".to_string(),
+            offset: 0,
+            replacement: None,
+            config_scope: scope,
+        };
+        let repo_hit = hit(ConfigScope::RepoConfig);
+        let source_hit = hit(ConfigScope::SourceFileOnly);
+
+        assert!(
+            is_allowlisted(&repo_hit, &allowlist),
+            "a RepoConfig hit is suppressible by the committed allowlist"
+        );
+        assert!(
+            !is_allowlisted(&source_hit, &allowlist),
+            "an identical SourceFileOnly hit must not be — same entry, same \
+             snippet, only the authority differs"
         );
     }
 
