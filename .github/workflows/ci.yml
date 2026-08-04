@@ -36,8 +36,14 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # --no-fail-fast: cargo otherwise stops after the first test binary that
+      # fails and never builds the remaining crates', so a red crate silently
+      # takes every other crate's tests out of the run. Measured on the
+      # red-tests branch (#551): the cadence crate failed with 5, aborted, and
+      # cadence-hooks-core's 718 tests never executed — CI reported the 5 as if
+      # it were the whole picture.
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
       # The checked-in Codex compatibility report is ~1700 generated lines that
       # external consumers read as "what Codex support actually covers", and the
