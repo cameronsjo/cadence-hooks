@@ -28,8 +28,10 @@ jobs:
           # `getInput("client-id") || getInput("app-id")` into one value it
           # hands to createAppAuth as appId, so the numeric App ID in
           # RELEASE_APP_ID stays valid — a rename, not a credential change.
-          # The rename REQUIRES v3: v2 has no client-id input at all
-          # (its app-id is required), so renaming on v2 breaks the job.
+          # The rename REQUIRES v3.1.0+, which is where client-id landed.
+          # Neither v2 nor v3.0.0 declares it, and both mark app-id required,
+          # so on either one client-id is ignored, app-id resolves empty, and
+          # token minting dies. Do not narrow this to @v3.0.0.
           client-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 

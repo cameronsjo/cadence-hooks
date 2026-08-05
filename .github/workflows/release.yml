@@ -201,7 +201,7 @@ jobs:
         with:
           # client-id, not the deprecated app-id — see auto-tag.yml for why the
           # numeric App ID in RELEASE_APP_ID stays valid under the new key, and
-          # why the rename requires v3 rather than v2.
+          # why the rename requires v3.1.0+ (not v2, and not v3.0.0).
           client-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           repositories: homebrew-tap
