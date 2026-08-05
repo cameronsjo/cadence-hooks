@@ -22,9 +22,15 @@ jobs:
     steps:
       - name: Generate Forge Bellows token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
+          # client-id, not the deprecated app-id. The action resolves
+          # `getInput("client-id") || getInput("app-id")` into one value it
+          # hands to createAppAuth as appId, so the numeric App ID in
+          # RELEASE_APP_ID stays valid — a rename, not a credential change.
+          # The rename REQUIRES v3: v2 has no client-id input at all
+          # (its app-id is required), so renaming on v2 breaks the job.
+          client-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
