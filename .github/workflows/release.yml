@@ -197,9 +197,12 @@ jobs:
 
       - name: Generate Forge Bellows token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
+          # client-id, not the deprecated app-id — see auto-tag.yml for why the
+          # numeric App ID in RELEASE_APP_ID stays valid under the new key, and
+          # why the rename requires v3.1.0+ (not v2, and not v3.0.0).
+          client-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           repositories: homebrew-tap
 
