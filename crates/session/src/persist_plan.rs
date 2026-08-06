@@ -279,7 +279,7 @@ pub fn run_persist_plan(
         &machine_digest,
         &repo_root,
         approved_label,
-        panel_line_settled(&body),
+        &body,
     )
 }
 
@@ -379,7 +379,7 @@ pub fn run_persist_plan_approval(
         &machine_digest,
         &repo_root,
         &own_name,
-        panel_line_settled(&body),
+        &body,
     )
 }
 
@@ -1003,6 +1003,12 @@ const PANEL_GATE_NUDGE: &str = "panel gate: this plan carries no settled Panel: 
 /// - `Panel: <seats> ran — <counts…>` (a panel ran; both sides non-empty)
 /// - `Panel: none — <reason>` (the absence assertion; non-empty reason)
 ///
+/// The separator tolerates what a human actually types: em dash (the
+/// template's canonical form), en dash, `--`, or a plain hyphen — a
+/// hand-written `Panel: none - reason` states the settled fact unambiguously,
+/// and hardcoding U+2014 would fire a false nudge on it (code review of this
+/// change).
+///
 /// Anything else — no `Panel:` line at all, a `Panel: pending…` placeholder,
 /// or a `## Panel review` heading with no settled line — is unsettled. The
 /// line-start anchor plus the required `Panel: ` prefix means a `## Panel`
@@ -1013,17 +1019,43 @@ const PANEL_GATE_NUDGE: &str = "panel gate: this plan carries no settled Panel: 
 /// stanza precedes the task body, so the stanza's own line is judged, and a
 /// quoted `Panel: … ran — …` example later in the body can neither satisfy
 /// the gate (the accidental-forgery hole a whole-body `any()` scan would
-/// open) nor contradict the stanza. Detection only; the caller appends the
-/// static [`PANEL_GATE_NUDGE`], never any matched text.
+/// open) nor contradict the stanza. Lines inside fenced code blocks
+/// (``` / ~~~ toggles, indentation-tolerant) and block quotes (`>`) are
+/// skipped before the first-match rule applies — a fenced or quoted example
+/// in a plan with no stanza at all must not mint a settled verdict (security
+/// review of this change; same class as the quoted-example hole above). The
+/// fence tracker is deliberately naive — it toggles without matching fence
+/// lengths — which errs toward skipping ambiguous lines: on a malformed
+/// document the failure mode is a spurious nudge (fail-loud), never a
+/// suppressed one. Detection only; the caller appends the static
+/// [`PANEL_GATE_NUDGE`], never any matched text.
 fn panel_line_settled(body: &str) -> bool {
-    let Some(rest) = body.lines().find_map(|line| line.strip_prefix("Panel: ")) else {
+    let mut in_fence = false;
+    let Some(rest) = body.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            return None;
+        }
+        if in_fence || line.starts_with('>') {
+            return None;
+        }
+        line.strip_prefix("Panel: ")
+    }) else {
         return false;
     };
-    if let Some(reason) = rest.strip_prefix("none — ") {
-        return !reason.trim().is_empty();
+    // Dash tolerance: `--` must be tried before `-` or the second hyphen
+    // leaks into the text it precedes.
+    fn strip_dash(s: &str) -> Option<&str> {
+        let s = s.trim_start();
+        ["—", "–", "--", "-"].iter().find_map(|d| s.strip_prefix(d))
     }
-    if let Some((seats, tail)) = rest.split_once(" ran — ") {
-        return !seats.trim().is_empty() && !tail.trim().is_empty();
+    if let Some(after_none) = rest.strip_prefix("none") {
+        return strip_dash(after_none).is_some_and(|reason| !reason.trim().is_empty());
+    }
+    if let Some((seats, tail)) = rest.split_once(" ran ") {
+        return !seats.trim().is_empty()
+            && strip_dash(tail).is_some_and(|counts| !counts.trim().is_empty());
     }
     false
 }
@@ -1044,7 +1076,7 @@ fn persist_and_nudge(
     machine_digest: &str,
     repo_root: &Path,
     approved_label: &str,
-    panel_settled: bool,
+    plan_body: &str,
 ) -> CheckResult {
     let path = match claim_target(plans_dir, stem, session_id, body_hash, document) {
         Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
@@ -1076,7 +1108,10 @@ fn persist_and_nudge(
          commit it (explicit-path git add) before implementation.",
         path.display()
     );
-    if !panel_settled {
+    // Evaluated only after the claim succeeded: the persistence write must
+    // never depend on the detector — a future panic here eats one nudge's
+    // sentence, never the persist (security review of this change).
+    if !panel_line_settled(plan_body) {
         nudge.push(' ');
         nudge.push_str(PANEL_GATE_NUDGE);
     }
@@ -2350,6 +2385,75 @@ mod tests {
             "# T\n\nPanel: reviewer ran — 2 findings, 2 folded in, 0 declined\n\n\
              Quoted form:\nPanel: pending — never do this\n"
         ));
+        // Dash tolerance: a hand-typed hyphen, double hyphen, or en dash
+        // states the settled fact as unambiguously as the template's em dash.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none - raw-draft bypass\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: 2 reviewers ran - 3 findings, all folded in\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none -- operator bypass\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: reviewer ran – 1 finding\n"
+        ));
+        // …but the dash is still required, and an empty ran-tail is unsettled.
+        assert!(!panel_line_settled("# T\n\nPanel: none reason given\n"));
+        assert!(!panel_line_settled("# T\n\nPanel: x ran — \n"));
+        assert!(!panel_line_settled("# T\n\nPanel: x ran 3 findings\n"));
+        // Fenced and block-quoted examples never mint a settled verdict for a
+        // plan with no stanza at all (security review of this change).
+        assert!(!panel_line_settled(
+            "# Add a Panel: stanza\n\n```markdown\nPanel: reviewer ran — 3 findings\n```\n\n\
+             Approach: …\n"
+        ));
+        assert!(!panel_line_settled(
+            "# T\n\n> Panel: reviewer ran — 3 findings\n\nbody\n"
+        ));
+        // A real stanza after a closed fence still settles.
+        assert!(panel_line_settled(
+            "# T\n\n```\nexample\n```\n\nPanel: reviewer ran — 1 finding, folded\n"
+        ));
+    }
+
+    #[test]
+    fn end_to_end_prompt_path_unpaneled_plan_appends_static_panel_sentence() {
+        // The UserPromptSubmit trigger extracts its body differently
+        // (PLAN_PREFIX strip vs the ExitPlanMode tool response), so the
+        // sentence wiring is asserted on this path too, both directions.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+
+        let prompt = "Implement the following plan:\n\n# Fix the Widget\n\nDo the thing.";
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            prompt,
+            &cwd,
+            &tmp.path().join("child-session-id.jsonl").to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(r.message.unwrap().contains(PANEL_GATE_NUDGE));
+
+        let prompt_settled = "Implement the following plan:\n\n# Fix the Sprocket\n\n\
+                              Panel: reviewer ran — 1 finding, folded\n\nDo the thing.";
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            prompt_settled,
+            &cwd,
+            &tmp.path().join("child-session-id.jsonl").to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(!r.message.unwrap().contains("panel gate:"));
     }
 
     #[test]
