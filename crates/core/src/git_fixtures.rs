@@ -113,8 +113,9 @@ pub(crate) fn resolve_scratch_dir(root: &Path, tag: &str) -> PathBuf {
 /// `root` is tried first, since it keeps fixtures local to the checkout for
 /// the common case. But `root` is computed from `CARGO_MANIFEST_DIR`, which
 /// lives INSIDE the checkout — so when the checkout itself sits under a
-/// carve-out (a `/tmp` worktree, following the documented worktree
-/// convention; cadence-hooks#403), `root` is under that same carve-out and no
+/// carve-out — any worktree under `.claude/worktrees/`, or one rooted in
+/// `/tmp`; `escapes_carveout` below exempts both (cadence-hooks#403) —
+/// `root` is under that same carve-out and no
 /// subdirectory of it can escape. In that case, fall back to a location
 /// outside the checkout entirely: `override_root`
 /// ([`SCRATCH_ROOT_OVERRIDE_ENV`]) if given, else `xdg_cache_home`

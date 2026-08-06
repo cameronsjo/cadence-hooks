@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **CONTRIBUTING.md and a `git_fixtures.rs` doc comment claimed `/tmp` was this project's own recommended worktree location.** It never was — `WORKTREE_CREATE_RECIPE` (`crates/guardrails/src/messages.rs`) has always emitted `.claude/worktrees/<slug>`, and the built-in EnterWorktree tool uses the same path. Retitled the CONTRIBUTING.md section and dropped the false attribution; corrected the stale comment. No code changed.
+- **CONTRIBUTING.md and a `git_fixtures.rs` doc comment claimed `/tmp` was this project's own recommended worktree location.** It never was — `WORKTREE_CREATE_RECIPE` (`crates/guardrails/src/messages.rs`) has always emitted `.claude/worktrees/<slug>`, and the built-in EnterWorktree tool uses the same path. Retitled the CONTRIBUTING.md section and dropped the false attribution; corrected both stale comments in `git_fixtures.rs` and the now-broken section reference in CLAUDE.md. The CONTRIBUTING section also framed fixture relocation as a `/tmp`-layout concern, when `escapes_carveout` exempts `.claude/worktrees/` too — so relocation fires for the ordinary convention path, which is now stated. No code changed.
 
 ## [0.73.0] - 2026-08-05
 

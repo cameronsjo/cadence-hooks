@@ -102,15 +102,18 @@ diagnostics that have no value on trivial sessions.
 
 ### Running the suite from a worktree
 
-`cargo test --workspace` works fine from a worktree, including one under
-`/tmp` (this project's own worktree convention is `.claude/worktrees/<slug>`,
-not `/tmp` — see `WORKTREE_CREATE_RECIPE` in
-`crates/guardrails/src/messages.rs`). Fixture directories that would
-otherwise land under the checkout's own `target/` — itself under `/tmp` in a
-`/tmp`-rooted layout, which `enforce-worktree`'s carve-out exempts —
-automatically relocate to `$XDG_CACHE_HOME` (or `$HOME/.cache`) instead, so
-the guard's block/allow logic is still exercised for real
-(cadence-hooks#403). A one-line `note:` on stderr says when this happens —
+`cargo test --workspace` works fine from a worktree. This project's worktree
+convention is `.claude/worktrees/<slug>` — see `WORKTREE_CREATE_RECIPE` in
+`crates/guardrails/src/messages.rs`.
+
+`enforce-worktree` exempts both `.claude/worktrees/` and `/tmp`, so a checkout
+in either place would make every fixture inherit the carve-out and every
+verdict read ALLOW. Fixture directories that would otherwise land under such a
+checkout's own `target/` therefore relocate automatically to
+`$XDG_CACHE_HOME` (or `$HOME/.cache`), so the guard's block/allow logic is
+still exercised for real (cadence-hooks#403). Since the convention path is
+itself a carve-out, this applies to the ordinary case, not just a `/tmp`
+worktree. A one-line `note:` on stderr says when this happens —
 once per test binary (`cargo test --workspace` runs several, each its own
 process), not once per fixture.
 
