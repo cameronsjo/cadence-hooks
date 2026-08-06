@@ -100,14 +100,16 @@ diagnostics that have no value on trivial sessions.
 - Use helper functions (`make_input`, `make_bash_input`) for test setup
 - Group tests: happy path first, then unhappy path / edge cases
 
-### Running the suite from a `/tmp` worktree
+### Running the suite from a worktree
 
-`git worktree add /tmp/my-feature ...` (the pattern this project's own
-worktree docs recommend) works fine for `cargo test --workspace`: fixture
-directories that would otherwise land under the checkout's own `target/` —
-itself under `/tmp` in that layout, which `enforce-worktree`'s carve-out
-exempts — automatically relocate to `$XDG_CACHE_HOME` (or `$HOME/.cache`)
-instead, so the guard's block/allow logic is still exercised for real
+`cargo test --workspace` works fine from a worktree, including one under
+`/tmp` (this project's own worktree convention is `.claude/worktrees/<slug>`,
+not `/tmp` — see `WORKTREE_CREATE_RECIPE` in
+`crates/guardrails/src/messages.rs`). Fixture directories that would
+otherwise land under the checkout's own `target/` — itself under `/tmp` in a
+`/tmp`-rooted layout, which `enforce-worktree`'s carve-out exempts —
+automatically relocate to `$XDG_CACHE_HOME` (or `$HOME/.cache`) instead, so
+the guard's block/allow logic is still exercised for real
 (cadence-hooks#403). A one-line `note:` on stderr says when this happens —
 once per test binary (`cargo test --workspace` runs several, each its own
 process), not once per fixture.
