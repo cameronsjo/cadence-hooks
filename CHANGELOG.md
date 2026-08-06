@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The plan-persistence nudge now flags an approved plan carrying no settled `Panel:` line (#623).** Both persistence triggers (`persist-plan`, UserPromptSubmit; `persist-plan-approval`, PostToolUse:ExitPlanMode) already hold the normalized plan body; they now scan it for the plan template's settled `Panel:` stanza — `Panel: <seats> ran — <counts>` or the absence assertion `Panel: none — <reason>`, anchored at line start, first match in document order deciding (the `Driver:` stamp's discipline, so a quoted example later in the body can neither satisfy nor contradict the stanza) — and when neither form is present (absent, `pending`-shaped, or a `## Panel review` heading with no settled line) append one static sentence to the existing nudge: run the plan-review panel before implementing, fold findings, or write the absence line. Post-approval, pre-implementation detection by design — a rejection emits no hook event, so the template layer (cameronsjo/cadence#849) covers approval-time visibility. Artifact-anchored (the marker survives the approve-and-clear session boundary that killed session-scoped markers, cameronsjo/cadence#578), nudge-only (no trust root needed, unlike the gate cameronsjo/cadence#392 rejected), and the sentence is a static string — committed plan content is untrusted input and is never echoed. No new registration, no hooks.json change.
+
 ## [0.72.1] - 2026-08-04
 
 ### Fixed

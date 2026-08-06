@@ -861,7 +861,15 @@
       "status": "native",
       "applicable": false,
       "evidence": "registered in the binary but not yet invoked: the cadence-guardrails SessionStart wiring ships in a companion monorepo PR. Flip to applicable when that wiring merges.",
-      "wiring": []
+      "wiring": [
+        {
+          "plugin": "cadence-guardrails",
+          "event": "SessionStart",
+          "matcher": "*",
+          "if": null,
+          "commandHash": "015e644cb4ac3720d4f018aef441a66094578157a6bfe827b898e80dc03e763f"
+        }
+      ]
     },
     {
       "criticality": "security-critical",
@@ -1696,7 +1704,7 @@
     },
     {
       "criticality": "workflow",
-      "description": "Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)",
+      "description": "Persist an approved plan whose post-approval turn was wiped, nudging when it carries no settled Panel: line (UserPromptSubmit)",
       "event": "UserPromptSubmit",
       "name": "persist-plan",
       "plugin": "session",
@@ -1716,7 +1724,7 @@
     },
     {
       "criticality": "workflow",
-      "description": "Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)",
+      "description": "Persist an approved plan on same-session approval, nudging when it carries no settled Panel: line (PostToolUse:ExitPlanMode)",
       "event": "PostToolUse",
       "name": "persist-plan-approval",
       "plugin": "session",
