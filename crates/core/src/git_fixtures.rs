@@ -113,8 +113,9 @@ pub(crate) fn resolve_scratch_dir(root: &Path, tag: &str) -> PathBuf {
 /// `root` is tried first, since it keeps fixtures local to the checkout for
 /// the common case. But `root` is computed from `CARGO_MANIFEST_DIR`, which
 /// lives INSIDE the checkout — so when the checkout itself sits under a
-/// carve-out (a `/tmp` worktree, following the documented worktree
-/// convention; cadence-hooks#403), `root` is under that same carve-out and no
+/// carve-out — any worktree under `.claude/worktrees/`, or one rooted in
+/// `/tmp`; `escapes_carveout` below exempts both (cadence-hooks#403) —
+/// `root` is under that same carve-out and no
 /// subdirectory of it can escape. In that case, fall back to a location
 /// outside the checkout entirely: `override_root`
 /// ([`SCRATCH_ROOT_OVERRIDE_ENV`]) if given, else `xdg_cache_home`
@@ -465,9 +466,8 @@ mod tests {
 
     // --- carve-out relocation (cadence-hooks#403) ---
     //
-    // `root` is only a default — when it lands inside a carve-out (the
-    // checkout itself sits under `/tmp`, e.g. a worktree created following
-    // the documented `git worktree add /tmp/...` convention), the resolver
+    // `root` is only a default — when it lands inside a carve-out (e.g. the
+    // checkout itself sits under a `/tmp`-rooted worktree), the resolver
     // must relocate to escape it rather than panic, so the guard's actual
     // block/allow logic still runs for real instead of the whole suite
     // reporting confusing failures.
