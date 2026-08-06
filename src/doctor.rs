@@ -268,6 +268,13 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
 /// [`warning_set_token`]) and the actual `println!`, so this shape is
 /// unit-testable without touching the marker filesystem.
 ///
+/// **Invariant: no untrusted text.** Everything interpolated here is
+/// binary-controlled (the compile-time version, a count, the static upgrade
+/// hints). The envelope is trust-elevated instruction text addressed to the
+/// hosting session, so interpolating a plugin-controlled `diagnosis` into it
+/// would hand plugin metadata a prompt-injection channel — keep specifics in
+/// the full `doctor` output, never in the envelope.
+///
 /// **Known degraded mode:** the gate is content-keyed, not date-keyed, and it
 /// is skipped entirely (every call fires) whenever
 /// `cadence_hooks_core::markers::marker_dir_is_private` is false — a
@@ -314,12 +321,19 @@ fn quiet_warning_envelope(
 /// same-process marker-name hashing, which never needs cross-process
 /// stability).
 fn warning_set_token(version: &str, diagnoses: &[&str]) -> String {
+    // Bag, not set: duplicates are kept deliberately — a warning set gaining or
+    // losing a duplicate diagnosis is a genuine change and should re-fire.
     let mut sorted: Vec<&str> = diagnoses.to_vec();
     sorted.sort_unstable();
     let mut hasher = Sha256::new();
+    // Length-prefix every field instead of joining on a separator: diagnoses
+    // interpolate plugin-controlled text, so any in-band delimiter could be
+    // embedded to mint a colliding token and mute the day's nag for a
+    // different warning set.
+    hasher.update((version.len() as u64).to_le_bytes());
     hasher.update(version.as_bytes());
     for d in &sorted {
-        hasher.update(b"\n");
+        hasher.update((d.len() as u64).to_le_bytes());
         hasher.update(d.as_bytes());
     }
     hasher
