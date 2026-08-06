@@ -59,4 +59,5 @@ cadence-hooks-rules.workspace = true
 cadence-hooks-obsidian.workspace = true
 cadence-hooks-metrics.workspace = true
 cadence-hooks-session.workspace = true
+sha2.workspace = true
 tempfile = "3"
