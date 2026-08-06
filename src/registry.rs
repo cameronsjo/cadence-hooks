@@ -419,13 +419,13 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "persist-plan",
-        description: "Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)",
+        description: "Persist an approved plan whose post-approval turn was wiped, nudging when it carries no settled Panel: line (UserPromptSubmit)",
         plugin: "session",
         event: Some(HookEvent::UserPromptSubmit),
     },
     HookEntry {
         name: "persist-plan-approval",
-        description: "Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)",
+        description: "Persist an approved plan on same-session approval, nudging when it carries no settled Panel: line (PostToolUse:ExitPlanMode)",
         plugin: "session",
         event: Some(HookEvent::PostToolUse),
     },

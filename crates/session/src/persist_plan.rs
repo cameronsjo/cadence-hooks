@@ -279,6 +279,7 @@ pub fn run_persist_plan(
         &machine_digest,
         &repo_root,
         approved_label,
+        panel_line_settled(&body),
     )
 }
 
@@ -378,6 +379,7 @@ pub fn run_persist_plan_approval(
         &machine_digest,
         &repo_root,
         &own_name,
+        panel_line_settled(&body),
     )
 }
 
@@ -983,6 +985,49 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
     format!("{}\n\n{body}\n", render_frontmatter(f))
 }
 
+/// The one static sentence appended to the persistence nudge when the
+/// approved plan carries no settled `Panel:` line (cameronsjo/cadence-hooks#623).
+/// Static by design: committed plan content is untrusted input, so the nudge
+/// never echoes any of it — detection is artifact-anchored (the line lives in
+/// the plan document, surviving the approve-and-clear session boundary that
+/// killed session-scoped markers, cameronsjo/cadence#578) and warn-tier only
+/// (a nudge needs no trust root, unlike the gate cameronsjo/cadence#392
+/// rejected).
+const PANEL_GATE_NUDGE: &str = "panel gate: this plan carries no settled Panel: line — run the \
+     plan-review panel before implementing, fold findings, or write \"Panel: none — <reason>\" \
+     (cadence:attune → plan-review-panel).";
+
+/// True when the plan body carries a settled `Panel:` line — anchored at line
+/// start, in exactly one of the plan template's two settled forms:
+///
+/// - `Panel: <seats> ran — <counts…>` (a panel ran; both sides non-empty)
+/// - `Panel: none — <reason>` (the absence assertion; non-empty reason)
+///
+/// Anything else — no `Panel:` line at all, a `Panel: pending…` placeholder,
+/// or a `## Panel review` heading with no settled line — is unsettled. The
+/// line-start anchor plus the required `Panel: ` prefix means a `## Panel`
+/// heading can never false-match.
+///
+/// **First match in document order decides** — the `Driver:` stamp's
+/// discipline (plan-pipeline-conventions §4/§5): the plan template's `## Panel`
+/// stanza precedes the task body, so the stanza's own line is judged, and a
+/// quoted `Panel: … ran — …` example later in the body can neither satisfy
+/// the gate (the accidental-forgery hole a whole-body `any()` scan would
+/// open) nor contradict the stanza. Detection only; the caller appends the
+/// static [`PANEL_GATE_NUDGE`], never any matched text.
+fn panel_line_settled(body: &str) -> bool {
+    let Some(rest) = body.lines().find_map(|line| line.strip_prefix("Panel: ")) else {
+        return false;
+    };
+    if let Some(reason) = rest.strip_prefix("none — ") {
+        return !reason.trim().is_empty();
+    }
+    if let Some((seats, tail)) = rest.split_once(" ran — ") {
+        return !seats.trim().is_empty() && !tail.trim().is_empty();
+    }
+    false
+}
+
 /// The shared tail both triggers converge on once each has resolved its own
 /// body/session/approval fields: claim a target, append the linkage row,
 /// render the nudge. Never overwrites anything (see [`claim_target`]).
@@ -999,6 +1044,7 @@ fn persist_and_nudge(
     machine_digest: &str,
     repo_root: &Path,
     approved_label: &str,
+    panel_settled: bool,
 ) -> CheckResult {
     let path = match claim_target(plans_dir, stem, session_id, body_hash, document) {
         Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
@@ -1025,11 +1071,16 @@ fn persist_and_nudge(
         body_hash,
     ));
 
-    CheckResult::nudge(format!(
+    let mut nudge = format!(
         "Approved plan persisted to {} (approved in {approved_label}). Verify placement, then \
          commit it (explicit-path git add) before implementation.",
         path.display()
-    ))
+    );
+    if !panel_settled {
+        nudge.push(' ');
+        nudge.push_str(PANEL_GATE_NUDGE);
+    }
+    CheckResult::nudge(nudge)
 }
 
 // ---------------------------------------------------------------------------
@@ -2262,6 +2313,117 @@ mod tests {
         assert!(!links.contains("test-host"));
         assert!(!links.contains("\"host\""));
         assert!(!links.contains("\"repo\""));
+    }
+
+    #[test]
+    fn panel_line_settled_accepts_both_settled_forms_only() {
+        // Settled: the ran form and the absence assertion.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: plan-reviewer ×2 ran — 3 findings, 2 folded in, 1 declined\n\nbody"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none — raw-draft bypass per operator ask\n"
+        ));
+        // Unsettled: absent, pending-shaped, empty reason/counts, heading-only.
+        assert!(!panel_line_settled("# T\n\nno panel line at all\n"));
+        assert!(!panel_line_settled(
+            "# T\n\nPanel: pending — seats not yet run\n"
+        ));
+        assert!(!panel_line_settled("# T\n\nPanel: none — \n"));
+        assert!(!panel_line_settled("# T\n\nPanel:  ran — 3 findings\n"));
+        assert!(!panel_line_settled(
+            "# T\n\n## Panel review — findings declined\n\n- none declined\n"
+        ));
+        // Anchored at line start: an indented or mid-line mention never matches.
+        assert!(!panel_line_settled("# T\n\n  Panel: x ran — y\n"));
+        assert!(!panel_line_settled(
+            "# T\n\nsee Panel: x ran — y for details\n"
+        ));
+        // First match in document order decides (the Driver: stamp's
+        // discipline): a settled-looking quoted example AFTER an unsettled
+        // stanza line never satisfies the gate…
+        assert!(!panel_line_settled(
+            "# T\n\nPanel: pending — seats queued\n\nExample: write\nPanel: x ran — 1 finding\n"
+        ));
+        // …and a later unsettled mention never contradicts a settled stanza.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: reviewer ran — 2 findings, 2 folded in, 0 declined\n\n\
+             Quoted form:\nPanel: pending — never do this\n"
+        ));
+    }
+
+    #[test]
+    fn end_to_end_approval_unpaneled_plan_appends_static_panel_sentence() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+
+        // `pending`-shaped line: present but unsettled — the nudge must fire,
+        // and must never echo the plan's own text (untrusted input).
+        let plan = "# Fix the Widget\n\nPanel: pending — awaiting seat dispatch\n\nDo the thing.";
+        let input = exit_plan_mode_post_tool_use(
+            "sid",
+            plan,
+            &cwd,
+            &tmp.path().join("t.jsonl").to_string_lossy(),
+            Some(false),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains(PANEL_GATE_NUDGE),
+            "unsettled Panel: line must append the static panel sentence: {msg}"
+        );
+        assert!(
+            !msg.contains("awaiting seat dispatch"),
+            "the nudge must never echo plan text: {msg}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_approval_settled_panel_line_gets_no_panel_sentence() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+
+        let plan = "# Fix the Widget\n\n\
+                    Panel: plan-reviewer ×2 ran — 3 findings, 2 folded in, 1 declined\n\n\
+                    Do the thing.";
+        let input = exit_plan_mode_post_tool_use(
+            "sid",
+            plan,
+            &cwd,
+            &tmp.path().join("t.jsonl").to_string_lossy(),
+            Some(false),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(
+            !msg.contains("panel gate:"),
+            "a settled Panel: line must not trigger the panel sentence: {msg}"
+        );
+        // The absence assertion is equally settled.
+        let plan_none = "# Fix the Sprocket\n\nPanel: none — raw-draft bypass per ask\n\nBody.";
+        let input = exit_plan_mode_post_tool_use(
+            "sid2",
+            plan_none,
+            &cwd,
+            &tmp.path().join("t2.jsonl").to_string_lossy(),
+            Some(false),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(!r.message.unwrap().contains("panel gate:"));
     }
 
     #[test]
