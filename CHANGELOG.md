@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`doctor --quiet`'s session-start warning line is now once-daily and enveloped** (#632): first sighting of a day's warning set prints a `<cadence-system-message>` block directing triage before session work ends; later sessions that day with the same warning set print nothing. Gated on the content-token daily marker (`claim_today`, keyed on a SHA-256 digest of version + sorted diagnoses), so a *changed* warning set still re-fires the same day. Honors `CADENCE_MARKER_DIR`/`CADENCE_NO_DAILY_GATE`; on a non-private marker dir the gate is skipped by design and the nag repeats.
+- **The orphaned-cache advisory no longer says "safe to prune"** (#633): the liveness gate is repo-scoped and cannot see sessions in other checkouts sharing the global cache, so the advisory now reads "prune only when no other sessions are live across checkouts; use cadence:tend". Cross-checkout liveness is tracked separately (#634).
+
 ### Fixed
 
 - **CONTRIBUTING.md and a `git_fixtures.rs` doc comment claimed `/tmp` was this project's own recommended worktree location.** It never was — `WORKTREE_CREATE_RECIPE` (`crates/guardrails/src/messages.rs`) has always emitted `.claude/worktrees/<slug>`, and the built-in EnterWorktree tool uses the same path. Retitled the CONTRIBUTING.md section and dropped the false attribution; corrected both stale comments in `git_fixtures.rs` and the now-broken section reference in CLAUDE.md. The CONTRIBUTING section also framed fixture relocation as a `/tmp`-layout concern, when `escapes_carveout` exempts `.claude/worktrees/` too — so relocation fires for the ordinary convention path, which is now stated. No code changed.

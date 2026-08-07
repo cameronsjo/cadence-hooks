@@ -16,6 +16,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use sha2::{Digest, Sha256};
+
 use crate::registry;
 // The session crate's `registry` (peer-session liveness) — aliased because the
 // bare name is already taken by the binary's hook-catalog `registry` above.
@@ -252,24 +254,93 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
     }
 }
 
-/// Build the one-line quiet SessionStart warning summary. Names an actor
-/// (Claude) and an action (run doctor, triage, surface to the user) instead of
-/// the old passive "run for details". The version-skew upgrade hint is appended
-/// only when a skew warning is present — stale-telemetry-only warnings carry no
-/// upgrade to suggest.
-fn quiet_warning_summary(
+/// Build the once-daily enveloped SessionStart warning nag. Wrapped in a
+/// `<cadence-system-message>` envelope and phrased as a `MUST` directive
+/// addressed to the hosting session (never the human directly) — the
+/// envelope tags are what let a downstream reader (or the session itself)
+/// recognize this as machine-directed instruction text rather than a plain
+/// status line. The version-skew upgrade hint is appended to the count line
+/// only when a skew warning is present — stale-telemetry-only warnings carry
+/// no upgrade to suggest.
+///
+/// Pure and print-free by design: the call site owns the once-daily gate
+/// (`cadence_hooks_core::markers::claim_today`, keyed on
+/// [`warning_set_token`]) and the actual `println!`, so this shape is
+/// unit-testable without touching the marker filesystem.
+///
+/// **Invariant: no untrusted text.** Everything interpolated here is
+/// binary-controlled (the compile-time version, a count, the static upgrade
+/// hints). The envelope is trust-elevated instruction text addressed to the
+/// hosting session, so interpolating a plugin-controlled `diagnosis` into it
+/// would hand plugin metadata a prompt-injection channel — keep specifics in
+/// the full `doctor` output, never in the envelope.
+///
+/// **Known degraded mode:** the gate is content-keyed, not date-keyed, and it
+/// is skipped entirely (every call fires) whenever
+/// `cadence_hooks_core::markers::marker_dir_is_private` is false — a
+/// non-private marker dir (e.g. a world-writable fallback base) means the nag
+/// simply repeats every session rather than risk a co-tenant muting it. A
+/// `$TMPDIR` reboot that clears the marker dir re-arms the gate the same way:
+/// the next session after a reboot sees "first sighting" again even for an
+/// unchanged warning set.
+fn quiet_warning_envelope(
     version: &str,
     n_warn: usize,
     has_skew: bool,
     channel: InstallChannel,
 ) -> String {
-    let mut summary = format!(
-        "cadence-hooks {version}: {n_warn} plugin warning(s). Claude: run 'cadence-hooks doctor', triage, and surface anything actionable to the user in one line."
-    );
+    let mut count_line = format!("cadence-hooks {version}: {n_warn} plugin warning(s).");
     if has_skew {
-        summary.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
+        count_line.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
     }
-    summary
+    format!(
+        "<cadence-system-message>\n\
+         This appears only on the first session of the day. You MUST run 'cadence-hooks doctor',\n\
+         triage, and surface anything actionable to the user in one line before session work ends.\n\
+         {count_line}\n\
+         </cadence-system-message>"
+    )
+}
+
+/// Deterministic content token for a warning set: a SHA-256 digest over the
+/// running binary's version plus every warning's `diagnosis`, sorted before
+/// hashing so the token is order-insensitive — the scan order of `findings`
+/// is not part of the identity of "today's warning set". Feeds
+/// `cadence_hooks_core::markers::claim_today`'s once-daily gate: the same
+/// warning set (same version, same diagnoses) always claims the same slot,
+/// while a genuinely different set — a new diagnosis, a dropped one, or a
+/// version bump — mints a new token so the gate re-fires the same day instead
+/// of waiting until tomorrow (mirrors `warn-stale`'s `verdict_token`
+/// precedent, per `claim_today`'s own doc comment).
+///
+/// **MUST** stay stable across the many separate `cadence-hooks` processes one
+/// SessionStart's worth of hooks spans — `std::collections::hash_map::
+/// DefaultHasher`/`RandomState` are process-randomized per `HashMap`
+/// construction and are unusable here for exactly that reason (this is a
+/// distinct concern from `crate::gitstate`'s or `markers::hash_of`'s
+/// same-process marker-name hashing, which never needs cross-process
+/// stability).
+fn warning_set_token(version: &str, diagnoses: &[&str]) -> String {
+    // Bag, not set: duplicates are kept deliberately — a warning set gaining or
+    // losing a duplicate diagnosis is a genuine change and should re-fire.
+    let mut sorted: Vec<&str> = diagnoses.to_vec();
+    sorted.sort_unstable();
+    let mut hasher = Sha256::new();
+    // Length-prefix every field instead of joining on a separator: diagnoses
+    // interpolate plugin-controlled text, so any in-band delimiter could be
+    // embedded to mint a colliding token and mute the day's nag for a
+    // different warning set.
+    hasher.update((version.len() as u64).to_le_bytes());
+    hasher.update(version.as_bytes());
+    for d in &sorted {
+        hasher.update((d.len() as u64).to_le_bytes());
+        hasher.update(d.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Judge an invocation against the registry.
@@ -1857,7 +1928,9 @@ fn orphan_findings(
             diagnosis: format!(
                 "{orphan_count} orphaned version dir(s) (~{mib:.1} MiB) left in cache"
             ),
-            remediation: "safe to prune — not the active pinned version".to_string(),
+            remediation:
+                "prune only when no other sessions are live across checkouts; use cadence:tend"
+                    .to_string(),
         });
     }
 
@@ -2521,7 +2594,8 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             );
             return 2;
         }
-        // Warnings only in quiet mode: one summary line to stdout, exit 0.
+        // Warnings only in quiet mode: an enveloped nag to stdout, gated to at
+        // most once per calendar day per distinct warning set (#632).
         // Warnings are now version skew (missing subcommands) and/or stale
         // telemetry, so the summary stays generic and defers the specifics to a
         // full `cadence-hooks doctor` run.
@@ -2529,10 +2603,14 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         let has_skew = warnings
             .iter()
             .any(|w| w.diagnosis.contains("not present in this binary"));
-        println!(
-            "{}",
-            quiet_warning_summary(version, warnings.len(), has_skew, channel)
-        );
+        let diagnoses: Vec<&str> = warnings.iter().map(|w| w.diagnosis.as_str()).collect();
+        let token = warning_set_token(version, &diagnoses);
+        if cadence_hooks_core::markers::claim_today("doctor-warnings", &token) {
+            println!(
+                "{}",
+                quiet_warning_envelope(version, warnings.len(), has_skew, channel)
+            );
+        }
         return 0;
     }
 
@@ -3953,8 +4031,8 @@ mod tests {
     #[test]
     fn orphan_findings_excludes_active_pins_sharing_parent() {
         // Two active pins (sha-A/sha-B) sharing a parent must NEVER be
-        // reported as "safe to prune" — only the genuine orphan (sha-C)
-        // should generate a finding, and exactly one (not one per label).
+        // flagged for pruning — only the genuine orphan (sha-C) should
+        // generate a finding, and exactly one (not one per label).
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("cache/mp/p");
         for sha in ["sha-A", "sha-B", "sha-C"] {
@@ -4605,33 +4683,91 @@ mod tests {
         assert!(!h.contains("brew"), "{h}");
     }
 
-    // ── quiet_warning_summary (#306) ────────────────────────────────────────
+    // ── quiet_warning_envelope (#306, #632) ─────────────────────────────────
 
     #[test]
-    fn quiet_summary_names_actor_and_action() {
-        let s = quiet_warning_summary("0.60.0", 2, false, InstallChannel::Unknown);
-        assert!(s.contains("Claude:"), "must name the actor: {s}");
+    fn quiet_envelope_carries_tags_must_sentence_and_count_line() {
+        let s = quiet_warning_envelope("0.60.0", 2, false, InstallChannel::Unknown);
         assert!(
-            s.contains("run 'cadence-hooks doctor'"),
-            "must name the action: {s}"
+            s.starts_with("<cadence-system-message>\n"),
+            "must open with the envelope tag: {s}"
+        );
+        assert!(
+            s.trim_end().ends_with("</cadence-system-message>"),
+            "must close with the envelope tag: {s}"
+        );
+        assert!(
+            s.contains("You MUST run 'cadence-hooks doctor'"),
+            "must carry the MUST directive: {s}"
+        );
+        assert!(
+            s.contains("cadence-hooks 0.60.0: 2 plugin warning(s)."),
+            "must carry the version/count line: {s}"
         );
     }
 
     #[test]
-    fn quiet_summary_no_skew_omits_upgrade_hint() {
-        let s = quiet_warning_summary("0.60.0", 1, false, InstallChannel::Homebrew);
+    fn quiet_envelope_no_skew_omits_upgrade_hint() {
+        let s = quiet_warning_envelope("0.60.0", 1, false, InstallChannel::Homebrew);
         assert!(!s.contains("brew upgrade"), "no upgrade hint expected: {s}");
         assert!(!s.contains("Version skew"), "no skew clause expected: {s}");
     }
 
     #[test]
-    fn quiet_summary_skew_includes_upgrade_hint() {
-        let s = quiet_warning_summary("0.60.0", 1, true, InstallChannel::Homebrew);
+    fn quiet_envelope_skew_includes_upgrade_hint() {
+        let s = quiet_warning_envelope("0.60.0", 1, true, InstallChannel::Homebrew);
         assert!(s.contains("Version skew"), "skew clause expected: {s}");
         assert!(
             s.contains("brew upgrade cadence-hooks"),
             "Homebrew skew hint expected: {s}"
         );
+    }
+
+    // ── warning_set_token (#632) ─────────────────────────────────────────────
+
+    #[test]
+    fn warning_set_token_is_order_insensitive() {
+        let a = warning_set_token("0.60.0", &["diag-a", "diag-b"]);
+        let b = warning_set_token("0.60.0", &["diag-b", "diag-a"]);
+        assert_eq!(
+            a, b,
+            "sort order of the input slice must not change the token"
+        );
+    }
+
+    #[test]
+    fn warning_set_token_changes_when_a_diagnosis_changes() {
+        let a = warning_set_token("0.60.0", &["diag-a", "diag-b"]);
+        let b = warning_set_token("0.60.0", &["diag-a", "diag-c"]);
+        assert_ne!(a, b, "a changed diagnosis must mint a different token");
+    }
+
+    #[test]
+    fn warning_set_token_changes_when_version_changes() {
+        let a = warning_set_token("0.60.0", &["diag-a"]);
+        let b = warning_set_token("0.61.0", &["diag-a"]);
+        assert_ne!(a, b, "a version bump must mint a different token");
+    }
+
+    // ── doctor-warnings daily gate (#632) ────────────────────────────────────
+
+    #[test]
+    fn doctor_warnings_gate_suppresses_second_call_with_same_token() {
+        // Mirrors the marker-family's own `with_marker_dir` pattern
+        // (crates/core/src/markers.rs) so the stamp lands in a fresh private
+        // tempdir rather than the real per-user marker directory.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(marker_tmp.path(), || {
+            let token = warning_set_token("0.60.0", &["diag-a"]);
+            assert!(
+                cadence_hooks_core::markers::claim_today("doctor-warnings", &token),
+                "first sighting today must fire"
+            );
+            assert!(
+                !cadence_hooks_core::markers::claim_today("doctor-warnings", &token),
+                "the same token must be silent for the rest of the day"
+            );
+        });
     }
 
     // ── integration tests via run(Some(tmpdir), ...) ─────────────────────────
