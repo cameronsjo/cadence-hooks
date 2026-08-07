@@ -21,10 +21,11 @@
 //! line and exits 0 (ADR-0001).
 
 use cadence_hooks_core::gitstate::GitState;
-use cadence_hooks_core::markers::{polish_marker, write_marker};
+use cadence_hooks_core::markers::{polish_marker, read_polish_record, write_marker};
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::time::utc_timestamp;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The canonical marker key for a directory: the canonicalized
@@ -134,6 +135,19 @@ fn parse_arms(raw: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Merge a trusted prior roster with the incoming delta. Existing names survive;
+/// incoming entries override in argument order, preserving last-value-wins.
+fn merge_arms(
+    existing: Option<&BTreeMap<String, String>>,
+    incoming: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut merged = existing.cloned().unwrap_or_default();
+    for (name, state) in incoming {
+        merged.insert(name, state);
+    }
+    merged.into_iter().collect()
+}
+
 /// Build the marker payload. Presence is what CP1 gates on; the fields are
 /// stored now so CP2's freshness/scope escalation needs no format change.
 /// The `arms` roster (cadence-hooks#467) is **additive and optional**: absent
@@ -203,7 +217,12 @@ pub fn run_record(
     };
 
     let scope = scope.unwrap_or_else(|| "full".to_string());
-    let arms = parse_arms(&arm);
+    let incoming_arms = parse_arms(&arm);
+    let prior = read_polish_record(&repo_root, &branch);
+    let arms = merge_arms(
+        prior.as_ref().and_then(|record| record.arms.as_ref()),
+        incoming_arms,
+    );
     let content = marker_content(&branch, &head_sha, &scope, &arms);
     let path = polish_marker(&repo_root, &branch);
     match write_marker(&path, &content) {
@@ -239,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn marker_content_records_arm_roster_additively() {
+    fn marker_content_serializes_supplied_arm_roster() {
         // #467 RED: the roster rides an additive "arms" object.
         let arms = vec![
             ("security".to_string(), "ran".to_string()),
@@ -334,6 +353,132 @@ mod tests {
             assert_eq!(v["branch"], branch);
             assert_eq!(v["scope"], "code");
             // #467: the roster round-trips through the written marker.
+            assert_eq!(v["arms"]["security"], "ran");
+        });
+    }
+
+    #[test]
+    fn run_record_merges_new_arms_into_existing_roster() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-merge-test-repo";
+            let branch = "feat/record-polish-merge";
+            let path = polish_marker(repo, branch);
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec![
+                    "tests=ran".into(),
+                    "security=skipped".into(),
+                    "simplify=ran".into(),
+                ],
+            );
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into()],
+            );
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["arms"]["tests"], "ran");
+            assert_eq!(v["arms"]["simplify"], "ran");
+            assert_eq!(v["arms"]["security"], "ran");
+        });
+    }
+
+    #[test]
+    fn run_record_with_no_new_arms_preserves_existing_roster_and_refreshes_scope() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-no-arm-test-repo";
+            let branch = "feat/record-polish-no-arm";
+            let path = polish_marker(repo, branch);
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["tests=ran".into()],
+            );
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("docs".into()),
+                vec![],
+            );
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["arms"]["tests"], "ran");
+            assert_eq!(v["scope"], "docs");
+        });
+    }
+
+    #[test]
+    fn run_record_without_arms_omits_roster_for_new_marker() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-rosterless-test-repo";
+            let branch = "feat/record-polish-rosterless";
+            let path = polish_marker(repo, branch);
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec![],
+            );
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(v.get("arms").is_none());
+        });
+    }
+
+    #[test]
+    fn run_record_replaces_malformed_prior_marker_with_current_record() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-malformed-test-repo";
+            let branch = "feat/record-polish-malformed";
+            let path = polish_marker(repo, branch);
+            write_marker(&path, "]]not json").unwrap();
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("code".into()),
+                vec!["security=ran".into()],
+            );
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["scope"], "code");
+            assert_eq!(v["arms"]["security"], "ran");
+        });
+    }
+
+    #[test]
+    fn run_record_duplicate_incoming_names_keep_last_value() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-duplicate-test-repo";
+            let branch = "feat/record-polish-duplicate";
+            let path = polish_marker(repo, branch);
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=skipped".into(), "security=ran".into()],
+            );
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
             assert_eq!(v["arms"]["security"], "ran");
         });
     }
