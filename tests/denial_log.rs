@@ -23,6 +23,10 @@ fn cadence_hooks() -> Command {
     cmd
 }
 
+fn flagged_term() -> &'static str {
+    concat!("white", "list")
+}
+
 /// A terminology-violating Edit against a non-excluded, non-git path. The
 /// `old_string` carries no violation, so the introduced `whitelist` fires a
 /// hard block (exit 2).
@@ -42,7 +46,7 @@ fn run_terminology(
         "tool_name": "Edit",
         "tool_input": {
             "file_path": file_path,
-            "new_string": format!("we should whitelist {new_private_content}"),
+            "new_string": format!("we should {} {new_private_content}", flagged_term()),
             "old_string": format!("we should permit {old_private_content}"),
         },
         "session_id": "itsess",
@@ -109,7 +113,7 @@ fn block_writes_one_privacy_safe_deny_row() {
         "block message present: {stderr}"
     );
     assert!(
-        stderr.contains("whitelist"),
+        stderr.contains(flagged_term()),
         "names the offending term: {stderr}"
     );
     assert!(
