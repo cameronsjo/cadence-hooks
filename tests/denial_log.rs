@@ -26,9 +26,30 @@ fn cadence_hooks() -> Command {
 /// A terminology-violating Edit against a non-excluded, non-git path. The
 /// `old_string` carries no violation, so the introduced `whitelist` fires a
 /// hard block (exit 2).
-const BLOCK_PAYLOAD: &str = r#"{"tool_name":"Edit","tool_input":{"file_path":"/tmp/o1-denial-it/notes.md","new_string":"we should whitelist this host","old_string":"we should permit this host"},"session_id":"itsess","cwd":"/tmp/o1-denial-it"}"#;
+fn run_terminology(
+    metrics_dir: &std::path::Path,
+    payload_cwd: &std::path::Path,
+    old_private_content: &str,
+    new_private_content: &str,
+) -> Output {
+    let file_path = payload_cwd.join("notes.md");
+    std::fs::write(
+        &file_path,
+        format!("we should permit {old_private_content}"),
+    )
+    .expect("failed to create controlled Edit target");
+    let payload = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": file_path,
+            "new_string": format!("we should whitelist {new_private_content}"),
+            "old_string": format!("we should permit {old_private_content}"),
+        },
+        "session_id": "itsess",
+        "cwd": payload_cwd,
+    })
+    .to_string();
 
-fn run_terminology(metrics_dir: &std::path::Path) -> Output {
     let mut cmd = cadence_hooks();
     cmd.args(["cadence", "terminology"]);
     cmd.env("CADENCE_METRICS_DIR", metrics_dir);
@@ -38,7 +59,7 @@ fn run_terminology(metrics_dir: &std::path::Path) -> Output {
 
     let mut child = cmd.spawn().expect("failed to spawn binary");
     if let Some(ref mut stdin) = child.stdin {
-        match stdin.write_all(BLOCK_PAYLOAD.as_bytes()) {
+        match stdin.write_all(payload.as_bytes()) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             Err(e) => panic!("failed to write child stdin: {e}"),
@@ -59,10 +80,26 @@ fn denial_rows(metrics_dir: &std::path::Path) -> Vec<serde_json::Value> {
     }
 }
 
+fn private_content_sentinels(nonce_dir: &std::path::Path) -> (String, String) {
+    // A fresh tempdir basename makes the exact sentinels runtime-specific, so
+    // they cannot accidentally match a fixed checkout or repository name.
+    let nonce = nonce_dir.file_name().unwrap().to_string_lossy();
+    (
+        format!("DENIAL_LOG_OLD_PRIVATE_{nonce}"),
+        format!("DENIAL_LOG_NEW_PRIVATE_{nonce}"),
+    )
+}
+
 #[test]
 fn block_writes_one_privacy_safe_deny_row() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = run_terminology(tmp.path());
+    let (old_private_content, new_private_content) = private_content_sentinels(tmp.path());
+    let out = run_terminology(
+        tmp.path(),
+        tmp.path(),
+        &old_private_content,
+        &new_private_content,
+    );
 
     // The block itself is unchanged: exit 2, block message + feedback footer.
     assert_eq!(out.status.code(), Some(2), "terminology block must exit 2");
@@ -106,12 +143,16 @@ fn block_writes_one_privacy_safe_deny_row() {
     }
     let serialized = row.to_string();
     assert!(
-        !serialized.contains("/tmp/o1-denial-it"),
+        !serialized.contains(tmp.path().to_string_lossy().as_ref()),
         "leaked path: {serialized}"
     );
     assert!(
-        !serialized.contains("host"),
-        "leaked edited content: {serialized}"
+        !serialized.contains(&old_private_content),
+        "leaked old edited content: {serialized}"
+    );
+    assert!(
+        !serialized.contains(&new_private_content),
+        "leaked new edited content: {serialized}"
     );
 }
 
@@ -169,7 +210,13 @@ fn logging_does_not_perturb_the_block_when_write_fails() {
     // the denial write succeeds (writable dir) or fail-opens (unwritable dir).
     // This is the load-bearing "logger must not touch enforcement output" check.
     let ok = tempfile::tempdir().unwrap();
-    let writable = run_terminology(ok.path());
+    let (old_private_content, new_private_content) = private_content_sentinels(ok.path());
+    let writable = run_terminology(
+        ok.path(),
+        ok.path(),
+        &old_private_content,
+        &new_private_content,
+    );
 
     // An unwritable metrics dir: a path whose parent is a regular file, so
     // create_dir_all fails and the writer degrades to a no-op.
@@ -177,7 +224,12 @@ fn logging_does_not_perturb_the_block_when_write_fails() {
     let blocker_file = blocker_dir.path().join("not-a-dir");
     std::fs::write(&blocker_file, b"x").unwrap();
     let unwritable_metrics = blocker_file.join("metrics");
-    let failopen = run_terminology(&unwritable_metrics);
+    let failopen = run_terminology(
+        &unwritable_metrics,
+        ok.path(),
+        &old_private_content,
+        &new_private_content,
+    );
 
     assert_eq!(writable.status.code(), Some(2));
     assert_eq!(
