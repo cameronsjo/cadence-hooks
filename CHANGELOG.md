@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`record-polish --arm` now retains previously recorded arms and overrides only names supplied again (#592).** Sequential arm-only recordings merge through the trusted private-marker reader, so a focused rerun no longer erases the rest of the polish roster; roster-less and malformed legacy markers continue to degrade to an empty prior roster.
+
 ## [0.74.0] - 2026-08-06
 
 ### Changed

@@ -272,14 +272,23 @@ impl PolishRecord {
 /// way everything else does: `None` → roster unknown → the presence bool
 /// alone decides, exactly the pre-#467 behavior.
 pub fn read_polish_marker(command: &str, cwd: Option<&str>) -> Option<PolishRecord> {
-    if !marker_dir_is_private() {
-        return None;
-    }
     let cwd = cwd?;
     let dir = parse_work_dir(command, cwd);
     let state = GitState::resolve(Path::new(&dir))?;
     let branch = state.branch?;
-    let path = polish_marker(&state.git_common_dir.to_string_lossy(), &branch);
+    read_polish_record(&state.git_common_dir.to_string_lossy(), &branch)
+}
+
+/// Read a polish record by its already-resolved `(repo_root, branch)` key.
+///
+/// Content is trusted only from the hardened private marker directory. Missing,
+/// unreadable, or malformed markers return `None`; non-string arm values are
+/// filtered from the optional roster instead of failing the whole record.
+pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord> {
+    if !marker_dir_is_private() {
+        return None;
+    }
+    let path = polish_marker(repo_root, branch);
     let content = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&content).ok()?;
     Some(PolishRecord {
@@ -777,6 +786,56 @@ mod tests {
         // Legacy full/code roster-less markers are UNKNOWN.
         assert_eq!(rec(Some("full"), None).security_ran(), None);
         assert_eq!(rec(None, None).security_ran(), None);
+    }
+
+    #[test]
+    fn read_polish_record_parses_scope_and_filters_non_string_arms() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/keyed-polish-record";
+            let branch = "feat/keyed-read";
+            write_marker(
+                &polish_marker(repo, branch),
+                r#"{"scope":"code","arms":{"security":"ran","tests":false}}"#,
+            )
+            .unwrap();
+
+            let rec = read_polish_record(repo, branch).expect("marker reads");
+            assert_eq!(rec.scope.as_deref(), Some("code"));
+            assert_eq!(
+                rec.arms
+                    .as_ref()
+                    .unwrap()
+                    .get("security")
+                    .map(String::as_str),
+                Some("ran")
+            );
+            assert!(!rec.arms.as_ref().unwrap().contains_key("tests"));
+        });
+    }
+
+    #[test]
+    fn read_polish_record_returns_none_for_missing_and_garbage() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/keyed-polish-record";
+            let branch = "feat/keyed-missing";
+            assert!(read_polish_record(repo, branch).is_none());
+
+            write_marker(&polish_marker(repo, branch), "]]not json").unwrap();
+            assert!(read_polish_record(repo, branch).is_none());
+        });
+    }
+
+    #[test]
+    fn read_polish_record_returns_none_from_degraded_marker_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("occupied");
+        std::fs::write(&not_a_dir, "").unwrap();
+        with_marker_dir(&not_a_dir, || {
+            assert!(!marker_dir_is_private(), "precondition: fail-open path");
+            assert!(read_polish_record("/tmp/repo", "feat/degraded").is_none());
+        });
     }
 
     #[test]
