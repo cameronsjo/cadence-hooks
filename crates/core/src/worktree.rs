@@ -582,7 +582,7 @@ mod tests {
     /// comparison, is what settles it.
     #[test]
     #[cfg(unix)]
-    fn tmpdir_symlinked_to_home_is_not_a_temp_root() {
+    fn symlinked_tmpdir_covering_home_is_not_a_temp_root() {
         let scratch = scratch("tmpdir-symlink-home");
         let home = scratch.path().join("home");
         let link = scratch.path().join("tmpdir-link");
@@ -599,6 +599,46 @@ mod tests {
         assert!(
             !is_temp_root(&link.join("Documents"), Some(link_str), Some(home_str)),
             "a $TMPDIR that resolves to home must not earn the temp carve-out"
+        );
+    }
+
+    /// A `$TMPDIR` differing from home only in CASE, on a case-insensitive
+    /// volume — macOS's default, and a shipped target. `Path::starts_with` is
+    /// byte-exact, so the literal comparison declines to call it covering, and
+    /// the raw prefix test then matches every operand spelled the same way:
+    /// `TMPDIR=/users/dev` against `HOME=/Users/dev` handed the whole home tree
+    /// the temp carve-out. Resolution is what closes it — `canonicalize`
+    /// returns the volume's real casing, so both spellings converge.
+    ///
+    /// The volume, not the platform, is the question: case-insensitive mounts
+    /// exist on Linux and case-sensitive APFS volumes exist on macOS, so this
+    /// probes the actual filesystem and self-skips where the two spellings
+    /// genuinely name different directories and there is nothing to reject.
+    #[test]
+    fn case_differing_tmpdir_covering_home_is_not_a_temp_root() {
+        let scratch = scratch("tmpdir-case-home");
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+
+        let shouted = scratch.path().join("HOME");
+        if !shouted.is_dir() {
+            println!("skipped: case-sensitive volume, the two spellings are different directories");
+            return;
+        }
+
+        let home_str = home.to_str().unwrap();
+        let shouted_str = shouted.to_str().unwrap();
+        // Sanity: byte-exact comparison really does decline here, so a
+        // literal-only check would have granted the carve-out.
+        assert!(!Path::new(home_str).starts_with(shouted_str));
+
+        assert!(
+            !is_temp_root(
+                &shouted.join("Documents"),
+                Some(shouted_str),
+                Some(home_str)
+            ),
+            "a $TMPDIR naming home in different case must not earn the temp carve-out"
         );
     }
 
