@@ -101,6 +101,7 @@ pub(crate) fn resolve_scratch_dir(root: &Path, tag: &str) -> PathBuf {
         std::env::var("TMPDIR").ok().as_deref(),
         override_root.as_deref(),
         xdg_cache_home().as_deref(),
+        Some(&crate::paths::user_home_lossy_or_default()),
     )
 }
 
@@ -138,13 +139,14 @@ fn resolve_scratch_dir_with(
     tmpdir: Option<&str>,
     override_root: Option<&Path>,
     xdg_cache_home: Option<&Path>,
+    home: Option<&str>,
 ) -> PathBuf {
     // `$TMPDIR` is invariant for the process — canonicalize once (a real
     // `realpath` syscall chain) and reuse it across all three candidates,
     // rather than re-canonicalizing per candidate inside `escapes_carveout`
     // (cadence-hooks#403 code review: the relocation path this function
     // exists for is precisely the one that was paying that cost 2-3x).
-    let tmpdir_canonical = crate::worktree::canonicalize_tmpdir(tmpdir);
+    let tmpdir_canonical = crate::worktree::canonicalize_tmpdir(tmpdir, home);
     let suffix = format!("{tag}-{}", std::process::id());
     let candidate = |base: &Path| base.join(&suffix);
     // Canonicalize `dir` (or its nearest existing ancestor — the `{tag}-{pid}`
@@ -162,7 +164,12 @@ fn resolve_scratch_dir_with(
     let escapes_carveout = |dir: &Path| {
         let resolved = canonicalize_nearest_existing(dir);
         !is_claude_managed_dir(&resolved)
-            && !path_under_temp_root_with_canonical(&resolved, tmpdir, tmpdir_canonical.as_deref())
+            && !path_under_temp_root_with_canonical(
+                &resolved,
+                tmpdir,
+                tmpdir_canonical.as_deref(),
+                home,
+            )
     };
 
     let default_dir = candidate(root);
@@ -523,7 +530,7 @@ mod tests {
     #[test]
     fn resolve_uses_the_default_when_it_escapes_the_carveout() {
         let root = Path::new("/Users/dev/checkout/target/scratch");
-        let dir = resolve_scratch_dir_with(root, "basic", None, None, None);
+        let dir = resolve_scratch_dir_with(root, "basic", None, None, None, None);
         assert_eq!(dir, root.join(format!("basic-{}", std::process::id())));
     }
 
@@ -536,6 +543,7 @@ mod tests {
             Some(&tmpdir),
             Some(Path::new("/Users/dev/.cache/cadence-hooks/test-scratch")),
             Some(Path::new("/Users/dev/.cache/should-not-be-used")),
+            None,
         );
         assert!(
             dir.starts_with("/Users/dev/.cache/cadence-hooks/test-scratch"),
@@ -553,6 +561,7 @@ mod tests {
             Some(&tmpdir),
             None,
             Some(Path::new("/Users/dev/.cache")),
+            None,
         );
         assert!(dir.starts_with("/Users/dev/.cache/cadence-hooks/test-scratch"));
     }
@@ -565,6 +574,7 @@ mod tests {
             None,
             None,
             Some(Path::new("/Users/dev/.cache")),
+            None,
         );
         // `!is_claude_managed_dir(&dir)` alone would pass for ANY non-`.claude`
         // result, including a wrong branch that happened to land somewhere
@@ -590,6 +600,7 @@ mod tests {
             Some(&tmpdir),
             None,
             None,
+            None,
         );
     }
 
@@ -603,6 +614,7 @@ mod tests {
             "tag",
             Some(&tmpdir),
             Some(&bad_override),
+            None,
             None,
         );
     }
@@ -623,6 +635,7 @@ mod tests {
             Some(&tmpdir),
             None,
             Some(&carved_out_xdg_cache_home),
+            None,
         );
     }
 
@@ -661,7 +674,7 @@ mod tests {
 
         // Sanity: the literal path does NOT lexically look like a carve-out.
         assert!(
-            !path_under_temp_root(&symlink_root.join("tag-x"), None),
+            !path_under_temp_root(&symlink_root.join("tag-x"), None, None),
             "test setup: the symlink's literal path must not itself start with /tmp"
         );
 
@@ -671,6 +684,7 @@ mod tests {
             None,
             None,
             Some(Path::new("/Users/dev/.cache")),
+            None,
         );
         assert!(
             dir.starts_with("/Users/dev/.cache/cadence-hooks/test-scratch"),

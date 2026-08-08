@@ -404,6 +404,14 @@ fn collect_targets(
     let mut dir_known = cwd_known;
 
     for (segment, _next_op) in split_segments_with_ops(script) {
+        // Drop empty substitutions BEFORE any other parsing touches the
+        // segment. `strip_group_wrappers` trims trailing `)` unconditionally,
+        // so a segment ending in `$()` reached the tokenizer as a dangling
+        // `$(` — and `tokenize` splits `$( )` into two words the shell joins
+        // into one. Either way the operand arrived carrying a `$`, and
+        // `resolve_target` answered ASK for a target whose contract is BLOCK
+        // (cadence-hooks#541).
+        let segment = strip_empty_substitutions(&segment);
         let segment = strip_group_wrappers(&segment);
         let tokens = tokenize(segment);
         let argv = skip_transparent_prefixes(&tokens);
@@ -707,6 +715,17 @@ fn resolve_target(
     single_file: bool,
     caller_dereferences: bool,
 ) -> TargetToken {
+    // An EMPTY operand is not a target. `rm -rf ''` deletes nothing — the shell
+    // errors on it — and an operand left empty by `strip_empty_substitutions`
+    // was entirely an empty expansion. Neither means "the current directory",
+    // but both reach the `literal.is_empty()` bare-cwd reading below and would
+    // carry the effective directory's verdict, which from a temp cwd is a
+    // silent ALLOW. The genuine bare-cwd spellings — `*` and a literal `.` —
+    // arrive non-empty and reach that reading through `glob_literal_prefix`,
+    // so they are unaffected.
+    if operand.is_empty() {
+        return TargetToken::Unresolvable;
+    }
     // Unexpanded variable / command substitution — can't prove anything. This
     // guard (with the `..` checks below) runs AHEAD of glob detection, so an
     // unresolvable operand never masquerades as a clean file-scoped sweep.
@@ -803,6 +822,94 @@ fn resolve_target(
     }
 }
 
+/// Remove every **lexically empty** substitution from `segment`: `$()`, `$( )`,
+/// and a backtick pair enclosing nothing but whitespace.
+///
+/// An empty body expands to the empty string in every shell, so `~/Documents$()`
+/// deletes exactly `~/Documents`. Without this, the operand reached
+/// [`resolve_target`] still carrying a `$`, which answered ASK for a target
+/// whose contract is BLOCK — a downgrade bought by appending two characters
+/// (cadence-hooks#541).
+///
+/// Deleting the span reproduces what the shell does, joining included:
+/// `a$( )b` is one word `ab` there too, because field splitting applies to the
+/// (empty) expansion, not to the literal text around it.
+///
+/// **Lexically** empty is the whole rule. `$(cat f)` and `${EMPTY}` are left
+/// verbatim so they keep their `Unresolvable` verdict: resolving those would
+/// mean modelling what a command prints or what a variable holds, which this
+/// parser cannot know. Only ASCII whitespace counts as an empty body — the same
+/// characters the shell's own word splitting treats as blank.
+///
+/// Stripping can never *create* a resolvable operand out of a real
+/// substitution: only a complete empty pair is removed, delimiters included, so
+/// any surviving substitution keeps the `$` or backtick that routes it to
+/// `Unresolvable`. It removes only `$`, `(`, `)`, backticks, and whitespace, so
+/// it cannot synthesize a `/`, cannot erase a `..`, and cannot move a target
+/// into a temp root or out of a `.git` component.
+///
+/// **Quote-blind, deliberately.** This scans the raw segment with no quote
+/// state, while the shell keeps `$()` as literal filename characters inside
+/// `'…'` or after a backslash. The divergence runs strict — the guard sees a
+/// SHORTER name, which lands in the same or a more protected class
+/// (`rm -rf ~/'$()'` reads as `~/` → Block) — with one narrow exception: a
+/// shortened name can end in a transient-scratch suffix the real one does not,
+/// so `rm ~/'notes.tmp$()'` reads as `~/notes.tmp` and allows. Accepted rather
+/// than fixed: the operand has to be a hand-typed file literally named
+/// `notes.tmp$()`, and threading quote state in here would duplicate
+/// `core::shell`'s tokenizer for that one case.
+fn strip_empty_substitutions(segment: &str) -> Cow<'_, str> {
+    let mut out: Option<String> = None;
+    // Bytes already flushed into `out`, and where the next delimiter hunt
+    // starts — they diverge because a non-empty body is scanned past, not copied.
+    let mut copied = 0;
+    let mut scan = 0;
+    while let Some(rel) = segment[scan..].find(['$', '`']) {
+        let at = scan + rel;
+        if let Some(len) = empty_substitution_len(&segment[at..]) {
+            let buf = out.get_or_insert_with(|| String::with_capacity(segment.len()));
+            buf.push_str(&segment[copied..at]);
+            copied = at + len;
+            scan = copied;
+        } else {
+            scan = at + 1;
+        }
+    }
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&segment[copied..]);
+            Cow::Owned(buf)
+        }
+        None => Cow::Borrowed(segment),
+    }
+}
+
+/// Byte length of the empty substitution starting at the head of `s`, if one
+/// starts there: `$(` + ASCII whitespace + `)`, or a backtick pair around the
+/// same. `None` for anything else, including a non-empty body — a
+/// conservative answer, because `None` means the operand stays unresolvable.
+fn empty_substitution_len(s: &str) -> Option<usize> {
+    let (open_len, closer) = if s.starts_with("$(") {
+        (2usize, ')')
+    } else if s.starts_with('`') {
+        (1usize, '`')
+    } else {
+        return None;
+    };
+    let body = &s[open_len..];
+    // `trim_start_matches` returns a suffix OF `body`, so the length difference
+    // is exactly that suffix's byte offset — always in range and always on a
+    // char boundary, however the operand is spelled. The slice below cannot
+    // panic on hostile input.
+    let blank = body.len()
+        - body
+            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+            .len();
+    body[blank..]
+        .starts_with(closer)
+        .then_some(open_len + blank + closer.len_utf8())
+}
+
 /// True when `operand`'s final path segment is a glob that scopes to files
 /// *within* a directory rather than naming the directory itself: it contains a
 /// glob metachar (`*`/`?`/`[`), does NOT start with `.` (so `.*` — which matches
@@ -874,6 +981,23 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
         tmpdir: ctx.tmpdir,
     };
     let shared = pathclass::classify(&norm, &pc_ctx, is_git_root);
+
+    // #576: `Temp` is a claim about where the target LIVES; a `.git` is an
+    // explicit protection the user put there. A repo checked out under `/tmp`
+    // is still a repo — the location claim loses to the marker, so the temp
+    // ALLOW does not apply and the git-repo BLOCK stands.
+    //
+    // `.claude` scratch stays ABOVE this rule: a `.claude/worktrees/` checkout
+    // is cadence's own managed scratch and its `.git` is exactly why cleanup
+    // must stay allowed. The predicate is asked directly rather than read off
+    // `shared`, because `pathclass::classify` tests temp BEFORE claude-scratch
+    // — a worktree that lives under `/tmp` arrives here reported as `Temp`.
+    if shared == PathClass::Temp
+        && !pathclass::under_claude_scratch(&norm)
+        && (has_git_component(&norm) || is_git_root(&norm))
+    {
+        return TargetClass::GitRepo;
+    }
 
     // ALLOW rules first — the shared classifier owns Temp and ClaudeScratch.
     match shared {
@@ -1582,6 +1706,70 @@ mod tests {
         assert_eq!(out, Outcome::Allow);
     }
 
+    // --- #569: a `$TMPDIR` that swallows home cannot disarm the home block ---
+
+    /// The end-to-end shape of the defect: point `$TMPDIR` at home and every
+    /// home child read as disposable temp. The protection now outlives the
+    /// widened root.
+    #[test]
+    fn home_child_blocks_under_a_widened_tmpdir() {
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some(VAULT),
+            tmpdir: Some(&home),
+        };
+        let out = judge_rm("rm -rf ~/Documents", "/home", &ctx, &|_| false, &|_| false).outcome;
+        assert_eq!(out, Outcome::Block);
+    }
+
+    // --- #576: an explicit protection outranks the temp carve-out ---
+
+    /// A repo checked out under `/tmp` is still a repo — the `.git` the user
+    /// put there outranks the claim that the location makes it disposable.
+    #[test]
+    fn git_repo_under_temp_blocks() {
+        assert_eq!(
+            judge_with("rm -rf /tmp/repo", "/home", &["/tmp/repo"]),
+            Outcome::Block
+        );
+    }
+
+    /// The carve-out itself is untouched: plain temp scratch with no `.git`
+    /// anywhere still allows.
+    #[test]
+    fn plain_temp_scratch_still_allows() {
+        assert_eq!(
+            judge_with("rm -rf /tmp/scratch", "/home", &[]),
+            Outcome::Allow
+        );
+    }
+
+    /// cadence's own managed scratch keeps its ALLOW even under a temp root,
+    /// where `pathclass::classify` reports it as `Temp` rather than
+    /// `ClaudeScratch` — the case a `shared != ClaudeScratch` guard would miss.
+    #[test]
+    fn claude_worktree_under_temp_still_allows() {
+        assert_eq!(
+            judge_with(
+                "rm -rf /tmp/x/.claude/worktrees/y",
+                "/home",
+                &["/tmp/x/.claude/worktrees/y"]
+            ),
+            Outcome::Allow
+        );
+    }
+
+    /// The literal-`.git`-component half of the git-root fact, which needs no
+    /// filesystem probe at all.
+    #[test]
+    fn dot_git_component_under_temp_blocks() {
+        assert_eq!(
+            judge_with("rm -rf /tmp/repo/.git", "/home", &[]),
+            Outcome::Block
+        );
+    }
+
     #[test]
     fn session_intro_allows() {
         assert_eq!(
@@ -1937,6 +2125,101 @@ mod tests {
     #[test]
     fn command_substitution_target_asks() {
         assert_eq!(judge("rm -rf $(mktemp -d)", "/home"), Outcome::Ask);
+    }
+
+    // --- #541: an empty substitution must not downgrade a protected target ---
+
+    /// `$()` and an empty backtick pair expand to nothing, so the operand still
+    /// names the protected home child — appending them was a free Block→Ask
+    /// downgrade.
+    #[test]
+    fn empty_substitution_suffix_still_blocks() {
+        for command in [
+            "rm -rf ~/Documents$()",
+            "rm -rf ~/Documents$( )",
+            "rm -rf ~/Documents``",
+            "rm -rf ~/Documents` `",
+            "rm -rf ~/$()Documents",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Block,
+                "an empty substitution expands to nothing: {command}"
+            );
+        }
+    }
+
+    /// The narrowness of the rule: a body with content resolves to a value this
+    /// parser cannot know, so it keeps its Ask verbatim.
+    #[test]
+    fn unknown_substitution_suffix_still_asks() {
+        assert_eq!(
+            judge("rm -rf ~/`cat which_dir`", "/private/tmp"),
+            Outcome::Ask
+        );
+        assert_eq!(judge("rm -rf $(mktemp -d)", "/private/tmp"), Outcome::Ask);
+    }
+
+    /// A variable is not a substitution — `${EMPTY}` names a value, and
+    /// modelling variable contents is out of scope.
+    #[test]
+    fn variable_suffix_still_asks() {
+        assert_eq!(
+            judge("rm -rf ~/Documents${EMPTY}", "/private/tmp"),
+            Outcome::Ask
+        );
+    }
+
+    /// The rail: an operand that is ALL empty substitution leaves the recursive
+    /// delete with no readable operand, which asks. It must NOT read as a bare
+    /// cwd reference and carry the effective directory's verdict.
+    #[test]
+    fn substitution_stripping_to_nothing_is_unresolvable() {
+        // `/private/tmp` is a temp root, so a cwd fall-through would ALLOW.
+        assert_eq!(judge("rm -rf $()", "/private/tmp"), Outcome::Ask);
+        assert_eq!(judge("rm -rf ``", "/private/tmp"), Outcome::Ask);
+    }
+
+    /// A QUOTED `$()` is a literal filename to the shell, not an expansion —
+    /// stripping it leaves an empty operand, which must not read as a bare cwd
+    /// reference and inherit the working directory's verdict. `/private/tmp`
+    /// is a temp root, so that fall-through would have been a silent ALLOW.
+    #[test]
+    fn an_operand_left_empty_by_stripping_is_unresolvable() {
+        for command in [
+            "rm -rf '$()'",
+            "rm -rf \"$()\"",
+            "rm -rf ''",
+            "rm -rf ``",
+            "rm -rf $()",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "an empty operand names no target: {command}"
+            );
+        }
+    }
+
+    /// The genuine bare-cwd spellings still resolve to the effective directory
+    /// — they arrive non-empty and empty out via `glob_literal_prefix`, which
+    /// the empty-operand rail deliberately sits ahead of.
+    #[test]
+    fn bare_cwd_globs_still_carry_the_directorys_verdict() {
+        assert_eq!(judge("rm -rf *", "/private/tmp"), Outcome::Allow);
+        assert_eq!(judge("rm -rf .", "/private/tmp"), Outcome::Allow);
+        assert_eq!(
+            judge("cd ~/Documents && rm -rf *", "/private/tmp"),
+            Outcome::Block
+        );
+    }
+
+    /// `guard_rm_liveness`'s command-substitution probe asserts Ask by
+    /// contract — a stripping rule that widened past empty bodies would fire a
+    /// false nudge every SessionStart.
+    #[test]
+    fn liveness_probe_contract_holds() {
+        assert_eq!(judge("rm -rf $(printf %s x)", "/private/tmp"), Outcome::Ask);
     }
 
     #[test]
