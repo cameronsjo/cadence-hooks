@@ -25,11 +25,17 @@ jobs:
     name: RustSec advisory audit
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Deliberately NOT `issues: write`. This job checks out branch-controlled
+    # input (Cargo.lock, and on a workflow PR the workflow itself) on every pull
+    # request, so the token that can write issues lives in the schedule-only
+    # `advisory-issue` job below instead — 1 run in 52 rather than all of them.
     permissions:
       contents: read
-      # A scheduled run files its findings as an issue rather than reddening
-      # main — see the two conditional steps at the end of this job.
-      issues: write
+    outputs:
+      # `outcome` is the step's result BEFORE continue-on-error rewrites it;
+      # `conclusion` is the rewritten one. The advisory-issue job branches on
+      # this, so reading the wrong one would make it file nothing, forever.
+      result: ${{ steps.audit.outcome }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -51,13 +57,27 @@ jobs:
         if: steps.audit-tool.outputs.cache-hit != 'true'
         run: cargo +"$RUST_TOOLCHAIN" install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
 
-      # `continue-on-error` ONLY on the schedule. A PR or push run has a change
-      # to fix the advisory against, so it fails the build; a scheduled run has
-      # no PR attached, and a permanently red main is a signal people learn to
-      # scroll past. The scheduled path files an issue instead (next steps).
+      # The cache stores a binary, not a verified artifact — a cache hit means
+      # "some bytes existed under this key", so assert the restored tool is the
+      # version we pinned before running it against the lockfile.
+      - name: Verify the restored cargo-audit
+        if: steps.audit-tool.outputs.cache-hit == 'true'
+        run: |
+          actual=$(cargo-audit audit --version | awk '{print $NF}')
+          if [ "$actual" != "$CARGO_AUDIT_VERSION" ]; then
+            echo "Failed: cached cargo-audit is $actual, expected $CARGO_AUDIT_VERSION" >&2
+            exit 1
+          fi
+          echo "Successfully verified cached cargo-audit $actual"
+
+      # `continue-on-error` ONLY on the schedule. A pull request or push run has
+      # a change to fix the advisory against, so it fails the build; a scheduled
+      # run has no PR attached, and a permanently red main is a signal people
+      # learn to scroll past. The scheduled path files an issue instead.
       #
-      # `outcome` is the step's real result; `conclusion` is what
-      # continue-on-error rewrote it to. Branch on `outcome`.
+      # `set -o pipefail` restates the GitHub Actions default shell rather than
+      # relying on it: without it `tee` masks cargo audit's exit code and every
+      # scheduled run reads clean.
       - name: Audit Rust dependencies
         id: audit
         continue-on-error: ${{ github.event_name == 'schedule' }}
@@ -65,8 +85,37 @@ jobs:
           set -o pipefail
           cargo +"$RUST_TOOLCHAIN" audit | tee "$RUNNER_TEMP/audit-report.txt"
 
+      - name: Upload the audit report
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: audit-report
+          path: ${{ runner.temp }}/audit-report.txt
+          retention-days: 7
+
+  # Split from `audit` purely to scope the token: this is the only job holding
+  # `issues: write`, and it never runs on a pull request.
+  advisory-issue:
+    name: Advisory issue
+    needs: audit
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: audit-report
+          path: ${{ runner.temp }}
+
       - name: File or update the advisory issue
-        if: github.event_name == 'schedule' && steps.audit.outcome == 'failure'
+        if: needs.audit.outputs.result == 'failure'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -76,18 +125,34 @@ jobs:
       # Without this the issue outlives the advisory: a scheduled run that comes
       # back clean is the only signal that says the tracked advisories are gone.
       - name: Resolve the advisory issue
-        if: github.event_name == 'schedule' && steps.audit.outcome == 'success'
+        if: needs.audit.outputs.result == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: bash scripts/advisory-issue.sh resolve
 
+  # advisory-issue.sh runs only on the weeks the scheduled audit is unhappy, so
+  # a regression in it would otherwise surface at the worst possible moment.
+  # This job is what actually exercises it.
+  tooling:
+    name: Advisory-issue script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Test advisory-issue.sh
+        run: bash scripts/test-advisory-issue.sh
+
   policy:
     name: Dependency policy
     # Schedule-exempt on purpose: licenses, bans, and sources are properties of
     # the committed dependency graph, so they cannot change without a commit
-    # that a PR or push run already checked. Only advisories move on their own.
+    # that a pull request or push run already checked. Only advisories move on
+    # their own.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -109,6 +174,16 @@ jobs:
       - name: Install cargo-deny
         if: steps.deny-tool.outputs.cache-hit != 'true'
         run: cargo +"$RUST_TOOLCHAIN" install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+
+      - name: Verify the restored cargo-deny
+        if: steps.deny-tool.outputs.cache-hit == 'true'
+        run: |
+          actual=$(cargo-deny --version | awk '{print $NF}')
+          if [ "$actual" != "$CARGO_DENY_VERSION" ]; then
+            echo "Failed: cached cargo-deny is $actual, expected $CARGO_DENY_VERSION" >&2
+            exit 1
+          fi
+          echo "Successfully verified cached cargo-deny $actual"
 
       # `advisories` is deliberately absent: cargo-audit owns that check above,
       # and running both would report every advisory twice under two names.
