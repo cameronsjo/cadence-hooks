@@ -148,7 +148,7 @@ jobs:
       # Attest the SBOM against the binaries it describes. Complements (does not
       # replace) the build-provenance attestation above.
       - name: Attest SBOM
-        uses: actions/attest-sbom@v2
+        uses: actions/attest-sbom@v4
         with:
           subject-path: |
             cadence-hooks-*.tar.gz
