@@ -1140,7 +1140,15 @@ pub fn repo_from_url(url: &str) -> Option<String> {
 pub fn looks_like_push_url(candidate: &str) -> bool {
     let trimmed = candidate.trim();
 
-    if let Some(after_scheme) = trimmed.split("://").nth(1) {
+    if let Some((scheme, after_scheme)) = trimmed.split_once("://") {
+        // `file://` is host-less by construction, and git pushes to it happily
+        // — so an empty host is a valid shape there, not a parse failure. A
+        // scheme-bearing URL cannot be mistaken for a local path operand, so
+        // this costs nothing that a bare path (`/srv/backup.git`) does not
+        // still keep: that stays non-URL-shaped and keeps the fallback.
+        if scheme.eq_ignore_ascii_case("file") {
+            return true;
+        }
         let host_part = after_scheme.split('/').next().unwrap_or(after_scheme);
         // Strip credentials (`user@host`, `token:x-oauth@host`) and port, the
         // same order `host_and_repo_from_url` strips them.
@@ -2386,6 +2394,21 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
                         i = next;
                         continue;
                     }
+                    // A backslash-escaped whitespace char is part of the
+                    // filename, not a token terminator — consume the backslash
+                    // and keep the escaped char. Without this,
+                    // `>> my\ dir/.env` truncated the target at the escaped
+                    // space (`my\`), so the append to a real `.env` inside a
+                    // space-bearing directory reached no guard — while the
+                    // quoted spelling `>> "my dir/.env"` blocked correctly. The
+                    // sibling [`clobber_redirect_targets`] already carried this
+                    // branch; the two redirect parsers must not disagree on
+                    // where a filename ends (cameronsjo/cadence-hooks#551).
+                    if tc == '\\' && i + 1 < chars.len() && chars[i + 1].is_whitespace() {
+                        target.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
                     if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
                         break;
                     }
@@ -2579,33 +2602,38 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut bodies = Vec::new();
     let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut quote: Option<Quote> = None;
     while i < chars.len() {
+        // Single quotes and ANSI-C `$'…'` strings suppress substitution; double
+        // quotes do not. While inside a suppressing run, `$(`/backtick are
+        // literal text — advance the shared quote state machine past them. The
+        // former hand-rolled `in_single`/`in_double` bools had no ANSI-C mode,
+        // so `$'a\'b'` read the escaped `\'` as a close and the real `'` as a
+        // reopen: every later `$(…)` fell inside a phantom single-quote and
+        // reached no guard, while bash executed it (cameronsjo/cadence-hooks#551
+        // outer loop). `scan_quote_syntax` is the same reader `split_segments`
+        // and `tokenize` use, so the three cannot drift on where a quoted run
+        // ends.
+        if matches!(quote, Some(Quote::Single | Quote::AnsiC))
+            && let Some(next) = scan_quote_syntax(&chars, i, &mut quote)
+        {
+            i = next;
+            continue;
+        }
         let c = chars[i];
-        if c == '\\' && !in_single {
+        // A backslash escapes the next character in executed context (unquoted
+        // or inside double quotes), so `\$(`, an escaped backtick, and `\"` open
+        // no substitution and close no quote. Handled before the `$(`/backtick
+        // detection so an escaped opener is never read as one — this is what
+        // keeps `"use \`cat .env\` carefully"` inert. `scan_quote_syntax`'s
+        // Double mode escapes only `"`/`\`, so it cannot carry this case alone.
+        if c == '\\' {
             i += 2;
             continue;
         }
-        if in_single {
-            if c == '\'' {
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '\'' && !in_double {
-            in_single = true;
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            in_double = !in_double;
-            i += 1;
-            continue;
-        }
         // `$(` … `)` with paren-depth AND quote tracking. `$(< file)` keeps
-        // its `<`.
+        // its `<`. Reached in executed context only — unquoted or inside double
+        // quotes, both of which run the substitution.
         if c == '$' && chars.get(i + 1) == Some(&'(') {
             if let Some((body, end)) = scan_substitution_body(&chars, i + 2, true) {
                 if !body.trim().is_empty() {
@@ -2654,6 +2682,14 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
                 bodies.push(body);
             }
             i = j + 1;
+            continue;
+        }
+        // Not a substitution: let the state machine open a quote, close the
+        // current double quote, or consume an outside-quotes escape; otherwise
+        // step one char. Inside double quotes this keeps `$(`/backtick
+        // detection live while still tracking the closing `"`.
+        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+            i = next;
             continue;
         }
         i += 1;
@@ -5436,6 +5472,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn redirect_targets_escaped_whitespace_in_path_kept() {
+        // #551: `redirect_targets` lost the escaped-whitespace branch its
+        // sibling `clobber_redirect_targets` carries, so a backslash-escaped
+        // space in the target path truncated the filename (`my\`) instead of
+        // continuing through it. The append to `.env` inside a space-bearing
+        // directory then named a non-secret target and reached no guard, while
+        // the quoted spelling was parsed correctly.
+        assert_eq!(
+            redirect_targets(r"echo TOKEN >> my\ dir/.env"),
+            vec!["my dir/.env"]
+        );
+        assert_eq!(
+            redirect_targets(r"echo TOKEN > my\ dir/.env"),
+            vec!["my dir/.env"]
+        );
+        // The two redirect parsers must agree on where the filename ends.
+        assert_eq!(
+            clobber_redirect_targets(r"echo TOKEN > my\ dir/.env"),
+            vec!["my dir/.env"]
+        );
+        // Control: the quoted spelling always resolved correctly, so this is
+        // evidence about the escape branch, not the parser generally.
+        assert_eq!(
+            redirect_targets(r#"echo TOKEN >> "my dir/.env""#),
+            vec!["my dir/.env"]
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_ansi_c_escaped_quote_does_not_hide_later_substitution() {
+        // #551 outer loop: the hand-rolled `in_single`/`in_double` bools had no
+        // ANSI-C mode, so `$'a\'b'` read the escaped `\'` as a close and the
+        // real `'` as a reopen — every later `$(…)` fell inside a phantom
+        // single-quote and was never surfaced as a body, while bash executed
+        // it. The shared `scan_quote_syntax` state machine tracks `$'…'`.
+        assert!(
+            substitution_bodies(r"echo $'a\'b' $(cat .env)")
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "ANSI-C escaped quote hid the substitution body"
+        );
+        assert!(
+            substitution_bodies(r"echo $'a\'b' `cat .env`")
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "ANSI-C escaped quote hid the backtick body"
+        );
+        // Control: an ANSI-C string genuinely containing a `$(` is literal and
+        // must NOT be surfaced — the fix suppresses inside single/ANSI-C runs.
+        assert!(
+            substitution_bodies(r"echo $'literal $(cat .env)'").is_empty(),
+            "a `$(` inside a single-quoted ANSI-C run must stay literal"
+        );
+    }
+
     // --- command_segments (wrapper expansion) ---
 
     #[test]
@@ -6421,6 +6513,13 @@ mod tests {
         assert!(!looks_like_push_url("refs/heads/x:refs/heads/y"));
         assert!(!looks_like_push_url("main"));
         assert!(!looks_like_push_url("../sibling-checkout"));
+        assert!(!looks_like_push_url("/srv/backup.git"));
+    }
+
+    #[test]
+    fn file_scheme_url_is_push_shaped_despite_an_empty_host() {
+        assert!(looks_like_push_url("file:///srv/exfil.git"));
+        assert!(host_and_repo_from_url("file:///srv/exfil.git").is_none());
     }
 
     #[test]

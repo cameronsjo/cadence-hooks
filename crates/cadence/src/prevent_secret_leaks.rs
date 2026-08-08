@@ -1051,6 +1051,33 @@ mod tests {
     }
 
     #[test]
+    fn ansi_c_escaped_quote_does_not_hide_substitution_read() {
+        // #551 outer loop: an ANSI-C `$'a\'b'` string before a `$(…)`
+        // substitution desynced the quote-blind outer scan in
+        // `substitution_bodies`, so `cat .env` never became a segment and
+        // reached no guard — while bash executed it (proven with a marker
+        // file). The `echo` head is metadata-safe, so the substitution body was
+        // the only path to the read.
+        let result = SecretLeaksGuard.run(&make_bash_input(r"echo $'a\'b' $(cat .env)"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn ansi_c_escaped_quote_does_not_hide_backtick_read() {
+        // Same desync via the backtick substitution arm.
+        let result = SecretLeaksGuard.run(&make_bash_input(r"echo $'a\'b' `cat .env`"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn ansi_c_escaped_quote_benign_command_still_allowed() {
+        // Control: the same ANSI-C string with no secret read stays allowed —
+        // the fix surfaces the hidden substitution, it does not over-block.
+        let result = SecretLeaksGuard.run(&make_bash_input(r"echo $'a\'b' hello"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
     fn verb_fold_cannot_widen_this_guards_exemption() {
         // This file is the ONE consumer of `core::shell::command_word` whose
         // lookup is an EXEMPTION (`METADATA_SAFE_COMMANDS`), where matching
