@@ -162,7 +162,7 @@ pub fn classify(
     // ancestor (a worktree under `.claude`, a repo in `/tmp`) resolves to its
     // allow-class before git-root can match. This ordering is load-bearing and
     // locked by `claude_scratch_wins_over_git_root_probe`.
-    if path_under_temp_root(Path::new(&norm), ctx.tmpdir) {
+    if path_under_temp_root(Path::new(&norm), ctx.tmpdir, Some(ctx.home)) {
         return PathClass::Temp;
     }
     if under_claude_scratch(&norm) {
@@ -242,7 +242,14 @@ pub const CLAUDE_SCRATCH_DIRS: &[&str] = &["worktrees", "intros"];
 /// (`.claude/worktrees`) is excluded — deleting it takes every worktree at once,
 /// which is not the single-disposable-item case. Mirrors the `.claude` dir's own
 /// exclusion one level down.
-fn under_claude_scratch(norm: &str) -> bool {
+///
+/// Public because [`classify`] tests `Temp` FIRST, so a scratch path that also
+/// lives under a temp root reports [`PathClass::Temp`] and the scratch fact is
+/// unreachable from the returned class. `guardrails::guard_rm` needs that fact
+/// to keep worktree cleanup allowed while blocking a plain repo under `/tmp`
+/// (cadence-hooks#576), and asking here is cheaper and safer than reordering a
+/// precedence three tests already lock.
+pub fn under_claude_scratch(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
     let Some(pos) = segs.iter().position(|s| *s == ".claude") else {
         return false;
