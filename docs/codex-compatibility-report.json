@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "binaryVersion": "0.74.0",
+  "binaryVersion": "0.75.0",
   "minimumCodexVersion": "0.145.0",
   "privacy": {
     "rawHookInputsPersisted": false,
@@ -845,7 +845,7 @@
         {
           "plugin": "cadence-guardrails",
           "event": "PreToolUse",
-          "matcher": "^Edit$|mcp__.*(delete|remove|move|rename).*",
+          "matcher": "^Edit$|^mcp__.*([dD][eE][lL][eE][tT][eE]|[rR][eE][mM][oO][vV][eE]|[mM][oO][vV][eE]|[rR][eE][nN][aA][mM][eE]).*",
           "if": null,
           "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
         }
@@ -1280,7 +1280,7 @@
         {
           "plugin": "cadence-obsidian",
           "event": "PreToolUse",
-          "matcher": "Bash|Edit|mcp__.*(delete|remove|move|rename).*",
+          "matcher": "^Bash$|^Edit$|mcp__.*([dD][eE][lL][eE][tT][eE]|[rR][eE][mM][oO][vV][eE]|[mM][oO][vV][eE]|[rR][eE][nN][aA][mM][eE]).*",
           "if": null,
           "commandHash": "aee750813d5d9e831abc921cfc6d3ff8ec170ca52158119f655ede783deadb5e"
         }

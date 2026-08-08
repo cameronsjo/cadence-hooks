@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.75.0] - 2026-08-08
+
 ### Added
 
 - **Supply-chain scanning in CI: `cargo audit` against the RustSec advisory database, and `cargo deny check bans licenses sources` against a new `deny.toml` (#434).** Both fail the build on a pull request or a push, where the change that introduced the finding is available to fix.
