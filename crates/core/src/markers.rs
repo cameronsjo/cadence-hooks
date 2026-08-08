@@ -26,6 +26,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The per-user private directory holding the advisory marker family.
 ///
@@ -367,6 +368,198 @@ pub fn claim_today(kind: &str, token: &str) -> bool {
     }
     let _ = write_marker(&path, &stamp);
     true
+}
+
+/// Filename prefix for the per-tool-event advisory dedupe markers, so the
+/// opportunistic sweep can recognize its own family without touching the
+/// session/polish/daily markers that share the directory.
+const DEDUPE_PREFIX: &str = "dedupe-";
+
+/// How long a dedupe marker is evidence that this advisory already fired.
+///
+/// A tool event lasts seconds; the window only has to outlive the fan-out of
+/// hook processes one event spawns. Ten minutes is generous enough that a slow
+/// or queued sibling process still finds the claim, and short enough that the
+/// same command re-run later in the session nudges again — which is the
+/// behavior an operator expects, since by then the advisory is new information.
+const DEDUPE_TTL: Duration = Duration::from_secs(600);
+
+/// True on the FIRST claim of `(session, tool event, hook, message)` — the
+/// per-tool-event advisory dedupe gate (claude-configurations#472).
+///
+/// One `hooks.json` can register the same command several times under one
+/// matcher with overlapping `if:` globs, so a single tool call spawns N
+/// identical hook processes and the operator reads the same advisory N times.
+/// Every one of those processes sees the same payload, so they derive the same
+/// key; the first to create the marker emits and the rest stay silent.
+///
+/// First-writer-wins via `create_new` (`O_EXCL`) on the final path — deliberately
+/// NOT [`write_marker`], whose stage-and-rename replaces an existing marker and
+/// would let every process "win".
+///
+/// **Every component is hashed**, never used as a path component: the session
+/// key, the tool fingerprint, and the hook+message are all payload-derived, so a
+/// crafted `--session-id ../../x` or a traversal-shaped command is inert (the
+/// result is always a direct child of [`marker_dir`]).
+///
+/// **Fails open in every direction** (ADR-0001) — this marker's presence
+/// *suppresses* output, so every uncertainty degrades toward emitting:
+///
+/// - no session key at all (neither `session_id` nor `transcript_path`) — the
+///   key would be session-global and could mute an unrelated session's advisory;
+/// - a non-private [`marker_dir`] — a co-tenant could pre-plant the (predictable)
+///   filename and silence the advisory for the whole window, the same reasoning
+///   [`claim_today`] carries;
+/// - any IO error creating the marker.
+///
+/// The session key is `session_id` else `transcript_path`, and NEVER
+/// [`session_scope`]: that helper falls back to `process::id()`, which differs
+/// per hook process and would give every member of the fan-out its own key —
+/// defeating the dedupe silently and completely.
+pub fn claim_tool_event_nudge(input: &HookInput, hook: &str, message: &str) -> bool {
+    claim_tool_event_nudge_within(input, hook, message, DEDUPE_TTL)
+}
+
+/// [`claim_tool_event_nudge`] with an explicit TTL, so the expiry behavior is
+/// testable without waiting ten minutes or backdating a file's mtime.
+fn claim_tool_event_nudge_within(
+    input: &HookInput,
+    hook: &str,
+    message: &str,
+    ttl: Duration,
+) -> bool {
+    if !marker_dir_is_private() {
+        return true;
+    }
+    let Some(session_key) = dedupe_session_key(input) else {
+        return true;
+    };
+    // Resolved once: every `marker_dir()` call re-runs `create_dir_all` and a
+    // `chmod`, and a hook process pays that latency on the user's tool call.
+    let dir = marker_dir();
+    let path = dir.join(format!(
+        "{DEDUPE_PREFIX}{:x}-{:x}-{:x}",
+        hash_of(session_key),
+        hash_of(&tool_event_fingerprint(input)),
+        hash_of(&format!("{hook}\u{1f}{message}")),
+    ));
+    // This family has no other GC, so each claim reaps the expired markers it
+    // walks past. Best-effort: a failed sweep is covered by the per-path
+    // expiry check below.
+    sweep_expired_dedupe_markers(&dir, ttl);
+    match create_exclusive(&path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if !dedupe_marker_is_expired(&path, ttl) {
+                return false;
+            }
+            // An expired marker is not evidence that THIS event nudged — treat
+            // it as absent and re-claim.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // Already gone: a concurrent sweep reaped it, and the claim
+                // below still decides who speaks.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // The expired marker is stuck. Emit rather than let an
+                // unreapable file mute the advisory for good — the retry
+                // below would read its presence as a lost race, which is
+                // exactly the wrong direction for a suppressing marker.
+                Err(_) => return true,
+            }
+            match create_exclusive(&path) {
+                // Losing this second race means a sibling process claimed the
+                // event first, which is the outcome the gate exists to produce.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+                _ => true,
+            }
+        }
+        Err(_) => true,
+    }
+}
+
+/// Create `path` as a new, empty file, refusing to follow a symlink squatting
+/// the name (`O_EXCL`) and refusing to reuse an existing one.
+fn create_exclusive(path: &Path) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
+}
+
+/// The session key for the dedupe gate: `session_id`, else `transcript_path`.
+/// `None` when the payload carries neither — the fail-open case.
+fn dedupe_session_key(input: &HookInput) -> Option<&str> {
+    input.session_id().or_else(|| input.transcript_path())
+}
+
+/// A stable string identifying *this tool call*, so two different commands in
+/// one session never share a dedupe key.
+///
+/// Fields are joined with U+001F (unit separator), a byte no tool payload
+/// carries in practice, so no two distinct field splits can render the same
+/// string by concatenation.
+fn tool_event_fingerprint(input: &HookInput) -> String {
+    let mut parts: Vec<&str> = vec![
+        input.tool_name().unwrap_or_default(),
+        input.cwd.as_deref().unwrap_or_default(),
+        input.prompt.as_deref().unwrap_or_default(),
+    ];
+    if let Some(tool_input) = input.tool_input.as_ref() {
+        parts.extend(
+            [
+                &tool_input.command,
+                &tool_input.cmd,
+                &tool_input.file_path,
+                &tool_input.path,
+                &tool_input.content,
+                &tool_input.old_string,
+                &tool_input.new_string,
+                &tool_input.patch,
+                &tool_input.skill,
+                &tool_input.args,
+            ]
+            .map(|field| field.as_deref().unwrap_or_default()),
+        );
+        if let Some(edits) = tool_input.edits.as_ref() {
+            for edit in edits {
+                parts.push(edit.old_string.as_deref().unwrap_or_default());
+                parts.push(edit.new_string.as_deref().unwrap_or_default());
+            }
+        }
+    }
+    parts.join("\u{1f}")
+}
+
+/// Is this dedupe marker older than `ttl` — i.e. no longer evidence that the
+/// advisory already fired for a live tool event?
+///
+/// A marker whose age cannot be established (unreadable metadata, or an mtime
+/// in the future from clock skew) reads as expired: uncertainty degrades toward
+/// emitting the advisory, never toward silencing it.
+fn dedupe_marker_is_expired(path: &Path, ttl: Duration) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return true;
+    };
+    modified.elapsed().is_ok_and(|age| age > ttl)
+}
+
+/// Remove every expired `dedupe-*` marker in [`marker_dir`]. Best-effort and
+/// entirely silent — an unreadable directory or an undeletable entry just
+/// leaves the marker for the per-path check to handle.
+fn sweep_expired_dedupe_markers(dir: &Path, ttl: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dedupe = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(DEDUPE_PREFIX));
+        if is_dedupe && dedupe_marker_is_expired(&path, ttl) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Write `contents` to a marker path symlink-safely.
@@ -1052,6 +1245,270 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         with_marker_dir(tmp.path(), || {
             assert!(marker_dir_is_private());
+        });
+    }
+
+    // --- claim_tool_event_nudge (the per-tool-event advisory dedupe gate, #472) ---
+
+    /// A `Bash` payload carrying a session id — the shape the fan-out of hook
+    /// processes for one tool call all see identically.
+    fn bash_event(session: &str, command: &str) -> HookInput {
+        HookInput {
+            session_id: Some(session.into()),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(crate::ToolInput {
+                command: Some(command.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claim_tool_event_nudge_fires_once_per_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let input = bash_event("sid", "git push");
+            assert!(
+                claim_tool_event_nudge(&input, "warn-overshare", "advisory"),
+                "the first process of a fan-out must emit"
+            );
+            for _ in 0..8 {
+                assert!(
+                    !claim_tool_event_nudge(&input, "warn-overshare", "advisory"),
+                    "every later process seeing the same event must stay silent"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn claim_tool_event_nudge_refires_for_a_distinct_tool_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            assert!(claim_tool_event_nudge(
+                &bash_event("sid", "git push"),
+                "warn-overshare",
+                "advisory"
+            ));
+            assert!(
+                claim_tool_event_nudge(
+                    &bash_event("sid", "gh pr create"),
+                    "warn-overshare",
+                    "advisory"
+                ),
+                "a different command is a different tool event and must nudge"
+            );
+            assert!(
+                claim_tool_event_nudge(
+                    &bash_event("other-sid", "git push"),
+                    "warn-overshare",
+                    "advisory"
+                ),
+                "another session's identical command must nudge"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_tool_event_nudge_refires_for_a_distinct_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let input = bash_event("sid", "git push");
+            assert!(claim_tool_event_nudge(&input, "warn-overshare", "first"));
+            assert!(
+                claim_tool_event_nudge(&input, "warn-overshare", "second"),
+                "a different advisory is different information and must reach the operator"
+            );
+            assert!(
+                claim_tool_event_nudge(&input, "other-hook", "first"),
+                "a different hook saying the same words is still a distinct advisory"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_tool_event_nudge_fails_open_without_a_session_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            // Neither session_id nor transcript_path: the key would be
+            // session-global, so the gate declines to suppress anything.
+            let input = HookInput {
+                tool_name: Some("Bash".into()),
+                tool_input: Some(crate::ToolInput {
+                    command: Some("git push".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert!(claim_tool_event_nudge(&input, "warn-overshare", "advisory"));
+            assert!(
+                claim_tool_event_nudge(&input, "warn-overshare", "advisory"),
+                "with no session key the gate must never suppress, however many times it is asked"
+            );
+
+            // The transcript path is the documented fallback and DOES key the
+            // gate — the positive control for the assertion above.
+            let keyed = HookInput {
+                transcript_path: Some("/tmp/transcript.jsonl".into()),
+                ..input
+            };
+            assert!(claim_tool_event_nudge(&keyed, "warn-overshare", "advisory"));
+            assert!(
+                !claim_tool_event_nudge(&keyed, "warn-overshare", "advisory"),
+                "transcript_path must key the gate when session_id is absent"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_tool_event_nudge_never_suppresses_from_the_shared_fail_open_base() {
+        // Same reasoning as claim_today: this marker's presence SUPPRESSES
+        // output, so on a pre-plantable shared base the gate must decline.
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("occupied");
+        std::fs::write(&not_a_dir, "").unwrap();
+        with_marker_dir(&not_a_dir, || {
+            assert!(
+                !marker_dir_is_private(),
+                "precondition: this must be the fail-open path, or the test proves nothing"
+            );
+            let input = bash_event("sid", "git push");
+            assert!(claim_tool_event_nudge(&input, "warn-overshare", "advisory"));
+            assert!(
+                claim_tool_event_nudge(&input, "warn-overshare", "advisory"),
+                "a degraded marker dir must never suppress an advisory"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_tool_event_nudge_refires_after_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let input = bash_event("sid", "git push");
+            assert!(claim_tool_event_nudge_within(
+                &input,
+                "warn-overshare",
+                "advisory",
+                DEDUPE_TTL
+            ));
+            assert!(
+                !claim_tool_event_nudge_within(&input, "warn-overshare", "advisory", DEDUPE_TTL),
+                "inside the window the claim still holds"
+            );
+
+            // Age the claim past its window by shrinking the window instead of
+            // waiting: an expired marker is not evidence this event nudged.
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                claim_tool_event_nudge_within(
+                    &input,
+                    "warn-overshare",
+                    "advisory",
+                    Duration::from_millis(1)
+                ),
+                "a marker older than the TTL must be reaped and the advisory re-claimed"
+            );
+        });
+    }
+
+    /// Every `dedupe-*` entry currently in the marker dir.
+    fn dedupe_marker_paths() -> Vec<PathBuf> {
+        std::fs::read_dir(marker_dir())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(DEDUPE_PREFIX))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn claim_tool_event_nudge_emits_when_an_expired_marker_cannot_be_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let input = bash_event("sid", "git push");
+            assert!(claim_tool_event_nudge_within(
+                &input,
+                "warn-overshare",
+                "advisory",
+                DEDUPE_TTL
+            ));
+
+            // Swap the claim for a directory at the same path: still expired,
+            // but now unreapable. Reading its presence as a lost race would
+            // mute the advisory permanently — the wrong direction for a marker
+            // whose presence suppresses.
+            let path = dedupe_marker_paths().pop().expect("the claim landed");
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                claim_tool_event_nudge_within(
+                    &input,
+                    "warn-overshare",
+                    "advisory",
+                    Duration::from_millis(1)
+                ),
+                "an expired marker that cannot be reaped must not suppress"
+            );
+        });
+    }
+
+    #[test]
+    fn claim_tool_event_nudge_never_escapes_the_private_dir() {
+        // Session id, command, hook, and message are all payload-controlled —
+        // every one of them is hashed, so the marker is always a direct child
+        // of the private dir.
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let input = bash_event("../../evil-session", "../../evil-command");
+            assert!(claim_tool_event_nudge(
+                &input,
+                "../../evil-hook",
+                "../../evil-message"
+            ));
+            let paths = dedupe_marker_paths();
+            assert_eq!(
+                paths.len(),
+                1,
+                "expected exactly one dedupe marker: {paths:?}"
+            );
+            assert_eq!(
+                paths[0].parent(),
+                Some(marker_dir().as_path()),
+                "marker must be a direct child of the private dir: {:?}",
+                paths[0]
+            );
+            let name = paths[0].file_name().unwrap().to_string_lossy();
+            assert!(
+                !name.contains('/') && !name.contains(".."),
+                "filename must carry no traversal: {name}"
+            );
+        });
+    }
+
+    #[test]
+    fn sweep_reaps_expired_dedupe_markers_and_leaves_the_family_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let stale = marker_dir().join(format!("{DEDUPE_PREFIX}1-2-3"));
+            create_exclusive(&stale).unwrap();
+            let neighbor = daily_marker("test-gate");
+            write_marker(&neighbor, "stamp").unwrap();
+
+            std::thread::sleep(Duration::from_millis(20));
+            sweep_expired_dedupe_markers(&marker_dir(), Duration::from_millis(1));
+
+            assert!(!stale.exists(), "an expired dedupe marker must be reaped");
+            assert!(
+                neighbor.exists(),
+                "the sweep must not touch markers outside its own family"
+            );
         });
     }
 

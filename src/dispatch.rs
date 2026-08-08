@@ -246,9 +246,40 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             // (Allow/Nudge let the tool proceed, so those still do).
             let enforced = matches!(result.outcome, Outcome::Block | Outcome::Ask);
             emit_telemetry_tail(enforced);
+            // Sits AFTER the telemetry tail on purpose: a suppressed duplicate
+            // is still a decision this hook made, so it stays counted in
+            // `denials.jsonl` and `hooks.jsonl`. Only the operator-facing
+            // emission is dropped.
+            if !claim_emission(&result, &input, hook_name) {
+                process::exit(Outcome::Nudge.code());
+            }
             emit_and_exit(&result, event);
         }
     }
+}
+
+/// Should this decision's advisory context actually reach the operator?
+///
+/// One `hooks.json` can register the same command several times under one
+/// matcher with overlapping `if:` globs, so a single tool call spawns N
+/// identical hook processes that each print the same advisory
+/// (claude-configurations#472). Every one of them sees the same payload, so
+/// they claim the same key and only the first emits.
+///
+/// **Only `Nudge` is gated, and only with a non-empty message.** A `Block` or
+/// `Ask` stops the operation, so suppressing its message would leave the
+/// operator staring at a halted tool call with no reason given — an advisory
+/// heard twice is noise, an enforcement heard zero times is a broken guard.
+/// `Allow` has nothing to say. The message is part of the key, so two hooks
+/// with genuinely different things to report both still speak.
+fn claim_emission(result: &CheckResult, input: &HookInput, hook_name: &str) -> bool {
+    if result.outcome != Outcome::Nudge {
+        return true;
+    }
+    let Some(message) = result.message.as_deref().filter(|m| !m.is_empty()) else {
+        return true;
+    };
+    cadence_hooks_core::markers::claim_tool_event_nudge(input, hook_name, message)
 }
 
 /// One invocation's decision, plus the two things the audit writes need that the
@@ -566,5 +597,90 @@ mod tests {
             ["dismiss-guard-rm", "CADENCE_ALLOW_MAIN"],
             "three rides of one dismissal are one event; a second mechanism is another"
         );
+    }
+
+    // --- claim_emission (the per-tool-event advisory dedupe gate, #472) ---
+
+    /// The payload every process of one fan-out sees: same session, same
+    /// command, same everything.
+    fn fanout_input(command: &str) -> HookInput {
+        HookInput {
+            session_id: Some("sid-472".into()),
+            ..cadence_hooks_core::test_builders::make_bash(command)
+        }
+    }
+
+    #[test]
+    fn dedupe_suppresses_a_repeat_nudge() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("git push");
+            let nudge = CheckResult::nudge("mind the overshare");
+
+            assert!(
+                claim_emission(&nudge, &input, "warn-overshare"),
+                "the first process of the fan-out must emit"
+            );
+            assert!(
+                !claim_emission(&nudge, &input, "warn-overshare"),
+                "a second identical registration must stay silent"
+            );
+            assert!(
+                claim_emission(
+                    &CheckResult::nudge("a different advisory"),
+                    &input,
+                    "warn-overshare"
+                ),
+                "a genuinely different message is different information and must reach the operator"
+            );
+        });
+    }
+
+    #[test]
+    fn dedupe_never_suppresses_a_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("git push --force origin main");
+            let block = CheckResult::block("blocked");
+            let ask = CheckResult {
+                outcome: Outcome::Ask,
+                message: Some("confirm?".to_string()),
+                block_metadata: None,
+                bypass: None,
+            };
+
+            for _ in 0..3 {
+                assert!(
+                    claim_emission(&block, &input, "git-safety"),
+                    "an enforcement message must never be deduped away"
+                );
+                assert!(
+                    claim_emission(&ask, &input, "git-safety"),
+                    "an Ask gates the operator and must always carry its reason"
+                );
+            }
+        });
+    }
+
+    /// The #472 regression fixture: one multi-command Bash call, registered
+    /// under overlapping `if:` globs that each match a different segment
+    /// (`git commit`, `git push`, `gh pr create`), spawns three processes with
+    /// identical payloads — and must produce exactly ONE emission.
+    #[test]
+    fn dedupe_collapses_a_multi_command_fan_out_to_one_emission() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("git commit -m 'ship it' && git push && gh pr create --fill");
+            let nudge = CheckResult::nudge("polish before opening the PR");
+
+            let emissions = (0..3)
+                .filter(|_| claim_emission(&nudge, &input, "nudge-polish-before-pr"))
+                .count();
+
+            assert_eq!(
+                emissions, 1,
+                "three overlapping registrations of one tool event must nudge once"
+            );
+        });
     }
 }

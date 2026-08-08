@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Identical advisory context is now emitted once per tool event instead of once per registration (cameronsjo/claude-configurations#472).** A `hooks.json` can register the same command several times under one matcher with overlapping `if:` globs, so one tool call spawned that many identical hook processes and the operator read the same nudge up to nine times. The universal dispatch tail now claims a per-`(session, tool event, hook, message)` marker before emitting advisory context, and only the first claimant speaks. Fails open in every direction — no session key, a non-private marker dir, or any IO error all emit — and `Block`/`Ask` are excluded by construction, so an enforcement message is never suppressed. Claims expire after ten minutes and are reaped opportunistically; suppressed emissions stay counted in `denials.jsonl` and `hooks.jsonl`. A new audit assertion (`no_duplicate_command_registrations_per_matcher`) ratchets the wiring side, allowlisting the twelve commands duplicated today and failing on a new one.
+
 ## [0.75.0] - 2026-08-08
 
 ### Added
