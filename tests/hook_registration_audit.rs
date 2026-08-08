@@ -205,6 +205,14 @@ struct HookRef {
     has_if_filter: bool,
     /// The hook event type from hooks.json (e.g., "PreToolUse", "PostToolUse")
     event_type: String,
+    /// Which matcher block inside `event_type` this hook was declared in.
+    ///
+    /// The registration fan-out behind claude-configurations#472 is *within*
+    /// one block: the same command listed N times under one matcher, each entry
+    /// carrying a different `if:` glob. Counting per event alone would miss
+    /// that, and counting across blocks would flag the legitimate case of one
+    /// command wired under two different matchers.
+    matcher_index: usize,
 }
 
 /// Where the `cadence` monorepo keeps its plugins, relative to the workspace
@@ -297,6 +305,78 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
         "SessionStart context injector; canon is its only registrar",
     ),
 ];
+
+/// Commands a plugin registers MORE THAN ONCE inside a single matcher block —
+/// the registration fan-out behind claude-configurations#472.
+///
+/// Each duplicate entry carries its own `if:` glob (one rule per `if:`, since
+/// alternation is a silent PostToolUse dead end), so a tool call matching K of
+/// them spawns K identical hook processes that each print the same advisory.
+/// The binary-side dedupe in `crates/core/src/markers.rs` collapses the
+/// *output*; the wiring itself is a cadence-monorepo concern tracked at
+/// [`DUPLICATE_REGISTRATION_TRACKING_REF`].
+///
+/// This list documents the offenders as they stood when the check landed. It is
+/// an allowlist, not an approval: the assertion's job is to fail on a NEW one,
+/// so a wiring change that consolidates entries is welcome and just needs its
+/// line removed here. Counts are deliberately absent — this audit reads a
+/// developer's working tree, whose freshness varies, so pinning exact
+/// multiplicities would fail on checkout drift rather than on real drift.
+const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
+    "cadence nudge-polish-before-pr",
+    "cadence redact-external-content",
+    "cadence warn-overshare",
+    "guardrails guard-op-vault-scan",
+    "guardrails guard-rm",
+    "guardrails verify-pr-autoclose",
+    "guardrails warn-alias-parsing",
+    "guardrails warn-branch-base",
+    "guardrails warn-going-public",
+    "guardrails warn-issue-tracker",
+    "metrics log-polish-nudge",
+    "session guard",
+];
+
+/// claude-configurations#472: the binary's dedupe allowlist may only name hooks
+/// this inventory records as real fan-outs.
+///
+/// The two lists are deliberately different sizes — the inventory is every
+/// duplicated *registration*, the allowlist is the subset whose duplicate
+/// processes print an operator-facing advisory — but the allowlist can never
+/// contain a hook the wiring does not actually fan out. That direction is what
+/// keeps the gate from silently acquiring the power to suppress a hook whose
+/// repeats are all genuine.
+#[test]
+fn dedupe_allowlist_only_names_known_duplicate_registrations() {
+    let inventory: BTreeSet<&str> = KNOWN_DUPLICATE_REGISTRATIONS
+        .iter()
+        .filter_map(|entry| entry.split_once(' ').map(|(_plugin, command)| command))
+        .collect();
+
+    let unbacked: Vec<&&str> = cadence_hooks_core::markers::DEDUPE_ELIGIBLE_HOOKS
+        .iter()
+        .filter(|hook| !inventory.contains(**hook))
+        .collect();
+
+    assert!(
+        unbacked.is_empty(),
+        "markers::DEDUPE_ELIGIBLE_HOOKS names a hook that KNOWN_DUPLICATE_REGISTRATIONS does \
+         not record as a duplicate registration, so the dedupe gate can suppress advisories \
+         from a hook that never fans out:\n{}\n\n\
+         Either add the wiring-side duplicate to KNOWN_DUPLICATE_REGISTRATIONS, or drop the \
+         hook from the allowlist in crates/core/src/markers.rs.",
+        unbacked
+            .iter()
+            .map(|hook| format!("  `{hook}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Where the wiring-side consolidation of [`KNOWN_DUPLICATE_REGISTRATIONS`] is
+/// tracked. The manifests live in the cadence monorepo, not this repo, so the
+/// binary-side fix and the wiring cleanup are separate PRs in separate repos.
+const DUPLICATE_REGISTRATION_TRACKING_REF: &str = "cameronsjo/claude-configurations#472";
 
 /// settings.json shell scripts that trip the keyword-overlap heuristic but are
 /// NOT duplicates of plugin hooks. Each entry documents the distinction.
@@ -435,7 +515,7 @@ fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> 
         let Some(matchers) = matchers.as_array() else {
             continue;
         };
-        for matcher_block in matchers {
+        for (matcher_index, matcher_block) in matchers.iter().enumerate() {
             let matcher_str = matcher_block
                 .get("matcher")
                 .and_then(serde_json::Value::as_str)
@@ -466,6 +546,7 @@ fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> 
                     is_bash_matcher: is_bash,
                     has_if_filter: has_if,
                     event_type: event.clone(),
+                    matcher_index,
                 });
             }
         }
@@ -785,6 +866,84 @@ fn bash_hooks_have_if_filter() {
          or add to INTENTIONAL_UNFILTERED_BASH_HOOKS if broad matching is required.\n\
          {STALE_CHECKOUT_HINT}",
         unfiltered.join("\n")
+    );
+}
+
+/// claude-configurations#472: no NEW command may be registered more than once
+/// inside one matcher block.
+///
+/// A duplicate registration is a fan-out — one tool call, K identical hook
+/// processes, K copies of the same advisory in the operator's terminal. The
+/// binary now dedupes the emissions, so this check exists to keep the wiring
+/// from quietly growing new fan-outs faster than they are consolidated.
+///
+/// Passing with a populated [`KNOWN_DUPLICATE_REGISTRATIONS`] is the intended
+/// landing state: the list is the inventory, the assertion is the ratchet.
+#[test]
+fn no_duplicate_command_registrations_per_matcher() {
+    require_plugin_refs!(all_refs);
+
+    let allowed: BTreeSet<&str> = KNOWN_DUPLICATE_REGISTRATIONS.iter().copied().collect();
+
+    let mut counts: BTreeMap<(&str, &str, usize, &str), usize> = BTreeMap::new();
+    for (dir, refs) in &all_refs {
+        for r in refs {
+            *counts
+                .entry((
+                    dir.as_str(),
+                    r.event_type.as_str(),
+                    r.matcher_index,
+                    r.command.as_str(),
+                ))
+                .or_default() += 1;
+        }
+    }
+
+    let mut new_offenders = Vec::new();
+    let mut still_duplicated: BTreeSet<&str> = BTreeSet::new();
+    for ((dir, event, index, command), count) in &counts {
+        if *count < 2 {
+            continue;
+        }
+        if allowed.contains(command) {
+            still_duplicated.insert(command);
+            continue;
+        }
+        new_offenders.push(format!(
+            "  {dir}/hooks.json {event} matcher[{index}] -> `{command}` registered {count}x"
+        ));
+    }
+
+    assert!(
+        new_offenders.is_empty(),
+        "a command is registered more than once inside one matcher block, so one tool call \
+         spawns that many identical hook processes:\n{}\n\n\
+         Consolidate the entries in the plugin's hooks.json (one registration, a broader \
+         `if:` filter, or let the binary's own matching do the precision work), or — if the \
+         fan-out is deliberate — add the command to KNOWN_DUPLICATE_REGISTRATIONS with the \
+         wiring cleanup tracked at {DUPLICATE_REGISTRATION_TRACKING_REF}.\n\
+         {STALE_CHECKOUT_HINT}",
+        new_offenders.join("\n")
+    );
+
+    // Self-expiring, the same discipline `pending_wiring_hooks_are_still_unwired`
+    // applies to PENDING_WIRING_HOOKS: an entry that no longer names a real
+    // duplicate is dead cover for the next one.
+    let resolved: Vec<&&str> = KNOWN_DUPLICATE_REGISTRATIONS
+        .iter()
+        .filter(|command| !still_duplicated.contains(**command))
+        .collect();
+    assert!(
+        resolved.is_empty(),
+        "KNOWN_DUPLICATE_REGISTRATIONS entry is no longer duplicated anywhere — the wiring \
+         was consolidated, so the allowlist entry has served its purpose and must be \
+         removed:\n{}\n\n\
+         {STALE_CHECKOUT_HINT}",
+        resolved
+            .iter()
+            .map(|command| format!("  `{command}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
