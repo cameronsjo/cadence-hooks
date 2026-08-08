@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Supply-chain scanning in CI: `cargo audit` against the RustSec advisory database, and `cargo deny check bans licenses sources` against a new `deny.toml` (#434).** Both fail the build on a pull request or a push, where the change that introduced the finding is available to fix.
+- **The weekly advisory sweep files an issue instead of reddening `main` (#434).** The Monday run exists to catch advisories published *after* a merge, so it has no pull request attached and a failure would leave `main` red with nothing to fix it against. It now opens or updates one tracking issue through `scripts/advisory-issue.sh` and lets the job pass; the next clean sweep closes that issue. A non-zero `cargo audit` that names no `RUSTSEC-` id is reported as the tooling or network failure it probably is, rather than as a vulnerability. Advisory text reaches `gh` only through `--body-file`, never shell interpolation, and the issue body is fence-widened and length-capped so external advisory text can neither break out of its code block nor exceed GitHub's body limit. Only the schedule-only job carries `issues: write`. Both tools are cached on their pinned versions and version-verified before use, so only a version bump pays their build cost.
+
 ### Fixed
 
 - **Codex `apply_patch` hook payloads now normalize both object-wrapped patch-body forms (#639).** The official Codex 0.146.0 `tool_input.command` envelope and the adapter-emitted `tool_input.input` envelope now reach per-target security guards instead of failing closed as if the patch body were missing. Raw-string `tool_input`, top-level `input`, and already-normalized `tool_input.patch` compatibility remain intact; conflicting recognized bodies and malformed or missing bodies fail closed without echoing patch content.
