@@ -132,9 +132,10 @@ pub(crate) fn git_dir_is_common_dir(git_dir: &Path, repo_root: &Path) -> bool {
 }
 
 /// Pure-ish: does `path` live under a temp root? `tmpdir` is the `$TMPDIR`
-/// value, when set. True for `/tmp`, `/private/tmp`, and `$TMPDIR` (with the
-/// canonicalized form too, for macOS's `/var/folders` vs `/private/var`
-/// split). The one non-pure step is a `canonicalize` of the `$TMPDIR` value.
+/// value, when set, and `home` the user's home directory, when resolvable.
+/// True for `/tmp`, `/private/tmp`, and `$TMPDIR` (with the canonicalized form
+/// too, for macOS's `/var/folders` vs `/private/var` split). The one non-pure
+/// step is a `canonicalize` of the `$TMPDIR` value.
 ///
 /// This is the generic predicate behind [`is_temp_root`]; `guardrails::guard_rm`
 /// reuses it to classify an `rm` target path (cadence-hooks#261), while
@@ -142,9 +143,55 @@ pub(crate) fn git_dir_is_common_dir(git_dir: &Path, repo_root: &Path) -> bool {
 /// carve-out. Canonicalizes `tmpdir` on every call — fine for a single check,
 /// but see [`path_under_temp_root_with_canonical`] when a caller checks
 /// several candidate paths against the same `$TMPDIR` in one pass.
-pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>) -> bool {
-    let canonical = canonicalize_tmpdir(tmpdir);
-    path_under_temp_root_with_canonical(path, tmpdir, canonical.as_deref())
+pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>, home: Option<&str>) -> bool {
+    let canonical = canonicalize_tmpdir(tmpdir, home);
+    path_under_temp_root_with_canonical(path, tmpdir, canonical.as_deref(), home)
+}
+
+/// True when `tmpdir` IS the home directory or an ancestor of it — under
+/// **either** spelling, the literal one or the resolved one.
+///
+/// A `$TMPDIR` that wide reclassifies every path under home as disposable, and
+/// the consumers of this predicate read "disposable" as ALLOW — with
+/// `TMPDIR=$HOME`, `rm -rf ~/Documents` was a silent allow (cadence-hooks#569).
+/// A temp root that swallows the user's whole working life is not a temp root,
+/// so it is rejected outright rather than trusted.
+///
+/// **Both spellings, because the literal one is what the prefix test uses.**
+/// `path_under_temp_root_with_canonical` matches an operand against the RAW
+/// `$TMPDIR` string, so an operand spelled the same way as a symlinked or
+/// case-differing `$TMPDIR` matches it — and a lexical-only check calls that
+/// value acceptable, because it compares unequal to home while naming the same
+/// directory. Two spellings survived a literal-only check: `TMPDIR=/scratch`
+/// where `/scratch -> $HOME`, and `TMPDIR=/users/dev` against `HOME=/Users/dev`
+/// on a case-insensitive volume (macOS's default, and a shipped target). Both
+/// are the exact failure class #569 exists to close.
+///
+/// Component-wise via [`Path::starts_with`], so `/Users/devon` does not swallow
+/// a home at `/Users/devon-old`. An unset or empty `home` disables the rule:
+/// nothing to protect means nothing to reject, and the alternative — treating
+/// an unresolvable home as "reject everything" — would disable the temp
+/// carve-out wholesale. A resolution failure on either side likewise declines
+/// to reject: an unreadable path is this predicate's blind spot, not evidence.
+///
+/// Costs up to two `realpath` chains, and only on the path where the cheap
+/// comparison already said no — the common case for a normal `$TMPDIR`. Paid
+/// deliberately: the callers are hooks that already spawn `git` or stat `.git`,
+/// and the alternative is a hole in the one branch that grants the carve-out.
+fn tmpdir_covers_home(tmpdir: &Path, home: Option<&str>) -> bool {
+    let Some(home) = home.map(str::trim).filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    if Path::new(home).starts_with(tmpdir) {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(tmpdir),
+        std::fs::canonicalize(Path::new(home)),
+    ) {
+        (Ok(resolved_tmpdir), Ok(resolved_home)) => resolved_home.starts_with(&resolved_tmpdir),
+        _ => false,
+    }
 }
 
 /// `$TMPDIR`, canonicalized once — factored out of [`path_under_temp_root`]
@@ -153,11 +200,25 @@ pub fn path_under_temp_root(path: &Path, tmpdir: Option<&str>) -> bool {
 /// fallback chain, cadence-hooks#403 code review) can canonicalize once and
 /// reuse it, instead of re-running a real `realpath` syscall chain per
 /// candidate.
-pub(crate) fn canonicalize_tmpdir(tmpdir: Option<&str>) -> Option<PathBuf> {
+///
+/// Returns `None` for a `$TMPDIR` that covers `home` — [`usable_tmpdir`] has
+/// already rejected it under both spellings, so no further check is owed here.
+pub(crate) fn canonicalize_tmpdir(tmpdir: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    usable_tmpdir(tmpdir, home).and_then(|t| std::fs::canonicalize(t).ok())
+}
+
+/// `$TMPDIR`, trimmed, when the value is usable as a temp root at all:
+/// non-empty, not the filesystem root, and not covering `home`.
+///
+/// One definition rather than a repeated filter chain, because both callers
+/// below decide the same security question and a divergence between them would
+/// be a hole in exactly one of the two paths. This is the single veto for the
+/// whole `via_env` branch — gating only the branch's canonical comparand left
+/// its raw one, the one that actually fires, unguarded.
+fn usable_tmpdir<'a>(tmpdir: Option<&'a str>, home: Option<&str>) -> Option<&'a str> {
     tmpdir
         .map(str::trim)
-        .filter(|t| !t.is_empty() && *t != "/")
-        .and_then(|t| std::fs::canonicalize(t).ok())
+        .filter(|t| !t.is_empty() && *t != "/" && !tmpdir_covers_home(Path::new(t), home))
 }
 
 /// Same check as [`path_under_temp_root`], but takes an already-canonicalized
@@ -167,20 +228,18 @@ pub(crate) fn path_under_temp_root_with_canonical(
     path: &Path,
     tmpdir: Option<&str>,
     tmpdir_canonical: Option<&Path>,
+    home: Option<&str>,
 ) -> bool {
     let fixed = path.starts_with("/tmp") || path.starts_with("/private/tmp");
-    let via_env = tmpdir
-        .map(str::trim)
-        .filter(|t| !t.is_empty() && *t != "/")
-        .is_some_and(|t| {
-            // `path` (a repo root from `git rev-parse --show-toplevel`, or a
-            // resolved `rm` target) may be canonicalized (`/private/var/…` on
-            // macOS) while `$TMPDIR` is not (`/var/folders/…`) — compare
-            // against the canonicalized tmpdir too, or the match never fires
-            // on macOS.
-            path.starts_with(t)
-                || tmpdir_canonical.is_some_and(|c| c != Path::new("/") && path.starts_with(c))
-        });
+    let via_env = usable_tmpdir(tmpdir, home).is_some_and(|t| {
+        // `path` (a repo root from `git rev-parse --show-toplevel`, or a
+        // resolved `rm` target) may be canonicalized (`/private/var/…` on
+        // macOS) while `$TMPDIR` is not (`/var/folders/…`) — compare
+        // against the canonicalized tmpdir too, or the match never fires
+        // on macOS.
+        path.starts_with(t)
+            || tmpdir_canonical.is_some_and(|c| c != Path::new("/") && path.starts_with(c))
+    });
     fixed || via_env
 }
 
@@ -188,8 +247,8 @@ pub(crate) fn path_under_temp_root_with_canonical(
 /// enforcing worktree discipline on them would only produce noise. Delegates
 /// to [`path_under_temp_root`] — kept as a named alias for the enforce-worktree
 /// carve-out's readability.
-pub fn is_temp_root(repo_root: &Path, tmpdir: Option<&str>) -> bool {
-    path_under_temp_root(repo_root, tmpdir)
+pub fn is_temp_root(repo_root: &Path, tmpdir: Option<&str>, home: Option<&str>) -> bool {
+    path_under_temp_root(repo_root, tmpdir, home)
 }
 
 /// Lexically normalize `dir`'s components — resolving `.` and `..` without
@@ -338,7 +397,12 @@ pub fn would_block_here(dir: &Path) -> bool {
     };
     let repo_root_path = Path::new(&repo_root);
     let is_primary = is_primary_checkout(&repo_root);
-    let temp_root = is_temp_root(repo_root_path, std::env::var("TMPDIR").ok().as_deref());
+    let home = crate::paths::user_home_lossy_or_default();
+    let temp_root = is_temp_root(
+        repo_root_path,
+        std::env::var("TMPDIR").ok().as_deref(),
+        Some(&home),
+    );
     let snoozed = is_snoozed_now(repo_root_path);
     let allow_main_env = is_truthy(std::env::var("CADENCE_ALLOW_MAIN").ok().as_deref());
     let repo_declared = is_primary
@@ -466,13 +530,100 @@ mod tests {
 
     #[test]
     fn tmp_roots_are_temp() {
-        assert!(is_temp_root(Path::new("/tmp/scratch-repo"), None));
-        assert!(is_temp_root(Path::new("/private/tmp/fixture"), None));
+        assert!(is_temp_root(Path::new("/tmp/scratch-repo"), None, None));
+        assert!(is_temp_root(Path::new("/private/tmp/fixture"), None, None));
     }
 
     #[test]
     fn home_repo_is_not_temp() {
-        assert!(!is_temp_root(Path::new("/Users/dev/Projects/repo"), None));
+        assert!(!is_temp_root(
+            Path::new("/Users/dev/Projects/repo"),
+            None,
+            None
+        ));
+    }
+
+    // --- #569: a `$TMPDIR` that swallows home is not a temp root ---
+
+    /// `TMPDIR=$HOME` reclassified the entire home directory as disposable,
+    /// and the ALLOW consumers read that literally: `rm -rf ~/Documents` was a
+    /// silent allow. The value is refused rather than trusted.
+    #[test]
+    fn tmpdir_equal_to_home_is_not_a_temp_root() {
+        assert!(!is_temp_root(
+            Path::new("/Users/dev/Documents"),
+            Some("/Users/dev"),
+            Some("/Users/dev")
+        ));
+    }
+
+    /// One level up is worse, not better — `/Users` covers every home on the
+    /// machine.
+    #[test]
+    fn tmpdir_ancestor_of_home_is_not_a_temp_root() {
+        assert!(!is_temp_root(
+            Path::new("/Users/dev/Documents"),
+            Some("/Users"),
+            Some("/Users/dev")
+        ));
+        // Component-wise: a sibling home with a shared string prefix is not
+        // covered, so the rejection stays as narrow as it should be.
+        assert!(is_temp_root(
+            Path::new("/Users/dev-old/scratch"),
+            Some("/Users/dev-old"),
+            Some("/Users/dev")
+        ));
+    }
+
+    /// A `$TMPDIR` that only *resolves* to home — the literal strings compare
+    /// unequal, so a lexical-only check granted the carve-out and the raw
+    /// prefix test then matched every operand spelled through the symlink.
+    /// Uses real directories: the whole point is that resolution, not string
+    /// comparison, is what settles it.
+    #[test]
+    #[cfg(unix)]
+    fn tmpdir_symlinked_to_home_is_not_a_temp_root() {
+        let scratch = scratch("tmpdir-symlink-home");
+        let home = scratch.path().join("home");
+        let link = scratch.path().join("tmpdir-link");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+
+        let home_str = home.to_str().unwrap();
+        let link_str = link.to_str().unwrap();
+        // Sanity: the two spellings really are lexically unrelated, so a
+        // lexical-only check would have granted the carve-out here.
+        assert!(!Path::new(home_str).starts_with(link_str));
+
+        assert!(
+            !is_temp_root(&link.join("Documents"), Some(link_str), Some(home_str)),
+            "a $TMPDIR that resolves to home must not earn the temp carve-out"
+        );
+    }
+
+    /// The real macOS `$TMPDIR` is nowhere near home and keeps working.
+    #[test]
+    fn macos_var_folders_tmpdir_still_honored() {
+        assert!(is_temp_root(
+            Path::new("/var/folders/xy/T/repo"),
+            Some("/var/folders/xy/T"),
+            Some("/Users/dev")
+        ));
+    }
+
+    /// Windows puts the per-user temp dir UNDER the profile directory, which
+    /// is why the rule rejects only an ancestor-or-equal of home and not
+    /// "anything under home" — the latter would kill the carve-out on Windows
+    /// outright.
+    #[test]
+    fn windows_appdata_temp_under_home_still_honored() {
+        let tmp = "C:/Users/dev/AppData/Local/Temp";
+        assert!(is_temp_root(
+            Path::new("C:/Users/dev/AppData/Local/Temp/repo"),
+            Some(tmp),
+            Some("C:/Users/dev")
+        ));
     }
 
     // --- is_claude_managed_dir / is_plan_doc_dir ---
