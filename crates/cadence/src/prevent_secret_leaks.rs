@@ -3431,4 +3431,39 @@ mod tests {
             drifted.join("\n")
         );
     }
+
+    // --- $() early close (no depth tracking) leaves unmatched quote ---
+    // `split_segments` has no `$()` depth, so a `)` inside a quoted string
+    // is not a separator but the segmenter doesn't know that. The outer quote
+    // state then sees an unmatched quote and swallows everything after it.
+
+    #[test]
+    fn subst_early_close_single_quote_should_not_bypass() {
+        use cadence_hooks_core::Outcome::Block;
+        let result = SecretLeaksGuard.run(&make_bash_input("echo $(echo ') && cat .env"));
+        assert_eq!(
+            result.outcome, Block,
+            "$() early close + unmatched single-quote bypassed the guard"
+        );
+    }
+
+    #[test]
+    fn subst_early_close_double_quote_should_not_bypass() {
+        use cadence_hooks_core::Outcome::Block;
+        let result = SecretLeaksGuard.run(&make_bash_input(r#"echo $(echo "a) && cat .env"#));
+        assert_eq!(
+            result.outcome, Block,
+            "$() early close + unmatched double-quote bypassed the guard"
+        );
+    }
+
+    #[test]
+    fn subst_early_close_with_different_reader_should_not_bypass() {
+        use cadence_hooks_core::Outcome::Block;
+        let result = SecretLeaksGuard.run(&make_bash_input("grep foo $(echo ') && cat .env"));
+        assert_eq!(
+            result.outcome, Block,
+            "$() early close + unmatched quote bypassed with a different head"
+        );
+    }
 }

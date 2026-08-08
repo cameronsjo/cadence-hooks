@@ -1208,4 +1208,31 @@ mod tests {
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
+
+    // --- ANSI-C redirect bypass (no `$'…'` state in redirect parser) ---
+    // The redirect parser has single-quote and double-quote tracking but no
+    // ANSI-C (`$'…'`) state. An escaped quote (`\'`) looks like a close,
+    // the real `'` reopens a phantom string, and the `>` after it is content.
+
+    #[test]
+    fn ansi_c_escaped_quote_should_not_bypass_clobber() {
+        let result = make_bash_input(r"echo $'a\'b' > .env");
+        let result = SecretWritesGuard.run(&result);
+        assert_eq!(
+            result.outcome,
+            cadence_hooks_core::Outcome::Block,
+            "ANSI-C escaped quote bypassed clobber redirect"
+        );
+    }
+
+    #[test]
+    fn ansi_c_escaped_quote_should_not_bypass_append() {
+        let result = make_bash_input(r"echo $'a\'b' >> .env");
+        let result = SecretWritesGuard.run(&result);
+        assert_eq!(
+            result.outcome,
+            cadence_hooks_core::Outcome::Block,
+            "ANSI-C escaped quote bypassed append redirect"
+        );
+    }
 }

@@ -56,6 +56,100 @@ enum Quote {
     AnsiC,
 }
 
+impl Quote {
+    /// Whether a `\` at `chars[i]` escapes the character after it inside this
+    /// quoting mode. `'…'` takes no escapes at all; `"…"` escapes only `"` and
+    /// `\`; `$'…'` escapes anything, `'` included.
+    fn escapes_next(self, chars: &[char], i: usize) -> bool {
+        match self {
+            Quote::Single => false,
+            Quote::Double => matches!(chars.get(i + 1), Some('"' | '\\')),
+            Quote::AnsiC => chars.get(i + 1).is_some(),
+        }
+    }
+
+    /// Whether `c` closes this quoting mode.
+    fn closed_by(self, c: char) -> bool {
+        match self {
+            Quote::Single | Quote::AnsiC => c == '\'',
+            Quote::Double => c == '"',
+        }
+    }
+}
+
+/// Advance `quote` across whatever quoting syntax sits at `chars[i]`, returning
+/// the index just past what was consumed — or `None` when the character is
+/// ordinary text the caller must interpret itself (an operator, a filename
+/// character, a paren).
+///
+/// One implementation so every index-walking parser here reads a quoted run the
+/// way [`split_segments_with_ops`] and [`tokenize`] do. A parser that tracks
+/// only `'` and `"` desyncs on `$'…'`: the escaped quote in `$'a\'b'` reads as
+/// the closer, the real closer reopens a phantom string, and everything after
+/// it — a `>` redirect, a `)` terminator — becomes quoted content the guards
+/// never see (cameronsjo/cadence-hooks#551).
+fn scan_quote_syntax(chars: &[char], i: usize, quote: &mut Option<Quote>) -> Option<usize> {
+    let c = chars[i];
+    if let Some(q) = *quote {
+        if c == '\\' && q.escapes_next(chars, i) {
+            return Some(i + 2);
+        }
+        if q.closed_by(c) {
+            *quote = None;
+        }
+        return Some(i + 1);
+    }
+    match c {
+        // Outside quotes a backslash escapes the next character, so `\'` and
+        // `\"` open nothing. A backslash-newline is a line continuation and is
+        // left to the caller.
+        '\\' if chars.get(i + 1).is_some_and(|&n| n != '\n') => Some(i + 2),
+        '$' if chars.get(i + 1) == Some(&'\'') => {
+            *quote = Some(Quote::AnsiC);
+            Some(i + 2)
+        }
+        '\'' => {
+            *quote = Some(Quote::Single);
+            Some(i + 1)
+        }
+        '"' => {
+            *quote = Some(Quote::Double);
+            Some(i + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Consume one quoted run starting at `chars[i]` — `'…'`, `"…"`, or `$'…'` —
+/// appending its literal content (quotes and escapes removed) to `out`. Returns
+/// the index just past the run, or `None` when `chars[i]` opens no quoted run.
+///
+/// The word-level companion to [`scan_quote_syntax`]: used where a parser is
+/// building a value (a redirect target) rather than tracking state. An
+/// unterminated run consumes the rest of the input, matching [`tokenize`].
+fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+    let (mode, mut j) = match chars[i] {
+        '\'' => (Quote::Single, i + 1),
+        '"' => (Quote::Double, i + 1),
+        '$' if chars.get(i + 1) == Some(&'\'') => (Quote::AnsiC, i + 2),
+        _ => return None,
+    };
+    while j < chars.len() {
+        let c = chars[j];
+        if c == '\\' && mode.escapes_next(chars, j) {
+            out.push(chars[j + 1]);
+            j += 2;
+            continue;
+        }
+        if mode.closed_by(c) {
+            return Some(j + 1);
+        }
+        out.push(c);
+        j += 1;
+    }
+    Some(j)
+}
+
 /// Split a shell command into whitespace-separated tokens, honoring quotes.
 ///
 /// Content inside matching `'` or `"` pairs stays in one token with the quotes
@@ -2105,9 +2199,13 @@ fn flush_segment_with_op(
 /// Extract clobber-redirect targets from a shell command segment: the file
 /// argument following a `>` or `>|` operator. Append redirects (`>>`) do NOT
 /// truncate an existing file, so they are excluded — the operator is consumed
-/// but no target is recorded for it. Quote-aware: a `>` inside `'…'`/`"…"` is
+/// but no target is recorded for it. Quote-aware through the shared
+/// [`scan_quote_syntax`] state machine: a `>` inside `'…'`/`"…"`/`$'…'` is
 /// literal text, not a redirect operator, so prose like `echo "a > b" > c`
-/// yields only `c`. A stream-prefixed form (`2>`, `1>`) still names a file
+/// yields only `c`, while `echo $'a\'b' > .env` still yields `.env` — an
+/// ANSI-C run's escaped quote no longer reads as its closer and hides the
+/// redirect behind a phantom string (cameronsjo/cadence-hooks#551). A
+/// stream-prefixed form (`2>`, `1>`) still names a file
 /// that gets clobbered, so its target is included — the leading digit is just
 /// an ordinary character before the operator. A fd-duplication form (`>&2`)
 /// has no file target: the target-collection loop below stops at `&`,
@@ -2123,22 +2221,15 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut targets = Vec::new();
     let mut i = 0;
-    let mut quote: Option<char> = None;
+    let mut quote: Option<Quote> = None;
 
     while i < chars.len() {
         let c = chars[i];
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            i += 1;
+        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+            i = next;
             continue;
         }
         match c {
-            '\'' | '"' => {
-                quote = Some(c);
-                i += 1;
-            }
             '>' => {
                 i += 1;
                 // `>>` (append) does not clobber — consume the doubled
@@ -2159,15 +2250,8 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
                 let mut target = String::new();
                 while i < chars.len() {
                     let tc = chars[i];
-                    if tc == '\'' || tc == '"' {
-                        i += 1;
-                        while i < chars.len() && chars[i] != tc {
-                            target.push(chars[i]);
-                            i += 1;
-                        }
-                        if i < chars.len() {
-                            i += 1; // closing quote
-                        }
+                    if let Some(next) = take_quoted_run(&chars, i, &mut target) {
+                        i = next;
                         continue;
                     }
                     // A backslash-escaped whitespace char is part of the
@@ -2206,9 +2290,12 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
 /// file, append included — the right set for a caller that cares whether a file
 /// is *mutated* at all, not just clobbered.
 ///
-/// Quote-aware: a `>` inside `'…'`/`"…"` is literal text, not a redirect (so
-/// `echo "a > b" > c` targets only `c`). Catches stderr (`2>`), clobber (`>|`),
-/// glued (`>file`), and multiple redirects in one segment.
+/// Quote-aware through the shared [`scan_quote_syntax`] state machine: a `>`
+/// inside `'…'`/`"…"`/`$'…'` is literal text, not a redirect (so
+/// `echo "a > b" > c` targets only `c`), and an ANSI-C escaped quote cannot
+/// desync the scan into hiding the operator (`echo $'a\'b' >> .env` still
+/// yields `.env` — cameronsjo/cadence-hooks#551). Catches stderr (`2>`),
+/// clobber (`>|`), glued (`>file`), and multiple redirects in one segment.
 ///
 /// Shared parser: consumed by `prevent-secret-writes` (append to a `.env` is a
 /// secret write) and by `enforce-worktree`'s subprocess-mutation nudge (append
@@ -2218,22 +2305,15 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut targets = Vec::new();
     let mut i = 0;
-    let mut quote: Option<char> = None;
+    let mut quote: Option<Quote> = None;
 
     while i < chars.len() {
         let c = chars[i];
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            i += 1;
+        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+            i = next;
             continue;
         }
         match c {
-            '\'' | '"' => {
-                quote = Some(c);
-                i += 1;
-            }
             '>' => {
                 i += 1;
                 // Consume a doubled `>>` (append) or `>|` (clobber).
@@ -2248,15 +2328,8 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
                 let mut target = String::new();
                 while i < chars.len() {
                     let tc = chars[i];
-                    if tc == '\'' || tc == '"' {
-                        i += 1;
-                        while i < chars.len() && chars[i] != tc {
-                            target.push(chars[i]);
-                            i += 1;
-                        }
-                        if i < chars.len() {
-                            i += 1; // closing quote
-                        }
+                    if let Some(next) = take_quoted_run(&chars, i, &mut target) {
+                        i = next;
                         continue;
                     }
                     if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
@@ -2390,10 +2463,64 @@ pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
     out
 }
 
+/// Push `text` as a substitution body when it carries anything but whitespace.
+fn push_body(bodies: &mut Vec<String>, text: &[char]) {
+    let body: String = text.iter().collect();
+    if !body.trim().is_empty() {
+        bodies.push(body);
+    }
+}
+
+/// Scan a `$(…)` body starting at `start` (just past the `$(`), returning the
+/// body text and the index just past its `)`. `None` when input runs out with
+/// the substitution still open.
+///
+/// With `quote_aware`, a `)` inside a quoted run is data rather than the
+/// terminator — the shell's own reading. Without it, only paren depth counts;
+/// that reading exists so [`substitution_bodies`] can surface both when an
+/// unterminated quote makes the two disagree.
+fn scan_substitution_body(
+    chars: &[char],
+    start: usize,
+    quote_aware: bool,
+) -> Option<(String, usize)> {
+    let mut depth = 1usize;
+    let mut j = start;
+    let mut body = String::new();
+    let mut quote: Option<Quote> = None;
+    while j < chars.len() {
+        if quote_aware && let Some(next) = scan_quote_syntax(chars, j, &mut quote) {
+            body.extend(&chars[j..next]);
+            j = next;
+            continue;
+        }
+        match chars[j] {
+            '(' => {
+                depth += 1;
+                body.push('(');
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((body, j + 1));
+                }
+                body.push(')');
+            }
+            other => body.push(other),
+        }
+        j += 1;
+    }
+    None
+}
+
 /// Extract command-substitution bodies from a segment: `$(…)` (tracking nested
-/// parens) and `` `…` `` backticks, in executed context only. Single quotes
-/// suppress; double quotes do not. A backslash escapes the next char outside
-/// single quotes, so `\$(` and an escaped backtick are literal.
+/// parens and quoting) and `` `…` `` backticks, in executed context only.
+/// Single quotes suppress; double quotes do not. A backslash escapes the next
+/// char outside single quotes, so `\$(` and an escaped backtick are literal.
+///
+/// Backticks deliberately get NO quote tracking — bash truncates a backtick
+/// span at the first unescaped backtick even inside quotes, so tracking there
+/// would diverge from the shell rather than agree with it.
 fn substitution_bodies(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut bodies = Vec::new();
@@ -2423,32 +2550,39 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
             i += 1;
             continue;
         }
-        // `$(` … `)` with paren-depth tracking. `$(< file)` keeps its `<`.
+        // `$(` … `)` with paren-depth AND quote tracking. `$(< file)` keeps
+        // its `<`.
         if c == '$' && chars.get(i + 1) == Some(&'(') {
-            let mut depth = 1;
-            let mut j = i + 2;
-            let mut body = String::new();
-            while j < chars.len() && depth > 0 {
-                match chars[j] {
-                    '(' => {
-                        depth += 1;
-                        body.push('(');
-                    }
-                    ')' => {
-                        depth -= 1;
-                        if depth > 0 {
-                            body.push(')');
-                        }
-                    }
-                    other => body.push(other),
+            if let Some((body, end)) = scan_substitution_body(&chars, i + 2, true) {
+                if !body.trim().is_empty() {
+                    bodies.push(body);
                 }
-                j += 1;
+                i = end;
+                continue;
             }
-            if !body.trim().is_empty() {
-                bodies.push(body);
+            // Unterminated: the quoting inside the substitution never resolved,
+            // so where it ends is genuinely ambiguous and bash rejects the line
+            // outright. Emit BOTH readings rather than picking one — the
+            // quote-aware body (everything left) and the quote-blind one (up to
+            // the first depth-0 `)`, plus the text after it, which under that
+            // reading is a sibling command. Picking only the quote-blind
+            // reading is what hid `cat .env` in `echo $(echo ') && cat .env`:
+            // the `)` inside the quotes closed the substitution early, the
+            // unmatched `'` swallowed the tail, and the read reached no guard
+            // (cameronsjo/cadence-hooks#551). Ambiguity surfaces more to the
+            // guards, never less. The quote-aware body below carries the
+            // unmatched quote with it, so `split_segments` swallows the same
+            // tail downstream — it is the quote-blind reading plus its post-`)`
+            // text that actually surfaces the hidden command. Both are emitted
+            // for completeness; do not assume the quote-aware one is load-bearing.
+            push_body(&mut bodies, &chars[i + 2..]);
+            if let Some((blind_body, blind_end)) = scan_substitution_body(&chars, i + 2, false) {
+                if !blind_body.trim().is_empty() {
+                    bodies.push(blind_body);
+                }
+                push_body(&mut bodies, &chars[blind_end..]);
             }
-            i = j;
-            continue;
+            break;
         }
         // `` `…` `` backticks.
         if c == '`' {
@@ -5038,6 +5172,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn split_segments_subst_early_close_single_quote_should_not_swallow_rest() {
+        // `split_segments` has no `$()` depth — a `)` inside a quoted string
+        // is not a separator but the segmenter doesn't know that. The outer
+        // quote state then sees an unmatched `'` and swallows everything after
+        // it, including the `&&` and the real next command.
+        let out = split_segments("echo $(echo ') && cat .env");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "unmatched quote swallowed the second command: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_subst_early_close_double_quote_should_not_swallow_rest() {
+        // Same bug with a double quote. The `)` inside `"…"` closes the
+        // `$()` early (no depth tracking), the `"` stays open and swallows
+        // the rest of the line.
+        let out = split_segments(r#"echo $(echo "a) && cat .env"#);
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "unmatched double-quote swallowed the second command: {out:?}"
+        );
+    }
+
     // --- clobber_redirect_targets ---
 
     #[test]
@@ -5146,6 +5305,31 @@ mod tests {
         assert_eq!(
             redirect_targets(r#"echo "a > b" > c 2>> err.log"#),
             vec!["c", "err.log"]
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_ansi_c_escaped_quote_should_not_bypass() {
+        // An ANSI-C string with an escaped quote (`\'`) desyncs the redirect
+        // parser — it has no `$'…'` state, so the `\\'` looks like a close,
+        // the real `'` reopens a phantom string, and the `>` after it is
+        // swallowed. The real target (`.env`) is never seen.
+        let targets = clobber_redirect_targets(r"echo $'a\'b' > .env");
+        assert!(
+            targets.iter().any(|t| t == ".env"),
+            "ANSI-C escaped quote hid the clobber redirect: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_append_ansi_c_escaped_quote_should_not_bypass() {
+        // Same desync via the append-redirect path. `redirect_targets` has
+        // no `$'…'` state either — an escaped quote in a `$'…'` run closes
+        // the string early, the real `'` reopens it, and the `>>` is content.
+        let targets = redirect_targets(r"echo $'a\'b' >> .env");
+        assert!(
+            targets.iter().any(|t| t == ".env"),
+            "ANSI-C escaped quote hid the append redirect: {targets:?}"
         );
     }
 
