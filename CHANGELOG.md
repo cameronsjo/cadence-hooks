@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Codex `apply_patch` hook payloads now normalize both object-wrapped patch-body forms (#639).** The official Codex 0.146.0 `tool_input.command` envelope and the adapter-emitted `tool_input.input` envelope now reach per-target security guards instead of failing closed as if the patch body were missing. Raw-string `tool_input`, top-level `input`, and already-normalized `tool_input.patch` compatibility remain intact; conflicting recognized bodies and malformed or missing bodies fail closed without echoing patch content.
 - **`record-polish --arm` now retains previously recorded arms and overrides only names supplied again (#592).** Sequential arm-only recordings merge through the trusted private-marker reader, so a focused rerun no longer erases the rest of the polish roster; roster-less and malformed legacy markers continue to degrade to an empty prior roster.
 
 ## [0.74.0] - 2026-08-06

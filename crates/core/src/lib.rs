@@ -464,6 +464,35 @@ where
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
+/// Resolve every supported `apply_patch` body envelope without letting one
+/// recognized field shadow another. `patch` is the already-normalized internal
+/// form; retaining it here preserves existing compatibility while subjecting it
+/// to the same conflict check as external harness envelopes.
+fn resolve_apply_patch_body(value: &serde_json::Value) -> Result<Option<&str>, &'static str> {
+    let tool_input = value.get("tool_input");
+    let candidates = [
+        tool_input.and_then(serde_json::Value::as_str),
+        tool_input
+            .and_then(|input| input.get("command"))
+            .and_then(serde_json::Value::as_str),
+        tool_input
+            .and_then(|input| input.get("input"))
+            .and_then(serde_json::Value::as_str),
+        tool_input
+            .and_then(|input| input.get("patch"))
+            .and_then(serde_json::Value::as_str),
+        value.get("input").and_then(serde_json::Value::as_str),
+    ];
+    let mut candidates = candidates.into_iter().flatten();
+    let Some(first) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.any(|candidate| candidate != first) {
+        return Err("apply_patch payload contains conflicting patch bodies");
+    }
+    Ok(Some(first))
+}
+
 impl HookInput {
     /// Read and parse hook input from stdin.
     pub fn from_stdin() -> Result<Self, String> {
@@ -492,10 +521,8 @@ impl HookInput {
             .unwrap_or_default()
             .to_string();
         if tool_name == "apply_patch" {
-            let patch = value
-                .get("tool_input")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| value.get("input").and_then(serde_json::Value::as_str))
+            let patch = resolve_apply_patch_body(&value)
+                .map_err(str::to_string)?
                 .map(str::to_string);
             if let Some(patch) = patch {
                 value["tool_input"] = serde_json::json!({"patch": patch});
@@ -1780,6 +1807,111 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some("Write"), Some("Edit"), Some("Write"), Some("Edit")]
         );
+    }
+
+    #[test]
+    fn codex_patch_command_object_expands_target() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Add File: command.txt\n+ok\n*** End Patch"}}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("command.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_input_object_expands_target() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":{"input":"*** Begin Patch\n*** Add File: input.txt\n+ok\n*** End Patch"}}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("input.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_top_level_input_expands_target() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","input":"*** Begin Patch\n*** Add File: top-level.txt\n+ok\n*** End Patch"}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("top-level.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_normalized_patch_field_expands_target() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":{"patch":"*** Begin Patch\n*** Add File: normalized.txt\n+ok\n*** End Patch"}}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("normalized.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_identical_duplicate_bodies_expand_target() {
+        let patch = "*** Begin Patch\n*** Add File: duplicate.txt\n+ok\n*** End Patch";
+        let payload = serde_json::json!({
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch, "input": patch, "patch": patch},
+            "input": patch,
+        });
+        let input = HookInput::from_json(&payload.to_string()).unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("duplicate.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_conflicting_bodies_fail_without_echoing_them() {
+        let benign = "*** Begin Patch\n*** Add File: benign.txt\n+ok\n*** End Patch";
+        let secret = "*** Begin Patch\n*** Add File: secret.env\n+TOP_SECRET\n*** End Patch";
+        let payloads = [
+            serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_input": {"command": benign, "input": secret},
+            }),
+            serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_input": {"command": benign},
+                "input": secret,
+            }),
+            serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_input": {"command": benign, "patch": secret},
+            }),
+        ];
+        for payload in payloads {
+            let error = HookInput::from_json(&payload.to_string()).unwrap_err();
+            assert!(error.contains("conflicting patch bodies"), "{error}");
+            assert!(!error.contains("benign.txt"), "{error}");
+            assert!(!error.contains("secret.env"), "{error}");
+            assert!(!error.contains("TOP_SECRET"), "{error}");
+        }
+    }
+
+    #[test]
+    fn malformed_object_wrapped_patch_diagnostic_does_not_echo_body() {
+        for field in ["command", "input"] {
+            let payload = serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_input": {field: "*** Begin Patch\nTOP_SECRET\n*** End Patch"},
+            });
+            let input = HookInput::from_json(&payload.to_string()).unwrap();
+            let error = input.normalized_inputs().unwrap_err();
+            assert!(error.contains("schema rejected"), "{field}: {error}");
+            assert!(!error.contains("TOP_SECRET"), "{field}: {error}");
+        }
     }
 
     #[test]
