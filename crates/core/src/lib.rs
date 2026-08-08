@@ -331,7 +331,12 @@ pub struct HookInput {
 }
 
 /// Tool-specific fields from the hook input.
-#[derive(Debug, Default, Clone, Deserialize)]
+///
+/// `Serialize` is derived so the dedupe gate can fingerprint a whole tool
+/// payload rather than a hand-maintained field list — a modeled field added
+/// here is then part of the key for free, and [`Self::extra`] covers the
+/// unmodeled rest.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ToolInput {
     pub file_path: Option<String>,
     pub path: Option<String>,
@@ -370,10 +375,23 @@ pub struct ToolInput {
     /// Skill tool: the skill's argument string. NEVER logged raw — only a
     /// non-reversible hash of it is recorded (see `log_skill`).
     pub args: Option<String>,
+    /// Every `tool_input` key this struct does not model, captured verbatim.
+    ///
+    /// Guards never read it. It exists so a *whole-payload* fingerprint — the
+    /// dedupe gate's key (`markers::claim_tool_event_nudge`) — cannot collapse
+    /// two genuinely different tool calls that happen to differ only in a field
+    /// the parser has not modeled yet. `BTreeMap` (not `HashMap`) because that
+    /// key must be byte-stable across the separate hook processes of one
+    /// fan-out, and only an ordered map serializes deterministically.
+    ///
+    /// NEVER logged, and never a guard input: an attacker-supplied key here
+    /// would otherwise be a free channel into whatever read it.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// A single edit operation within a MultiEdit tool call.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct EditOperation {
     pub old_string: Option<String>,
     pub new_string: Option<String>,
@@ -381,7 +399,7 @@ pub struct EditOperation {
 }
 
 /// A single AskUserQuestion question and its answer options.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskQuestion {
     pub question: Option<String>,
@@ -391,7 +409,7 @@ pub struct AskQuestion {
 }
 
 /// A single answer option within an AskUserQuestion question.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct AskOption {
     pub label: Option<String>,
     pub description: Option<String>,

@@ -250,7 +250,7 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             // is still a decision this hook made, so it stays counted in
             // `denials.jsonl` and `hooks.jsonl`. Only the operator-facing
             // emission is dropped.
-            if !claim_emission(&result, &input, hook_name) {
+            if !claim_emission(&result, &input, event, hook_name) {
                 process::exit(Outcome::Nudge.code());
             }
             emit_and_exit(&result, event);
@@ -272,14 +272,23 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
 /// heard twice is noise, an enforcement heard zero times is a broken guard.
 /// `Allow` has nothing to say. The message is part of the key, so two hooks
 /// with genuinely different things to report both still speak.
-fn claim_emission(result: &CheckResult, input: &HookInput, hook_name: &str) -> bool {
+///
+/// **And only for a hook in `markers::DEDUPE_ELIGIBLE_HOOKS`** — the handful of
+/// commands actually registered more than once in a single matcher block. Every
+/// other hook reaches the operator unconditionally, whatever the key says.
+fn claim_emission(
+    result: &CheckResult,
+    input: &HookInput,
+    event: HookEvent,
+    hook_name: &str,
+) -> bool {
     if result.outcome != Outcome::Nudge {
         return true;
     }
     let Some(message) = result.message.as_deref().filter(|m| !m.is_empty()) else {
         return true;
     };
-    cadence_hooks_core::markers::claim_tool_event_nudge(input, hook_name, message)
+    cadence_hooks_core::markers::claim_tool_event_nudge(input, event, hook_name, message)
 }
 
 /// One invocation's decision, plus the two things the audit writes need that the
@@ -618,17 +627,18 @@ mod tests {
             let nudge = CheckResult::nudge("mind the overshare");
 
             assert!(
-                claim_emission(&nudge, &input, "warn-overshare"),
+                claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-overshare"),
                 "the first process of the fan-out must emit"
             );
             assert!(
-                !claim_emission(&nudge, &input, "warn-overshare"),
+                !claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-overshare"),
                 "a second identical registration must stay silent"
             );
             assert!(
                 claim_emission(
                     &CheckResult::nudge("a different advisory"),
                     &input,
+                    HookEvent::PreToolUse,
                     "warn-overshare"
                 ),
                 "a genuinely different message is different information and must reach the operator"
@@ -651,11 +661,11 @@ mod tests {
 
             for _ in 0..3 {
                 assert!(
-                    claim_emission(&block, &input, "git-safety"),
+                    claim_emission(&block, &input, HookEvent::PreToolUse, "git-safety"),
                     "an enforcement message must never be deduped away"
                 );
                 assert!(
-                    claim_emission(&ask, &input, "git-safety"),
+                    claim_emission(&ask, &input, HookEvent::PreToolUse, "git-safety"),
                     "an Ask gates the operator and must always carry its reason"
                 );
             }
@@ -674,12 +684,57 @@ mod tests {
             let nudge = CheckResult::nudge("polish before opening the PR");
 
             let emissions = (0..3)
-                .filter(|_| claim_emission(&nudge, &input, "nudge-polish-before-pr"))
+                .filter(|_| {
+                    claim_emission(
+                        &nudge,
+                        &input,
+                        HookEvent::PreToolUse,
+                        "nudge-polish-before-pr",
+                    )
+                })
                 .count();
 
             assert_eq!(
                 emissions, 1,
                 "three overlapping registrations of one tool event must nudge once"
+            );
+        });
+    }
+
+    /// The narrowing that makes the gate safe: a hook that is NOT a known
+    /// fan-out offender is never gated, so two same-event nudges from it both
+    /// reach the operator even when their payload fingerprints identically.
+    ///
+    /// Shaped after `warn-empty-answers` / `warn-recommended-option`, which fire
+    /// per *question* within one `AskUserQuestion` call — same session, same
+    /// tool payload, genuinely different things to say.
+    #[test]
+    fn non_allowlisted_hook_is_never_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("irrelevant — the payload is identical either way");
+            let nudge = CheckResult::nudge("that answer set looks empty");
+
+            for _ in 0..5 {
+                assert!(
+                    claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-empty-answers"),
+                    "a hook outside DEDUPE_ELIGIBLE_HOOKS must never be suppressed, \
+                     however identical the event looks"
+                );
+            }
+
+            // Positive control: the same identical repeat IS collapsed for an
+            // allowlisted hook, so the assertion above proves the allowlist and
+            // not a dead gate.
+            assert!(claim_emission(
+                &nudge,
+                &input,
+                HookEvent::PreToolUse,
+                "warn-overshare"
+            ));
+            assert!(
+                !claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-overshare"),
+                "the gate must still collapse a real fan-out"
             );
         });
     }

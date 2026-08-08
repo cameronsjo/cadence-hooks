@@ -337,6 +337,42 @@ const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
     "session guard",
 ];
 
+/// claude-configurations#472: the binary's dedupe allowlist may only name hooks
+/// this inventory records as real fan-outs.
+///
+/// The two lists are deliberately different sizes — the inventory is every
+/// duplicated *registration*, the allowlist is the subset whose duplicate
+/// processes print an operator-facing advisory — but the allowlist can never
+/// contain a hook the wiring does not actually fan out. That direction is what
+/// keeps the gate from silently acquiring the power to suppress a hook whose
+/// repeats are all genuine.
+#[test]
+fn dedupe_allowlist_only_names_known_duplicate_registrations() {
+    let inventory: BTreeSet<&str> = KNOWN_DUPLICATE_REGISTRATIONS
+        .iter()
+        .filter_map(|entry| entry.split_once(' ').map(|(_plugin, command)| command))
+        .collect();
+
+    let unbacked: Vec<&&str> = cadence_hooks_core::markers::DEDUPE_ELIGIBLE_HOOKS
+        .iter()
+        .filter(|hook| !inventory.contains(**hook))
+        .collect();
+
+    assert!(
+        unbacked.is_empty(),
+        "markers::DEDUPE_ELIGIBLE_HOOKS names a hook that KNOWN_DUPLICATE_REGISTRATIONS does \
+         not record as a duplicate registration, so the dedupe gate can suppress advisories \
+         from a hook that never fans out:\n{}\n\n\
+         Either add the wiring-side duplicate to KNOWN_DUPLICATE_REGISTRATIONS, or drop the \
+         hook from the allowlist in crates/core/src/markers.rs.",
+        unbacked
+            .iter()
+            .map(|hook| format!("  `{hook}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 /// Where the wiring-side consolidation of [`KNOWN_DUPLICATE_REGISTRATIONS`] is
 /// tracked. The manifests live in the cadence monorepo, not this repo, so the
 /// binary-side fix and the wiring cleanup are separate PRs in separate repos.
