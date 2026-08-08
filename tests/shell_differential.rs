@@ -20,15 +20,20 @@
 #![cfg(unix)]
 
 use std::ffi::OsString;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const BASH: &str = "/bin/bash";
 const BASH_PAYLOAD: &str = "touch ./canary";
 const GUARDED_PAYLOAD: &str = "cat .env";
+const PROCESS_DEADLINE: Duration = Duration::from_secs(10);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy)]
 struct Case {
@@ -172,18 +177,136 @@ fn oracle_path(shim_dir: &Path) -> OsString {
         .expect("construct isolated oracle PATH")
 }
 
+const SIGKILL: i32 = 9;
+
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn send_signal(pid: i32, signal: i32) -> i32;
+}
+
+fn collect_output(
+    child: &mut Child,
+    stdout: &mut File,
+    stderr: &mut File,
+) -> Result<Output, String> {
+    let status = child.wait().map_err(|error| format!("wait: {error}"))?;
+    stdout
+        .rewind()
+        .map_err(|error| format!("rewind stdout: {error}"))?;
+    stderr
+        .rewind()
+        .map_err(|error| format!("rewind stderr: {error}"))?;
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    stdout
+        .read_to_end(&mut output.stdout)
+        .map_err(|error| format!("read stdout: {error}"))?;
+    stderr
+        .read_to_end(&mut output.stderr)
+        .map_err(|error| format!("read stderr: {error}"))?;
+    Ok(output)
+}
+
+fn kill_process_group(child: &mut Child) -> io::Result<()> {
+    let process_group = i32::try_from(child.id())
+        .map_err(|_| io::Error::other("child pid does not fit in a process-group id"))?;
+    // SAFETY: `process_group` is the positive pid returned for this child, so
+    // negating it targets only the isolated group created immediately below.
+    let result = unsafe { send_signal(-process_group, SIGKILL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn run_bounded(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    deadline: Duration,
+) -> Result<Output, String> {
+    let description = format!("{command:?}");
+    if let Some(bytes) = stdin {
+        let mut file = tempfile::tempfile().map_err(|error| format!("create stdin: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write stdin: {error}"))?;
+        file.rewind()
+            .map_err(|error| format!("rewind stdin: {error}"))?;
+        command.stdin(Stdio::from(file));
+    } else {
+        command.stdin(Stdio::null());
+    }
+    let mut stdout = tempfile::tempfile().map_err(|error| format!("create stdout: {error}"))?;
+    let mut stderr = tempfile::tempfile().map_err(|error| format!("create stderr: {error}"))?;
+    command
+        .stdout(Stdio::from(
+            stdout
+                .try_clone()
+                .map_err(|error| format!("clone stdout: {error}"))?,
+        ))
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .map_err(|error| format!("clone stderr: {error}"))?,
+        ))
+        .process_group(0);
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn {description}: {error}"))?;
+
+    loop {
+        if started.elapsed() >= deadline {
+            let group_kill_error = kill_process_group(&mut child).err();
+            let direct_kill_error = group_kill_error.as_ref().and_then(|_| child.kill().err());
+            let output = collect_output(&mut child, &mut stdout, &mut stderr)
+                .map_err(|error| format!("reap timed-out {description}: {error}"))?;
+            return Err(format!(
+                "{description} timed out after {deadline:?} (group_kill_error={group_kill_error:?}, direct_kill_error={direct_kill_error:?}, status={:?}, stdout={}, stderr={})",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => return collect_output(&mut child, &mut stdout, &mut stderr),
+            Ok(None) => {}
+            Err(error) => {
+                let group_kill_error = kill_process_group(&mut child).err();
+                let direct_kill_error = group_kill_error.as_ref().and_then(|_| child.kill().err());
+                let output = collect_output(&mut child, &mut stdout, &mut stderr)
+                    .map_err(|collect_error| format!("collect after {error}: {collect_error}"))?;
+                return Err(format!(
+                    "poll {description}: {error} (group_kill_error={group_kill_error:?}, direct_kill_error={direct_kill_error:?}, status={:?}, stdout={}, stderr={})",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                ));
+            }
+        }
+
+        let remaining = deadline.saturating_sub(started.elapsed());
+        thread::sleep(PROCESS_POLL_INTERVAL.min(remaining));
+    }
+}
+
 fn observe_bash(case: Case) -> BashObservation {
     let scratch = tempfile::tempdir().expect("create isolated oracle directory");
     install_sudo_shim(scratch.path());
     let source = case.template.replace("PAYLOAD", BASH_PAYLOAD);
-    let output = Command::new(BASH)
+    let mut command = Command::new(BASH);
+    command
         .args(["--noprofile", "--norc", "-c", &source])
         .current_dir(scratch.path())
         .env_clear()
         .env("PATH", oracle_path(scratch.path()))
-        .env("LC_ALL", "C")
-        .output()
-        .expect("run real bash oracle");
+        .env("LC_ALL", "C");
+    let output = run_bounded(&mut command, None, PROCESS_DEADLINE)
+        .unwrap_or_else(|error| panic!("run real bash oracle: {error}"));
     let executed = scratch.path().join("canary").is_file();
     assert_eq!(
         executed,
@@ -222,10 +345,9 @@ fn cadence_hooks_binary() -> PathBuf {
         path.display(),
     );
 
-    let version = Command::new(&path)
-        .arg("--version")
-        .env_clear()
-        .output()
+    let mut command = Command::new(&path);
+    command.arg("--version").env_clear();
+    let version = run_bounded(&mut command, None, PROCESS_DEADLINE)
         .unwrap_or_else(|error| panic!("probe cadence-hooks binary {}: {error}", path.display()));
     assert!(
         version.status.success()
@@ -254,7 +376,8 @@ fn run_guard(binary: &Path, case: Case, scratch: &Path) -> Output {
     })
     .to_string();
 
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(["cadence", "prevent-secret-leaks"])
         .current_dir(scratch)
         .env_clear()
@@ -263,19 +386,9 @@ fn run_guard(binary: &Path, case: Case, scratch: &Path) -> Output {
         .env("TMPDIR", scratch)
         .env("CADENCE_METRICS_DIR", scratch.join("metrics"))
         .env("CADENCE_MARKER_DIR", scratch.join("markers"))
-        .env("CADENCE_NO_FEEDBACK_FOOTER", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("run built cadence-hooks parser consumer");
-    child
-        .stdin
-        .as_mut()
-        .expect("guard stdin")
-        .write_all(payload.as_bytes())
-        .expect("write guard payload");
-    child.wait_with_output().expect("wait for guard oracle")
+        .env("CADENCE_NO_FEEDBACK_FOOTER", "1");
+    run_bounded(&mut command, Some(payload.as_bytes()), PROCESS_DEADLINE)
+        .unwrap_or_else(|error| panic!("run built cadence-hooks parser consumer: {error}"))
 }
 
 fn observe(binary: &Path, case: Case) -> Observation {
@@ -334,6 +447,24 @@ fn diagnostic(case: Case, observation: &Observation) -> String {
 
 fn disagrees(bash_executed: bool, guard_blocked: bool) -> bool {
     bash_executed != guard_blocked
+}
+
+#[test]
+fn bounded_process_timeout_kills_and_reports_output() {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf timeout-stdout; printf timeout-stderr >&2; exec /bin/sleep 60",
+    ]);
+
+    let started = Instant::now();
+    let error = run_bounded(&mut command, None, Duration::from_millis(25))
+        .expect_err("sleeping process must exceed the bounded deadline");
+
+    assert!(started.elapsed() < Duration::from_secs(1), "{error}");
+    assert!(error.contains("timed out after 25ms"), "{error}");
+    assert!(error.contains("stdout=timeout-stdout"), "{error}");
+    assert!(error.contains("stderr=timeout-stderr"), "{error}");
 }
 
 #[test]
