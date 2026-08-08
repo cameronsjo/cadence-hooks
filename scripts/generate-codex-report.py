@@ -121,12 +121,11 @@ def _without_wiring(text: str) -> str:
 def _wiring_is_empty(text: str) -> bool:
     """True when every hook in `text` renders an empty `wiring` array.
 
-    The exemption below rests on a claim — "this run could not determine wiring,
-    so wiring is the one field it must not compare". That claim is inferred from
-    an absent sibling directory; this asserts it against the output actually
-    produced. If a run somehow *did* render wiring while the sibling was absent,
-    the inference was wrong and dropping the field would hide a real diff, so the
-    exemption must not apply. Unparsable output is not empty wiring either.
+    The check exemption below rests on a claim — "this run could not determine
+    wiring, so wiring is the one field it must not compare". The normal-write
+    guard uses the same rendered-output fact to prevent an absent or unusable
+    plugin estate from replacing known wiring with empty arrays. Unparsable
+    output is not empty wiring either.
     """
     try:
         doc = json.loads(text)
@@ -198,6 +197,15 @@ def main() -> int:
     if args.stdout:
         print(rendered, end="")
         return 0
+    if _wiring_is_empty(rendered):
+        plugins_path = args.workspace.resolve() / "cadence" / "plugins"
+        print(
+            "Codex compatibility report not written: "
+            f"no recognized plugin wiring rendered from {plugins_path}; "
+            "pass --workspace with a workspace containing cadence/plugins",
+            file=sys.stderr,
+        )
+        return 1
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(rendered, encoding="utf-8")
     return 0
