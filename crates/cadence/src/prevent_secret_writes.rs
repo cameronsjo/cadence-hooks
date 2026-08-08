@@ -1235,4 +1235,37 @@ mod tests {
             "ANSI-C escaped quote bypassed append redirect"
         );
     }
+
+    // --- #551: escaped-whitespace in a redirect target path ---
+    // `redirect_targets` (the append-inclusive parser feeding this guard) lost
+    // the escaped-whitespace branch its sibling `clobber_redirect_targets`
+    // kept, so `>> my\ dir/.env` truncated the target at the escaped space
+    // (`my\`). The append to a real `.env` inside a space-bearing directory
+    // then named a non-secret target and reached no guard, while the quoted
+    // spelling `>> "my dir/.env"` blocked. The shell writes `my dir/.env`
+    // (final component `.env`), proven with a marker file.
+
+    #[test]
+    fn escaped_space_in_dir_path_clobber_blocked() {
+        assert!(bash_targets_env_file(r"echo TOKEN > my\ dir/.env"));
+    }
+
+    #[test]
+    fn escaped_space_in_dir_path_append_blocked() {
+        assert!(bash_targets_env_file(r"echo TOKEN >> my\ dir/.env"));
+    }
+
+    #[test]
+    fn escaped_space_secret_write_blocks_via_run() {
+        let result = SecretWritesGuard.run(&make_bash_input(r"echo TOKEN >> my\ dir/.env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn quoted_space_in_dir_path_still_blocked() {
+        // Control: the quoted spelling always resolved correctly, so the
+        // assertions above are evidence about the escape branch, not the
+        // parser generally.
+        assert!(bash_targets_env_file(r#"echo TOKEN > "my dir/.env""#));
+    }
 }

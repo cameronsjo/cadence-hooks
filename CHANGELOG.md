@@ -9,6 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **Identical advisory context is now emitted once per tool event instead of once per registration (cameronsjo/claude-configurations#472).** A `hooks.json` can register the same command several times under one matcher with overlapping `if:` globs, so one tool call spawned that many identical hook processes and the operator read the same nudge up to nine times. The universal dispatch tail now claims a per-`(session, tool event, hook, message)` marker before emitting advisory context, and only the first claimant speaks. Fails open in every direction — no session key, a non-private marker dir, or any IO error all emit — and `Block`/`Ask` are excluded by construction, so an enforcement message is never suppressed. Claims expire after ten minutes and are reaped opportunistically; suppressed emissions stay counted in `denials.jsonl` and `hooks.jsonl`. A new audit assertion (`no_duplicate_command_registrations_per_matcher`) ratchets the wiring side, allowlisting the twelve commands duplicated today and failing on a new one.
+## [0.75.1] - 2026-08-08
+
+### Fixed
+
+- **Two shell-parser secret bypasses the #551 quote-migration left open, both live in 0.75.0 (#551 follow-up).** `substitution_bodies`' outer loop tracked quotes with ANSI-C-blind `in_single`/`in_double` bools, so a `$'a\'b'` string before a command substitution desynced the scan and every later `$(…)`/`` `…` `` — e.g. `echo $'a\'b' $(cat .env)` — was hidden from `prevent-secret-leaks` while bash executed the read (proven with a marker file). The outer loop now drives the shared `scan_quote_syntax` state machine, the same reader `split_segments`/`tokenize` use. Separately, `redirect_targets` (the append-inclusive parser feeding `prevent-secret-writes`) lost the escaped-whitespace branch its `clobber_redirect_targets` sibling kept, so `>> my\ dir/.env` truncated the target at the escaped space and the append to a real `.env` inside a space-bearing directory reached no guard; the branch is restored so the two redirect parsers agree on where a filename ends. Regression tests pin the executed read/write blocking, the escaped-backtick-prose and single-quoted-literal negatives, and parser-level parity with the quoted spellings.
 
 ## [0.75.0] - 2026-08-08
 
