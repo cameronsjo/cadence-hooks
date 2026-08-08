@@ -2570,7 +2570,11 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
             // the `)` inside the quotes closed the substitution early, the
             // unmatched `'` swallowed the tail, and the read reached no guard
             // (cameronsjo/cadence-hooks#551). Ambiguity surfaces more to the
-            // guards, never less.
+            // guards, never less. The quote-aware body below carries the
+            // unmatched quote with it, so `split_segments` swallows the same
+            // tail downstream — it is the quote-blind reading plus its post-`)`
+            // text that actually surfaces the hidden command. Both are emitted
+            // for completeness; do not assume the quote-aware one is load-bearing.
             push_body(&mut bodies, &chars[i + 2..]);
             if let Some((blind_body, blind_end)) = scan_substitution_body(&chars, i + 2, false) {
                 if !blind_body.trim().is_empty() {
