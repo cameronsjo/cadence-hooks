@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **A `$TMPDIR` that is the home directory, or an ancestor of it, is no longer honored as a temp root (#569).** Pointing `$TMPDIR` at `$HOME` reclassified every path under home as disposable scratch, making `rm -rf ~/Documents` a silent allow. The value is now refused across `guard-rm`, `enforce-worktree`, and the shared path classifier — component-wise, and under either spelling: a `$TMPDIR` that only *resolves* to home is rejected too, closing a symlinked `$TMPDIR` and a `$TMPDIR` differing from `$HOME` only in case on a case-insensitive volume. Real temp roots are unaffected, including macOS `/var/folders` and the Windows per-user temp directory that legitimately lives *under* the profile directory.
 - **An explicit `.git` now outranks `guard-rm`'s temp carve-out (#576).** A repository checked out under `/tmp` is still a repository, so `rm -rf /tmp/repo` blocks instead of allowing on the strength of its location alone. cadence's own managed scratch keeps its allow: a `.claude/worktrees/` checkout is disposable by construction, including when it lives under a temp root.
 
+## [0.75.1] - 2026-08-08
+
+### Fixed
+
+- **Two shell-parser secret bypasses the #551 quote-migration left open, both live in 0.75.0 (#551 follow-up).** `substitution_bodies`' outer loop tracked quotes with ANSI-C-blind `in_single`/`in_double` bools, so a `$'a\'b'` string before a command substitution desynced the scan and every later `$(…)`/`` `…` `` — e.g. `echo $'a\'b' $(cat .env)` — was hidden from `prevent-secret-leaks` while bash executed the read (proven with a marker file). The outer loop now drives the shared `scan_quote_syntax` state machine, the same reader `split_segments`/`tokenize` use. Separately, `redirect_targets` (the append-inclusive parser feeding `prevent-secret-writes`) lost the escaped-whitespace branch its `clobber_redirect_targets` sibling kept, so `>> my\ dir/.env` truncated the target at the escaped space and the append to a real `.env` inside a space-bearing directory reached no guard; the branch is restored so the two redirect parsers agree on where a filename ends. Regression tests pin the executed read/write blocking, the escaped-backtick-prose and single-quoted-literal negatives, and parser-level parity with the quoted spellings.
+
 ## [0.75.0] - 2026-08-08
 
 ### Added
