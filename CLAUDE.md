@@ -18,13 +18,13 @@ Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatch
 
 **Step 2 is the one that keeps getting skipped, and it is CI-gated.** The report embeds `binaryVersion`, which `scripts/generate-codex-report.py --check` compares as exact text against the freshly-built binary's `manifest --format json` — so a Cargo.toml-only bump turns `make report-check` red on the ubuntu leg. It went stale at 0.70.1 and left `report-check` red on `main` from the 0.71.0 bump onward; 0.72.0 and 0.72.1 both had to touch four files for this reason.
 
-**`make report` from a worktree silently empties every wiring array (#566).** The generator's `--workspace` defaults to the repo's *parent* directory and globs plugin wiring from `<workspace>/cadence/plugins/*/hooks/hooks.json`. From `.claude/worktrees/<name>/` that parent resolves to a directory with no plugin checkout, so all 67 wiring arrays render `[]` and get written with no warning. Pass the real workspace explicitly:
+**`make report` from a worktree needs an explicit plugin workspace.** The generator's `--workspace` defaults to the repo's *parent* directory and globs plugin wiring from `<workspace>/cadence/plugins/*/hooks/hooks.json`. From `.claude/worktrees/<name>/` that parent resolves to a directory with no plugin checkout, so all 67 wiring arrays render `[]`. A normal write now refuses that all-empty estate before touching the output (#566). Pass the real workspace explicitly:
 
 ```bash
 python3 scripts/generate-codex-report.py --workspace <path-to-plugin-workspace-root>
 ```
 
-Two more traps on that flag. `--check` **cannot catch this** — with no sibling checkout it takes a documented exemption path and compares everything-but-wiring, so it passes either way (that is also why CI can never verify wiring). And pointing it at a plugin checkout parked on a feature branch rewrites wiring to match *that branch*; generate against a synthetic workspace built from the plugin repo's `origin/main` (`git -C <plugin-repo> archive origin/main plugins | tar -x -C <tmp>/cadence`) when the local checkout has moved. Verify with a strict `--check --workspace <same>`, which does compare wiring.
+Three related traps remain. `--check` **cannot verify wiring** with no sibling checkout: it takes a documented exemption path and compares everything but wiring, which is also why CI can never verify that field. `--stdout` deliberately keeps the all-empty render available for inspection and never writes it. And pointing either mode at a plugin checkout parked on a feature branch reflects *that branch*; generate against a synthetic workspace built from the plugin repo's `origin/main` (`git -C <plugin-repo> archive origin/main plugins | tar -x -C <tmp>/cadence`) when the local checkout has moved. Verify with a strict `--check --workspace <same>`, which does compare wiring.
 
 Manual tagging or formula edits race the automation. Post-release: `brew update && brew upgrade cadence-hooks`, verify `cadence-hooks --version`.
 
