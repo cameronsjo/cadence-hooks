@@ -399,6 +399,11 @@ const DEDUPE_TTL: Duration = Duration::from_secs(30);
 /// (`tests/hook_registration_audit.rs`, `KNOWN_DUPLICATE_REGISTRATIONS`), which
 /// asserts every entry here is still a real fan-out — so the two cannot drift
 /// apart, and a consolidated wiring fails loudly instead of leaving dead cover.
+///
+/// **Every entry today is a `PreToolUse` hook, and adding a `PostToolUse` one
+/// needs a fingerprint change first.** `tool_response` is not in the key, so a
+/// PostToolUse hook would collapse two events that shared a payload but
+/// returned different results — response-blind by construction.
 pub const DEDUPE_ELIGIBLE_HOOKS: &[&str] = &[
     "nudge-polish-before-pr",
     "redact-external-content",
@@ -557,6 +562,12 @@ fn dedupe_session_key(input: &HookInput) -> Option<&str> {
 /// same session re-injecting context after a compaction is a different event
 /// from its startup injection, and must not be collapsed into it.
 ///
+/// So is `agent_id`. A dispatched subagent's payload carries the *parent's*
+/// `session_id` and inherits the spawning `cwd`, so two subagents working in
+/// parallel can hit the same advisory on an identical payload inside one TTL —
+/// and without `agent_id` the second one's advisory would be swallowed by the
+/// first one's claim.
+///
 /// Fields are joined with U+001F (unit separator), a byte no tool payload
 /// carries in practice, so no two distinct field splits can render the same
 /// string by concatenation.
@@ -576,6 +587,7 @@ fn tool_event_fingerprint(input: &HookInput, event: HookEvent) -> Option<String>
             input.cwd.as_deref().unwrap_or_default(),
             input.prompt.as_deref().unwrap_or_default(),
             input.source.as_deref().unwrap_or_default(),
+            input.agent_id.as_deref().unwrap_or_default(),
             tool_input.as_deref().unwrap_or_default(),
         ]
         .join("\u{1f}"),
@@ -1618,6 +1630,35 @@ mod tests {
                 dedupe_marker_paths().is_empty(),
                 "an ungated hook must not even stamp a marker: {:?}",
                 dedupe_marker_paths()
+            );
+        });
+    }
+
+    #[test]
+    fn parallel_agents_with_identical_payloads_both_emit() {
+        // A dispatched subagent carries the PARENT's session_id and inherits the
+        // spawning cwd, so two subagents can hit one advisory on a byte-identical
+        // payload inside one TTL. `agent_id` is what keeps them distinct.
+        let tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(tmp.path(), || {
+            let agent = |id: &str| HookInput {
+                agent_id: Some(id.into()),
+                ..bash_event("parent-sid", "git push")
+            };
+            assert!(claim_tool_event_nudge(
+                &agent("agent-a"),
+                PRE,
+                "warn-overshare",
+                "advisory"
+            ));
+            assert!(
+                claim_tool_event_nudge(&agent("agent-b"), PRE, "warn-overshare", "advisory"),
+                "a parallel subagent's advisory must not be swallowed by its sibling's claim"
+            );
+            // Positive control: the same agent repeating IS still a fan-out.
+            assert!(
+                !claim_tool_event_nudge(&agent("agent-b"), PRE, "warn-overshare", "advisory"),
+                "one agent's own repeat is still collapsed"
             );
         });
     }
