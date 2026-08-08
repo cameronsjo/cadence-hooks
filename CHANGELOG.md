@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard-rm` no longer treats a protected target as unresolvable because an empty substitution was appended (#541).** `$()`, `$( )`, and an empty backtick pair expand to nothing in every shell, so `rm -rf ~/Documents$()` names exactly `~/Documents` — but the operand reached the classifier still carrying a `$` and downgraded a contractual Block to an Ask, a downgrade bought with two characters. Empty substitutions are now removed before any other parsing touches the segment, which also covers the two shapes the shell layer mangled: a trailing `$()` whose `)` the group-wrapper trim consumed, and `$( )` split across two tokens. Only *lexically* empty bodies are removed — `$(cat f)` and `${EMPTY}` keep their Ask verbatim, and an operand that was all empty substitution still asks rather than falling through to the working directory's verdict.
+- **A `$TMPDIR` that is the home directory, or an ancestor of it, is no longer honored as a temp root (#569).** Pointing `$TMPDIR` at `$HOME` reclassified every path under home as disposable scratch, making `rm -rf ~/Documents` a silent allow. The value is now refused across `guard-rm`, `enforce-worktree`, and the shared path classifier — component-wise, and under either spelling: a `$TMPDIR` that only *resolves* to home is rejected too, closing a symlinked `$TMPDIR` and a `$TMPDIR` differing from `$HOME` only in case on a case-insensitive volume. Real temp roots are unaffected, including macOS `/var/folders` and the Windows per-user temp directory that legitimately lives *under* the profile directory.
+- **An explicit `.git` now outranks `guard-rm`'s temp carve-out (#576).** A repository checked out under `/tmp` is still a repository, so `rm -rf /tmp/repo` blocks instead of allowing on the strength of its location alone. cadence's own managed scratch keeps its allow: a `.claude/worktrees/` checkout is disposable by construction, including when it lives under a temp root.
+
 ## [0.75.1] - 2026-08-08
 
 ### Fixed

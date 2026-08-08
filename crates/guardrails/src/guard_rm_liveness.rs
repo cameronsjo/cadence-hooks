@@ -41,12 +41,11 @@
 //! # What it deliberately does NOT probe
 //!
 //! **The git-repo Block path.** Unlike the home case, it needs a real `.git` on
-//! disk, and every writable fixture location is wrong: under the temp root the
-//! Temp classification is evaluated *first* and pre-empts the git-repo check
-//! (verified — `rm -rf /tmp/<dir-with-.git>` is a silent Allow), so a tempdir
-//! fixture would assert Block, get Allow, and nudge falsely every session. The
-//! alternative — writing a fixture outside the temp roots at every SessionStart
-//! — is a worse hazard than the gap it would close.
+//! disk, and none of the four probes may write one. A tempdir fixture is now
+//! classifiable — since #576 an explicit `.git` outranks the temp carve-out, so
+//! `rm -rf /tmp/<dir-with-.git>` Blocks rather than allowing — but creating and
+//! removing a repo at every SessionStart is a worse hazard than the gap it would
+//! close, and a fixture outside the temp roots is worse still.
 //!
 //! # What it structurally CANNOT see
 //!
@@ -130,14 +129,14 @@ const HOME_PROBE_BASENAME: &str = "cadence-guard-rm-liveness-probe";
 /// same as a real one. (The git-repo Block case is *not* reachable; see the
 /// module header.)
 ///
-/// It is also the probe that catches the widest real degradation. `guard-rm`
-/// resolves its temp roots partly from `$TMPDIR`, and a `$TMPDIR` pointing at a
-/// directory that contains real work silently converts that whole subtree to
-/// "disposable": with `TMPDIR` set to the home directory, `rm -rf ~/Documents`
-/// is a **silent Allow** (verified). The three probes above all still pass in
-/// that state, because none of their operands falls under the widened root —
-/// so without this one the check would report healthy while home protection was
-/// gone. Filed separately as a `guard-rm` defect; this probe is the detection.
+/// It is also the probe that catches the widest real degradation: home
+/// protection failing while the other three probes still pass, because none of
+/// their operands falls under home. The instance it was written for — a
+/// `$TMPDIR` pointing at the home directory, which converted that whole subtree
+/// to "disposable" and made `rm -rf ~/Documents` a silent Allow — is fixed at
+/// the source (cadence-hooks#569: a `$TMPDIR` that is home, or an ancestor of
+/// it, is refused the temp carve-out). The probe stays because the failure
+/// *class* is what it watches, not that one instance.
 ///
 /// Returns `None` when the home directory cannot be resolved, so the probe is
 /// skipped rather than failed — an unresolvable home is this check's own blind
@@ -330,13 +329,17 @@ mod tests {
     }
 
     #[test]
-    fn widened_tmpdir_that_swallows_home_is_caught() {
-        // The finding this probe exists for. guard-rm resolves temp roots partly
-        // from $TMPDIR; pointing TMPDIR at the home directory reclassifies that
-        // whole subtree as disposable, and `rm -rf ~/<anything>` becomes a
-        // silent Allow. The other three probes all still pass in that state —
-        // none of their operands falls under the widened root — so this asserts
-        // the check as a whole goes loud, not merely that one probe flips.
+    fn widened_tmpdir_no_longer_disarms_the_home_block() {
+        // This probe was added to DETECT the #569 degradation: guard-rm resolved
+        // its temp roots partly from $TMPDIR, so pointing TMPDIR at the home
+        // directory reclassified that whole subtree as disposable and
+        // `rm -rf ~/<anything>` became a silent Allow. #569 fixed it at the
+        // source — a $TMPDIR that is home, or an ancestor of it, is refused the
+        // temp carve-out — so the check is now correctly SILENT in that state.
+        //
+        // The probe itself is not obsolete: it still fails loudly if home
+        // protection regresses by any other route. This test pins the fix; the
+        // probe covers the rest.
         let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
         let Ok(home) = home else {
             return; // no resolvable home on this platform; the probe self-skips
@@ -351,12 +354,8 @@ mod tests {
                 let result = GuardRmLiveness.run(&make_session("s1", "startup"));
                 assert_eq!(
                     result.outcome,
-                    Outcome::Nudge,
-                    "a TMPDIR that swallows $HOME must not read as healthy"
-                );
-                assert!(
-                    result.message.unwrap().contains("home directory"),
-                    "the nudge must name the home-directory probe as the diverging one"
+                    Outcome::Allow,
+                    "a TMPDIR that swallows $HOME no longer degrades guard-rm (#569)"
                 );
             },
         );

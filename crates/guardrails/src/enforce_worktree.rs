@@ -188,6 +188,10 @@ struct EnvConfig {
     kill_switch: bool,
     /// `$TMPDIR`, for the scratch-repo exemption.
     tmpdir: Option<String>,
+    /// The user's home directory, so a `$TMPDIR` that swallows it is refused
+    /// the scratch exemption rather than exempting the whole checkout tree
+    /// (cadence-hooks#569).
+    home: String,
 }
 
 impl EnvConfig {
@@ -197,6 +201,7 @@ impl EnvConfig {
             allow_main: truthy("CADENCE_ALLOW_MAIN"),
             kill_switch: truthy("CADENCE_NO_ENFORCE_WORKTREE"),
             tmpdir: std::env::var("TMPDIR").ok(),
+            home: cadence_hooks_core::paths::user_home_lossy_or_default(),
         }
     }
 }
@@ -1339,7 +1344,11 @@ fn assess_dir(
     };
     let common_dir = PathBuf::from(common_dir);
     let is_primary = is_primary_checkout(&repo_root);
-    let temp_root = is_temp_root(Path::new(&repo_root), cfg.tmpdir.as_deref());
+    let temp_root = is_temp_root(
+        Path::new(&repo_root),
+        cfg.tmpdir.as_deref(),
+        Some(&cfg.home),
+    );
     let snoozed = cadence_hooks_core::worktree::is_snoozed_in_common_dir(&common_dir);
     let repo_declared = is_primary && !cfg.allow_main && repo_allow.is_allowed(&repo_root);
     let allowed_main = cfg.allow_main || repo_declared;
@@ -1733,11 +1742,17 @@ mod tests {
         Scratch::new(&scratch_root(), tag)
     }
 
+    /// An empty `home` disables the #569 swallowed-home rule, which is what
+    /// keeps these cases testing what they were written to test. Read a pass
+    /// here as evidence about the exemption under test and nothing else — the
+    /// rule itself is covered where it lives, in `core::worktree`'s
+    /// `tmpdir_*_home_is_not_a_temp_root` tests.
     fn cfg(allow_main: bool, kill_switch: bool) -> EnvConfig {
         EnvConfig {
             allow_main,
             kill_switch,
             tmpdir: None,
+            home: String::new(),
         }
     }
 
@@ -1810,36 +1825,43 @@ mod tests {
 
     #[test]
     fn tmp_roots_are_temp() {
-        assert!(is_temp_root(Path::new("/tmp/scratch-repo"), None));
-        assert!(is_temp_root(Path::new("/private/tmp/fixture"), None));
+        assert!(is_temp_root(Path::new("/tmp/scratch-repo"), None, None));
+        assert!(is_temp_root(Path::new("/private/tmp/fixture"), None, None));
     }
 
     #[test]
     fn tmpdir_env_root_is_temp() {
         assert!(is_temp_root(
             Path::new("/var/folders/xy/T/repo"),
-            Some("/var/folders/xy/T")
+            Some("/var/folders/xy/T"),
+            None
         ));
     }
 
     #[test]
     fn home_repo_is_not_temp() {
-        assert!(!is_temp_root(Path::new("/Users/dev/Projects/repo"), None));
+        assert!(!is_temp_root(
+            Path::new("/Users/dev/Projects/repo"),
+            None,
+            None
+        ));
         // A degenerate `$TMPDIR=/` must not exempt everything.
         assert!(!is_temp_root(
             Path::new("/Users/dev/Projects/repo"),
-            Some("/")
+            Some("/"),
+            None
         ));
         assert!(!is_temp_root(
             Path::new("/Users/dev/Projects/repo"),
-            Some("")
+            Some(""),
+            None
         ));
     }
 
     #[test]
     fn temp_lookalike_is_not_temp() {
         // Path-component boundary: /tmpfoo is not under /tmp.
-        assert!(!is_temp_root(Path::new("/tmpfoo/repo"), None));
+        assert!(!is_temp_root(Path::new("/tmpfoo/repo"), None, None));
     }
 
     #[test]
@@ -1856,7 +1878,7 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let repo_root = std::fs::canonicalize(&real).unwrap().join("repo");
-        assert!(is_temp_root(&repo_root, Some(link.to_str().unwrap())));
+        assert!(is_temp_root(&repo_root, Some(link.to_str().unwrap()), None));
     }
 
     // --- git_commit_targets (pure parsing) ---
