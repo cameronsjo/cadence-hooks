@@ -20,8 +20,11 @@ release:
 
 .PHONY: test
 ## Run all workspace tests
+# --no-fail-fast is load-bearing: without it cargo stops after the first test
+# binary that fails and never builds the rest, so one red crate hides every
+# other crate's results while the run still looks like a complete answer.
 test:
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace --no-fail-fast
 
 .PHONY: check
 ## Run cargo check (fast compilation check)

@@ -372,7 +372,7 @@ fn patch_add_file_carrying_a_secret_is_blocked() {
     let payload = serde_json::json!({
         "tool_name": "apply_patch",
         "cwd": "/private/tmp",
-        "tool_input": patch,
+        "tool_input": {"command": patch},
     })
     .to_string();
     let (code, stderr) = run_hook(
@@ -381,6 +381,10 @@ fn patch_add_file_carrying_a_secret_is_blocked() {
         &payload,
     );
     assert_eq!(code, Some(2), "a patched-in secret must block: {stderr}");
+    assert!(
+        !stderr.contains("targets could not be enumerated"),
+        "the guard, not patch normalization, must decide the block: {stderr}"
+    );
 
     // Control: the same guard on the same content through a plain Write. If
     // this did not block, the assertion above would prove nothing about the
@@ -393,6 +397,66 @@ fn patch_add_file_carrying_a_secret_is_blocked() {
     .to_string();
     let (code, _) = run_hook(&["cadence", "prevent-secret-writes"], &[], &write);
     assert_eq!(code, Some(2), "control: the plain Write must block too");
+}
+
+#[test]
+fn adapter_wrapped_benign_patch_reaches_security_critical_guard() {
+    let patch = "*** Begin Patch\n*** Add File: harmless.txt\n+ok\n*** End Patch";
+    let payload = serde_json::json!({
+        "tool_name": "apply_patch",
+        "cwd": "/private/tmp",
+        "tool_input": {"input": patch},
+    })
+    .to_string();
+    let (code, stderr) = run_hook(
+        &["cadence", "prevent-secret-writes"],
+        &[("CADENCE_HARNESS", "codex")],
+        &payload,
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "a benign patch must reach the guard: {stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "a benign patch must stay silent: {stderr}"
+    );
+}
+
+#[test]
+fn conflicting_patch_bodies_fail_closed_without_echoing_them() {
+    let benign = "*** Begin Patch\n*** Add File: benign.txt\n+ok\n*** End Patch";
+    let secret = "*** Begin Patch\n*** Add File: secret.env\n+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n*** End Patch";
+    let payloads = [
+        serde_json::json!({
+            "tool_name": "apply_patch",
+            "cwd": "/private/tmp",
+            "tool_input": {"command": benign, "input": secret},
+        }),
+        serde_json::json!({
+            "tool_name": "apply_patch",
+            "cwd": "/private/tmp",
+            "tool_input": {"command": benign},
+            "input": secret,
+        }),
+    ];
+    for payload in payloads {
+        let (code, stderr) = run_hook(
+            &["cadence", "prevent-secret-writes"],
+            &[("CADENCE_HARNESS", "codex")],
+            &payload.to_string(),
+        );
+        assert_eq!(code, Some(2), "conflicting patch bodies must block");
+        assert!(
+            stderr.contains("apply_patch payload contains conflicting patch bodies")
+                && stderr.contains("security-critical hook input could not be parsed"),
+            "the security-critical parse failure must explain the block: {stderr}"
+        );
+        assert!(!stderr.contains("benign.txt"), "{stderr}");
+        assert!(!stderr.contains("secret.env"), "{stderr}");
+        assert!(!stderr.contains("AKIAIOSFODNN7EXAMPLE"), "{stderr}");
+    }
 }
 
 /// `guard-dotfiles` sees a patch target: an `apply_patch` writing a managed

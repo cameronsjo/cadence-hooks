@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "binaryVersion": "0.70.0",
+  "binaryVersion": "0.74.0",
   "minimumCodexVersion": "0.145.0",
   "privacy": {
     "rawHookInputsPersisted": false,
@@ -325,28 +325,49 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr create*)",
+          "if": "Bash(*gh pr *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr edit*)",
+          "if": "Bash(*gh issue *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh issue create*)",
+          "if": "Bash(*gh release *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh issue comment*)",
+          "if": "Bash(*gh gist *)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh discussion *)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*tea pr *)",
+          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*tea issue *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         }
       ]
@@ -411,11 +432,18 @@
       "event": "PreToolUse",
       "name": "redact-external-content",
       "plugin": "cadence",
-      "protected": false,
+      "protected": true,
       "status": "native",
       "applicable": true,
       "evidence": "tests/hook_registration_audit.rs",
       "wiring": [
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Write|Edit|mcp__.*(write|edit|create|update|delete|remove|move|rename).*",
+          "if": null,
+          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
+        },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
@@ -820,6 +848,26 @@
           "matcher": "^Edit$|mcp__.*(delete|remove|move|rename).*",
           "if": null,
           "commandHash": "75602022397b59ae8b3b84d1b0ec27202f5f49f0708bcd6fcfaf71395d0fb036"
+        }
+      ]
+    },
+    {
+      "criticality": "workflow",
+      "description": "Assert at SessionStart that guard-rm is present and classifying as contracted",
+      "event": "SessionStart",
+      "name": "guard-rm-liveness",
+      "plugin": "guardrails",
+      "protected": false,
+      "status": "native",
+      "applicable": false,
+      "evidence": "registered in the binary but not yet invoked: the cadence-guardrails SessionStart wiring ships in a companion monorepo PR. Flip to applicable when that wiring merges.",
+      "wiring": [
+        {
+          "plugin": "cadence-guardrails",
+          "event": "SessionStart",
+          "matcher": "*",
+          "if": null,
+          "commandHash": "015e644cb4ac3720d4f018aef441a66094578157a6bfe827b898e80dc03e763f"
         }
       ]
     },
@@ -1656,7 +1704,7 @@
     },
     {
       "criticality": "workflow",
-      "description": "Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)",
+      "description": "Persist an approved plan whose post-approval turn was wiped, nudging when it carries no settled Panel: line (UserPromptSubmit)",
       "event": "UserPromptSubmit",
       "name": "persist-plan",
       "plugin": "session",
@@ -1676,7 +1724,7 @@
     },
     {
       "criticality": "workflow",
-      "description": "Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)",
+      "description": "Persist an approved plan on same-session approval, nudging when it carries no settled Panel: line (PostToolUse:ExitPlanMode)",
       "event": "PostToolUse",
       "name": "persist-plan-approval",
       "plugin": "session",

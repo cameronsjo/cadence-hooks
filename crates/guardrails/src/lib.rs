@@ -115,6 +115,8 @@ pub mod guard_push_remote;
 pub mod guard_read_model;
 /// Path-aware triage of rm-family delete commands (allow/ask/block).
 pub mod guard_rm;
+/// SessionStart assertion that `guard-rm` is present and classifying correctly.
+pub mod guard_rm_liveness;
 /// Inject the gh-write allowlist + `-R` rule on SessionStart.
 pub mod inject_gh_context;
 /// Re-inject the gh-write allowlist + `-R` rule just before an untargeted gh write.

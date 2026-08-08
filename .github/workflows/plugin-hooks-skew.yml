@@ -33,8 +33,12 @@ jobs:
           set -euo pipefail
           tag="$(gh release view --repo cameronsjo/cadence-hooks --json tagName --jq .tagName)"
           echo "Latest released cadence-hooks: $tag"
+          # --clobber: on a self-hosted runner /tmp/ch survives between runs,
+          # and a leftover same-version tarball fails the download with
+          # "already exists" before any skew logic runs (observed 2026-08-03
+          # failing every hooks-touching cadence PR in ~5s).
           gh release download "$tag" --repo cameronsjo/cadence-hooks \
-            --pattern "*linux-x86_64.tar.gz" --dir /tmp/ch
+            --pattern "*linux-x86_64.tar.gz" --dir /tmp/ch --clobber
           tar -xzf /tmp/ch/*linux-x86_64.tar.gz -C /tmp/ch
           bin="$(find /tmp/ch -type f -name cadence-hooks | head -n1)"
           mkdir -p "$HOME/.local/bin"
