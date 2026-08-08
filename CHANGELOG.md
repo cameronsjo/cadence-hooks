@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Supply-chain scanning runs in CI, and its weekly sweep files an issue rather than reddening `main` (#434).** `cargo audit` checks `Cargo.lock` against the RustSec advisory database and `cargo deny check bans licenses sources` enforces the new `deny.toml` policy; both fail the build on a pull request or a push, where the change that introduced the finding is available to fix. The Monday sweep exists to catch advisories published *after* a merge, so it has no pull request attached — there it opens or updates one tracking issue through `scripts/advisory-issue.sh` and lets the job pass, and the next clean sweep closes that issue. Advisory text reaches `gh` only through `--body-file`, never shell interpolation. Both tools are cached on their pinned versions, so only a version bump pays their build cost.
+
 ### Fixed
 
 - **Codex `apply_patch` hook payloads now normalize both object-wrapped patch-body forms (#639).** The official Codex 0.146.0 `tool_input.command` envelope and the adapter-emitted `tool_input.input` envelope now reach per-target security guards instead of failing closed as if the patch body were missing. Raw-string `tool_input`, top-level `input`, and already-normalized `tool_input.patch` compatibility remain intact; conflicting recognized bodies and malformed or missing bodies fail closed without echoing patch content.
