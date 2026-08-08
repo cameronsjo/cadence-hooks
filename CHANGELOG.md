@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.75.1] - 2026-08-08
+
 ### Fixed
 
 - **Two shell-parser secret bypasses the #551 quote-migration left open, both live in 0.75.0 (#551 follow-up).** `substitution_bodies`' outer loop tracked quotes with ANSI-C-blind `in_single`/`in_double` bools, so a `$'a\'b'` string before a command substitution desynced the scan and every later `$(…)`/`` `…` `` — e.g. `echo $'a\'b' $(cat .env)` — was hidden from `prevent-secret-leaks` while bash executed the read (proven with a marker file). The outer loop now drives the shared `scan_quote_syntax` state machine, the same reader `split_segments`/`tokenize` use. Separately, `redirect_targets` (the append-inclusive parser feeding `prevent-secret-writes`) lost the escaped-whitespace branch its `clobber_redirect_targets` sibling kept, so `>> my\ dir/.env` truncated the target at the escaped space and the append to a real `.env` inside a space-bearing directory reached no guard; the branch is restored so the two redirect parsers agree on where a filename ends. Regression tests pin the executed read/write blocking, the escaped-backtick-prose and single-quoted-literal negatives, and parser-level parity with the quoted spellings.
