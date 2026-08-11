@@ -3,7 +3,7 @@ status: "in-flight"
 updated: "2026-08-11"
 branch: "plan/living-plan-lifecycle-guards"
 pr: "cameronsjo/cadence-hooks#671"
-next: "Task 1: instrument run_persist_plan early-returns against session beffcf50; work payload sample owed from Cameron"
+next: "Task 2: late-persist fallback for the dead injection event (#672) + approval-arm robustness; work payload sample owed from Cameron as corroboration"
 body_sha256: "3aac1eaabc19ef8667c4573ab3da2f6e3cb4f732253df6877b2ef1ee125a9c1d"
 session: "frost-anchor"
 session_id: "1322f0d3-8e45-49be-b07c-217268925560"
@@ -36,16 +36,16 @@ Ruling from Cameron: build all the guards; prose isn't enough.
 
 ### Task 1 — Probe first (evidence before code)
 
-- [ ] **Instrument the UPS-arm failure** (panel-rescoped): trace every early-return in `run_persist_plan` (prompt/prefix, empty body, cwd, repo_root, unsafe session_id, `canonical_plans_dir`) and `claim_target`'s give-up path against session `beffcf50`'s recorded prompt — name the specific return that ate four real persists before Task 2 writes any code
+- [x] **Root cause named — no early-return, no code defect: the event is dead.** Replaying `beffcf50`'s exact prompt through the installed 0.75.1 binary persists cleanly; every cache version since 07-27 carries both wiring rows; and the transcript shows the approve-and-clear injection (an entry carrying `origin` + `planContent`) is followed by zero UserPromptSubmit hook context, while typed prompts get it. The harness stopped routing the injection through UserPromptSubmit. Evidence filed as [cadence-hooks#672](https://github.com/cameronsjo/cadence-hooks/issues/672)
 - [x] Local approval-path probe: approval `tool_response` carries `plan`; `tool_input` carries `plan` + `planFilePath`; rejection = bare error string (this session's transcript, claude-code 2.1.227 / hooks 0.75.1)
-- [ ] Work payload sample: Cameron relays work Claude's `ExitPlanMode` transcript line + `cadence-hooks --version` at work
-- [ ] Record the evidence on a new cadence-hooks issue (platform-moved-under-the-hook; sibling of #396's probe); comment on #429 that Cameron's 2026-08-11 ruling supersedes its wait-for-the-trial gate
+- [ ] Work payload sample: Cameron relays work Claude's `ExitPlanMode` transcript line + `cadence-hooks --version` at work (demoted from gate to corroboration — #672 likely explains work too, but work's install state is still unverified)
+- [x] Evidence recorded on [#672](https://github.com/cameronsjo/cadence-hooks/issues/672); #429's wait-for-the-trial gate superseded by comment (Cameron's 2026-08-11 ruling)
 
 ### Task 2 — Repair the persist-plan triggers (cadence-hooks)
 
 `crates/session/src/persist_plan.rs` (re-resolve all line cites against `origin/main` first — the plan's cites came from a checkout 26 commits behind):
 
-- [ ] Fix the Task-1-named early-return in the UserPromptSubmit arm
+- [ ] **Late-persist fallback for the dead injection event** (closes #672): on any UserPromptSubmit whose prompt lacks the prefix, scan the transcript tail for an injected plan entry (`planContent`) whose normalized `body_sha256` matches no existing `docs/plans/*.md`, and persist it then — bounded tail read (the existing `find_parent` discipline), `body_sha256` dedupe against the approval arm
 - [ ] Robustness on the approval arm: source the plan from `tool_response.plan` → `tool_input.plan` → plan-store `planFilePath` read, first present wins; keep the rejection no-op and the subagent gate
 - [ ] Cross-trigger idempotency: both arms must normalize to a byte-identical body before hashing (`body_sha256`), and the approval arm wins on same-session double-fire — state it in tests, not just here
 - [ ] Tests: all payload shapes, rejection, double-fire skip, the named early-return's regression case
@@ -115,6 +115,7 @@ cadence-hooks work in this worktree (`plan/living-plan-lifecycle-guards`, based 
 - **2026-08-11 — Context folded from [cadence#942](https://github.com/cameronsjo/cadence/issues/942)** (posted after approval): defect 6 narrowed (init-* works; `cadence-rules.md`'s sole installer sits outside every preflight), defect 7 added (executing-seat gap), Task 5 upgraded to the cite-the-path forcing function, Task 6 retargeted at the `initializing-cadence` install path.
 - **2026-08-11 — Panel refuted both approved persist-defect root causes.** The red-team seat proved the legacy prefix still matches (four live sessions) and persistence still fails — the defect is an unnamed early-return, not the prefix and not the payload field. Task 1 rescoped from payload-shape capture to early-return instrumentation against session `beffcf50`; Task 2 rescoped to fix-what-Task-1-names. The plan's file:line cites and test count also derived from a checkout 26 commits behind `origin/main`; the worktree is based on current `origin/main` and cites re-resolve at edit time.
 - **2026-08-11 — Guard specs tightened per panel** (events pinned, dedupe rules named, no-fire cases for failed commands, guard 4's dead frontmatter-arm dropped, new bounded body reader named, wiring rows budgeted 3+, release checklist completed with the platform-baseline bump).
+- **2026-08-11 — Task 1's instrumentation superseded by a cheaper decisive probe.** Instead of instrumenting early-returns, replaying the failing prompt through the installed binary exonerated the code, the cache sweep exonerated the wiring, and the transcript's hook-context absence convicted the event: the approve-and-clear injection no longer fires UserPromptSubmit ([#672](https://github.com/cameronsjo/cadence-hooks/issues/672)). Task 2's first bullet respecified as the late-persist fallback.
 
 ## Learnings
 
