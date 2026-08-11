@@ -53,6 +53,7 @@ pub mod identity;
 /// approving turn leaves no durable trace — the approve-and-clear wipe
 /// (cadence#505) and same-session approval (cadence-hooks#396) respectively.
 pub mod persist_plan;
+pub mod plan_guards;
 /// `docs/plans/*.md` frontmatter scan consumed by [`start`]'s SessionStart
 /// disclosure — surfaces in-flight/blocked plans without a GitHub call
 /// (cadence-hooks#429). Not `pub`: its one consumer, [`start`], lives in this

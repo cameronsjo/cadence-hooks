@@ -264,6 +264,11 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "cameronsjo/cadence#653",
     ),
     ("guardrails guard-rm-liveness", "cameronsjo/cadence#760"),
+    ("session nudge-plan-tick", "cameronsjo/cadence-hooks#671"),
+    (
+        "session warn-plan-ready-flip",
+        "cameronsjo/cadence-hooks#671",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
