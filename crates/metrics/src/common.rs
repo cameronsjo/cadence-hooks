@@ -583,11 +583,28 @@ mod tests {
 
         #[test]
         fn non_repo_dir_falls_back_to_cwd_basename() {
-            let scratch = Scratch::new(&scratch_root(), "non-repo");
-            let dir = scratch.path().join("not-a-repo");
-            std::fs::create_dir(&dir).unwrap();
+            // A genuine system tempdir, not a `Scratch` — `Scratch` is
+            // `target/`-rooted by default (cadence-hooks#312/#403), which
+            // nests it inside THIS repo's own working tree on a plain
+            // checkout. `GitState::resolve` then correctly walks up and
+            // finds cadence-hooks' own `.git`, so a `Scratch`-based "not a
+            // repo" dir isn't actually outside a repo on CI (only locally,
+            // where a `.claude/worktrees/` checkout trips Scratch's
+            // carve-out relocation to `$XDG_CACHE_HOME` and masks it). A
+            // system tempdir is outside any repo regardless of where the
+            // test runs.
+            let dir = tempfile::Builder::new()
+                .prefix("not-a-repo-")
+                .tempdir()
+                .unwrap();
+            let expected = dir
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
 
-            assert_eq!(repo_basename(Some(&dir.to_string_lossy())), "not-a-repo");
+            assert_eq!(repo_basename(Some(&dir.path().to_string_lossy())), expected);
         }
     }
 }
