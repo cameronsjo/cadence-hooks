@@ -3,7 +3,7 @@ status: "in-flight"
 updated: "2026-08-11"
 branch: "plan/living-plan-lifecycle-guards"
 pr: "cameronsjo/cadence-hooks#671"
-next: "Task 2: late-persist fallback for the dead injection event (#672) + approval-arm robustness; work payload sample owed from Cameron as corroboration"
+next: "Task 3: the four guards (uncommitted-plan nudge, commit advisory, ready-flip #429, format lint) — Task 2 landed as PR #674; work payload sample owed from Cameron as corroboration"
 body_sha256: "3aac1eaabc19ef8667c4573ab3da2f6e3cb4f732253df6877b2ef1ee125a9c1d"
 session: "frost-anchor"
 session_id: "1322f0d3-8e45-49be-b07c-217268925560"
@@ -45,10 +45,10 @@ Ruling from Cameron: build all the guards; prose isn't enough.
 
 `crates/session/src/persist_plan.rs` (re-resolve all line cites against `origin/main` first — the plan's cites came from a checkout 26 commits behind):
 
-- [ ] **Late-persist fallback for the dead injection event** (closes #672): on any UserPromptSubmit whose prompt lacks the prefix, scan the transcript tail for an injected plan entry (`planContent`) whose normalized `body_sha256` matches no existing `docs/plans/*.md`, and persist it then — bounded tail read (the existing `find_parent` discipline), `body_sha256` dedupe against the approval arm
-- [ ] Robustness on the approval arm: source the plan from `tool_response.plan` → `tool_input.plan` → plan-store `planFilePath` read, first present wins; keep the rejection no-op and the subagent gate
-- [ ] Cross-trigger idempotency: both arms must normalize to a byte-identical body before hashing (`body_sha256`), and the approval arm wins on same-session double-fire — state it in tests, not just here
-- [ ] Tests: all payload shapes, rejection, double-fire skip, the named early-return's regression case
+- [x] **Late-persist fallback for the dead injection event** (closes #672): head-scan (not tail — the injection never moves from the head; a deviation, see below) for the injected `planContent` entry, explicit `isSidechain: false` only; dir-wide hash dedupe over `docs/plans/*.md` (regular files, newest-first, bounded) — PR [#674](https://github.com/cameronsjo/cadence-hooks/pull/674)
+- [x] Approval-arm fallback chain: `tool_response.plan` → `tool_input.plan` → **contained** plan-store read (path must canonicalize to a `.md` under `<config_dir>/plans` — the polish security arm's Critical: an unconstrained model-populated path was an arbitrary-local-file read); rejection no-op and subagent gate kept — PR #674
+- [x] Cross-trigger idempotency: all three paths normalize to byte-identical bodies (`late_persist_normalizes_to_the_same_hash_as_the_prefix_path`)
+- [x] Tests: 8 new (late-persist ×3, fallback chain ×3, containment ×2); 1156 crate tests green, clippy clean; polish ran diff-based (security Opus + code-review + provenance arms), all Critical/Important findings fixed in `962e444`
 
 ### Task 3 — The four guards (cadence-hooks, advisory tier — all four in scope)
 
@@ -117,6 +117,8 @@ cadence-hooks work in this worktree (`plan/living-plan-lifecycle-guards`, based 
 - **2026-08-11 — Panel refuted both approved persist-defect root causes.** The red-team seat proved the legacy prefix still matches (four live sessions) and persistence still fails — the defect is an unnamed early-return, not the prefix and not the payload field. Task 1 rescoped from payload-shape capture to early-return instrumentation against session `beffcf50`; Task 2 rescoped to fix-what-Task-1-names. The plan's file:line cites and test count also derived from a checkout 26 commits behind `origin/main`; the worktree is based on current `origin/main` and cites re-resolve at edit time.
 - **2026-08-11 — Guard specs tightened per panel** (events pinned, dedupe rules named, no-fire cases for failed commands, guard 4's dead frontmatter-arm dropped, new bounded body reader named, wiring rows budgeted 3+, release checklist completed with the platform-baseline bump).
 - **2026-08-11 — Task 1's instrumentation superseded by a cheaper decisive probe.** Instead of instrumenting early-returns, replaying the failing prompt through the installed binary exonerated the code, the cache sweep exonerated the wiring, and the transcript's hook-context absence convicted the event: the approve-and-clear injection no longer fires UserPromptSubmit ([#672](https://github.com/cameronsjo/cadence-hooks/issues/672)). Task 2's first bullet respecified as the late-persist fallback.
+
+- **2026-08-11 — Task 2 executed head-scan, not the spec'd tail-scan.** The injection is the first user entry of its session and never moves; a tail window loses it as the session grows. Improvement, not reality-forced. The polish security arm (Opus) upgraded the plan-store fallback with containment (its Critical) and flipped the sidechain gate fail-closed — both folded into PR [#674](https://github.com/cameronsjo/cadence-hooks/pull/674) before it opened.
 
 ## Learnings
 
