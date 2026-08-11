@@ -3,6 +3,7 @@
 
 use regex::Regex;
 use serde_json::json;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -176,7 +177,16 @@ pub fn branch(cwd: Option<&str>) -> String {
 pub fn repo_basename(cwd: Option<&str>) -> String {
     let dir = match cwd.and_then(|d| cadence_hooks_core::gitstate::GitState::resolve(Path::new(d)))
     {
-        Some(state) if state.git_common_dir.to_string_lossy().ends_with(".git") => state
+        // Exact component match, not a string suffix: `ends_with(".git")` on
+        // the whole path would also match a `--separate-git-dir` target
+        // conventionally named `<name>.git` (e.g. `/gitdirs/myrepo.git`),
+        // taking this branch and reporting `gitdirs` — the *parent* of the
+        // admin dir, not the repo — as the repo name. Comparing the final
+        // path component to the literal `.git` closes that: only a real
+        // `.git`-named dir (primary checkout or linked worktree) takes this
+        // branch; a `--separate-git-dir` admin dir named `myrepo.git` falls
+        // through to the `repo_root` branch below, same as a bare repo.
+        Some(state) if state.git_common_dir.file_name() == Some(OsStr::new(".git")) => state
             .git_common_dir
             .parent()
             .map(PathBuf::from)
@@ -579,6 +589,33 @@ mod tests {
             let basename = repo_basename(Some(&wt.to_string_lossy()));
             assert_eq!(basename, "myrepo");
             assert_ne!(basename, "some-slug");
+        }
+
+        /// The regression a naive `ends_with(".git")` on the whole path would
+        /// reintroduce: a `--separate-git-dir` admin dir conventionally named
+        /// `<repo>.git` (a real-world layout, e.g. bare-style admin dirs under
+        /// `/gitdirs/`) also ends with the literal `.git`, so a string-suffix
+        /// check takes the "parent of git_common_dir" branch and reports the
+        /// admin dir's *parent* (`gitdirs`) as the repo — not the actual repo
+        /// working directory, and not even a subdirectory of it. Comparing
+        /// the exact final path component to `.git` closes this: the admin
+        /// dir here is named `myrepo.git`, not `.git`, so it correctly falls
+        /// through to the `repo_root` branch instead.
+        #[test]
+        fn separate_git_dir_named_with_dot_git_suffix_does_not_report_its_parent() {
+            let scratch = Scratch::new(&scratch_root(), "separate-gitdir");
+            let admin = scratch.path().join("gitdirs").join("myrepo.git");
+            std::fs::create_dir_all(admin.parent().unwrap()).unwrap();
+            let repo = scratch.path().join("myrepo");
+            std::fs::create_dir(&repo).unwrap();
+            git_in(
+                &repo,
+                &["init", "--separate-git-dir", &admin.to_string_lossy()],
+            );
+
+            let basename = repo_basename(Some(&repo.to_string_lossy()));
+            assert_eq!(basename, "myrepo");
+            assert_ne!(basename, "gitdirs");
         }
 
         #[test]
