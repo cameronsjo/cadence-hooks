@@ -409,6 +409,10 @@ enum SessionCommands {
     PersistPlan,
     /// Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)
     PersistPlanApproval,
+    /// Nudge once per session when commits keep skipping the branch's in-flight plan (PostToolUse:Bash)
+    NudgePlanTick,
+    /// Warn on gh pr ready/merge while the branch's plan is unreconciled (PreToolUse:Bash)
+    WarnPlanReadyFlip,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -518,6 +522,8 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::BackstopWarn => "backstop-warn",
             SessionCommands::PersistPlan => "persist-plan",
             SessionCommands::PersistPlanApproval => "persist-plan-approval",
+            SessionCommands::NudgePlanTick => "nudge-plan-tick",
+            SessionCommands::WarnPlanReadyFlip => "warn-plan-ready-flip",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -1288,6 +1294,16 @@ fn main() {
             SessionCommands::PersistPlanApproval => dispatch::run_logged_check(
                 &cadence_hooks_session::persist_plan::PersistPlanApproval,
                 post,
+                canonical_hook,
+            ),
+            SessionCommands::NudgePlanTick => dispatch::run_logged_check(
+                &cadence_hooks_session::plan_guards::NudgePlanTick,
+                post,
+                canonical_hook,
+            ),
+            SessionCommands::WarnPlanReadyFlip => dispatch::run_logged_check(
+                &cadence_hooks_session::plan_guards::WarnPlanReadyFlip,
+                pre,
                 canonical_hook,
             ),
             SessionCommands::Declare {

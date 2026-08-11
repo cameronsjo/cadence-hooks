@@ -325,49 +325,14 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr *)",
+          "if": "Bash(*gh *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh issue *)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh release *)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh gist *)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh discussion *)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*tea pr *)",
-          "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*tea issue *)",
+          "if": "Bash(*tea *)",
           "commandHash": "4e29c437b95503c318b77b5befa411c309981ee3d7cacf74f741c39e366873bf"
         }
       ]
@@ -387,21 +352,7 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr create*)",
-          "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr ready*)",
-          "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr merge*)",
+          "if": "Bash(*gh pr *)",
           "commandHash": "a64b8f9931d6dd0eea592e8953e1a90d3e1fe3e65f2650da12098644f3401345"
         }
       ]
@@ -448,41 +399,6 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh issue *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh release *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh gist *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh discussion *)",
-          "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
           "if": "Bash(*git commit*)",
           "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
         },
@@ -490,14 +406,14 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*tea pr *)",
+          "if": "Bash(*gh *)",
           "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
         },
         {
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*tea issue *)",
+          "if": "Bash(*tea *)",
           "commandHash": "a5ab5b4c692e07b821b489edac41c35f8c7f3f9d04e171b7f9efa6d65a72f5fa"
         }
       ]
@@ -1280,7 +1196,7 @@
         {
           "plugin": "cadence-obsidian",
           "event": "PreToolUse",
-          "matcher": "^Bash$|^Edit$|mcp__.*([dD][eE][lL][eE][tT][eE]|[rR][eE][mM][oO][vV][eE]|[mM][oO][vV][eE]|[rR][eE][nN][aA][mM][eE]).*",
+          "matcher": "^Bash$|^Edit$|^mcp__.*([dD][eE][lL][eE][tT][eE]|[rR][eE][mM][oO][vV][eE]|[mM][oO][vV][eE]|[rR][eE][nN][aA][mM][eE]).*",
           "if": null,
           "commandHash": "aee750813d5d9e831abc921cfc6d3ff8ec170ca52158119f655ede783deadb5e"
         }
@@ -1741,6 +1657,30 @@
           "commandHash": "d1c0dd1503f638435e2ea9fdc2247f050838cc1abd886b95c7f2d3c182c154df"
         }
       ]
+    },
+    {
+      "criticality": "workflow",
+      "description": "Nudge once per session when successful commits keep skipping the branch's in-flight plan doc (PostToolUse:Bash)",
+      "event": "PostToolUse",
+      "name": "nudge-plan-tick",
+      "plugin": "session",
+      "protected": false,
+      "status": "native",
+      "applicable": false,
+      "evidence": "registered in the binary but not yet invoked: the cadence PostToolUse:Bash wiring ships in a companion monorepo PR (cameronsjo/cadence-hooks#671 Task 4). Flip to applicable when that wiring merges.",
+      "wiring": []
+    },
+    {
+      "criticality": "workflow",
+      "description": "Warn on gh pr ready/merge while the branch's plan is still in-flight or carries unticked boxes (PreToolUse:Bash)",
+      "event": "PreToolUse",
+      "name": "warn-plan-ready-flip",
+      "plugin": "session",
+      "protected": false,
+      "status": "native",
+      "applicable": false,
+      "evidence": "registered in the binary but not yet invoked: the cadence PreToolUse:Bash wiring ships in a companion monorepo PR (cameronsjo/cadence-hooks#671 Task 4). Flip to applicable when that wiring merges.",
+      "wiring": []
     }
   ]
 }

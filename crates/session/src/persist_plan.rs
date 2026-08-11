@@ -997,6 +997,57 @@ const PANEL_GATE_NUDGE: &str = "panel gate: this plan carries no settled Panel: 
      plan-review panel before implementing, fold findings, or write \"Panel: none — <reason>\" \
      (cadence:attune → plan-review-panel).";
 
+/// Static sentence appended when the plan body carries no
+/// `## Alternatives declined` stanza — the plan template's mandatory record
+/// of the approaches proposed and declined (or its explicit
+/// `none proposed — single obvious approach` assertion). Same static-only
+/// discipline as [`PANEL_GATE_NUDGE`]: the harness's own plan-mode template
+/// (Context/Changes/Verification) omits every cadence stanza, so this lint
+/// is the deterministic catch for that displacement (the living-plan-guards
+/// plan's Task 3 guard 4).
+const ALTERNATIVES_GATE_NUDGE: &str = "format gate: no Alternatives-declined stanza — record \
+     the approaches declined at planning (or \"none proposed — single obvious approach\").";
+
+/// Static sentence appended when the plan body carries no `- [ ]` checkbox
+/// tasks — a living plan's execution zone is its tickable checklist; without
+/// one, the tick discipline and the ready-flip guard both have nothing to
+/// hold on to.
+const CHECKBOX_GATE_NUDGE: &str = "format gate: no checkbox tasks — give the plan a tickable \
+     `- [ ]` checklist; the execution zone's ticks are what a resuming session reconciles.";
+
+/// True when the plan body carries an `## Alternatives declined` heading at
+/// line start (fences and block quotes skipped, same discipline as
+/// [`panel_line_settled`]). Case-exact: the template writes it one way.
+fn alternatives_stanza_present(body: &str) -> bool {
+    let mut in_fence = false;
+    body.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            return false;
+        }
+        if in_fence || line.starts_with('>') {
+            return false;
+        }
+        line.starts_with("## Alternatives declined")
+    })
+}
+
+/// True when the plan body carries at least one checkbox task (`- [ ]` or
+/// `- [x]`) outside fenced code (block quotes are allowed — a quoted
+/// checklist is still a checklist shape the author chose).
+fn checkbox_present(body: &str) -> bool {
+    let mut in_fence = false;
+    body.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            return false;
+        }
+        !in_fence && (trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]"))
+    })
+}
+
 /// True when the plan body carries a settled `Panel:` line — anchored at line
 /// start, in exactly one of the plan template's two settled forms:
 ///
@@ -1109,11 +1160,20 @@ fn persist_and_nudge(
         path.display()
     );
     // Evaluated only after the claim succeeded: the persistence write must
-    // never depend on the detector — a future panic here eats one nudge's
-    // sentence, never the persist (security review of this change).
+    // never depend on the detectors — a future panic here eats one nudge's
+    // sentence, never the persist (security review of this change). All
+    // three append static text only, never matched content.
     if !panel_line_settled(plan_body) {
         nudge.push(' ');
         nudge.push_str(PANEL_GATE_NUDGE);
+    }
+    if !alternatives_stanza_present(plan_body) {
+        nudge.push(' ');
+        nudge.push_str(ALTERNATIVES_GATE_NUDGE);
+    }
+    if !checkbox_present(plan_body) {
+        nudge.push(' ');
+        nudge.push_str(CHECKBOX_GATE_NUDGE);
     }
     CheckResult::nudge(nudge)
 }
@@ -2348,6 +2408,65 @@ mod tests {
         assert!(!links.contains("test-host"));
         assert!(!links.contains("\"host\""));
         assert!(!links.contains("\"repo\""));
+    }
+
+    #[test]
+    fn format_gate_detectors_anchor_on_real_stanzas_only() {
+        // Alternatives stanza: line-start heading, fences and quotes skipped.
+        assert!(alternatives_stanza_present(
+            "# T\n\n## Alternatives declined\n\n- none proposed\n"
+        ));
+        assert!(!alternatives_stanza_present("# T\n\nno stanza here\n"));
+        assert!(!alternatives_stanza_present(
+            "# T\n\n```\n## Alternatives declined\n```\n"
+        ));
+        assert!(!alternatives_stanza_present(
+            "# T\n\n> ## Alternatives declined\n"
+        ));
+        // Checkboxes: ticked or unticked count; fenced examples don't.
+        assert!(checkbox_present("# T\n\n- [ ] build\n"));
+        assert!(checkbox_present("# T\n\n  - [x] done\n"));
+        assert!(!checkbox_present("# T\n\nprose only\n"));
+        assert!(!checkbox_present("# T\n\n```\n- [ ] fenced example\n```\n"));
+    }
+
+    #[test]
+    fn format_gate_sentences_ride_the_persist_nudge() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+
+        // A harness-template-shaped plan: no Panel, no Alternatives, no boxes.
+        let bare = make_user_prompt_submit(
+            "fmt-session",
+            "Implement the following plan:\n\n# Bare Plan\n\nContext prose only.",
+            &cwd,
+            &tmp.path().join("fmt-session.jsonl").to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&bare, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+        });
+        let msg = r.message.unwrap();
+        assert!(msg.contains("panel gate:"));
+        assert!(msg.contains("no Alternatives-declined stanza"));
+        assert!(msg.contains("no checkbox tasks"));
+
+        // A template-conforming plan gets the plain persist nudge only.
+        let full = make_user_prompt_submit(
+            "fmt-session-2",
+            "Implement the following plan:\n\n# Full Plan\n\nPanel: reviewer ran — 1 finding, \
+             1 folded in, 0 declined\n\n## Alternatives declined\n\n- none proposed — single \
+             obvious approach\n\n- [ ] build it\n",
+            &cwd,
+            &tmp.path().join("fmt-session-2.jsonl").to_string_lossy(),
+        );
+        let r2 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&full, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+        });
+        let msg2 = r2.message.unwrap();
+        assert!(!msg2.contains("format gate:"));
+        assert!(!msg2.contains("panel gate:"));
     }
 
     #[test]

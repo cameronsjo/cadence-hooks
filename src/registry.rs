@@ -429,6 +429,18 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: Some(HookEvent::PostToolUse),
     },
+    HookEntry {
+        name: "nudge-plan-tick",
+        description: "Nudge once per session when successful commits keep skipping the branch's in-flight plan doc (PostToolUse:Bash)",
+        plugin: "session",
+        event: Some(HookEvent::PostToolUse),
+    },
+    HookEntry {
+        name: "warn-plan-ready-flip",
+        description: "Warn on gh pr ready/merge while the branch's plan is still in-flight or carries unticked boxes (PreToolUse:Bash)",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.

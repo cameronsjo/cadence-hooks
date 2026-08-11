@@ -171,7 +171,56 @@ fn worktree_posture_line(cwd: &str) -> Option<String> {
 /// repo root the same way [`crate::persist_plan`] does.
 fn plan_disclosure_line(cwd: &str) -> Option<String> {
     let root = registry::repo_root(cwd)?;
-    crate::plan_scan::scan_in_flight_plans(&root)
+    let scan = crate::plan_scan::scan_in_flight_plans(&root);
+    let uncommitted = uncommitted_plans_line(&root);
+    match (scan, uncommitted) {
+        (Some(scan), Some(unc)) => Some(format!("{scan}\n{unc}")),
+        (Some(scan), None) => Some(scan),
+        (None, Some(unc)) => Some(unc),
+        (None, None) => None,
+    }
+}
+
+/// One line naming in-flight plan docs that are untracked or dirty in the
+/// working tree — the persist-plan nudge's "commit it" half can be wasted
+/// (plan mode blocks the commit; a session ends first), and an uncommitted
+/// plan is invisible to every other checkout (the living-plan-guards plan's
+/// Task 3 guard 1). One `git status` spawn, once per session start, only when
+/// an in-flight plan exists; any spawn failure or clean status is silence.
+/// File names are repo-authored text — sanitized before rendering.
+fn uncommitted_plans_line(repo_root: &Path) -> Option<String> {
+    let plans = crate::plan_scan::in_flight_plans(repo_root);
+    if plans.is_empty() {
+        return None;
+    }
+    let status = cadence_hooks_core::shell::git_command(
+        &repo_root.to_string_lossy(),
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "docs/plans",
+        ],
+    )?;
+    let dirty: Vec<&str> = status
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(str::trim)
+        .collect();
+    let hits: Vec<String> = plans
+        .iter()
+        .filter(|plan| dirty.iter().any(|d| *d == plan.rel_path))
+        .map(|plan| identity::sanitize_field(&plan.rel_path, identity::MAX_FIELD_DISPLAY))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Uncommitted living plan(s): {} — commit them (explicit-path git add); an uncommitted \
+         plan is invisible to every other session and checkout.",
+        hits.join(", ")
+    ))
 }
 
 /// Compose the final result from the optional posture line, peer disclosure,
@@ -576,6 +625,39 @@ mod tests {
         );
         assert!(msg.contains("2026-07-25-x"), "slug named: {msg}");
         assert!(msg.contains("ship it"), "next: text named: {msg}");
+        // The plan file above is untracked — the uncommitted-plan guard line
+        // rides the same disclosure (living-plan-guards Task 3 guard 1).
+        assert!(
+            msg.contains("Uncommitted living plan(s): docs/plans/2026-07-25-x.md"),
+            "uncommitted line present: {msg}"
+        );
+    }
+
+    #[test]
+    fn uncommitted_plan_line_goes_silent_once_the_plan_is_committed() {
+        let scratch = scratch("plan-uncommitted");
+        init_repo(scratch.path());
+        let plans_dir = scratch.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(
+            plans_dir.join("2026-07-25-x.md"),
+            "---\nstatus: in-flight\nnext: \"ship it\"\n---\n\nbody\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(scratch.path())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "plan lands"]);
+
+        let line = uncommitted_plans_line(scratch.path());
+        assert_eq!(line, None, "committed plan must not draw the line");
     }
 
     #[test]

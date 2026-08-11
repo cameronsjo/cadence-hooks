@@ -97,6 +97,46 @@ struct PlanFacts {
 /// [`crate::start`], within this crate — unlike the `Check`/`Logger` types
 /// `main.rs` dispatches across the crate boundary, nothing outside
 /// `cadence-hooks-session` ever calls this directly.
+/// One in-flight (or blocked) plan doc, structured for the plan guards
+/// ([`crate::plan_guards`]) — the same bounded scan the disclosure renderer
+/// uses, exposed as data instead of prose. `rel_path` is forward-slash
+/// repo-relative (`docs/plans/<file>`), the shape `git log --name-only`
+/// prints, so guard-side comparisons are string-equal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InFlightPlan {
+    pub(crate) path: PathBuf,
+    pub(crate) rel_path: String,
+    pub(crate) status: String,
+    pub(crate) branch: Option<String>,
+}
+
+/// Every plan doc whose `status:` is `in-flight` or `blocked`, under the same
+/// candidate bounds as [`scan_in_flight_plans`]. Empty on a missing or
+/// unreadable directory (fail-open).
+pub(crate) fn in_flight_plans(repo_root: &Path) -> Vec<InFlightPlan> {
+    let plans_dir = repo_root.join("docs").join("plans");
+    let Some(paths) = list_markdown_files(&plans_dir) else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let content = read_capped(&path)?;
+            let facts = parse_frontmatter_facts(&content)?;
+            if !matches_in_flight_or_blocked(&facts.status) {
+                return None;
+            }
+            let file_name = path.file_name()?.to_str()?.to_string();
+            Some(InFlightPlan {
+                rel_path: format!("docs/plans/{file_name}"),
+                status: facts.status,
+                branch: facts.branch,
+                path,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn scan_in_flight_plans(repo_root: &Path) -> Option<String> {
     let plans_dir = repo_root.join("docs").join("plans");
     let paths = list_markdown_files(&plans_dir)?;
