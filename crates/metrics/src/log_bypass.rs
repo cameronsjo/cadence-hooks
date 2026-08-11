@@ -77,6 +77,16 @@ impl BypassEvent {
     /// arming even if the snooze is never ridden through). Always a `dismissal`
     /// kind. `repo_root` is resolved to a basename here so the caller never has
     /// to reach into the privacy contract.
+    ///
+    /// `repo_root` arrives already resolved by the caller (the toplevel path a
+    /// `dismiss-*` CLI arm computed for its own confirmation message, or a
+    /// bare-repo common-dir fallback), so `repo_basename` re-derives a fact the
+    /// caller already has. That was a second `git` subprocess before
+    /// cameronsjo/cadence#857; `repo_basename` is now a pure filesystem walk
+    /// (`GitState::resolve`), so the redundancy is a walk, not a spawn, and it's
+    /// the only path that's correct for both the toplevel and bare-repo shapes
+    /// `repo_root` can carry — left as-is rather than reshaping the CLI arms to
+    /// pass a pre-computed basename for a cost that no longer exists.
     #[allow(clippy::too_many_arguments)]
     pub fn armed(
         hook: &str,
