@@ -195,10 +195,26 @@ pub fn run_persist_plan(
     let Some(prompt) = input.prompt() else {
         return CheckResult::allow();
     };
-    let Some(rest) = prompt.strip_prefix(PLAN_PREFIX) else {
-        return CheckResult::allow();
+    // Two ways the plan text arrives (cadence-hooks#672): the classic
+    // prefix-carrying injected prompt, or — since the harness stopped routing
+    // its auto-continuation injection through UserPromptSubmit at all — a
+    // LATER, ordinary prompt whose transcript head carries the injected
+    // `planContent` entry. The late path normalizes through the same
+    // prefix-strip + suffix-strip so all three triggers hash byte-identical
+    // bodies (Design 18).
+    let (body, via_late_scan) = match prompt.strip_prefix(PLAN_PREFIX) {
+        Some(rest) => (strip_trailing_suffix_lines_and_trim(rest), false),
+        None => match input
+            .transcript_path()
+            .and_then(|tp| injected_plan_from_transcript(Path::new(tp)))
+        {
+            Some(injected) => {
+                let rest = injected.strip_prefix(PLAN_PREFIX).unwrap_or(&injected);
+                (strip_trailing_suffix_lines_and_trim(rest), true)
+            }
+            None => return CheckResult::allow(),
+        },
     };
-    let body = strip_trailing_suffix_lines_and_trim(rest);
     if body.is_empty() {
         return CheckResult::allow();
     }
@@ -222,6 +238,15 @@ pub fn run_persist_plan(
     let Some((repo_root, plans_dir)) = canonical_plans_dir(&repo_root) else {
         return CheckResult::allow();
     };
+    // The late path re-fires on EVERY subsequent prompt of the session, and
+    // the persist date may differ from the approval date — so the same-stem
+    // claim ladder alone cannot recognize an earlier persist under an earlier
+    // date. A dir-wide hash check closes that: any existing plan doc carrying
+    // this body hash makes the late scan a silent idempotent skip. The
+    // prefix path keeps its original semantics (one injection, one date).
+    if via_late_scan && plans_dir_contains_hash(&plans_dir, &body_hash) {
+        return CheckResult::allow();
+    }
     let stem = format!("{local_date}-{slug}");
 
     let parent = input
@@ -309,13 +334,27 @@ pub fn run_persist_plan_approval(
     if !is_top_level_approval {
         return CheckResult::allow();
     }
-    let Some(raw_plan) = input.tool_response_plan() else {
-        return CheckResult::allow();
+    // Plan source fallback chain (cadence-hooks#672): the 2.1.220-era probe
+    // found the plan ONLY in `tool_response.plan`; the current harness also
+    // fills `tool_input.plan` at call time and names the plan-store copy in
+    // `planFilePath`. Response first (the historically reliable,
+    // approval-side field), then the call-side text, then a bounded read of
+    // the plan-store file — so a future harness that drops either inline
+    // field degrades to the next source instead of a silent no-op.
+    let raw_plan = match input
+        .tool_response_plan()
+        .or_else(|| input.tool_input_plan())
+    {
+        Some(inline) => inline.to_string(),
+        None => match input.plan_file_path().and_then(read_plan_store_file) {
+            Some(stored) => stored,
+            None => return CheckResult::allow(),
+        },
     };
     // Same normalization `run_persist_plan` applies to its extracted body
     // (Design 18): both triggers must hash byte-identical text so a plan
     // approved through either path is recognized as the same re-fire.
-    let body = strip_trailing_suffix_lines_and_trim(raw_plan);
+    let body = strip_trailing_suffix_lines_and_trim(&raw_plan);
     if body.is_empty() {
         return CheckResult::allow();
     }
@@ -456,6 +495,100 @@ fn strip_trailing_suffix_lines_and_trim(text: &str) -> String {
         .position(|line| !line.trim().is_empty())
         .unwrap_or(lines.len());
     lines[first_non_blank..].join("\n")
+}
+
+/// Bounded read of the harness plan-store file named by an `ExitPlanMode`
+/// payload's `filePath`/`planFilePath` — the last-resort plan source in
+/// [`run_persist_plan_approval`]'s fallback chain (cadence-hooks#672).
+/// `None` on any I/O failure, a non-regular target, or a file over
+/// [`IDEMPOTENCY_MAX_FILE_BYTES`] — every ambiguity degrades to "no plan"
+/// (ADR-0001), never a partial read persisted as if complete.
+fn read_plan_store_file(path: &str) -> Option<String> {
+    use std::io::Read as _;
+    let path = Path::new(path);
+    if !fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let mut content = String::new();
+    file.take(IDEMPOTENCY_MAX_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    if content.len() as u64 > IDEMPOTENCY_MAX_FILE_BYTES || content.trim().is_empty() {
+        return None;
+    }
+    Some(content)
+}
+
+/// How much of the transcript's HEAD [`injected_plan_from_transcript`] will
+/// read looking for the auto-continuation entry. The injection is the very
+/// first user entry of a fresh post-`/clear` session, so it sits well inside
+/// this window even under large SessionStart context; a bounded head read
+/// (not [`cadence_hooks_core::transcript::read_tail`]) because a long session
+/// pushes the head OUT of any tail window while the entry never moves.
+const INJECTED_PLAN_SCAN_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Line cap for the same scan — the entry sits in the first handful of lines;
+/// the cap keeps a pathological many-tiny-lines file from turning the
+/// byte bound into a line-count problem.
+const INJECTED_PLAN_SCAN_MAX_LINES: usize = 200;
+
+/// The harness's auto-continuation plan injection from the transcript head,
+/// if present: a top-level `type: "user"` entry carrying non-empty
+/// `planContent` (the BARE plan body — the prefix/suffix chrome lives only in
+/// the message text) and not marked `isSidechain` (a subagent's plan is not
+/// this session's to persist). First match wins; a fresh post-`/clear`
+/// session carries at most one. Live payload shape: cadence-hooks#672
+/// (session beffcf50, claude-code 2.1.227).
+fn injected_plan_from_transcript(transcript_path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let file = fs::File::open(transcript_path).ok()?;
+    let reader = BufReader::new(file.take(INJECTED_PLAN_SCAN_MAX_BYTES));
+    for line in reader.lines().take(INJECTED_PLAN_SCAN_MAX_LINES) {
+        let Ok(line) = line else { return None };
+        // Substring pre-filter before any JSON parse — same discipline as
+        // `find_parent`'s sibling scan.
+        if !line.contains("\"planContent\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(plan) = value
+            .get("planContent")
+            .and_then(Value::as_str)
+            .filter(|p| !p.trim().is_empty())
+        {
+            return Some(plan.to_string());
+        }
+    }
+    None
+}
+
+/// Cap on how many `docs/plans` entries [`plans_dir_contains_hash`] will
+/// check. The measured corpus tops out in the low hundreds; the cap bounds a
+/// pathological directory without ever silently skipping a real one below it.
+const DIR_HASH_SCAN_MAX_FILES: usize = 512;
+
+/// Does any markdown document in `plans_dir` already carry `body_hash`?
+/// Per-file work is [`file_matches_body`]'s bounded read. Fail-open: an
+/// unreadable dir reads as "no match" and lets the claim ladder — which
+/// dedupes within the same stem — take over.
+fn plans_dir_contains_hash(plans_dir: &Path, body_hash: &str) -> bool {
+    let Ok(entries) = fs::read_dir(plans_dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .take(DIR_HASH_SCAN_MAX_FILES)
+        .any(|e| file_matches_body(&e.path(), body_hash))
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
@@ -2348,6 +2481,255 @@ mod tests {
         assert!(!links.contains("test-host"));
         assert!(!links.contains("\"host\""));
         assert!(!links.contains("\"repo\""));
+    }
+
+    // --- late persist: the injected plan entry (cadence-hooks#672) ---
+
+    /// A minimal transcript whose head carries the harness's auto-continuation
+    /// plan injection — the entry shape live-captured from session beffcf50
+    /// (cadence-hooks#672): `type: "user"`, top-level `planContent` with the
+    /// BARE plan body, `origin.kind: "auto-continuation"`, and a message text
+    /// that carries the prefix + suffix chrome the hook must never persist.
+    fn write_injected_transcript(path: &Path, plan_body: &str) {
+        let msg_text = format!(
+            "Implement the following plan:\n\n{plan_body}\n\nIf this plan can be broken down \
+             into discrete units of work, consider using the Agent tool to dispatch them."
+        );
+        let injected = serde_json::json!({
+            "type": "user",
+            "isSidechain": false,
+            "origin": {"kind": "auto-continuation"},
+            "planContent": plan_body,
+            "message": {"role": "user", "content": msg_text},
+        });
+        let ordinary = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": []},
+        });
+        fs::write(path, format!("{injected}\n{ordinary}\n")).unwrap();
+    }
+
+    #[test]
+    fn late_persist_recovers_the_injected_plan_on_a_prefixless_prompt() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, "# Fix the Widget\n\nDo the thing.");
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            "sounds good, keep going",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge, "late persist must fire");
+        let written =
+            fs::read_to_string(tmp.path().join("docs/plans/2026-08-11-fix-the-widget.md")).unwrap();
+        assert!(written.contains("# Fix the Widget"));
+        assert!(
+            !written.contains("Implement the following plan:"),
+            "the persisted body is the bare plan, never the prompt chrome"
+        );
+        assert!(!written.contains("If this plan can be broken down"));
+    }
+
+    #[test]
+    fn late_persist_normalizes_to_the_same_hash_as_the_prefix_path() {
+        // The prefix path and the late path must hash byte-identical bodies
+        // (Design 18 extended to the third trigger): persist via the prefix
+        // path first, then a prefixless prompt over the injected transcript
+        // must be a silent idempotent skip — no second file, no second nudge.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, "# Fix the Widget\n\nDo the thing.");
+
+        let prefixed = make_user_prompt_submit(
+            "child-session-id",
+            "Implement the following plan:\n\n# Fix the Widget\n\nDo the thing.",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&prefixed, "2026-08-10T00:00:00Z", "2026-08-10", "test-host")
+        });
+        assert_eq!(r1.outcome, Outcome::Nudge);
+
+        let prefixless = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        // A LATER local date: the stems differ, so only a hash-level dedupe
+        // across the whole plans dir — not the same-stem claim ladder — can
+        // recognize the re-fire.
+        let r2 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(
+                &prefixless,
+                "2026-08-11T00:00:00Z",
+                "2026-08-11",
+                "test-host",
+            )
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Allow,
+            "already-persisted plan (different date stem) must be a silent skip"
+        );
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-08-11-fix-the-widget.md")
+                .exists(),
+            "no duplicate file under the later date"
+        );
+    }
+
+    #[test]
+    fn late_persist_ignores_sidechain_and_plain_user_entries() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        // A sidechain injection (a subagent's plan) and an ordinary user entry
+        // with no planContent — neither may trigger a persist.
+        let sidechain = serde_json::json!({
+            "type": "user", "isSidechain": true,
+            "planContent": "# Subagent Plan\n\nnope.",
+            "message": {"role": "user", "content": "x"},
+        });
+        let plain = serde_json::json!({
+            "type": "user", "isSidechain": false,
+            "message": {"role": "user", "content": "just chatting"},
+        });
+        fs::write(&transcript, format!("{sidechain}\n{plain}\n")).unwrap();
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            "hello",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(
+            !tmp.path().join("docs/plans").exists() || {
+                fs::read_dir(tmp.path().join("docs/plans")).unwrap().count() == 0
+            }
+        );
+    }
+
+    // --- approval arm: plan source fallback chain (cadence-hooks#672) ---
+
+    #[test]
+    fn approval_falls_back_to_tool_input_plan() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+
+        let input = HookInput {
+            tool_name: Some("ExitPlanMode".into()),
+            tool_input: Some(ToolInput {
+                plan: Some("# Call Side Plan\n\nbody.".into()),
+                ..Default::default()
+            }),
+            tool_response: Some(ToolResponse {
+                is_agent: Some(false),
+                ..Default::default()
+            }),
+            cwd: Some(cwd),
+            session_id: Some("approving-session".into()),
+            ..Default::default()
+        };
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge, "tool_input.plan must persist");
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-11-call-side-plan.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn approval_falls_back_to_the_plan_store_file() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let store = tmp.path().join("store-plan.md");
+        fs::write(&store, "# Stored Plan\n\nbody from the plan store.").unwrap();
+
+        let input = HookInput {
+            tool_name: Some("ExitPlanMode".into()),
+            tool_response: Some(ToolResponse {
+                is_agent: Some(false),
+                file_path: Some(store.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+            cwd: Some(cwd),
+            session_id: Some("approving-session".into()),
+            ..Default::default()
+        };
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge, "planFilePath read must persist");
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-11-stored-plan.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn approval_prefers_tool_response_plan_over_the_fallbacks() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+
+        let input = HookInput {
+            tool_name: Some("ExitPlanMode".into()),
+            tool_input: Some(ToolInput {
+                plan: Some("# Call Side Plan\n\nstale draft.".into()),
+                ..Default::default()
+            }),
+            tool_response: Some(ToolResponse {
+                is_agent: Some(false),
+                plan: Some("# Response Plan\n\napproved text.".into()),
+                ..Default::default()
+            }),
+            cwd: Some(cwd),
+            session_id: Some("approving-session".into()),
+            ..Default::default()
+        };
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan_approval(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-11-response-plan.md")
+                .exists()
+        );
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-08-11-call-side-plan.md")
+                .exists()
+        );
     }
 
     #[test]
