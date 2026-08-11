@@ -1033,19 +1033,13 @@ fn alternatives_stanza_present(body: &str) -> bool {
     })
 }
 
-/// True when the plan body carries at least one checkbox task (`- [ ]` or
-/// `- [x]`) outside fenced code (block quotes are allowed — a quoted
-/// checklist is still a checklist shape the author chose).
+/// True when the plan body carries at least one checkbox task outside fenced
+/// code — delegates to the shared fence-aware reader
+/// ([`crate::plan_scan::checkbox_counts`]) so this detector and the plan
+/// guards can never diverge on what counts as a box.
 fn checkbox_present(body: &str) -> bool {
-    let mut in_fence = false;
-    body.lines().any(|line| {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            return false;
-        }
-        !in_fence && (trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]"))
-    })
+    let (unticked, ticked) = crate::plan_scan::checkbox_counts(body);
+    unticked + ticked > 0
 }
 
 /// True when the plan body carries a settled `Panel:` line — anchored at line

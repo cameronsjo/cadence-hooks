@@ -110,6 +110,34 @@ pub(crate) struct InFlightPlan {
     pub(crate) branch: Option<String>,
 }
 
+/// The shared, fence-aware checkbox scan — the ONE body reader every checkbox
+/// consumer uses (the living-plan-guards plan's Task 3 shared-reader bullet;
+/// two independent scanners diverged on fence discipline in this feature's
+/// first cut, which is exactly the drift a single reader prevents). Lines
+/// inside fenced code blocks (``` / ~~~ toggles) never count — a plan that
+/// *documents* checklist syntax in a fenced example carries no real boxes
+/// there. Both tick spellings count as ticked (`[x]`/`[X]`).
+pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
+    let mut in_fence = false;
+    let (mut unticked, mut ticked) = (0usize, 0usize);
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trimmed.starts_with("- [ ]") {
+            unticked += 1;
+        } else if trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
+            ticked += 1;
+        }
+    }
+    (unticked, ticked)
+}
+
 /// Every plan doc whose `status:` is `in-flight` or `blocked`, under the same
 /// candidate bounds as [`scan_in_flight_plans`]. Empty on a missing or
 /// unreadable directory (fail-open).

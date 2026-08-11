@@ -71,13 +71,15 @@ impl Check for WarnPlanReadyFlip {
 }
 
 pub fn run_nudge_plan_tick(input: &HookInput) -> CheckResult {
-    // Cheap prefilter: the wiring's `if:` already narrows to git commits, but
-    // the binary re-verifies — a hook wired broadly must not nudge on
-    // arbitrary Bash.
+    // Structural gate, not a substring (security review of this change): a
+    // bare `contains("commit")` is satisfied by `cat docs/commit-policy.md`,
+    // whose stdout a repo-controlled file could shape into a fake summary
+    // line — spending the once-per-session marker and silencing the real
+    // nudge. `is_git_commit` parses the command as a git-commit invocation.
     let Some(command) = input.command() else {
         return CheckResult::allow();
     };
-    if !command.contains("commit") {
+    if !cadence_hooks_metrics::common::is_git_commit(command) {
         return CheckResult::allow();
     }
     // The success signal is git's own commit summary line (`[branch abc1234]
@@ -117,9 +119,15 @@ pub fn run_nudge_plan_tick(input: &HookInput) -> CheckResult {
         return CheckResult::allow();
     }
 
-    // Claim the marker BEFORE emitting so a fan-out double-fire can't nudge
-    // twice; a failed write degrades to a possible repeat nudge, never a miss.
-    let _ = markers::write_marker(&marker, "nudged\n");
+    // Atomic claim (`create_new`) BEFORE emitting, so a concurrent double-fire
+    // can't nudge twice — the `exists()` above is only the cheap short-circuit;
+    // this is the real gate (code review of this change: exists-then-write is
+    // a TOCTOU the doc must not oversell). A failed claim from a race means
+    // the sibling spoke; any other failure degrades to a possible repeat
+    // nudge, never a miss.
+    if !claim_marker(&marker) {
+        return CheckResult::allow();
+    }
     let rel = crate::identity::sanitize_field(&plan.rel_path, crate::identity::MAX_FIELD_DISPLAY);
     CheckResult::nudge(format!(
         "living plan untouched: the last commits didn't tick {rel} — tick completed boxes and \
@@ -133,7 +141,7 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
     let Some(command) = input.command() else {
         return CheckResult::allow();
     };
-    if !(command.contains("pr ready") || command.contains("pr merge")) {
+    if !is_pr_flip_command(command) {
         return CheckResult::allow();
     }
     let Some(cwd) = input.cwd.as_deref() else {
@@ -170,6 +178,39 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
 /// is a silent no-fire (the guard must not guess), and shared-main repos
 /// match naturally because both sides read `main`. First match wins in
 /// `plan_scan`'s deterministic path order.
+/// Is `command` a `gh pr ready` / `gh pr merge` invocation? Token-window
+/// scan over the shell tokenizer's output rather than a substring (security
+/// review of this change): `echo "gh pr merge"` tokenizes the quoted text
+/// into ONE token, so prose about the command never matches, while flags
+/// after the verb (`gh pr merge 42 --squash`) don't disturb the window.
+fn is_pr_flip_command(command: &str) -> bool {
+    let tokens = cadence_hooks_core::shell::tokenize(command);
+    tokens.windows(3).any(|w| {
+        cadence_hooks_core::shell::basename(&w[0]) == "gh"
+            && w[1] == "pr"
+            && (w[2] == "ready" || w[2] == "merge")
+    })
+}
+
+/// Atomically claim `path` with `create_new`: `true` means this invocation
+/// owns the claim; `AlreadyExists` means a sibling got there first; any other
+/// failure (unwritable marker dir) claims anyway — for an advisory nudge the
+/// cheap failure is a repeat, never a miss.
+fn claim_marker(path: &Path) -> bool {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => true,
+    }
+}
+
 fn plan_for_current_branch(repo_root: &Path) -> Option<InFlightPlan> {
     let branch =
         cadence_hooks_core::gitstate::GitState::resolve(repo_root).and_then(|gs| gs.branch)?;
@@ -228,9 +269,11 @@ fn working_tree_touches(repo_root: &str, rel_path: &str) -> bool {
     .is_some_and(|out| !out.trim().is_empty())
 }
 
-/// Count of unticked `- [ ]` checkboxes in the plan body, bounded by
-/// [`PLAN_BODY_READ_CAP_BYTES`]. Any read failure counts as zero — the guard
-/// then decides on `status:` alone rather than inventing boxes.
+/// Count of unticked checkboxes in the plan body, bounded by
+/// [`PLAN_BODY_READ_CAP_BYTES`] and counted by the shared fence-aware reader
+/// ([`plan_scan::checkbox_counts`] — fenced examples never count). Any read
+/// failure counts as zero — the guard then decides on `status:` alone rather
+/// than inventing boxes.
 fn unticked_boxes(path: &Path) -> usize {
     use std::io::Read as _;
     let Ok(file) = std::fs::File::open(path) else {
@@ -244,11 +287,8 @@ fn unticked_boxes(path: &Path) -> usize {
     {
         return 0;
     }
-    let content = String::from_utf8_lossy(&buf);
-    content
-        .lines()
-        .filter(|line| line.trim_start().starts_with("- [ ]"))
-        .count()
+    let (unticked, _) = plan_scan::checkbox_counts(&String::from_utf8_lossy(&buf));
+    unticked
 }
 
 #[cfg(test)]
@@ -543,6 +583,77 @@ mod tests {
         assert_eq!(
             run_warn_plan_ready_flip(&other).outcome,
             cadence_hooks_core::Outcome::Allow
+        );
+        // Prose ABOUT the command is one quoted token — never a match
+        // (security review: the substring prefilter drew warnings here).
+        let prose = bash_input("flip-session-3", tmp.path(), "echo \"gh pr merge\"", "");
+        assert_eq!(
+            run_warn_plan_ready_flip(&prose).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn ready_flip_ignores_fenced_checkbox_examples() {
+        // The shared reader's fence discipline: a plan documenting checklist
+        // syntax in a fenced example, real checklist fully ticked → silent
+        // when status is done (the polish code-review arm's Critical).
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-08-11-guards.md",
+            "done",
+            "main",
+            "# G\n\n- [x] build\n\n```\n- [ ] fenced example, not a task\n```\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+        let input = bash_input("flip-session-4", tmp.path(), "gh pr ready 42", "");
+        assert_eq!(
+            run_warn_plan_ready_flip(&input).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn tick_nudge_requires_a_structural_git_commit_command() {
+        // A non-commit command whose stdout carries a fake summary line (a
+        // repo-controlled file's contents) must neither nudge nor burn the
+        // once-per-session marker (security review: the Important finding).
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-08-11-guards.md",
+            "in-flight",
+            "main",
+            "# G\n\n- [ ] build\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+        for i in 0..3 {
+            fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
+            commit_all(tmp.path(), "work");
+        }
+        let spoof = bash_input(
+            "tick-session-5",
+            tmp.path(),
+            "cat docs/commit-policy.md",
+            "[main abc1234] looks like a commit\n",
+        );
+        assert_eq!(
+            run_nudge_plan_tick(&spoof).outcome,
+            cadence_hooks_core::Outcome::Allow
+        );
+        // The marker was NOT burned: a real commit right after still nudges.
+        let real = bash_input(
+            "tick-session-5",
+            tmp.path(),
+            "git commit -m work",
+            "[main abc1234] work\n",
+        );
+        assert_eq!(
+            run_nudge_plan_tick(&real).outcome,
+            cadence_hooks_core::Outcome::Nudge
         );
     }
 }

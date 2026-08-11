@@ -208,7 +208,7 @@ fn uncommitted_plans_line(repo_root: &Path) -> Option<String> {
         .filter_map(|line| line.get(3..))
         .map(str::trim)
         .collect();
-    let hits: Vec<String> = plans
+    let mut hits: Vec<String> = plans
         .iter()
         .filter(|plan| dirty.iter().any(|d| *d == plan.rel_path))
         .map(|plan| identity::sanitize_field(&plan.rel_path, identity::MAX_FIELD_DISPLAY))
@@ -216,9 +216,19 @@ fn uncommitted_plans_line(repo_root: &Path) -> Option<String> {
     if hits.is_empty() {
         return None;
     }
+    // Cap the rendered list (the sibling plan-scan renderer's discipline) so
+    // repo-controlled filenames can't inflate the SessionStart context.
+    const MAX_NAMED: usize = 5;
+    let overflow = hits.len().saturating_sub(MAX_NAMED);
+    hits.truncate(MAX_NAMED);
+    let tail = if overflow > 0 {
+        format!(" …and {overflow} more")
+    } else {
+        String::new()
+    };
     Some(format!(
-        "Uncommitted living plan(s): {} — commit them (explicit-path git add); an uncommitted \
-         plan is invisible to every other session and checkout.",
+        "Uncommitted living plan(s): {}{tail} — commit them (explicit-path git add); an \
+         uncommitted plan is invisible to every other session and checkout.",
         hits.join(", ")
     ))
 }
