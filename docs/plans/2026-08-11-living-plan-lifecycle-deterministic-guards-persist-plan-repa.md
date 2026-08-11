@@ -3,7 +3,7 @@ status: "in-flight"
 updated: "2026-08-11"
 branch: "plan/living-plan-lifecycle-guards"
 pr: "cameronsjo/cadence-hooks#671"
-next: "Task 3: the four guards (uncommitted-plan nudge, commit advisory, ready-flip #429, format lint) — Task 2 landed as PR #674; work payload sample owed from Cameron as corroboration"
+next: "Cameron merges PRs #674/#675 (hooks) + cadence#945; then Task 4 wiring+release and Task 6 absence detection (start.rs conflicts gate Task 6 on #675). Work payload sample owed as corroboration"
 body_sha256: "3aac1eaabc19ef8667c4573ab3da2f6e3cb4f732253df6877b2ef1ee125a9c1d"
 session: "frost-anchor"
 session_id: "1322f0d3-8e45-49be-b07c-217268925560"
@@ -52,11 +52,11 @@ Ruling from Cameron: build all the guards; prose isn't enough.
 
 ### Task 3 — The four guards (cadence-hooks, advisory tier — all four in scope)
 
-- [ ] **Guard 1 — uncommitted-plan nudge** (`session start` only, not UserPromptSubmit — once per session, no per-prompt friction): an in-flight `docs/plans/*.md` that is untracked or dirty (git status via the session crate's existing git helpers; non-git cwd = silent no-fire) ⇒ one line "persisted plan uncommitted — commit it (explicit-path git add)"
-- [ ] **Guard 2 — commit-without-plan-touch advisory** (PostToolUse Bash, `git commit`, single-rule `if:` — no pipe alternation, the log-polish-nudge dead-hook precedent): repo has a `status: in-flight` plan bound to the current branch (fallback: shared-main plans match any branch; stale `branch:` = no-fire) and the last 3 commits didn't touch it ⇒ "tick the plan, bump `updated:`/`next:`". Consult the command's exit status — an aborted commit never nudges. Once per session
-- [ ] **Guard 3 — ready-flip guard** (closes #429): two separate PreToolUse rows (`gh pr ready`, `gh pr merge` — never one alternated rule) while the branch's plan has unticked boxes or `status: in-flight` ⇒ warn, never block
-- [ ] **Guard 4 — plan-format lint at persist time**: widen the Panel-line nudge (#624) to also flag a missing Alternatives-declined stanza and zero `- [ ]` checkboxes. Drop the frontmatter-key arm (dead by construction — `render_frontmatter` just wrote those keys). Preserve the shipped nudge's invariants: detection runs after the claim succeeds, and the nudge appends static text only, never matched content
-- [ ] **Shared body reader**: guards 2–4 need checkbox counts from the body, which `plan_scan.rs` deliberately never reads. Add a separately-bounded body scanner (line + byte caps, same hostile-directory discipline), placed so both the session crate and the guards reach it; frontmatter stays untrusted (charset-validate before rendering into context)
+- [x] **Guard 1 — uncommitted-plan nudge** (`session start` only, not UserPromptSubmit — once per session, no per-prompt friction): an in-flight `docs/plans/*.md` that is untracked or dirty (git status via the session crate's existing git helpers; non-git cwd = silent no-fire) ⇒ one line "persisted plan uncommitted — commit it (explicit-path git add)"
+- [x] **Guard 2 — commit-without-plan-touch advisory** (PostToolUse Bash, `git commit`, single-rule `if:` — no pipe alternation, the log-polish-nudge dead-hook precedent): repo has a `status: in-flight` plan bound to the current branch (fallback: shared-main plans match any branch; stale `branch:` = no-fire) and the last 3 commits didn't touch it ⇒ "tick the plan, bump `updated:`/`next:`". Consult the command's exit status — an aborted commit never nudges. Once per session
+- [x] **Guard 3 — ready-flip guard** (closes #429): two separate PreToolUse rows (`gh pr ready`, `gh pr merge` — never one alternated rule) while the branch's plan has unticked boxes or `status: in-flight` ⇒ warn, never block
+- [x] **Guard 4 — plan-format lint at persist time**: widen the Panel-line nudge (#624) to also flag a missing Alternatives-declined stanza and zero `- [ ]` checkboxes. Drop the frontmatter-key arm (dead by construction — `render_frontmatter` just wrote those keys). Preserve the shipped nudge's invariants: detection runs after the claim succeeds, and the nudge appends static text only, never matched content
+- [x] **Shared body reader**: guards 2–4 need checkbox counts from the body, which `plan_scan.rs` deliberately never reads. Add a separately-bounded body scanner (line + byte caps, same hostile-directory discipline), placed so both the session crate and the guards reach it; frontmatter stays untrusted (charset-validate before rendering into context)
 
 ### Task 4 — Wiring + release
 
@@ -67,9 +67,9 @@ Ruling from Cameron: build all the guards; prose isn't enough.
 
 ### Task 5 — Close the attune-exemption hole (cadence plugin, prose)
 
-- [ ] attune / using-cadence: the "approved plan in context = attuned" exemption becomes a **forcing function** (#942 seam 4): the exemption form must cite the plan's on-disk path — `attune (executing approved plan — docs/plans/<file>)` — unfillable when the file is missing; a missing file means persist it now. This also binds the executing seat (defect 7)
-- [ ] attune: plan-mode drafts (plan file at `~/.claude/plans/`) MUST still carry cadence's template shape — Panel line, Alternatives declined, checkbox tasks — so the persisted doc lints clean under guard 4. The harness workflow dictates *where* the draft lives, never its shape. **Sequencing: this PR merges before or with guard 4's wiring** — shipping the lint first would nudge every plan until the shape fix lands
-- [ ] Same-PR regen: catalog, graph, llms.txt
+- [x] attune / using-cadence: the "approved plan in context = attuned" exemption becomes a **forcing function** (#942 seam 4): the exemption form must cite the plan's on-disk path — `attune (executing approved plan — docs/plans/<file>)` — unfillable when the file is missing; a missing file means persist it now. This also binds the executing seat (defect 7)
+- [x] attune: plan-mode drafts (plan file at `~/.claude/plans/`) MUST still carry cadence's template shape — Panel line, Alternatives declined, checkbox tasks — so the persisted doc lints clean under guard 4. The harness workflow dictates *where* the draft lives, never its shape. **Sequencing: this PR merges before or with guard 4's wiring** — shipping the lint first would nudge every plan until the shape fix lands
+- [x] Same-PR regen: catalog, graph, llms.txt
 
 ### Task 6 — Rules-delivery repair (cadence-hooks binary + cadence wiring; addresses [cadence#942](https://github.com/cameronsjo/cadence/issues/942))
 
@@ -119,6 +119,8 @@ cadence-hooks work in this worktree (`plan/living-plan-lifecycle-guards`, based 
 - **2026-08-11 — Task 1's instrumentation superseded by a cheaper decisive probe.** Instead of instrumenting early-returns, replaying the failing prompt through the installed binary exonerated the code, the cache sweep exonerated the wiring, and the transcript's hook-context absence convicted the event: the approve-and-clear injection no longer fires UserPromptSubmit ([#672](https://github.com/cameronsjo/cadence-hooks/issues/672)). Task 2's first bullet respecified as the late-persist fallback.
 
 - **2026-08-11 — Task 2 executed head-scan, not the spec'd tail-scan.** The injection is the first user entry of its session and never moves; a tail window loses it as the session grows. Improvement, not reality-forced. The polish security arm (Opus) upgraded the plan-store fallback with containment (its Critical) and flipped the sidechain gate fail-closed — both folded into PR [#674](https://github.com/cameronsjo/cadence-hooks/pull/674) before it opened.
+
+- **2026-08-11 — Tasks 3+5 executed with two review folds.** Guards PR [#675](https://github.com/cameronsjo/cadence-hooks/pull/675) (closes #429): the polish security arm's Important (spoofable commit prefilter burning the session marker → structural `is_git_commit` + atomic claim) and the code-review arm's Critical (two diverging checkbox scanners → the plan's shared-reader bullet restored as `plan_scan::checkbox_counts`) both fixed pre-PR. Task 5 PR [cadence#945](https://github.com/cameronsjo/cadence/pull/945): reviewer caught the attune line asserting the unshipped lint as present fact (hedged to cite #675) and made the persist-first recipe self-contained. Task 6's binary side is deliberately sequenced AFTER #675 merges — both edit `start.rs`.
 
 ## Learnings
 
