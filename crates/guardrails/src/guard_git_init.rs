@@ -24,7 +24,7 @@
 //! that no longer need it. Path is the only signal available at init time that
 //! separates a fixture from a project.
 
-use cadence_hooks_core::shell::strip_quotes;
+use cadence_hooks_core::shell::{looks_absolute, strip_quotes};
 use cadence_hooks_core::worktree::path_under_temp_root;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use std::path::{Path, PathBuf};
@@ -87,12 +87,24 @@ fn literal_path_token(token: &str) -> Option<&str> {
 }
 
 /// Join `candidate` onto `base`, or take it whole when it is absolute.
+///
+/// Absoluteness is decided from the STRING, via `core::shell::looks_absolute`,
+/// not from `Path::is_absolute`. These are bash command lines: a leading `/` is
+/// absolute regardless of the host this binary was compiled for. `is_absolute`
+/// is drive-letter-aware only on Windows, so it calls `/Users/x/project`
+/// *relative* there — the target then found no base to join onto, resolved to
+/// nothing, and a real repo classified as `Unresolvable`, which handed the
+/// verdict to the `mktemp` tell (the Windows-only false-allow on
+/// `mktemp -d && git init /Users/x/Projects/real`). Same platform split, same
+/// fail-open shape as `enforce_worktree`'s `is_shell_absolute`
+/// (cadence-hooks#377/#378), so it takes that function's remedy: the string
+/// check first, with `Path::is_absolute` kept as a belt-and-braces fallback for
+/// a native Windows form the string check does not cover (a UNC share).
 fn resolve_against(candidate: &str, base: Option<&Path>) -> Option<PathBuf> {
-    let path = Path::new(candidate);
-    if path.is_absolute() {
-        Some(path.to_path_buf())
+    if looks_absolute(candidate) || Path::new(candidate).is_absolute() {
+        Some(PathBuf::from(candidate))
     } else {
-        base.map(|b| b.join(path))
+        base.map(|b| b.join(candidate))
     }
 }
 
@@ -551,6 +563,18 @@ mod tests {
     fn git_init_no_cwd_still_nudges() {
         // Nothing resolves and nothing tells — fail open to the nudge (ADR-0001).
         let result = GuardGitInit.run(&make_bash("git init"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn windows_drive_init_target_resolves_standalone() {
+        // The counterpart to `mktemp_does_not_suppress_explicit_real_path`, and
+        // the reason absoluteness is decided from the string: a drive path reads
+        // absolute on EVERY build, so the resolution this asserts is testable
+        // from any host rather than only on a Windows runner. Were it read as
+        // relative, the target would resolve to nothing and the mktemp tell
+        // would allow.
+        let result = GuardGitInit.run(&make_bash("mktemp -d && git init C:\\Users\\x\\real"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
