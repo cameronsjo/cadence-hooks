@@ -10,10 +10,13 @@
 //! **Throwaway repos under a temp root are exempt** (cameronsjo/cadence#899).
 //! Test fixtures, scratch probes, and `mktemp -d` sandboxes are `git init`ed
 //! constantly, and none of them wants a scaffolding-and-license reminder. The
-//! suppression keys on the *path* the repo is being created at — the `git init`
-//! target resolved against the last literal `cd`, else the event cwd — and
-//! reuses [`path_under_temp_root`], the same primitive `guard_rm` classifies
-//! delete targets with.
+//! suppression keys on the *path* the repo is being created at. The command is
+//! walked segment by segment, tracking `cd` the way the shell does, so **every**
+//! `git init` gets its own resolved site; suppression needs all of them under a
+//! temp root. Position matters in both directions — a `cd` after the init cannot
+//! reclassify it, and a temp-rooted fixture cannot vouch for a real repo created
+//! later in the same command. Classification reuses [`path_under_temp_root`],
+//! the same primitive `guard_rm` classifies delete targets with.
 //!
 //! A "zero commits, no remote" predicate was considered for this and REJECTED:
 //! it is true of *every* repo one millisecond after `git init`, so it would
@@ -53,122 +56,158 @@ fn is_gh_repo_create(cmd: &str) -> bool {
         .any(|w| w[0] == "gh" && w[1] == "repo" && w[2] == "create")
 }
 
-/// `git init`'s explicit target directory, when it names one literally.
-///
-/// The first non-flag token after `[git, init]`, skipping init's own flags and
-/// consuming the values of the flags that take one. Returns `None` for a bare
-/// `git init` and for a target that is only a `$VAR` or `~` — an unexpanded
-/// spelling names no path this parser can resolve, so the caller falls through
-/// to the next candidate rather than guessing.
-fn init_target(cmd: &str) -> Option<&str> {
-    /// `git init` flags whose value is a separate token — the value must not be
-    /// mistaken for the target directory.
-    const VALUE_FLAGS: [&str; 4] = ["-b", "--initial-branch", "--separate-git-dir", "--template"];
+/// Tokens that end one command and begin the next. Splitting on these is what
+/// makes the walk below position-aware: a `cd` only moves the shell when it is
+/// its own segment's first word, so `echo cd /tmp && git init` no longer reads
+/// as a `cd`, and a `cd` *after* the init cannot reach back and reclassify it.
+const SEPARATORS: [&str; 5] = ["&&", "||", ";", "|", "&"];
 
-    let words: Vec<&str> = cmd.split_whitespace().collect();
-    let start = words
-        .windows(2)
-        .position(|w| w[0] == "git" && w[1] == "init")?
-        + 2;
+/// `git init` flags whose value is a separate token — the value must never be
+/// mistaken for the target directory.
+const INIT_VALUE_FLAGS: [&str; 4] = ["-b", "--initial-branch", "--separate-git-dir", "--template"];
 
-    let mut idx = start;
-    while let Some(word) = words.get(idx) {
-        if VALUE_FLAGS.contains(word) {
+/// Where one `git init` in the command will create its repo.
+#[derive(Debug, PartialEq, Eq)]
+enum InitSite {
+    /// The resolved directory the repo lands in.
+    At(PathBuf),
+    /// The target names a value the shell builds at run time, or no directory
+    /// is knowable at all — there is no path to classify.
+    Unresolvable,
+}
+
+/// Strip surrounding quote characters and reject spellings this parser cannot
+/// resolve: an unexpanded `$VAR` or `~`, and the empty string.
+fn literal_path_token(token: &str) -> Option<&str> {
+    let bare = token.trim_matches(['"', '\'']);
+    if bare.is_empty() || bare.starts_with('$') || bare.starts_with('~') {
+        return None;
+    }
+    Some(bare)
+}
+
+/// Join `candidate` onto `base`, or take it whole when it is absolute.
+fn resolve_against(candidate: &str, base: Option<&Path>) -> Option<PathBuf> {
+    let path = Path::new(candidate);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        base.map(|b| b.join(path))
+    }
+}
+
+/// The directory a `cd` segment moves the shell to, or `None` when it cannot be
+/// named. Mirrors `guard_rm::collect_targets`' conventions: cd's own flags are
+/// skipped, and a bare `-`, a `$VAR`, or a missing target makes the new
+/// directory UNKNOWN rather than silently keeping the old one.
+fn cd_destination(segment: &[&str], base: Option<&Path>) -> Option<PathBuf> {
+    let mut idx = 1;
+    while segment
+        .get(idx)
+        .is_some_and(|t| *t == "--" || (t.starts_with('-') && *t != "-"))
+    {
+        idx += 1;
+    }
+    let target = segment.get(idx)?;
+    if *target == "-" {
+        return None;
+    }
+    resolve_against(literal_path_token(target)?, base)
+}
+
+/// Classify the `git init` occurring in `rest` — the segment's tokens after the
+/// `[git, init]` pair — against the directory the shell is standing in.
+fn init_site(rest: &[&str], effective_dir: Option<&Path>) -> InitSite {
+    let mut idx = 0;
+    while let Some(word) = rest.get(idx) {
+        if INIT_VALUE_FLAGS.contains(word) {
             idx += 2;
         } else if word.starts_with('-') {
             // `--initial-branch=main` and friends carry their value inline.
             idx += 1;
         } else {
-            return Some(*word).filter(|t| !t.starts_with('$') && !t.starts_with('~'));
+            // An explicit target outranks the cwd even when it cannot be
+            // resolved — `git init "$d"` names a directory that is emphatically
+            // not the one the shell is standing in, so falling back to the cwd
+            // would classify the wrong path.
+            return match literal_path_token(word).and_then(|t| resolve_against(t, effective_dir)) {
+                Some(path) => InitSite::At(path),
+                None => InitSite::Unresolvable,
+            };
         }
     }
-    None
+    // No target: the repo lands wherever the shell currently is.
+    match effective_dir {
+        Some(dir) => InitSite::At(dir.to_path_buf()),
+        None => InitSite::Unresolvable,
+    }
 }
 
-/// The target of the LAST literal `cd <dir>` in the command, when there is one.
+/// Walk the command segment by segment, tracking `cd` the way the shell does,
+/// and return one site per `git init` — in command order.
 ///
-/// Deliberately not full cwd tracking — `guard_rm::collect_targets` carries
-/// that machinery because it gates deletions; this is an advisory nudge, and
-/// the last `cd` is where a `cd … && git init` chain leaves the shell. Mirrors
-/// that parser's conventions: the literal first token only, cd's own flags
-/// skipped, and a bare `-` or a `$VAR` yielding `None` because the resulting
-/// directory is unknowable here.
-fn last_cd_target(cmd: &str) -> Option<&str> {
+/// A miniature cwd tracker rather than a whole-string scan, because both of the
+/// shortcuts it replaces were false-allows: taking the LAST `cd` anywhere let a
+/// `cd` *after* the init decide its verdict, and resolving only the FIRST
+/// `git init` let a temp-rooted fixture vouch for a real repo created later in
+/// the same command.
+fn init_sites(cmd: &str, cwd: Option<&str>) -> Vec<InitSite> {
     let words: Vec<&str> = cmd.split_whitespace().collect();
-    let mut found = None;
+    let mut effective_dir: Option<PathBuf> = cwd.map(PathBuf::from);
+    let mut sites = Vec::new();
 
-    for (pos, word) in words.iter().enumerate() {
-        if *word != "cd" {
+    for segment in words.split(|word| SEPARATORS.contains(word)) {
+        if segment.first() == Some(&"cd") {
+            effective_dir = cd_destination(segment, effective_dir.as_deref());
             continue;
         }
-        let mut idx = pos + 1;
-        while words
-            .get(idx)
-            .is_some_and(|t| *t == "--" || (t.starts_with('-') && *t != "-"))
+        if let Some(pos) = segment
+            .windows(2)
+            .position(|w| w[0] == "git" && w[1] == "init")
         {
-            idx += 1;
+            sites.push(init_site(&segment[pos + 2..], effective_dir.as_deref()));
         }
-        found = words
-            .get(idx)
-            .copied()
-            .filter(|t| *t != "-" && !t.starts_with('$'));
     }
-    found
+    sites
 }
 
-/// Is this `git init` creating a throwaway repo under a temp root?
+/// Is every repo this command creates a throwaway under a temp root?
 ///
-/// Resolution follows the shell's own order. The `cd` runs first, so the last
-/// literal `cd` — else the event cwd — is the directory `git init` executes in;
-/// an explicit init target is then resolved against *that*, not against the cwd
-/// the command started in. So `cd /tmp/x && git init sub` reads as `/tmp/x/sub`,
-/// and an absolute target overrides both.
+/// **Every** one, deliberately — a single init that resolves outside a temp root
+/// keeps the nudge for the whole command. Suppression is the permissive verdict
+/// here, so an ambiguous command fails toward the reminder.
 ///
-/// Each candidate falls through when it cannot be resolved to a path, rather
-/// than ending the search: a relative target with no directory to join onto
-/// names nothing, and treating it as an answer would discard a perfectly
-/// resolvable `cd` behind it.
-///
-/// One fallback: when NOTHING resolves and the command contains a `mktemp`
-/// invocation, treat it as throwaway. That covers the common fixture chain
-/// `d=$(mktemp -d) && git init "$d"`, where quote-stripping leaves the target
-/// unspellable. The tell is gated on nothing else resolving precisely so it
-/// cannot suppress a nudge for an explicit real path sitting next to an
-/// unrelated `mktemp`.
+/// An `Unresolvable` site counts as throwaway only when the command invokes
+/// `mktemp`, which is what carries the fixture chain
+/// `d=$(mktemp -d) && git init "$d"`. That tell is gated on the site being
+/// unresolvable, so a `mktemp` sitting next to an explicit real path never
+/// silences it.
 fn is_throwaway(cmd: &str, cwd: Option<&str>, tmpdir: Option<&str>, home: Option<&str>) -> bool {
-    let resolve = |candidate: &str, base: Option<&Path>| -> Option<PathBuf> {
-        let path = Path::new(candidate);
-        if path.is_absolute() {
-            Some(path.to_path_buf())
-        } else {
-            base.map(|b| b.join(path))
-        }
-    };
-
-    let cwd_path = cwd.map(Path::new);
-    let effective_dir = last_cd_target(cmd)
-        .and_then(|dir| resolve(dir, cwd_path))
-        .or_else(|| cwd_path.map(Path::to_path_buf));
-    let resolved = init_target(cmd)
-        .and_then(|target| resolve(target, effective_dir.as_deref()))
-        .or(effective_dir);
-
-    match resolved {
-        Some(path) => path_under_temp_root(&path, tmpdir, home),
-        None => mentions_mktemp(cmd),
+    let sites = init_sites(cmd, cwd);
+    if sites.is_empty() {
+        return false;
     }
+    let mktemp = mentions_mktemp(cmd);
+    sites.iter().all(|site| match site {
+        InitSite::At(path) => path_under_temp_root(path, tmpdir, home),
+        InitSite::Unresolvable => mktemp,
+    })
 }
 
 /// Does any token in `cmd` invoke `mktemp`?
 ///
-/// Matches the tail of a token after the characters that can precede a command
-/// word — `d=$(mktemp` and `/usr/bin/mktemp` both count — because the fixture
-/// chains this exists for wrap `mktemp` in a substitution.
+/// Compares the tail of a token after the characters that can precede a command
+/// word, with trailing substitution and quote punctuation trimmed — so
+/// `$(mktemp)`, `d=$(mktemp`, and `/usr/bin/mktemp` all count. The fixture
+/// chains this exists for wrap `mktemp` in a substitution, and an echoed decoy
+/// is defused by the caller's gate rather than here: a decoy leaves the init
+/// site resolvable, and a resolvable site never consults this tell.
 fn mentions_mktemp(cmd: &str) -> bool {
     cmd.split_whitespace().any(|token| {
         token
             .rsplit(['$', '(', '`', ';', '&', '|', '=', '/', '{'])
             .next()
+            .map(|tail| tail.trim_end_matches([')', '}', '"', '\'', ';']))
             == Some("mktemp")
     })
 }
@@ -205,11 +244,18 @@ impl Check for GuardGitInit {
             // Only the LOCAL arm is exempt. `gh repo create` publishes a repo to
             // GitHub; the directory it happens to run from says nothing about
             // whether that repo is disposable, so a temp cwd must not silence it.
+            //
+            // Resolution reads the RAW command, not `stripped`. Quote-stripping
+            // exists to keep prose from tripping the *trigger*; by here the
+            // trigger has already fired, and the raw text is what still spells
+            // the target — `git init "$d"` survives as a `$`-token to classify
+            // rather than vanishing into a bare `git init` that would wrongly
+            // resolve to the cwd.
             let tmpdir = std::env::var("TMPDIR").ok();
             let home = cadence_hooks_core::paths::user_home_lossy_or_default();
             if !creates_remote
                 && is_throwaway(
-                    &stripped,
+                    command,
                     input.cwd.as_deref(),
                     tmpdir.as_deref(),
                     Some(&home),
@@ -467,9 +513,13 @@ mod tests {
 
     #[test]
     fn mktemp_fixture_chain_allowed() {
-        // `strip_quotes` eats `"$d"`, so no candidate resolves and the mktemp
-        // tell is what carries the suppression.
-        let result = GuardGitInit.run(&make_bash("d=$(mktemp -d) && git init \"$d\""));
+        // A realistic payload: the fixture chain runs from a real project cwd.
+        // The explicit `"$d"` target is unresolvable but still outranks that
+        // cwd, so the mktemp tell is what carries the suppression.
+        let result = GuardGitInit.run(&make_bash_with_cwd(
+            "d=$(mktemp -d) && git init \"$d\"",
+            "/Users/x/Projects/real",
+        ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
@@ -501,6 +551,47 @@ mod tests {
     fn git_init_no_cwd_still_nudges() {
         // Nothing resolves and nothing tells — fail open to the nudge (ADR-0001).
         let result = GuardGitInit.run(&make_bash("git init"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn cd_to_temp_after_init_still_nudges() {
+        // The `cd` runs AFTER the repo is created, so it says nothing about
+        // where the repo landed — that is the starting cwd, a real project.
+        let result = GuardGitInit.run(&make_bash_with_cwd(
+            "git init && cd /tmp/logs",
+            "/Users/x/Projects/real",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn echoed_cd_decoy_still_nudges() {
+        // `cd` is an argument to `echo` here, not a command — the shell never
+        // leaves the project directory.
+        let result = GuardGitInit.run(&make_bash_with_cwd(
+            "echo cd /tmp && git init",
+            "/Users/x/Projects/real",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn temp_fixture_does_not_vouch_for_later_real_init() {
+        // Two inits: the first is a temp fixture, the second a real repo. Every
+        // site must be throwaway, so the real one keeps the nudge.
+        let result = GuardGitInit.run(&make_bash_with_cwd(
+            "git init /tmp/fixture && cd /Users/x/Projects/new && git init",
+            "/Users/x/Projects/real",
+        ));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
+    }
+
+    #[test]
+    fn temp_init_prefix_does_not_vouch_for_unresolvable_later_init() {
+        // Same shape with a `;` separator and a `~` cd the parser cannot expand:
+        // the second site is Unresolvable with no mktemp tell, so it nudges.
+        let result = GuardGitInit.run(&make_bash("git init /tmp/x; cd ~/p && git init"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Nudge);
     }
 
