@@ -209,6 +209,10 @@ pub fn run_persist_plan(
             .and_then(|tp| injected_plan_from_transcript(Path::new(tp)))
         {
             Some(injected) => {
+                // `planContent` is documented bare (no prefix), so this strip
+                // is a no-op today — kept as cheap insurance that a future
+                // harness variant which DOES prefix it still hashes
+                // byte-identical to the other two paths.
                 let rest = injected.strip_prefix(PLAN_PREFIX).unwrap_or(&injected);
                 (strip_trailing_suffix_lines_and_trim(rest), true)
             }
@@ -500,16 +504,46 @@ fn strip_trailing_suffix_lines_and_trim(text: &str) -> String {
 /// Bounded read of the harness plan-store file named by an `ExitPlanMode`
 /// payload's `filePath`/`planFilePath` — the last-resort plan source in
 /// [`run_persist_plan_approval`]'s fallback chain (cadence-hooks#672).
-/// `None` on any I/O failure, a non-regular target, or a file over
-/// [`IDEMPOTENCY_MAX_FILE_BYTES`] — every ambiguity degrades to "no plan"
-/// (ADR-0001), never a partial read persisted as if complete.
+///
+/// The payload path is UNTRUSTED (security review of this change): the field
+/// travels in `tool_input`, which the model populates, so without containment
+/// this is an arbitrary-local-file read whose content lands in the repo under
+/// a "commit it" nudge — a secret-exfiltration sink. The path is therefore
+/// accepted only when it canonicalizes to a `.md` file nested under the
+/// harness plan store (`<config_dir>/plans`, per
+/// [`cadence_hooks_core::paths::claude_config_dir`]) — the one directory the
+/// legitimate `planFilePath` ever names.
+///
+/// `None` on any I/O failure, a non-regular or out-of-store target, or a file
+/// over [`IDEMPOTENCY_MAX_FILE_BYTES`] — every ambiguity degrades to "no
+/// plan" (ADR-0001), never a partial or out-of-boundary read persisted as if
+/// legitimate.
 fn read_plan_store_file(path: &str) -> Option<String> {
+    let root = cadence_hooks_core::paths::claude_config_dir().join("plans");
+    read_plan_store_file_within(path, &root)
+}
+
+/// Testable core of [`read_plan_store_file`]: the containment root is
+/// injected so tests never mutate `CLAUDE_CONFIG_DIR` (a process-global other
+/// tests read concurrently).
+fn read_plan_store_file_within(path: &str, plan_store_root: &Path) -> Option<String> {
     use std::io::Read as _;
     let path = Path::new(path);
+    if path.extension().is_none_or(|ext| ext != "md") {
+        return None;
+    }
     if !fs::symlink_metadata(path).ok()?.is_file() {
         return None;
     }
-    let file = fs::File::open(path).ok()?;
+    // Canonicalize BOTH sides and require nesting — the same discipline as
+    // `canonical_plans_dir`. Canonicalizing the whole final path (not
+    // dir-then-basename) is what defeats a symlinked final component.
+    let canonical = path.canonicalize().ok()?;
+    let canonical_root = plan_store_root.canonicalize().ok()?;
+    if !canonical.starts_with(&canonical_root) {
+        return None;
+    }
+    let file = fs::File::open(&canonical).ok()?;
     let mut content = String::new();
     file.take(IDEMPOTENCY_MAX_FILE_BYTES + 1)
         .read_to_string(&mut content)
@@ -528,26 +562,35 @@ fn read_plan_store_file(path: &str) -> Option<String> {
 /// pushes the head OUT of any tail window while the entry never moves.
 const INJECTED_PLAN_SCAN_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Line cap for the same scan — the entry sits in the first handful of lines;
-/// the cap keeps a pathological many-tiny-lines file from turning the
-/// byte bound into a line-count problem.
-const INJECTED_PLAN_SCAN_MAX_LINES: usize = 200;
+/// Line cap for the same scan — the injection is among the very first entries
+/// of its fresh session (observed at entry 8 in the live capture), so 50
+/// lines is generous headroom while keeping this every-turn scan cheap:
+/// `BufReader::lines` reads incrementally, so a session that never had an
+/// injection costs one small partial read per prompt, never the full byte
+/// bound (the code-review pass's per-turn-cost finding on this change).
+const INJECTED_PLAN_SCAN_MAX_LINES: usize = 50;
 
 /// The harness's auto-continuation plan injection from the transcript head,
 /// if present: a top-level `type: "user"` entry carrying non-empty
 /// `planContent` (the BARE plan body — the prefix/suffix chrome lives only in
-/// the message text) and not marked `isSidechain` (a subagent's plan is not
-/// this session's to persist). First match wins; a fresh post-`/clear`
-/// session carries at most one. Live payload shape: cadence-hooks#672
-/// (session beffcf50, claude-code 2.1.227).
+/// the message text) and explicitly marked `isSidechain: false`. First match
+/// wins; a fresh post-`/clear` session carries at most one. Live payload
+/// shape: cadence-hooks#672 (session beffcf50, claude-code 2.1.227).
+///
+/// `None` on any read failure — an unreadable transcript degrades to no late
+/// persist this turn (ADR-0001), and the scan re-fires on the next prompt.
 fn injected_plan_from_transcript(transcript_path: &Path) -> Option<String> {
     use std::io::Read as _;
     let file = fs::File::open(transcript_path).ok()?;
     let reader = BufReader::new(file.take(INJECTED_PLAN_SCAN_MAX_BYTES));
     for line in reader.lines().take(INJECTED_PLAN_SCAN_MAX_LINES) {
-        let Ok(line) = line else { return None };
+        // A single unreadable line skips that line, not the scan — the
+        // sibling `find_parent` scanner's convention for the same condition.
+        let Ok(line) = line else { continue };
         // Substring pre-filter before any JSON parse — same discipline as
-        // `find_parent`'s sibling scan.
+        // `find_parent`'s sibling scan. A line that carries the marker but
+        // fails to parse is skipped, not fatal: transcripts legitimately mix
+        // entry shapes, and one malformed line must not end the scan.
         if !line.contains("\"planContent\"") {
             continue;
         }
@@ -557,7 +600,12 @@ fn injected_plan_from_transcript(transcript_path: &Path) -> Option<String> {
         if value.get("type").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        // Fail-CLOSED on the sidechain marker, matching the approval arm's
+        // `is_agent` gate (security review of this change): only an explicit
+        // `false` persists. An absent or non-boolean `isSidechain` is a
+        // payload-shape drift, and treating it as "not a sidechain" would
+        // forge a subagent's plan as the operator's approved plan.
+        if value.get("isSidechain").and_then(Value::as_bool) != Some(false) {
             continue;
         }
         if let Some(plan) = value
@@ -577,18 +625,39 @@ fn injected_plan_from_transcript(transcript_path: &Path) -> Option<String> {
 const DIR_HASH_SCAN_MAX_FILES: usize = 512;
 
 /// Does any markdown document in `plans_dir` already carry `body_hash`?
-/// Per-file work is [`file_matches_body`]'s bounded read. Fail-open: an
-/// unreadable dir reads as "no match" and lets the claim ladder — which
-/// dedupes within the same stem — take over.
+/// Per-file work is [`file_matches_body`]'s bounded read, gated to regular
+/// files only — a committed symlink (git stores them) pointing at a FIFO
+/// would otherwise block `File::open` on this every-turn path forever
+/// (security review of this change). Candidates are ordered newest-first
+/// (the sibling `find_parent` scan's discipline) so the cap degrades toward
+/// the most likely re-fire targets — and the just-persisted doc matches on
+/// the first read in the common case. Fail-open: an unreadable dir reads as
+/// "no match" and lets the claim ladder — which dedupes within the same stem
+/// — take over.
 fn plans_dir_contains_hash(plans_dir: &Path, body_hash: &str) -> bool {
     let Ok(entries) = fs::read_dir(plans_dir) else {
         return false;
     };
-    entries
+    let mut candidates: Vec<(SystemTime, PathBuf)> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().is_none_or(|ext| ext != "md") {
+                return None;
+            }
+            let meta = fs::symlink_metadata(&path).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((mtime, path))
+        })
+        .collect();
+    candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    candidates
+        .into_iter()
         .take(DIR_HASH_SCAN_MAX_FILES)
-        .any(|e| file_matches_body(&e.path(), body_hash))
+        .any(|(_, path)| file_matches_body(&path, body_hash))
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
@@ -2606,11 +2675,18 @@ mod tests {
             "planContent": "# Subagent Plan\n\nnope.",
             "message": {"role": "user", "content": "x"},
         });
+        // Absent isSidechain fails CLOSED (the approval arm's is_agent
+        // doctrine): a payload-shape drift must not forge a persist.
+        let unmarked = serde_json::json!({
+            "type": "user",
+            "planContent": "# Unmarked Plan\n\nnope.",
+            "message": {"role": "user", "content": "y"},
+        });
         let plain = serde_json::json!({
             "type": "user", "isSidechain": false,
             "message": {"role": "user", "content": "just chatting"},
         });
-        fs::write(&transcript, format!("{sidechain}\n{plain}\n")).unwrap();
+        fs::write(&transcript, format!("{sidechain}\n{unmarked}\n{plain}\n")).unwrap();
 
         let input = make_user_prompt_submit(
             "child-session-id",
@@ -2664,11 +2740,57 @@ mod tests {
     }
 
     #[test]
-    fn approval_falls_back_to_the_plan_store_file() {
+    fn plan_store_read_accepts_only_md_nested_under_the_store_root() {
+        let store = TempDir::new().unwrap();
+        let root = store.path();
+        let inside = root.join("my-plan.md");
+        fs::write(&inside, "# Stored Plan\n\nbody from the plan store.").unwrap();
+
+        // In-store .md — the one accepted shape.
+        let got = read_plan_store_file_within(&inside.to_string_lossy(), root).unwrap();
+        assert!(got.contains("# Stored Plan"));
+
+        // Outside the store root — rejected even as a real, readable .md.
+        // This is the arbitrary-local-file-read sink the containment closes:
+        // a payload naming a secret outside the plan store must read as
+        // "no plan", never as content to persist.
+        let outside_dir = TempDir::new().unwrap();
+        let outside = outside_dir.path().join("secrets.md");
+        fs::write(&outside, "SECRET").unwrap();
+        assert_eq!(
+            read_plan_store_file_within(&outside.to_string_lossy(), root),
+            None
+        );
+
+        // Wrong extension in-store — rejected.
+        let key = root.join("id_ed25519");
+        fs::write(&key, "PRIVATE KEY").unwrap();
+        assert_eq!(
+            read_plan_store_file_within(&key.to_string_lossy(), root),
+            None
+        );
+
+        // A symlinked .md in-store pointing outside — rejected: the whole
+        // final path canonicalizes before the nesting check.
+        #[cfg(unix)]
+        {
+            let link = root.join("escape.md");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert_eq!(
+                read_plan_store_file_within(&link.to_string_lossy(), root),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn approval_plan_store_path_outside_the_store_never_persists() {
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let cwd = tmp.path().to_string_lossy().into_owned();
         let metrics_dir = TempDir::new().unwrap();
+        // A real, readable markdown file — but not under the harness plan
+        // store, so the fallback chain must end in a silent allow.
         let store = tmp.path().join("store-plan.md");
         fs::write(&store, "# Stored Plan\n\nbody from the plan store.").unwrap();
 
@@ -2686,9 +2808,9 @@ mod tests {
         let r = with_metrics_dir(metrics_dir.path(), || {
             run_persist_plan_approval(&input, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
         });
-        assert_eq!(r.outcome, Outcome::Nudge, "planFilePath read must persist");
+        assert_eq!(r.outcome, Outcome::Allow);
         assert!(
-            tmp.path()
+            !tmp.path()
                 .join("docs/plans/2026-08-11-stored-plan.md")
                 .exists()
         );
