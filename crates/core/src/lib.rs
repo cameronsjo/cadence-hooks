@@ -375,6 +375,19 @@ pub struct ToolInput {
     /// Skill tool: the skill's argument string. NEVER logged raw — only a
     /// non-reversible hash of it is recorded (see `log_skill`).
     pub args: Option<String>,
+    /// ExitPlanMode tool: the plan's markdown body as carried on the CALL
+    /// side. The current harness fills this at call time (live-verified
+    /// 2026-08-11, claude-code 2.1.227 — cadence-hooks#672), where the
+    /// 2.1.220-era probe found it EMPTY with the plan only in
+    /// `tool_response.plan`. Both sources stay modeled; consumers try the
+    /// response first (the historically reliable field), then this.
+    pub plan: Option<String>,
+    /// ExitPlanMode tool: path to the harness's own plan-store copy
+    /// (`~/.claude/plans/<slug>.md`), carried on the call side alongside
+    /// `plan` (cadence-hooks#672). Last-resort plan source when both inline
+    /// fields are absent.
+    #[serde(rename = "planFilePath")]
+    pub plan_file_path: Option<String>,
     /// Every `tool_input` key this struct does not model, captured verbatim.
     ///
     /// Guards never read it. It exists so a *whole-payload* fingerprint — the
@@ -928,6 +941,29 @@ impl HookInput {
         self.tool_response
             .as_ref()
             .and_then(|tr| tr.plan.as_deref())
+    }
+
+    /// The `ExitPlanMode` plan text from the CALL side (`tool_input.plan`) —
+    /// filled by the current harness at call time (cadence-hooks#672), empty
+    /// in the 2.1.220-era payloads. Fallback source after
+    /// [`Self::tool_response_plan`].
+    pub fn tool_input_plan(&self) -> Option<&str> {
+        self.tool_input.as_ref().and_then(|ti| ti.plan.as_deref())
+    }
+
+    /// The harness plan-store path for an `ExitPlanMode` call, preferring the
+    /// response-side `filePath` over the call-side `planFilePath`
+    /// (cadence-hooks#672). Last-resort plan source when both inline plan
+    /// fields are absent.
+    pub fn plan_file_path(&self) -> Option<&str> {
+        self.tool_response
+            .as_ref()
+            .and_then(|tr| tr.file_path.as_deref())
+            .or_else(|| {
+                self.tool_input
+                    .as_ref()
+                    .and_then(|ti| ti.plan_file_path.as_deref())
+            })
     }
 
     /// The AskUserQuestion questions carried by this tool call, if any.
