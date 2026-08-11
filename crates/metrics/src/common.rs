@@ -160,12 +160,31 @@ pub fn branch(cwd: Option<&str>) -> String {
     git_output(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap_or_default()
 }
 
-/// Repo name: the basename of the git worktree root (`rev-parse --show-toplevel`)
-/// so a subdirectory name is never logged as the repo. Falls back to the
-/// `cwd`/process-directory basename when not inside a git repo.
+/// Repo name: the basename of the repository the checkout at `cwd` belongs
+/// to — never a linked worktree's own directory name (`.claude/worktrees/<slug>`),
+/// which [`GitState::resolve`](cadence_hooks_core::gitstate::GitState::resolve)
+/// deliberately does not expose as `repo_root` for a linked worktree.
+///
+/// Resolution order:
+/// 1. `git_common_dir` ends in `.git` (the overwhelmingly common shape, both
+///    primary checkouts and linked worktrees): the repo dir is its parent.
+/// 2. Otherwise — a bare repo or a `--separate-git-dir` primary, where the
+///    common dir is not named `.git` — best-effort falls back to
+///    `repo_root` itself.
+/// 3. Not inside a git repo at all (or [`GitState::resolve`] can't place
+///    `cwd`): falls back to the `cwd`/process-directory basename, as before.
 pub fn repo_basename(cwd: Option<&str>) -> String {
-    let dir = match git_output(cwd, &["rev-parse", "--show-toplevel"]) {
-        Some(toplevel) => PathBuf::from(toplevel),
+    let dir = match cwd.and_then(|d| cadence_hooks_core::gitstate::GitState::resolve(Path::new(d)))
+    {
+        Some(state) if state.git_common_dir.to_string_lossy().ends_with(".git") => state
+            .git_common_dir
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or(state.repo_root),
+        // Bare repo or `--separate-git-dir` primary: the common dir isn't
+        // named `.git`, so there's no parent to peel — best-effort fall back
+        // to the resolved repo root.
+        Some(state) => state.repo_root,
         None => match cwd {
             Some(d) if Path::new(d).is_dir() => PathBuf::from(d),
             _ => std::env::current_dir().unwrap_or_default(),
@@ -511,5 +530,64 @@ mod tests {
         // e.g. 2026-05-19T00:51:45Z — 20 chars, ends in Z.
         assert!(ts.ends_with('Z'), "timestamp should end in Z: {ts}");
         assert_eq!(ts.len(), 20, "ISO second-precision UTC is 20 chars: {ts}");
+    }
+
+    // `repo_basename`'s git-backed resolution — this crate's first tests to
+    // spin up a real on-disk repo. `Scratch` is `target/`-rooted by default
+    // (never tempdir-rooted, cadence-hooks#312/#403's carve-out gotcha), so
+    // these run outside the enforce-worktree carve-out like every other
+    // consumer of `cadence_hooks_core::git_fixtures`.
+    mod repo_basename_tests {
+        use super::*;
+        use cadence_hooks_core::git_fixtures::{Scratch, git_in, init_repo};
+        use std::path::{Path, PathBuf};
+
+        /// This crate's own `target/`-relative scratch root — `env!` resolves
+        /// at THIS call site, landing under `crates/metrics`'s own `target/`.
+        fn scratch_root() -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/metrics-repo-basename-scratch")
+        }
+
+        #[test]
+        fn primary_checkout_names_the_repo() {
+            let scratch = Scratch::new(&scratch_root(), "primary");
+            let repo = scratch.path().join("myrepo");
+            std::fs::create_dir(&repo).unwrap();
+            init_repo(&repo);
+
+            assert_eq!(repo_basename(Some(&repo.to_string_lossy())), "myrepo");
+        }
+
+        /// The regression this fix closes: a linked worktree at
+        /// `<repo>/.claude/worktrees/<slug>` must still report the *repo's*
+        /// name, never `<slug>` — `git_common_dir`'s parent is the repo root
+        /// on both the primary checkout and every linked worktree.
+        #[test]
+        fn linked_worktree_names_the_repo_not_the_slug() {
+            let scratch = Scratch::new(&scratch_root(), "linked");
+            let repo = scratch.path().join("myrepo");
+            std::fs::create_dir(&repo).unwrap();
+            init_repo(&repo);
+
+            let wt = repo.join(".claude").join("worktrees").join("some-slug");
+            std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+            git_in(
+                &repo,
+                &["worktree", "add", &wt.to_string_lossy(), "-b", "feat/x"],
+            );
+
+            let basename = repo_basename(Some(&wt.to_string_lossy()));
+            assert_eq!(basename, "myrepo");
+            assert_ne!(basename, "some-slug");
+        }
+
+        #[test]
+        fn non_repo_dir_falls_back_to_cwd_basename() {
+            let scratch = Scratch::new(&scratch_root(), "non-repo");
+            let dir = scratch.path().join("not-a-repo");
+            std::fs::create_dir(&dir).unwrap();
+
+            assert_eq!(repo_basename(Some(&dir.to_string_lossy())), "not-a-repo");
+        }
     }
 }
