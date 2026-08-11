@@ -2,7 +2,7 @@
 status: "in-flight"
 updated: "2026-08-11"
 branch: "plan/living-plan-lifecycle-guards"
-pr: "—"
+pr: "cameronsjo/cadence-hooks#671"
 next: "Task 1: instrument run_persist_plan early-returns against session beffcf50; work payload sample owed from Cameron"
 body_sha256: "3aac1eaabc19ef8667c4573ab3da2f6e3cb4f732253df6877b2ef1ee125a9c1d"
 session: "frost-anchor"
