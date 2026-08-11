@@ -75,6 +75,7 @@ Ruling from Cameron: build all the guards; prose isn't enough.
 
 - [ ] **Absence detection** in `session start`: check `${CLAUDE_CONFIG_DIR:-~/.claude}/rules/cadence/cadence-rules.md` (that exact precedence — the `initializing-cadence` install target); missing ⇒ once per calendar day (the platform-drift daily-gate mechanism is the in-tree pattern) one line naming `cadence-groundwork:initializing-cadence` as the installer. No "plugin active" predicate needed — the check only runs when the cadence plugin's own wiring invoked it
 - [ ] **Doctrine rides the scanner**: append the two load-bearing Plan Execution lines (tick as work lands; reconcile before trusting) to the in-flight-plans SessionStart disclosure
+- [ ] **Preflight integration** (#942 seam 2; added when #944 — its duplicate — was closed): fold the rules install into the preflight path so `cadence:catalog preflight` proposes `cadence-groundwork:initializing-cadence` when the rules file is absent — the installer stops being a skill nothing routes to
 - [ ] File the rules-transport ruling issue on cadence (SessionStart wholesale injection vs status quo) — decide-and-record, not build
 
 ### Task 7 — Housekeeping (meta-repo, shared-main — not this repo)
