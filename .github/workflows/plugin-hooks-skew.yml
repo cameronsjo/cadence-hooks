@@ -39,7 +39,13 @@ jobs:
           # failing every hooks-touching cadence PR in ~5s).
           gh release download "$tag" --repo cameronsjo/cadence-hooks \
             --pattern "*linux-x86_64.tar.gz" --dir /tmp/ch --clobber
-          tar -xzf /tmp/ch/*linux-x86_64.tar.gz -C /tmp/ch
+          # Exact filename, never a glob: /tmp/ch survives between runs on the
+          # self-hosted runner, so after a version rollover TWO tarballs match
+          # *linux-x86_64.tar.gz and tar reads the older one as the archive
+          # with the newer one as a member name ("Not found in archive" —
+          # observed on the first rollover after the --clobber fix, v0.75.1 ->
+          # v0.76.0, 2026-08-12).
+          tar -xzf "/tmp/ch/cadence-hooks-${tag}-linux-x86_64.tar.gz" -C /tmp/ch
           bin="$(find /tmp/ch -type f -name cadence-hooks | head -n1)"
           mkdir -p "$HOME/.local/bin"
           install -m 0755 "$bin" "$HOME/.local/bin/cadence-hooks"
