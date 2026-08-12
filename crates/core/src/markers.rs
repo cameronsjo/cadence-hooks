@@ -405,7 +405,9 @@ const DEDUPE_TTL: Duration = Duration::from_secs(30);
 /// PostToolUse hook would collapse two events that shared a payload but
 /// returned different results — response-blind by construction.
 pub const DEDUPE_ELIGIBLE_HOOKS: &[&str] = &[
-    "nudge-polish-before-pr",
+    // nudge-polish-before-pr left this list when cadence#912 consolidated its
+    // overlapping registrations to one coarse if-filter — no fan-out remains
+    // to dedupe (cameronsjo/cadence-hooks#673 hygiene).
     "redact-external-content",
     "warn-overshare",
 ];

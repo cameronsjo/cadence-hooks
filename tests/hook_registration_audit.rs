@@ -258,18 +258,7 @@ const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 /// binary so the wiring PR has something to point at, and reaching no event
 /// until that PR lands.
 /// (`<plugin> <subcommand>`, tracking_reference)
-const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
-    (
-        "guardrails inject-gh-write-context",
-        "cameronsjo/cadence#653",
-    ),
-    ("guardrails guard-rm-liveness", "cameronsjo/cadence#760"),
-    ("session nudge-plan-tick", "cameronsjo/cadence-hooks#671"),
-    (
-        "session warn-plan-ready-flip",
-        "cameronsjo/cadence-hooks#671",
-    ),
-];
+const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
@@ -300,6 +289,19 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
         "session persist-plan-approval",
         "must ride the always-on cadence plugin; `session` is its clap namespace",
     ),
+    // Same rationale again: the living-plan guards (cameronsjo/cadence-hooks#675,
+    // wired in cameronsjo/cadence#947) ride the always-on cadence plugin while
+    // `session` owns plan/session state.
+    (
+        "cadence",
+        "session nudge-plan-tick",
+        "must ride the always-on cadence plugin; `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session warn-plan-ready-flip",
+        "must ride the always-on cadence plugin; `session` is its clap namespace",
+    ),
     // Predates the monorepo consolidation (present in canon's manifest at the
     // subtree-add commit f61b5f6), canon is its only registrar anywhere, and it
     // sits in canon's SessionStart block beside `session start` and `session
@@ -328,7 +330,6 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
 /// developer's working tree, whose freshness varies, so pinning exact
 /// multiplicities would fail on checkout drift rather than on real drift.
 const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
-    "cadence nudge-polish-before-pr",
     "cadence redact-external-content",
     "cadence warn-overshare",
     "guardrails guard-op-vault-scan",
