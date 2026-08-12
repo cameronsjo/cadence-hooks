@@ -88,15 +88,6 @@ struct PlanFacts {
     pr: Option<String>,
 }
 
-/// Scan `<repo_root>/docs/plans/*.md` and render a disclosure block for every
-/// plan whose `status:` is `in-flight` or `blocked`. `None` when the
-/// directory doesn't exist, is unreadable, or no plan matches — the "zero
-/// matching plans = silence" contract at `session start`.
-///
-/// `pub(crate)`, not `pub`: this scanner has exactly one consumer,
-/// [`crate::start`], within this crate — unlike the `Check`/`Logger` types
-/// `main.rs` dispatches across the crate boundary, nothing outside
-/// `cadence-hooks-session` ever calls this directly.
 /// One in-flight (or blocked) plan doc, structured for the plan guards
 /// ([`crate::plan_guards`]) — the same bounded scan the disclosure renderer
 /// uses, exposed as data instead of prose. `rel_path` is forward-slash
@@ -165,6 +156,14 @@ pub(crate) fn in_flight_plans(repo_root: &Path) -> Vec<InFlightPlan> {
         .collect()
 }
 
+/// Scan `<repo_root>/docs/plans/*.md` and render a disclosure block for every
+/// plan whose `status:` is `in-flight` or `blocked`. `None` when the
+/// directory doesn't exist, is unreadable, or no plan matches — the "zero
+/// matching plans = silence" contract at `session start`.
+///
+/// `pub(crate)`, not `pub`: this scanner's consumers all live in this crate
+/// ([`crate::start`], [`crate::plan_guards`]) — unlike the `Check`/`Logger`
+/// types `main.rs` dispatches across the crate boundary.
 pub(crate) fn scan_in_flight_plans(repo_root: &Path) -> Option<String> {
     let plans_dir = repo_root.join("docs").join("plans");
     let paths = list_markdown_files(&plans_dir)?;
@@ -404,7 +403,9 @@ fn render_block(lines: &[String]) -> String {
     }
     format!(
         "{header}\n{}\nThe plan file is an index — verify it against the branch log before \
-         trusting it.",
+         trusting it. Tick the plan as work lands — the commit that lands work is the commit \
+         that touches the plan (Plan Execution doctrine, carried here so it reaches every \
+         machine the hook reaches, rules installed or not).",
         body.join("\n")
     )
 }
@@ -629,7 +630,10 @@ mod tests {
         assert_eq!(
             block,
             "1 in-flight plan in docs/plans/:\n- a\nThe plan file is an index — verify it \
-             against the branch log before trusting it."
+             against the branch log before trusting it. Tick the plan as work lands — the \
+             commit that lands work is the commit that touches the plan (Plan Execution \
+             doctrine, carried here so it reaches every machine the hook reaches, rules \
+             installed or not)."
         );
     }
 
@@ -818,7 +822,10 @@ mod tests {
             block,
             "1 in-flight plan in docs/plans/:\n\
              - 2026-07-25-real-plan — next: \"ship the thing\" (branch: feat/x)\n\
-             The plan file is an index — verify it against the branch log before trusting it."
+             The plan file is an index — verify it against the branch log before trusting it. \
+             Tick the plan as work lands — the commit that lands work is the commit that \
+             touches the plan (Plan Execution doctrine, carried here so it reaches every \
+             machine the hook reaches, rules installed or not)."
         );
     }
 

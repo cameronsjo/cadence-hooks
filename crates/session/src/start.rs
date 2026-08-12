@@ -46,25 +46,77 @@ impl Check for Start {
         // it behind the registry guards would silence it in exactly the cwd
         // that has no git repo to coordinate in.
         let failopen = cadence_hooks_metrics::failopen_disclose::disclosure_line();
+        // Machine-level like `failopen`, and joined into its slot so
+        // `run_start`'s testable signature stays stable: an always-on rules
+        // file that was never installed is behaviorally identical to a loaded
+        // one the model ignored — with the opposite fix (cadence#942). Once
+        // per calendar day via the same daily gate `platform-drift` uses.
+        let machine = join_machine_lines(rules_absence_line(), failopen);
         let Some(cwd) = input.cwd.as_deref() else {
-            return finish(None, None, None, failopen);
+            return finish(None, None, None, machine);
         };
         let Some(dir) = registry::sessions_dir(cwd) else {
             // Not a git repository — no registry, nothing to coordinate.
-            return finish(None, None, None, failopen);
+            return finish(None, None, None, machine);
         };
         if let Some(root) = registry::repo_root(cwd) {
             registry::ensure_git_excluded(&root);
         }
         let branch = git_command(cwd, &["branch", "--show-current"]);
         let stale_secs = registry::stale_minutes() * 60;
-        run_start(input, &dir, branch, stale_secs, failopen)
+        run_start(input, &dir, branch, stale_secs, machine)
     }
 }
 
-/// Testable core: registry path, branch, and the fail-open disclosure are
-/// injected so tests can target a tempdir without a git repository — and
-/// without reading the machine's real telemetry.
+/// Join the machine-level disclosure lines (rules absence, guard fail-open)
+/// into the single machine slot [`finish`] renders last.
+fn join_machine_lines(rules: Option<String>, failopen: Option<String>) -> Option<String> {
+    match (rules, failopen) {
+        (Some(r), Some(f)) => Some(format!("{r}\n\n{f}")),
+        (Some(r), None) => Some(r),
+        (None, f) => f,
+    }
+}
+
+/// One line, once per calendar day, when the always-on cadence rules file was
+/// never installed on this machine — the silent-absence gap cadence#942
+/// reported: every other always-on surface announces itself at SessionStart,
+/// and without this line "never installed" is indistinguishable from
+/// "installed and ignored". Fail-open: a present file, an unclaimable daily
+/// marker, or any resolution failure is silence.
+fn rules_absence_line() -> Option<String> {
+    rules_absence_line_from(&cadence_hooks_core::paths::claude_config_dir())
+}
+
+/// Testable core of [`rules_absence_line`]: the config dir is injected so
+/// tests target a tempdir instead of the machine's real one. The daily-gate
+/// side (`claim_today`) still reads `CADENCE_MARKER_DIR` — sandbox it with
+/// `test_builders::with_marker_dir` (the #302 discipline) so a test run never
+/// consumes the machine's real once-per-day claim.
+fn rules_absence_line_from(config_dir: &Path) -> Option<String> {
+    let path = config_dir
+        .join("rules")
+        .join("cadence")
+        .join("cadence-rules.md");
+    if path.is_file() {
+        return None;
+    }
+    if !cadence_hooks_core::markers::claim_today("rules-absence", "cadence-rules.md") {
+        return None;
+    }
+    Some(
+        "cadence-rules.md is NOT installed (rules/cadence/ under the Claude config dir) — \
+         sessions on this machine run with none of the cadence doctrine (principles, plan \
+         execution, verification). Install it: the cadence-groundwork initializing-cadence \
+         skill (cadence#942)."
+            .to_string(),
+    )
+}
+
+/// Testable core: registry path, branch, and the machine-level disclosure —
+/// the pre-joined rules-absence + fail-open string from [`join_machine_lines`]
+/// — are injected so tests can target a tempdir without a git repository, and
+/// without reading the machine's real telemetry or rules install.
 pub fn run_start(
     input: &HookInput,
     dir: &std::path::Path,
@@ -254,6 +306,52 @@ fn finish(
         CheckResult::allow()
     } else {
         CheckResult::nudge(parts.join("\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod machine_lines_tests {
+    use super::{join_machine_lines, rules_absence_line_from};
+    use cadence_hooks_core::test_builders::with_marker_dir;
+    use tempfile::TempDir;
+
+    #[test]
+    fn join_machine_lines_covers_all_four_shapes() {
+        assert_eq!(join_machine_lines(None, None), None);
+        assert_eq!(join_machine_lines(Some("r".into()), None), Some("r".into()));
+        assert_eq!(join_machine_lines(None, Some("f".into())), Some("f".into()));
+        assert_eq!(
+            join_machine_lines(Some("r".into()), Some("f".into())),
+            Some("r\n\nf".into())
+        );
+    }
+
+    #[test]
+    fn rules_absence_fires_once_when_missing_and_never_when_installed() {
+        // Sandboxed on BOTH globals the probe reads: the config dir is
+        // injected, and the daily marker lands in a tempdir via
+        // `with_marker_dir` — never the machine's real once-per-day claim
+        // (the #302 discipline; review of this change).
+        let config = TempDir::new().unwrap();
+        let markers = TempDir::new().unwrap();
+        with_marker_dir(markers.path(), || {
+            let line = rules_absence_line_from(config.path())
+                .expect("missing rules file must draw the line");
+            assert!(line.contains("cadence-rules.md is NOT installed"));
+            assert!(line.contains("initializing-cadence"));
+            // Same calendar day: the daily gate holds.
+            assert_eq!(rules_absence_line_from(config.path()), None);
+        });
+
+        // Installed file: silence, and no marker is even claimed.
+        let installed = TempDir::new().unwrap();
+        let rules_dir = installed.path().join("rules").join("cadence");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("cadence-rules.md"), "# rules\n").unwrap();
+        let fresh_markers = TempDir::new().unwrap();
+        with_marker_dir(fresh_markers.path(), || {
+            assert_eq!(rules_absence_line_from(installed.path()), None);
+        });
     }
 }
 
@@ -548,18 +646,26 @@ mod tests {
         // `Start::run`, not `run_start`, because the ordering being pinned
         // lives in the guards themselves.
         let metrics = TempDir::new().unwrap();
+        // `Start::run` also probes the rules-absence line, whose daily claim
+        // must land in a sandbox — on a machine without the rules file this
+        // test would otherwise consume the real once-per-day claim (#302
+        // discipline; review of this change). Nested inside the metrics lock:
+        // different globals, different mutexes, no deadlock.
+        let marker_sandbox = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-session", "startup", "/tmp");
         let r = registry::test_metrics_env::with_metrics_dir(metrics.path(), || {
-            for _ in 0..3 {
-                cadence_hooks_metrics::log_failopen(
-                    "deadline",
-                    Some("guardrails"),
-                    Some("guard-rm"),
-                    "1.0.0",
-                    None,
-                );
-            }
-            Start.run(&input)
+            cadence_hooks_core::test_builders::with_marker_dir(marker_sandbox.path(), || {
+                for _ in 0..3 {
+                    cadence_hooks_metrics::log_failopen(
+                        "deadline",
+                        Some("guardrails"),
+                        Some("guard-rm"),
+                        "1.0.0",
+                        None,
+                    );
+                }
+                Start.run(&input)
+            })
         });
         assert_eq!(
             r.outcome,
