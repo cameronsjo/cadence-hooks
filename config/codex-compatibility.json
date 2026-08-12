@@ -68,14 +68,6 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Codex does not expose Claude ExitPlanMode approval events"
-    },
-    "nudge-plan-tick": {
-      "applicable": false,
-      "evidence": "registered in the binary but not yet invoked: the cadence PostToolUse:Bash wiring ships in a companion monorepo PR (cameronsjo/cadence-hooks#671 Task 4). Flip to applicable when that wiring merges."
-    },
-    "warn-plan-ready-flip": {
-      "applicable": false,
-      "evidence": "registered in the binary but not yet invoked: the cadence PreToolUse:Bash wiring ships in a companion monorepo PR (cameronsjo/cadence-hooks#671 Task 4). Flip to applicable when that wiring merges."
     }
   },
   "capabilities": [

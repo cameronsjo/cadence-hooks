@@ -1666,9 +1666,17 @@
       "plugin": "session",
       "protected": false,
       "status": "native",
-      "applicable": false,
-      "evidence": "registered in the binary but not yet invoked: the cadence PostToolUse:Bash wiring ships in a companion monorepo PR (cameronsjo/cadence-hooks#671 Task 4). Flip to applicable when that wiring merges.",
-      "wiring": []
+      "applicable": true,
+      "evidence": "tests/hook_registration_audit.rs",
+      "wiring": [
+        {
+          "plugin": "cadence",
+          "event": "PostToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*git commit*)",
+          "commandHash": "1e75fe857ef769eb6fa6913a4b0182dc76d2b27e5cac73195e7fecc404859eb1"
+        }
+      ]
     },
     {
       "criticality": "workflow",
@@ -1678,9 +1686,24 @@
       "plugin": "session",
       "protected": false,
       "status": "native",
-      "applicable": false,
-      "evidence": "registered in the binary but not yet invoked: the cadence PreToolUse:Bash wiring ships in a companion monorepo PR (cameronsjo/cadence-hooks#671 Task 4). Flip to applicable when that wiring merges.",
-      "wiring": []
+      "applicable": true,
+      "evidence": "tests/hook_registration_audit.rs",
+      "wiring": [
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr ready*)",
+          "commandHash": "da7c944a9132d454f0a28da012aa4c1277da8a72191fe0e06754e01b086b4e3b"
+        },
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr merge*)",
+          "commandHash": "da7c944a9132d454f0a28da012aa4c1277da8a72191fe0e06754e01b086b4e3b"
+        }
+      ]
     }
   ]
 }
