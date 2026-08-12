@@ -46,20 +46,62 @@ impl Check for Start {
         // it behind the registry guards would silence it in exactly the cwd
         // that has no git repo to coordinate in.
         let failopen = cadence_hooks_metrics::failopen_disclose::disclosure_line();
+        // Machine-level like `failopen`, and joined into its slot so
+        // `run_start`'s testable signature stays stable: an always-on rules
+        // file that was never installed is behaviorally identical to a loaded
+        // one the model ignored — with the opposite fix (cadence#942). Once
+        // per calendar day via the same daily gate `platform-drift` uses.
+        let machine = join_machine_lines(rules_absence_line(), failopen);
         let Some(cwd) = input.cwd.as_deref() else {
-            return finish(None, None, None, failopen);
+            return finish(None, None, None, machine);
         };
         let Some(dir) = registry::sessions_dir(cwd) else {
             // Not a git repository — no registry, nothing to coordinate.
-            return finish(None, None, None, failopen);
+            return finish(None, None, None, machine);
         };
         if let Some(root) = registry::repo_root(cwd) {
             registry::ensure_git_excluded(&root);
         }
         let branch = git_command(cwd, &["branch", "--show-current"]);
         let stale_secs = registry::stale_minutes() * 60;
-        run_start(input, &dir, branch, stale_secs, failopen)
+        run_start(input, &dir, branch, stale_secs, machine)
     }
+}
+
+/// Join the machine-level disclosure lines (rules absence, guard fail-open)
+/// into the single machine slot [`finish`] renders last.
+fn join_machine_lines(rules: Option<String>, failopen: Option<String>) -> Option<String> {
+    match (rules, failopen) {
+        (Some(r), Some(f)) => Some(format!("{r}\n\n{f}")),
+        (Some(r), None) => Some(r),
+        (None, f) => f,
+    }
+}
+
+/// One line, once per calendar day, when the always-on cadence rules file was
+/// never installed on this machine — the silent-absence gap cadence#942
+/// reported: every other always-on surface announces itself at SessionStart,
+/// and without this line "never installed" is indistinguishable from
+/// "installed and ignored". Fail-open: a present file, an unclaimable daily
+/// marker, or any resolution failure is silence.
+fn rules_absence_line() -> Option<String> {
+    let path = cadence_hooks_core::paths::claude_config_dir()
+        .join("rules")
+        .join("cadence")
+        .join("cadence-rules.md");
+    if path.is_file() {
+        return None;
+    }
+    if !cadence_hooks_core::markers::claim_today("rules-absence", "cadence-rules.md") {
+        return None;
+    }
+    Some(
+        "cadence-rules.md is NOT installed (rules/cadence/ under the Claude config dir) — \
+         sessions on this machine run with none of the cadence doctrine (principles, plan \
+         execution, verification). Install it: the cadence-groundwork initializing-cadence \
+         skill (cadence#942)."
+            .to_string(),
+    )
 }
 
 /// Testable core: registry path, branch, and the fail-open disclosure are
@@ -254,6 +296,22 @@ fn finish(
         CheckResult::allow()
     } else {
         CheckResult::nudge(parts.join("\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod machine_lines_tests {
+    use super::join_machine_lines;
+
+    #[test]
+    fn join_machine_lines_covers_all_four_shapes() {
+        assert_eq!(join_machine_lines(None, None), None);
+        assert_eq!(join_machine_lines(Some("r".into()), None), Some("r".into()));
+        assert_eq!(join_machine_lines(None, Some("f".into())), Some("f".into()));
+        assert_eq!(
+            join_machine_lines(Some("r".into()), Some("f".into())),
+            Some("r\n\nf".into())
+        );
     }
 }
 
