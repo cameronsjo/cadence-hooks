@@ -3,7 +3,7 @@ status: "in-flight"
 updated: "2026-08-11"
 branch: "plan/living-plan-lifecycle-guards"
 pr: "cameronsjo/cadence-hooks#671"
-next: "Cameron merges PRs #674/#675 (hooks) + cadence#945; then Task 4 wiring+release and Task 6 absence detection (start.rs conflicts gate Task 6 on #675). Work payload sample owed as corroboration"
+next: "TAIL: cadence#954 (ready-flip single-row + baseline bump) merges when its queued CI drains; Cameron: brew upgrade to 0.76.0 on sjomba/M5/work + work payload sample; Task 5 preflight-integration bullet tracked via cadence#946/#942"
 body_sha256: "3aac1eaabc19ef8667c4573ab3da2f6e3cb4f732253df6877b2ef1ee125a9c1d"
 session: "frost-anchor"
 session_id: "1322f0d3-8e45-49be-b07c-217268925560"
@@ -60,9 +60,9 @@ Ruling from Cameron: build all the guards; prose isn't enough.
 
 ### Task 4 — Wiring + release
 
-- [ ] `cadence/plugins/cadence/hooks/hooks.json`: budget 3+ new rows (PostToolUse/Bash for guard 2 — none exists today; two PreToolUse rows for guard 3), each single-rule; regen codex assets (`scripts/build-codex-assets.py --check`)
-- [ ] Wiring may merge before the release — verified safe: an unknown subcommand takes `run-cadence-hooks.sh`'s inert path (exit 0, one stderr line/day) on machines with older binaries
-- [ ] Release per CLAUDE.md's full checklist: `make bump` + `cargo check` + `make report` with explicit `--workspace` (the worktree wiring-emptying trap) + CHANGELOG `[Unreleased]` stamp + `platform-baseline.json` `cadence_hooks.current_version` bump in the cadence monorepo (already stale at 0.74.0 vs released 0.75.1 — fix in passing)
+- [x] `cadence/plugins/cadence/hooks/hooks.json`: budget 3+ new rows (PostToolUse/Bash for guard 2 — none exists today; two PreToolUse rows for guard 3), each single-rule; regen codex assets (`scripts/build-codex-assets.py --check`)
+- [x] Wiring may merge before the release — verified safe: an unknown subcommand takes `run-cadence-hooks.sh`'s inert path (exit 0, one stderr line/day) on machines with older binaries
+- [x] Release per CLAUDE.md's full checklist: `make bump` + `cargo check` + `make report` with explicit `--workspace` (the worktree wiring-emptying trap) + CHANGELOG `[Unreleased]` stamp + `platform-baseline.json` `cadence_hooks.current_version` bump in the cadence monorepo (already stale at 0.74.0 vs released 0.75.1 — fix in passing)
 - [ ] Brew upgrade gates on sjomba/M5/work — Cameron actions
 
 ### Task 5 — Close the attune-exemption hole (cadence plugin, prose)
@@ -73,10 +73,10 @@ Ruling from Cameron: build all the guards; prose isn't enough.
 
 ### Task 6 — Rules-delivery repair (cadence-hooks binary + cadence wiring; addresses [cadence#942](https://github.com/cameronsjo/cadence/issues/942))
 
-- [ ] **Absence detection** in `session start`: check `${CLAUDE_CONFIG_DIR:-~/.claude}/rules/cadence/cadence-rules.md` (that exact precedence — the `initializing-cadence` install target); missing ⇒ once per calendar day (the platform-drift daily-gate mechanism is the in-tree pattern) one line naming `cadence-groundwork:initializing-cadence` as the installer. No "plugin active" predicate needed — the check only runs when the cadence plugin's own wiring invoked it
-- [ ] **Doctrine rides the scanner**: append the two load-bearing Plan Execution lines (tick as work lands; reconcile before trusting) to the in-flight-plans SessionStart disclosure
-- [ ] **Preflight integration** (#942 seam 2; added when #944 — its duplicate — was closed): fold the rules install into the preflight path so `cadence:catalog preflight` proposes `cadence-groundwork:initializing-cadence` when the rules file is absent — the installer stops being a skill nothing routes to
-- [ ] File the rules-transport ruling issue on cadence (SessionStart wholesale injection vs status quo) — decide-and-record, not build
+- [x] **Absence detection** in `session start`: check `${CLAUDE_CONFIG_DIR:-~/.claude}/rules/cadence/cadence-rules.md` (that exact precedence — the `initializing-cadence` install target); missing ⇒ once per calendar day (the platform-drift daily-gate mechanism is the in-tree pattern) one line naming `cadence-groundwork:initializing-cadence` as the installer. No "plugin active" predicate needed — the check only runs when the cadence plugin's own wiring invoked it
+- [x] **Doctrine rides the scanner**: append the two load-bearing Plan Execution lines (tick as work lands; reconcile before trusting) to the in-flight-plans SessionStart disclosure
+- [x] **Preflight integration** (#942 seam 2; added when #944 — its duplicate — was closed): fold the rules install into the preflight path so `cadence:catalog preflight` proposes `cadence-groundwork:initializing-cadence` when the rules file is absent — the installer stops being a skill nothing routes to
+- [x] File the rules-transport ruling issue on cadence (SessionStart wholesale injection vs status quo) — decide-and-record, not build
 
 ### Task 7 — Housekeeping (meta-repo, shared-main — not this repo)
 
@@ -118,6 +118,7 @@ cadence-hooks work in this worktree (`plan/living-plan-lifecycle-guards`, based 
 - **2026-08-11 — Guard specs tightened per panel** (events pinned, dedupe rules named, no-fire cases for failed commands, guard 4's dead frontmatter-arm dropped, new bounded body reader named, wiring rows budgeted 3+, release checklist completed with the platform-baseline bump).
 - **2026-08-11 — Task 1's instrumentation superseded by a cheaper decisive probe.** Instead of instrumenting early-returns, replaying the failing prompt through the installed binary exonerated the code, the cache sweep exonerated the wiring, and the transcript's hook-context absence convicted the event: the approve-and-clear injection no longer fires UserPromptSubmit ([#672](https://github.com/cameronsjo/cadence-hooks/issues/672)). Task 2's first bullet respecified as the late-persist fallback.
 
+- **2026-08-12 — Tasks 4+6 landed with three unplanned discoveries.** (1) The doctor CI gate validates wiring against the LATEST RELEASE, so the release had to precede the wiring merge — inverting the plan's wiring-first note (v0.76.0 released, then cadence#947 merged). (2) The estate ruleset now blocks direct pushes to cadence-hooks main — the release recipe's push-branch-to-main step became release PR #677. (3) The audit counts per-matcher registrations regardless of if:, so the ready-flip two-row split consolidated to one coarse row (cadence#954, queued CI). Post-wiring housekeeping (#678): pending entries out, cross-plugin sanctions in, codex flip, plus #673's cheap half. Preflight integration recorded on cadence#946; the doctrine lines + absence detection shipped in #676.
 - **2026-08-11 — Task 2 executed head-scan, not the spec'd tail-scan.** The injection is the first user entry of its session and never moves; a tail window loses it as the session grows. Improvement, not reality-forced. The polish security arm (Opus) upgraded the plan-store fallback with containment (its Critical) and flipped the sidechain gate fail-closed — both folded into PR [#674](https://github.com/cameronsjo/cadence-hooks/pull/674) before it opened.
 
 - **2026-08-11 — Tasks 3+5 executed with two review folds.** Guards PR [#675](https://github.com/cameronsjo/cadence-hooks/pull/675) (closes #429): the polish security arm's Important (spoofable commit prefilter burning the session marker → structural `is_git_commit` + atomic claim) and the code-review arm's Critical (two diverging checkbox scanners → the plan's shared-reader bullet restored as `plan_scan::checkbox_counts`) both fixed pre-PR. Task 5 PR [cadence#945](https://github.com/cameronsjo/cadence/pull/945): reviewer caught the attune line asserting the unshipped lint as present fact (hedged to cite #675) and made the persist-first recipe self-contained. Task 6's binary side is deliberately sequenced AFTER #675 merges — both edit `start.rs`.
