@@ -675,23 +675,19 @@ mod tests {
     /// The #472 regression fixture: one multi-command Bash call, registered
     /// under overlapping `if:` globs that each match a different segment
     /// (`git commit`, `git push`, `gh pr create`), spawns three processes with
-    /// identical payloads — and must produce exactly ONE emission.
+    /// identical payloads — and must produce exactly ONE emission. The fixture
+    /// hook is `warn-overshare` — a hook still on `DEDUPE_ELIGIBLE_HOOKS` with
+    /// genuinely overlapping registrations (`nudge-polish-before-pr` left the
+    /// list when cadence#912 consolidated its wiring).
     #[test]
     fn dedupe_collapses_a_multi_command_fan_out_to_one_emission() {
         let tmp = tempfile::tempdir().unwrap();
         cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
             let input = fanout_input("git commit -m 'ship it' && git push && gh pr create --fill");
-            let nudge = CheckResult::nudge("polish before opening the PR");
+            let nudge = CheckResult::nudge("possible overshare in the outgoing content");
 
             let emissions = (0..3)
-                .filter(|_| {
-                    claim_emission(
-                        &nudge,
-                        &input,
-                        HookEvent::PreToolUse,
-                        "nudge-polish-before-pr",
-                    )
-                })
+                .filter(|_| claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-overshare"))
                 .count();
 
             assert_eq!(
