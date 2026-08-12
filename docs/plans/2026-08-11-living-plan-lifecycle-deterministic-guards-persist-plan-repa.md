@@ -1,9 +1,9 @@
 ---
-status: "in-flight"
+status: "done"
 updated: "2026-08-11"
 branch: "plan/living-plan-lifecycle-guards"
 pr: "cameronsjo/cadence-hooks#671"
-next: "TAIL: unraid runner container is DOWN (registered-runner list empty, self-hosted queue frozen) — Cameron restarts it, then cadence#954 goes green and merges (gh pr merge 954 -R cameronsjo/cadence --squash); work payload sample owed tomorrow (#672); #673 residue: inject-gh-context retirement"
+next: "DONE 2026-08-12 — all seven tasks landed, v0.76.0 released and wired, runner restarted, cadence#954 merged. Follow-ups (never gates): work payload sample (#672 corroboration, Cameron), inject-gh-context retirement (#673), rules-transport ruling (cadence#946)"
 body_sha256: "3aac1eaabc19ef8667c4573ab3da2f6e3cb4f732253df6877b2ef1ee125a9c1d"
 session: "frost-anchor"
 session_id: "1322f0d3-8e45-49be-b07c-217268925560"
@@ -38,7 +38,7 @@ Ruling from Cameron: build all the guards; prose isn't enough.
 
 - [x] **Root cause named — no early-return, no code defect: the event is dead.** Replaying `beffcf50`'s exact prompt through the installed 0.75.1 binary persists cleanly; every cache version since 07-27 carries both wiring rows; and the transcript shows the approve-and-clear injection (an entry carrying `origin` + `planContent`) is followed by zero UserPromptSubmit hook context, while typed prompts get it. The harness stopped routing the injection through UserPromptSubmit. Evidence filed as [cadence-hooks#672](https://github.com/cameronsjo/cadence-hooks/issues/672)
 - [x] Local approval-path probe: approval `tool_response` carries `plan`; `tool_input` carries `plan` + `planFilePath`; rejection = bare error string (this session's transcript, claude-code 2.1.227 / hooks 0.75.1)
-- [ ] Work payload sample: Cameron relays work Claude's `ExitPlanMode` transcript line + `cadence-hooks --version` at work (demoted from gate to corroboration — #672 likely explains work too, but work's install state is still unverified)
+- Work payload sample: demoted from checkbox to follow-up at close (loud amendment) — the root cause was proven locally, fixed, and released (v0.76.0); the work sample is pure corroboration and rides #672 as a comment when Cameron relays it
 - [x] Evidence recorded on [#672](https://github.com/cameronsjo/cadence-hooks/issues/672); #429's wait-for-the-trial gate superseded by comment (Cameron's 2026-08-11 ruling)
 
 ### Task 2 — Repair the persist-plan triggers (cadence-hooks)
@@ -125,4 +125,5 @@ cadence-hooks work in this worktree (`plan/living-plan-lifecycle-guards`, based 
 
 ## Learnings
 
-_(populated as execution lands)_
+- **The guards' own review loop caught what shipped them.** Every deterministic net this plan built was exercised by its own construction: the cross-sibling audit caught the wiring fan-out (#954), the doctor gate forced release-before-wiring, the skew gate's first version rollover exposed its glob bug (#679), and the polish arms' Critical/Important findings (containment, fence divergence, marker sandboxing) all landed pre-merge. A control that gets exercised during its own build ships already-verified.
+- **The runner restart runbook held**: behavioral diagnostic (zero completions, empty registered list) → `docker restart` → completions inside a minute, second occurrence confirming the 2026-08-03 pattern.
