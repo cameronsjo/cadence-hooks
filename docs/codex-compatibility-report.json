@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "binaryVersion": "0.76.0",
+  "binaryVersion": "0.77.0",
   "minimumCodexVersion": "0.145.0",
   "privacy": {
     "rawHookInputsPersisted": false,
@@ -1693,14 +1693,7 @@
           "plugin": "cadence",
           "event": "PreToolUse",
           "matcher": "Bash",
-          "if": "Bash(*gh pr ready*)",
-          "commandHash": "da7c944a9132d454f0a28da012aa4c1277da8a72191fe0e06754e01b086b4e3b"
-        },
-        {
-          "plugin": "cadence",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*gh pr merge*)",
+          "if": "Bash(*gh pr *)",
           "commandHash": "da7c944a9132d454f0a28da012aa4c1277da8a72191fe0e06754e01b086b4e3b"
         }
       ]
