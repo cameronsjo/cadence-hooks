@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`session start` now names a checkout that has fallen behind `origin`'s default branch, from cached refs only — no network call.** A fifth part in `finish()` computes the behind-count via `refs/heads/<default>..refs/remotes/origin/<default>` and renders one line (`Checkout: N commits behind origin/<default> (refs fetched <age>)`) when the count is nonzero; silent when current, when there is no resolvable `origin/HEAD` symref, or on any git read failure. Deliberately no fetch: a network call here would share the hook's deadline budget and, on timeout, would mark the same guard-fail-open signal the fourth part already discloses. Companion half of the checkout-freshness plan is an `outro` sync step (cadence monorepo) that keeps the cache this line reads fresh.
+
 ## [0.77.0] - 2026-08-14
 
 ### Fixed
