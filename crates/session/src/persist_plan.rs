@@ -28,6 +28,19 @@
 //! UserPromptSubmit-exclusive, since `PersistPlanApproval` never sees an
 //! injected prompt to strip a prefix from in the first place.
 //!
+//! Late-scan re-fire recognition runs two layers, in order: **row → dir
+//! scan** (cadence-hooks#690). The row layer ([`session_already_persisted`])
+//! asks the machine-local `plan-links.jsonl` stream "did THIS session already
+//! persist THIS body?" — cwd-independent, so a session whose cwd wanders into
+//! a sibling repo skips before touching any cwd-derived path. The dir-scan
+//! layer ([`plans_dir_contains_hash`]) remains as the second layer (a wiped
+//! metrics file, rows beyond the tail window, pre-fix sessions with no rows);
+//! its per-file matching keeps its own internal tiers (frontmatter key →
+//! legacy trailer → recompute — see [`file_matches_body`]). The two layers are
+//! never numbered as one sequence. `CADENCE_PERSIST_PLAN_FORCE` (any
+//! non-empty value) skips the row layer for the turn — the returnable escape
+//! for an intentional same-session re-persist.
+//!
 //! Never blocks (ADR-0001): every failure path — no prompt/no plan text, no
 //! match, no `cwd`, not a git repo, unsafe session id, exhausted suffix ladder,
 //! a subagent-context approval — exits silently via `CheckResult::allow()`. A
@@ -132,6 +145,14 @@ const PARENT_SCAN_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// separately-drifting way to say the same thing; confirmed no consumer
 /// (`reconstruct-journey.py`) reads either field before dropping it.
 const PLAN_LINKS_SCHEMA_VERSION: u32 = 2;
+
+/// Tail window of `plan-links.jsonl` the row-keyed idempotency check
+/// ([`session_already_persisted`]) reads — roughly 1000 recent rows. The file
+/// is append-only, so recent rows live at the TAIL; a head-anchored
+/// `take(cap)` would silently blind the check as the file grows. A matching
+/// row that has scrolled out of this window reads as "no row" and fails open
+/// to the dir scan (ADR-0001) — one benign duplicate, never a lost persist.
+const PLAN_LINKS_SCAN_MAX_BYTES: u64 = 256 * 1024;
 
 /// Persist an approved plan whose post-approval turn was wiped
 /// (approve-and-clear, cross-session).
@@ -238,17 +259,34 @@ pub fn run_persist_plan(
     };
 
     let body_hash = sha256_hex(body.as_bytes());
-    let slug = slugify(&body);
-    let Some((repo_root, plans_dir)) = canonical_plans_dir(&repo_root) else {
+    // Recognition layer 1 of 2 — the row check (cadence-hooks#690): did THIS
+    // session already persist THIS body on this machine? Runs BEFORE any
+    // plans-dir resolution, so a session whose cwd has wandered into a
+    // sibling repo never invents (or even resolves) a `docs/plans/` there on
+    // a skip turn. Session-keyed on purpose: suppression is exactly
+    // coextensive with the defect (a session's own re-fires), while a
+    // DIFFERENT session legitimately persisting the same body into another
+    // repo is untouched. The skip is silent — the row exists only because a
+    // persist already nudged once, and the per-prompt re-nudge is the noise
+    // this layer removes. `CADENCE_PERSIST_PLAN_FORCE` skips this layer only.
+    if via_late_scan && !persist_plan_force() && session_already_persisted(&body_hash, session_id) {
         return CheckResult::allow();
-    };
-    // The late path re-fires on EVERY subsequent prompt of the session, and
-    // the persist date may differ from the approval date — so the same-stem
-    // claim ladder alone cannot recognize an earlier persist under an earlier
-    // date. A dir-wide hash check closes that: any existing plan doc carrying
-    // this body hash makes the late scan a silent idempotent skip. The
-    // prefix path keeps its original semantics (one injection, one date).
-    if via_late_scan && plans_dir_contains_hash(&plans_dir, &body_hash) {
+    }
+    let slug = slugify(&body);
+    // Recognition layer 2 of 2 — the dir-wide scan: the late path re-fires on
+    // EVERY subsequent prompt of the session, and the persist date may differ
+    // from the approval date — so the same-stem claim ladder alone cannot
+    // recognize an earlier persist under an earlier date. Any existing plan
+    // doc carrying this body hash makes the late scan a silent idempotent
+    // skip. Covers what the row check cannot (a wiped metrics file, a row
+    // beyond the tail window, pre-row sessions). Resolves the plans dir via
+    // the EXISTING-only variant — a scan must never create the directory it
+    // scans (the wrong-repo `docs/plans/` invention of cadence-hooks#690).
+    // The prefix path keeps its original semantics (one injection, one date).
+    if via_late_scan
+        && let Some((_, scan_dir)) = existing_canonical_plans_dir(&repo_root)
+        && plans_dir_contains_hash(&scan_dir, &body_hash)
+    {
         return CheckResult::allow();
     }
     let stem = format!("{local_date}-{slug}");
@@ -296,6 +334,12 @@ pub fn run_persist_plan(
     let document = render_document(&fields, &body);
 
     let approved_label = parent_name.as_deref().unwrap_or("unknown");
+    // Write-time resolution through the CREATING variant (its symlink-escape
+    // guard intact): the dir is invented only on a turn that actually
+    // persists, never on a scan-only skip (cadence-hooks#690).
+    let Some((repo_root, plans_dir)) = canonical_plans_dir(&repo_root) else {
+        return CheckResult::allow();
+    };
     persist_and_nudge(
         &plans_dir,
         &stem,
@@ -452,6 +496,68 @@ fn canonical_plans_dir(repo_root: &Path) -> Option<(PathBuf, PathBuf)> {
     canonical_plans_dir
         .starts_with(&canonical_repo_root)
         .then_some((canonical_repo_root, canonical_plans_dir))
+}
+
+/// [`canonical_plans_dir`]'s read-only sibling: identical signature and the
+/// same canonicalize + `starts_with` symlink-escape guard, but requires
+/// `docs/plans` to ALREADY exist instead of creating it. Used by the
+/// late-scan dir check only (cadence-hooks#690) — a scan must never invent
+/// the directory it scans, which is exactly how a wandered-cwd session
+/// deposited empty `docs/plans/` dirs into sibling repos. Its two `None`
+/// causes (dir absent; symlink escaping the repo) deliberately collapse to
+/// the same outcome — "nothing scannable here" — because an escaping dir
+/// must not be scanned either. The write path re-resolves through the
+/// creating variant above, whose own guard is untouched.
+fn existing_canonical_plans_dir(repo_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let plans_dir = repo_root.join("docs").join("plans");
+    if !plans_dir.is_dir() {
+        return None;
+    }
+    let canonical_repo_root = repo_root.canonicalize().ok()?;
+    let canonical_plans_dir = plans_dir.canonicalize().ok()?;
+    canonical_plans_dir
+        .starts_with(&canonical_repo_root)
+        .then_some((canonical_repo_root, canonical_plans_dir))
+}
+
+/// The returnable escape for the row-keyed idempotency layer
+/// (cadence-hooks#690): any non-empty `CADENCE_PERSIST_PLAN_FORCE` skips the
+/// row check for the turn — the delete-and-retarget workflow's same-session
+/// path (a fresh session persists regardless, via session-keying). Skips the
+/// row layer ONLY; the dir scan and claim ladder still apply.
+fn persist_plan_force() -> bool {
+    std::env::var("CADENCE_PERSIST_PLAN_FORCE").is_ok_and(|v| !v.is_empty())
+}
+
+/// Has THIS session already persisted THIS plan body on this machine?
+///
+/// Tail-anchored bounded read of `<metrics_dir>/plan-links.jsonl` — the row
+/// [`append_plan_links_row`] writes on every successful persist. The file is
+/// machine-local and cwd-independent, which is what lets this check run
+/// BEFORE any cwd-derived path resolution (cadence-hooks#690). Matches only
+/// a row whose `body_sha256` AND `child_session_id` both equal the running
+/// session's values — see [`plan_links_row`]'s schema pin.
+///
+/// Fail-open (ADR-0001) in every direction: an unreadable or absent file,
+/// malformed rows, or a matching row that has scrolled out of the
+/// [`PLAN_LINKS_SCAN_MAX_BYTES`] tail window all read as `false`, degrading
+/// to the dir scan (at worst one benign duplicate, never a lost persist).
+/// `metrics_dir()`'s `CADENCE_METRICS_DIR` tier is production, not a test
+/// seam — this read honors it like every other consumer.
+fn session_already_persisted(body_hash: &str, session_id: &str) -> bool {
+    let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
+    let Some(tail) =
+        cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)
+    else {
+        return false;
+    };
+    tail.lines().any(|line| {
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        row.get("body_sha256").and_then(Value::as_str) == Some(body_hash)
+            && row.get("child_session_id").and_then(Value::as_str) == Some(session_id)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,6 +1494,11 @@ fn persist_and_nudge(
 /// (`reconstruct-journey.py`, which reads only `parent_session_id`,
 /// `body_sha256`, and `plan_path`) depends on either the old `host` or `repo`
 /// fields before making this change.
+///
+/// Schema pin (cadence-hooks#690): `body_sha256` and `child_session_id` are
+/// idempotency-critical — [`session_already_persisted`] keys the row-keyed
+/// re-fire suppression on exactly these two fields, across a live stream that
+/// mixes v1 and v2 rows — and MUST never be dropped or renamed.
 fn plan_links_row(
     utc_now: &str,
     parent_session_id: Option<&str>,
