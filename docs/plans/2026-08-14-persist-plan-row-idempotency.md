@@ -1,6 +1,6 @@
 ---
 status: in-progress
-next: implement session_already_persisted + row gate + existing_canonical_plans_dir
+next: PR cadence-hooks#693 review + merge (Cameron), then post-merge re-pin verify on sjomba
 branch: plan/690-persist-plan-row-idempotency
 approved_in: 7afe614c-d777-40a3-a059-91ba088c0026
 approved_session_id: 7afe614c-d777-40a3-a059-91ba088c0026
@@ -58,8 +58,8 @@ Add a **tier-0 row check** to the late-scan path, and stop inventing directories
   - malformed rows skipped; matching row beyond the tail window → fail-open to dir tier (fixture sized just over `PLAN_LINKS_SCAN_MAX_BYTES` with the match at the head — documents the bound honestly, no multi-MB fixture)
   - `CADENCE_PERSIST_PLAN_FORCE=1` + matching row → persists anyway (escape hatch works)
   - must-stay-green: `canonical_plans_dir_refuses_a_symlinked_docs_escaping_the_repo`, `run_persist_plan_never_writes_through_a_symlinked_docs_escaping_the_repo` (containment across the variant split)
-- [ ] **Gates** — `make ci` (the repo's named gate); if running pieces directly, `cargo test --workspace --no-fail-fast`, `cargo clippy`, `cargo fmt --check`. CHANGELOG entry per repo convention.
-- [ ] **Polish + PR** — diff-based review arms (session cwd is the meta-repo; built-in `/polish` arms no-op on worktree diffs), `cadence:redaction` pre-post, PR body: `Fixes #690`, producer tuple (squash-merge repo), public refs only.
+- [x] **Gates** — `make ci` (the repo's named gate); if running pieces directly, `cargo test --workspace --no-fail-fast`, `cargo clippy`, `cargo fmt --check`. CHANGELOG entry per repo convention.
+- [x] **Polish + PR** — diff-based review arms (session cwd is the meta-repo; built-in `/polish` arms no-op on worktree diffs), `cadence:redaction` pre-post, PR body: `Fixes #690`, producer tuple (squash-merge repo), public refs only.
 - [ ] **Close the loop** — comment on #690 naming the fix shape + the accepted residual; after merge, verify the re-pin on sjomba and confirm this very session's transcript (which still carries the injected `planContent`) no longer re-persists.
 
 ## Alternatives declined
@@ -86,4 +86,5 @@ Solo (single-file Rust change requiring judgment about check ordering; not dispa
 
 ## Deviations
 
-_None yet._
+- Local `make ci` carried three machine-local reds, all attributed off-branch before shipping: `codex_coverage` ×2 (ambient `CADENCE_DISABLE=guard-rm` — green under `env -u`), `hook_registration_audit` (`inject-gh-context` awaits monorepo wiring; CI skips the sibling audit), `doctor_quiet_warnings_print_summary_to_stdout` (fails on pristine `origin/main` on this machine too). GitHub CI: both legs green.
+- Polish security arm raised one Important (advisory, not applied): a *forged* `plan-links.jsonl` row suppresses persists silently — same silent-skip decision the plan's declined-findings section already records; suggested observability record left to Cameron's disposition.

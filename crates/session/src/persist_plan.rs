@@ -32,7 +32,8 @@
 //! scan** (cadence-hooks#690). The row layer ([`session_already_persisted`])
 //! asks the machine-local `plan-links.jsonl` stream "did THIS session already
 //! persist THIS body?" — cwd-independent, so a session whose cwd wanders into
-//! a sibling repo skips before touching any cwd-derived path. The dir-scan
+//! a sibling repo skips before any plans-dir path is resolved or created
+//! (`repo_root` itself is still resolved by the earlier gates). The dir-scan
 //! layer ([`plans_dir_contains_hash`]) remains as the second layer (a wiped
 //! metrics file, rows beyond the tail window, pre-fix sessions with no rows);
 //! its per-file matching keeps its own internal tiers (frontmatter key →
@@ -534,7 +535,7 @@ fn persist_plan_force() -> bool {
 /// Tail-anchored bounded read of `<metrics_dir>/plan-links.jsonl` — the row
 /// [`append_plan_links_row`] writes on every successful persist. The file is
 /// machine-local and cwd-independent, which is what lets this check run
-/// BEFORE any cwd-derived path resolution (cadence-hooks#690). Matches only
+/// BEFORE any plans-dir resolution (cadence-hooks#690). Matches only
 /// a row whose `body_sha256` AND `child_session_id` both equal the running
 /// session's values — see [`plan_links_row`]'s schema pin.
 ///
