@@ -3292,6 +3292,380 @@ mod tests {
         );
     }
 
+    // --- row-keyed tier-0 idempotency (cadence-hooks#690) ---
+
+    /// The late-path plan body every #690 test persists, and its hash.
+    const ROW_TIER_BODY: &str = "# Fix the Widget\n\nDo the thing.";
+
+    fn row_tier_hash() -> String {
+        sha256_hex(ROW_TIER_BODY.as_bytes())
+    }
+
+    /// A hand-built v2 row for `plan-links.jsonl` fixtures.
+    fn plan_links_fixture_row(child_session_id: &str, body_hash: &str) -> String {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "ts": "2026-08-14T00:00:00Z",
+            "parent_session_id": null,
+            "child_session_id": child_session_id,
+            "machine": "digest",
+            "plan_path": "docs/plans/2026-08-14-fix-the-widget.md",
+            "body_sha256": body_hash,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn row_tier_suppresses_a_wandered_cwd_late_refire_without_creating_plans_dir() {
+        // Facet-1 regression (cadence-hooks#690): once the row exists, a late
+        // re-fire in a DIFFERENT repo (the session's cwd wandered) must skip
+        // before any cwd-derived path is touched — the sibling repo never
+        // grows a docs/plans/.
+        let repo_a = TempDir::new().unwrap();
+        init_repo(repo_a.path());
+        let repo_b = TempDir::new().unwrap();
+        init_repo(repo_b.path());
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = repo_a.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, ROW_TIER_BODY);
+
+        let in_a = make_user_prompt_submit(
+            "child-session-id",
+            "go ahead",
+            &repo_a.path().to_string_lossy(),
+            &transcript.to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&in_a, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(
+            r1.outcome,
+            Outcome::Nudge,
+            "first late persist lands in repo A"
+        );
+
+        let in_b = make_user_prompt_submit(
+            "child-session-id",
+            "keep going",
+            &repo_b.path().to_string_lossy(),
+            &transcript.to_string_lossy(),
+        );
+        let r2 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&in_b, "2026-08-15T00:00:00Z", "2026-08-15", "test-host")
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Allow,
+            "the row suppresses the wandered re-fire"
+        );
+        assert!(
+            !repo_b.path().join("docs").exists(),
+            "the wandered-cwd repo must never grow docs/ (let alone docs/plans/)"
+        );
+    }
+
+    #[test]
+    fn row_tier_alone_explains_the_skip_after_the_plan_file_is_deleted() {
+        // Attribution: delete the persisted file so the dir scan CANNOT match —
+        // only the row can explain a skip. Mirrors the field repro (the
+        // delete-the-stray workflow).
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, ROW_TIER_BODY);
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(r1.outcome, Outcome::Nudge);
+        // Confirm the row exists before trusting any negative below.
+        let links = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
+        assert!(links.contains(&row_tier_hash()));
+        assert!(links.contains("\"child_session_id\":\"child-session-id\""));
+
+        let plan_file = tmp.path().join("docs/plans/2026-08-14-fix-the-widget.md");
+        fs::remove_file(&plan_file).unwrap();
+
+        let r2 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T01:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Allow,
+            "with the file gone, only the row can explain this skip"
+        );
+        assert!(!plan_file.exists(), "no re-write after the row-keyed skip");
+    }
+
+    #[test]
+    fn row_for_a_different_session_does_not_suppress() {
+        // Session-keying: the same body hash under ANOTHER session's id is a
+        // different session legitimately persisting the same plan — never
+        // suppressed.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        fs::write(
+            metrics_dir.path().join("plan-links.jsonl"),
+            format!(
+                "{}\n",
+                plan_links_fixture_row("someone-else", &row_tier_hash())
+            ),
+        )
+        .unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, ROW_TIER_BODY);
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "another session's row must not suppress"
+        );
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-14-fix-the-widget.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn prefix_path_ignores_rows() {
+        // The prefix path fires once per injection by design — its
+        // one-injection-one-date semantics never consult the row tier.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        fs::write(
+            metrics_dir.path().join("plan-links.jsonl"),
+            format!(
+                "{}\n",
+                plan_links_fixture_row("child-session-id", &row_tier_hash())
+            ),
+        )
+        .unwrap();
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            &format!("Implement the following plan:\n\n{ROW_TIER_BODY}"),
+            &cwd,
+            &tmp.path().join("child-session-id.jsonl").to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "prefix path persists despite the row"
+        );
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-14-fix-the-widget.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn malformed_rows_are_skipped_not_fatal() {
+        // Garbage lines around a valid matching row must not defeat (or
+        // panic) the check — the match still suppresses.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        fs::write(
+            metrics_dir.path().join("plan-links.jsonl"),
+            format!(
+                "not json at all\n{{\"body_sha256\": 42}}\n{}\n{{truncated",
+                plan_links_fixture_row("child-session-id", &row_tier_hash())
+            ),
+        )
+        .unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, ROW_TIER_BODY);
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "the valid row among garbage still matches"
+        );
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-08-14-fix-the-widget.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn row_beyond_the_tail_window_fails_open_to_the_dir_tier() {
+        // The bound documented honestly: a matching row that has scrolled out
+        // of the PLAN_LINKS_SCAN_MAX_BYTES tail window reads as "no row" and
+        // the persist proceeds (fail-open, ADR-0001) — sized just over the
+        // window with the match at the HEAD, no multi-MB fixture.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let mut links = format!(
+            "{}\n",
+            plan_links_fixture_row("child-session-id", &row_tier_hash())
+        );
+        let mut n = 0u32;
+        while (links.len() as u64) <= PLAN_LINKS_SCAN_MAX_BYTES {
+            links.push_str(&plan_links_fixture_row(
+                "filler-session",
+                &format!("filler-{n}"),
+            ));
+            links.push('\n');
+            n += 1;
+        }
+        fs::write(metrics_dir.path().join("plan-links.jsonl"), links).unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, ROW_TIER_BODY);
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "a row beyond the tail window must fail open and persist"
+        );
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-14-fix-the-widget.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn force_env_skips_the_row_tier_and_persists() {
+        // The returnable escape (delete-and-retarget within one session): the
+        // stray file is deleted, the row would suppress the re-persist —
+        // CADENCE_PERSIST_PLAN_FORCE overrides the row tier for the turn.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, ROW_TIER_BODY);
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(r1.outcome, Outcome::Nudge);
+        let plan_file = tmp.path().join("docs/plans/2026-08-14-fix-the-widget.md");
+        fs::remove_file(&plan_file).unwrap();
+
+        let r2 = with_metrics_dir(metrics_dir.path(), || {
+            // SAFETY: inside the METRICS_ENV_LOCK critical section — every
+            // test that reaches the FORCE read is a late-path test holding
+            // this same lock, so no concurrent reader sees a torn state.
+            unsafe {
+                std::env::set_var("CADENCE_PERSIST_PLAN_FORCE", "1");
+            }
+            let r = run_persist_plan(&input, "2026-08-14T01:00:00Z", "2026-08-14", "test-host");
+            // SAFETY: same lock as above.
+            unsafe {
+                std::env::remove_var("CADENCE_PERSIST_PLAN_FORCE");
+            }
+            r
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Nudge,
+            "FORCE must override the row tier"
+        );
+        assert!(plan_file.exists(), "the plan is re-persisted under FORCE");
+    }
+
+    #[test]
+    fn dir_scan_layer_still_recognizes_without_a_row() {
+        // The second recognition layer stands on its own: a wiped metrics
+        // file (fresh dir, no row) plus an on-disk plan doc under an EARLIER
+        // date still makes the late re-fire a silent idempotent skip.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, ROW_TIER_BODY);
+
+        let metrics_one = TempDir::new().unwrap();
+        let prefixed = make_user_prompt_submit(
+            "child-session-id",
+            &format!("Implement the following plan:\n\n{ROW_TIER_BODY}"),
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_one.path(), || {
+            run_persist_plan(&prefixed, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(r1.outcome, Outcome::Nudge);
+
+        // A fresh metrics dir models the wiped-file case: no row anywhere.
+        let metrics_two = TempDir::new().unwrap();
+        let late = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r2 = with_metrics_dir(metrics_two.path(), || {
+            run_persist_plan(&late, "2026-08-15T00:00:00Z", "2026-08-15", "test-host")
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Allow,
+            "the dir scan recognizes the earlier-dated doc with no row at all"
+        );
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-08-15-fix-the-widget.md")
+                .exists(),
+            "no duplicate under the later date"
+        );
+    }
+
     #[test]
     fn end_to_end_model_and_harness_fall_back_to_the_approving_parent_transcript() {
         // The regression this fold fixes (cameronsjo/cadence-hooks#396
