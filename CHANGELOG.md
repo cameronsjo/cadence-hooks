@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`persist-plan`'s row tier was session-keyed, and a session id dies at every `/clear`/compaction restart — so the #690 re-persist loop re-opened at exactly that boundary, within hours of 0.77.0 (cameronsjo/cadence-hooks#699).** The harness re-injects the same `planContent` into the restarted window's transcript while minting a new session id; the `(body_sha256, child_session_id)` match then misses, the dir scan looks only in the cwd's repo, and a fresh duplicate lands wherever the session happens to be standing. The row match is now keyed on `body_sha256` **alone** — "this machine already persisted this approved body", the durable identity of the approved text and the fix's original anchor before the session conjunct was folded in. Rows survive restarts, so one persist quiets every future window of the same plan, and a hand-persisted plan's worst case drops from one duplicate per session restart to **one per machine, ever** (the first firing writes the row that ends it). The rare legitimate re-persist of the same body into a second repo rides the existing `CADENCE_PERSIST_PLAN_FORCE` escape. Nothing else moves: the dir scan, claim ladder, containment guards, and fail-open posture (ADR-0001) are unchanged, and `child_session_id` stays in the row schema for journey reconstruction.
+
 ## [0.77.0] - 2026-08-14
 
 ### Fixed

@@ -29,18 +29,25 @@
 //! injected prompt to strip a prefix from in the first place.
 //!
 //! Late-scan re-fire recognition runs two layers, in order: **row → dir
-//! scan** (cadence-hooks#690). The row layer ([`session_already_persisted`])
-//! asks the machine-local `plan-links.jsonl` stream "did THIS session already
+//! scan** (cadence-hooks#690). The row layer ([`machine_already_persisted`])
+//! asks the machine-local `plan-links.jsonl` stream "did THIS MACHINE already
 //! persist THIS body?" — cwd-independent, so a session whose cwd wanders into
 //! a sibling repo skips before any plans-dir path is resolved or created
-//! (`repo_root` itself is still resolved by the earlier gates). The dir-scan
-//! layer ([`plans_dir_contains_hash`]) remains as the second layer (a wiped
-//! metrics file, rows beyond the tail window, pre-fix sessions with no rows);
-//! its per-file matching keeps its own internal tiers (frontmatter key →
-//! legacy trailer → recompute — see [`file_matches_body`]). The two layers are
-//! never numbered as one sequence. `CADENCE_PERSIST_PLAN_FORCE` (any
-//! non-empty value) skips the row layer for the turn — the returnable escape
-//! for an intentional same-session re-persist.
+//! (`repo_root` itself is still resolved by the earlier gates), and
+//! session-independent, because a session id does not survive the plan: every
+//! `/clear`/compaction restart mints a new id while the harness re-injects
+//! the same `planContent`, so a session-keyed row re-opened the loop at every
+//! restart (cadence-hooks#699 — the original #690 fix shipped that keying and
+//! it escaped within hours). The body hash is the durable identity of an
+//! approved plan; the row is the machine's memory of having persisted it. The
+//! dir-scan layer ([`plans_dir_contains_hash`]) remains as the second layer
+//! (a wiped metrics file, rows beyond the tail window, pre-fix sessions with
+//! no rows); its per-file matching keeps its own internal tiers (frontmatter
+//! key → legacy trailer → recompute — see [`file_matches_body`]). The two
+//! layers are never numbered as one sequence. `CADENCE_PERSIST_PLAN_FORCE`
+//! (any non-empty value) skips the row layer for the turn — the returnable
+//! escape for any intentional re-persist, including the same approved body
+//! into a second repo.
 //!
 //! Never blocks (ADR-0001): every failure path — no prompt/no plan text, no
 //! match, no `cwd`, not a git repo, unsafe session id, exhausted suffix ladder,
@@ -260,17 +267,18 @@ pub fn run_persist_plan(
     };
 
     let body_hash = sha256_hex(body.as_bytes());
-    // Recognition layer 1 of 2 — the row check (cadence-hooks#690): did THIS
-    // session already persist THIS body on this machine? Runs BEFORE any
-    // plans-dir resolution, so a session whose cwd has wandered into a
-    // sibling repo never invents (or even resolves) a `docs/plans/` there on
-    // a skip turn. Session-keyed on purpose: suppression is exactly
-    // coextensive with the defect (a session's own re-fires), while a
-    // DIFFERENT session legitimately persisting the same body into another
-    // repo is untouched. The skip is silent — the row exists only because a
-    // persist already nudged once, and the per-prompt re-nudge is the noise
-    // this layer removes. `CADENCE_PERSIST_PLAN_FORCE` skips this layer only.
-    if via_late_scan && !persist_plan_force() && session_already_persisted(&body_hash, session_id) {
+    // Recognition layer 1 of 2 — the row check (cadence-hooks#690): did this
+    // MACHINE already persist THIS body? Runs BEFORE any plans-dir
+    // resolution, so a session whose cwd has wandered into a sibling repo
+    // never invents (or even resolves) a `docs/plans/` there on a skip turn.
+    // Deliberately NOT session-keyed (cadence-hooks#699): a session id dies
+    // at every /clear/compaction restart while the injected `planContent`
+    // lives on, so a session-keyed row re-opened the loop at every restart.
+    // The rare legitimate re-persist of the same body (a second repo) rides
+    // `CADENCE_PERSIST_PLAN_FORCE`. The skip is silent — the row exists only
+    // because a persist already nudged once, and the per-prompt re-nudge is
+    // the noise this layer removes.
+    if via_late_scan && !persist_plan_force() && machine_already_persisted(&body_hash) {
         return CheckResult::allow();
     }
     let slug = slugify(&body);
@@ -523,21 +531,29 @@ fn existing_canonical_plans_dir(repo_root: &Path) -> Option<(PathBuf, PathBuf)> 
 
 /// The returnable escape for the row-keyed idempotency layer
 /// (cadence-hooks#690): any non-empty `CADENCE_PERSIST_PLAN_FORCE` skips the
-/// row check for the turn — the delete-and-retarget workflow's same-session
-/// path (a fresh session persists regardless, via session-keying). Skips the
-/// row layer ONLY; the dir scan and claim ladder still apply.
+/// row check for the turn — the escape for any intentional re-persist
+/// (delete-and-retarget, or the same approved body into a second repo, since
+/// the row is machine-keyed per cadence-hooks#699). Skips the row layer ONLY;
+/// the dir scan and claim ladder still apply.
 fn persist_plan_force() -> bool {
     std::env::var("CADENCE_PERSIST_PLAN_FORCE").is_ok_and(|v| !v.is_empty())
 }
 
-/// Has THIS session already persisted THIS plan body on this machine?
+/// Has this MACHINE already persisted THIS plan body?
 ///
 /// Tail-anchored bounded read of `<metrics_dir>/plan-links.jsonl` — the row
 /// [`append_plan_links_row`] writes on every successful persist. The file is
 /// machine-local and cwd-independent, which is what lets this check run
-/// BEFORE any plans-dir resolution (cadence-hooks#690). Matches only
-/// a row whose `body_sha256` AND `child_session_id` both equal the running
-/// session's values — see [`plan_links_row`]'s schema pin.
+/// BEFORE any plans-dir resolution (cadence-hooks#690). Matches any row whose
+/// `body_sha256` equals the extracted body's hash — see [`plan_links_row`]'s
+/// schema pin.
+///
+/// Deliberately NOT keyed on `child_session_id` (cadence-hooks#699): the
+/// executing session's id changes at every `/clear`/compaction restart while
+/// the harness re-injects the same `planContent`, so a session-keyed match
+/// re-opened the re-persist loop at exactly that boundary. The body hash is
+/// the durable identity of the approved text; `CADENCE_PERSIST_PLAN_FORCE`
+/// carries the rare intentional re-persist of the same body.
 ///
 /// Fail-open (ADR-0001) in every direction: an unreadable or absent file,
 /// malformed rows, or a matching row that has scrolled out of the
@@ -545,7 +561,7 @@ fn persist_plan_force() -> bool {
 /// to the dir scan (at worst one benign duplicate, never a lost persist).
 /// `metrics_dir()`'s `CADENCE_METRICS_DIR` tier is production, not a test
 /// seam — this read honors it like every other consumer.
-fn session_already_persisted(body_hash: &str, session_id: &str) -> bool {
+fn machine_already_persisted(body_hash: &str) -> bool {
     let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
     let Some(tail) =
         cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)
@@ -557,7 +573,6 @@ fn session_already_persisted(body_hash: &str, session_id: &str) -> bool {
             return false;
         };
         row.get("body_sha256").and_then(Value::as_str) == Some(body_hash)
-            && row.get("child_session_id").and_then(Value::as_str) == Some(session_id)
     })
 }
 
@@ -1496,10 +1511,12 @@ fn persist_and_nudge(
 /// `body_sha256`, and `plan_path`) depends on either the old `host` or `repo`
 /// fields before making this change.
 ///
-/// Schema pin (cadence-hooks#690): `body_sha256` and `child_session_id` are
-/// idempotency-critical — [`session_already_persisted`] keys the row-keyed
-/// re-fire suppression on exactly these two fields, across a live stream that
-/// mixes v1 and v2 rows — and MUST never be dropped or renamed.
+/// Schema pin (cadence-hooks#690/#699): `body_sha256` is idempotency-critical
+/// — [`machine_already_persisted`] keys the row-keyed re-fire suppression on
+/// it, across a live stream that mixes v1 and v2 rows — and MUST never be
+/// dropped or renamed. `child_session_id` is no longer consulted for
+/// idempotency (#699 dropped the session conjunct) but stays pinned for
+/// journey reconstruction, which reads it alongside `parent_session_id`.
 fn plan_links_row(
     utc_now: &str,
     parent_session_id: Option<&str>,
@@ -3407,10 +3424,12 @@ mod tests {
     }
 
     #[test]
-    fn row_for_a_different_session_does_not_suppress() {
-        // Session-keying: the same body hash under ANOTHER session's id is a
-        // different session legitimately persisting the same plan — never
-        // suppressed.
+    fn row_from_another_session_suppresses_machine_wide() {
+        // The #699 regression: a session id dies at every /clear/compaction
+        // restart while the harness re-injects the same planContent, so the
+        // row match is machine-keyed on the body hash ALONE. A row written
+        // under a prior window's id must suppress the restarted window's
+        // late re-fire — no new file, in any repo.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -3419,7 +3438,7 @@ mod tests {
             metrics_dir.path().join("plan-links.jsonl"),
             format!(
                 "{}\n",
-                plan_links_fixture_row("someone-else", &row_tier_hash())
+                plan_links_fixture_row("pre-restart-window-id", &row_tier_hash())
             ),
         )
         .unwrap();
@@ -3437,13 +3456,12 @@ mod tests {
         });
         assert_eq!(
             r.outcome,
-            Outcome::Nudge,
-            "another session's row must not suppress"
+            Outcome::Allow,
+            "a prior window's row must suppress the restarted session's re-fire"
         );
         assert!(
-            tmp.path()
-                .join("docs/plans/2026-08-14-fix-the-widget.md")
-                .exists()
+            !tmp.path().join("docs").exists(),
+            "no plans dir invented on the suppressed turn"
         );
     }
 
