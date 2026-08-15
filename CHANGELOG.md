@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`persist-plan` re-persisted the approved plan on every prompt for the life of a session, and a scan-only turn invented `docs/plans/` in whatever repo the cwd had wandered into (cameronsjo/cadence-hooks#690).** The late-scan path's dir-wide dedupe could not recognize a correctly-maintained plan — the living-plan lifecycle diverges the body by design (ticks, `## Deviations`, merged frontmatter), defeating all three per-file matching tiers — so a session whose transcript carried the injected `planContent` entry laddered a fresh duplicate on every prompt, on every machine, into every repo it visited. Recognition now runs two layers, in order: a **row-keyed tier** (new) asks the machine-local, cwd-independent `plan-links.jsonl` stream "did THIS session already persist THIS body?" — matching a row on `body_sha256` + `child_session_id` via a tail-anchored bounded read (256 KiB, ~1000 rows) — and skips silently *before any cwd-derived path is resolved*; the existing dir-wide scan stays as the second layer (a wiped metrics file, a row beyond the tail window, pre-fix sessions). Session-keying makes suppression exactly coextensive with the defect: a *different* session legitimately persisting the same body into another repo is untouched, and a fresh session recovers the delete-and-retarget workflow by construction. The scan path resolves the plans dir through a new existing-only variant (same canonicalize + `starts_with` symlink-escape guard, no `create_dir_all`), and the creating variant moves to write time — the dir is invented only on a turn that actually persists. Escape hatch: `CADENCE_PERSIST_PLAN_FORCE` (any non-empty value) skips the row tier for the turn. Fail-open in every direction (ADR-0001): an unreadable metrics file, malformed rows, or a row beyond the tail window degrade to the dir scan — at worst one benign duplicate, never a lost persist. The prefix and approval arms are untouched (they fire once per event by design). Accepted residual: a hand-persisted, diverged plan whose session has no row yet still gets one duplicate on the first late-scan firing, which writes the row and ends that session's loop.
+
 ## [0.76.0] - 2026-08-12
 
 ### Added
