@@ -155,7 +155,7 @@ const PARENT_SCAN_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const PLAN_LINKS_SCHEMA_VERSION: u32 = 2;
 
 /// Tail window of `plan-links.jsonl` the row-keyed idempotency check
-/// ([`session_already_persisted`]) reads — roughly 1000 recent rows. The file
+/// ([`machine_already_persisted`]) reads — roughly 1000 recent rows. The file
 /// is append-only, so recent rows live at the TAIL; a head-anchored
 /// `take(cap)` would silently blind the check as the file grows. A matching
 /// row that has scrolled out of this window reads as "no row" and fails open
@@ -278,7 +278,11 @@ pub fn run_persist_plan(
     // `CADENCE_PERSIST_PLAN_FORCE`. The skip is silent — the row exists only
     // because a persist already nudged once, and the per-prompt re-nudge is
     // the noise this layer removes.
-    if via_late_scan && !persist_plan_force() && machine_already_persisted(&body_hash) {
+    let machine_digest = crate::provenance::machine_digest(host);
+    if via_late_scan
+        && !persist_plan_force()
+        && machine_already_persisted(&body_hash, &machine_digest)
+    {
         return CheckResult::allow();
     }
     let slug = slugify(&body);
@@ -306,7 +310,6 @@ pub fn run_persist_plan(
     let parent_session_id = parent.as_ref().map(|p| p.session_id.as_str());
     let parent_name = parent_session_id.map(identity::generate_name);
     let own_name = identity::generate_name(session_id);
-    let machine_digest = crate::provenance::machine_digest(host);
 
     // The EXECUTING session's own transcript is structurally empty at this
     // point on a cross-session approve-and-clear wipe: the wipe IS a new
@@ -555,13 +558,23 @@ fn persist_plan_force() -> bool {
 /// the durable identity of the approved text; `CADENCE_PERSIST_PLAN_FORCE`
 /// carries the rare intentional re-persist of the same body.
 ///
+/// The match requires the row's `machine` field to equal this run's salted
+/// [`crate::provenance::machine_digest`] — the function's name is a claim,
+/// and without this conjunct a metrics dir reachable from more than one
+/// machine (a synced config dir, `CADENCE_METRICS_DIR` on shared storage)
+/// would let machine A's persist suppress machine B's (the #699 security
+/// pass's finding; the old session conjunct covered this by accident, since
+/// session ids never repeat across machines). A schema-v1 row carries a raw
+/// `host` instead of `machine` and simply never matches — fail-open to the
+/// dir scan, like every other miss.
+///
 /// Fail-open (ADR-0001) in every direction: an unreadable or absent file,
 /// malformed rows, or a matching row that has scrolled out of the
 /// [`PLAN_LINKS_SCAN_MAX_BYTES`] tail window all read as `false`, degrading
 /// to the dir scan (at worst one benign duplicate, never a lost persist).
 /// `metrics_dir()`'s `CADENCE_METRICS_DIR` tier is production, not a test
 /// seam — this read honors it like every other consumer.
-fn machine_already_persisted(body_hash: &str) -> bool {
+fn machine_already_persisted(body_hash: &str, machine_digest: &str) -> bool {
     let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
     let Some(tail) =
         cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)
@@ -573,6 +586,7 @@ fn machine_already_persisted(body_hash: &str) -> bool {
             return false;
         };
         row.get("body_sha256").and_then(Value::as_str) == Some(body_hash)
+            && row.get("machine").and_then(Value::as_str) == Some(machine_digest)
     })
 }
 
@@ -3319,14 +3333,29 @@ mod tests {
         sha256_hex(ROW_TIER_BODY.as_bytes())
     }
 
-    /// A hand-built v2 row for `plan-links.jsonl` fixtures.
+    /// A hand-built v2 row for `plan-links.jsonl` fixtures. `machine` carries
+    /// the digest of the e2e tests' shared `"test-host"` — the row-tier match
+    /// requires it (#699 security pass), so a fixture row must look like one
+    /// this machine wrote.
     fn plan_links_fixture_row(child_session_id: &str, body_hash: &str) -> String {
+        plan_links_fixture_row_for_machine(
+            child_session_id,
+            body_hash,
+            &crate::provenance::machine_digest("test-host"),
+        )
+    }
+
+    fn plan_links_fixture_row_for_machine(
+        child_session_id: &str,
+        body_hash: &str,
+        machine: &str,
+    ) -> String {
         serde_json::json!({
             "schemaVersion": 2,
             "ts": "2026-08-14T00:00:00Z",
             "parent_session_id": null,
             "child_session_id": child_session_id,
-            "machine": "digest",
+            "machine": machine,
             "plan_path": "docs/plans/2026-08-14-fix-the-widget.md",
             "body_sha256": body_hash,
         })
@@ -3462,6 +3491,52 @@ mod tests {
         assert!(
             !tmp.path().join("docs").exists(),
             "no plans dir invented on the suppressed turn"
+        );
+    }
+
+    #[test]
+    fn row_from_another_machine_does_not_suppress() {
+        // The machine conjunct (#699 security pass): a metrics file reachable
+        // from more than one machine (synced config dir, shared storage) must
+        // not let machine A's persist suppress machine B's — only a row whose
+        // `machine` digest matches this run's host counts.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        fs::write(
+            metrics_dir.path().join("plan-links.jsonl"),
+            format!(
+                "{}\n",
+                plan_links_fixture_row_for_machine(
+                    "child-session-id",
+                    &row_tier_hash(),
+                    &crate::provenance::machine_digest("some-other-host"),
+                )
+            ),
+        )
+        .unwrap();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&transcript, ROW_TIER_BODY);
+
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "another machine's row must not suppress this machine's persist"
+        );
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-14-fix-the-widget.md")
+                .exists()
         );
     }
 
