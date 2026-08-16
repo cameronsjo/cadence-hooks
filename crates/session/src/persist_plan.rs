@@ -1531,12 +1531,14 @@ fn find_driver_line(block: &[&str]) -> Option<Tier> {
 /// [`find_driver_line`] — this search is NOT line-start-anchored, so a
 /// backtick-quoted mention like `` `sonnet-drivable` `` needs the strip to
 /// stay excluded); the earliest match in document order wins (first matching
-/// line, leftmost token on that line). Left-boundary checked so a compound
-/// like `non-sonnet-drivable` cannot false-match `sonnet-drivable` — same
-/// "whole token" discipline as [`match_family_prefix`]'s right boundary. A
-/// decoy earlier on the line that fails the boundary check is not retried
-/// against a later, valid occurrence of the same family term on that line —
-/// conservative, matching this module's "ambiguous → skip" bias.
+/// line, leftmost token on that line). BOTH boundaries checked — left, so a
+/// compound like `non-sonnet-drivable` cannot false-match `sonnet-drivable`;
+/// right, so `opus-drivability` (a real word continuing past the token)
+/// cannot false-match `opus-drivable` — same "whole token" discipline as
+/// [`match_family_prefix`]'s boundary check. A decoy earlier on the line that
+/// fails either boundary check is not retried against a later, valid
+/// occurrence of the same family term on that line — conservative, matching
+/// this module's "ambiguous → skip" bias.
 fn find_drivable_token(block: &[&str]) -> Option<Tier> {
     block.iter().find_map(|line| {
         let stripped = strip_inline_code(line);
@@ -1544,12 +1546,17 @@ fn find_drivable_token(block: &[&str]) -> Option<Tier> {
         FAMILIES
             .iter()
             .filter_map(|(name, tier)| {
-                let idx = lower.find(&format!("{name}-drivable"))?;
-                let boundary_ok = lower[..idx]
+                let needle = format!("{name}-drivable");
+                let idx = lower.find(&needle)?;
+                let left_ok = lower[..idx]
                     .chars()
                     .next_back()
                     .is_none_or(|c| !(c.is_alphanumeric() || c == '-'));
-                boundary_ok.then_some((idx, *tier))
+                let right_ok = lower[idx + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric());
+                (left_ok && right_ok).then_some((idx, *tier))
             })
             .min_by_key(|(idx, _)| *idx)
             .map(|(_, tier)| tier)
@@ -2969,6 +2976,15 @@ mod tests {
         // Regression: find_drivable_token had no left word-boundary check,
         // so "non-sonnet-drivable" false-matched "sonnet-drivable".
         let body = "## Orchestrator\n\nThis work is NOT non-sonnet-drivable; it needs escalation.";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_priority2_right_boundary_no_false_match() {
+        // Regression: find_drivable_token had no right word-boundary check,
+        // so "opus-drivability" (a real word continuing past the token)
+        // false-matched "opus-drivable".
+        let body = "## Orchestrator\n\nThis section is barely opus-drivability at this stage.";
         assert_eq!(recommended_tier(body), None);
     }
 
