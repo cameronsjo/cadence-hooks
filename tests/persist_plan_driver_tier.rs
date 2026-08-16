@@ -64,6 +64,8 @@ fn init_repo(dir: &std::path::Path) {
             .expect("git")
     };
     assert!(git(&["init", "-q", "-b", "main"]).success());
+    assert!(git(&["config", "user.email", "t@t"]).success());
+    assert!(git(&["config", "user.name", "t"]).success());
     assert!(git(&["commit", "--allow-empty", "-q", "-m", "root"]).success());
 }
 
