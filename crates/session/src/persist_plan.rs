@@ -151,8 +151,13 @@ const PARENT_SCAN_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// the committed frontmatter's own field two functions up), and `repo` is
 /// dropped — `plan_path` is already repo-relative, so `repo` was a second,
 /// separately-drifting way to say the same thing; confirmed no consumer
-/// (`reconstruct-journey.py`) reads either field before dropping it.
-const PLAN_LINKS_SCHEMA_VERSION: u32 = 2;
+/// (`reconstruct-journey.py`) reads either field before dropping it. Bumped to
+/// 3 (model-guard "stronger prose, not teeth"): `recommended_model` carries
+/// the plan's parsed [`Tier`] (see [`recommended_tier`]) — OMITTED from the
+/// row, never written null, when the plan carries no recognized `Driver:`
+/// anchor, so a consumer distinguishes "no driver recorded" from an explicit
+/// empty value without a schema-version branch.
+const PLAN_LINKS_SCHEMA_VERSION: u32 = 3;
 
 /// Tail window of `plan-links.jsonl` the row-keyed idempotency check
 /// ([`machine_already_persisted`]) reads — roughly 1000 recent rows. The file
@@ -297,10 +302,34 @@ pub fn run_persist_plan(
     // scans (the wrong-repo `docs/plans/` invention of cadence-hooks#690).
     // The prefix path keeps its original semantics (one injection, one date).
     if via_late_scan
-        && let Some((_, scan_dir)) = existing_canonical_plans_dir(&repo_root)
-        && plans_dir_contains_hash(&scan_dir, &body_hash)
+        && let Some((canonical_repo_root, scan_dir)) = existing_canonical_plans_dir(&repo_root)
+        && let Some(matched_path) = plans_dir_contains_hash(&scan_dir, &body_hash)
     {
-        return CheckResult::allow();
+        // This path recognizes a re-fire but never itself wrote the row (the
+        // original persist did, or would have — a row beyond the scan
+        // window). Append one now so the row-check layer above suppresses
+        // subsequent turns for this body on this machine (the row is what
+        // makes the row-check's own skip fire) — `parent_session_id` is
+        // `None` by construction: a plan already committed to `docs/plans/`
+        // has no approving parent this hook can resolve here, so this
+        // deliberately never reaches for `find_parent`. Nudge only when a
+        // tier was parsed — this is a re-fire recognition, not a fresh
+        // persist, so the "persisted to"/format-gate sentences don't apply.
+        let plan_path_rel = repo_relative(&matched_path, &canonical_repo_root);
+        let tier = recommended_tier(&body);
+        append_plan_links_row(&plan_links_row(
+            utc_now,
+            None,
+            session_id,
+            &machine_digest,
+            &plan_path_rel,
+            &body_hash,
+            tier.map(Tier::as_str),
+        ));
+        return match tier {
+            Some(t) => CheckResult::nudge(model_check_directive(t)),
+            None => CheckResult::allow(),
+        };
     }
     let stem = format!("{local_date}-{slug}");
 
@@ -365,6 +394,7 @@ pub fn run_persist_plan(
         &repo_root,
         approved_label,
         &body,
+        recommended_tier(&body),
     )
 }
 
@@ -479,6 +509,7 @@ pub fn run_persist_plan_approval(
         &repo_root,
         &own_name,
         &body,
+        recommended_tier(&body),
     )
 }
 
@@ -760,7 +791,10 @@ fn injected_plan_from_transcript(transcript_path: &Path) -> Option<String> {
 /// pathological directory without ever silently skipping a real one below it.
 const DIR_HASH_SCAN_MAX_FILES: usize = 512;
 
-/// Does any markdown document in `plans_dir` already carry `body_hash`?
+/// Does any markdown document in `plans_dir` already carry `body_hash`? Returns
+/// the matched candidate's path — the dir-scan-skip path (Priority Q3/#396)
+/// derives `plan_path_rel` from it the same way [`persist_and_nudge`] does, so
+/// it can append a plan-links row for a re-fire it recognizes but never wrote.
 /// Per-file work is [`file_matches_body`]'s bounded read, gated to regular
 /// files only — a committed symlink (git stores them) pointing at a FIFO
 /// would otherwise block `File::open` on this every-turn path forever
@@ -770,10 +804,8 @@ const DIR_HASH_SCAN_MAX_FILES: usize = 512;
 /// the first read in the common case. Fail-open: an unreadable dir reads as
 /// "no match" and lets the claim ladder — which dedupes within the same stem
 /// — take over.
-fn plans_dir_contains_hash(plans_dir: &Path, body_hash: &str) -> bool {
-    let Ok(entries) = fs::read_dir(plans_dir) else {
-        return false;
-    };
+fn plans_dir_contains_hash(plans_dir: &Path, body_hash: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(plans_dir).ok()?;
     let mut candidates: Vec<(SystemTime, PathBuf)> = entries
         .flatten()
         .filter_map(|e| {
@@ -793,7 +825,8 @@ fn plans_dir_contains_hash(plans_dir: &Path, body_hash: &str) -> bool {
     candidates
         .into_iter()
         .take(DIR_HASH_SCAN_MAX_FILES)
-        .any(|(_, path)| file_matches_body(&path, body_hash))
+        .find(|(_, path)| file_matches_body(path, body_hash))
+        .map(|(_, path)| path)
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
@@ -1323,6 +1356,251 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
     format!("{}\n\n{body}\n", render_frontmatter(f))
 }
 
+// ---------------------------------------------------------------------------
+// Driver tier (model-guard, cameronsjo/cadence-hooks — "stronger prose, not
+// teeth"): the hook can never know the LIVE model at pickup (probed
+// 2026-08-14: no `model` field on UserPromptSubmit, no structural `model` in
+// the transcript before the first assistant turn), but it CAN deterministically
+// parse the plan's own recorded intent — the `## Orchestrator` block's
+// `Driver:` line. Each party carries its half: this parser records the tier,
+// [`persist_and_nudge`] instructs Claude to compare it against the live
+// model, and Claude alone completes the comparison.
+// ---------------------------------------------------------------------------
+
+/// The plan's recorded Driver tier — a closed enum, deliberately. This is the
+/// injection wall: [`Tier::as_str`]'s canonical lowercase name is the ONLY
+/// text [`recommended_tier`]'s callers ever render (the plan-links row, the
+/// nudge directive) — never the matched source text, which is untrusted plan
+/// content (same discipline as [`PANEL_GATE_NUDGE`] and its siblings below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    Fable,
+    Opus,
+    Sonnet,
+    Haiku,
+}
+
+impl Tier {
+    /// The canonical lowercase family name — the sole text this enum ever
+    /// contributes to rendered output.
+    fn as_str(self) -> &'static str {
+        match self {
+            Tier::Fable => "fable",
+            Tier::Opus => "opus",
+            Tier::Sonnet => "sonnet",
+            Tier::Haiku => "haiku",
+        }
+    }
+}
+
+/// Every recognized family, in a fixed order used only for the earliest-match
+/// scan in [`find_drivable_token`] — priority BETWEEN anchors is decided by
+/// [`recommended_tier`], not by this array's order.
+const FAMILIES: [(&str, Tier); 4] = [
+    ("fable", Tier::Fable),
+    ("opus", Tier::Opus),
+    ("sonnet", Tier::Sonnet),
+    ("haiku", Tier::Haiku),
+];
+
+/// Drop every inline-code span (`` `...` ``) from `line`, non-nested. Used
+/// only by [`find_drivable_token`]'s unanchored substring search, so a
+/// paragraph merely discussing the syntax (`` `sonnet-drivable` ``) can never
+/// forge a real match. Pairing is positional (`split('`').step_by(2)` keeps
+/// even-indexed segments): with an EVEN backtick count each odd-indexed
+/// segment is a genuine code span, correctly dropped; with an ODD count the
+/// trailing segment — everything after the final, unpaired backtick — is
+/// also dropped as if it were code. Conservative for this module's one
+/// caller (an over-stripped candidate simply fails to match, never forges
+/// one), but not a general-purpose inline-code stripper: callers needing
+/// exact span semantics should not reuse this.
+fn strip_inline_code(line: &str) -> String {
+    line.split('`').step_by(2).collect::<Vec<_>>().join(" ")
+}
+
+/// Case-insensitive "does `s` begin with the whole family token `name`"
+/// check, returning the tier and the remainder past the token when it does.
+/// "Whole token" is the load-bearing word: the char immediately after the
+/// token must be absent, whitespace, or one of the tail-introducing marks
+/// tolerated elsewhere in this module (`*` \` `:` `,` `.` `(` and the dash
+/// family) — never an alphanumeric or `/`. This is what makes a multi-family
+/// value like `Opus/Fable` fail every family's boundary check and fall
+/// through to `None` (conservative, per the plan's pinned rule), while
+/// `sonnet — needs Opus fallback` still matches `sonnet` cleanly.
+fn match_family_prefix(s: &str) -> Option<(Tier, &str)> {
+    let lower = s.to_ascii_lowercase();
+    for (name, tier) in FAMILIES {
+        if let Some(after) = lower.strip_prefix(name) {
+            let real_after = &s[s.len() - after.len()..];
+            let boundary_ok = real_after
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '/'));
+            if boundary_ok {
+                return Some((tier, real_after));
+            }
+        }
+    }
+    None
+}
+
+/// Extract a `Tier` from a `Driver:`-style value, e.g. `**sonnet**`,
+/// `` `sonnet` ``, or `sonnet — needs Opus fallback`. Formatting (`**`,
+/// backticks) around the value is stripped before matching; anything after
+/// the whole token (an em/en-dash tail, a trailing colon or comma) is
+/// ignored by [`match_family_prefix`]'s boundary check.
+fn extract_family_value(rest: &str) -> Option<Tier> {
+    let trimmed = rest.trim().trim_matches(|c: char| c == '*' || c == '`');
+    match_family_prefix(trimmed.trim_start()).map(|(tier, _)| tier)
+}
+
+/// `path`, made relative to `repo_root` and forward-slash normalized (the
+/// core crate's own convention — see [`cadence_hooks_core::normalize_path`])
+/// — so a value written to `plan-links.jsonl`'s `plan_path` field is stable
+/// and cross-platform, regardless of the native separator
+/// `PathBuf::to_string_lossy` would otherwise render on Windows. Shared by
+/// [`persist_and_nudge`] and the dir-scan-skip repair so the two `plan_path`
+/// derivations can never drift onto different values for the same row.
+fn repo_relative(path: &Path, repo_root: &Path) -> String {
+    cadence_hooks_core::normalize_path(
+        &path
+            .strip_prefix(repo_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned()),
+    )
+}
+
+/// Every detector in this module (also [`alternatives_stanza_present`],
+/// [`panel_line_settled`]) skips the same two things before inspecting a
+/// line: fenced code (a naive ```` ``` ````/`~~~` toggle — no length
+/// matching, which errs toward skipping ambiguous lines) and block quotes
+/// (`>`). One shared filter so the discipline can't drift between detectors.
+fn visible_lines(body: &str) -> impl Iterator<Item = &str> {
+    let mut in_fence = false;
+    body.lines().filter(move |line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            return false;
+        }
+        !in_fence && !line.starts_with('>')
+    })
+}
+
+/// Is `line` exactly a level-2 `## Orchestrator` heading (surrounding
+/// whitespace and a trailing marker like `## Orchestrator ⏳` tolerated via
+/// [`str::trim`], but not a mere prefix)? A bare `starts_with("## Orchestrator")`
+/// would also open on `## OrchestratorNotes` or `## Orchestrator2` — this
+/// requires the heading TEXT to equal `"Orchestrator"` after the `## ` marker.
+fn is_orchestrator_heading(line: &str) -> bool {
+    line.trim_start().strip_prefix("## ").map(str::trim) == Some("Orchestrator")
+}
+
+/// The `## Orchestrator` block's lines — from just past the line-start
+/// heading through (but not including) the next line-start `## ` heading, or
+/// EOF. Headings inside fenced code or block quotes never open or close a
+/// block ([`visible_lines`]'s discipline). On more than one `## Orchestrator`
+/// heading, the FIRST wins.
+fn orchestrator_block(body: &str) -> Option<Vec<&str>> {
+    let mut lines = visible_lines(body).skip_while(|line| !is_orchestrator_heading(line));
+    lines.next()?; // the heading line itself, consumed but not part of the block
+    Some(lines.take_while(|line| !line.starts_with("## ")).collect())
+}
+
+/// Priority 1: a line-start `**Driver:**` or `Driver:` line inside the
+/// `## Orchestrator` block (`plan-template.md`'s canonical form). NOT
+/// inline-code-stripped: [`strip_inline_code`] is reserved for
+/// [`find_drivable_token`]'s unanchored substring search — applying it here
+/// would also erase a legitimately backtick-wrapped VALUE (`` **Driver:**
+/// `sonnet` ``, [`extract_family_value`]'s own documented syntax), and it is
+/// unneeded for decoy exclusion: a decoy anchor quoted in backticks (`` `**
+/// Driver:** Sonnet` `` or a mid-sentence `` `Driver: sonnet` `` mention)
+/// cannot satisfy the line-start `strip_prefix` below in the first place,
+/// since a leading backtick byte breaks the literal match.
+fn find_driver_line(block: &[&str]) -> Option<Tier> {
+    block.iter().find_map(|line| {
+        let rest = line
+            .strip_prefix("**Driver:**")
+            .or_else(|| line.strip_prefix("Driver:"))?;
+        extract_family_value(rest)
+    })
+}
+
+/// Priority 2: the prose token `<family>-drivable` (case-insensitive)
+/// anywhere in the `## Orchestrator` block, inline-code-stripped (unlike
+/// [`find_driver_line`] — this search is NOT line-start-anchored, so a
+/// backtick-quoted mention like `` `sonnet-drivable` `` needs the strip to
+/// stay excluded); the earliest match in document order wins (first matching
+/// line, leftmost token on that line). BOTH boundaries checked — left, so a
+/// compound like `non-sonnet-drivable` cannot false-match `sonnet-drivable`;
+/// right, so `opus-drivability` (a real word continuing past the token)
+/// cannot false-match `opus-drivable` — same "whole token" discipline as
+/// [`match_family_prefix`]'s boundary check. A decoy earlier on the line that
+/// fails either boundary check is not retried against a later, valid
+/// occurrence of the same family term on that line — conservative, matching
+/// this module's "ambiguous → skip" bias.
+fn find_drivable_token(block: &[&str]) -> Option<Tier> {
+    block.iter().find_map(|line| {
+        let stripped = strip_inline_code(line);
+        let lower = stripped.to_ascii_lowercase();
+        FAMILIES
+            .iter()
+            .filter_map(|(name, tier)| {
+                let needle = format!("{name}-drivable");
+                let idx = lower.find(&needle)?;
+                let left_ok = lower[..idx]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '-'));
+                let right_ok = lower[idx + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric());
+                (left_ok && right_ok).then_some((idx, *tier))
+            })
+            .min_by_key(|(idx, _)| *idx)
+            .map(|(_, tier)| tier)
+    })
+}
+
+/// Priority 3 (legacy fallback): a line-start `recommended_model:` line
+/// appearing before the first line-start `## ` heading. Scanning stops at
+/// the first such heading; nothing past it is a legacy header field. Not
+/// inline-code-stripped — same reasoning as [`find_driver_line`] (line-start
+/// anchored, so a decoy can't reach it, and stripping would eat a
+/// legitimately backtick-wrapped value).
+fn legacy_recommended_model(body: &str) -> Option<Tier> {
+    visible_lines(body)
+        .take_while(|line| !line.starts_with("## "))
+        .find_map(|line| extract_family_value(line.strip_prefix("recommended_model:")?))
+}
+
+/// Parse the plan's recommended Driver tier from its body, per the pinned
+/// priority order. `None` when nothing settles it — including a
+/// recognized-but-invalid capture — never a guess.
+fn recommended_tier(body: &str) -> Option<Tier> {
+    if let Some(block) = orchestrator_block(body)
+        && let Some(tier) = find_driver_line(&block).or_else(|| find_drivable_token(&block))
+    {
+        return Some(tier);
+    }
+    legacy_recommended_model(body)
+}
+
+/// The model-check directive, verbatim from the plan doc — the ONLY text
+/// [`Tier`] contributes to it is [`Tier::as_str`]'s canonical name. Shared by
+/// [`persist_and_nudge`] and the dir-scan-skip repair so the two nudge sites
+/// can never drift onto different wording for the same instruction.
+fn model_check_directive(tier: Tier) -> String {
+    let t = tier.as_str();
+    format!(
+        "This plan's recommended driver is {t}: dispatch workers at {t} or hand the session \
+         down; if you are about to execute inline, compare {t} against your running model \
+         (the \"You are powered by\" line) and on a tier mismatch pause and ask before the \
+         first implementation step."
+    )
+}
+
 /// The one static sentence appended to the persistence nudge when the
 /// approved plan carries no settled `Panel:` line (cameronsjo/cadence-hooks#623).
 /// Static by design: committed plan content is untrusted input, so the nudge
@@ -1354,21 +1632,10 @@ const CHECKBOX_GATE_NUDGE: &str = "format gate: no checkbox tasks — give the p
      `- [ ]` checklist; the execution zone's ticks are what a resuming session reconciles.";
 
 /// True when the plan body carries an `## Alternatives declined` heading at
-/// line start (fences and block quotes skipped, same discipline as
-/// [`panel_line_settled`]). Case-exact: the template writes it one way.
+/// line start ([`visible_lines`]'s fence/quote-skip discipline). Case-exact:
+/// the template writes it one way.
 fn alternatives_stanza_present(body: &str) -> bool {
-    let mut in_fence = false;
-    body.lines().any(|line| {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            return false;
-        }
-        if in_fence || line.starts_with('>') {
-            return false;
-        }
-        line.starts_with("## Alternatives declined")
-    })
+    visible_lines(body).any(|line| line.starts_with("## Alternatives declined"))
 }
 
 /// True when the plan body carries at least one checkbox task outside fenced
@@ -1402,29 +1669,18 @@ fn checkbox_present(body: &str) -> bool {
 /// stanza precedes the task body, so the stanza's own line is judged, and a
 /// quoted `Panel: … ran — …` example later in the body can neither satisfy
 /// the gate (the accidental-forgery hole a whole-body `any()` scan would
-/// open) nor contradict the stanza. Lines inside fenced code blocks
-/// (``` / ~~~ toggles, indentation-tolerant) and block quotes (`>`) are
-/// skipped before the first-match rule applies — a fenced or quoted example
-/// in a plan with no stanza at all must not mint a settled verdict (security
-/// review of this change; same class as the quoted-example hole above). The
-/// fence tracker is deliberately naive — it toggles without matching fence
+/// open) nor contradict the stanza. Lines inside fenced code blocks and
+/// block quotes are skipped before the first-match rule applies
+/// ([`visible_lines`]'s discipline) — a fenced or quoted example in a plan
+/// with no stanza at all must not mint a settled verdict (security review of
+/// this change; same class as the quoted-example hole above). The fence
+/// tracker is deliberately naive — it toggles without matching fence
 /// lengths — which errs toward skipping ambiguous lines: on a malformed
 /// document the failure mode is a spurious nudge (fail-loud), never a
 /// suppressed one. Detection only; the caller appends the static
 /// [`PANEL_GATE_NUDGE`], never any matched text.
 fn panel_line_settled(body: &str) -> bool {
-    let mut in_fence = false;
-    let Some(rest) = body.lines().find_map(|line| {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            return None;
-        }
-        if in_fence || line.starts_with('>') {
-            return None;
-        }
-        line.strip_prefix("Panel: ")
-    }) else {
+    let Some(rest) = visible_lines(body).find_map(|line| line.strip_prefix("Panel: ")) else {
         return false;
     };
     // Dash tolerance: `--` must be tried before `-` or the second hyphen
@@ -1460,23 +1716,14 @@ fn persist_and_nudge(
     repo_root: &Path,
     approved_label: &str,
     plan_body: &str,
+    recommended_tier: Option<Tier>,
 ) -> CheckResult {
     let path = match claim_target(plans_dir, stem, session_id, body_hash, document) {
         Claim::Wrote(path) | Claim::AlreadyPersisted(path) => path,
         Claim::GiveUp => return CheckResult::allow(),
     };
 
-    // Normalized to forward slashes (the core crate's own convention — see
-    // `cadence_hooks_core::normalize_path`) so the linkage row's `plan_path`
-    // is a stable, cross-platform value for consumers, regardless of the
-    // native separator `PathBuf::to_string_lossy` would otherwise render on
-    // Windows.
-    let plan_path_rel = cadence_hooks_core::normalize_path(
-        &path
-            .strip_prefix(repo_root)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned()),
-    );
+    let plan_path_rel = repo_relative(&path, repo_root);
     append_plan_links_row(&plan_links_row(
         utc_now,
         parent_session_id,
@@ -1484,12 +1731,24 @@ fn persist_and_nudge(
         machine_digest,
         &plan_path_rel,
         body_hash,
+        recommended_tier.map(Tier::as_str),
     ));
 
     let mut nudge = format!(
-        "Approved plan persisted to {} (approved in {approved_label}). Verify placement, then \
-         commit it (explicit-path git add) before implementation.",
+        "Approved plan persisted to {} (approved in {approved_label}).",
         path.display()
+    );
+    // The model-check directive lands between the persist confirmation and
+    // the format-gate sentences — only when a tier was actually parsed
+    // (see [`recommended_tier`]); the hook has no way to know the LIVE
+    // model at pickup, so it hands Claude the comparison to complete.
+    if let Some(tier) = recommended_tier {
+        nudge.push(' ');
+        nudge.push_str(&model_check_directive(tier));
+    }
+    nudge.push(' ');
+    nudge.push_str(
+        "Verify placement, then commit it (explicit-path git add) before implementation.",
     );
     // Evaluated only after the claim succeeded: the persistence write must
     // never depend on the detectors — a future panic here eats one nudge's
@@ -1531,6 +1790,9 @@ fn persist_and_nudge(
 /// dropped or renamed. `child_session_id` is no longer consulted for
 /// idempotency (#699 dropped the session conjunct) but stays pinned for
 /// journey reconstruction, which reads it alongside `parent_session_id`.
+/// `recommended_model` (schema v3) is OMITTED from the row — never written
+/// null — when `None`, so its mere presence is the signal a consumer checks,
+/// rather than a presence-plus-null-check.
 fn plan_links_row(
     utc_now: &str,
     parent_session_id: Option<&str>,
@@ -1538,8 +1800,9 @@ fn plan_links_row(
     machine_digest: &str,
     plan_path: &str,
     body_hash: &str,
+    recommended_model: Option<&str>,
 ) -> Value {
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "schemaVersion": PLAN_LINKS_SCHEMA_VERSION,
         "ts": utc_now,
         "parent_session_id": parent_session_id,
@@ -1547,7 +1810,14 @@ fn plan_links_row(
         "machine": machine_digest,
         "plan_path": plan_path,
         "body_sha256": body_hash,
-    })
+    });
+    if let Some(tier) = recommended_model {
+        // `Value`'s `IndexMut<&str>` inserts a missing key on assignment, so
+        // this alone gets the omit-when-`None`/never-null result without an
+        // `as_object_mut` unwrap.
+        row["recommended_model"] = Value::from(tier);
+    }
+    row
 }
 
 /// Append one row to `<metrics_dir>/plan-links.jsonl`. Fully fail-open
@@ -2607,6 +2877,198 @@ mod tests {
         );
     }
 
+    // --- driver tier parsing ---
+
+    #[test]
+    fn recommended_tier_priority_1_bold_driver_line() {
+        let body = "## Orchestrator\n\n**Driver:** Sonnet — fully spec'd, no escalation.";
+        assert_eq!(recommended_tier(body), Some(Tier::Sonnet));
+    }
+
+    #[test]
+    fn recommended_tier_priority_1_plain_driver_line() {
+        let body = "## Orchestrator\n\nDriver: opus\n";
+        assert_eq!(recommended_tier(body), Some(Tier::Opus));
+    }
+
+    #[test]
+    fn recommended_tier_priority_2_drivable_prose_token() {
+        // The pinned checkout-freshness Orchestrator block, verbatim (R4
+        // fixture note): no `Driver:` line, only the priority-2 prose token.
+        let body = "## Orchestrator\n\nBoth parts are tightly specced and Sonnet-drivable as \
+             fresh implementer dispatches from the committed plan (bash script per contract; \
+             Rust part follows an existing append pattern with a named seam). Driver \
+             announcement at approval.";
+        assert_eq!(recommended_tier(body), Some(Tier::Sonnet));
+    }
+
+    #[test]
+    fn recommended_tier_priority_3_legacy_recommended_model() {
+        let body = "recommended_model: fable\n\n## Goal\n\nDo the thing.";
+        assert_eq!(recommended_tier(body), Some(Tier::Fable));
+    }
+
+    #[test]
+    fn recommended_tier_legacy_field_ignored_past_first_heading() {
+        // `recommended_model:` is a legacy HEADER field — nothing past the
+        // first `## ` heading is in scope for priority 3.
+        let body = "## Goal\n\nrecommended_model: fable\n";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_priority_order_driver_line_wins_over_prose_token() {
+        let body = "## Orchestrator\n\n**Driver:** Opus — escalated.\n\nHaiku-drivable as a \
+             fallback if budget tightens.";
+        assert_eq!(recommended_tier(body), Some(Tier::Opus));
+    }
+
+    #[test]
+    fn recommended_tier_backtick_decoy_excluded() {
+        let body = "## Orchestrator\n\nThis plan does not use the `Driver: sonnet` syntax \
+             anywhere in its body.";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_fenced_code_decoy_excluded() {
+        let body = "## Orchestrator\n\n```\nDriver: sonnet\n```\n";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_conflicting_anchors_priority_order_wins() {
+        let body = "recommended_model: haiku\n\n## Orchestrator\n\n**Driver:** Opus — the \
+             newer, higher-priority anchor.";
+        assert_eq!(recommended_tier(body), Some(Tier::Opus));
+    }
+
+    #[test]
+    fn recommended_tier_em_dash_tail_tolerated() {
+        let body = "## Orchestrator\n\nDriver: sonnet — fully spec'd against a named file.";
+        assert_eq!(recommended_tier(body), Some(Tier::Sonnet));
+    }
+
+    #[test]
+    fn recommended_tier_multi_family_value_is_none() {
+        let body = "## Orchestrator\n\n**Driver:** Opus/Fable — undecided.";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_absent_is_none() {
+        let body = "## Goal\n\nDo the thing.\n\n## Approach\n\n1. Step one.";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_backtick_wrapped_value_still_matches() {
+        // Regression: strip_inline_code used to run over the whole line
+        // before the Driver: prefix match, which silently ate a legitimately
+        // backtick-wrapped VALUE — the exact syntax extract_family_value's
+        // own doc comment documents as supported.
+        let body = "## Orchestrator\n\n**Driver:** `sonnet`";
+        assert_eq!(recommended_tier(body), Some(Tier::Sonnet));
+    }
+
+    #[test]
+    fn recommended_tier_priority2_hyphen_compound_no_false_match() {
+        // Regression: find_drivable_token had no left word-boundary check,
+        // so "non-sonnet-drivable" false-matched "sonnet-drivable".
+        let body = "## Orchestrator\n\nThis work is NOT non-sonnet-drivable; it needs escalation.";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_priority2_right_boundary_no_false_match() {
+        // Regression: find_drivable_token had no right word-boundary check,
+        // so "opus-drivability" (a real word continuing past the token)
+        // false-matched "opus-drivable".
+        let body = "## Orchestrator\n\nThis section is barely opus-drivability at this stage.";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_priority2_backtick_decoy_excluded() {
+        let body = "## Orchestrator\n\nThis plan does not use the `sonnet-drivable` token \
+             anywhere in its body.";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    #[test]
+    fn recommended_tier_orchestrator_heading_must_match_exactly() {
+        // Regression: orchestrator_block's opening check was a bare
+        // starts_with("## Orchestrator"), so "## OrchestratorNotes" opened
+        // the block too — this plan's real Orchestrator section (if any)
+        // never appears, so the Driver: line under the imposter heading must
+        // NOT be picked up.
+        let body = "## OrchestratorNotes\n\n**Driver:** Sonnet";
+        assert_eq!(recommended_tier(body), None);
+    }
+
+    // --- nudge composition ---
+
+    #[test]
+    fn nudge_includes_directive_between_persist_sentence_and_format_gates_when_some() {
+        let tmp = TempDir::new().unwrap();
+        let plans_dir = tmp.path().join("docs/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        let body = "## Orchestrator\n\n**Driver:** Sonnet — fully spec'd.";
+        let r = persist_and_nudge(
+            &plans_dir,
+            "2026-08-16-x",
+            "session-id",
+            "hash",
+            "document text",
+            "2026-08-16T00:00:00Z",
+            None,
+            "session-id",
+            "digest",
+            tmp.path(),
+            "unknown",
+            body,
+            recommended_tier(body),
+        );
+        let msg = r.message.unwrap();
+        let persisted_idx = msg.find("Approved plan persisted to").unwrap();
+        let directive_idx = msg
+            .find("This plan's recommended driver is sonnet")
+            .expect("directive must be present when tier is Some");
+        let verify_idx = msg.find("Verify placement,").unwrap();
+        assert!(
+            persisted_idx < directive_idx && directive_idx < verify_idx,
+            "directive must land between the persist sentence and the format gates: {msg}"
+        );
+    }
+
+    #[test]
+    fn nudge_omits_directive_when_tier_is_none() {
+        let tmp = TempDir::new().unwrap();
+        let plans_dir = tmp.path().join("docs/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+        let body = "## Goal\n\nDo the thing.";
+        let r = persist_and_nudge(
+            &plans_dir,
+            "2026-08-16-x",
+            "session-id",
+            "hash",
+            "document text",
+            "2026-08-16T00:00:00Z",
+            None,
+            "session-id",
+            "digest",
+            tmp.path(),
+            "unknown",
+            body,
+            recommended_tier(body),
+        );
+        let msg = r.message.unwrap();
+        assert!(
+            !msg.contains("recommended driver"),
+            "no directive text when no tier was parsed: {msg}"
+        );
+    }
+
     // --- linkage row schema ---
 
     #[test]
@@ -2618,17 +3080,19 @@ mod tests {
             "digest",
             "docs/plans/2026-07-20-x.md",
             "hash",
+            Some("sonnet"),
         );
-        assert_eq!(row["schemaVersion"], 2);
+        assert_eq!(row["schemaVersion"], 3);
         assert_eq!(row["ts"], "2026-07-20T00:00:00Z");
         assert_eq!(row["parent_session_id"], "parent-sid");
         assert_eq!(row["child_session_id"], "child-sid");
         assert_eq!(row["machine"], "digest");
         assert_eq!(row["plan_path"], "docs/plans/2026-07-20-x.md");
         assert_eq!(row["body_sha256"], "hash");
+        assert_eq!(row["recommended_model"], "sonnet");
         assert!(
             row.get("host").is_none() && row.get("repo").is_none(),
-            "v2 drops both the raw host and the repo field: {row}"
+            "v3 still drops both the raw host and the repo field: {row}"
         );
     }
 
@@ -2641,8 +3105,29 @@ mod tests {
             "digest",
             "docs/plans/2026-07-20-x.md",
             "hash",
+            None,
         );
         assert!(row["parent_session_id"].is_null());
+    }
+
+    #[test]
+    fn plan_links_row_omits_recommended_model_when_none() {
+        // Deliberately NOT the null convention `parent_session_id` uses above
+        // — `recommended_model` (schema v3) is OMITTED, never written null,
+        // when the plan carries no recognized `Driver:` anchor.
+        let row = plan_links_row(
+            "2026-07-20T00:00:00Z",
+            Some("parent-sid"),
+            "child-sid",
+            "digest",
+            "docs/plans/2026-07-20-x.md",
+            "hash",
+            None,
+        );
+        assert!(
+            row.get("recommended_model").is_none(),
+            "recommended_model must be omitted, not null, when unrecognized: {row}"
+        );
     }
 
     // --- end-to-end (tempdir git repo) ---
@@ -3757,6 +4242,160 @@ mod tests {
                 .join("docs/plans/2026-08-15-fix-the-widget.md")
                 .exists(),
             "no duplicate under the later date"
+        );
+    }
+
+    #[test]
+    fn dir_scan_skip_appends_row_and_nudges_directive_only_then_goes_silent() {
+        // Dir-scan-skip repair (Part R3): a re-fire recognized only by the
+        // dir scan (no row for it) must append a plan-links row —
+        // `parent_session_id` is `None` by construction, the approving
+        // parent is unknown on a plan already committed to `docs/plans/` —
+        // and nudge with the directive-only text (no "persisted to" claim,
+        // no format gates) when a tier was parsed. The appended row is what
+        // makes the ROW-CHECK layer suppress every subsequent turn for this
+        // body on this machine.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        let body = "# Fix the Widget\n\n## Orchestrator\n\n**Driver:** Sonnet — fully spec'd.";
+        write_injected_transcript(&transcript, body);
+
+        let metrics_one = TempDir::new().unwrap();
+        let prefixed = make_user_prompt_submit(
+            "child-session-id",
+            &format!("Implement the following plan:\n\n{body}"),
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_one.path(), || {
+            run_persist_plan(&prefixed, "2026-08-16T00:00:00Z", "2026-08-16", "test-host")
+        });
+        assert_eq!(r1.outcome, Outcome::Nudge);
+
+        // A fresh metrics dir models the wiped-file case: no row anywhere,
+        // so the dir scan (not the row check) recognizes the re-fire.
+        let metrics_two = TempDir::new().unwrap();
+        let late = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r2 = with_metrics_dir(metrics_two.path(), || {
+            run_persist_plan(&late, "2026-08-17T00:00:00Z", "2026-08-17", "test-host")
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Nudge,
+            "directive-only nudge when the re-fire's plan carries a parsed tier"
+        );
+        let msg2 = r2.message.unwrap();
+        assert!(
+            msg2.contains("This plan's recommended driver is sonnet"),
+            "the dir-scan-skip nudge must carry the directive: {msg2}"
+        );
+        assert!(
+            !msg2.contains("Approved plan persisted to"),
+            "a re-fire recognition is not a fresh persist claim: {msg2}"
+        );
+
+        let rows = fs::read_to_string(metrics_two.path().join("plan-links.jsonl")).unwrap();
+        assert!(
+            rows.contains("\"recommended_model\":\"sonnet\""),
+            "the dir-scan-skip row must carry the parsed tier: {rows}"
+        );
+        assert!(
+            rows.contains("\"parent_session_id\":null"),
+            "parent_session_id is unknown by construction on this path: {rows}"
+        );
+
+        // The row just appended makes the ROW-CHECK layer suppress the next
+        // turn silently — proving row-check suppression engages.
+        let third = make_user_prompt_submit(
+            "child-session-id",
+            "keep going",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r3 = with_metrics_dir(metrics_two.path(), || {
+            run_persist_plan(&third, "2026-08-18T00:00:00Z", "2026-08-18", "test-host")
+        });
+        assert_eq!(
+            r3.outcome,
+            Outcome::Allow,
+            "the row appended by the dir-scan-skip path suppresses the next turn"
+        );
+    }
+
+    #[test]
+    fn dir_scan_skip_appends_row_silently_when_no_tier_is_recorded() {
+        // Companion to the test above, covering the tier == None branch: the
+        // row must still be appended (and recommended_model omitted, not
+        // null) even when the re-fired plan carries no recognized Driver:
+        // anchor — the CHANGELOG's "closes a gap where this path never wrote
+        // the row that ends its own loop" claim applies regardless of tier.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let transcript = tmp.path().join("child-session-id.jsonl");
+        let body = ROW_TIER_BODY; // no Orchestrator/Driver block
+        write_injected_transcript(&transcript, body);
+
+        let metrics_one = TempDir::new().unwrap();
+        let prefixed = make_user_prompt_submit(
+            "child-session-id",
+            &format!("Implement the following plan:\n\n{body}"),
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_one.path(), || {
+            run_persist_plan(&prefixed, "2026-08-16T00:00:00Z", "2026-08-16", "test-host")
+        });
+        assert_eq!(r1.outcome, Outcome::Nudge);
+
+        let metrics_two = TempDir::new().unwrap();
+        let late = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r2 = with_metrics_dir(metrics_two.path(), || {
+            run_persist_plan(&late, "2026-08-17T00:00:00Z", "2026-08-17", "test-host")
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Allow,
+            "no tier parsed → silent allow, no directive-only nudge"
+        );
+
+        let rows = fs::read_to_string(metrics_two.path().join("plan-links.jsonl")).unwrap();
+        assert!(
+            !rows.contains("recommended_model"),
+            "the row must still be appended, omitting recommended_model (not null): {rows}"
+        );
+        assert!(
+            rows.contains("\"parent_session_id\":null"),
+            "parent_session_id is unknown by construction on this path: {rows}"
+        );
+
+        // The row appended on the tier==None branch must still suppress the
+        // next turn via the row-check layer.
+        let third = make_user_prompt_submit(
+            "child-session-id",
+            "keep going",
+            &cwd,
+            &transcript.to_string_lossy(),
+        );
+        let r3 = with_metrics_dir(metrics_two.path(), || {
+            run_persist_plan(&third, "2026-08-18T00:00:00Z", "2026-08-18", "test-host")
+        });
+        assert_eq!(
+            r3.outcome,
+            Outcome::Allow,
+            "the row appended on the tier==None branch still suppresses the next turn"
         );
     }
 

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`persist-plan` now records the plan's own `## Orchestrator` → `Driver:` tier and hands a pickup session a deterministic model-check directive (model-guard "stronger prose, not teeth").** The hook can never know the LIVE model at pickup — no `model` field on `UserPromptSubmit`, no structural `model` in the transcript before the first assistant turn (probed 2026-08-14) — but it CAN deterministically parse the plan's own recorded intent. A new closed-enum parser reads the `## Orchestrator` block for a `**Driver:**`/`Driver:` line (priority 1), an `<family>-drivable` prose token (priority 2), or falls back to the legacy `recommended_model:` header field (priority 3, scoped before the first `## ` heading) — fence- and quote-skipped, first match in document order wins, and a multi-family or unrecognized capture is conservatively `None`, never a guess. Only the parsed tier's canonical lowercase name (`sonnet`, `opus`, `fable`, `haiku`) is ever rendered — the injection wall this module's other detectors already use. `plan-links.jsonl` bumps to schema v3: `recommended_model` is appended when a tier was parsed, **omitted** (never null) when it wasn't. The persist nudge gains one sentence, landing between the persist confirmation and the format-gate sentences, only when a tier was parsed: it names the recommended driver and instructs Claude to compare it against the running model before the first implementation step. The dir-scan-skip layer (a re-fire recognized only by the dir scan, with no row yet) now appends a plan-links row on every hit — `parent_session_id: None` by construction, since the approving parent is unknown for a plan already committed to `docs/plans/` — and nudges with the directive alone (no persist claim, no format gates) when a tier was parsed; that row is what makes the row-check layer suppress the next turn silently, closing a gap where this path never wrote the row that ends its own loop.
+
 ## [0.79.0] - 2026-08-16
 
 ### Added
