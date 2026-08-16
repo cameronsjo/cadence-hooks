@@ -377,11 +377,25 @@ fn checkout_staleness_line(cwd: &str) -> Option<String> {
         .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
         .map(|elapsed| identity::relative_age(elapsed.as_secs()));
 
+    // `default` is the REMOTE's advertised `origin/HEAD` target — repo state
+    // a peer's registry file already gets this same treatment for (see
+    // `render_disclosure`'s `sanitize_field` calls below: "a crafted file
+    // must not be able to inject instruction blocks into the context Claude
+    // reads"). git's own ref-name rules permit unbounded length and several
+    // Unicode whitespace/line-separator categories `sanitize_field` doesn't
+    // strip (it only scrubs `char::is_control()`/Cc), but the length cap and
+    // control-char scrub still matter here and keep this part consistent
+    // with the rest of this surface. The RAW `default` is used above to
+    // build the actual git range — only the rendered copy is sanitized.
+    let display_default = identity::sanitize_field(&default, identity::MAX_FIELD_DISPLAY);
+
     Some(match age {
         Some(age) => {
-            format!("Checkout: {behind} commits behind origin/{default} (refs fetched {age})")
+            format!(
+                "Checkout: {behind} commits behind origin/{display_default} (refs fetched {age})"
+            )
         }
-        None => format!("Checkout: {behind} commits behind origin/{default}"),
+        None => format!("Checkout: {behind} commits behind origin/{display_default}"),
     })
 }
 
@@ -962,6 +976,37 @@ mod tests {
         assert_eq!(
             checkout_staleness_line(&scratch.path().to_string_lossy()),
             None
+        );
+    }
+
+    #[test]
+    fn display_default_sanitizes_and_caps_a_crafted_branch_name() {
+        // `checkout_staleness_line`'s render step passes `default` (the
+        // remote's advertised `origin/HEAD` target — a crafted-remote PoC
+        // an independent Opus security review confirmed reachable via a
+        // real `git clone`) through `sanitize_field` before it reaches the
+        // formatted line, exactly like `render_disclosure` already does for
+        // peer-supplied branch/intent fields. `sanitize_field` itself is
+        // covered by its own tests (`display.rs`); this pins that the new
+        // part actually calls it with the same cap the rest of this surface
+        // uses, rather than re-deriving `sanitize_field`'s own behavior
+        // (attempts to reproduce the crafted-name scenario end-to-end
+        // through real git ref resolution hit unrelated git-internal
+        // revision-parsing limits on very long two-sided ranges — a test
+        // environment artifact, not a property of this code).
+        let crafted = format!("main\u{7}{}", "a".repeat(200));
+        let sanitized = identity::sanitize_field(&crafted, identity::MAX_FIELD_DISPLAY);
+        assert!(
+            !sanitized.contains('\u{7}'),
+            "control char must not survive: {sanitized}"
+        );
+        assert!(
+            sanitized.len() < crafted.len(),
+            "must be capped, not rendered whole: {sanitized}"
+        );
+        assert!(
+            sanitized.contains('…'),
+            "cap must show the truncation marker: {sanitized}"
         );
     }
 
