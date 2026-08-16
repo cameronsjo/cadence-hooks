@@ -22,6 +22,17 @@
 //! only composes the line it returns. Unlike the other three it is resolved
 //! *before* the registry guards, since guard health belongs to the machine
 //! rather than to a repo — a cwd with no git repository still hears it.
+//!
+//! A fifth part answers "is this checkout behind `origin`?" — nothing else on
+//! this surface counts commits, and nothing brings a primary checkout back up
+//! to date on its own. **No network call**: a fetch here would share the
+//! deadline budget with the guards ahead of it and, on a timeout, would mark
+//! [`cadence_hooks_core::deadline::note_hit`] — the same signal the fail-open
+//! part above discloses as "guards may not be enforcing", so a slow network
+//! would make a session announce a guard-health problem it does not have. The
+//! count comes from cached `refs/remotes/origin/<default>` instead; the outro
+//! skill's sync step is what keeps that cache fresh, and the rendered line
+//! names its own age so a stale cache reads as stale, not as current.
 
 use crate::identity::{self, SessionRecord};
 use crate::registry::{self, Peer};
@@ -53,11 +64,12 @@ impl Check for Start {
         // per calendar day via the same daily gate `platform-drift` uses.
         let machine = join_machine_lines(rules_absence_line(), failopen);
         let Some(cwd) = input.cwd.as_deref() else {
-            return finish(None, None, None, machine);
+            return finish(None, None, None, machine, None);
         };
         let Some(dir) = registry::sessions_dir(cwd) else {
-            // Not a git repository — no registry, nothing to coordinate.
-            return finish(None, None, None, machine);
+            // Not a git repository — no registry, nothing to coordinate. A
+            // non-repo cwd also has no checkout to measure staleness for.
+            return finish(None, None, None, machine, None);
         };
         if let Some(root) = registry::repo_root(cwd) {
             registry::ensure_git_excluded(&root);
@@ -136,12 +148,16 @@ pub fn run_start(
     // must surface even when the session id is missing/unsafe or the
     // registry write below fails.
     let plan_disclosure = input.cwd.as_deref().and_then(plan_disclosure_line);
+    // Independent of session registration, same reasoning as `posture` and
+    // `plan_disclosure`: checkout staleness is repo state, cached-refs-only,
+    // so it must surface regardless of session id or registry-write outcome.
+    let staleness = input.cwd.as_deref().and_then(checkout_staleness_line);
 
     let Some(sid) = input
         .session_id()
         .filter(|s| identity::is_safe_session_id(s))
     else {
-        return finish(posture, None, plan_disclosure, failopen);
+        return finish(posture, None, plan_disclosure, failopen, staleness);
     };
 
     // Register (or re-register on resume — preserves any declared
@@ -188,7 +204,7 @@ pub fn run_start(
     };
     if registry::write_record(dir, &record).is_err() {
         // Fail open: a read-only filesystem must not break session start.
-        return finish(posture, None, plan_disclosure, failopen);
+        return finish(posture, None, plan_disclosure, failopen, staleness);
     }
 
     // Housekeeping: presumed-dead peers leave the room before roll call. Our
@@ -198,7 +214,13 @@ pub fn run_start(
     // Disclose live peers, if any.
     let peers = registry::live_peers(dir, sid, stale_secs);
     let peer_disclosure = (!peers.is_empty()).then(|| render_disclosure(&record, &peers));
-    finish(posture, peer_disclosure, plan_disclosure, failopen)
+    finish(
+        posture,
+        peer_disclosure,
+        plan_disclosure,
+        failopen,
+        staleness,
+    )
 }
 
 /// The worktree-posture line for `cwd`, or `None` when `enforce-worktree`
@@ -297,16 +319,84 @@ fn finish(
     peer_disclosure: Option<String>,
     plan_disclosure: Option<String>,
     failopen: Option<String>,
+    staleness: Option<String>,
 ) -> CheckResult {
-    let parts: Vec<String> = [posture, peer_disclosure, plan_disclosure, failopen]
-        .into_iter()
-        .flatten()
-        .collect();
+    let parts: Vec<String> = [
+        posture,
+        peer_disclosure,
+        plan_disclosure,
+        failopen,
+        staleness,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if parts.is_empty() {
         CheckResult::allow()
     } else {
         CheckResult::nudge(parts.join("\n\n"))
     }
+}
+
+/// The checkout-staleness line for `cwd`'s repo, or `None` when there is no
+/// resolvable default branch ([`GitState::default_branch`] — no `origin`
+/// remote, or an unreadable `origin/HEAD` symref), the local default branch
+/// is already current, or any git read fails. Cached refs only — see the
+/// module docs for why this never fetches.
+fn checkout_staleness_line(cwd: &str) -> Option<String> {
+    let state = cadence_hooks_core::gitstate::GitState::resolve(Path::new(cwd))?;
+    let default = state.default_branch?;
+    let common_dir = state.git_common_dir;
+
+    let range = format!("refs/heads/{default}..refs/remotes/origin/{default}");
+    // `run_git_bounded` directly, not `git_command`/`git_command_detailed`:
+    // the latter's `GitQuery::Value` maps empty stdout to `Failed`, and while
+    // `rev-list --count` never emits empty stdout on success, spawning
+    // `run_git_bounded` ourselves keeps that class of trap out of this read
+    // entirely rather than relying on the argument staying true.
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(&common_dir)
+        .args(["rev-list", "--count", &range]);
+    let behind: u64 = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
+        cadence_hooks_core::shell::GitSpawn::Completed(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .ok()?
+        }
+        _ => return None,
+    };
+    if behind == 0 {
+        return None;
+    }
+
+    let age = std::fs::metadata(common_dir.join("FETCH_HEAD"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .map(|elapsed| identity::relative_age(elapsed.as_secs()));
+
+    // `default` is the REMOTE's advertised `origin/HEAD` target — repo state
+    // a peer's registry file already gets this same treatment for (see
+    // `render_disclosure`'s `sanitize_field` calls below: "a crafted file
+    // must not be able to inject instruction blocks into the context Claude
+    // reads"). git's own ref-name rules permit unbounded length and several
+    // Unicode whitespace/line-separator categories `sanitize_field` doesn't
+    // strip (it only scrubs `char::is_control()`/Cc), but the length cap and
+    // control-char scrub still matter here and keep this part consistent
+    // with the rest of this surface. The RAW `default` is used above to
+    // build the actual git range — only the rendered copy is sanitized.
+    let display_default = identity::sanitize_field(&default, identity::MAX_FIELD_DISPLAY);
+
+    Some(match age {
+        Some(age) => {
+            format!(
+                "Checkout: {behind} commits behind origin/{display_default} (refs fetched {age})"
+            )
+        }
+        None => format!("Checkout: {behind} commits behind origin/{display_default}"),
+    })
 }
 
 #[cfg(test)]
@@ -803,6 +893,160 @@ mod tests {
             r.outcome,
             Outcome::Allow,
             "no docs/plans/ dir at all → silence"
+        );
+    }
+
+    // --- checkout staleness line (Part B, checkout-freshness plan) ---
+    //
+    // `checkout_staleness_line` reads only cached refs — no fetch — so these
+    // fixtures fabricate the "already fetched" state directly: a bare remote,
+    // an `origin` pointed at it, and (for the behind case) a second commit
+    // pushed to the bare remote and pulled down with a real `git fetch`,
+    // which also gives a genuine, fresh `FETCH_HEAD` for the age half of the
+    // line.
+
+    /// A primary checkout on `main` with a real `origin` remote (a bare repo)
+    /// and `origin/HEAD` set, freshly fetched. Returns the primary and bare
+    /// paths.
+    fn repo_with_origin(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let primary = dir.join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        init_repo(&primary);
+        let bare = dir.join("origin.git");
+        git_in(dir, &["clone", "-q", "--bare", "primary", "origin.git"]);
+        git_in(
+            &primary,
+            &["remote", "add", "origin", &bare.to_string_lossy()],
+        );
+        git_in(&primary, &["fetch", "-q", "origin"]);
+        git_in(&primary, &["remote", "set-head", "origin", "-a"]);
+        (primary, bare)
+    }
+
+    #[test]
+    fn checkout_staleness_line_renders_when_behind() {
+        let scratch = scratch("staleness-behind");
+        let (primary, bare) = repo_with_origin(scratch.path());
+
+        // Advance the bare remote via a throwaway clone, then pull the new
+        // ref down into `primary`'s remote-tracking branch WITHOUT merging —
+        // exactly the "behind" state this line reports on.
+        let pusher = scratch.path().join("pusher");
+        git_in(
+            scratch.path(),
+            &["clone", "-q", &bare.to_string_lossy(), "pusher"],
+        );
+        git_in(&pusher, &["config", "user.email", "t@t"]);
+        git_in(&pusher, &["config", "user.name", "t"]);
+        std::fs::write(pusher.join("g.txt"), "y").unwrap();
+        git_in(&pusher, &["add", "g.txt"]);
+        git_in(&pusher, &["commit", "-q", "-m", "second"]);
+        git_in(&pusher, &["push", "-q", "origin", "main"]);
+        git_in(&primary, &["fetch", "-q", "origin"]);
+
+        let line = checkout_staleness_line(&primary.to_string_lossy())
+            .expect("one commit behind must render");
+        assert!(
+            line.contains("1 commits behind origin/main"),
+            "count and branch named: {line}"
+        );
+        assert!(
+            line.contains("refs fetched"),
+            "age qualifier present: {line}"
+        );
+    }
+
+    #[test]
+    fn checkout_staleness_line_silent_when_current() {
+        let scratch = scratch("staleness-current");
+        let (primary, _bare) = repo_with_origin(scratch.path());
+        assert_eq!(
+            checkout_staleness_line(&primary.to_string_lossy()),
+            None,
+            "freshly fetched and up to date → silence"
+        );
+    }
+
+    #[test]
+    fn checkout_staleness_line_silent_with_no_default_branch() {
+        // No `origin` remote at all → `GitState::default_branch` is `None` →
+        // silent by contract (the plan's stated scope).
+        let scratch = scratch("staleness-no-origin");
+        init_repo(scratch.path());
+        assert_eq!(
+            checkout_staleness_line(&scratch.path().to_string_lossy()),
+            None
+        );
+    }
+
+    #[test]
+    fn display_default_sanitizes_and_caps_a_crafted_branch_name() {
+        // `checkout_staleness_line`'s render step passes `default` (the
+        // remote's advertised `origin/HEAD` target — a crafted-remote PoC
+        // an independent Opus security review confirmed reachable via a
+        // real `git clone`) through `sanitize_field` before it reaches the
+        // formatted line, exactly like `render_disclosure` already does for
+        // peer-supplied branch/intent fields. `sanitize_field` itself is
+        // covered by its own tests (`display.rs`); this pins that the new
+        // part actually calls it with the same cap the rest of this surface
+        // uses, rather than re-deriving `sanitize_field`'s own behavior
+        // (attempts to reproduce the crafted-name scenario end-to-end
+        // through real git ref resolution hit unrelated git-internal
+        // revision-parsing limits on very long two-sided ranges — a test
+        // environment artifact, not a property of this code).
+        let crafted = format!("main\u{7}{}", "a".repeat(200));
+        let sanitized = identity::sanitize_field(&crafted, identity::MAX_FIELD_DISPLAY);
+        assert!(
+            !sanitized.contains('\u{7}'),
+            "control char must not survive: {sanitized}"
+        );
+        assert!(
+            sanitized.len() < crafted.len(),
+            "must be capped, not rendered whole: {sanitized}"
+        );
+        assert!(
+            sanitized.contains('…'),
+            "cap must show the truncation marker: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn checkout_staleness_line_fails_open_on_git_error() {
+        // `origin/HEAD` is set (so `default_branch` resolves), but no fetch
+        // ever ran, so `refs/remotes/origin/main` does not exist — `git
+        // rev-list --count <range>` fails ("unknown revision"), and the line
+        // must fail open silently rather than panic or propagate the error.
+        let scratch = scratch("staleness-git-error");
+        let primary = scratch.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        init_repo(&primary);
+        let bare = scratch.path().join("origin.git");
+        git_in(
+            scratch.path(),
+            &["clone", "-q", "--bare", "primary", "origin.git"],
+        );
+        git_in(
+            &primary,
+            &["remote", "add", "origin", &bare.to_string_lossy()],
+        );
+        // Set the symref by hand instead of fetching, so `default_branch`
+        // resolves while `refs/remotes/origin/main` stays absent.
+        let common = primary.join(".git");
+        std::fs::create_dir_all(common.join("refs").join("remotes").join("origin")).unwrap();
+        std::fs::write(
+            common
+                .join("refs")
+                .join("remotes")
+                .join("origin")
+                .join("HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            checkout_staleness_line(&primary.to_string_lossy()),
+            None,
+            "unresolvable range fails open, not panics"
         );
     }
 
