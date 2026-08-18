@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`doctor --quiet` tests no longer read or write the machine's real daily-nudge marker.** `doctor_quiet_warnings_print_summary_to_stdout` and `doctor_quiet_clean_prints_nothing` now pin `CADENCE_MARKER_DIR` to a per-test tempdir, following the `daily_gate.rs:24` precedent, so a same-day rerun can't have its verdict shifted by prior marker state on the runner (#660).
+
 ## [0.80.0] - 2026-08-16
 
 ### Added
