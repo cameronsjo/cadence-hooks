@@ -2548,6 +2548,34 @@ fn push_body(bodies: &mut Vec<String>, text: &[char]) {
     }
 }
 
+/// Whether a quote opened inside `chars` never closes by the end of the slice
+/// — walked with the same quote-tracking and backslash-escape rule
+/// [`substitution_bodies`] applies at the top level (a `\` skips two chars
+/// outside a suppressing quote). Used to detect a backtick span whose own
+/// embedded quoting is unbalanced, per cameronsjo/cadence-hooks#653.
+fn span_quoting_unterminated(chars: &[char]) -> bool {
+    let mut quote: Option<Quote> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if matches!(quote, Some(Quote::Single | Quote::AnsiC))
+            && let Some(next) = scan_quote_syntax(chars, i, &mut quote)
+        {
+            i = next;
+            continue;
+        }
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if let Some(next) = scan_quote_syntax(chars, i, &mut quote) {
+            i = next;
+            continue;
+        }
+        i += 1;
+    }
+    quote.is_some()
+}
+
 /// Scan a `$(…)` body starting at `start` (just past the `$(`), returning the
 /// body text and the index just past its `)`. `None` when input runs out with
 /// the substitution still open.
@@ -2595,9 +2623,14 @@ fn scan_substitution_body(
 /// Single quotes suppress; double quotes do not. A backslash escapes the next
 /// char outside single quotes, so `\$(` and an escaped backtick are literal.
 ///
-/// Backticks deliberately get NO quote tracking — bash truncates a backtick
-/// span at the first unescaped backtick even inside quotes, so tracking there
-/// would diverge from the shell rather than agree with it.
+/// Backticks deliberately get NO quote tracking for where the span CLOSES —
+/// bash truncates a backtick span at the first unescaped backtick even inside
+/// quotes, so tracking there would diverge from the shell rather than agree
+/// with it. When the closed span's own content still carries an unresolved
+/// quote, though, the outer segment splitter (which does track quotes) reads
+/// everything after the span as inside that still-open quote and never turns
+/// it into its own segment — the backtick arm below surfaces that tail as an
+/// extra body so it still reaches the guards (cameronsjo/cadence-hooks#653).
 fn substitution_bodies(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut bodies = Vec::new();
@@ -2680,6 +2713,22 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
             }
             if !body.trim().is_empty() {
                 bodies.push(body);
+            }
+            // The closing backtick was found (j < chars.len()), but the span's
+            // own quoting never resolved — an unterminated `'…'`/`"…"`/`$'…'`
+            // inside it. The outer segment splitter doesn't know backticks
+            // close on the first unescaped backtick regardless of embedded
+            // quotes, so it reads everything after this span as still inside
+            // that open quote and never gives the tail its own segment. Surface
+            // it here as a sibling command instead, mirroring the `$( )` arm's
+            // both-readings emission above (cameronsjo/cadence-hooks#653).
+            // `break` rather than falling through: the tail is pushed whole so
+            // any substitution inside it surfaces when that body is itself
+            // re-scanned, and continuing the outer loop here would re-walk —
+            // and could double-emit — the same text char by char.
+            if j < chars.len() && span_quoting_unterminated(&chars[i + 1..j]) {
+                push_body(&mut bodies, &chars[j + 1..]);
+                break;
             }
             i = j + 1;
             continue;
@@ -5525,6 +5574,57 @@ mod tests {
         assert!(
             substitution_bodies(r"echo $'literal $(cat .env)'").is_empty(),
             "a `$(` inside a single-quoted ANSI-C run must stay literal"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_backtick_unterminated_single_quote_surfaces_the_tail() {
+        // #653: the span between backticks ("echo '") carries an unmatched
+        // single quote. The outer segment splitter's quote tracking doesn't
+        // know backticks close on the first unescaped backtick regardless of
+        // embedded quotes, so it reads everything after the closing backtick
+        // as still inside that open quote and never gives `cat .env` its own
+        // segment. The tail must be surfaced here instead.
+        assert!(
+            substitution_bodies("echo `echo '` && cat .env")
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "unterminated single quote inside a backtick span hid the tail"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_backtick_unterminated_double_quote_surfaces_the_tail() {
+        // Same shape, double-quote variant.
+        assert!(
+            substitution_bodies(r#"echo `echo "` && cat .env"#)
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "unterminated double quote inside a backtick span hid the tail"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_backtick_balanced_quote_emits_no_extra_tail() {
+        // Control: a balanced quote inside the span resolves cleanly, so
+        // there is no ambiguity and no extra body should appear for the tail.
+        let bodies = substitution_bodies("echo `echo 'x'` && cat .env");
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("cat .env")).count(),
+            0,
+            "a balanced quote inside the span must not emit a tail body: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_backtick_escaped_quote_emits_no_extra_tail() {
+        // Control: an escaped quote inside the span never opens quoting at
+        // all, so `span_quoting_unterminated` must read it as resolved.
+        let bodies = substitution_bodies(r"echo `echo \'` && cat .env");
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("cat .env")).count(),
+            0,
+            "an escaped quote inside the span must not emit a tail body: {bodies:?}"
         );
     }
 

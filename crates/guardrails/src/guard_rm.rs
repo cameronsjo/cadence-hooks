@@ -1284,7 +1284,7 @@ fn judge_targets(
             CheckResult::block(block_message(block_class.unwrap_or(TargetClass::Unknown)))
         }
         Outcome::Ask => CheckResult::ask(ASK_MESSAGE),
-        // Allow (and the impossible Nudge/LoopBlock) → defer to normal flow.
+        // Allow (and the impossible Nudge) → defer to normal flow.
         _ => CheckResult::allow(),
     }
 }

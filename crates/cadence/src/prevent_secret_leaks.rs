@@ -1078,6 +1078,18 @@ mod tests {
     }
 
     #[test]
+    fn backtick_unterminated_quote_does_not_hide_the_tail_command() {
+        // #653: the span between backticks ("echo '") carries an unmatched
+        // single quote. The outer segment splitter's quote tracking doesn't
+        // know backticks close on the first unescaped backtick regardless of
+        // embedded quotes, so `&& cat .env` read as still inside that open
+        // quote and never became its own segment — reaching no guard while
+        // bash executed it.
+        let result = SecretLeaksGuard.run(&make_bash_input("echo `echo '` && cat .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
     fn verb_fold_cannot_widen_this_guards_exemption() {
         // This file is the ONE consumer of `core::shell::command_word` whose
         // lookup is an EXEMPTION (`METADATA_SAFE_COMMANDS`), where matching
