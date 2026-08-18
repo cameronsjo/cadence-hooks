@@ -901,7 +901,7 @@ fn allowed_display_list(owners: &[AllowEntry], repos: &[AllowEntry]) -> Vec<Stri
 
 /// Build the block message for a looped gh write, with a concrete `-R` fix
 /// when the cwd resolved to an owned repo.
-fn loop_block_message(writes: &[String], suggestion: Option<&str>) -> String {
+fn looped_write_block_message(writes: &[String], suggestion: Option<&str>) -> String {
     let found = if writes.is_empty() {
         "gh write command(s) without -R".to_string()
     } else {
@@ -2010,7 +2010,7 @@ impl Check for GhWriteGuard {
                             None => "-R <owner>/<repo>".to_string(),
                         };
                         return CheckResult::block_structured(
-                            loop_block_message(&writes, suggestion.as_deref()),
+                            looped_write_block_message(&writes, suggestion.as_deref()),
                             BlockMetadata {
                                 rule_id: "gh-write-loop-missing-repo".to_string(),
                                 fix,
@@ -3028,17 +3028,17 @@ mod tests {
     // --- #44: loop block message ---
 
     #[test]
-    fn loop_block_message_includes_suggestion() {
+    fn looped_write_block_message_includes_suggestion() {
         let writes = vec!["`gh issue close $i`".to_string()];
-        let msg = loop_block_message(&writes, Some("cameronsjo/cadence-hooks"));
+        let msg = looped_write_block_message(&writes, Some("cameronsjo/cadence-hooks"));
         assert!(msg.contains("-R cameronsjo/cadence-hooks"));
         assert!(msg.contains("`gh issue close $i`"));
     }
 
     #[test]
-    fn loop_block_message_generic_without_suggestion() {
+    fn looped_write_block_message_generic_without_suggestion() {
         let writes = vec!["`gh pr create`".to_string()];
-        let msg = loop_block_message(&writes, None);
+        let msg = looped_write_block_message(&writes, None);
         assert!(msg.contains("-R owner/repo"));
     }
 

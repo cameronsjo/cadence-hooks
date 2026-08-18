@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **Retired the dead `Outcome::LoopBlock` variant** — no `Check` in the tree ever constructed one (the `PostToolUse` re-prompt shape it existed for was never wired), so it carried a `code()` arm, a `merge()` severity tier, a `render_output` JSON shape, and matching test coverage with no live caller. Wiring a real PostToolUse re-prompt gate is new feature work needing its own spec, not a revival of this variant.
+
 ## [0.80.0] - 2026-08-16
 
 ### Added
