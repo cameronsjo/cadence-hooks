@@ -111,12 +111,6 @@ pub enum Outcome {
     Nudge,
     /// Operation blocked, error message shown (exit 2, stderr).
     Block,
-    /// Re-prompt loop (exit 0). The tool already ran, so the write stands, but
-    /// Claude Code's `{"decision":"block","reason":...}` convention feeds the
-    /// reason back so the model self-corrects with a fresh write. Used by
-    /// PostToolUse feedback loops (e.g. validate-then-rewrite gates) where a
-    /// hard `Block` (exit 2) cannot un-run the tool.
-    LoopBlock,
     /// Surface the interactive permission prompt (exit 0). Emits a PreToolUse
     /// `permissionDecision: "ask"` envelope on stdout. Per Claude Code's
     /// precedence (`deny` > `defer` > `ask` > `allow`, most-restrictive-wins),
@@ -132,7 +126,6 @@ impl Outcome {
         match self {
             Outcome::Allow => 0,
             Outcome::Nudge => 0,
-            Outcome::LoopBlock => 0,
             Outcome::Ask => 0,
             Outcome::Block => 2,
         }
@@ -140,17 +133,13 @@ impl Outcome {
 
     /// Merge two outcomes, keeping the more severe one.
     ///
-    /// Severity, most-to-least: `Block` > `Ask` > `LoopBlock` > `Nudge` >
-    /// `Allow`. `Ask` outranks `Nudge` (a prompt is a stronger intervention
-    /// than a silent context line) but yields to `Block`. `Ask` (PreToolUse)
-    /// and `LoopBlock` (PostToolUse) are emitted on disjoint events and never
-    /// actually co-occur, so their relative order is a convention, not
-    /// observable behavior.
+    /// Severity, most-to-least: `Block` > `Ask` > `Nudge` > `Allow`. `Ask`
+    /// outranks `Nudge` (a prompt is a stronger intervention than a silent
+    /// context line) but yields to `Block`.
     pub fn merge(self, other: Outcome) -> Outcome {
         match (self, other) {
             (Outcome::Block, _) | (_, Outcome::Block) => Outcome::Block,
             (Outcome::Ask, _) | (_, Outcome::Ask) => Outcome::Ask,
-            (Outcome::LoopBlock, _) | (_, Outcome::LoopBlock) => Outcome::LoopBlock,
             (Outcome::Nudge, _) | (_, Outcome::Nudge) => Outcome::Nudge,
             _ => Outcome::Allow,
         }
@@ -1137,8 +1126,8 @@ pub struct CheckResult {
     pub outcome: Outcome,
     pub message: Option<String>,
     /// Structured payload attached to hard blocks. Always `None` for
-    /// `Allow`, `Nudge`, `LoopBlock`, and `Ask` (their delivery shapes don't
-    /// carry it). When `Some`, its `fix` is folded into the block's stderr
+    /// `Allow`, `Nudge`, and `Ask` (their delivery shapes don't carry it).
+    /// When `Some`, its `fix` is folded into the block's stderr
     /// message (exit 2 surfaces stderr only — see [`render_output`]).
     pub block_metadata: Option<BlockMetadata>,
     /// Attribution when the guard allowed *because a bypass was active* — a
@@ -1184,17 +1173,6 @@ impl CheckResult {
             outcome: Outcome::Block,
             message: Some(message.into()),
             block_metadata: Some(meta),
-            bypass: None,
-        }
-    }
-
-    /// Re-prompt loop result (exit 0). The message is fed back via Claude Code's
-    /// `{"decision":"block","reason":...}` convention so the model rewrites.
-    pub fn loop_block(message: impl Into<String>) -> Self {
-        Self {
-            outcome: Outcome::LoopBlock,
-            message: Some(message.into()),
-            block_metadata: None,
             bypass: None,
         }
     }
@@ -1295,8 +1273,8 @@ fn feedback_footer() -> Option<String> {
 }
 
 /// Compose the message body emitted for an outcome, appending the feedback
-/// footer to **hard blocks only** (never Nudge/LoopBlock/Allow — they aren't
-/// errors the user needs a feedback channel for).
+/// footer to **hard blocks only** (never Nudge/Allow — they aren't errors the
+/// user needs a feedback channel for).
 ///
 /// `footer` is the resolved footer ([`feedback_footer`]); passing it in keeps
 /// this pure and unit-testable without mutating process-global env.
@@ -1322,7 +1300,7 @@ struct RenderedOutput {
 /// Code's exit-code contract.
 ///
 /// The contract (code.claude.com/docs/en/hooks):
-/// - **Exit 0** (Allow/Nudge/LoopBlock): stdout JSON is parsed for control
+/// - **Exit 0** (Allow/Nudge/Ask): stdout JSON is parsed for control
 ///   (`hookSpecificOutput`, `decision`); stderr is ignored.
 /// - **Exit 2** (Block): stdout is **ignored entirely** — only stderr is fed
 ///   back to Claude. So a block emits *no* stdout: a JSON envelope there is
@@ -1353,23 +1331,6 @@ fn render_output(
         Outcome::Nudge => RenderedOutput {
             stdout: Some(
                 serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": event_name,
-                        "additionalContext": msg,
-                    }
-                })
-                .to_string(),
-            ),
-            stderr: None,
-        },
-        Outcome::LoopBlock => RenderedOutput {
-            // PostToolUse re-prompt: the tool already ran, so exit 0 and use the
-            // `decision: block` convention to feed the reason back. Mirror it
-            // into additionalContext for clients that read that.
-            stdout: Some(
-                serde_json::json!({
-                    "decision": "block",
-                    "reason": msg,
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
                         "additionalContext": msg,
@@ -1427,7 +1388,7 @@ fn render_output(
 /// Routing (delegated to the pure [`render_output`], then written and exited):
 /// - `skip_at_effort()` matches `$CLAUDE_EFFORT` → silent Allow (exit 0),
 ///   `check.run()` is not called.
-/// - Nudge / LoopBlock → JSON to stdout (exit 0). Claude Code parses this and
+/// - Nudge / Ask → JSON to stdout (exit 0). Claude Code parses this and
 ///   injects the message into Claude's context.
 /// - Block → text to stderr **only** (exit 2). Claude Code ignores stdout on a
 ///   block, so no JSON envelope is emitted there; the structured [`BlockMetadata`]
@@ -1678,7 +1639,6 @@ mod tests {
     fn outcome_codes() {
         assert_eq!(Outcome::Allow.code(), 0);
         assert_eq!(Outcome::Nudge.code(), 0);
-        assert_eq!(Outcome::LoopBlock.code(), 0);
         assert_eq!(Outcome::Block.code(), 2);
     }
 
@@ -1990,16 +1950,12 @@ mod tests {
     }
 
     #[test]
-    fn feedback_footer_skips_nudge_loop_block_and_allow() {
-        // The footer is a block-only affordance — nudges and loop-blocks are not
-        // errors the user needs a feedback channel for, so they pass through.
+    fn feedback_footer_skips_nudge_and_allow() {
+        // The footer is a block-only affordance — nudges are not errors the
+        // user needs a feedback channel for, so they pass through.
         assert_eq!(
             apply_feedback_footer(Outcome::Nudge, "heads up", Some(FEEDBACK_FOOTER)),
             "heads up"
-        );
-        assert_eq!(
-            apply_feedback_footer(Outcome::LoopBlock, "rewrite", Some(FEEDBACK_FOOTER)),
-            "rewrite"
         );
         assert_eq!(
             apply_feedback_footer(Outcome::Allow, "", Some(FEEDBACK_FOOTER)),
@@ -2072,13 +2028,12 @@ mod tests {
     }
 
     #[test]
-    fn allow_nudge_loop_block_have_no_metadata() {
+    fn allow_nudge_have_no_metadata() {
         // Only hard blocks carry structured metadata. The other outcomes
-        // serialize through different envelopes (additionalContext for
-        // Nudge; decision:block for LoopBlock) where it has no place.
+        // serialize through a different envelope (additionalContext for
+        // Nudge) where it has no place.
         assert!(CheckResult::allow().block_metadata.is_none());
         assert!(CheckResult::nudge("x").block_metadata.is_none());
-        assert!(CheckResult::loop_block("y").block_metadata.is_none());
     }
 
     #[test]
@@ -2233,27 +2188,6 @@ mod tests {
     }
 
     #[test]
-    fn render_loop_block_shape() {
-        // Documents/guards the PostToolUse re-prompt shape: top-level decision +
-        // reason, plus the nested hookSpecificOutput mirror (string context).
-        let rendered = render_output(
-            Outcome::LoopBlock,
-            Some("rewrite this"),
-            None,
-            HookEvent::PostToolUse,
-            None,
-        );
-        assert_eq!(rendered.stderr, None);
-        let json: serde_json::Value =
-            serde_json::from_str(&rendered.stdout.expect("loop_block writes stdout"))
-                .expect("valid JSON");
-        assert_eq!(json["decision"], "block");
-        assert_eq!(json["reason"], "rewrite this");
-        assert!(json["hookSpecificOutput"]["additionalContext"].is_string());
-        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PostToolUse");
-    }
-
-    #[test]
     fn render_allow_and_empty_message_emit_nothing() {
         assert_eq!(
             render_output(Outcome::Allow, None, None, HookEvent::PreToolUse, None),
@@ -2349,22 +2283,6 @@ mod tests {
         assert_eq!(r.message.as_deref(), Some("confirm this rm"));
         assert!(r.block_metadata.is_none());
         assert!(r.bypass.is_none());
-    }
-
-    #[test]
-    fn outcome_merge_loop_block_below_block_above_nudge() {
-        assert_eq!(Outcome::LoopBlock.merge(Outcome::Nudge), Outcome::LoopBlock);
-        assert_eq!(Outcome::Nudge.merge(Outcome::LoopBlock), Outcome::LoopBlock);
-        assert_eq!(Outcome::Block.merge(Outcome::LoopBlock), Outcome::Block);
-        assert_eq!(Outcome::LoopBlock.merge(Outcome::Block), Outcome::Block);
-        assert_eq!(Outcome::LoopBlock.merge(Outcome::Allow), Outcome::LoopBlock);
-    }
-
-    #[test]
-    fn check_result_loop_block() {
-        let r = CheckResult::loop_block("rewrite");
-        assert_eq!(r.outcome, Outcome::LoopBlock);
-        assert_eq!(r.message.as_deref(), Some("rewrite"));
     }
 
     #[test]
@@ -2800,7 +2718,6 @@ mod tests {
         assert!(CheckResult::allow().bypass.is_none());
         assert!(CheckResult::nudge("x").bypass.is_none());
         assert!(CheckResult::block("y").bypass.is_none());
-        assert!(CheckResult::loop_block("z").bypass.is_none());
     }
 
     #[test]

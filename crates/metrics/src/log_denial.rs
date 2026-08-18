@@ -22,7 +22,7 @@ use std::io::Write;
 /// Record a guard's decision at the dispatch seam.
 ///
 /// - `Block` → always logged as `decision: "deny"`.
-/// - `Nudge` / `LoopBlock` → logged as `decision: "nudge"` by **default**;
+/// - `Nudge` → logged as `decision: "nudge"` by **default**;
 ///   `CADENCE_LOG_NUDGES=0|false|off` opts out (cadence-hooks#420 — nudge-fire
 ///   rates are the denominator for every adherence measurement, and a
 ///   dark-by-default layer went unnoticed for its whole life).
@@ -94,8 +94,7 @@ fn nudges_enabled() -> bool {
 
 /// Map an [`Outcome`] to the `decision` field, or `None` when nothing should be
 /// logged. Pure — `nudges_on` is passed in so the env read stays out of the
-/// mapping and the mapping is unit-testable. `LoopBlock` (advisory, exit 0) maps
-/// to `"nudge"` alongside `Nudge`.
+/// mapping and the mapping is unit-testable.
 ///
 /// `Ask` maps to `"ask"` and is logged *unconditionally* (like `Block`), not
 /// gated on `nudges_on`: forcing an interactive prompt is a real guard
@@ -105,7 +104,7 @@ fn decision_for(outcome: Outcome, nudges_on: bool) -> Option<&'static str> {
     match outcome {
         Outcome::Block => Some("deny"),
         Outcome::Ask => Some("ask"),
-        Outcome::Nudge | Outcome::LoopBlock => nudges_on.then_some("nudge"),
+        Outcome::Nudge => nudges_on.then_some("nudge"),
         Outcome::Allow => None,
     }
 }
@@ -211,11 +210,9 @@ mod tests {
     }
 
     #[test]
-    fn nudge_and_loop_block_gated_on_env() {
+    fn nudge_gated_on_env() {
         assert_eq!(decision_for(Outcome::Nudge, false), None);
         assert_eq!(decision_for(Outcome::Nudge, true), Some("nudge"));
-        assert_eq!(decision_for(Outcome::LoopBlock, false), None);
-        assert_eq!(decision_for(Outcome::LoopBlock, true), Some("nudge"));
     }
 
     #[test]
