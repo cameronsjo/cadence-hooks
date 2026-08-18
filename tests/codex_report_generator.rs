@@ -125,6 +125,147 @@ fn check_preserves_the_absent_workspace_exemption() {
     assert!(stderr(&output).contains("wiring unverified: no plugin checkout beside this repo"));
 }
 
+fn write_two_plugin_fixture(workspace: &Path) {
+    let guardrails_hooks = workspace.join("cadence/plugins/cadence-guardrails/hooks");
+    fs::create_dir_all(&guardrails_hooks).expect("create guardrails plugin fixture");
+    fs::write(
+        guardrails_hooks.join("hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "^Bash$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm"
+                    }]
+                }]
+            }
+        }))
+        .expect("serialize guardrails fixture"),
+    )
+    .expect("write guardrails plugin fixture");
+
+    let cadence_hooks = workspace.join("cadence/plugins/cadence/hooks");
+    fs::create_dir_all(&cadence_hooks).expect("create cadence plugin fixture");
+    fs::write(
+        cadence_hooks.join("hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "^Write$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" cadence terminology"
+                    }]
+                }]
+            }
+        }))
+        .expect("serialize cadence fixture"),
+    )
+    .expect("write cadence plugin fixture");
+}
+
+#[test]
+fn normal_write_refuses_a_partial_wiring_wipe() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    write_two_plugin_fixture(&workspace);
+
+    let report = temp.path().join("report.json");
+    let baseline = run_generator(&workspace, Some(&report), &[]);
+    assert!(baseline.status.success(), "{}", stderr(&baseline));
+    let original_bytes = fs::read(&report).expect("read baseline report");
+
+    // Drop one plugin's wiring entirely, then regenerate against the same
+    // output — the guardrails plugin is now missing from the render while
+    // the checked-in report still carries its wiring.
+    fs::remove_dir_all(workspace.join("cadence/plugins/cadence-guardrails"))
+        .expect("remove guardrails plugin dir");
+
+    let output = run_generator(&workspace, Some(&report), &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(error.contains("cadence-guardrails"));
+    assert!(error.contains("--retired-plugin"));
+    assert_eq!(
+        fs::read(&report).expect("read report after refused write"),
+        original_bytes,
+        "refused write must not touch the output file"
+    );
+}
+
+#[test]
+fn normal_write_accepts_a_legitimate_wiring_edit() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    write_two_plugin_fixture(&workspace);
+
+    let report = temp.path().join("report.json");
+    let baseline = run_generator(&workspace, Some(&report), &[]);
+    assert!(baseline.status.success(), "{}", stderr(&baseline));
+
+    // Change the guardrails matcher without dropping the plugin's wiring
+    // entirely — both plugins still carry wiring, so this is not a wipe.
+    fs::write(
+        workspace.join("cadence/plugins/cadence-guardrails/hooks/hooks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "^Edit$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-cadence-hooks.sh\" guardrails guard-rm"
+                    }]
+                }]
+            }
+        }))
+        .expect("serialize edited guardrails fixture"),
+    )
+    .expect("rewrite guardrails plugin fixture");
+
+    let output = run_generator(&workspace, Some(&report), &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let generated: Value =
+        serde_json::from_slice(&fs::read(&report).expect("read report")).expect("report json");
+    let guard_rm = generated["hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hook| hook["name"] == "guard-rm")
+        .expect("guard-rm row");
+    assert_eq!(guard_rm["wiring"][0]["matcher"].as_str().unwrap(), "^Edit$");
+}
+
+#[test]
+fn retired_plugin_flag_permits_the_wipe_it_names() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    write_two_plugin_fixture(&workspace);
+
+    let report = temp.path().join("report.json");
+    let baseline = run_generator(&workspace, Some(&report), &[]);
+    assert!(baseline.status.success(), "{}", stderr(&baseline));
+
+    fs::remove_dir_all(workspace.join("cadence/plugins/cadence-guardrails"))
+        .expect("remove guardrails plugin dir");
+
+    let output = run_generator(
+        &workspace,
+        Some(&report),
+        &["--retired-plugin", "cadence-guardrails"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let generated: Value =
+        serde_json::from_slice(&fs::read(&report).expect("read report")).expect("report json");
+    let guard_rm = generated["hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hook| hook["name"] == "guard-rm")
+        .expect("guard-rm row");
+    assert!(guard_rm["wiring"].as_array().unwrap().is_empty());
+}
+
 #[test]
 fn malformed_plugin_input_does_not_echo_contents_or_mutate_output() {
     let temp = tempfile::tempdir().expect("temp dir");
