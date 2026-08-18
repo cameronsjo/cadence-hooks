@@ -134,6 +134,26 @@ def _wiring_is_empty(text: str) -> bool:
     return all(not hook.get("wiring") for hook in doc.get("hooks", []))
 
 
+def _plugins_with_wiring(text: str) -> set[str]:
+    """The set of plugin names carrying at least one wiring entry in `text`.
+
+    Unparsable text returns an empty set, so the shortfall-guard comparison
+    that consumes this simply skips (fail-open per ADR-0001) rather than
+    treating a corrupt render as a wipe of every plugin's wiring.
+    """
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        return set()
+    plugins: set[str] = set()
+    for hook in doc.get("hooks", []):
+        for entry in hook.get("wiring", []):
+            plugin = entry.get("plugin")
+            if plugin:
+                plugins.add(plugin)
+    return plugins
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -145,6 +165,17 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--stdout", action="store_true")
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--retired-plugin",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Plugin name to exempt from the partial-wipe shortfall check "
+            "(repeatable) — the escape hatch for a genuinely retired plugin "
+            "whose wiring is expected to disappear."
+        ),
+    )
     args = parser.parse_args()
     rendered = json.dumps(
         build(args.binary.resolve(), args.workspace.resolve()),
@@ -206,6 +237,22 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if args.output.exists():
+        checked_in = args.output.read_text(encoding="utf-8")
+        missing = (
+            _plugins_with_wiring(checked_in)
+            - _plugins_with_wiring(rendered)
+            - set(args.retired_plugin)
+        )
+        if missing:
+            print(
+                "Codex compatibility report not written: "
+                f"{', '.join(sorted(missing))} had wiring in the checked-in report "
+                "but none in this render; pass --retired-plugin NAME for each "
+                "plugin genuinely retired, or fix the workspace/plugin checkout",
+                file=sys.stderr,
+            )
+            return 1
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(rendered, encoding="utf-8")
     return 0
