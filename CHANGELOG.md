@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`.GIT` no longer evades `GitRoot` protection on a case-insensitive volume (cameronsjo/cadence-hooks#657).** The `.git`-segment match in `pathclass::has_git_component` — and guard-rm's attributed duplicate of it — compared bytes exactly, so `rm -rf repo/.GIT` classified as ordinary source while APFS (case-insensitive by default) resolved the path to the real `.git` and deleted the repository's history. Both predicates now compare the segment with `eq_ignore_ascii_case`. Folding only ever promotes a path *into* `GitRoot`, never out of it, so on a genuinely case-sensitive volume the worst outcome is protecting a directory that merely looks like a repo — no allow-side carve-out widens. No other segment comparison folds: `.claude`, `docs/plans`, and the temp/home/vault predicates feed ALLOW decisions, where folding would widen a silent allow instead.
+
 ## [0.80.0] - 2026-08-16
 
 ### Added

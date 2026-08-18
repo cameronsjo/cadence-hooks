@@ -1100,7 +1100,12 @@ fn classify_operand(
     }
 }
 
-/// True when any `/`-separated segment of `norm` is exactly `.git`.
+/// True when any `/`-separated segment of `norm` is `.git`, compared
+/// case-insensitively.
+///
+/// Case-insensitive volumes (the APFS default) resolve `.GIT` to the real
+/// `.git`, so a case-sensitive match let `.GIT` walk past GitRoot protection.
+/// Folding only ever promotes a path *into* GitRoot, never out of it.
 ///
 /// Deliberately duplicates `pathclass`'s private predicate of the same name
 /// (this module's reuse ledger: promote when cheap, else duplicate with
@@ -1108,7 +1113,7 @@ fn classify_operand(
 /// apart, and the shared classifier answers only the union — exposing its
 /// internals to serve one consumer would couple the two without real reuse.
 fn has_git_component(norm: &str) -> bool {
-    norm.split('/').any(|seg| seg == ".git")
+    norm.split('/').any(|seg| seg.eq_ignore_ascii_case(".git"))
 }
 
 /// The decision core: collect targets, classify each, and keep the most severe
@@ -1770,6 +1775,17 @@ mod tests {
         );
     }
 
+    /// #657: on a case-insensitive volume `.GIT` *is* the repo's `.git`, so the
+    /// temp carve-out must not release it either. No probe fires here — the
+    /// verdict comes from the literal segment alone.
+    #[test]
+    fn dot_git_case_variant_under_temp_blocks() {
+        assert_eq!(
+            judge_with("rm -rf /tmp/repo/.GIT", "/home", &[]),
+            Outcome::Block
+        );
+    }
+
     #[test]
     fn session_intro_allows() {
         assert_eq!(
@@ -2049,6 +2065,20 @@ mod tests {
         );
         assert_eq!(
             judge_with_symlinks("rm /srv/repo/.git", "/home", &[], &["/srv/repo/.git"]),
+            Outcome::Block
+        );
+    }
+
+    /// #657's twin of the symlink case: the same probe-free literal path, spelled
+    /// in the case a case-insensitive volume also resolves to the real `.git`.
+    #[test]
+    fn a_symlinked_git_component_case_variant_still_blocks() {
+        assert_eq!(
+            judge_with_symlinks("rm -rf /srv/repo/.GIT", "/home", &[], &["/srv/repo/.GIT"]),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge_with_symlinks("rm /srv/repo/.GIT", "/home", &[], &["/srv/repo/.GIT"]),
             Outcome::Block
         );
     }
