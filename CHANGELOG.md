@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`guard_rm_liveness`'s module doc dropped a stale claim about the operator's `permissions.allow`/`deny` rows.** It named `Bash(rm:*)` as always in `allow` and `deny` as covering only `/` and `/var/log` — a per-machine, per-date settings snapshot presented as a fixed fact. Reworded to note the blocks drift instead of asserting their current contents.
+
 ## [0.80.0] - 2026-08-16
 
 ### Added
