@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scripts/generate-codex-report.py` now refuses a partial wiring wipe, not just a total one.** The existing all-empty guard only caught a render where *every* plugin's wiring vanished; a workspace missing just one plugin dir (a moved checkout, a bad `--workspace`, a botched sibling sync) still rendered non-empty wiring overall and sailed through, silently dropping that plugin's wiring from the checked-in report. A new `_plugins_with_wiring()` helper compares the set of plugins carrying wiring in the checked-in report against the fresh render; any plugin present in the former and absent from the latter refuses the write and names the missing plugin(s). A new repeatable `--retired-plugin NAME` flag is the escape hatch for a genuinely retired plugin whose wiring is expected to disappear.
+
 ## [0.80.0] - 2026-08-16
 
 ### Added
