@@ -277,9 +277,15 @@ fn is_first_level_home_child(norm: &str, home: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
 }
 
-/// Any `/`-separated segment of `norm` is exactly `.git`.
+/// Any `/`-separated segment of `norm` is `.git`, compared case-insensitively.
+///
+/// Case-insensitive volumes (the APFS default) resolve `.GIT` to the real
+/// `.git`, so a case-sensitive match let `.GIT` walk past GitRoot protection.
+/// Folding only ever promotes a path *into* GitRoot, never out of it, so on a
+/// case-sensitive volume the worst outcome is protecting a directory that
+/// merely looks like a repo.
 fn has_git_component(norm: &str) -> bool {
-    norm.split('/').any(|seg| seg == ".git")
+    norm.split('/').any(|seg| seg.eq_ignore_ascii_case(".git"))
 }
 
 #[cfg(test)]
@@ -524,6 +530,18 @@ mod tests {
     fn dot_git_component_is_git_root() {
         assert_eq!(class("/a/repo/.git", "/Users/x"), PathClass::GitRoot);
         assert_eq!(class("/a/repo/.git/hooks", "/Users/x"), PathClass::GitRoot);
+    }
+
+    /// #657: a case-insensitive volume resolves `.GIT` to the real `.git`, so
+    /// the segment match folds case. The negative controls prove the fold did
+    /// not widen into substring matching.
+    #[test]
+    fn dot_git_component_case_variants_are_git_root() {
+        assert_eq!(class("/a/repo/.GIT", "/Users/x"), PathClass::GitRoot);
+        assert_eq!(class("/a/repo/.Git", "/Users/x"), PathClass::GitRoot);
+        assert_eq!(class("/a/repo/.GIT/hooks", "/Users/x"), PathClass::GitRoot);
+        assert_eq!(class("/a/repo/.gitx", "/Users/x"), PathClass::Source);
+        assert_eq!(class("/a/repo/x.GIT", "/Users/x"), PathClass::Source);
     }
 
     #[test]
