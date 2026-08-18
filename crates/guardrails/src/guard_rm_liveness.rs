@@ -7,9 +7,9 @@
 //! `Bash(rm -r:*)`) sat under `guard-rm` as a belt: if the guard did not run,
 //! the settings row still prompted. Those rows were retired because they had no
 //! filesystem awareness — they fired on deletes `guard-rm` had already proven
-//! safe. `Bash(rm:*)` remains in `allow`, and `deny` covers only `/` and
-//! `/var/log`, so with the belt gone a `guard-rm` that silently fails to run
-//! means `rm -rf` executes with no prompt anywhere.
+//! safe. What the operator's `allow`/`deny` blocks contain is a per-machine,
+//! per-date snapshot that drifts, so with the belt gone a `guard-rm` that
+//! silently fails to run can mean `rm -rf` executes with no prompt anywhere.
 //!
 //! That failure is invisible by construction: [`Outcome::Allow`] is a silent
 //! exit 0 and only denials reach `denials.jsonl`, so "guard-rm inspected this

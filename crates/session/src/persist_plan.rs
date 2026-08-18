@@ -28,26 +28,42 @@
 //! UserPromptSubmit-exclusive, since `PersistPlanApproval` never sees an
 //! injected prompt to strip a prefix from in the first place.
 //!
-//! Late-scan re-fire recognition runs two layers, in order: **row → dir
-//! scan** (cadence-hooks#690). The row layer ([`machine_already_persisted`])
-//! asks the machine-local `plan-links.jsonl` stream "did THIS MACHINE already
-//! persist THIS body?" — cwd-independent, so a session whose cwd wanders into
-//! a sibling repo skips before any plans-dir path is resolved or created
-//! (`repo_root` itself is still resolved by the earlier gates), and
-//! session-independent, because a session id does not survive the plan: every
-//! `/clear`/compaction restart mints a new id while the harness re-injects
-//! the same `planContent`, so a session-keyed row re-opened the loop at every
-//! restart (cadence-hooks#699 — the original #690 fix shipped that keying and
-//! it escaped within hours). The body hash is the durable identity of an
-//! approved plan; the row is the machine's memory of having persisted it. The
-//! dir-scan layer ([`plans_dir_contains_hash`]) remains as the second layer
-//! (a wiped metrics file, rows beyond the tail window, pre-fix sessions with
-//! no rows); its per-file matching keeps its own internal tiers (frontmatter
-//! key → legacy trailer → recompute — see [`file_matches_body`]). The two
-//! layers are never numbered as one sequence. `CADENCE_PERSIST_PLAN_FORCE`
-//! (any non-empty value) skips the row layer for the turn — the returnable
-//! escape for any intentional re-persist, including the same approved body
-//! into a second repo.
+//! Re-fire recognition runs THREE layers, in order, on BOTH trigger paths
+//! (cadence-hooks#703 extended cadence-hooks#690's late-path-only layers to the
+//! prefix path too — a resumed session replaying the same injected prompt
+//! re-nudged forever otherwise, since the prefix path never consulted either
+//! layer before this fold): **row → dir-hash scan → dir-session-id scan**.
+//! The row layer ([`machine_already_persisted`]) asks the machine-local
+//! `plan-links.jsonl` stream "did THIS MACHINE already persist THIS body?" —
+//! cwd-independent, so a session whose cwd wanders into a sibling repo skips
+//! before any plans-dir path is resolved or created (`repo_root` itself is
+//! still resolved by the earlier gates), and session-independent, because a
+//! session id does not survive the plan: every `/clear`/compaction restart
+//! mints a new id while the harness re-injects the same `planContent`, so a
+//! session-keyed row re-opened the loop at every restart (cadence-hooks#699 —
+//! the original #690 fix shipped that keying and it escaped within hours).
+//! The body hash is the durable identity of an approved plan; the row is the
+//! machine's memory of having persisted it. A row-tier skip is silent
+//! (`CheckResult::allow()`) and leaves an observability trail in
+//! `<metrics_dir>/plan-skips.jsonl` naming the matched `plan_path`
+//! (cadence-hooks#695) — never a nudge, and never gated on that path still
+//! existing on disk. The dir-hash-scan layer
+//! ([`plans_dir_contains_hash`]) is the second layer (a wiped metrics file,
+//! rows beyond the tail window, pre-fix sessions with no rows); its per-file
+//! matching keeps its own internal tiers (frontmatter key → legacy trailer →
+//! recompute — see [`file_matches_body`]). The dir-session-id-scan layer
+//! ([`plans_dir_contains_approved_session`]) is the third and last: a living
+//! plan's body legitimately drifts after persist (ticked checkboxes, appended
+//! `## Deviations`/`## Learnings`), which can defeat hash-based recognition
+//! entirely, but the approving parent's session id — resolved by
+//! [`find_parent`], the same scan that resolves `approved_in` — never
+//! changes once a document's frontmatter records it. This layer only runs
+//! after a hash-scan miss, and only when a parent actually resolved; on
+//! match it appends a plan-links row (cross-repo memory of the recognition)
+//! and skips. None of the three layers are ever numbered as one sequence.
+//! `CADENCE_PERSIST_PLAN_FORCE` (any non-empty value) skips the row layer for
+//! the turn — the returnable escape for any intentional re-persist, including
+//! the same approved body into a second repo.
 //!
 //! Never blocks (ADR-0001): every failure path — no prompt/no plan text, no
 //! match, no `cwd`, not a git repo, unsafe session id, exhausted suffix ladder,
@@ -235,9 +251,12 @@ pub fn run_persist_plan(
     // LATER, ordinary prompt whose transcript head carries the injected
     // `planContent` entry. The late path normalizes through the same
     // prefix-strip + suffix-strip so all three triggers hash byte-identical
-    // bodies (Design 18).
-    let (body, via_late_scan) = match prompt.strip_prefix(PLAN_PREFIX) {
-        Some(rest) => (strip_trailing_suffix_lines_and_trim(rest), false),
+    // bodies (Design 18). Which path extracted the body no longer steers
+    // anything downstream (cadence-hooks#703 dropped the `via_late_scan`
+    // gates on all three recognition layers) — the boolean this match used to
+    // also return is gone.
+    let body = match prompt.strip_prefix(PLAN_PREFIX) {
+        Some(rest) => strip_trailing_suffix_lines_and_trim(rest),
         None => match input
             .transcript_path()
             .and_then(|tp| injected_plan_from_transcript(Path::new(tp)))
@@ -248,7 +267,7 @@ pub fn run_persist_plan(
                 // harness variant which DOES prefix it still hashes
                 // byte-identical to the other two paths.
                 let rest = injected.strip_prefix(PLAN_PREFIX).unwrap_or(&injected);
-                (strip_trailing_suffix_lines_and_trim(rest), true)
+                strip_trailing_suffix_lines_and_trim(rest)
             }
             None => return CheckResult::allow(),
         },
@@ -272,71 +291,130 @@ pub fn run_persist_plan(
     };
 
     let body_hash = sha256_hex(body.as_bytes());
-    // Recognition layer 1 of 2 — the row check (cadence-hooks#690): did this
-    // MACHINE already persist THIS body? Runs BEFORE any plans-dir
-    // resolution, so a session whose cwd has wandered into a sibling repo
-    // never invents (or even resolves) a `docs/plans/` there on a skip turn.
-    // Deliberately NOT session-keyed (cadence-hooks#699): a session id dies
-    // at every /clear/compaction restart while the injected `planContent`
-    // lives on, so a session-keyed row re-opened the loop at every restart.
-    // The rare legitimate re-persist of the same body (a second repo) rides
+    let machine_digest = crate::provenance::machine_digest(host);
+    // Resolved AHEAD of the persist decision (cadence-hooks#703 — was
+    // computed just before the frontmatter fields, well after the recognition
+    // gates below) — but AFTER the row-tier gate, not ahead of it: the row
+    // check needs neither `parent` nor a plans-dir resolution, and this hook
+    // fires on every UserPromptSubmit, so a sibling-transcript directory scan
+    // on every row-suppressed turn would be wasted work the row tier's own
+    // "runs BEFORE any plans-dir resolution" discipline was written to avoid.
+    // Resolved here because the third recognition layer below needs the
+    // approving parent's session id, which only `find_parent` can supply.
+    // Otherwise unchanged: same scan, same `SystemTime::now()`, same use for
+    // `approved_in`/model/harness fallback further down.
+    //
+    // Recognition layer 1 of 3 — the row check (cadence-hooks#690, extended to
+    // both trigger paths by cadence-hooks#703): did this MACHINE already
+    // persist THIS body? Runs BEFORE any plans-dir resolution, so a session
+    // whose cwd has wandered into a sibling repo never invents (or even
+    // resolves) a `docs/plans/` there on a skip turn. Deliberately NOT
+    // session-keyed (cadence-hooks#699): a session id dies at every
+    // /clear/compaction restart while the injected `planContent` lives on, so
+    // a session-keyed row re-opened the loop at every restart. The rare
+    // legitimate re-persist of the same body (a second repo) rides
     // `CADENCE_PERSIST_PLAN_FORCE`. The skip is silent — the row exists only
     // because a persist already nudged once, and the per-prompt re-nudge is
-    // the noise this layer removes.
-    let machine_digest = crate::provenance::machine_digest(host);
-    if via_late_scan
-        && !persist_plan_force()
-        && machine_already_persisted(&body_hash, &machine_digest)
+    // the noise this layer removes. No longer gated on `via_late_scan`
+    // (cadence-hooks#703): a resumed session replaying the same prefixed
+    // prompt re-nudged forever before this fold, since the prefix path never
+    // consulted the row at all.
+    if !persist_plan_force()
+        && let Some(matched_plan_path) = machine_already_persisted(&body_hash, &machine_digest)
     {
+        // Observability (cadence-hooks#695): the skip is otherwise silent —
+        // this is the only artifact naming WHICH plan_path explained it.
+        // Never a nudge, and never gated on `matched_plan_path` still
+        // existing on disk (a stray record naming a since-deleted file is
+        // still useful attribution).
+        append_plan_skip_row(utc_now, &body_hash, &matched_plan_path, &machine_digest);
         return CheckResult::allow();
     }
     let slug = slugify(&body);
-    // Recognition layer 2 of 2 — the dir-wide scan: the late path re-fires on
-    // EVERY subsequent prompt of the session, and the persist date may differ
-    // from the approval date — so the same-stem claim ladder alone cannot
-    // recognize an earlier persist under an earlier date. Any existing plan
-    // doc carrying this body hash makes the late scan a silent idempotent
-    // skip. Covers what the row check cannot (a wiped metrics file, a row
-    // beyond the tail window, pre-row sessions). Resolves the plans dir via
-    // the EXISTING-only variant — a scan must never create the directory it
-    // scans (the wrong-repo `docs/plans/` invention of cadence-hooks#690).
-    // The prefix path keeps its original semantics (one injection, one date).
-    if via_late_scan
-        && let Some((canonical_repo_root, scan_dir)) = existing_canonical_plans_dir(&repo_root)
-        && let Some(matched_path) = plans_dir_contains_hash(&scan_dir, &body_hash)
-    {
-        // This path recognizes a re-fire but never itself wrote the row (the
-        // original persist did, or would have — a row beyond the scan
-        // window). Append one now so the row-check layer above suppresses
-        // subsequent turns for this body on this machine (the row is what
-        // makes the row-check's own skip fire) — `parent_session_id` is
-        // `None` by construction: a plan already committed to `docs/plans/`
-        // has no approving parent this hook can resolve here, so this
-        // deliberately never reaches for `find_parent`. Nudge only when a
-        // tier was parsed — this is a re-fire recognition, not a fresh
-        // persist, so the "persisted to"/format-gate sentences don't apply.
-        let plan_path_rel = repo_relative(&matched_path, &canonical_repo_root);
-        let tier = recommended_tier(&body);
-        append_plan_links_row(&plan_links_row(
-            utc_now,
-            None,
-            session_id,
-            &machine_digest,
-            &plan_path_rel,
-            &body_hash,
-            tier.map(Tier::as_str),
-        ));
-        return match tier {
-            Some(t) => CheckResult::nudge(model_check_directive(t)),
-            None => CheckResult::allow(),
-        };
-    }
-    let stem = format!("{local_date}-{slug}");
-
+    // Resolved only now that the row tier didn't already suppress this turn —
+    // the third recognition layer below needs the approving parent's session
+    // id, which only `find_parent` can supply.
     let parent = input
         .transcript_path()
         .and_then(|tp| find_parent(Path::new(tp), &body_hash, SystemTime::now()));
     let parent_session_id = parent.as_ref().map(|p| p.session_id.as_str());
+    // Recognition layers 2 and 3 of 3 — the dir-wide scans: the late path
+    // re-fires on EVERY subsequent prompt of the session, and the persist
+    // date may differ from the approval date — so the same-stem claim ladder
+    // alone cannot recognize an earlier persist under an earlier date. Now
+    // also unconditional on `via_late_scan` (cadence-hooks#703) — a resumed
+    // session replaying the same prefixed prompt gets the same recognition as
+    // a late re-fire. Resolves the plans dir via the EXISTING-only variant —
+    // a scan must never create the directory it scans (the wrong-repo
+    // `docs/plans/` invention of cadence-hooks#690).
+    if let Some((canonical_repo_root, scan_dir)) = existing_canonical_plans_dir(&repo_root) {
+        // Layer 2: any existing plan doc carrying this body hash makes the
+        // re-fire a silent idempotent skip. Covers what the row check cannot
+        // (a wiped metrics file, a row beyond the tail window, pre-row
+        // sessions).
+        if let Some(matched_path) = plans_dir_contains_hash(&scan_dir, &body_hash) {
+            // This path recognizes a re-fire but never itself wrote the row
+            // (the original persist did, or would have — a row beyond the
+            // scan window). Append one now so the row-check layer above
+            // suppresses subsequent turns for this body on this machine (the
+            // row is what makes the row-check's own skip fire) —
+            // `parent_session_id` is `None` by construction: a plan already
+            // committed to `docs/plans/` has no approving parent this hook
+            // can resolve HERE (the resolved `parent` above answers "who
+            // approved the CURRENT turn's body", not "who approved the
+            // MATCHED document" — a hash match is a re-fire of the exact same
+            // approval, so recording it as unknown rather than conflating the
+            // two is deliberate). Nudge only when a tier was parsed — this is
+            // a re-fire recognition, not a fresh persist, so the "persisted
+            // to"/format-gate sentences don't apply.
+            let plan_path_rel = repo_relative(&matched_path, &canonical_repo_root);
+            let tier = recommended_tier(&body);
+            append_plan_links_row(&plan_links_row(
+                utc_now,
+                None,
+                session_id,
+                &machine_digest,
+                &plan_path_rel,
+                &body_hash,
+                tier.map(Tier::as_str),
+            ));
+            return match tier {
+                Some(t) => CheckResult::nudge(model_check_directive(t)),
+                None => CheckResult::allow(),
+            };
+        }
+        // Layer 3 (cadence-hooks#703): a hash-scan miss doesn't rule out a
+        // re-fire — a living plan's body legitimately drifts after persist
+        // (ticked checkboxes, appended `## Deviations`/`## Learnings`), which
+        // defeats hash-based recognition entirely. But the approving
+        // session's identity never changes once a document's frontmatter
+        // records it, so a doc carrying THIS turn's resolved parent as its
+        // `approved_session_id` is the same approval, however far the body
+        // has since moved. Only runs when a parent actually resolved —
+        // `parent_session_id` unresolved means there is nothing to match
+        // against, not a decision to skip this layer.
+        if let Some(sid) = parent_session_id
+            && let Some(matched_path) = plans_dir_contains_approved_session(&scan_dir, sid)
+        {
+            let plan_path_rel = repo_relative(&matched_path, &canonical_repo_root);
+            let tier = recommended_tier(&body);
+            append_plan_links_row(&plan_links_row(
+                utc_now,
+                parent_session_id,
+                session_id,
+                &machine_digest,
+                &plan_path_rel,
+                &body_hash,
+                tier.map(Tier::as_str),
+            ));
+            return match tier {
+                Some(t) => CheckResult::nudge(model_check_directive(t)),
+                None => CheckResult::allow(),
+            };
+        }
+    }
+    let stem = format!("{local_date}-{slug}");
+
     let parent_name = parent_session_id.map(identity::generate_name);
     let own_name = identity::generate_name(session_id);
 
@@ -573,7 +651,8 @@ fn persist_plan_force() -> bool {
     std::env::var("CADENCE_PERSIST_PLAN_FORCE").is_ok_and(|v| !v.is_empty())
 }
 
-/// Has this MACHINE already persisted THIS plan body?
+/// Has this MACHINE already persisted THIS plan body? Returns the matched
+/// row's `plan_path` on a hit — `None` on any miss, ambiguity, or failure.
 ///
 /// Tail-anchored bounded read of `<metrics_dir>/plan-links.jsonl` — the row
 /// [`append_plan_links_row`] writes on every successful persist. The file is
@@ -600,24 +679,30 @@ fn persist_plan_force() -> bool {
 /// dir scan, like every other miss.
 ///
 /// Fail-open (ADR-0001) in every direction: an unreadable or absent file,
-/// malformed rows, or a matching row that has scrolled out of the
-/// [`PLAN_LINKS_SCAN_MAX_BYTES`] tail window all read as `false`, degrading
-/// to the dir scan (at worst one benign duplicate, never a lost persist).
-/// `metrics_dir()`'s `CADENCE_METRICS_DIR` tier is production, not a test
-/// seam — this read honors it like every other consumer.
-fn machine_already_persisted(body_hash: &str, machine_digest: &str) -> bool {
+/// malformed rows, a row missing `plan_path`, or a matching row that has
+/// scrolled out of the [`PLAN_LINKS_SCAN_MAX_BYTES`] tail window all read as
+/// `None`, degrading to the dir scan (at worst one benign duplicate, never a
+/// lost persist). `metrics_dir()`'s `CADENCE_METRICS_DIR` tier is production,
+/// not a test seam — this read honors it like every other consumer.
+///
+/// The returned `plan_path` feeds only [`append_plan_skip_row`]'s
+/// observability record (cadence-hooks#695) — never a nudge, and never a
+/// second existence check against the filesystem (a stray record naming a
+/// since-deleted file is still useful attribution, not a reason to gate).
+fn machine_already_persisted(body_hash: &str, machine_digest: &str) -> Option<String> {
     let path = cadence_hooks_metrics::metrics_dir().join("plan-links.jsonl");
-    let Some(tail) =
-        cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)
-    else {
-        return false;
-    };
-    tail.lines().any(|line| {
-        let Ok(row) = serde_json::from_str::<Value>(line) else {
-            return false;
-        };
-        row.get("body_sha256").and_then(Value::as_str) == Some(body_hash)
+    let tail = cadence_hooks_core::transcript::read_tail_bounded(&path, PLAN_LINKS_SCAN_MAX_BYTES)?;
+    tail.lines().find_map(|line| {
+        let row = serde_json::from_str::<Value>(line).ok()?;
+        if row.get("body_sha256").and_then(Value::as_str) == Some(body_hash)
             && row.get("machine").and_then(Value::as_str) == Some(machine_digest)
+        {
+            row.get("plan_path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
     })
 }
 
@@ -805,7 +890,42 @@ const DIR_HASH_SCAN_MAX_FILES: usize = 512;
 /// "no match" and lets the claim ladder — which dedupes within the same stem
 /// — take over.
 fn plans_dir_contains_hash(plans_dir: &Path, body_hash: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(plans_dir).ok()?;
+    newest_markdown_candidates(plans_dir)
+        .into_iter()
+        .find(|path| file_matches_body(path, body_hash))
+}
+
+/// Does any markdown document in `plans_dir` carry `session_id` as its LEADING
+/// frontmatter's `approved_session_id:` value? The third recognition layer
+/// (cadence-hooks#703): a living plan's body legitimately drifts after
+/// persist (ticked checkboxes, appended `## Deviations`/`## Learnings`),
+/// which can defeat [`plans_dir_contains_hash`] entirely — but the approving
+/// session's identity, once a document's frontmatter records it, never
+/// changes. Same newest-first, capped, regular-files-only candidate list as
+/// [`plans_dir_contains_hash`] ([`newest_markdown_candidates`]); per-file work
+/// is [`file_has_approved_session_id`]'s bounded read, exact-string compare
+/// only against the parsed (`yaml_unquote`'d) value. Committed frontmatter is
+/// untrusted input (security review of this change) — the compared value is
+/// never rendered or interpolated, only compared.
+fn plans_dir_contains_approved_session(plans_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    newest_markdown_candidates(plans_dir)
+        .into_iter()
+        .find(|path| file_has_approved_session_id(path, session_id))
+}
+
+/// Shared candidate list for both dir-scan layers: every regular `.md` file
+/// directly in `plans_dir`, newest-first (the sibling `find_parent` scan's
+/// discipline), capped at [`DIR_HASH_SCAN_MAX_FILES`] so a pathological
+/// directory degrades toward the most likely re-fire targets rather than
+/// scanning without bound. Gated to regular files only — a committed symlink
+/// (git stores them) pointing at a FIFO would otherwise block `File::open` on
+/// this every-turn path forever (security review of this change). Fail-open:
+/// an unreadable dir yields an empty list, and every caller treats "no
+/// candidates" as "no match".
+fn newest_markdown_candidates(plans_dir: &Path) -> Vec<PathBuf> {
+    let Some(entries) = fs::read_dir(plans_dir).ok() else {
+        return Vec::new();
+    };
     let mut candidates: Vec<(SystemTime, PathBuf)> = entries
         .flatten()
         .filter_map(|e| {
@@ -825,8 +945,8 @@ fn plans_dir_contains_hash(plans_dir: &Path, body_hash: &str) -> Option<PathBuf>
     candidates
         .into_iter()
         .take(DIR_HASH_SCAN_MAX_FILES)
-        .find(|(_, path)| file_matches_body(path, body_hash))
         .map(|(_, path)| path)
+        .collect()
 }
 
 /// SHA-256 of `bytes`, lowercase hex.
@@ -995,23 +1115,32 @@ pub(crate) fn leading_frontmatter_block(doc: &str) -> Option<&str> {
 /// Only an equality returns `true`; every ambiguity (unreadable, over
 /// [`IDEMPOTENCY_MAX_FILE_BYTES`], hash differs) returns `false` and lets the
 /// suffix ladder run.
-fn file_matches_body(path: &Path, body_hash: &str) -> bool {
+/// Bounded read of `path`, capped at [`IDEMPOTENCY_MAX_FILE_BYTES`] — shared
+/// by [`file_matches_body`] and [`file_has_approved_session_id`], which
+/// otherwise duplicated the identical open-take-read-and-size-check
+/// sequence. Caps the read itself rather than stat-then-read: a file over the
+/// cap is not a plan this hook wrote, and must not become an unbounded read.
+/// `None` on any open/read failure or an oversized file.
+fn read_capped_at_idempotency_limit(path: &Path) -> Option<String> {
     use std::io::Read as _;
 
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
+    let file = fs::File::open(path).ok()?;
     let mut content = String::new();
-    // Cap the read itself rather than stat-then-read: a file over the cap is
-    // not a plan this hook wrote, and must not become an unbounded read.
     if file
         .take(IDEMPOTENCY_MAX_FILE_BYTES + 1)
         .read_to_string(&mut content)
         .is_err()
         || content.len() as u64 > IDEMPOTENCY_MAX_FILE_BYTES
     {
-        return false;
+        return None;
     }
+    Some(content)
+}
+
+fn file_matches_body(path: &Path, body_hash: &str) -> bool {
+    let Some(content) = read_capped_at_idempotency_limit(path) else {
+        return false;
+    };
 
     if let Some(recorded) = leading_frontmatter_block(&content).and_then(|fm| {
         fm.lines()
@@ -1030,6 +1159,27 @@ fn file_matches_body(path: &Path, body_hash: &str) -> bool {
 
     let body = strip_trailing_suffix_lines_and_trim(strip_leading_frontmatter(&content));
     sha256_hex(body.as_bytes()) == body_hash
+}
+
+/// Does the document at `path` carry `session_id` as its LEADING
+/// frontmatter's `approved_session_id:` value? [`plans_dir_contains_approved_session`]'s
+/// per-file work — same bounded-read discipline as [`file_matches_body`]
+/// (capped at [`IDEMPOTENCY_MAX_FILE_BYTES`], frontmatter-only, never a
+/// whole-document scan), but EXACT string comparison only: no hash, no
+/// legacy-trailer fallback, no body recompute. The compared value is parsed
+/// (`yaml_unquote`'d) but never rendered back out — committed frontmatter is
+/// untrusted input (security review of this change). `false` on any read
+/// failure, oversized file, or absent key.
+fn file_has_approved_session_id(path: &Path, session_id: &str) -> bool {
+    let Some(content) = read_capped_at_idempotency_limit(path) else {
+        return false;
+    };
+    leading_frontmatter_block(&content)
+        .and_then(|fm| {
+            fm.lines()
+                .find_map(|l| l.strip_prefix("approved_session_id:"))
+        })
+        .is_some_and(|recorded| yaml_unquote(recorded.trim()) == session_id)
 }
 
 /// Try each candidate in order with `create_new` (O_EXCL): a fresh path wins
@@ -1371,7 +1521,7 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
 /// injection wall: [`Tier::as_str`]'s canonical lowercase name is the ONLY
 /// text [`recommended_tier`]'s callers ever render (the plan-links row, the
 /// nudge directive) — never the matched source text, which is untrusted plan
-/// content (same discipline as [`PANEL_GATE_NUDGE`] and its siblings below).
+/// content (same discipline as the format-gate line's stanza names below).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
     Fable,
@@ -1601,36 +1751,6 @@ fn model_check_directive(tier: Tier) -> String {
     )
 }
 
-/// The one static sentence appended to the persistence nudge when the
-/// approved plan carries no settled `Panel:` line (cameronsjo/cadence-hooks#623).
-/// Static by design: committed plan content is untrusted input, so the nudge
-/// never echoes any of it — detection is artifact-anchored (the line lives in
-/// the plan document, surviving the approve-and-clear session boundary that
-/// killed session-scoped markers, cameronsjo/cadence#578) and warn-tier only
-/// (a nudge needs no trust root, unlike the gate cameronsjo/cadence#392
-/// rejected).
-const PANEL_GATE_NUDGE: &str = "panel gate: this plan carries no settled Panel: line — run the \
-     plan-review panel before implementing, fold findings, or write \"Panel: none — <reason>\" \
-     (cadence:attune → plan-review-panel).";
-
-/// Static sentence appended when the plan body carries no
-/// `## Alternatives declined` stanza — the plan template's mandatory record
-/// of the approaches proposed and declined (or its explicit
-/// `none proposed — single obvious approach` assertion). Same static-only
-/// discipline as [`PANEL_GATE_NUDGE`]: the harness's own plan-mode template
-/// (Context/Changes/Verification) omits every cadence stanza, so this lint
-/// is the deterministic catch for that displacement (the living-plan-guards
-/// plan's Task 3 guard 4).
-const ALTERNATIVES_GATE_NUDGE: &str = "format gate: no Alternatives-declined stanza — record \
-     the approaches declined at planning (or \"none proposed — single obvious approach\").";
-
-/// Static sentence appended when the plan body carries no `- [ ]` checkbox
-/// tasks — a living plan's execution zone is its tickable checklist; without
-/// one, the tick discipline and the ready-flip guard both have nothing to
-/// hold on to.
-const CHECKBOX_GATE_NUDGE: &str = "format gate: no checkbox tasks — give the plan a tickable \
-     `- [ ]` checklist; the execution zone's ticks are what a resuming session reconciles.";
-
 /// True when the plan body carries an `## Alternatives declined` heading at
 /// line start ([`visible_lines`]'s fence/quote-skip discipline). Case-exact:
 /// the template writes it one way.
@@ -1677,8 +1797,9 @@ fn checkbox_present(body: &str) -> bool {
 /// tracker is deliberately naive — it toggles without matching fence
 /// lengths — which errs toward skipping ambiguous lines: on a malformed
 /// document the failure mode is a spurious nudge (fail-loud), never a
-/// suppressed one. Detection only; the caller appends the static
-/// [`PANEL_GATE_NUDGE`], never any matched text.
+/// suppressed one. Detection only; the caller names this stanza (a static
+/// string, "a settled Panel: line") in the composed format-gate line, never
+/// any matched text.
 fn panel_line_settled(body: &str) -> bool {
     let Some(rest) = visible_lines(body).find_map(|line| line.strip_prefix("Panel: ")) else {
         return false;
@@ -1751,20 +1872,26 @@ fn persist_and_nudge(
         "Verify placement, then commit it (explicit-path git add) before implementation.",
     );
     // Evaluated only after the claim succeeded: the persistence write must
-    // never depend on the detectors — a future panic here eats one nudge's
-    // sentence, never the persist (security review of this change). All
-    // three append static text only, never matched content.
+    // never depend on the detectors — a future panic here eats the format-gate
+    // line, never the persist (security review of this change). One composed
+    // line naming only the missing stanzas (cameronsjo/cadence-hooks#715) —
+    // never any matched plan text, only these static stanza names.
+    let mut missing_stanzas: Vec<&str> = Vec::new();
     if !panel_line_settled(plan_body) {
-        nudge.push(' ');
-        nudge.push_str(PANEL_GATE_NUDGE);
+        missing_stanzas.push("a settled Panel: line");
     }
     if !alternatives_stanza_present(plan_body) {
-        nudge.push(' ');
-        nudge.push_str(ALTERNATIVES_GATE_NUDGE);
+        missing_stanzas.push("an Alternatives-declined stanza");
     }
     if !checkbox_present(plan_body) {
+        missing_stanzas.push("checkbox tasks");
+    }
+    if !missing_stanzas.is_empty() {
         nudge.push(' ');
-        nudge.push_str(CHECKBOX_GATE_NUDGE);
+        nudge.push_str(&format!(
+            "format gate: plan lacks {} — see the plan template.",
+            missing_stanzas.join(", ")
+        ));
     }
     CheckResult::nudge(nudge)
 }
@@ -1834,6 +1961,56 @@ fn append_plan_links_row(row: &Value) {
         // single small write atomic), so a concurrent append from another
         // session can't interleave a record with its trailing newline — same
         // assumption as the crate's other metrics writers (e.g. `log_failopen`).
+        let mut line = row.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// Schema version stamped on every `plan-skips.jsonl` row — its own stream,
+/// its own version, independent of [`PLAN_LINKS_SCHEMA_VERSION`] (a new
+/// stream per cadence#238 convention).
+const PLAN_SKIPS_SCHEMA_VERSION: u32 = 1;
+
+/// Cap on `<metrics_dir>/plan-skips.jsonl`'s size, mirroring
+/// `cadence_hooks_metrics::common`'s `MAX_DIAGNOSTICS_BYTES` cap pattern
+/// (`crates/metrics/src/common.rs:72-86`: check-then-skip on a size probe
+/// before ever opening for append). The stream is purely observational
+/// (cadence-hooks#695) — a dropped record past this cap costs no functional
+/// idempotency, since the row tier's own suppression keeps working from
+/// `plan-links.jsonl` regardless of whether this sibling stream is being
+/// written.
+const PLAN_SKIPS_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Append one observability record to `<metrics_dir>/plan-skips.jsonl` when
+/// the row-tier layer silently suppresses a persist (cadence-hooks#695) — the
+/// gap this closes: a bare `CheckResult::allow()` left no artifact anywhere
+/// naming WHICH `plan_path` explained the skip, so answering "why didn't this
+/// persist" required re-deriving the hash by hand against `plan-links.jsonl`.
+///
+/// Fully fail-open (ADR-0001), same discipline as [`append_plan_links_row`]:
+/// a missing dir it can't create, a failed open/write, or a file already at
+/// [`PLAN_SKIPS_MAX_BYTES`] all degrade to a silent no-op. Never called on
+/// anything but the row-tier skip path — this must never become a nudge, and
+/// `plan_path` is written as given, never re-checked against the filesystem
+/// (a stray record naming a since-deleted file is still useful attribution).
+fn append_plan_skip_row(utc_now: &str, body_hash: &str, plan_path: &str, machine_digest: &str) {
+    let dir = cadence_hooks_metrics::metrics_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("plan-skips.jsonl");
+    if fs::metadata(&path).is_ok_and(|meta| meta.len() >= PLAN_SKIPS_MAX_BYTES) {
+        return;
+    }
+    let row = serde_json::json!({
+        "schemaVersion": PLAN_SKIPS_SCHEMA_VERSION,
+        "ts": utc_now,
+        "body_sha256": body_hash,
+        "plan_path": plan_path,
+        "machine": machine_digest,
+    });
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let mut line = row.to_string();
         line.push('\n');
         let _ = file.write_all(line.as_bytes());
@@ -3574,9 +3751,18 @@ mod tests {
             run_persist_plan(&bare, "2026-08-11T00:00:00Z", "2026-08-11", "test-host")
         });
         let msg = r.message.unwrap();
-        assert!(msg.contains("panel gate:"));
-        assert!(msg.contains("no Alternatives-declined stanza"));
-        assert!(msg.contains("no checkbox tasks"));
+        // One composed format-gate line naming every missing stanza
+        // (cameronsjo/cadence-hooks#715) — never three separate sentences.
+        assert!(msg.contains("format gate: plan lacks "));
+        assert!(msg.contains("a settled Panel: line"));
+        assert!(msg.contains("an Alternatives-declined stanza"));
+        assert!(msg.contains("checkbox tasks"));
+        assert!(msg.contains("see the plan template."));
+        assert_eq!(
+            msg.matches("format gate:").count(),
+            1,
+            "one composed line, not one per stanza: {msg}"
+        );
 
         // A template-conforming plan gets the plain persist nudge only.
         let full = make_user_prompt_submit(
@@ -3684,7 +3870,11 @@ mod tests {
             run_persist_plan(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
         });
         assert_eq!(r.outcome, Outcome::Nudge);
-        assert!(r.message.unwrap().contains(PANEL_GATE_NUDGE));
+        assert!(
+            r.message
+                .unwrap()
+                .contains("format gate: plan lacks a settled Panel: line")
+        );
 
         let prompt_settled = "Implement the following plan:\n\n# Fix the Sprocket\n\n\
                               Panel: reviewer ran — 1 finding, folded\n\nDo the thing.";
@@ -3698,7 +3888,10 @@ mod tests {
             run_persist_plan(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
         });
         assert_eq!(r.outcome, Outcome::Nudge);
-        assert!(!r.message.unwrap().contains("panel gate:"));
+        assert!(
+            !r.message.unwrap().contains("a settled Panel: line"),
+            "the Panel stanza is settled here — it must not appear among the missing stanzas"
+        );
     }
 
     #[test]
@@ -3724,8 +3917,8 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(
-            msg.contains(PANEL_GATE_NUDGE),
-            "unsettled Panel: line must append the static panel sentence: {msg}"
+            msg.contains("format gate: plan lacks a settled Panel: line"),
+            "unsettled Panel: line must name the missing stanza: {msg}"
         );
         assert!(
             !msg.contains("awaiting seat dispatch"),
@@ -3756,8 +3949,8 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(
-            !msg.contains("panel gate:"),
-            "a settled Panel: line must not trigger the panel sentence: {msg}"
+            !msg.contains("a settled Panel: line"),
+            "a settled Panel: line must not appear among the missing stanzas: {msg}"
         );
         // The absence assertion is equally settled.
         let plan_none = "# Fix the Sprocket\n\nPanel: none — raw-draft bypass per ask\n\nBody.";
@@ -3772,11 +3965,17 @@ mod tests {
             run_persist_plan_approval(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
         });
         assert_eq!(r.outcome, Outcome::Nudge);
-        assert!(!r.message.unwrap().contains("panel gate:"));
+        assert!(!r.message.unwrap().contains("a settled Panel: line"));
     }
 
     #[test]
-    fn end_to_end_re_fire_skips_write_but_still_nudges() {
+    fn end_to_end_prefix_path_re_fire_is_a_silent_row_tier_skip() {
+        // Pre-cadence-hooks#703, the prefix path never consulted the row (or
+        // dir-scan) tier at all, so an identical re-fire of the SAME prompt
+        // (a resumed session replaying the same injection) re-nudged every
+        // time. The row tier now applies to both trigger paths (T1) — a
+        // re-fire on the prefix path is recognized and silently suppressed
+        // exactly like a late-path re-fire.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -3790,17 +3989,22 @@ mod tests {
             &tmp.path().join("child-session-id.jsonl").to_string_lossy(),
         );
 
-        with_metrics_dir(metrics_dir.path(), || {
-            run_persist_plan(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host");
+        let r1 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-07-20T00:00:00Z", "2026-07-20", "test-host")
         });
+        assert_eq!(r1.outcome, Outcome::Nudge, "the first persist still nudges");
         let first_write =
             fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
 
         // Re-fire: same prompt, later timestamp (compaction/resume replay).
-        let r = with_metrics_dir(metrics_dir.path(), || {
+        let r2 = with_metrics_dir(metrics_dir.path(), || {
             run_persist_plan(&input, "2026-07-20T01:00:00Z", "2026-07-20", "test-host")
         });
-        assert_eq!(r.outcome, Outcome::Nudge, "re-fire still nudges");
+        assert_eq!(
+            r2.outcome,
+            Outcome::Allow,
+            "the row tier now silently suppresses a prefix-path re-fire too"
+        );
         let second_write =
             fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
         assert_eq!(
@@ -3935,6 +4139,13 @@ mod tests {
             "with the file gone, only the row can explain this skip"
         );
         assert!(!plan_file.exists(), "no re-write after the row-keyed skip");
+
+        // Observability (cadence-hooks#695): the otherwise-silent skip left a
+        // plan-skips.jsonl record naming the matched plan_path — never gated
+        // on that path still existing (it was just deleted above).
+        let skips = fs::read_to_string(metrics_dir.path().join("plan-skips.jsonl")).unwrap();
+        assert!(skips.contains(&row_tier_hash()));
+        assert!(skips.contains("docs/plans/2026-08-14-fix-the-widget.md"));
     }
 
     #[test]
@@ -4026,9 +4237,12 @@ mod tests {
     }
 
     #[test]
-    fn prefix_path_ignores_rows() {
-        // The prefix path fires once per injection by design — its
-        // one-injection-one-date semantics never consult the row tier.
+    fn prefix_path_honors_a_matching_machine_row() {
+        // cadence-hooks#703: the row tier used to be late-scan-only, so a
+        // prefix-path re-fire against an already-persisted body ignored a
+        // matching row and wrote (or attempted to write) anyway. The row tier
+        // now applies to the prefix path too — a matching row is a silent
+        // allow, and no plans dir is invented for the skip.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -4053,14 +4267,19 @@ mod tests {
         });
         assert_eq!(
             r.outcome,
-            Outcome::Nudge,
-            "prefix path persists despite the row"
+            Outcome::Allow,
+            "the row now suppresses the prefix path too"
         );
         assert!(
-            tmp.path()
-                .join("docs/plans/2026-08-14-fix-the-widget.md")
-                .exists()
+            !tmp.path().join("docs").exists(),
+            "no plans dir invented on a row-suppressed prefix-path turn"
         );
+
+        // Observability (cadence-hooks#695): the skip left a plan-skips.jsonl
+        // record naming the matched row's plan_path.
+        let skips = fs::read_to_string(metrics_dir.path().join("plan-skips.jsonl")).unwrap();
+        assert!(skips.contains(&row_tier_hash()));
+        assert!(skips.contains("docs/plans/2026-08-14-fix-the-widget.md"));
     }
 
     #[test]
@@ -4243,6 +4462,178 @@ mod tests {
                 .exists(),
             "no duplicate under the later date"
         );
+    }
+
+    #[test]
+    fn dir_hash_scan_now_recognizes_a_prefix_path_re_fire_under_a_different_date_stem() {
+        // cadence-hooks#703's T1: the dir-hash-scan layer used to be
+        // late-scan-only. A prefix-path re-fire of the SAME body under a
+        // DIFFERENT date-stem (a fresh metrics dir models the row tier having
+        // nothing to say) is exactly what defeated the same-stem claim ladder
+        // before this fold — now the dir scan catches it on the prefix path
+        // too, mirroring `late_persist_normalizes_to_the_same_hash_as_the_prefix_path`
+        // but with BOTH calls on the prefix path instead of prefix-then-late.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        let metrics_one = TempDir::new().unwrap();
+        let first = make_user_prompt_submit(
+            "child-session-id",
+            &format!("Implement the following plan:\n\n{ROW_TIER_BODY}"),
+            &cwd,
+            &tmp.path().join("child-session-id.jsonl").to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_one.path(), || {
+            run_persist_plan(&first, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(r1.outcome, Outcome::Nudge);
+
+        // A fresh metrics dir models the row tier having nothing to say —
+        // only the dir-hash scan can explain the skip below.
+        let metrics_two = TempDir::new().unwrap();
+        let second = make_user_prompt_submit(
+            "child-session-id-2",
+            &format!("Implement the following plan:\n\n{ROW_TIER_BODY}"),
+            &cwd,
+            &tmp.path()
+                .join("child-session-id-2.jsonl")
+                .to_string_lossy(),
+        );
+        let r2 = with_metrics_dir(metrics_two.path(), || {
+            run_persist_plan(&second, "2026-08-15T00:00:00Z", "2026-08-15", "test-host")
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Allow,
+            "the dir-hash scan recognizes the earlier-dated doc on the prefix path too"
+        );
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-08-15-fix-the-widget.md")
+                .exists(),
+            "no duplicate file under the later date"
+        );
+    }
+
+    #[test]
+    fn dir_session_id_scan_recognizes_a_drifted_living_plan_with_a_matching_approving_parent() {
+        // cadence-hooks#703's T2 (third recognition layer): a living plan's
+        // body legitimately drifts after persist (ticked boxes, appended
+        // Deviations/Learnings), which defeats hash-based recognition
+        // entirely — but the persisted doc's `approved_session_id` never
+        // changes, so a re-fire whose resolved approving parent matches it is
+        // still recognized. Simulated directly: hand-write a persisted doc
+        // whose frontmatter names the approving parent session id but whose
+        // BODY has drifted (no `body_sha256:` match possible), then run a
+        // late re-fire whose parent transcript resolves to that same
+        // session id.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let plans_dir = tmp.path().join("docs/plans");
+        fs::create_dir_all(&plans_dir).unwrap();
+
+        let plan_path = plans_dir.join("2026-08-10-fix-the-widget.md");
+        fs::write(
+            &plan_path,
+            "---\n\
+             status: \"in-flight\"\n\
+             updated: \"2026-08-10\"\n\
+             session: \"some-name\"\n\
+             session_id: \"some-session-id\"\n\
+             approved_in: \"parent-name\"\n\
+             approved_session_id: \"parent-session-id\"\n\
+             ---\n\n\
+             # Fix the Widget\n\n- [x] already done, body has drifted since persist\n",
+        )
+        .unwrap();
+
+        // The parent transcript `find_parent` must resolve — an ExitPlanMode
+        // line whose plan text hashes to the CURRENT (late) re-fire's body.
+        let parent_transcript = tmp.path().join("parent-session-id.jsonl");
+        fs::write(
+            &parent_transcript,
+            exit_plan_mode_line(ROW_TIER_BODY, None, None),
+        )
+        .unwrap();
+
+        let child_transcript = tmp.path().join("child-session-id.jsonl");
+        write_injected_transcript(&child_transcript, ROW_TIER_BODY);
+
+        let metrics_dir = TempDir::new().unwrap();
+        let late = make_user_prompt_submit(
+            "child-session-id",
+            "carry on",
+            &cwd,
+            &child_transcript.to_string_lossy(),
+        );
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&late, "2026-08-16T00:00:00Z", "2026-08-16", "test-host")
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Allow,
+            "no Driver: tier on this body — recognition is a silent allow"
+        );
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-08-16-fix-the-widget.md")
+                .exists(),
+            "the drifted-but-recognized doc must not get a duplicate sibling"
+        );
+
+        let rows = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
+        assert!(
+            rows.contains("\"parent_session_id\":\"parent-session-id\""),
+            "unlike the hash-scan-skip row, THIS layer resolved a real parent: {rows}"
+        );
+        assert!(rows.contains("docs/plans/2026-08-10-fix-the-widget.md"));
+    }
+
+    #[test]
+    fn force_env_bypasses_the_row_tier_on_the_prefix_path_too() {
+        // T5/T1: FORCE's escape must cover both trigger paths now that the
+        // row tier itself does.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+
+        let prompt = format!("Implement the following plan:\n\n{ROW_TIER_BODY}");
+        let input = make_user_prompt_submit(
+            "child-session-id",
+            &prompt,
+            &cwd,
+            &tmp.path().join("child-session-id.jsonl").to_string_lossy(),
+        );
+        let r1 = with_metrics_dir(metrics_dir.path(), || {
+            run_persist_plan(&input, "2026-08-14T00:00:00Z", "2026-08-14", "test-host")
+        });
+        assert_eq!(r1.outcome, Outcome::Nudge);
+        let plan_file = tmp.path().join("docs/plans/2026-08-14-fix-the-widget.md");
+        fs::remove_file(&plan_file).unwrap();
+
+        let r2 = with_metrics_dir(metrics_dir.path(), || {
+            // SAFETY: inside the METRICS_ENV_LOCK critical section — every
+            // test that reaches the FORCE read is a late-path test holding
+            // this same lock, so no concurrent reader sees a torn state.
+            unsafe {
+                std::env::set_var("CADENCE_PERSIST_PLAN_FORCE", "1");
+            }
+            let r = run_persist_plan(&input, "2026-08-14T01:00:00Z", "2026-08-14", "test-host");
+            // SAFETY: same lock as above.
+            unsafe {
+                std::env::remove_var("CADENCE_PERSIST_PLAN_FORCE");
+            }
+            r
+        });
+        assert_eq!(
+            r2.outcome,
+            Outcome::Nudge,
+            "FORCE must override the row tier on the prefix path too"
+        );
+        assert!(plan_file.exists(), "the plan is re-persisted under FORCE");
     }
 
     #[test]
