@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`persist-plan` now recognizes an already-persisted plan across filenames, sessions, and BOTH trigger paths, not just the late-scan path.** The row tier (`machine_already_persisted`) and the dir-hash-scan tier (`plans_dir_contains_hash`) were gated on `via_late_scan`, so a resumed session replaying the same injected prompt on the prefix (`UserPromptSubmit`) path never consulted either — every replay re-nudged forever (cameronsjo/cadence-hooks#703). Both gates now apply unconditionally to both trigger paths. A third recognition layer, `plans_dir_contains_approved_session`, catches what hash-matching structurally can't: a living plan's body legitimately drifts after persist (ticked checkboxes, appended `## Deviations`/`## Learnings`), so a re-fire whose resolved approving-parent session id matches an on-disk doc's `approved_session_id:` frontmatter is recognized and skipped even though the body hash no longer matches — exact string comparison only, never rendered or interpolated (committed frontmatter is untrusted input). `machine_already_persisted` now returns the matched row's `plan_path` instead of a bare bool, and a row-tier skip appends one observability record `{schemaVersion, ts, body_sha256, plan_path, machine}` to a new fail-open, 1 MiB-capped `<metrics_dir>/plan-skips.jsonl` (cameronsjo/cadence-hooks#695) — the otherwise-silent skip previously left no artifact naming which `plan_path` explained it. `CADENCE_PERSIST_PLAN_FORCE` still bypasses the row tier on both paths. The persist nudge's three format-gate sentences (missing Panel line, Alternatives-declined stanza, checkbox tasks) collapse into one composed line naming only the missing stanzas — `format gate: plan lacks <names> — see the plan template.` (cameronsjo/cadence-hooks#715) — rather than three separate unconditional sentences.
+
 ## [0.80.0] - 2026-08-16
 
 ### Added
