@@ -186,9 +186,13 @@ fn doctor_quiet_warnings_print_summary_to_stdout() {
     let tmp = tempfile::tempdir().unwrap();
     write_plugin(tmp.path(), "skewed-plugin", SKEW_HOOKS_JSON);
 
+    // Sandbox the daily-nudge marker so this run never reads or writes the
+    // machine's real per-user marker state (daily_gate.rs:24 precedent, #660).
+    let markers = tempfile::tempdir().unwrap();
     let output = cadence_hooks()
         .args(["doctor", "--quiet", "--root"])
         .arg(tmp.path())
+        .env("CADENCE_MARKER_DIR", markers.path())
         .output()
         .expect("failed to execute");
 
@@ -218,9 +222,12 @@ fn doctor_quiet_clean_prints_nothing() {
         r#"{ "hooks": { "PreToolUse": [{ "hooks": [{ "command": "\"${X}\" arg" }]}] }}"#,
     );
 
+    // Sandbox the daily-nudge marker for symmetry with the warnings case above.
+    let markers = tempfile::tempdir().unwrap();
     let output = cadence_hooks()
         .args(["doctor", "--quiet", "--root"])
         .arg(tmp.path())
+        .env("CADENCE_MARKER_DIR", markers.path())
         .output()
         .expect("failed to execute");
 
