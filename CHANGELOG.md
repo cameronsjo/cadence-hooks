@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A backtick span whose own quoting never resolved (`` `echo '` ``) hid the command after it from every guard.** `substitution_bodies`'s backtick arm closes at the first unescaped backtick regardless of embedded quotes (unchanged, matching bash), but the outer segment splitter's quote tracking doesn't know that — it reads everything after such a span as still inside the still-open quote, so a sibling command like `&& cat .env` never became its own segment. The backtick arm now surfaces that tail as an extra body whenever `` `…` ``'s content carries an unterminated quote, mirroring the `$( )` arm's both-readings emission for the same ambiguity (cameronsjo/cadence-hooks#653).
+
 ## [0.80.0] - 2026-08-16
 
 ### Added
