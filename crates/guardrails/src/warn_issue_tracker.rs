@@ -9,8 +9,9 @@
 //! against a *set* of trackers (`cadence`, `cadence-hooks`, `forgectl`,
 //! `claude-configurations`) rather than a single canonical repo. Override the
 //! set with `CADENCE_ISSUE_TRACKERS` (plural, comma-separated) or the legacy
-//! singular `CADENCE_ISSUE_TRACKER`. Unowned repos and third-party projects are
-//! silently allowed — the nudge only fires for repos you control.
+//! singular `CADENCE_ISSUE_TRACKER`. The nudge is scoped to owners that host a
+//! known tracker: an owned repo under an owner with no tracker at all, unowned
+//! repos, and third-party projects are all silently allowed.
 
 use cadence_hooks_core::config::{self, default_host, env_allow_entries, env_extra_hosts};
 use cadence_hooks_core::shell::{
@@ -59,6 +60,18 @@ fn trackers() -> Vec<String> {
         }
     }
     DEFAULT_TRACKERS.iter().map(|s| s.to_lowercase()).collect()
+}
+
+/// Return the set of owners (lowercased) that host a known ecosystem tracker.
+///
+/// Derived from `trackers()` so a `CADENCE_ISSUE_TRACKERS`/`CADENCE_ISSUE_TRACKER`
+/// override moves the scope with it — the nudge only ever fires for owners that
+/// actually host a tracker this session knows about.
+fn tracker_owners() -> Vec<String> {
+    trackers()
+        .iter()
+        .filter_map(|t| t.split('/').next().map(str::to_string))
+        .collect()
 }
 
 /// Matches `gh api /?repos/OWNER/REPO/issues` where `/issues` is the final
@@ -147,6 +160,8 @@ fn is_issue_create(stripped: &str) -> bool {
 /// - The command is an issue-create write (after quote-stripping)
 /// - A target `owner/repo` resolves via `-R` flag, API path, or git remote
 /// - The target host is the default host (`github.com` unless `GH_HOST` is set)
+/// - The target owner hosts a known ecosystem tracker (owned AND under an
+///   owner that hosts a known tracker)
 /// - The target owner is in `CADENCE_ALLOWED_OWNERS`
 /// - The target is not among the known ecosystem issue trackers
 pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
@@ -184,10 +199,17 @@ pub fn judge_issue_target(command: &str, work_dir: &Path) -> Option<String> {
         return None;
     }
 
-    // Gate: target must be owned.
+    // Gate: target owner must host a known ecosystem tracker. Scopes the nudge
+    // to owners this session already knows have a tracker — an owned repo
+    // under an owner with no tracker at all is silently allowed.
     let mut parts = target.splitn(2, '/');
     let owner = parts.next().unwrap_or("");
     let repo_name = parts.next().unwrap_or("");
+    if !tracker_owners().iter().any(|o| o == owner) {
+        return None;
+    }
+
+    // Gate: target must be owned.
     if !config::is_allowed_with_extra_hosts(
         &host,
         owner,
@@ -853,5 +875,109 @@ mod tests {
         // /tmp has no git remote — unresolvable → allow silently.
         let result = WarnIssueTracker.run(&make_bash_with_cwd("gh issue create --title x", "/tmp"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // ---- owner-scope tests (#727) ----
+    // An owned repo under an owner that hosts none of the known ecosystem
+    // trackers must be silent — the nudge only fires for owners that host a
+    // tracker this session knows about.
+
+    #[test]
+    fn owned_repo_under_non_tracker_owner_not_nudged_via_issue_create() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo,acme-corp")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R acme-corp/service --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    result.is_none(),
+                    "owned repo under a non-tracker owner should be silent: {result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn owned_repo_under_non_tracker_owner_not_nudged_via_api_post() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo,acme-corp")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh api repos/acme-corp/service/issues -X POST -f title=x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    result.is_none(),
+                    "owned repo under a non-tracker owner should be silent: {result:?}"
+                );
+            },
+        );
+    }
+
+    // The plural override moves BOTH the tracker set AND the owner scope: an
+    // owner that hosted a tracker under the default set no longer does once
+    // the override points elsewhere, and vice versa.
+    #[test]
+    fn plural_override_moves_owner_scope() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo,otherorg")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", Some("otherorg/foo")),
+            ],
+            || {
+                // otherorg now hosts a tracker — an owned non-tracker repo
+                // under it nudges.
+                let nudge = judge_issue_target(
+                    "gh issue create -R otherorg/bar --title x",
+                    &workdir("/tmp"),
+                );
+                assert_eq!(
+                    nudge,
+                    Some("otherorg/bar".to_string()),
+                    "otherorg hosts a tracker under the override — bar should nudge"
+                );
+
+                // cameronsjo no longer hosts any known tracker under the
+                // override — an owned repo under it is silent.
+                let silent = judge_issue_target(
+                    "gh issue create -R cameronsjo/workbench --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    silent.is_none(),
+                    "cameronsjo hosts no tracker under the override — workbench should be silent: {silent:?}"
+                );
+            },
+        );
+    }
+
+    // ---- Check::run level (#727) ----
+
+    #[test]
+    fn check_allows_owned_non_ecosystem_owner() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo,acme-corp")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let result = WarnIssueTracker
+                    .run(&make_bash("gh issue create -R acme-corp/service --title x"));
+                assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+                assert!(result.message.is_none());
+            },
+        );
     }
 }
