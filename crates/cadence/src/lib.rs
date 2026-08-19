@@ -32,6 +32,8 @@ pub mod terminology;
 pub mod validate_env_vars;
 /// Block CRLF line endings in shell scripts.
 pub mod validate_line_endings;
+/// Nudge to add a CHANGELOG.md entry when shipping code changes.
+pub mod warn_changelog_entry;
 /// Nudge to review documentation when creating a pull request.
 pub mod warn_docs_update;
 /// Nudge to audit about-to-ship content for personal-context overshare.

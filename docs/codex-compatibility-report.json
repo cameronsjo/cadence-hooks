@@ -291,6 +291,18 @@
     },
     {
       "criticality": "workflow",
+      "description": "Nudge to add a CHANGELOG.md entry when shipping code changes",
+      "event": "PreToolUse",
+      "name": "warn-changelog-entry",
+      "plugin": "cadence",
+      "protected": false,
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Registered in the binary but not yet wired in any hooks.json — the cadence plugin wiring PR is separate (cameronsjo/cadence-hooks#730); flip back to applicable once it lands",
+      "wiring": []
+    },
+    {
+      "criticality": "workflow",
       "description": "Nudge to audit about-to-ship content for personal-context overshare",
       "event": "PreToolUse",
       "name": "warn-overshare",

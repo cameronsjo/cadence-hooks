@@ -77,6 +77,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-changelog-entry",
+        description: "Nudge to add a CHANGELOG.md entry when shipping code changes",
+        plugin: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "warn-overshare",
         description: "Nudge to audit about-to-ship content for personal-context overshare",
         plugin: "cadence",

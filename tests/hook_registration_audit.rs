@@ -258,7 +258,10 @@ const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 /// binary so the wiring PR has something to point at, and reaching no event
 /// until that PR lands.
 /// (`<plugin> <subcommand>`, tracking_reference)
-const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[];
+const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[(
+    "cadence warn-changelog-entry",
+    "cameronsjo/cadence-hooks#730",
+)];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.

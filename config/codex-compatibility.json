@@ -37,6 +37,11 @@
       "applicable": false,
       "evidence": "cadence#658 retired the SessionStart registrar in favor of inject-gh-write-context"
     },
+    "warn-changelog-entry": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Registered in the binary but not yet wired in any hooks.json — the cadence plugin wiring PR is separate (cameronsjo/cadence-hooks#730); flip back to applicable once it lands"
+    },
     "warn-recommended-option": {
       "status": "unavailable",
       "applicable": false,
