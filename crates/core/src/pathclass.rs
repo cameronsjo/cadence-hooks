@@ -44,9 +44,10 @@
 //! **Case folding follows the verdict direction, not consistency.** A path
 //! compare folds ASCII case only when folding can move a path into a *stricter*
 //! class: `.claude` (#726), `.git` (#657), and the home-child prefix (#732) all
-//! feed BLOCK or ASK, so they fold. [`under_claude_scratch`] and
-//! `worktree::path_under_temp_root` grant a silent ALLOW, so they stay
-//! byte-exact. The per-predicate reasoning lives on [`under_claude_dir`].
+//! feed BLOCK or ASK, so they fold. [`under_claude_scratch`],
+//! `worktree::path_under_temp_root`, and `guard_rm::is_transient_scratch` each
+//! grant a silent ALLOW, so all three stay byte-exact. The per-predicate
+//! reasoning lives on [`under_claude_dir`].
 //!
 //! **Non-goals of the #732 fold, recorded so a later pass does not re-derive
 //! them:**
@@ -254,6 +255,9 @@ pub fn classify(
 ///   `claude_scratch_carve_out_stays_byte_exact`.
 /// - `worktree::path_under_temp_root` feeds [`PathClass::Temp`], guard_rm's
 ///   other silent ALLOW. `/TMP/x` is therefore not a temp root here.
+/// - `guard_rm::is_transient_scratch` (guard-local, so not linkable from here)
+///   demotes a home child to an ALLOW on a `.tmp`/`.swp`/`.swo` suffix, which
+///   is why `~/notes.TMP` still blocks.
 fn under_claude_dir(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
     match segs.iter().position(|s| s.eq_ignore_ascii_case(".claude")) {
@@ -346,20 +350,32 @@ fn is_first_level_home_child(norm: &str, home: &str) -> bool {
 /// `path` lies strictly under `dir`: a `{dir}/` prefix, with the `dir` half
 /// compared ASCII-case-insensitively.
 ///
-/// Sliced with [`str::get`] rather than `path[..dir.len()]` on purpose. A home
-/// or vault carrying a non-ASCII character (`/Users/José`) can put `dir.len()`
-/// in the middle of a UTF-8 sequence for some `path`, and indexing there
-/// **panics** — a guard that panics blocks nothing and fails the fail-open
-/// contract (ADR-0001). `get` answers `None` for that split instead, which reads
-/// as "not under `dir`".
+/// An **empty `dir` is never a parent** — it returns `false` rather than
+/// matching every absolute path. Both of today's callers already reject an
+/// empty home/vault before reaching here, so this guard is for the next one:
+/// the predicate is `pub`, and a caller that forgot the check would otherwise
+/// classify the entire filesystem as living under its empty root.
+///
+/// Case folding forces a byte comparison, which is what makes the slicing
+/// deliberate: [`str::get`] rather than `path[..dir.len()]`, because a home or
+/// vault carrying a non-ASCII character (`/Users/José`) can put `dir.len()` in
+/// the middle of a UTF-8 sequence for some `path`, and indexing there panics.
+/// `get` answers `None` for that split instead, which reads as "not under
+/// `dir`". This is a hazard the *new* code introduces and closes, not a bug
+/// being fixed: the byte-exact predicates this replaced used `strip_prefix` and
+/// `starts_with`, which are `&str`-safe and could never panic. It matters
+/// because a panicking guard blocks nothing, which is the one failure the
+/// fail-open contract (ADR-0001) does not cover.
 ///
 /// ASCII-only folding is the limit, not an oversight: `é` and `É` still compare
 /// unequal, so a non-ASCII case variant keeps its unfolded verdict. Widening to
 /// Unicode case folding would need the volume's own collation rules, which this
 /// pure predicate cannot see.
 pub fn is_under_dir_ignoring_ascii_case(path: &str, dir: &str) -> bool {
-    path.get(..dir.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(dir))
+    !dir.is_empty()
+        && path
+            .get(..dir.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(dir))
         && path.as_bytes().get(dir.len()) == Some(&b'/')
 }
 
@@ -705,10 +721,13 @@ mod tests {
         assert_eq!(class("/USERS/x", "/Users/x"), PathClass::Source);
     }
 
-    /// The panic rail. A non-ASCII home puts `home.len()` in the middle of a
-    /// UTF-8 sequence for some paths, and a byte-indexing prefix test
-    /// (`norm[..prefix.len()]`) panics there — which in a guard means blocking
-    /// nothing at all. `is_under_dir_ignoring_ascii_case` slices with `get`, so
+    /// The panic rail on the folded prefix test. Case folding forces a byte
+    /// comparison, so the new predicate slices — and a non-ASCII home puts
+    /// `home.len()` in the middle of a UTF-8 sequence for some paths, where
+    /// `norm[..home.len()]` would panic. (The byte-exact predicate this
+    /// replaced used `strip_prefix` and could not: this guards a hazard the
+    /// fold introduces, not a bug it inherited.) A panicking guard blocks
+    /// nothing, so `is_under_dir_ignoring_ascii_case` slices with `get` and
     /// these answer a verdict instead.
     #[test]
     fn non_ascii_home_does_not_panic() {
@@ -724,6 +743,22 @@ mod tests {
             class("/Users/JOSÉ/Documents", "/Users/José"),
             PathClass::Source
         );
+    }
+
+    /// An empty `dir` is never a parent. Both of today's callers reject an
+    /// empty home/vault first, so this asserts the `pub` helper's own contract
+    /// for the next caller — without the guard, the separator test alone would
+    /// call every absolute path a child of the empty root.
+    #[test]
+    fn empty_dir_is_never_a_parent() {
+        assert!(!is_under_dir_ignoring_ascii_case("/Users/x/Documents", ""));
+        assert!(!is_under_dir_ignoring_ascii_case("/", ""));
+        assert!(!is_under_dir_ignoring_ascii_case("", ""));
+        // …while a real parent still matches, folded.
+        assert!(is_under_dir_ignoring_ascii_case(
+            "/USERS/x/Documents",
+            "/Users/x"
+        ));
     }
 
     /// #732's invariant lock, the counterpart to

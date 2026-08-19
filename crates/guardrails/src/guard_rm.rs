@@ -330,6 +330,16 @@ enum TargetClass {
     /// only copy. ASK would put a prompt on routine cleanup that has never
     /// prompted, which is friction the deviation does not earn. So this blocks
     /// nothing new and asks nothing new — it only stops being silent.
+    ///
+    /// **What the tier does NOT see**, recorded so the scope is on the record
+    /// rather than discovered: a single *named* secret file (`rm -f key.pem`)
+    /// is a [`SingleFile`](TargetToken::SingleFile), never a glob, so it takes
+    /// the existing single-file verdict; a leading-dot pattern (`.env*`) is not
+    /// file-scoped and keeps the whole directory's stricter verdict; and a
+    /// `find . -name '*.pem' -delete` is judged on its *search roots*, so the
+    /// pattern never reaches this predicate at all. Each of the three is at
+    /// least as strict as a nudge, so none is a hole — but none is a nudge
+    /// either.
     SecretSweep,
     /// Unexpanded variable, command substitution, or a `..`-bearing path that
     /// cannot be confidently resolved. ASK.
@@ -1030,6 +1040,15 @@ fn has_parent_segment(path: &str) -> bool {
 /// (`.tmp`, `.swp`, `.swo`) — an editor swap file or a temp-write artifact.
 /// `.bak`/`.orig`/`.old` are deliberately excluded: those can be intentional
 /// backups a user means to keep, so they stay BLOCK under home.
+///
+/// **The suffix compare stays byte-exact (#732)**, and it is the third
+/// predicate in that group, beside `pathclass::under_claude_scratch` and
+/// `worktree::path_under_temp_root`. All three grant a silent ALLOW — this one
+/// demotes a home child to [`TargetClass::Scratch`] — so folding would widen an
+/// allow rather than narrow one, which is the direction guard-rm never moves.
+/// `~/notes.TMP` therefore keeps the home-child BLOCK. See `pathclass`'s module
+/// doc for the governing rule: a compare folds only when folding can move a
+/// path into a stricter class.
 fn is_transient_scratch(norm: &str) -> bool {
     let last = norm.rsplit('/').next().unwrap_or(norm);
     last.ends_with(".tmp") || last.ends_with(".swp") || last.ends_with(".swo")
@@ -3225,6 +3244,13 @@ mod tests {
         assert!(!pathclass::under_claude_scratch(
             "/srv/repo/.CLAUDE/worktrees/x"
         ));
+        // …and so does the transient-suffix demotion, the third member of the
+        // group: `~/notes.TMP` keeps the home-child Block rather than riding a
+        // folded suffix to the Scratch ALLOW.
+        assert_eq!(judge("rm -f ~/notes.TMP", "/home"), Outcome::Block);
+        assert_eq!(judge("rm -f ~/notes.SWP", "/home"), Outcome::Block);
+        // The canonical spellings keep their ALLOW.
+        assert_eq!(judge("rm -f ~/notes.tmp", "/home"), Outcome::Allow);
     }
 
     #[test]
