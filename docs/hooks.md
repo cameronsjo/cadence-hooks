@@ -22,6 +22,7 @@ For how hooks communicate with Claude Code (stdin/stdout/exit codes), see
 | `line-endings` | PreToolUse (Write) | Validate shell script line endings (LF, not CRLF) |
 | `env-vars` | PreToolUse (Write, Edit) | Warn on generic env var names (DEBUG, PORT) |
 | `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
+| `warn-changelog-entry` | PreToolUse (Bash) | Nudge to add a CHANGELOG.md entry when shipping code changes |
 | `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
