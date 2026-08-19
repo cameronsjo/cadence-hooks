@@ -2812,6 +2812,57 @@ mod tests {
         );
     }
 
+    /// #726, the measured probe: on a case-insensitive volume (the APFS default)
+    /// `~/.CLAUDE/projects/t.jsonl` IS `~/.claude/projects/t.jsonl`, but the
+    /// byte-exact `.claude` compare missed the variant, which then rode the
+    /// single-file softening to a silent ALLOW. Both spellings must ASK.
+    #[test]
+    fn claude_state_case_variants_still_ask() {
+        assert_eq!(
+            judge("rm ~/.CLAUDE/projects/t.jsonl", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm ~/.Claude/projects/t.jsonl", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm ~/.claude/projects/t.jsonl", "/home"),
+            Outcome::Ask
+        );
+        // Negative controls: the fold did not widen into substring matching.
+        assert_eq!(
+            judge("rm /srv/repo/.claudex/t.jsonl", "/home"),
+            Outcome::Allow
+        );
+        assert_eq!(
+            judge("rm /srv/repo/x.CLAUDE/t.jsonl", "/home"),
+            Outcome::Allow
+        );
+    }
+
+    /// #726's asymmetry, end to end: `under_claude_dir` folds case (protective),
+    /// `under_claude_scratch` does not (folding would widen a silent ALLOW). A
+    /// case-variant scratch path must therefore lose the ALLOW carve-out and
+    /// ASK, not inherit worktree cleanup's exemption. A consistency sweep that
+    /// folds both breaks this test rather than shipping.
+    #[test]
+    fn claude_scratch_carve_out_does_not_fold_case() {
+        assert_eq!(
+            judge("rm -rf /srv/repo/.CLAUDE/worktrees/x", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm -rf /srv/repo/.claude/WORKTREES/x", "/home"),
+            Outcome::Ask
+        );
+        // The canonical spelling keeps its ALLOW.
+        assert_eq!(
+            judge("rm -rf /srv/repo/.claude/worktrees/x", "/home"),
+            Outcome::Allow
+        );
+    }
+
     #[test]
     fn single_file_requires_no_glob_and_no_recursion() {
         // `rm *` resolves to the DIRECTORY the sweep runs in — not one file.

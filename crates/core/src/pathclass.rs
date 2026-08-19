@@ -206,9 +206,25 @@ pub fn classify(
 /// `.claude` appears as a path component AND is not the final one — the path
 /// lives *under* a `.claude` dir rather than being it. The coarse fact;
 /// [`under_claude_scratch`] is the narrow allowlist within it.
+///
+/// The component compare **folds case** (#726), and that is deliberately the
+/// opposite of [`under_claude_scratch`], which stays byte-exact. The two
+/// predicates point in opposite safety directions, so a "consistency" sweep
+/// folding both would be a regression:
+///
+/// - This one feeds [`PathClass::ClaudeState`], a *protective* class — guard_rm
+///   maps it to ASK, while the fall-through (`Source`) rides the single-file
+///   softening to a silent ALLOW. Folding here only ever moves a path from
+///   ALLOW to ASK. On a case-insensitive volume (the APFS default)
+///   `~/.CLAUDE/projects/t.jsonl` and `~/.claude/projects/t.jsonl` are the same
+///   transcript, and before the fold the case variant took the silent ALLOW.
+/// - [`under_claude_scratch`] feeds [`PathClass::ClaudeScratch`], an
+///   *allow-side* carve-out. Folding there would widen a silent ALLOW — the
+///   wrong direction — so it does not fold. Locked by
+///   `claude_scratch_carve_out_stays_byte_exact`.
 fn under_claude_dir(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    match segs.iter().position(|s| *s == ".claude") {
+    match segs.iter().position(|s| s.eq_ignore_ascii_case(".claude")) {
         Some(pos) => pos + 1 < segs.len(),
         None => false,
     }
@@ -249,6 +265,15 @@ pub const CLAUDE_SCRATCH_DIRS: &[&str] = &["worktrees", "intros"];
 /// to keep worktree cleanup allowed while blocking a plain repo under `/tmp`
 /// (cadence-hooks#576), and asking here is cheaper and safer than reordering a
 /// precedence three tests already lock.
+///
+/// **Both compares stay byte-exact on purpose (#726)** — do not "make this
+/// consistent" with [`under_claude_dir`], which folds case. This predicate
+/// grants an ALLOW at both of its call sites: `classify` returns
+/// [`PathClass::ClaudeScratch`] (guard_rm ALLOW), and guard_rm's #576 rule reads
+/// it *negated* to decline the git-repo BLOCK. Folding here would widen a silent
+/// ALLOW in both — the wrong safety direction — where folding `under_claude_dir`
+/// only ever tightens ALLOW into ASK. Locked by
+/// `claude_scratch_carve_out_stays_byte_exact`.
 pub fn under_claude_scratch(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
     let Some(pos) = segs.iter().position(|s| *s == ".claude") else {
@@ -429,6 +454,64 @@ mod tests {
     fn claude_curdir_segment_still_scratch() {
         assert_eq!(
             class("/srv/repo/.claude/./worktrees/f", "/Users/x"),
+            PathClass::ClaudeScratch
+        );
+    }
+
+    /// #726: a case-insensitive volume resolves `.CLAUDE` to the real `.claude`,
+    /// so the protective `ClaudeState` compare folds case — otherwise
+    /// `~/.CLAUDE/projects/t.jsonl` fell through to `Source` and rode guard_rm's
+    /// single-file softening to a silent ALLOW while the canonical spelling
+    /// asked. The negative controls prove the fold did not widen into substring
+    /// matching.
+    #[test]
+    fn claude_dir_case_variants_are_claude_state() {
+        assert_eq!(
+            class("/Users/x/.CLAUDE/projects/t.jsonl", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/Users/x/.Claude/projects/t.jsonl", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/srv/repo/.CLAUDE/agent-memory", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/Users/x/repo/.claudex/a", "/Users/x"),
+            PathClass::Source
+        );
+        assert_eq!(
+            class("/Users/x/repo/x.CLAUDE/a", "/Users/x"),
+            PathClass::Source
+        );
+    }
+
+    /// #726's asymmetry lock: the two `.claude` predicates fold in OPPOSITE
+    /// safety directions, so a later consistency sweep must break a test rather
+    /// than ship. `under_claude_dir` folds (protective: ALLOW → ASK);
+    /// `under_claude_scratch` stays byte-exact (folding would widen a silent
+    /// ALLOW). A case-variant scratch path therefore must NOT gain the carve-out
+    /// — it lands on the protective `ClaudeState` instead.
+    #[test]
+    fn claude_scratch_carve_out_stays_byte_exact() {
+        assert!(!under_claude_scratch("/srv/repo/.CLAUDE/worktrees/x"));
+        assert!(!under_claude_scratch("/srv/repo/.claude/WORKTREES/x"));
+        assert!(under_claude_scratch("/srv/repo/.claude/worktrees/x"));
+
+        // Through `classify`: the case variant falls to the protective class,
+        // never to the allow-granting one.
+        assert_eq!(
+            class("/srv/repo/.CLAUDE/worktrees/x", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/srv/repo/.claude/WORKTREES/x", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/srv/repo/.claude/worktrees/x", "/Users/x"),
             PathClass::ClaudeScratch
         );
     }
