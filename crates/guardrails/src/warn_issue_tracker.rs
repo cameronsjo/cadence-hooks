@@ -70,7 +70,8 @@ fn trackers() -> Vec<String> {
 fn tracker_owners() -> Vec<String> {
     trackers()
         .iter()
-        .filter_map(|t| t.split('/').next().map(str::to_string))
+        .filter_map(|t| t.split('/').next().map(|o| o.trim().to_string()))
+        .filter(|o| !o.is_empty())
         .collect()
 }
 
@@ -957,6 +958,69 @@ mod tests {
                 assert!(
                     silent.is_none(),
                     "cameronsjo hosts no tracker under the override — workbench should be silent: {silent:?}"
+                );
+            },
+        );
+    }
+
+    // Whitespace around the `/` in a plural override entry must not leave a
+    // trailing/leading space in the derived owner — a padded entry like
+    // "cameronsjo / cadence" must still scope to "cameronsjo" (sec-733 Minor 1).
+    #[test]
+    fn tracker_owner_scope_trims_whitespace_around_the_slash() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", Some("cameronsjo / cadence")),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create -R cameronsjo/workbench --title x",
+                    &workdir("/tmp"),
+                );
+                assert_eq!(
+                    result,
+                    Some("cameronsjo/workbench".to_string()),
+                    "padded owner segment should still scope to cameronsjo: {result:?}"
+                );
+            },
+        );
+    }
+
+    // The legacy singular CADENCE_ISSUE_TRACKER override also moves the
+    // owner-scope, not just the plural CADENCE_ISSUE_TRACKERS (rev-733 nit —
+    // only the plural override was covered for owner-scope movement).
+    #[test]
+    fn singular_override_moves_owner_scope() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo,otherorg")),
+                ("CADENCE_ISSUE_TRACKER", Some("otherorg/foo")),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                // otherorg now hosts a tracker under the singular override —
+                // an owned non-tracker repo under it nudges.
+                let nudge = judge_issue_target(
+                    "gh issue create -R otherorg/bar --title x",
+                    &workdir("/tmp"),
+                );
+                assert_eq!(
+                    nudge,
+                    Some("otherorg/bar".to_string()),
+                    "otherorg hosts a tracker under the singular override — bar should nudge"
+                );
+
+                // cameronsjo no longer hosts any known tracker under the
+                // singular override — an owned repo under it is silent.
+                let silent = judge_issue_target(
+                    "gh issue create -R cameronsjo/workbench --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    silent.is_none(),
+                    "cameronsjo hosts no tracker under the singular override — workbench should be silent: {silent:?}"
                 );
             },
         );
