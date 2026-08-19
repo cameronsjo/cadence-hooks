@@ -140,10 +140,14 @@ fn is_plugin_changelog(path: &str) -> bool {
 /// count).
 fn changed_plugin_name(path: &str) -> Option<String> {
     let segs: Vec<&str> = path.split('/').collect();
-    if segs.len() < 2 || segs[0] != "plugins" || segs[1].is_empty() {
+    // >= 3: a file directly under plugins/ (e.g. plugins/README.md) has no
+    // plugin directory to own — segs[1] would be a filename, not a plugin
+    // name, and nudging for plugins/README.md/CHANGELOG.md is an obligation
+    // nothing can pay (cameronsjo/cadence-hooks#730 Gate-2 Important 2).
+    if segs.len() < 3 || segs[0] != "plugins" || segs[1].is_empty() {
         return None;
     }
-    if segs.len() >= 3 && matches!(segs[2], "docs" | "scripts") {
+    if matches!(segs[2], "docs" | "scripts") {
         return None;
     }
     Some(segs[1].to_string())
@@ -346,5 +350,21 @@ mod tests {
     fn changed_plugin_name_non_plugin_path_is_none() {
         assert_eq!(changed_plugin_name("src/main.rs"), None);
         assert_eq!(changed_plugin_name("README.md"), None);
+    }
+
+    #[test]
+    fn changed_plugin_name_file_directly_under_plugins_is_none() {
+        // plugins/README.md has no plugin directory to own — segs[1] would be
+        // a filename ("README.md"), not a plugin name, and nudging for
+        // plugins/README.md/CHANGELOG.md is an obligation nothing can pay.
+        assert_eq!(changed_plugin_name("plugins/README.md"), None);
+        assert_eq!(changed_plugin_name("plugins/.gitkeep"), None);
+    }
+
+    #[test]
+    fn file_directly_under_plugins_does_not_generate_an_unpayable_nudge() {
+        let changed = s(&["plugins/README.md"]);
+        let tracked = s(&["plugins/cadence/CHANGELOG.md"]);
+        assert!(missing_changelogs(&changed, &tracked).is_empty());
     }
 }

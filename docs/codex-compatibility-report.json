@@ -296,9 +296,9 @@
       "name": "warn-changelog-entry",
       "plugin": "cadence",
       "protected": false,
-      "status": "native",
-      "applicable": true,
-      "evidence": "tests/hook_registration_audit.rs",
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Registered in the binary but not yet wired in any hooks.json — the cadence plugin wiring PR is separate (cameronsjo/cadence-hooks#730); flip back to applicable once it lands",
       "wiring": []
     },
     {
