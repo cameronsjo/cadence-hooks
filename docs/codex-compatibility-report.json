@@ -291,6 +291,18 @@
     },
     {
       "criticality": "workflow",
+      "description": "Nudge to add a CHANGELOG.md entry when shipping code changes",
+      "event": "PreToolUse",
+      "name": "warn-changelog-entry",
+      "plugin": "cadence",
+      "protected": false,
+      "status": "native",
+      "applicable": true,
+      "evidence": "tests/hook_registration_audit.rs",
+      "wiring": []
+    },
+    {
+      "criticality": "workflow",
       "description": "Nudge to audit about-to-ship content for personal-context overshare",
       "event": "PreToolUse",
       "name": "warn-overshare",

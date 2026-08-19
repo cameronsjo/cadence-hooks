@@ -194,6 +194,8 @@ enum CadenceCommands {
     EnvVars,
     /// Nudge to review docs when creating a PR
     WarnDocsUpdate,
+    /// Nudge to add a CHANGELOG.md entry when shipping code changes
+    WarnChangelogEntry,
     /// Nudge to audit about-to-ship content for personal-context overshare
     WarnOvershare,
     /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR
@@ -443,6 +445,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::LineEndings => "line-endings",
             CadenceCommands::EnvVars => "env-vars",
             CadenceCommands::WarnDocsUpdate => "warn-docs-update",
+            CadenceCommands::WarnChangelogEntry => "warn-changelog-entry",
             CadenceCommands::WarnOvershare => "warn-overshare",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
@@ -940,6 +943,11 @@ fn main() {
             ),
             CadenceCommands::WarnDocsUpdate => dispatch::run_logged_check(
                 &cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::WarnChangelogEntry => dispatch::run_logged_check(
+                &cadence_hooks_cadence::warn_changelog_entry::WarnChangelogEntry,
                 pre,
                 canonical_hook,
             ),

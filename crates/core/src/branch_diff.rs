@@ -17,10 +17,22 @@
 use crate::shell::{GitSpawn, git_command, run_git_bounded};
 use std::process::Command;
 
+/// The merge base with `origin/main` (falling back to `origin/master`) for the
+/// branch checked out at `dir`. The base refs are spelled fully qualified
+/// (`refs/remotes/origin/main`) so a hostile local branch literally named
+/// `origin/main` cannot shift the diff base.
+///
+/// `None` when the repo or base ref can't be resolved — including a deadline
+/// timeout or spawn failure. Shared by every caller that needs "this branch's
+/// base commit vs upstream", so the fallback-ref order lives in exactly one
+/// place.
+pub fn merge_base_with_origin(dir: &str) -> Option<String> {
+    git_command(dir, &["merge-base", "HEAD", "refs/remotes/origin/main"])
+        .or_else(|| git_command(dir, &["merge-base", "HEAD", "refs/remotes/origin/master"]))
+}
+
 /// Files changed on the branch at `dir`, from the merge base with
-/// `origin/main` (falling back to `origin/master`) to `HEAD`. The base refs
-/// are spelled fully qualified (`refs/remotes/origin/main`) so a hostile local
-/// branch literally named `origin/main` cannot shift the diff base.
+/// `origin/main` (falling back to `origin/master`) to `HEAD`.
 ///
 /// `None` when the repo, base ref, or diff can't be resolved — including a
 /// deadline timeout or spawn failure. Callers gate on evidence, so `None`
@@ -29,8 +41,7 @@ use std::process::Command;
 /// [`run_git_bounded`] rather than [`git_command`], whose empty-stdout-is-
 /// failure mapping would collapse "confirmed no changes" into "no evidence".
 pub fn changed_files(dir: &str) -> Option<Vec<String>> {
-    let base = git_command(dir, &["merge-base", "HEAD", "refs/remotes/origin/main"])
-        .or_else(|| git_command(dir, &["merge-base", "HEAD", "refs/remotes/origin/master"]))?;
+    let base = merge_base_with_origin(dir)?;
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(dir)
