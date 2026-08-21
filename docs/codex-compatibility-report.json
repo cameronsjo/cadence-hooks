@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "binaryVersion": "0.81.0",
+  "binaryVersion": "0.82.0",
   "minimumCodexVersion": "0.145.0",
   "privacy": {
     "rawHookInputsPersisted": false,

@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-08-20
+
 ### Removed
 
 - **`session persist-plan` (the UserPromptSubmit re-scan arm) and `CADENCE_PERSIST_PLAN_FORCE`.** It re-fired every prompt holding the RAW approved plan text, which is stale the moment a plan starts living — so it wrote raw duplicate siblings (cameronsjo/cadence-hooks#703, #724, #729), stamped a second frontmatter block over a ticked plan (#738), and wrote into primary checkouts (#739); three rounds of on-disk recognition heuristics could not track a document that drifts away from every hash by design. `session persist-plan-approval` (PostToolUse:ExitPlanMode) is the sole writer now; when no approval-time persist happened (the approve-and-clear path), the cadence rules' copy rule is the fallback. The `plan-skips.jsonl` stream dies with the arm. Unwired first in cameronsjo/cadence#1025.
