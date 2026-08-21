@@ -1,39 +1,24 @@
-//! `guardrails inject-gh-context` — SessionStart hook.
+//! Shared renderer for the gh-write allowlist + `-R owner/repo` context line
+//! that [`inject_gh_write_context`](super::inject_gh_write_context) injects
+//! just before an untargeted `gh` write. Primes the model with the same
+//! context [`guard_gh_write`](super::guard_gh_write) enforces, so writes
+//! target the right repo on the first try.
 //!
-//! Injects the gh-write allowlist + `-R owner/repo` rule into Claude's
-//! context at session start (and after compaction). Primes the model with
-//! the same context [`guard_gh_write`](super::guard_gh_write) enforces, so
-//! writes target the right repo on the first try — recovering Mode A
-//! "silent damage" cases where cwd's remote happens to be allowed but
-//! isn't the intended write target.
-//!
-//! Wired by `cadence-canon`'s `hooks.json` on `matcher: startup|resume|compact`.
+//! This module used to also carry `guardrails inject-gh-context`, a
+//! SessionStart injector of the same text. cameronsjo/cadence#658 retired that
+//! wiring (session start is many turns — or a compaction — away from the
+//! write; the just-in-time twin is what actually lands), and the binary half
+//! followed (cameronsjo/cadence-hooks#673). The renderer stays here so the
+//! one remaining caller keeps a single place where its inputs are assembled.
 
 use std::collections::BTreeSet;
 
 use cadence_hooks_core::config::{AllowEntry, default_host, env_allow_entries, env_extra_hosts};
-use cadence_hooks_core::{Check, CheckResult, HookInput};
-
-/// Inject gh allowlist + `-R` rule on session start.
-pub struct InjectGhContext;
-
-impl Check for InjectGhContext {
-    fn name(&self) -> &str {
-        "inject-gh-context"
-    }
-
-    fn run(&self, _input: &HookInput) -> CheckResult {
-        CheckResult::nudge(render_from_env())
-    }
-}
-
 /// Read the allowlist env vars and render the context message.
 ///
-/// The one place the renderer's four inputs are assembled, so the SessionStart
-/// injector and its just-in-time twin
-/// ([`inject_gh_write_context`](super::inject_gh_write_context)) cannot drift:
-/// a fifth input added here reaches both, where two hand-copied call sites
-/// would leave the twin quietly rendering a staler message.
+/// The one place the renderer's four inputs are assembled — kept as a seam
+/// even with a single caller ([`inject_gh_write_context`](super::inject_gh_write_context)),
+/// so a future second injector cannot drift from it.
 pub fn render_from_env() -> String {
     let owners = env_allow_entries("CADENCE_ALLOWED_OWNERS");
     let repos = env_allow_entries("CADENCE_ALLOWED_REPOS");
@@ -109,7 +94,6 @@ pub fn render_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadence_hooks_core::Outcome;
     use cadence_hooks_core::config::parse_allow_entries;
 
     #[test]
@@ -224,19 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn check_name_matches_subcommand() {
-        assert_eq!(InjectGhContext.name(), "inject-gh-context");
-    }
-
-    #[test]
-    fn check_returns_nudge_with_message() {
-        // Hermetic: this check does not read cwd or git state, so HookInput::default
-        // is enough. Env vars may or may not be set in the test process; we only
-        // assert the shape (Nudge + non-empty message), not the content.
-        let input = HookInput::default();
-        let result = InjectGhContext.run(&input);
-        assert!(matches!(result.outcome, Outcome::Nudge));
-        let msg = result.message.expect("nudge always carries a message");
+    fn render_from_env_carries_the_rule_whatever_the_env_holds() {
+        // Env vars may or may not be set in the test process; assert the shape
+        // every caller relies on, not the allowlist content.
+        let msg = render_from_env();
         assert!(msg.contains("git-guardrails"));
         assert!(msg.contains("`-R owner/repo`"));
     }

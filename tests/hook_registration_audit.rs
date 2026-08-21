@@ -300,15 +300,6 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
         "session warn-plan-ready-flip",
         "must ride the always-on cadence plugin; `session` is its clap namespace",
     ),
-    // Predates the monorepo consolidation (present in canon's manifest at the
-    // subtree-add commit f61b5f6), canon is its only registrar anywhere, and it
-    // sits in canon's SessionStart block beside `session start` and `session
-    // backstop-warn` — where a SessionStart context injector belongs.
-    (
-        "cadence-canon",
-        "guardrails inject-gh-context",
-        "SessionStart context injector; canon is its only registrar",
-    ),
 ];
 
 /// Commands a plugin registers MORE THAN ONCE inside a single matcher block —

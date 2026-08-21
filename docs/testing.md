@@ -4,11 +4,11 @@ Hook subcommands expect piped stdin. Run one bare in a terminal and it prints
 guidance instead of hanging:
 
 ```text
-$ cadence-hooks guardrails inject-gh-context
-cadence-hooks: 'inject-gh-context' is a Claude Code hook, not an interactive command.
+$ cadence-hooks guardrails inject-gh-write-context
+cadence-hooks: 'inject-gh-write-context' is a Claude Code hook, not an interactive command.
 
 It reads a JSON payload on stdin — Claude Code pipes this automatically on
-SessionStart. Nothing was piped and stdin is a terminal, so it would wait forever.
+PreToolUse. Nothing was piped and stdin is a terminal, so it would wait forever.
 ...
 ```
 
@@ -16,11 +16,24 @@ The fastest way to see what a hook does is `try` — it generates a sample
 payload for the hook's event, runs the hook against it, and reports the outcome:
 
 ```bash
-$ cadence-hooks try guardrails inject-gh-context
-Hook:     guardrails inject-gh-context — Inject the gh-write allowlist + `-R` rule on SessionStart
-Event:    SessionStart
-Payload:  {"cwd":"...","session_id":"test","source":"startup"}
+$ cadence-hooks try guardrails inject-gh-write-context
+Hook:     guardrails inject-gh-write-context — Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write
+Event:    PreToolUse
+Payload:  {"cwd":"...","tool_input":{"command":"git status"},"tool_name":"Bash"}
 
+Outcome:  ALLOW (exit 0)
+Stdout:   (none)
+Stderr:   (none)
+```
+
+The generated sample is deliberately inert for most hooks; pass a payload that
+trips the check to see a nudge rendered:
+
+```bash
+$ printf '%s' '{"tool_name":"Bash","tool_input":{"command":"gh pr create -t x"}}' \
+    > /tmp/gh-write.json
+$ cadence-hooks try guardrails inject-gh-write-context --payload /tmp/gh-write.json
+...
 Outcome:  NUDGE (exit 0)
 Context injected (what Claude sees):
 

@@ -97,6 +97,8 @@ pub mod dismiss_enforce_worktree;
 pub mod dismiss_main_branch_warn;
 /// Block mutations in a primary checkout of a branch-mode repo.
 pub mod enforce_worktree;
+/// Shared renderer for the gh-write allowlist + `-R` rule context line.
+pub mod gh_context;
 /// Block the first Claude-in-Chrome action per session until the device is confirmed.
 pub mod guard_browser_device;
 /// Block direct edits to production dotfiles; redirect to chezmoi source.
@@ -117,8 +119,6 @@ pub mod guard_read_model;
 pub mod guard_rm;
 /// SessionStart assertion that `guard-rm` is present and classifying correctly.
 pub mod guard_rm_liveness;
-/// Inject the gh-write allowlist + `-R` rule on SessionStart.
-pub mod inject_gh_context;
 /// Re-inject the gh-write allowlist + `-R` rule just before an untargeted gh write.
 pub mod inject_gh_write_context;
 /// Shared closing-keyword detection for GitHub issue references.

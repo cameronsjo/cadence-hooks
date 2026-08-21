@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **`guardrails inject-gh-context`** (SessionStart). cameronsjo/cadence#658 retired its wiring in favor of the just-in-time `inject-gh-write-context` (PreToolUse) and the binary half was never removed, leaving the local `hook_registration_audit` red against every current sibling checkout (cameronsjo/cadence-hooks#673). The shared renderer lives on as `crates/guardrails/src/gh_context.rs`.
+
 ## [0.82.0] - 2026-08-20
 
 ### Removed
