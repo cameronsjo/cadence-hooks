@@ -87,9 +87,7 @@ impl HookEvent {
                 r#"{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"},"tool_response":{"stdout":"ok"}}"#
             }
             HookEvent::SessionStart => r#"{"session_id":"test","source":"startup"}"#,
-            // Exercises the persist-plan prefix gate — a prompt shaped like the
-            // approve-and-clear re-injection (see `session persist-plan`).
-            HookEvent::UserPromptSubmit => r#"{"prompt":"Implement the following plan:\n\ntest"}"#,
+            HookEvent::UserPromptSubmit => r#"{"prompt":"test prompt"}"#,
         }
     }
 }
@@ -3044,15 +3042,10 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_submit_sample_exercises_the_persist_plan_prefix_gate() {
+    fn user_prompt_submit_sample_carries_a_prompt() {
         let input: HookInput =
             serde_json::from_str(HookEvent::UserPromptSubmit.sample_payload()).unwrap();
-        assert!(
-            input
-                .prompt()
-                .is_some_and(|p| p.starts_with("Implement the following plan:")),
-            "sample should exercise the persist-plan prefix gate"
-        );
+        assert!(input.prompt().is_some_and(|p| !p.is_empty()));
     }
 
     #[test]

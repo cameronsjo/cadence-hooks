@@ -418,14 +418,8 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::SessionStart),
     },
     HookEntry {
-        name: "persist-plan",
-        description: "Persist an approved plan whose post-approval turn was wiped, nudging when it carries no settled Panel: line (UserPromptSubmit)",
-        plugin: "session",
-        event: Some(HookEvent::UserPromptSubmit),
-    },
-    HookEntry {
         name: "persist-plan-approval",
-        description: "Persist an approved plan on same-session approval, nudging when it carries no settled Panel: line (PostToolUse:ExitPlanMode)",
+        description: "Persist an approved plan at approval, merging into its own frontmatter and nudging when it carries no settled Panel: line; CADENCE_NO_PERSIST_PLAN opts out (PostToolUse:ExitPlanMode)",
         plugin: "session",
         event: Some(HookEvent::PostToolUse),
     },
@@ -569,29 +563,22 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "backstop-warn") => {
             Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#)
         }
-        // persist-plan gates on an exact "Implement the following plan:"
-        // prefix; the generic UserPromptSubmit sample carries no cwd/session_id
-        // so `try` would fail open before ever reaching the write path.
+        // persist-plan-approval gates on tool_name == "ExitPlanMode" and a
+        // non-empty tool_response.plan; the generic PostToolUse sample carries
+        // neither, so `try` would fail open before ever reaching the write
+        // path.
         //
         // `cwd` is a deliberately NONEXISTENT path, and `try_hook`'s
         // `CWD_OVERRIDE_REFUSED` list keeps it that way — this hook has a
         // genuine filesystem WRITE side effect, and `try`'s normal behavior
         // (inject the REAL current_dir(), so most checks exercise real repo
         // detection) would otherwise let a bare `cadence-hooks try session
-        // persist-plan` actually create a plan doc in whatever repo the user
-        // ran it from (cameronsjo/cadence-hooks#396 review: verified end to
-        // end — a real plan doc landed in a real repo during review). A
+        // persist-plan-approval` actually create a plan doc in whatever repo
+        // the user ran it from (cameronsjo/cadence-hooks#396 review: verified
+        // end to end — a real plan doc landed in a real repo during review). A
         // nonexistent directory makes `repo_root`'s `git -C <cwd> …` spawn
         // fail deterministically, so the check reaches (and exercises) its
         // "not a git repo" fail-open arm instead of ever writing.
-        ("session", "persist-plan") => Some(
-            r#"{"session_id":"test","prompt":"Implement the following plan:\n\n# Try Sample\n\nbody text","cwd":"/nonexistent-cadence-hooks-try-sandbox","transcript_path":"/tmp/test.jsonl"}"#,
-        ),
-        // persist-plan-approval gates on tool_name == "ExitPlanMode" and a
-        // non-empty tool_response.plan; the generic PostToolUse sample carries
-        // neither, so `try` would fail open before ever reaching the write
-        // path. Same nonexistent-`cwd` discipline as `persist-plan` above —
-        // see that entry's comment.
         ("session", "persist-plan-approval") => Some(
             // Extra `#` in the raw-string delimiter: the payload's own plan
             // text embeds a literal `"#` (a quote immediately followed by an

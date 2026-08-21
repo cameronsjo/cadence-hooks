@@ -30,7 +30,6 @@
 //! | `end`               | SessionEnd   | [`end`]         |
 //! | `backstop-record`   | SessionEnd   | [`backstop`]    |
 //! | `backstop-warn`     | SessionStart | [`backstop`]    |
-//! | `persist-plan`      | UserPromptSubmit | [`persist_plan`] |
 //! | `persist-plan-approval` | PostToolUse | [`persist_plan`] |
 
 /// Outro "no loose ends" backstop: SessionEnd records loose ends, SessionStart warns (#123).

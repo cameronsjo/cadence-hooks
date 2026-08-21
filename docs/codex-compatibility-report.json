@@ -1612,27 +1612,7 @@
     },
     {
       "criticality": "workflow",
-      "description": "Persist an approved plan whose post-approval turn was wiped, nudging when it carries no settled Panel: line (UserPromptSubmit)",
-      "event": "UserPromptSubmit",
-      "name": "persist-plan",
-      "plugin": "session",
-      "protected": false,
-      "status": "native",
-      "applicable": true,
-      "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence",
-          "event": "UserPromptSubmit",
-          "matcher": "*",
-          "if": null,
-          "commandHash": "b7a6e48b7e6f883899674c899e991bb289c0e65c7f4fcf00ee5ff602bb812ad0"
-        }
-      ]
-    },
-    {
-      "criticality": "workflow",
-      "description": "Persist an approved plan on same-session approval, nudging when it carries no settled Panel: line (PostToolUse:ExitPlanMode)",
+      "description": "Persist an approved plan at approval, merging into its own frontmatter and nudging when it carries no settled Panel: line; CADENCE_NO_PERSIST_PLAN opts out (PostToolUse:ExitPlanMode)",
       "event": "PostToolUse",
       "name": "persist-plan-approval",
       "plugin": "session",

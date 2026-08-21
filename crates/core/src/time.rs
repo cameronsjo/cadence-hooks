@@ -26,7 +26,7 @@ pub fn utc_timestamp() -> String {
 /// Current LOCAL calendar date, `%Y-%m-%d` (e.g. `2026-07-20`).
 ///
 /// Distinct from [`utc_timestamp`]: filenames that carry a date (e.g. the
-/// `docs/plans/YYYY-MM-DD-<slug>.md` convention `session persist-plan` writes
+/// `docs/plans/YYYY-MM-DD-<slug>.md` convention `session persist-plan-approval` writes
 /// into) use the author's local calendar day, matching every hand-authored
 /// plan file — a UTC-derived date would occasionally be a day off from what
 /// the session experienced. `Zoned::now()` resolves the system time zone,
