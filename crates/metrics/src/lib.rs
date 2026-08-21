@@ -57,7 +57,7 @@ pub mod warn_stale;
 /// The metrics root directory (`CADENCE_METRICS_DIR`, else
 /// `<config_dir>/metrics`) — the single source of truth every stream's
 /// writer resolves against. Re-exported so a JSONL append living outside
-/// this crate (e.g. `session persist-plan`'s `plan-links.jsonl`) reuses the
+/// this crate (e.g. `session persist-plan-approval`'s `plan-links.jsonl`) reuses the
 /// resolution instead of re-deriving it.
 pub use common::metrics_dir;
 

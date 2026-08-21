@@ -278,15 +278,10 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
     // The hook has to ride the always-on cadence plugin to fire at all, while
     // `session` is the clap namespace that owns plan/session state
     // (cameronsjo/cadence-hooks#348, cameronsjo/cadence#507).
-    (
-        "cadence",
-        "session persist-plan",
-        "must ride the always-on cadence plugin; `session` is its clap namespace",
-    ),
-    // Same rationale as its sibling above: the approval hook rides the
-    // always-on cadence plugin while `session` owns plan/session state.
-    // Wiring shipped in the cadence monorepo without this entry, leaving the
-    // audit red for any workspace with a current sibling checkout (#460).
+    // The approval hook rides the always-on cadence plugin while `session`
+    // owns plan/session state. Wiring shipped in the cadence monorepo without
+    // this entry once, leaving the audit red for any workspace with a current
+    // sibling checkout (#460).
     (
         "cadence",
         "session persist-plan-approval",

@@ -24,8 +24,7 @@
 //! every plan doc is committed source, but a shared checkout can carry a
 //! contributor-authored file, so this scan treats the corpus as adversarial
 //! input, not just large input: candidates are capped to the newest
-//! [`PLAN_SCAN_MAX_FILES`] by mtime (mirroring
-//! `persist_plan::find_parent`'s newest-first bound), a symlinked or
+//! [`PLAN_SCAN_MAX_FILES`] by mtime (a newest-first bound), a symlinked or
 //! non-regular `.md` entry is skipped via `symlink_metadata` rather than
 //! opened, each file's read is capped to [`PLAN_SCAN_READ_CAP_BYTES`], and
 //! the rendered disclosure itself caps at [`PLAN_SCAN_MAX_EMITTED_LINES`]
@@ -58,8 +57,7 @@ use std::time::SystemTime;
 const PLAN_SCAN_READ_CAP_BYTES: u64 = 64 * 1024;
 
 /// Cap on how many `docs/plans/*.md` candidates are even considered, newest
-/// by mtime — mirrors `persist_plan::find_parent`'s `PARENT_SCAN_MAX_FILES`
-/// bound on sibling transcripts. Bounds the scan's total work independent of
+/// by mtime. Bounds the scan's total work independent of
 /// how large (or adversarially padded) the directory grows.
 const PLAN_SCAN_MAX_FILES: usize = 50;
 

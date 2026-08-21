@@ -15,7 +15,7 @@
 //! What the inline tests do NOT cover is the compiled BINARY's own stdin/
 //! stdout contract for this feature: real JSON on stdin, the real
 //! `hookSpecificOutput.additionalContext` envelope on stdout, and the CLI
-//! surface (`session persist-plan` / `session persist-plan-approval`) a real
+//! surface (`session persist-plan-approval`) a real
 //! Claude Code hook invocation actually drives. That is exactly the gap this
 //! repo's existing top-level `tests/*.rs` integration suite fills for other
 //! hooks (see `tests/session_markers.rs`, `tests/try_hook.rs`), so this file

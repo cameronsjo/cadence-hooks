@@ -405,8 +405,6 @@ enum SessionCommands {
     BackstopRecord,
     /// Warn at session start when the last session in this repo left loose ends (SessionStart)
     BackstopWarn,
-    /// Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)
-    PersistPlan,
     /// Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)
     PersistPlanApproval,
     /// Nudge once per session when commits keep skipping the branch's in-flight plan (PostToolUse:Bash)
@@ -520,7 +518,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::End => "end",
             SessionCommands::BackstopRecord => "backstop-record",
             SessionCommands::BackstopWarn => "backstop-warn",
-            SessionCommands::PersistPlan => "persist-plan",
             SessionCommands::PersistPlanApproval => "persist-plan-approval",
             SessionCommands::NudgePlanTick => "nudge-plan-tick",
             SessionCommands::WarnPlanReadyFlip => "warn-plan-ready-flip",
@@ -846,7 +843,6 @@ fn main() {
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
     let session = HookEvent::SessionStart;
-    let user_prompt_submit = HookEvent::UserPromptSubmit;
 
     match cli.command {
         Commands::Try {
@@ -1284,11 +1280,6 @@ fn main() {
             SessionCommands::BackstopWarn => dispatch::run_logged_check(
                 &cadence_hooks_session::backstop::BackstopWarn,
                 session,
-                canonical_hook,
-            ),
-            SessionCommands::PersistPlan => dispatch::run_logged_check(
-                &cadence_hooks_session::persist_plan::PersistPlan,
-                user_prompt_submit,
                 canonical_hook,
             ),
             SessionCommands::PersistPlanApproval => dispatch::run_logged_check(

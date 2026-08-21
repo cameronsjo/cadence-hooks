@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- **`session persist-plan` (the UserPromptSubmit re-scan arm) and `CADENCE_PERSIST_PLAN_FORCE`.** It re-fired every prompt holding the RAW approved plan text, which is stale the moment a plan starts living — so it wrote raw duplicate siblings (cameronsjo/cadence-hooks#703, #724, #729), stamped a second frontmatter block over a ticked plan (#738), and wrote into primary checkouts (#739); three rounds of on-disk recognition heuristics could not track a document that drifts away from every hash by design. `session persist-plan-approval` (PostToolUse:ExitPlanMode) is the sole writer now; when no approval-time persist happened (the approve-and-clear path), the cadence rules' copy rule is the fallback. The `plan-skips.jsonl` stream dies with the arm. Unwired first in cameronsjo/cadence#1025.
+
+### Fixed
+
+- **`session persist-plan-approval` merges into a plan's own leading frontmatter instead of stacking a second block on top (cameronsjo/cadence-hooks#738).** A template-authored plan already opens with `status:`/`next:`/`branch:`; the hook used to prepend its own `---` block, so SessionStart and outro read the hook's `status: "in-flight"` / `branch:` forever. The written file now carries ONE block — the plan's lines byte-for-byte, then the hook-owned provenance keys, with `status`/`updated`/`branch` suppressed when the plan's block already declares them. Plan content stays untrusted: the only interpretation is the existing fence scan plus a column-0 `key:` read.
+
+### Added
+
+- **`CADENCE_NO_PERSIST_PLAN` opts out of `session persist-plan-approval` (cameronsjo/cadence-hooks#692).** Any non-empty value, from the process environment or the repo's `.claude/settings.local.json` / `.claude/settings.json` `env` block (the `CADENCE_ALLOW_MAIN` precedent), skips the persist entirely — no file, no `plan-links.jsonl` row, exit 0. Advisory tier. The four plan guards and the SessionStart plan scanner are not covered by this flag.
+
 - **`guardrails warn-subagent-concurrency` and its `CADENCE_MAX_CONCURRENT_SUBAGENTS` cap.** The nudge guessed at an observed server-side throttle; Claude Code now documents the real caps (`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` = 20 concurrent, 200 spawns per session), so the guard was dead weight. The `cadence-guardrails` wiring left first (cameronsjo/cadence, `chore/remove-warn-subagent-concurrency`); `run-cadence-hooks.sh` fails open on the unknown subcommand for any binary/plugin skew in between.
 
 ## [0.81.0] - 2026-08-20
