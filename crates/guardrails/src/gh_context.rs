@@ -27,7 +27,7 @@ pub fn render_from_env() -> String {
     render_context(&owners, &repos, &extras, &default)
 }
 
-/// Pure renderer: build the SessionStart context message from a parsed
+/// Pure renderer: build the gh-write context message from a parsed
 /// allowlist. Exposed for unit testing without env-var fiddling.
 ///
 /// `owner_entries` and `repo_entries` come from two separate env vars
