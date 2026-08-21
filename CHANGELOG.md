@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.81.0] - 2026-08-20
+
 ### Added
 
 - **New `cadence warn-changelog-entry` nudge-only check**: fires on the same ship anchors as `warn-docs-update` (`gh pr create`/`ready`/bare `merge`) and flags a shipped branch that touched code but not the `CHANGELOG.md` its repo class owns — a plugin's own `plugins/<name>/CHANGELOG.md` in a monorepo, or the root `CHANGELOG.md` otherwise. Silent in a repo tracking no changelog at all. Opt out via `CADENCE_DISABLE=warn-changelog-entry` (cameronsjo/cadence-hooks#730).
