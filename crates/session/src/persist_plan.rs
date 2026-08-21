@@ -267,11 +267,15 @@ pub fn run_persist_plan_approval(
 }
 
 /// Has this repo or session opted out of the persist (cadence-hooks#692)?
-/// `CADENCE_NO_PERSIST_PLAN` with any non-empty value, read from the process
-/// environment first and then from the repo's `.claude/settings.local.json` /
-/// `.claude/settings.json` `env` block — the same two sources and the same
-/// untrusted-config reader `CADENCE_ALLOW_MAIN` uses. Advisory tier: no
-/// `PROTECTED_GUARDS` treatment, no audit row on the skip.
+/// `CADENCE_NO_PERSIST_PLAN` with any non-empty value — the `CADENCE_NO_*`
+/// family's convention (`CADENCE_NO_OUTRO_BACKSTOP`, `CADENCE_NO_FEEDBACK_FOOTER`),
+/// so `"0"`/`"false"` DO opt out; unset or empty to re-enable — read from the
+/// process environment first and then from the repo's
+/// `.claude/settings.local.json` / `.claude/settings.json` `env` block, the
+/// same two sources and the same untrusted-config reader `CADENCE_ALLOW_MAIN`
+/// uses. Advisory tier: no `PROTECTED_GUARDS` treatment, no audit row on the
+/// skip — the flag is the operator's own choice about an advisory write, not
+/// a bypass of a block.
 fn persist_plan_opted_out(repo_root: &Path) -> bool {
     std::env::var("CADENCE_NO_PERSIST_PLAN").is_ok_and(|v| !v.is_empty())
         || cadence_hooks_core::config::repo_env_flag(repo_root, "CADENCE_NO_PERSIST_PLAN")
@@ -816,24 +820,40 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
     lines
 }
 
-/// The top-level keys a plan's own frontmatter block declares — the bare
-/// `key` of every `key:` line at column 0. Byte-level, deliberately: the
-/// block is untrusted plan content, and this is the ONLY interpretation
-/// [`render_document`] makes of it (which hook defaults to suppress). Nested
-/// or indented keys, comments, and anything that is not `ident:` at column 0
-/// are ignored.
+/// The frontmatter keys this hook owns: the persist's provenance, which a
+/// plan's own block must never be able to pre-empt. [`render_document`] drops
+/// any plan line declaring one of these (and emits its own lines FIRST), so
+/// a first-match line reader (`file_matches_body`, `plan_scan`) and a
+/// last-wins YAML parser agree on the provenance of the written file.
+const HOOK_OWNED_KEYS: [&str; 8] = [
+    "body_sha256",
+    "session",
+    "session_id",
+    "model",
+    "harness",
+    "machine",
+    "approved_in",
+    "approved_session_id",
+];
+
+/// The bare `key` of a `key:` line at column 0, or `None` for anything else
+/// (an indented/nested key, a comment, a continuation line, prose). Byte-level,
+/// deliberately: a plan's frontmatter block is untrusted content, and this is
+/// the ONLY interpretation [`render_document`] makes of it — which hook
+/// defaults to suppress, and which plan lines to drop as hook-owned.
+fn plan_line_key(line: &str) -> Option<&str> {
+    let (key, _) = line.split_once(':')?;
+    (!key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+    .then_some(key)
+}
+
+/// The top-level keys a plan's own frontmatter block declares — see
+/// [`plan_line_key`] for what counts.
 fn plan_frontmatter_keys(block: &str) -> Vec<&str> {
-    block
-        .lines()
-        .filter_map(|line| {
-            let (key, _) = line.split_once(':')?;
-            (!key.is_empty()
-                && key
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
-            .then_some(key)
-        })
-        .collect()
+    block.lines().filter_map(plan_line_key).collect()
 }
 
 /// The full document written to disk, trailing-newline terminated.
@@ -841,14 +861,24 @@ fn plan_frontmatter_keys(block: &str) -> Vec<&str> {
 /// A body with no leading frontmatter gets the hook's block, a blank line,
 /// then the body. A body that already OPENS with its own `---` block (a plan
 /// authored from the template carries `status:`/`next:`/`branch:` from birth)
-/// gets ONE merged block (cadence-hooks#738): the plan's own lines copied
-/// byte-for-byte first — untrusted content, never parsed beyond
-/// [`frontmatter_extent`]'s fence scan and [`plan_frontmatter_keys`]'s
-/// column-0 key read — then the hook-owned lines, with `status`/`updated`/
-/// `branch` suppressed when the plan's block already declares them; the body
-/// resumes after the plan's closing fence. Stacking a second block on top
-/// left SessionStart/outro reading the hook's `status: "in-flight"` /
-/// `branch:` forever, however far the plan had moved on.
+/// gets ONE merged block (cadence-hooks#738): the hook-owned lines FIRST —
+/// with `status`/`updated`/`branch` suppressed when the plan's block already
+/// declares them — then the plan's own lines copied byte-for-byte, minus any
+/// line declaring a [`HOOK_OWNED_KEYS`] key; the body resumes after the
+/// plan's closing fence. Stacking a second block on top left SessionStart/
+/// outro reading the hook's `status: "in-flight"` / `branch:` forever,
+/// however far the plan had moved on.
+///
+/// The plan block is untrusted content. It is never parsed beyond
+/// [`frontmatter_extent`]'s fence scan and [`plan_line_key`]'s column-0 key
+/// read; hook-first ordering plus the hook-owned-key drop is what keeps a
+/// plan from pre-empting the provenance keys (a plan declaring its own
+/// `body_sha256:`/`approved_session_id:` would otherwise win a first-match
+/// read), and from swallowing them into a malformed scalar of its own (an
+/// unterminated quote or a `...` document-end marker on a plan line can only
+/// damage what FOLLOWS it — now only the plan's own lines). Lines are
+/// re-joined with `\n`, so a CRLF-authored block comes out LF (`str::lines`
+/// strips the `\r`) — deliberate, the rest of the file is LF too.
 fn render_document(f: &FrontmatterFields, body: &str) -> String {
     let Some((start, end, body_start)) = frontmatter_extent(body) else {
         return format!("{}\n\n{body}\n", render_frontmatter(f));
@@ -856,8 +886,13 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
     let plan_block = &body[start..end];
     let plan_keys = plan_frontmatter_keys(plan_block);
     let mut lines = vec!["---".to_string()];
-    lines.extend(plan_block.lines().map(str::to_string));
     lines.extend(hook_frontmatter_lines(f, &plan_keys));
+    lines.extend(
+        plan_block
+            .lines()
+            .filter(|line| !plan_line_key(line).is_some_and(|k| HOOK_OWNED_KEYS.contains(&k)))
+            .map(str::to_string),
+    );
     lines.push("---".to_string());
     let rest = body[body_start..].trim_start_matches(['\r', '\n']);
     format!("{}\n\n{rest}\n", lines.join("\n"))
@@ -2083,22 +2118,22 @@ mod tests {
             1,
             "exactly one closing fence (one block), got:\n{doc}"
         );
-        assert!(doc.starts_with("---\nstatus: done\nnext: \"ship it\"\nbranch: feat/x\n"));
-        // The plan's status/branch win: the hook's defaults are suppressed.
-        assert_eq!(
-            doc.matches("\nstatus:").count() + usize::from(doc.starts_with("---\nstatus:")),
-            1
-        );
+        // Hook-owned lines first (`updated` was absent from the plan's block,
+        // so the hook supplies it; `status`/`branch` are the plan's), then the
+        // plan's own lines verbatim, then the one closing fence.
+        assert!(doc.starts_with("---\nupdated: \"2026-07-25\"\nbody_sha256: \"hash\"\n"));
+        assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
+        assert_eq!(doc.matches("\nstatus:").count(), 1, "{doc}");
         assert!(!doc.contains("status: \"in-flight\""));
         assert_eq!(doc.matches("\nbranch:").count(), 1);
-        // `updated` was absent from the plan's block, so the hook supplies it.
-        assert!(doc.contains("\nupdated: \"2026-07-25\"\n"));
-        assert!(doc.contains("\nbody_sha256: \"hash\"\n"));
-        assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
         let (frontmatter, rest) = doc
             .split_once("---\n\n")
             .expect("closing fence + blank line");
-        assert!(frontmatter.ends_with("\nmachine: \"digest\"\n"));
+        assert!(
+            frontmatter.ends_with(
+                "\nmachine: \"digest\"\nstatus: done\nnext: \"ship it\"\nbranch: feat/x\n"
+            )
+        );
         assert_eq!(rest, "# Title\n\nbody text\n");
     }
 
@@ -2117,6 +2152,44 @@ mod tests {
         assert_eq!(doc.matches("\nstatus: \"in-flight\"\n").count(), 1);
         assert_eq!(doc.matches("\n---\n").count(), 1);
         assert!(doc.ends_with("---\n\nbody\n"));
+    }
+
+    #[test]
+    fn render_document_merge_drops_plan_lines_that_claim_hook_owned_keys() {
+        // A plan block declaring the hook's provenance keys must not be able
+        // to forge them: its lines are dropped, the hook's come first, and
+        // each hook-owned key appears exactly once with the hook's value.
+        let fields = base_fields("real-hash", "real-digest");
+        let body = "---\nbody_sha256: \"forged\"\nsession_id: \"forged-sid\"\n\
+                    approved_session_id: \"forged-approver\"\nmachine: \"forged-machine\"\n\
+                    status: done\n---\n\nbody";
+        let doc = render_document(&fields, body);
+        assert!(!doc.contains("forged"), "{doc}");
+        for key in HOOK_OWNED_KEYS {
+            let count = doc.matches(&format!("\n{key}:")).count();
+            assert!(count <= 1, "{key} appears {count} times:\n{doc}");
+        }
+        assert!(doc.contains("\nbody_sha256: \"real-hash\"\n"));
+        assert!(doc.contains("\nsession_id: \"own-sid\"\n"));
+        assert!(doc.contains("\nmachine: \"real-digest\"\n"));
+        // The plan's non-owned key survives, after the hook's lines.
+        let (frontmatter, _) = doc.split_once("---\n\n").unwrap();
+        assert!(frontmatter.ends_with("\nstatus: done\n"));
+        assert!(!doc.contains("status: \"in-flight\""));
+        assert_eq!(doc.matches("\n---\n").count(), 1);
+    }
+
+    #[test]
+    fn render_document_merge_keeps_hook_keys_ahead_of_a_malformed_plan_line() {
+        // An unterminated quote on the plan's last line can only swallow what
+        // follows it — and nothing hook-owned follows it any more.
+        let fields = base_fields("hash", "digest");
+        let doc = render_document(&fields, "---\ntitle: \"unterminated\n---\nbody");
+        let (frontmatter, _) = doc.split_once("---\n\n").unwrap();
+        let hook_at = frontmatter.find("\nbody_sha256:").unwrap();
+        let plan_at = frontmatter.find("\ntitle:").unwrap();
+        assert!(hook_at < plan_at, "{doc}");
+        assert!(frontmatter.ends_with("\ntitle: \"unterminated\n"));
     }
 
     #[test]
@@ -3067,10 +3140,11 @@ mod tests {
             "one block:\n{written}"
         );
         let block = leading_frontmatter_block(&written).expect("leading block");
-        assert!(block.starts_with("status: in-flight\nnext: \"Phase 2\"\nbranch: main\n"));
-        assert!(block.contains("body_sha256: \""));
+        assert!(block.starts_with("updated: \"2026-07-20\"\nbody_sha256: \""));
+        assert!(block.ends_with("\nstatus: in-flight\nnext: \"Phase 2\"\nbranch: main\n"));
         assert!(block.contains("approved_session_id: \"merge-sid\""));
         assert_eq!(block.matches("status:").count(), 1);
+        assert_eq!(block.matches("branch:").count(), 1);
         assert!(written.ends_with("---\n\n# Merge Me\n\n- [x] done\n"));
     }
 
