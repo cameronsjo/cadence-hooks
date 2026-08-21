@@ -599,26 +599,6 @@
     },
     {
       "criticality": "workflow",
-      "description": "Nudge when live subagents reach the concurrency cap on an Agent/Task spawn",
-      "event": "PreToolUse",
-      "name": "warn-subagent-concurrency",
-      "plugin": "guardrails",
-      "protected": false,
-      "status": "adapted",
-      "applicable": true,
-      "evidence": "crates/core/src/lib.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Agent|Task",
-          "if": null,
-          "commandHash": "116b0fb98af53440e7782112b86910d68c59e29888ebf975c06d264d7068807b"
-        }
-      ]
-    },
-    {
-      "criticality": "workflow",
       "description": "Warn when creating a branch from a non-main base",
       "event": "PreToolUse",
       "name": "warn-branch-base",

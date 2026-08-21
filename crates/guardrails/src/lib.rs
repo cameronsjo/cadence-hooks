@@ -14,8 +14,8 @@ pub(crate) static CADENCE_ALLOW_MAIN_TEST_LOCK: std::sync::Mutex<()> = std::sync
 /// Shared test lock serializing every test in this crate that mutates a
 /// process-global env var OUTSIDE the `CADENCE_ALLOW_MAIN` family above
 /// (`guard_push_remote`, `guard_gh_write`, `warn_issue_tracker`,
-/// `warn_subagent_worktree`, `warn_going_public`, `warn_subagent_concurrency`,
-/// `guard_read_model` — seven modules, seven different var sets). Each used
+/// `warn_subagent_worktree`, `warn_going_public`, `guard_read_model` —
+/// six modules, six different var sets). Each used
 /// to mint its own module-local `ENV_LOCK`, on the theory that disjoint var
 /// sets need no shared exclusion — but that theory lives only in a doc
 /// comment, and the moment two modules' vars overlap (or a future edit adds
@@ -151,8 +151,6 @@ pub mod warn_issue_tracker;
 pub mod warn_main_branch;
 /// Remind on `gh pr create` when the PR body has no closing keyword linking to an issue.
 pub mod warn_pr_issue_link;
-/// Nudge when the live subagent count is at or over the configured cap.
-pub mod warn_subagent_concurrency;
 /// Warn when dispatching a subagent from main while a sibling worktree exists.
 pub mod warn_subagent_worktree;
 /// Warn about untracked files during git commit operations.

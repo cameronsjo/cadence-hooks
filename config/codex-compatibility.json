@@ -20,7 +20,6 @@
     "guard-dotfiles": {"status": "adapted", "evidence": "tests/codex_coverage.rs::patch_target_reaches_guard_dotfiles"},
     "enforce-worktree": {"status": "adapted", "evidence": "crates/core/src/lib.rs::codex_patch_expands_every_target_and_rename_destination"},
     "warn-subagent-worktree": {"status": "adapted", "evidence": "crates/core/src/lib.rs"},
-    "warn-subagent-concurrency": {"status": "adapted", "evidence": "crates/core/src/lib.rs"},
     "guard-rm": {"status": "adapted", "evidence": "crates/guardrails/src/guard_rm.rs::patch_delete_of_a_protected_path_blocks"},
     "guard-rm-liveness": {
       "applicable": false,

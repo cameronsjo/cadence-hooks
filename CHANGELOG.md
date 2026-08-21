@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **`guardrails warn-subagent-concurrency` and its `CADENCE_MAX_CONCURRENT_SUBAGENTS` cap.** The nudge guessed at an observed server-side throttle; Claude Code now documents the real caps (`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` = 20 concurrent, 200 spawns per session), so the guard was dead weight. The `cadence-guardrails` wiring left first (cameronsjo/cadence, `chore/remove-warn-subagent-concurrency`); `run-cadence-hooks.sh` fails open on the unknown subcommand for any binary/plugin skew in between.
+
 ## [0.81.0] - 2026-08-20
 
 ### Added
