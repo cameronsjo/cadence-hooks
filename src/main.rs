@@ -267,8 +267,6 @@ enum GuardrailsCommands {
     WarnMainBranch,
     /// Warn when dispatching a subagent from main while a sibling worktree exists
     WarnSubagentWorktree,
-    /// Nudge when the live subagent count is at or over the concurrency cap
-    WarnSubagentConcurrency,
     /// Warn when creating a branch from a non-main base
     WarnBranchBase,
     /// Remind to check datetime before scheduling cron jobs
@@ -464,7 +462,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardGitInit => "guard-git-init",
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
             GuardrailsCommands::WarnSubagentWorktree => "warn-subagent-worktree",
-            GuardrailsCommands::WarnSubagentConcurrency => "warn-subagent-concurrency",
             GuardrailsCommands::WarnBranchBase => "warn-branch-base",
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
@@ -1031,11 +1028,6 @@ fn main() {
             ),
             GuardrailsCommands::WarnSubagentWorktree => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_subagent_worktree::WarnSubagentWorktree,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnSubagentConcurrency => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_subagent_concurrency::WarnSubagentConcurrency,
                 pre,
                 canonical_hook,
             ),
