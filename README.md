@@ -8,16 +8,16 @@ Claude Code hooks run on every tool invocation. Shell scripts accumulate startup
 
 ## Hooks
 
-64 hooks across 6 namespaces, each named for the plugin it serves:
+67 hooks across 6 namespaces, each named for the plugin it serves:
 
 | Namespace | Plugin | Hooks | Focus |
 |-----------|--------|-------|-------|
-| `cadence` | cadence | 14 | Terminology, secret guards, git safety, memory limits, markdown/docs nudges |
+| `cadence` | cadence | 15 | Terminology, secret guards, git safety, memory limits, markdown/docs nudges |
 | `guardrails` | git-guardrails | 26 | Push & gh-write allowlists, branch/PR/issue nudges, dotfile & vault guards |
 | `rules` | cadence-rules | 4 | Frontmatter validation + a security anti-pattern scan |
 | `obsidian` | cadence-obsidian | 1 | Block `rm` inside the Obsidian vault |
 | `metrics` | cadence-metrics | 9 | Cost-per-commit and subagent JSONL loggers (never block) |
-| `session` | cadence-canon | 10 | Multi-session identity, peer disclosure, lane warnings |
+| `session` | cadence-canon | 12 | Multi-session identity, peer disclosure, lane warnings |
 
 **Full catalog:** [docs/hooks.md](docs/hooks.md) — every hook with its event and behavior, plus the CLI actions (`session declare`/`status`, `dismiss-main-branch-warn`) that are commands rather than hooks.
 

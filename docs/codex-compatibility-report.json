@@ -1064,18 +1064,6 @@
     },
     {
       "criticality": "workflow",
-      "description": "Inject the gh-write allowlist + `-R` rule on SessionStart",
-      "event": "SessionStart",
-      "name": "inject-gh-context",
-      "plugin": "guardrails",
-      "protected": false,
-      "status": "unavailable",
-      "applicable": false,
-      "evidence": "cadence#658 retired the SessionStart registrar in favor of inject-gh-write-context",
-      "wiring": []
-    },
-    {
-      "criticality": "workflow",
       "description": "Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write",
       "event": "PreToolUse",
       "name": "inject-gh-write-context",

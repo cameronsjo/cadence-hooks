@@ -303,8 +303,6 @@ enum GuardrailsCommands {
     WarnAliasParsing,
     /// Block the first Claude-in-Chrome action per session until the device is confirmed
     GuardBrowserDevice,
-    /// Inject the gh-write allowlist + `-R` rule on SessionStart
-    InjectGhContext,
     /// Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write
     InjectGhWriteContext,
     /// Snooze warn-main-branch for this repo for the given duration
@@ -478,7 +476,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnCoderabbitRetrigger => "warn-coderabbit-retrigger",
             GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             GuardrailsCommands::GuardBrowserDevice => "guard-browser-device",
-            GuardrailsCommands::InjectGhContext => "inject-gh-context",
             GuardrailsCommands::InjectGhWriteContext => "inject-gh-write-context",
             GuardrailsCommands::EnforceWorktree => "enforce-worktree",
             // The dismiss-* subcommands are CLI actions, not hooks —
@@ -1115,11 +1112,6 @@ fn main() {
             GuardrailsCommands::GuardBrowserDevice => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_browser_device::GuardBrowserDevice,
                 pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::InjectGhContext => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::inject_gh_context::InjectGhContext,
-                session,
                 canonical_hook,
             ),
             GuardrailsCommands::InjectGhWriteContext => dispatch::run_logged_check(
