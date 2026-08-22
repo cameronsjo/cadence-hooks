@@ -343,8 +343,8 @@ enum GuardrailsCommands {
     WarnCurlAlias,
     /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
     WarnGhMergePreflight,
-    /// Warn that CodeRabbit re-trigger comments are no-ops on reviewed content
-    WarnCoderabbitRetrigger,
+    /// Warn on gh pr ready/merge when the PR head has no reviewed signal
+    WarnUnreviewedReadyFlip,
     /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers
     WarnAliasParsing,
     /// Block the first Claude-in-Chrome action per session until the device is confirmed
@@ -519,7 +519,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
             GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
-            GuardrailsCommands::WarnCoderabbitRetrigger => "warn-coderabbit-retrigger",
+            GuardrailsCommands::WarnUnreviewedReadyFlip => "warn-unreviewed-ready-flip",
             GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             GuardrailsCommands::GuardBrowserDevice => "guard-browser-device",
             GuardrailsCommands::InjectGhWriteContext => "inject-gh-write-context",
@@ -1179,8 +1179,8 @@ fn main() {
                 pre,
                 canonical_hook,
             ),
-            GuardrailsCommands::WarnCoderabbitRetrigger => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_coderabbit_retrigger::WarnCoderabbitRetrigger,
+            GuardrailsCommands::WarnUnreviewedReadyFlip => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::warn_unreviewed_ready_flip::WarnUnreviewedReadyFlip,
                 pre,
                 canonical_hook,
             ),

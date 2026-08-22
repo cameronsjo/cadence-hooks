@@ -36,6 +36,11 @@
       "applicable": false,
       "evidence": "Registered in the binary but not yet wired in any hooks.json — the cadence plugin wiring PR is separate (cameronsjo/cadence-hooks#730); flip back to applicable once it lands"
     },
+    "warn-unreviewed-ready-flip": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Registered in the binary but not yet wired in any hooks.json — the guardrails wiring PR is separate (cameronsjo/cadence#1037, plan Task 5, after this binary's release); flip back to applicable once it lands"
+    },
     "warn-recommended-option": {
       "status": "unavailable",
       "applicable": false,
