@@ -41,6 +41,23 @@ static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
 /// Return true when running inside Claude Code. Detected via `CLAUDECODE=1`,
 /// which Claude Code exports for every spawned shell. Empty/unset means no.
+/// True when the positional subcommand path names a CLI/diagnostic command
+/// that `CADENCE_BYPASS=1` must NOT short-circuit.
+///
+/// `first`/`second` are argv[1] and argv[2] — position, not any argv token,
+/// so a hook *argument* that happens to equal `list` or `try` cannot buy an
+/// exemption. The `_` on the first arm covers every sub-subcommand and flag of
+/// those commands, `configure guardrails` included.
+fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
+    matches!(
+        (first, second),
+        (
+            Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
+            _
+        ) | (Some("session"), Some("declare" | "status"))
+    )
+}
+
 fn under_claude_code() -> bool {
     std::env::var("CLAUDECODE")
         .map(|v| !v.is_empty())
@@ -48,6 +65,7 @@ fn under_claude_code() -> bool {
 }
 
 mod configure;
+mod configure_guardrails;
 mod dispatch;
 mod doctor;
 mod hook_latency;
@@ -147,6 +165,10 @@ enum Commands {
         /// Print current configuration without interactive mode
         #[arg(long)]
         list: bool,
+
+        /// Configure a specific subject instead of the hook-disable wizard
+        #[command(subcommand)]
+        action: Option<ConfigureCommands>,
     },
 
     /// Scan installed plugin hooks.json files for shell-expansion bugs and subcommand skew
@@ -172,6 +194,30 @@ enum Commands {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ManifestFormat {
     Json,
+}
+
+#[derive(Subcommand)]
+enum ConfigureCommands {
+    /// Set the git-guardrails identity allowlist in the USER settings.json
+    Guardrails {
+        /// GitHub users/orgs you own (space-separated). Omit to keep the
+        /// current value, or to be prompted.
+        #[arg(long, num_args = 1.., value_name = "OWNER")]
+        owners: Vec<String>,
+
+        /// Other owners' repos you have write access to, as `owner/repo`.
+        /// Omitting this preserves whatever is already configured.
+        #[arg(long, num_args = 1.., value_name = "OWNER/REPO")]
+        repos: Vec<String>,
+
+        /// Write without prompting (scriptable). Identical values are a no-op.
+        #[arg(long)]
+        yes: bool,
+
+        /// Print the current allowlist and exit — read-only, no writes
+        #[arg(long)]
+        show: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -642,13 +688,8 @@ fn main() {
     // CLI actions) — not any argv token, which would let a hook argument that
     // happens to equal "list"/"try"/etc. skip the bypass short-circuit.
     let mut positional = std::env::args().skip(1);
-    let bypass_exempt = matches!(
-        (positional.next().as_deref(), positional.next().as_deref()),
-        (
-            Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
-            _
-        ) | (Some("session"), Some("declare" | "status"))
-    );
+    let bypass_exempt =
+        is_bypass_exempt(positional.next().as_deref(), positional.next().as_deref());
     if bypassed && !bypass_exempt {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
@@ -863,7 +904,40 @@ fn main() {
             print_hook_manifest(format);
             process::exit(0);
         }
-        Commands::Configure { list } => {
+        Commands::Configure {
+            action:
+                Some(ConfigureCommands::Guardrails {
+                    owners,
+                    repos,
+                    yes,
+                    show,
+                }),
+            ..
+        } => {
+            // Same refusal as the hook-disable wizard below, and for a sharper
+            // reason: this writes the allowlist that decides which repos the
+            // agent may push to. An agent that can append an owner here grants
+            // itself write access to every repo under it. `--show` is read-only
+            // and stays available.
+            if under_claude_code() && !show {
+                eprintln!(
+                    "cadence-hooks: `configure guardrails` is disabled under Claude Code.\n\
+                     \n\
+                     It writes CADENCE_ALLOWED_OWNERS — the allowlist deciding which repos\n\
+                     pushes and gh writes are permitted against — so the agent could widen\n\
+                     its own permissions.\n\
+                     \n\
+                     Run it yourself from a terminal:\n\
+                     \n\
+                     \x20   cadence-hooks configure guardrails\n\
+                     \n\
+                     Or use `configure guardrails --show` to see the current values."
+                );
+                process::exit(1);
+            }
+            configure_guardrails::run(owners, repos, yes, show);
+        }
+        Commands::Configure { list, action: None } => {
             // Under Claude Code, refuse the interactive wizard — it edits settings.json
             // and would let the agent silently disable guardrails. `--list` is read-only
             // and stays available for visibility.
@@ -1331,6 +1405,82 @@ fn finish_dismiss(result: Result<cadence_hooks_guardrails::snooze_meta::DismissA
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configure_guardrails_is_exempt_from_the_maintenance_bypass() {
+        assert!(is_bypass_exempt(Some("configure"), Some("guardrails")));
+        assert!(is_bypass_exempt(Some("configure"), None));
+        assert!(is_bypass_exempt(Some("doctor"), None));
+        assert!(is_bypass_exempt(Some("session"), Some("status")));
+    }
+
+    #[test]
+    fn enforcement_hooks_are_not_exempt_from_the_maintenance_bypass() {
+        assert!(!is_bypass_exempt(
+            Some("guardrails"),
+            Some("guard-push-remote")
+        ));
+        // Position, not presence: an argument spelled like an exempt command
+        // must not buy an exemption.
+        assert!(!is_bypass_exempt(Some("cadence"), Some("configure")));
+    }
+
+    /// `configure guardrails` parses, and its flags land where the dispatch
+    /// arm reads them.
+    #[test]
+    fn configure_guardrails_flags_parse() {
+        let cli = Cli::command();
+        let matches = cli
+            .try_get_matches_from([
+                "cadence-hooks",
+                "configure",
+                "guardrails",
+                "--owners",
+                "cameronsjo",
+                "acme",
+                "--repos",
+                "other/tool",
+                "--yes",
+            ])
+            .expect("configure guardrails parses");
+        let parsed = Cli::from_arg_matches(&matches).expect("into Cli");
+
+        match parsed.command {
+            Commands::Configure {
+                action:
+                    Some(ConfigureCommands::Guardrails {
+                        owners,
+                        repos,
+                        yes,
+                        show,
+                    }),
+                ..
+            } => {
+                assert_eq!(owners, vec!["cameronsjo".to_string(), "acme".to_string()]);
+                assert_eq!(repos, vec!["other/tool".to_string()]);
+                assert!(yes);
+                assert!(!show);
+            }
+            _ => panic!("expected Configure/Guardrails"),
+        }
+    }
+
+    /// Bare `configure` keeps its existing shape — the hook-disable wizard.
+    #[test]
+    fn bare_configure_still_takes_list_and_no_action() {
+        let matches = Cli::command()
+            .try_get_matches_from(["cadence-hooks", "configure", "--list"])
+            .expect("configure --list parses");
+        let parsed = Cli::from_arg_matches(&matches).expect("into Cli");
+
+        match parsed.command {
+            Commands::Configure { list, action } => {
+                assert!(list);
+                assert!(action.is_none());
+            }
+            _ => panic!("expected Configure"),
+        }
+    }
 
     /// The registry must mirror clap's dispatch exactly — both directions.
     ///

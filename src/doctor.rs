@@ -2377,6 +2377,64 @@ fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
     })
 }
 
+/// Guardrails identity health from the USER settings.json: is
+/// `CADENCE_ALLOWED_OWNERS` set, and are the retired `GIT_GUARDRAILS_ALLOWED_*`
+/// keys still lying around (cameronsjo/cadence-hooks#275)?
+///
+/// Advisory only — a `Warning`, never an `Error`. An unset allowlist is a
+/// legitimate state on a machine that has not run `configure guardrails` yet;
+/// what makes it worth surfacing is that the failure it produces is a *block*
+/// on every push and gh write, which reads as a guard bug rather than as
+/// missing configuration.
+///
+/// Fails open on an unreadable or malformed settings file: this is a config
+/// health check, not a JSON validator, and a false finding about a file the
+/// binary could not read would be worse than silence (ADR-0001).
+fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
+    let content = cadence_hooks_core::paths::read_untrusted_config(settings_path)?;
+    let root = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => return None,
+    };
+    let current = crate::configure_guardrails::current_from(&root);
+
+    let diagnosis = match (current.owners.is_empty(), current.has_legacy()) {
+        (false, false) => return None,
+        (false, true) => format!(
+            "`{}` is set, but the retired `{}`/`{}` keys are still present in the \
+             env block and are no longer read — they mislead the next person who \
+             edits this file",
+            crate::configure_guardrails::OWNERS_KEY,
+            crate::configure_guardrails::LEGACY_OWNERS_KEY,
+            crate::configure_guardrails::LEGACY_REPOS_KEY,
+        ),
+        (true, true) => format!(
+            "only the retired `{}` key is set — this binary reads `{}`, so every \
+             `git push` and `gh` write is blocked",
+            crate::configure_guardrails::LEGACY_OWNERS_KEY,
+            crate::configure_guardrails::OWNERS_KEY,
+        ),
+        (true, false) => format!(
+            "`{}` is unset or empty — the push and gh-write guards block every \
+             operation until it names at least one GitHub owner",
+            crate::configure_guardrails::OWNERS_KEY,
+        ),
+    };
+
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: "cadence-guardrails".to_string(),
+        file: settings_path.to_path_buf(),
+        line: None,
+        snippet: crate::configure_guardrails::OWNERS_KEY.to_string(),
+        diagnosis,
+        remediation: "run `cadence-hooks configure guardrails` from a terminal \
+                      (it is refused under Claude Code — it edits the push allowlist), \
+                      then restart Claude Code"
+            .to_string(),
+    })
+}
+
 /// Entry point for the `doctor` subcommand. Returns the process exit code.
 ///
 /// Exit codes:
@@ -2524,6 +2582,15 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             cadence_hooks_core::paths::claude_config_dir(),
         ));
         findings.extend(cloud_sync_findings(&sync_candidates));
+        // Guardrails identity, from the USER settings.json — the same file
+        // `configure guardrails` writes. Live-machine read, so it is gated with
+        // the rest of this block; under `--root` there is no user config to
+        // inspect.
+        if let Some(finding) =
+            guardrails_identity_finding(&crate::configure_guardrails::user_settings_path())
+        {
+            findings.push(finding);
+        }
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);
             print_platform_drift_status();
@@ -5195,6 +5262,88 @@ mod tests {
             prune_liveness_gate(Some(&dir), 0, false),
             PruneGate::Proceed
         ));
+    }
+
+    // ── guardrails_identity_finding (#275) ───────────────────────────────────
+
+    /// Write a user-level settings.json body and return its path.
+    fn seed_user_settings(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn guardrails_identity_configured_machine_is_clean() {
+        let (_dir, path) = seed_user_settings(r#"{"env":{"CADENCE_ALLOWED_OWNERS":"cameronsjo"}}"#);
+
+        assert!(guardrails_identity_finding(&path).is_none());
+    }
+
+    #[test]
+    fn guardrails_identity_unset_owners_warns_about_blocked_pushes() {
+        let (_dir, path) = seed_user_settings(r#"{"env":{"SOMETHING_ELSE":"x"}}"#);
+
+        let finding = guardrails_identity_finding(&path).expect("unset owners warns");
+
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(
+            finding.diagnosis.contains("unset or empty"),
+            "{}",
+            finding.diagnosis
+        );
+        assert!(
+            finding.remediation.contains("configure guardrails"),
+            "names the fix: {}",
+            finding.remediation
+        );
+    }
+
+    #[test]
+    fn guardrails_identity_legacy_only_says_every_push_is_blocked() {
+        let (_dir, path) =
+            seed_user_settings(r#"{"env":{"GIT_GUARDRAILS_ALLOWED_OWNERS":"cameronsjo"}}"#);
+
+        let finding = guardrails_identity_finding(&path).expect("legacy-only warns");
+
+        assert!(
+            finding.diagnosis.contains("is blocked"),
+            "{}",
+            finding.diagnosis
+        );
+        assert!(
+            finding.diagnosis.contains("GIT_GUARDRAILS_ALLOWED_OWNERS"),
+            "names the legacy key: {}",
+            finding.diagnosis
+        );
+    }
+
+    #[test]
+    fn guardrails_identity_lingering_legacy_alongside_current_warns() {
+        let (_dir, path) = seed_user_settings(
+            r#"{"env":{
+                 "CADENCE_ALLOWED_OWNERS":"cameronsjo",
+                 "GIT_GUARDRAILS_ALLOWED_OWNERS":"cameronsjo"
+               }}"#,
+        );
+
+        let finding = guardrails_identity_finding(&path).expect("lingering legacy warns");
+
+        assert!(
+            finding.diagnosis.contains("no longer read"),
+            "{}",
+            finding.diagnosis
+        );
+    }
+
+    #[test]
+    fn guardrails_identity_fails_open_on_missing_or_malformed_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(guardrails_identity_finding(&dir.path().join("absent.json")).is_none());
+
+        let (_dir, path) = seed_user_settings("{ not json");
+        assert!(guardrails_identity_finding(&path).is_none());
     }
 
     // ── legacy_config_findings / cadence_config_parse_finding (#153) ─────────
