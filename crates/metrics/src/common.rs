@@ -30,27 +30,63 @@ pub fn is_git_commit(command: &str) -> bool {
 /// Resolution order:
 /// 1. `CADENCE_METRICS_DIR` — when set and non-empty, the value **is** the
 ///    metrics dir (JSONL files and the `state/` subdir live directly inside it).
-/// 2. `<config_dir>/metrics` — where `<config_dir>` honors `CLAUDE_CONFIG_DIR`
-///    and falls back to `~/.claude`.
+///    An explicit override always wins — it names an exact directory, not a
+///    root to layer the cadence-owned cutover under.
+/// 2. `<config_dir>/cadence/metrics` (the "new root") when it already exists —
+///    either a fresh install that has started writing there, or a machine
+///    the cadence#773 migration script has already run on.
+/// 3. `<config_dir>/metrics` (the "legacy root") when it exists and the new
+///    root does not — the read-both window: an unmigrated install keeps
+///    reading and writing its existing ledgers in place. Resolved through any
+///    symlink (cadence-hooks#626, from the cadence#773 B-classify ruling): on
+///    a multi-profile machine the legacy root can be a symlink shared across
+///    profiles, and operating on the symlink path itself — rather than its
+///    target — is exactly what breaks the second profile silently once the
+///    first profile's migration moves the shared target.
+/// 4. Otherwise (neither root exists — a true fresh install) — the new root,
+///    created lazily on first write.
 ///
-/// Relocating this default is deliberately out of scope for cross-runtime work.
-/// Moving it stranded ten of twelve live ledgers on the first upgrade: only two
-/// call sites had a legacy read fallback, against roughly twenty that resolve
-/// this directly, and no step copied the existing data forward. A relocation
-/// needs its own change with a migration, not a side effect of a schema bump.
+/// `<config_dir>` honors `CLAUDE_CONFIG_DIR` and falls back to `~/.claude`
+/// (`cadence_hooks_core::paths::claude_config_dir`).
+///
+/// This binary's job is exactly the new default plus the read-both window —
+/// moving *data* already under the legacy root is the monorepo's migration
+/// script's job (cadence#773), operator-scheduled after this ships. An
+/// earlier relocation attempt stranded ten of twelve live ledgers by skipping
+/// that read-both step entirely; this cutover is what closes that gap.
 pub fn metrics_dir() -> PathBuf {
-    metrics_dir_from(std::env::var("CADENCE_METRICS_DIR").ok())
+    metrics_dir_from(
+        std::env::var("CADENCE_METRICS_DIR").ok(),
+        cadence_hooks_core::paths::claude_config_dir(),
+    )
 }
 
-/// Pure resolver behind [`metrics_dir`]: takes the `CADENCE_METRICS_DIR` value
-/// so the precedence is testable without mutating process environment.
-fn metrics_dir_from(override_dir: Option<String>) -> PathBuf {
+/// Pure-ish resolver behind [`metrics_dir`]: takes the `CADENCE_METRICS_DIR`
+/// override and the already-resolved config dir directly, so the write-new /
+/// read-both precedence is testable against a temp-dir fixture without
+/// mutating `CLAUDE_CONFIG_DIR` (process-global, races parallel tests).
+///
+/// Only the existence checks below touch the filesystem; the precedence logic
+/// itself is a pure function of `(override_dir, config_dir, what's on disk)`.
+fn metrics_dir_from(override_dir: Option<String>, config_dir: PathBuf) -> PathBuf {
     if let Some(dir) = override_dir
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
-    cadence_hooks_core::paths::claude_config_dir().join("metrics")
+    let new_root = config_dir.join("cadence").join("metrics");
+    if new_root.is_dir() {
+        return new_root;
+    }
+    let legacy_root = config_dir.join("metrics");
+    if legacy_root.is_dir() {
+        // Resolve a symlinked legacy root to its real target (see the
+        // symlink caveat on `metrics_dir`'s doc comment above). A dangling
+        // or non-symlink path canonicalizes to itself or fails; either way,
+        // fall back to the un-resolved path rather than losing the read.
+        return std::fs::canonicalize(&legacy_root).unwrap_or(legacy_root);
+    }
+    new_root
 }
 
 /// Harness stamped on schema-v2 rows.
@@ -434,26 +470,25 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod tests {
     use super::*;
 
-    // `metrics_dir`'s resolution order is tested through the pure
-    // `metrics_dir_from` helper, so these tests never touch process-global env
-    // (no `set_var`/`remove_var`, no serialization lock, no cross-test leakage).
+    // `metrics_dir`'s resolution order is tested through the pure(-ish)
+    // `metrics_dir_from` helper against a temp-dir fixture, so these never
+    // touch process-global env (no `set_var`/`remove_var`, no serialization
+    // lock, no cross-test leakage) — except the dedicated
+    // `CLAUDE_CONFIG_DIR`-override test at the bottom of this module, which
+    // does hold `ENV_LOCK`.
 
     #[test]
     fn metrics_dir_override_via_cadence_metrics_dir() {
-        // A non-empty override value becomes the metrics dir verbatim.
+        // A non-empty override value becomes the metrics dir verbatim, even
+        // when a config dir with an existing new/legacy root is supplied —
+        // the override always wins.
+        let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            metrics_dir_from(Some("/tmp/cadence-test-metrics".to_string())),
+            metrics_dir_from(
+                Some("/tmp/cadence-test-metrics".to_string()),
+                tmp.path().to_path_buf()
+            ),
             std::path::PathBuf::from("/tmp/cadence-test-metrics")
-        );
-    }
-
-    #[test]
-    fn metrics_dir_fallback_contains_metrics() {
-        // No override → the `<config_dir>/metrics` default.
-        let dir = metrics_dir_from(None);
-        assert!(
-            dir.to_string_lossy().contains("metrics"),
-            "fallback metrics_dir should contain 'metrics': {dir:?}"
         );
     }
 
@@ -461,11 +496,117 @@ mod tests {
     fn metrics_dir_empty_override_falls_through() {
         // An empty CADENCE_METRICS_DIR must not shadow the default (guards the
         // `!dir.is_empty()` branch).
-        let dir = metrics_dir_from(Some(String::new()));
-        assert!(
-            dir.to_string_lossy().contains("metrics"),
-            "empty override should fall through to the default: {dir:?}"
-        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = metrics_dir_from(Some(String::new()), tmp.path().to_path_buf());
+        assert_eq!(dir, tmp.path().join("cadence").join("metrics"));
+    }
+
+    // --- write-new / read-both precedence (cadence-hooks#626) ---
+
+    #[test]
+    fn fresh_install_writes_land_under_the_new_config_root() {
+        // Neither the new nor the legacy root exists on disk yet — a true
+        // fresh install. The resolved dir is the new root (created lazily by
+        // the first write), never the legacy shape.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = metrics_dir_from(None, tmp.path().to_path_buf());
+        assert_eq!(dir, tmp.path().join("cadence").join("metrics"));
+        assert!(!dir.exists(), "resolving the dir must not create it");
+    }
+
+    #[test]
+    fn legacy_only_data_is_still_read() {
+        // An unmigrated install: only the legacy `<config>/metrics` root has
+        // ever existed. The read-both window means it keeps being resolved
+        // until the migration script moves its data.
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("metrics");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("commits.jsonl"), "{}\n").unwrap();
+
+        let dir = metrics_dir_from(None, tmp.path().to_path_buf());
+        // Canonicalized: the resolver always resolves the legacy root before
+        // returning it (cheap and correct even when it's a plain directory,
+        // not just when it's a symlink — see the dedicated symlink test
+        // below), and on macOS a tempdir's own path traverses a `/tmp` ->
+        // `/private/tmp`-style symlink, so the literal `legacy` path and its
+        // canonical form can legitimately differ here too.
+        assert_eq!(dir, std::fs::canonicalize(&legacy).unwrap());
+        assert!(dir.join("commits.jsonl").exists());
+    }
+
+    #[test]
+    fn new_root_takes_precedence_once_both_exist() {
+        // Both roots present — the shape mid-migration, or right after the
+        // script runs and leaves the legacy root behind for a beat. The new
+        // root wins outright; this binary never merges the two trees.
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("metrics");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("commits.jsonl"), "{}\n").unwrap();
+
+        let new_root = tmp.path().join("cadence").join("metrics");
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::write(new_root.join("commits.jsonl"), "{}\n").unwrap();
+
+        let dir = metrics_dir_from(None, tmp.path().to_path_buf());
+        assert_eq!(dir, new_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_legacy_root_resolves_to_its_target() {
+        // The multi-profile caveat: the legacy root is a symlink (shared
+        // across profiles) rather than a real directory. Operating on the
+        // symlink path itself is what breaks a second profile silently once
+        // its target moves — resolve to the target instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_target = tmp.path().join("shared-metrics-target");
+        std::fs::create_dir_all(&real_target).unwrap();
+        std::fs::write(real_target.join("commits.jsonl"), "{}\n").unwrap();
+
+        let legacy = tmp.path().join("metrics");
+        std::os::unix::fs::symlink(&real_target, &legacy).unwrap();
+
+        let dir = metrics_dir_from(None, tmp.path().to_path_buf());
+        assert_eq!(dir, std::fs::canonicalize(&real_target).unwrap());
+    }
+
+    #[test]
+    fn claude_config_dir_override_is_respected() {
+        // `metrics_dir()` itself (not the pure helper) must resolve the
+        // config root through `CLAUDE_CONFIG_DIR`, honoring a relocated
+        // config dir end to end. Holds `ENV_LOCK` (see the module doc above)
+        // since this mutates process-global env, and clears
+        // `CADENCE_METRICS_DIR` so it can't shadow the config-dir path this
+        // test is asserting on.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let previous_metrics_dir = std::env::var("CADENCE_METRICS_DIR").ok();
+        // SAFETY: serialized by ENV_LOCK above — no other thread in this
+        // process reads/writes CLAUDE_CONFIG_DIR or CADENCE_METRICS_DIR while
+        // this guard is held.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+            std::env::remove_var("CADENCE_METRICS_DIR");
+        }
+
+        let dir = metrics_dir();
+
+        // SAFETY: same justification as above — still under ENV_LOCK.
+        unsafe {
+            match previous_config_dir {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+            match previous_metrics_dir {
+                Some(v) => std::env::set_var("CADENCE_METRICS_DIR", v),
+                None => std::env::remove_var("CADENCE_METRICS_DIR"),
+            }
+        }
+
+        assert_eq!(dir, tmp.path().join("cadence").join("metrics"));
     }
 
     #[test]
