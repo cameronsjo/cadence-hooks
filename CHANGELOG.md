@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Metrics root moves under `<config>/cadence/metrics/`** — write-new, read-both. `metrics_dir()` now resolves `<config>/cadence/metrics` (writing there when it exists, or on a true fresh install with neither root present) and falls back to the legacy `<config>/metrics` only when it alone exists, resolving through any symlink so a shared legacy root on a multi-profile machine doesn't break the second profile silently. `CADENCE_METRICS_DIR` still overrides both. Data migration is the cadence monorepo's operator-scheduled script (cameronsjo/cadence#773 B-migrate); this binary's half is the new default plus the read-both window (cameronsjo/cadence-hooks#626).
+
 ### Removed
 
 - **`guardrails inject-gh-context`** (SessionStart). cameronsjo/cadence#658 retired its wiring in favor of the just-in-time `inject-gh-write-context` (PreToolUse) and the binary half was never removed, leaving the local `hook_registration_audit` red against every current sibling checkout (cameronsjo/cadence-hooks#673). The shared renderer lives on as `crates/guardrails/src/gh_context.rs`.
