@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-08-22
+
 ### Added
 
 - **`guardrails warn-unreviewed-ready-flip`** (PreToolUse:Bash) — nudges on `gh pr ready`/`gh pr merge` when the PR's head SHA carries no reviewed signal: neither a non-author human review APPROVED on that SHA, nor a `cadence-review` marker (`<!-- cadence-review: <reviewer> head=<sha> crit=0 imp=0 -->`) on it. Part of CodeRabbit's retirement (cameronsjo/cadence#1037) — the deterministic backstop for the "reviewed" convention `cadence-forge:review-loop` now defines. Fails open on any `gh` fetch or parse error, or an unresolvable PR.
