@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`configure guardrails`** — the git-guardrails identity setup, moved out of the `cadence-guardrails:guardrails-init` plugin skill and into the binary (cameronsjo/cadence-hooks#275). Detects the GitHub login via `gh api user`, prompts for additional owners and for `owner/repo` entries, and writes `CADENCE_ALLOWED_OWNERS` / `CADENCE_ALLOWED_REPOS` into the **user** settings.json (`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`) — a different file from the project-scoped `CADENCE_DISABLE` wizard. Migrates the retired `GIT_GUARDRAILS_ALLOWED_*` keys forward and removes them, preserves everything else in the file, and is idempotent. `--owners`/`--repos`/`--yes` make it scriptable; `--show` is read-only. Refused under Claude Code for the same reason the hook-disable wizard is, and a sharper one: it writes the allowlist deciding which repos the agent may push to.
+- **`doctor` warns when `CADENCE_ALLOWED_OWNERS` is unset, empty, or only present under its legacy name** — the state in which every `git push` and `gh` write is blocked, which reads as a guard bug rather than as missing configuration. Advisory (a warning, never an error), and names `cadence-hooks configure guardrails` as the fix.
+
 ### Changed
 
 - **Metrics root moves under `<config>/cadence/metrics/`** — write-new, read-both. `metrics_dir()` now resolves `<config>/cadence/metrics` (writing there when it exists, or on a true fresh install with neither root present) and falls back to the legacy `<config>/metrics` only when it alone exists, resolving through any symlink so a shared legacy root on a multi-profile machine doesn't break the second profile silently. `CADENCE_METRICS_DIR` still overrides both. Data migration is the cadence monorepo's operator-scheduled script (cameronsjo/cadence#773 B-migrate); this binary's half is the new default plus the read-both window (cameronsjo/cadence-hooks#626).
