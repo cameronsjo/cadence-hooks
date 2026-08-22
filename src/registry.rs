@@ -246,8 +246,8 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
-        name: "warn-coderabbit-retrigger",
-        description: "Warn that CodeRabbit re-trigger comments are no-ops on reviewed content",
+        name: "warn-unreviewed-ready-flip",
+        description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker)",
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
@@ -514,6 +514,14 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // logger sample carries no tool_name and would no-op.
         ("metrics", "log-skill") => Some(
             r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_name":"Skill","cwd":"/tmp","tool_input":{"skill":"cadence:attune","args":"execute C8"}}"#,
+        ),
+        // warn-unreviewed-ready-flip gates on `gh pr ready`/`gh pr merge`;
+        // the generic PreToolUse sample carries neither the command nor a
+        // real git remote, so the try run exercises the matcher then fails
+        // open on the git-remote lookup (no origin in a sample cwd) —
+        // useful signal without a live gh call.
+        ("guardrails", "warn-unreviewed-ready-flip") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr merge 5 --squash"}}"#,
         ),
         // warn-branch-drift early-exits unless the command is a git commit —
         // the generic PreToolUse sample (`git status`) would never reach the

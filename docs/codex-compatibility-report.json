@@ -299,7 +299,15 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Registered in the binary but not yet wired in any hooks.json — the cadence plugin wiring PR is separate (cameronsjo/cadence-hooks#730); flip back to applicable once it lands",
-      "wiring": []
+      "wiring": [
+        {
+          "plugin": "cadence",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": null,
+          "commandHash": "7ddf417e6465de4987b0c3e73331402ebec5103548a87e48badb5170c9f120dd"
+        }
+      ]
     },
     {
       "criticality": "workflow",
@@ -969,23 +977,15 @@
     },
     {
       "criticality": "workflow",
-      "description": "Warn that CodeRabbit re-trigger comments are no-ops on reviewed content",
+      "description": "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker)",
       "event": "PreToolUse",
-      "name": "warn-coderabbit-retrigger",
+      "name": "warn-unreviewed-ready-flip",
       "plugin": "guardrails",
       "protected": false,
-      "status": "native",
-      "applicable": true,
-      "evidence": "tests/hook_registration_audit.rs",
-      "wiring": [
-        {
-          "plugin": "cadence-guardrails",
-          "event": "PreToolUse",
-          "matcher": "Bash",
-          "if": "Bash(*coderabbitai*)",
-          "commandHash": "d1b6168b47b813945a546720f1dea3c1147796b3be9620b174a2c70c2108074c"
-        }
-      ]
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Registered in the binary but not yet wired in any hooks.json — the guardrails wiring PR is separate (cameronsjo/cadence#1037, plan Task 5, after this binary's release); flip back to applicable once it lands",
+      "wiring": []
     },
     {
       "criticality": "workflow",

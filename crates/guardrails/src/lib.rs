@@ -135,8 +135,6 @@ pub mod verify_pr_autoclose;
 pub mod warn_alias_parsing;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
-/// Warn that CodeRabbit re-trigger comments are no-ops on already-reviewed content.
-pub mod warn_coderabbit_retrigger;
 /// Remind to check datetime before scheduling cron jobs.
 pub mod warn_cron_datetime;
 /// Warn when bare `curl` (aliased to curlie) is used with custom headers.
@@ -153,5 +151,7 @@ pub mod warn_main_branch;
 pub mod warn_pr_issue_link;
 /// Warn when dispatching a subagent from main while a sibling worktree exists.
 pub mod warn_subagent_worktree;
+/// Warn on `gh pr ready`/`gh pr merge` when the PR's head SHA has no reviewed signal.
+pub mod warn_unreviewed_ready_flip;
 /// Warn about untracked files during git commit operations.
 pub mod warn_untracked;
