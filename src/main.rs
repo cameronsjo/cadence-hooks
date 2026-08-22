@@ -914,18 +914,24 @@ fn main() {
                 }),
             ..
         } => {
-            // Same refusal as the hook-disable wizard below, and for a sharper
-            // reason: this writes the allowlist that decides which repos the
-            // agent may push to. An agent that can append an owner here grants
-            // itself write access to every repo under it. `--show` is read-only
-            // and stays available.
+            // Same refusal as the hook-disable wizard below: this writes the
+            // allowlist deciding which repos a push or gh write may target, so
+            // an incidental agent invocation would silently widen it.
+            //
+            // It is an ACCIDENT GUARD, not a capability boundary — worth saying
+            // plainly so the point is not re-derived at every review.
+            // `CLAUDECODE` is a plain env var an agent can clear in one Bash
+            // call (this estate's own docs instruct `CLAUDECODE= claude …`),
+            // and nothing guards the user settings file against the Write tool
+            // either. That matches this repo's stated threat model: accidents,
+            // not a hostile agent. `--show` is read-only and stays available.
             if under_claude_code() && !show {
                 eprintln!(
                     "cadence-hooks: `configure guardrails` is disabled under Claude Code.\n\
                      \n\
                      It writes CADENCE_ALLOWED_OWNERS — the allowlist deciding which repos\n\
-                     pushes and gh writes are permitted against — so the agent could widen\n\
-                     its own permissions.\n\
+                     pushes and gh writes are permitted against — so it is not something an\n\
+                     agent should change on your behalf.\n\
                      \n\
                      Run it yourself from a terminal:\n\
                      \n\

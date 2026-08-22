@@ -52,16 +52,40 @@ pub fn parse_entries(raw: &str) -> Vec<String> {
     out
 }
 
-/// Reject an allowlist entry that the guards could not match, or that would
-/// silently split into two entries once written.
+/// Which key an entry is bound for. The two have different legal shapes, and
+/// the consumer decides shape by content, so the distinction has to be checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `CADENCE_ALLOWED_OWNERS` — an owner-wide grant, `owner` or `host/owner`.
+    Owner,
+    /// `CADENCE_ALLOWED_REPOS` — one repo, `owner/repo` or `host/owner/repo`.
+    Repo,
+}
+
+impl Kind {
+    fn flag(self) -> &'static str {
+        match self {
+            Kind::Owner => "--owners",
+            Kind::Repo => "--repos",
+        }
+    }
+}
+
+/// Reject an allowlist entry that the guards could not match, that would
+/// silently split into two entries once written, or that resolves to a
+/// *different shape* than the key it is bound for.
 ///
-/// Accepts the three forms `parse_allow_entry` understands — `owner`,
-/// `owner/repo` (or `host/owner`), and `host/owner/repo` — over the character
-/// set GitHub allows in a login or repo name, plus `.` and `:` for a host.
-/// Validation matters because a bad value does not fail loudly: it becomes a
-/// junk allowlist entry that silently never matches, and the user reads the
-/// resulting block as a guard bug.
-pub fn validate_entry(entry: &str) -> Result<(), String> {
+/// The shape check is a **round trip through the consumer**
+/// (`cadence_hooks_core::config::parse_allow_entry`), not a re-implementation
+/// of its rules — that function decides host-vs-owner on "does the first
+/// segment contain a dot", so `foo.bar/tool` reads as host `foo.bar` owner
+/// `tool` with no repo, and `github.com` reads as a bare owner literally named
+/// `github.com`. Both are values a person would write on purpose and neither
+/// can ever match anything; a bare owner also only matches `default_host`, so
+/// a dot in one is dead by construction. Validation matters because none of
+/// this fails loudly: a junk entry is silently never matched, and the guard
+/// block that follows reads as a guard bug rather than as a typo.
+pub fn validate_entry(entry: &str, kind: Kind) -> Result<(), String> {
     if entry.is_empty() {
         return Err("empty entry".to_string());
     }
@@ -71,6 +95,10 @@ pub fn validate_entry(entry: &str) -> Result<(), String> {
             "'{entry}' has too many '/' segments — expected owner, owner/repo, or host/owner/repo"
         ));
     }
+    // Charset gate first, so the round trip below never sees a control byte or
+    // whitespace. This is also what keeps `parse_entries`' splitter (space,
+    // comma, tab, newline) equivalent to the consumer's (any whitespace or
+    // comma): relaxing this charset re-opens a one-entry-becomes-two hole.
     for segment in &segments {
         if segment.is_empty() {
             return Err(format!("'{entry}' has an empty '/' segment"));
@@ -84,12 +112,61 @@ pub fn validate_entry(entry: &str) -> Result<(), String> {
             ));
         }
     }
+
+    let parsed = cadence_hooks_core::config::parse_allow_entry(entry);
+
+    match (kind, parsed.repo.is_some()) {
+        (Kind::Owner, true) => {
+            return Err(format!(
+                "'{entry}' names a specific repo — pass it to --repos, not --owners"
+            ));
+        }
+        (Kind::Repo, false) => {
+            return Err(format!(
+                "'{entry}' does not resolve to owner/repo — a first segment containing '.' is \
+                 read as a HOST, so this would grant nothing and match nothing. Write it as \
+                 owner/repo, or host/owner/repo"
+            ));
+        }
+        _ => {}
+    }
+
+    // Per-position charset, now that the positions are known. A GitHub login
+    // carries no dot or colon, so one in the owner slot can never match —
+    // which is exactly how `github.com` or a trailing-dot typo becomes a dead
+    // entry that reads as a guard bug.
+    if parsed
+        .owner
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+    {
+        return Err(format!(
+            "'{entry}' resolves to owner '{}', which is not a valid GitHub login ('.' and ':' \
+             belong in a host segment) — it would match nothing. For a self-hosted forge write \
+             host/owner{}",
+            parsed.owner,
+            if kind == Kind::Repo { "/repo" } else { "" }
+        ));
+    }
+    if let Some(repo) = &parsed.repo
+        && repo
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        return Err(format!(
+            "'{entry}' resolves to repo '{repo}', which is not a valid GitHub repo name"
+        ));
+    }
+
     Ok(())
 }
 
-/// Validate every entry, returning the first failure.
-pub fn validate_entries(entries: &[String]) -> Result<(), String> {
-    entries.iter().try_for_each(|e| validate_entry(e))
+/// Validate every entry against `kind`, returning the first failure with the
+/// flag named so the message says which list to move the value to.
+pub fn validate_entries(entries: &[String], kind: Kind) -> Result<(), String> {
+    entries.iter().try_for_each(|e| {
+        validate_entry(e, kind).map_err(|msg| format!("{} value {msg}", kind.flag()))
+    })
 }
 
 /// What the settings file currently says about the allowlist.
@@ -216,15 +293,63 @@ fn render_list(entries: &[String]) -> String {
     }
 }
 
-/// Write the settings object back, creating the config dir if needed.
+/// Write the settings object back **atomically**: serialize to a temp file in
+/// the same directory, then rename over the target.
+///
+/// A plain `fs::write` truncates in place, so an interrupt, a crash, or a full
+/// disk mid-write leaves a half-written settings.json — every unrelated setting
+/// in it gone. `load_settings` already refuses to clobber a file it could not
+/// parse; this is the same promise kept on the write side. The temp file must
+/// live in the same directory because `rename` is only atomic within a
+/// filesystem.
 pub fn save(path: &Path, root: &Map<String, Value>) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
-    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+
     let output = serde_json::to_string_pretty(&Value::Object(root.clone()))
         .map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    fs::write(path, output + "\n").map_err(|e| format!("Failed to write {}: {e}", path.display()))
+
+    let temp = parent.join(format!(
+        ".{}.cadence-hooks-{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings"),
+        std::process::id()
+    ));
+    fs::write(&temp, output + "\n")
+        .map_err(|e| format!("Failed to write {}: {e}", temp.display()))?;
+    fs::rename(&temp, path).map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        format!("Failed to replace {}: {e}", path.display())
+    })
+}
+
+/// Re-read the settings file and confirm nobody changed the allowlist while the
+/// prompts were open.
+///
+/// `run` snapshots the whole settings object, then can sit in `dialoguer` for
+/// minutes; writing the stale snapshot back would silently revert anything
+/// Claude Code's own `/config` (or a second terminal) wrote in that window.
+/// Returns the **fresh** object to apply onto, so an unrelated concurrent edit
+/// survives; errors when the allowlist keys themselves moved, since merging two
+/// intents for the same key is not something this can decide.
+fn reload_for_write(path: &Path, snapshot: &Current) -> Result<Map<String, Value>, String> {
+    let fresh = load_settings(path)?;
+    let now = current_from(&fresh);
+    if &now == snapshot {
+        return Ok(fresh);
+    }
+    Err(format!(
+        "{} changed while this was waiting for input — its guardrails keys now read \
+         {OWNERS_KEY}={}, {REPOS_KEY}={}. Nothing was written; re-run to start from the \
+         current values.",
+        path.display(),
+        render_list(&now.owners),
+        render_list(&now.repos)
+    ))
 }
 
 /// The GitHub login `gh` is authenticated as, or `None` when `gh` is missing,
@@ -232,7 +357,17 @@ pub fn save(path: &Path, root: &Map<String, Value>) -> Result<(), String> {
 ///
 /// The only impure step in this module's decision path, kept behind one
 /// function so every other path is testable without a `gh` on PATH.
+///
+/// **Refuses to answer when `GH_HOST` is set.** `gh api user` resolves against
+/// `GH_HOST`, so on a self-hosted forge it returns a login from *that*
+/// namespace — but a bare entry written here is matched against
+/// `config::default_host()`, so internal-forge `alice` would silently become a
+/// grant for `github.com/alice`, possibly a different person. That is a
+/// widening, not a narrowing, so detection declines and the caller asks.
 fn detect_github_login() -> Option<String> {
+    if std::env::var_os("GH_HOST").is_some() {
+        return None;
+    }
     let output = process::Command::new("gh")
         .args(["api", "user", "--jq", ".login"])
         .output()
@@ -241,10 +376,27 @@ fn detect_github_login() -> Option<String> {
         return None;
     }
     let login = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if login.is_empty() || validate_entry(&login).is_err() {
+    if login.is_empty() || validate_entry(&login, Kind::Owner).is_err() {
         return None;
     }
     Some(login)
+}
+
+/// Why identity detection produced nothing, in words the operator can act on.
+///
+/// `GH_HOST` is called out by name because it is the one case where the fix is
+/// not "authenticate `gh`" — the value would have been wrong, not missing.
+fn detection_failure_note() -> String {
+    if std::env::var_os("GH_HOST").is_some() {
+        format!(
+            "GH_HOST is set, so `gh api user` would return a login from that forge — and a bare \
+             {OWNERS_KEY} entry is matched against github.com, so writing it would grant the \
+             wrong account. Name the owner explicitly (use host/owner for the self-hosted one)."
+        )
+    } else {
+        "Could not detect a GitHub identity ('gh api user' unavailable or unauthenticated)."
+            .to_string()
+    }
 }
 
 /// Print the current allowlist state and exit 0.
@@ -270,7 +422,7 @@ fn show(path: &Path, current: &Current) -> ! {
 }
 
 /// Ask for a space-separated list, seeded with `default`.
-fn prompt_list(prompt: &str, default: &[String]) -> Result<Vec<String>, String> {
+fn prompt_list(prompt: &str, default: &[String], kind: Kind) -> Result<Vec<String>, String> {
     let raw: String = Input::new()
         .with_prompt(prompt)
         .with_initial_text(default.join(" "))
@@ -278,7 +430,7 @@ fn prompt_list(prompt: &str, default: &[String]) -> Result<Vec<String>, String> 
         .interact_text()
         .map_err(|e| format!("prompt cancelled: {e}"))?;
     let entries = parse_entries(&raw);
-    validate_entries(&entries)?;
+    validate_entries(&entries, kind)?;
     Ok(entries)
 }
 
@@ -317,7 +469,7 @@ fn seed_repos(flags: &[String], current: &Current) -> Vec<String> {
 pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_only: bool) -> ! {
     let path = user_settings_path();
 
-    let mut root = match load_settings(&path) {
+    let root = match load_settings(&path) {
         Ok(root) => root,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -332,7 +484,9 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
 
     let owner_flags = parse_entries(&owner_flags.join(" "));
     let repo_flags = parse_entries(&repo_flags.join(" "));
-    if let Err(e) = validate_entries(&owner_flags).and_then(|()| validate_entries(&repo_flags)) {
+    if let Err(e) = validate_entries(&owner_flags, Kind::Owner)
+        .and_then(|()| validate_entries(&repo_flags, Kind::Repo))
+    {
         eprintln!("Error: {e}");
         process::exit(1);
     }
@@ -345,6 +499,14 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
     } else {
         None
     };
+
+    // Whose identity this is, echoed before it can become a grant. `gh api
+    // user` resolves against GH_TOKEN, so in a shell carrying a bot or
+    // second-account token the answer is a different person than the operator
+    // assumes — and under --yes nothing else would ever show it.
+    if let Some(login) = &detected {
+        println!("Detected GitHub identity via `gh api user`: {login}");
+    }
 
     let mut owners = seed_owners(&owner_flags, &current, detected.as_deref());
     let mut repos = seed_repos(&repo_flags, &current);
@@ -371,16 +533,19 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
                 process::exit(0);
             }
         } else if detected.is_none() && owners.is_empty() {
-            println!(
-                "Could not detect a GitHub identity ('gh api user' unavailable or \
-                 unauthenticated) — enter it below."
-            );
+            println!("{} Enter it below.", detection_failure_note());
         }
 
-        match prompt_list("GitHub users/orgs you own (space-separated)", &owners).and_then(|o| {
+        match prompt_list(
+            "GitHub users/orgs you own (space-separated)",
+            &owners,
+            Kind::Owner,
+        )
+        .and_then(|o| {
             let r = prompt_list(
                 "Other owners' repos you have write access to, as owner/repo (blank for none)",
                 &repos,
+                Kind::Repo,
             )?;
             Ok((o, r))
         }) {
@@ -399,10 +564,23 @@ pub fn run(owner_flags: Vec<String>, repo_flags: Vec<String>, yes: bool, show_on
         eprintln!(
             "Error: {OWNERS_KEY} would be empty, and the guards block every push and \
              gh write when it is unset.\n\
-             Pass --owners <github-user> [more...] or run without --yes to be prompted."
+             Pass --owners <github-user> [more...] or run without --yes to be prompted.\n\
+             {}",
+            detection_failure_note()
         );
         process::exit(1);
     }
+
+    // Apply onto a FRESH read, not the snapshot taken before the prompts — see
+    // `reload_for_write`. Under --yes the window is microseconds and this is
+    // nearly free; interactively it is the whole point.
+    let mut root = match reload_for_write(&path, &current) {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
 
     let changes = match apply(&mut root, &owners, &repos) {
         Ok(changes) => changes,
@@ -460,21 +638,87 @@ mod tests {
     }
 
     #[test]
-    fn validate_entry_accepts_the_three_allowlist_forms() {
-        for good in [
-            "cameronsjo",
-            "cameronsjo/repo",
-            "git.example.com/owner/repo",
-        ] {
-            assert!(validate_entry(good).is_ok(), "{good} should be valid");
+    fn validate_entry_accepts_each_kinds_legal_forms() {
+        for good in ["cameronsjo", "git.example.com/owner"] {
+            assert!(
+                validate_entry(good, Kind::Owner).is_ok(),
+                "{good} should be a valid owner entry"
+            );
+        }
+        for good in ["cameronsjo/repo", "git.example.com/owner/repo", "acme/a.js"] {
+            assert!(
+                validate_entry(good, Kind::Repo).is_ok(),
+                "{good} should be a valid repo entry"
+            );
         }
     }
 
     #[test]
     fn validate_entry_rejects_junk_that_would_silently_never_match() {
         for bad in ["", "owner/", "a/b/c/d", "own er", "owner;rm -rf /", "$(id)"] {
-            assert!(validate_entry(bad).is_err(), "{bad} should be rejected");
+            assert!(
+                validate_entry(bad, Kind::Owner).is_err(),
+                "{bad} should be rejected"
+            );
         }
+    }
+
+    /// A dotted single-segment owner parses as a bare owner literally named
+    /// `github.com`, and a bare owner only matches `default_host` — so it can
+    /// never match, and the block it causes reads as a guard bug.
+    #[test]
+    fn dotted_single_segment_owner_is_rejected_not_written() {
+        for dead in ["github.com", "cameronsjo.", "git.sjo.lol"] {
+            let Err(err) = validate_entry(dead, Kind::Owner) else {
+                panic!("'{dead}' resolves to an owner that can never match — must be rejected");
+            };
+            assert!(
+                err.contains("not a valid GitHub login"),
+                "message must say why: {err}"
+            );
+            assert!(
+                err.contains("host/owner"),
+                "message must name the fix: {err}"
+            );
+        }
+        // The same string, round-tripped through the consumer, confirms the
+        // shape this rejects — the check is not guessing at parse_allow_entry.
+        let parsed = cadence_hooks_core::config::parse_allow_entry("github.com");
+        assert_eq!(parsed.owner, "github.com");
+        assert!(parsed.host.is_none() && parsed.repo.is_none());
+    }
+
+    /// `--repos foo.bar/tool` reads as host `foo.bar`, owner `tool`, no repo —
+    /// an owner-wide entry on a host that does not exist. The user believes
+    /// they named one repo precisely; it matches nothing.
+    #[test]
+    fn dotted_first_segment_in_repos_is_rejected_not_reinterpreted_as_a_host() {
+        let parsed = cadence_hooks_core::config::parse_allow_entry("foo.bar/tool");
+        assert_eq!(parsed.host.as_deref(), Some("foo.bar"));
+        assert_eq!(parsed.owner, "tool");
+        assert!(parsed.repo.is_none(), "no repo — this is the whole problem");
+
+        let err = validate_entry("foo.bar/tool", Kind::Repo).expect_err("must be rejected");
+        assert!(err.contains("read as a HOST"), "{err}");
+        assert!(err.contains("host/owner/repo"), "names the fix: {err}");
+
+        // Same string is legitimate as an OWNER entry (host/owner), so the
+        // rejection is shape-vs-kind, not a blanket ban on the string.
+        assert!(validate_entry("foo.bar/tool", Kind::Owner).is_ok());
+    }
+
+    #[test]
+    fn an_owner_repo_pair_is_rejected_from_the_owners_list() {
+        let err = validate_entry("acme/tool", Kind::Owner).expect_err("must be rejected");
+
+        assert!(err.contains("--repos"), "points at the right flag: {err}");
+    }
+
+    #[test]
+    fn validate_entries_names_the_flag_in_the_message() {
+        let err = validate_entries(&owners(&["github.com"]), Kind::Owner).unwrap_err();
+
+        assert!(err.starts_with("--owners value"), "{err}");
     }
 
     #[test]
@@ -606,6 +850,82 @@ mod tests {
         let current = current_from(&load_settings(&path).unwrap());
 
         assert!(current.owners.is_empty());
+    }
+
+    /// The snapshot-then-prompt window: a concurrent writer touching an
+    /// UNRELATED key must survive, because `run` applies onto the fresh read.
+    #[test]
+    fn a_concurrent_unrelated_edit_survives_the_write() {
+        let (_dir, path) = settings(r#"{"env":{"CADENCE_ALLOWED_OWNERS":"cameronsjo"}}"#);
+        let snapshot = current_from(&load_settings(&path).unwrap());
+
+        // Someone else edits the file while the prompts are open.
+        fs::write(
+            &path,
+            r#"{"model":"opus","env":{"CADENCE_ALLOWED_OWNERS":"cameronsjo","OTHER":"new"}}"#,
+        )
+        .unwrap();
+
+        let mut fresh = reload_for_write(&path, &snapshot).expect("allowlist unchanged — proceed");
+        apply(&mut fresh, &owners(&["cameronsjo", "acme"]), &[]).unwrap();
+        save(&path, &fresh).unwrap();
+
+        let written = load_settings(&path).unwrap();
+        let env = written.get("env").unwrap().as_object().unwrap();
+        assert_eq!(
+            env.get("OTHER").unwrap().as_str(),
+            Some("new"),
+            "the concurrent edit must not be reverted"
+        );
+        assert_eq!(written.get("model").unwrap().as_str(), Some("opus"));
+        assert_eq!(
+            env.get(OWNERS_KEY).unwrap().as_str(),
+            Some("cameronsjo acme")
+        );
+    }
+
+    /// When the concurrent writer changed the ALLOWLIST itself, two intents
+    /// collide and this refuses rather than picking one.
+    #[test]
+    fn a_concurrent_allowlist_edit_aborts_without_writing() {
+        let (_dir, path) = settings(r#"{"env":{"CADENCE_ALLOWED_OWNERS":"cameronsjo"}}"#);
+        let snapshot = current_from(&load_settings(&path).unwrap());
+
+        fs::write(
+            &path,
+            r#"{"env":{"CADENCE_ALLOWED_OWNERS":"someone-else"}}"#,
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let err = reload_for_write(&path, &snapshot).expect_err("must refuse");
+
+        assert!(err.contains("changed while this was waiting"), "{err}");
+        assert!(err.contains("Nothing was written"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "the file must be untouched"
+        );
+    }
+
+    #[test]
+    fn save_replaces_atomically_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let mut root = Map::new();
+        apply(&mut root, &owners(&["cameronsjo"]), &[]).unwrap();
+        save(&path, &root).unwrap();
+
+        let strays: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "settings.json")
+            .collect();
+        assert!(strays.is_empty(), "temp files left behind: {strays:?}");
+        assert!(load_settings(&path).unwrap().contains_key("env"));
     }
 
     #[test]
