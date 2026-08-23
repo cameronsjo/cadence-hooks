@@ -144,94 +144,6 @@ impl Outcome {
     }
 }
 
-/// Set once this process parses a payload only the Codex harness produces.
-/// See [`is_codex_payload_shape`] for the sniff and [`is_codex_harness`] for why
-/// it exists.
-static CODEX_PAYLOAD_SEEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Tool names no Claude Code build sends and every Codex build does.
-///
-/// `spawn_agents_on_csv`/`multi_agents` are deliberately absent: they alias to
-/// `Agent` like `spawn_agent` does, but they are variant spellings this repo has
-/// not measured, and a sniff list is a place to be conservative rather than
-/// exhaustive — a name that turns out to exist on some other harness would start
-/// applying Codex strictness there.
-const CODEX_ONLY_TOOLS: &[&str] = &["apply_patch", "exec_command", "unified_exec", "spawn_agent"];
-
-/// Does this raw payload carry a shape only Codex produces?
-///
-/// Two signals, OR'd: a [`CODEX_ONLY_TOOLS`] tool name, or a string-valued
-/// `tool_input` (Codex's freeform-body form; Claude Code sends an object).
-///
-/// Pure, and public so the rule is testable without mutating process state.
-#[must_use]
-pub fn is_codex_payload_shape(value: &serde_json::Value) -> bool {
-    let codex_only_tool = value
-        .get("tool_name")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|name| CODEX_ONLY_TOOLS.contains(&name));
-    let freeform_tool_input = value
-        .get("tool_input")
-        .is_some_and(serde_json::Value::is_string);
-    codex_only_tool || freeform_tool_input
-}
-
-/// Whether this process is running under the Codex harness.
-///
-/// The single source of truth for the harness question. Security behaviour keys
-/// off this (fail-closed parse denial, the `Ask` → `Block` conversion) and so
-/// does metrics tagging, so all callers must agree — a site that compared
-/// case-sensitively while another compared case-insensitively would fail **open**
-/// on `CADENCE_HARNESS=Codex` at exactly the moment metrics recorded the run as
-/// Codex.
-///
-/// Two independent signals, OR'd:
-///
-/// 1. `CADENCE_HARNESS` — set by the Codex wrapper. Matching is case-insensitive:
-///    the value is set by shell wrappers, and a harness that announces itself at
-///    all should be honoured however it cased it.
-/// 2. A Codex-shaped payload already parsed by this process
-///    ([`is_codex_payload_shape`]).
-///
-/// The second exists because the *normalization* is unconditional while the
-/// *hardening* was conditional, which is the worst-shaped failure available: on a
-/// Codex session where the wrapper did not export the variable, payloads still
-/// normalize and guards still fire, so the integration looks healthy — while a
-/// malformed payload on a security-critical hook exits 0 instead of 2, and a
-/// guard returning `Ask` exits 0 with an envelope Codex cannot render, so the
-/// operation proceeds unconfirmed. The wrapper does export it today; this is the
-/// belt to that suspenders, and it is derivable from data the normalizer already
-/// inspects.
-///
-/// **The sniff can only ever ADD strictness, never subtract it.** Both directions
-/// were checked rather than assumed:
-///
-/// - A false *positive* under Claude Code costs nothing reachable. The only
-///   `Outcome::Ask` producer in the tree is `guard-rm`, and both of its routes
-///   need an object `tool_input` (a `command`, or a `file_path` plus
-///   `operation: "delete"`); a string-valued `tool_input` degrades to `None`, so
-///   such a payload returns Allow and there is no Ask to convert to a Block. The
-///   fail-closed parse arm is likewise unreachable — if stdin failed to parse,
-///   no payload was sniffed.
-/// - A false *negative* leaves exactly today's behaviour: the env check alone.
-///
-/// Spoofing is safe in the same direction: an attacker-set
-/// `CADENCE_HARNESS=codex`, or a payload crafted to look Codex-shaped, only makes
-/// this binary stricter. The danger was always *absence*.
-#[must_use]
-pub fn is_codex_harness() -> bool {
-    is_codex_harness_value(std::env::var("CADENCE_HARNESS").ok().as_deref())
-        || CODEX_PAYLOAD_SEEN.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Pure resolver behind [`is_codex_harness`], so the matching rule is testable
-/// without mutating process environment shared by every parallel test.
-#[must_use]
-pub fn is_codex_harness_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| value.eq_ignore_ascii_case("codex"))
-}
-
 /// Normalize a file path for consistent matching:
 /// - Replace backslashes with forward slashes (Windows compatibility)
 /// - Strip null bytes (C string truncation attack prevention)
@@ -511,28 +423,66 @@ fn resolve_apply_patch_body(value: &serde_json::Value) -> Result<Option<&str>, &
     Ok(Some(first))
 }
 
+/// Why a hook payload failed to parse, and whether the failure was specifically
+/// an `apply_patch` body whose targets could not be enumerated.
+///
+/// The distinction is load-bearing, not cosmetic: an unenumerable patch on a
+/// security-critical hook fails **closed** (the guard cannot prove the operation
+/// safe), while ordinary malformed JSON fails **open** per ADR-0001. Carrying it
+/// as a typed field rather than by matching on `message` is deliberate — this
+/// binary already has one war story about a stderr substring match deciding a
+/// verdict (see `stale_signature` in the hook launcher).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseFailure {
+    /// This binary's own diagnostic. Never contains payload or patch content.
+    pub message: String,
+    /// True when an `apply_patch` body was present but could not be resolved to
+    /// a set of targets.
+    pub patch_targets_unenumerable: bool,
+}
+
+impl std::fmt::Display for ParseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseFailure {}
+
 impl HookInput {
     /// Read and parse hook input from stdin.
     pub fn from_stdin() -> Result<Self, String> {
+        Self::from_stdin_detailed().map_err(|e| e.message)
+    }
+
+    /// [`HookInput::from_stdin`], keeping the [`ParseFailure`] classification.
+    pub fn from_stdin_detailed() -> Result<Self, ParseFailure> {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
-            .map_err(|e| format!("Failed to read stdin: {e}"))?;
-        Self::from_json(&buf)
+            .map_err(|e| ParseFailure {
+                message: format!("Failed to read stdin: {e}"),
+                patch_targets_unenumerable: false,
+            })?;
+        Self::from_json_detailed(&buf)
     }
 
-    /// Parse a Claude or Codex hook payload and normalize harness aliases.
+    /// Parse a hook payload and normalize harness aliases.
     ///
     /// Raw inputs are never retained beyond this value. In particular, a patch
     /// body is parsed in memory and is not included in parse diagnostics.
     pub fn from_json(raw: &str) -> Result<Self, String> {
-        let mut value: serde_json::Value =
-            serde_json::from_str(raw).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
-        // Sniffed on the RAW value, before the `apply_patch` rewrite below turns
-        // a string `tool_input` into an object and erases the second signal.
-        if is_codex_payload_shape(&value) {
-            CODEX_PAYLOAD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        Self::from_json_detailed(raw).map_err(|e| e.message)
+    }
+
+    /// [`HookInput::from_json`], keeping the [`ParseFailure`] classification.
+    pub fn from_json_detailed(raw: &str) -> Result<Self, ParseFailure> {
+        let plain = |message: String| ParseFailure {
+            message,
+            patch_targets_unenumerable: false,
+        };
+        let mut value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| plain(format!("Failed to parse hook JSON: {e}")))?;
         let tool_name = value
             .get("tool_name")
             .and_then(serde_json::Value::as_str)
@@ -540,14 +490,17 @@ impl HookInput {
             .to_string();
         if tool_name == "apply_patch" {
             let patch = resolve_apply_patch_body(&value)
-                .map_err(str::to_string)?
+                .map_err(|e| ParseFailure {
+                    message: e.to_string(),
+                    patch_targets_unenumerable: true,
+                })?
                 .map(str::to_string);
             if let Some(patch) = patch {
                 value["tool_input"] = serde_json::json!({"patch": patch});
             }
         }
-        let mut input: HookInput =
-            serde_json::from_value(value).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        let mut input: HookInput = serde_json::from_value(value)
+            .map_err(|e| plain(format!("Failed to parse hook JSON: {e}")))?;
         if let Some(tool_input) = input.tool_input.as_mut()
             && tool_input.command.is_none()
         {
@@ -1422,15 +1375,6 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
-    if result.outcome == Outcome::Ask && is_codex_harness() {
-        let reason = result.message.as_deref().unwrap_or("confirmation required");
-        eprintln!(
-            "{reason}\n\nBlocked because Codex hooks cannot hand an Ask decision to the user. \
-             Review the target, then use the documented scoped bypass or run the operation \
-             yourself outside the agent session."
-        );
-        process::exit(Outcome::Block.code());
-    }
     let rendered = render_output(
         result.outcome,
         result.message.as_deref(),
@@ -1546,9 +1490,11 @@ pub fn guard_interactive_terminal(
 /// silently got less enforcement.
 ///
 /// What it deliberately does NOT gain is the dispatch wrapper's telemetry tail
-/// (denial ledger, timing, panic guard) or its Codex fail-closed parse arm: those
-/// need the canonical registry hook name, which lives in the binary. So this
-/// stays the *unlogged* path, not a weaker one.
+/// (denial ledger, timing, panic guard) or its fail-closed arm for an
+/// unenumerable patch on a security-critical hook: both need the canonical
+/// registry hook name, which lives in the binary. So this stays the *unlogged*
+/// path — and, for that one arm, a genuinely weaker one; every shipped hook goes
+/// through the dispatch wrapper.
 pub fn run_check_from_stdin(check: &dyn Check, event: HookEvent) -> ! {
     guard_interactive_terminal(check.name(), Some(event), None);
     let input = match HookInput::from_stdin() {
@@ -1638,65 +1584,6 @@ mod tests {
         assert_eq!(Outcome::Allow.code(), 0);
         assert_eq!(Outcome::Nudge.code(), 0);
         assert_eq!(Outcome::Block.code(), 2);
-    }
-
-    // --- the payload-shape harness sniff (C3) ---
-
-    /// Both Codex signals are recognized. Asserted on the pure predicate so the
-    /// test says nothing about process-global state other tests may have set.
-    #[test]
-    fn codex_payload_shapes_are_recognized() {
-        for raw in [
-            r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\n*** End Patch"}"#,
-            r#"{"tool_name":"exec_command","tool_input":{"cmd":"ls"}}"#,
-            r#"{"tool_name":"unified_exec","tool_input":{"cmd":"ls"}}"#,
-            r#"{"tool_name":"spawn_agent","tool_input":{}}"#,
-            // The freeform-body signal on its own, with no Codex-only name.
-            r#"{"tool_name":"Read","tool_input":"/etc/hosts"}"#,
-        ] {
-            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
-            assert!(
-                is_codex_payload_shape(&value),
-                "should sniff as Codex: {raw}"
-            );
-        }
-    }
-
-    /// The other direction, which is the one that matters: an ordinary Claude
-    /// Code payload must NOT trip the sniff, or every session would silently
-    /// take the Codex hardening path.
-    #[test]
-    fn claude_payload_shapes_are_not_sniffed_as_codex() {
-        for raw in [
-            r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#,
-            r#"{"tool_name":"Edit","tool_input":{"file_path":"a","old_string":"x","new_string":"y"}}"#,
-            r#"{"tool_name":"Agent","tool_input":{"subagent_type":"explorer"}}"#,
-            r#"{"tool_name":"mcp__claude-in-chrome__read_page","tool_input":{}}"#,
-            r#"{"session_id":"s","source":"startup"}"#,
-            // Not a substring match: a Claude tool whose name merely contains a
-            // Codex-only name must not sniff.
-            r#"{"tool_name":"apply_patch_helper","tool_input":{}}"#,
-        ] {
-            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
-            assert!(
-                !is_codex_payload_shape(&value),
-                "should NOT sniff as Codex: {raw}"
-            );
-        }
-    }
-
-    /// End to end: parsing a Codex payload makes `is_codex_harness()` true with
-    /// `CADENCE_HARNESS` unset — the whole point of the fallback. Deliberately
-    /// one-directional: the flag is process-global and sticky by design, so a
-    /// "stays false" assertion here would be a race against every other test in
-    /// this binary. That direction is covered above, on the pure predicate.
-    #[test]
-    fn parsing_a_codex_payload_arms_the_harness_fallback() {
-        HookInput::from_json(r#"{"tool_name":"exec_command","tool_input":{"cmd":"ls"}}"#).unwrap();
-        assert!(
-            is_codex_harness(),
-            "a parsed Codex payload must arm the harness fallback without the env var"
-        );
     }
 
     #[test]
@@ -2320,32 +2207,6 @@ mod tests {
         // synthetic test inputs) deserialize to None, never an error.
         let input: HookInput = serde_json::from_str(r#"{"tool_name":"Bash"}"#).unwrap();
         assert_eq!(input.transcript_path(), None);
-    }
-
-    #[test]
-    fn codex_harness_match_is_case_insensitive() {
-        // The security paths (fail-closed parse denial, Ask -> Block) and the
-        // metrics harness tag all read this one rule. When they disagreed, a
-        // non-lowercase value tagged the run "codex" in metrics while both
-        // security paths silently treated it as Claude — failing open exactly
-        // when the ledger said Codex was driving.
-        for value in ["codex", "Codex", "CODEX", "cOdEx"] {
-            assert!(
-                is_codex_harness_value(Some(value)),
-                "{value} should be recognized as the Codex harness"
-            );
-        }
-    }
-
-    #[test]
-    fn codex_harness_match_rejects_non_codex_values() {
-        for value in ["claude", "", "codexx", "co dex", "codex-cli"] {
-            assert!(
-                !is_codex_harness_value(Some(value)),
-                "{value} should not be recognized as the Codex harness"
-            );
-        }
-        assert!(!is_codex_harness_value(None));
     }
 
     #[test]

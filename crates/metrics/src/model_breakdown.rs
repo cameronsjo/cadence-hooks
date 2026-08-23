@@ -32,8 +32,9 @@ pub fn by_model_json(by_model: &[(String, Tokens)], prices: &Prices) -> Vec<Valu
         .collect()
 }
 
-/// Per-model usage buckets for Codex. Public API pricing is not subscription
-/// cost, so Codex rows omit `costUsd` rather than writing a misleading zero.
+/// Per-model usage buckets with no `costUsd`, for a harness whose public API
+/// pricing is not subscription cost. Retained after the Codex adapters were
+/// retired (#1040): it is the shape historical unpriced rows were written in.
 pub fn by_model_unpriced_json(by_model: &[(String, Tokens)]) -> Vec<Value> {
     by_model
         .iter()

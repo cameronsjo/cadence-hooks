@@ -107,9 +107,11 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
     // Hoisted above the stdin parse so both the parse-failure arm and the
     // decided-result arm below can record against the same canonical name.
     let hook_name = hook.unwrap_or_else(|| check.name());
-    let input = match HookInput::from_stdin() {
+    let input = match HookInput::from_stdin_detailed() {
         Ok(input) => input,
         Err(e) => {
+            let unenumerable_patch = e.patch_targets_unenumerable;
+            let e = e.message;
             eprintln!("cadence-hooks: {e}");
             // `e` is this binary's own message ("Failed to parse hook JSON:
             // <serde error>") — a line/column locator, never an echo of the
@@ -121,11 +123,22 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                 env!("CARGO_PKG_VERSION"),
                 Some(&e),
             );
-            if codex_fail_closed(hook_name) {
+            // Fail CLOSED only for an `apply_patch` body whose targets could not
+            // be enumerated, on a security-critical hook — the same pair of
+            // conditions the pre-#1040 code fired on. That path LOOKED
+            // harness-gated and was not: `tool_name: "apply_patch"` armed the
+            // harness sniff on the raw value before the patch rewrite errored,
+            // so it blocked with no env var set. Ordinary malformed JSON still
+            // fails open (ADR-0001), exactly as before.
+            //
+            // Verified against a binary built from the pre-change `main`:
+            //   conflicting apply_patch bodies, no env -> exit 2
+            //   plain unparseable JSON, no env         -> exit 0
+            if unenumerable_patch && crate::registry::is_security_critical(hook_name) {
                 eprintln!(
-                    "cadence-hooks: security-critical hook input could not be parsed; \
-                     blocking because the guard cannot prove the operation safe. \
-                     Fix the hook payload/schema or run the reviewed operation yourself."
+                    "cadence-hooks: blocked because security-critical patch targets \
+                     could not be enumerated. Review the patch and retry with a \
+                     parseable operation, or apply it yourself."
                 );
                 process::exit(2);
             }
@@ -142,15 +155,36 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                 env!("CARGO_PKG_VERSION"),
                 Some(&error),
             );
-            if codex_fail_closed(hook_name) {
+            // The diagnostic names why normalization gave up without ever
+            // echoing the patch body — `error` is this binary's own message and
+            // every `patch::parse` error is a static string.
+            eprintln!("cadence-hooks: {error}");
+            // Fail CLOSED on a security-critical hook, unconditionally.
+            //
+            // This arm used to be gated on the Codex harness, but that gate was
+            // never really a gate: the only payload that reaches it carries
+            // `tool_name: "apply_patch"`, which armed the harness sniff by
+            // itself, so it fired with no env var set. Retiring the harness
+            // (#1040) therefore silently turned a live fail-closed path into a
+            // fail-open one — caught by an Opus review's old-vs-new differential,
+            // not by the suite.
+            //
+            // `patch.rs` and the guards that consume it were retained
+            // deliberately, so the route keeps its partner. The asymmetry the
+            // original design warned about — normalization unconditional,
+            // hardening conditional — is the exact shape being avoided here.
+            //
+            // Not an ADR-0001 violation: that rule protects the user from a
+            // guard's OWN failure. This is the input being unparseable, so the
+            // guard cannot prove the operation safe and says so.
+            if crate::registry::is_security_critical(hook_name) {
                 eprintln!(
-                    "cadence-hooks: {error}; blocked because security-critical patch \
-                     targets could not be enumerated. Review the patch and retry with \
-                     a parseable operation or apply it yourself."
+                    "cadence-hooks: blocked because security-critical patch targets \
+                     could not be enumerated. Review the patch and retry with a \
+                     parseable operation, or apply it yourself."
                 );
                 process::exit(2);
             }
-            eprintln!("cadence-hooks: {error}");
             process::exit(0);
         }
     };
@@ -368,10 +402,6 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
         outcomes,
         bypasses,
     })
-}
-
-fn codex_fail_closed(hook_name: &str) -> bool {
-    cadence_hooks_core::is_codex_harness() && crate::registry::is_security_critical(hook_name)
 }
 
 /// Run a fire-and-forget logger from stdin, record its wall-clock time to

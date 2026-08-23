@@ -62,7 +62,7 @@ impl Logger for LogSession {
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
         };
-        let usage = match scan_transcript(&transcript, None, common::harness()) {
+        let usage = match scan_transcript(&transcript, None) {
             TranscriptScan::Usage(usage) => usage,
             TranscriptScan::Diagnostic(diagnostic) => {
                 common::append_transcript_diagnostic(
@@ -77,8 +77,11 @@ impl Logger for LogSession {
         };
 
         let prices = Prices::load(self.prices_path.as_deref());
-        let cost = (usage.harness == "claude")
-            .then(|| compute_cost_by_model(&usage.scan.by_model, &prices));
+        // Unconditional since the unpriced harness was retired (#1040). It was
+        // `(usage.harness == "claude").then(...)`, which is now a tautology —
+        // left in place it would read as live logic while its `unwrap_or(0.0)`
+        // fallback silently rendered "unpriced" as "$0.00" in any aggregation.
+        let cost = compute_cost_by_model(&usage.scan.by_model, &prices);
 
         let branch = common::branch(input.cwd.as_deref());
         let repo = common::repo_basename(input.cwd.as_deref());
@@ -159,7 +162,7 @@ fn build_session_record(
     branch: &str,
     repo: &str,
     usage: &UsageScan,
-    cost: Option<f64>,
+    cost: f64,
     prices: &Prices,
     start_ts: Option<&str>,
     commits: u64,
@@ -199,13 +202,7 @@ fn build_session_record(
         "agentId": input.agent_id,
         "parentSessionId": input.parent_session_id,
     });
-    if usage.is_unpriced_harness() {
-        record["estimatedCostUsd"] = Value::Null;
-        record["pricingSource"] = Value::Null;
-        record["pricingVerifiedAt"] = Value::Null;
-    } else {
-        record["costUsd"] = json!(cost.unwrap_or(0.0));
-    }
+    record["costUsd"] = json!(cost);
     record
 }
 
@@ -269,7 +266,7 @@ mod tests {
             "feat/x",
             "myrepo",
             &sample_usage(),
-            Some(0.001234),
+            0.001234,
             &prices,
             None,
             2,
@@ -318,7 +315,7 @@ mod tests {
             "",
             "myrepo",
             &sample_usage(),
-            Some(0.0),
+            0.0,
             &prices,
             None,
             0,
@@ -364,7 +361,7 @@ mod tests {
             "main",
             "r",
             &UsageScan::claude(scan),
-            Some(0.0),
+            0.0,
             &prices,
             None,
             0,
@@ -384,7 +381,7 @@ mod tests {
             "main",
             "r",
             &sample_usage(),
-            Some(0.0),
+            0.0,
             &prices,
             Some("2026-07-02T00:10:00Z"),
             5,
@@ -450,11 +447,13 @@ mod tests {
         assert_eq!(whole.tokens.output, 60);
     }
 
+    /// Every session record carries a real `costUsd`.
+    ///
+    /// Inherited from `codex_session_cost_is_an_unverified_nullable_estimate`;
+    /// see the sibling in `log_commit` for why the assertions inverted.
     #[test]
-    fn codex_session_cost_is_an_unverified_nullable_estimate() {
-        let mut usage = sample_usage();
-        usage.harness = "codex";
-        usage.source_format = "codex-rollout-v1";
+    fn session_record_carries_a_real_cost() {
+        let usage = sample_usage();
         let record = build_session_record(
             "ts",
             &sample_input(),
@@ -462,14 +461,14 @@ mod tests {
             "main",
             "r",
             &usage,
-            None,
+            0.004_2,
             &Prices::embedded(),
             None,
             0,
         );
-        assert!(record.get("costUsd").is_none());
-        assert!(record["estimatedCostUsd"].is_null());
-        assert!(record["pricingSource"].is_null());
-        assert!(record["pricingVerifiedAt"].is_null());
+        assert_eq!(record["costUsd"], 0.004_2);
+        assert!(record.get("estimatedCostUsd").is_none());
+        assert!(record.get("pricingSource").is_none());
+        assert!(record.get("pricingVerifiedAt").is_none());
     }
 }

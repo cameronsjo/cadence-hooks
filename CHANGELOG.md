@@ -6,6 +6,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **Codex harness detection and its fail-closed arms.** `is_codex_harness`,
+  `is_codex_harness_value`, `is_codex_payload_shape`, `CODEX_ONLY_TOOLS`, and the
+  `CODEX_PAYLOAD_SEEN` sniff are gone from `crates/core`, along with
+  `emit_and_exit`'s `Ask` → `Block` conversion and `dispatch`'s two
+  `codex_fail_closed` arms. `CADENCE_HARNESS` is no longer read anywhere in the
+  binary — verified by running an `Ask`-producing guard with and without
+  `CADENCE_HARNESS=codex` and diffing exit code and stderr (identical), against a
+  control confirming a genuine `Deny` still exits 2.
+
+  **Net behaviour delta is zero**, verified by a seven-case differential against
+  a binary built from the pre-change `main`. That took two rounds: the first
+  removal also dropped the fail-closed arms, on the reading that both were
+  harness-gated. They were not — `tool_name: "apply_patch"` armed the harness
+  sniff on the raw value *before* the patch rewrite errored, so both arms fired
+  with no env var set. Since `patch.rs` and its consuming guards were retained
+  deliberately, the arms are retained too, now keyed on the payload rather than
+  the harness.
+
+- **The Codex compatibility report and its CI gate** —
+  `docs/codex-compatibility-report.json`, `config/codex-compatibility.json`,
+  `scripts/generate-codex-report.py`, `tests/codex_report_generator.rs`, the
+  `report`/`report-check` Makefile targets, and `ci.yml`'s freshness step. The
+  release recipe drops from four steps to three; `make ci` is now
+  `fmt-check clippy test`.
+
+- **The Codex rollout transcript scanner** (`crates/metrics`) — `scan_codex_rollout_v1`,
+  `CodexUsage`, its marker parser, and `UsageScan::is_unpriced_harness`.
+  `common::harness()` is now the constant `"claude"` and `scan_transcript` no
+  longer takes a harness argument. The `harness` and `sourceFormat` fields stay
+  on schema-v2 rows: rows written before this change carry the other harness's
+  values, and a reader of the ledger still needs the fields to interpret them.
+
+### Added
+
+- **`ParseFailure`, a typed hook-payload parse error** (`crates/core`), carrying
+  `patch_targets_unenumerable` alongside the message. `HookInput::from_stdin` and
+  `from_json` keep their `Result<_, String>` signatures; `from_stdin_detailed` /
+  `from_json_detailed` expose the classification.
+
+  It exists so the dispatcher can tell "an `apply_patch` body whose targets could
+  not be enumerated" (fail **closed** on a security-critical hook — the guard
+  cannot prove the operation safe) from "ordinary malformed JSON" (fail **open**,
+  ADR-0001) *structurally*, rather than by matching on the message. This binary
+  already has one war story about a stderr substring match deciding a verdict —
+  see the anchored `stale_signature` regex in the hook launcher.
+
+### Changed
+
+- **`tests/codex_coverage.rs` → `tests/patch_normalization.rs`.** `crates/core/src/patch.rs`
+  is retained — it normalizes an `apply_patch` body into one Claude-shaped input
+  per target, which is what lets `prevent-secret-writes`, `guard-dotfiles`,
+  `guard-rm`, and `trash-guard` judge a patched file — and `patch.rs` has only 7
+  unit tests, none of which spawn the binary. The report-dependent tests and the
+  ones pinning the removed posture were deleted; the rest were kept and their now
+  inert `CADENCE_HARNESS=codex` env dropped.
+
+  Three tests carried a *retained* privacy invariant inside a removed-posture
+  assertion and were rewritten rather than deleted, so the coverage narrowed
+  instead of disappearing: a malformed patch body is still never echoed,
+  conflicting patch bodies are still rejected without echoing either, and prompt
+  content still never reaches a metrics record — the last was the only test of
+  that property in `crates/metrics` and is now pointed at a Claude transcript.
+
 ## [0.85.0] - 2026-08-23
 
 ### Added
