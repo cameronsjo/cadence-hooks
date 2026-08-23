@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.85.0] - 2026-08-23
+
 ### Added
 
 - **`session lint-plan-shape`** (PreToolUse:ExitPlanMode) — the call-side plan-shape gate. A top-level `ExitPlanMode` whose plan carries no settled `Panel:` line is **blocked** before the operator sees it, naming only the static missing-stanza names (`a settled Panel: line`, `an Alternatives-declined stanza`, `checkbox tasks`) plus the in-band escape (`Panel: none — <reason>`, or shift-tab out of plan mode) — never matched plan text. A settled `Panel:` line with other stanzas missing draws one nudge sentence. Plan text comes from `tool_input.plan` first, else a bounded containment-checked read of `planFilePath` inside the plan store; subagent-originated calls (`agent_id` present) and every internal failure allow (ADR-0001). Motivated by a 2026-08-23 recurrence where a plan-mode session presented the harness's Context/Changes/Verification plan unasked and un-paneled — the persist-time lint (#675) runs after approval and could not catch it. Wiring lands in the cadence monorepo after release.
