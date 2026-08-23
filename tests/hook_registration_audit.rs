@@ -273,10 +273,7 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
     // Registered here (Task 1 of the plan-shape-gate plan); the cadence
     // hooks.json row (PreToolUse, matcher ExitPlanMode) lands in the wiring PR
     // after this binary's 0.85.0 release.
-    (
-        "session lint-plan-shape",
-        "cameronsjo/cadence-ecosystem docs/plans/2026-08-23-plan-shape-gate-at-exitplanmode.md",
-    ),
+    ("session lint-plan-shape", "cameronsjo/cadence-hooks#751"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
