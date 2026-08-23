@@ -121,14 +121,6 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                 env!("CARGO_PKG_VERSION"),
                 Some(&e),
             );
-            if codex_fail_closed(hook_name) {
-                eprintln!(
-                    "cadence-hooks: security-critical hook input could not be parsed; \
-                     blocking because the guard cannot prove the operation safe. \
-                     Fix the hook payload/schema or run the reviewed operation yourself."
-                );
-                process::exit(2);
-            }
             process::exit(0);
         }
     };
@@ -142,15 +134,13 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                 env!("CARGO_PKG_VERSION"),
                 Some(&error),
             );
-            if codex_fail_closed(hook_name) {
-                eprintln!(
-                    "cadence-hooks: {error}; blocked because security-critical patch \
-                     targets could not be enumerated. Review the patch and retry with \
-                     a parseable operation or apply it yourself."
-                );
-                process::exit(2);
-            }
-            eprintln!("cadence-hooks: {error}");
+            // The diagnostic names why normalization gave up without ever
+            // echoing the patch body — `error` is this binary's own message.
+            eprintln!(
+                "cadence-hooks: {error}; security-critical patch targets could not \
+                 be enumerated. Review the patch and retry with a parseable \
+                 operation or apply it yourself."
+            );
             process::exit(0);
         }
     };
@@ -368,10 +358,6 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
         outcomes,
         bypasses,
     })
-}
-
-fn codex_fail_closed(hook_name: &str) -> bool {
-    cadence_hooks_core::is_codex_harness() && crate::registry::is_security_critical(hook_name)
 }
 
 /// Run a fire-and-forget logger from stdin, record its wall-clock time to

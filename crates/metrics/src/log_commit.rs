@@ -77,20 +77,19 @@ impl Logger for LogCommit {
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
         };
-        let usage =
-            match scan_transcript(&transcript, last_message_id.as_deref(), common::harness()) {
-                TranscriptScan::Usage(usage) => usage,
-                TranscriptScan::Diagnostic(diagnostic) => {
-                    common::append_transcript_diagnostic(
-                        diagnostic.harness,
-                        diagnostic.source_format,
-                        diagnostic.code,
-                        "commits",
-                    );
-                    return;
-                }
-                TranscriptScan::Empty => return,
-            };
+        let usage = match scan_transcript(&transcript, last_message_id.as_deref()) {
+            TranscriptScan::Usage(usage) => usage,
+            TranscriptScan::Diagnostic(diagnostic) => {
+                common::append_transcript_diagnostic(
+                    diagnostic.harness,
+                    diagnostic.source_format,
+                    diagnostic.code,
+                    "commits",
+                );
+                return;
+            }
+            TranscriptScan::Empty => return,
+        };
 
         let prices = Prices::load(self.prices_path.as_deref());
         let cost = (usage.harness == "claude")
@@ -194,13 +193,7 @@ fn build_commit_record(
         "parentSessionId": input.parent_session_id,
         "parentAgentId": input.parent_agent_id,
     });
-    if usage.is_unpriced_harness() {
-        record["estimatedCostUsd"] = Value::Null;
-        record["pricingSource"] = Value::Null;
-        record["pricingVerifiedAt"] = Value::Null;
-    } else {
-        record["costUsd"] = json!(cost.unwrap_or(0.0));
-    }
+    record["costUsd"] = json!(cost.unwrap_or(0.0));
     record
 }
 
@@ -458,11 +451,17 @@ mod tests {
         assert!(rec["unpricedModels"].as_array().unwrap().is_empty());
     }
 
+    /// Every commit record carries a real `costUsd` and the schema-v2
+    /// `reasoningOutput` field.
+    ///
+    /// Inherited from `codex_record_uses_nullable_estimate_without_cost_usd`,
+    /// which asserted the nullable-estimate shape written for the unpriced
+    /// harness. That harness is retired (#1040) and the branch with it, so the
+    /// assertions invert; `reasoningOutput` is retained and keeps its coverage,
+    /// which is why this was rewritten rather than deleted.
     #[test]
-    fn codex_record_uses_nullable_estimate_without_cost_usd() {
+    fn record_carries_a_real_cost_and_reasoning_output() {
         let mut usage = sample_usage();
-        usage.harness = "codex";
-        usage.source_format = "codex-rollout-v1";
         usage.reasoning_output = 20;
         let rec = build_commit_record(
             "ts",
@@ -476,11 +475,10 @@ mod tests {
             "session-start",
             &Prices::embedded(),
         );
-        assert!(rec.get("costUsd").is_none());
-        assert!(rec["estimatedCostUsd"].is_null());
-        assert!(rec["pricingSource"].is_null());
-        assert!(rec["pricingVerifiedAt"].is_null());
+        assert!(rec["costUsd"].is_number(), "{rec:?}");
+        assert!(rec.get("estimatedCostUsd").is_none());
+        assert!(rec.get("pricingSource").is_none());
+        assert!(rec.get("pricingVerifiedAt").is_none());
         assert_eq!(rec["tokens"]["reasoningOutput"], 20);
-        assert!(rec["byModel"][0].get("costUsd").is_none());
     }
 }

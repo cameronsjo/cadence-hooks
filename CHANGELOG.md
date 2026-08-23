@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **Codex harness detection and its fail-closed arms.** `is_codex_harness`,
+  `is_codex_harness_value`, `is_codex_payload_shape`, `CODEX_ONLY_TOOLS`, and the
+  `CODEX_PAYLOAD_SEEN` sniff are gone from `crates/core`, along with
+  `emit_and_exit`'s `Ask` → `Block` conversion and `dispatch`'s two
+  `codex_fail_closed` arms. `CADENCE_HARNESS` is no longer read anywhere in the
+  binary — verified by running an `Ask`-producing guard with and without
+  `CADENCE_HARNESS=codex` and diffing exit code and stderr (identical), against a
+  control confirming a genuine `Deny` still exits 2.
+
+  Behaviour under Claude Code is unchanged: both arms were reachable only via a
+  Codex signal, so they were already dead there. What is genuinely gone is the
+  *mechanism* — a security-critical hook whose input cannot be parsed now fails
+  open (ADR-0001) in every case, with a diagnostic that still names why
+  normalization gave up and still never echoes the payload.
+
+- **The Codex compatibility report and its CI gate** —
+  `docs/codex-compatibility-report.json`, `config/codex-compatibility.json`,
+  `scripts/generate-codex-report.py`, `tests/codex_report_generator.rs`, the
+  `report`/`report-check` Makefile targets, and `ci.yml`'s freshness step. The
+  release recipe drops from four steps to three; `make ci` is now
+  `fmt-check clippy test`.
+
+- **The Codex rollout transcript scanner** (`crates/metrics`) — `scan_codex_rollout_v1`,
+  `CodexUsage`, its marker parser, and `UsageScan::is_unpriced_harness`.
+  `common::harness()` is now the constant `"claude"` and `scan_transcript` no
+  longer takes a harness argument. The `harness` and `sourceFormat` fields stay
+  on schema-v2 rows: rows written before this change carry the other harness's
+  values, and a reader of the ledger still needs the fields to interpret them.
+
+### Changed
+
+- **`tests/codex_coverage.rs` → `tests/patch_normalization.rs`.** `crates/core/src/patch.rs`
+  is retained — it normalizes an `apply_patch` body into one Claude-shaped input
+  per target, which is what lets `prevent-secret-writes`, `guard-dotfiles`,
+  `guard-rm`, and `trash-guard` judge a patched file — and `patch.rs` has only 7
+  unit tests, none of which spawn the binary. The report-dependent tests and the
+  ones pinning the removed posture were deleted; the rest were kept and their now
+  inert `CADENCE_HARNESS=codex` env dropped.
+
+  Three tests carried a *retained* privacy invariant inside a removed-posture
+  assertion and were rewritten rather than deleted, so the coverage narrowed
+  instead of disappearing: a malformed patch body is still never echoed,
+  conflicting patch bodies are still rejected without echoing either, and prompt
+  content still never reaches a metrics record — the last was the only test of
+  that property in `crates/metrics` and is now pointed at a Claude transcript.
+
 ### Added
 
 - **`session lint-plan-shape`** (PreToolUse:ExitPlanMode) — the call-side plan-shape gate. A top-level `ExitPlanMode` whose plan carries no settled `Panel:` line is **blocked** before the operator sees it, naming only the static missing-stanza names (`a settled Panel: line`, `an Alternatives-declined stanza`, `checkbox tasks`) plus the in-band escape (`Panel: none — <reason>`, or shift-tab out of plan mode) — never matched plan text. A settled `Panel:` line with other stanzas missing draws one nudge sentence. Plan text comes from `tool_input.plan` first, else a bounded containment-checked read of `planFilePath` inside the plan store; subagent-originated calls (`agent_id` present) and every internal failure allow (ADR-0001). Motivated by a 2026-08-23 recurrence where a plan-mode session presented the harness's Context/Changes/Verification plan unasked and un-paneled — the persist-time lint (#675) runs after approval and could not catch it. Wiring lands in the cadence monorepo after release.

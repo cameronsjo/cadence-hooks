@@ -12,19 +12,8 @@ Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatch
 ## Release (fully automated — do NOT create tags or edit the tap formula manually)
 
 1. `make bump VERSION=X.Y.Z` (updates Cargo.toml), then `cargo check` to refresh Cargo.lock
-2. `make report` to regenerate `docs/codex-compatibility-report.json` — **not optional, and read the warning below before running it**
-3. Commit all three files (plus the CHANGELOG stamp), push to main
-4. `auto-tag.yml` creates the `vX.Y.Z` tag → `release.yml` builds 4 platform binaries, publishes the GitHub Release, and sends a `repository_dispatch` that updates `cameronsjo/homebrew-tap`'s formula
-
-**Step 2 is the one that keeps getting skipped, and it is CI-gated.** The report embeds `binaryVersion`, which `scripts/generate-codex-report.py --check` compares as exact text against the freshly-built binary's `manifest --format json` — so a Cargo.toml-only bump turns `make report-check` red on the ubuntu leg. It went stale at 0.70.1 and left `report-check` red on `main` from the 0.71.0 bump onward; 0.72.0 and 0.72.1 both had to touch four files for this reason.
-
-**`make report` from a worktree needs an explicit plugin workspace.** The generator's `--workspace` defaults to the repo's *parent* directory and globs plugin wiring from `<workspace>/cadence/plugins/*/hooks/hooks.json`. From `.claude/worktrees/<name>/` that parent resolves to a directory with no plugin checkout, so all 67 wiring arrays render `[]`. A normal write now refuses that all-empty estate before touching the output (#566). Pass the real workspace explicitly:
-
-```bash
-python3 scripts/generate-codex-report.py --workspace <path-to-plugin-workspace-root>
-```
-
-Three related traps remain. `--check` **cannot verify wiring** with no sibling checkout: it takes a documented exemption path and compares everything but wiring, which is also why CI can never verify that field. `--stdout` deliberately keeps the all-empty render available for inspection and never writes it. And pointing either mode at a plugin checkout parked on a feature branch reflects *that branch*; generate against a synthetic workspace built from the plugin repo's `origin/main` (`git -C <plugin-repo> archive origin/main plugins | tar -x -C <tmp>/cadence`) when the local checkout has moved. Verify with a strict `--check --workspace <same>`, which does compare wiring.
+2. Commit both files (plus the CHANGELOG stamp), push to main
+3. `auto-tag.yml` creates the `vX.Y.Z` tag → `release.yml` builds 4 platform binaries, publishes the GitHub Release, and sends a `repository_dispatch` that updates `cameronsjo/homebrew-tap`'s formula
 
 Manual tagging or formula edits race the automation. Post-release: `brew update && brew upgrade cadence-hooks`, verify `cadence-hooks --version`.
 
@@ -35,7 +24,7 @@ Manual tagging or formula edits race the automation. Post-release: `brew update 
 
 A stale baseline in either direction fails open (ADR-0001) — it never blocks, just under- or (if hand-typed wrong) over-nudges.
 
-**From a Claude session the bump commit to main is blocked by this repo's own `enforce-worktree` guard** (a primary-checkout `git commit`), unless the session happens to carry `CADENCE_ALLOW_MAIN` in its env. Do the bump in a worktree and push its tip to main: `git worktree add .claude/worktrees/release-X -b release/X origin/main`, then `make bump` + `cargo check` + the explicit-`--workspace` report regeneration from step 2 above (the worktree is exactly where the wiring-emptying trap fires) + stamp the CHANGELOG (`## [Unreleased]` → `## [X] - DATE`) **in the worktree**, `git commit`, then `git push origin release/X:main` (fast-forward → triggers auto-tag). `git rebase` is also guard-blocked (git-safety hook), so reshape commits with `reset`, not rebase. Note `release.yml` builds and publishes even when `ci.yml` is red (it doesn't gate on the test suite) — verify the release via the tag/Release workflow/tap formula, not the CI check.
+**From a Claude session the bump commit to main is blocked by this repo's own `enforce-worktree` guard** (a primary-checkout `git commit`), unless the session happens to carry `CADENCE_ALLOW_MAIN` in its env. Do the bump in a worktree and push its tip to main: `git worktree add .claude/worktrees/release-X -b release/X origin/main`, then `make bump` + `cargo check` + stamp the CHANGELOG (`## [Unreleased]` → `## [X] - DATE`) **in the worktree**, `git commit`, then `git push origin release/X:main` (fast-forward → triggers auto-tag). `git rebase` is also guard-blocked (git-safety hook), so reshape commits with `reset`, not rebase. Note `release.yml` builds and publishes even when `ci.yml` is red (it doesn't gate on the test suite) — verify the release via the tag/Release workflow/tap formula, not the CI check.
 
 **Check `git log --oneline -5` on main for bump commits before choosing the next version number.** Parallel Claude sessions release from this repo too — a 0.15.1 shipped mid-session while another session was building what became 0.15.2. The race only surfaced because the bump commit failed loudly; don't rely on that.
 

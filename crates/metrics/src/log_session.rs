@@ -62,7 +62,7 @@ impl Logger for LogSession {
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
         };
-        let usage = match scan_transcript(&transcript, None, common::harness()) {
+        let usage = match scan_transcript(&transcript, None) {
             TranscriptScan::Usage(usage) => usage,
             TranscriptScan::Diagnostic(diagnostic) => {
                 common::append_transcript_diagnostic(
@@ -199,13 +199,7 @@ fn build_session_record(
         "agentId": input.agent_id,
         "parentSessionId": input.parent_session_id,
     });
-    if usage.is_unpriced_harness() {
-        record["estimatedCostUsd"] = Value::Null;
-        record["pricingSource"] = Value::Null;
-        record["pricingVerifiedAt"] = Value::Null;
-    } else {
-        record["costUsd"] = json!(cost.unwrap_or(0.0));
-    }
+    record["costUsd"] = json!(cost.unwrap_or(0.0));
     record
 }
 
@@ -450,11 +444,13 @@ mod tests {
         assert_eq!(whole.tokens.output, 60);
     }
 
+    /// Every session record carries a real `costUsd`.
+    ///
+    /// Inherited from `codex_session_cost_is_an_unverified_nullable_estimate`;
+    /// see the sibling in `log_commit` for why the assertions inverted.
     #[test]
-    fn codex_session_cost_is_an_unverified_nullable_estimate() {
-        let mut usage = sample_usage();
-        usage.harness = "codex";
-        usage.source_format = "codex-rollout-v1";
+    fn session_record_carries_a_real_cost() {
+        let usage = sample_usage();
         let record = build_session_record(
             "ts",
             &sample_input(),
@@ -467,9 +463,9 @@ mod tests {
             None,
             0,
         );
-        assert!(record.get("costUsd").is_none());
-        assert!(record["estimatedCostUsd"].is_null());
-        assert!(record["pricingSource"].is_null());
-        assert!(record["pricingVerifiedAt"].is_null());
+        assert!(record["costUsd"].is_number(), "{record:?}");
+        assert!(record.get("estimatedCostUsd").is_none());
+        assert!(record.get("pricingSource").is_none());
+        assert!(record.get("pricingVerifiedAt").is_none());
     }
 }

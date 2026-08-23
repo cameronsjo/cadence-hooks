@@ -90,12 +90,12 @@ fn metrics_dir_from(override_dir: Option<String>, config_dir: PathBuf) -> PathBu
 }
 
 /// Harness stamped on schema-v2 rows.
+///
+/// Constant since the Codex adapters were retired (#1040). The field stays
+/// because rows written before 2026-08-23 carry the other value, and a reader
+/// of the ledger still needs it to interpret them.
 pub fn harness() -> &'static str {
-    if cadence_hooks_core::is_codex_harness() {
-        "codex"
-    } else {
-        "claude"
-    }
+    "claude"
 }
 
 /// Append a schema-only transcript diagnostic. No transcript text, tool input,

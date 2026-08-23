@@ -32,7 +32,7 @@ use std::io::Write;
 /// `terminology`, not the `Check::name()` value `terminology-guard`).
 ///
 /// `outcomes` carries EVERY normalized target's outcome — one element for an
-/// ordinary tool call, N for a Codex `apply_patch` with N file operations.
+/// ordinary tool call, N for an `apply_patch` with N file operations.
 ///
 /// **Exactly one row is written per hook invocation regardless of N.** Writing
 /// per target made ledger volume proportional to an attacker-chosen patch body:
