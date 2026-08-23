@@ -985,7 +985,22 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Registered in the binary but not yet wired in any hooks.json — the guardrails wiring PR is separate (cameronsjo/cadence#1037, plan Task 5, after this binary's release); flip back to applicable once it lands",
-      "wiring": []
+      "wiring": [
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr ready*)",
+          "commandHash": "3a7dc8024df953899eb48701ec60bac7abd938ea8338e9f9a5db0941a6e9fbd6"
+        },
+        {
+          "plugin": "cadence-guardrails",
+          "event": "PreToolUse",
+          "matcher": "Bash",
+          "if": "Bash(*gh pr merge*)",
+          "commandHash": "3a7dc8024df953899eb48701ec60bac7abd938ea8338e9f9a5db0941a6e9fbd6"
+        }
+      ]
     },
     {
       "criticality": "workflow",
@@ -1657,6 +1672,18 @@
           "commandHash": "da7c944a9132d454f0a28da012aa4c1277da8a72191fe0e06754e01b086b4e3b"
         }
       ]
+    },
+    {
+      "criticality": "workflow",
+      "description": "Block ExitPlanMode when the plan carries no settled Panel: line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
+      "event": "PreToolUse",
+      "name": "lint-plan-shape",
+      "plugin": "session",
+      "protected": false,
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Codex does not expose Claude ExitPlanMode calls (same route as persist-plan-approval)",
+      "wiring": []
     }
   ]
 }

@@ -270,6 +270,10 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
         "guardrails warn-unreviewed-ready-flip",
         "cameronsjo/cadence#1037",
     ),
+    // Registered here (Task 1 of the plan-shape-gate plan); the cadence
+    // hooks.json row (PreToolUse, matcher ExitPlanMode) lands in the wiring PR
+    // after this binary's 0.85.0 release.
+    ("session lint-plan-shape", "cameronsjo/cadence-hooks#751"),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
@@ -307,6 +311,13 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
     (
         "cadence",
         "session warn-plan-ready-flip",
+        "must ride the always-on cadence plugin; `session` is its clap namespace",
+    ),
+    // The call-side plan-shape gate (the plan-shape-gate plan, 2026-08-23)
+    // rides the always-on cadence plugin for the same reason.
+    (
+        "cadence",
+        "session lint-plan-shape",
         "must ride the always-on cadence plugin; `session` is its clap namespace",
     ),
 ];

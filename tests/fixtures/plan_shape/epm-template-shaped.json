@@ -1,0 +1,13 @@
+{
+  "session_id": "test",
+  "transcript_path": "/tmp/test.jsonl",
+  "cwd": "/tmp",
+  "permission_mode": "plan",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "ExitPlanMode",
+  "tool_use_id": "toolu_test",
+  "tool_input": {
+    "plan": "# Widget refresh\n\n## Goal\n\nFresh data on load.\n\n## Alternatives declined\n\n- none proposed — single obvious approach\n\n## Panel\n\nPanel: plan-reviewer ran — 2 findings, 2 folded in, 0 declined\n\n## Tasks\n\n- [ ] Refresh the cache on load\n- [ ] Add a unit test\n",
+    "planFilePath": "/nonexistent/plans/template.md"
+  }
+}

@@ -429,6 +429,12 @@ pub const HOOKS: &[HookEntry] = &[
         plugin: "session",
         event: Some(HookEvent::PreToolUse),
     },
+    HookEntry {
+        name: "lint-plan-shape",
+        description: "Block ExitPlanMode when the plan carries no settled Panel: line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
 ];
 
 /// The registry entry for `<namespace> <subcommand>`, if one exists.
@@ -587,6 +593,14 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
             // ATX heading marker), which would otherwise close a `r#"..."#`
             // raw string early.
             r##"{"session_id":"test","tool_name":"ExitPlanMode","cwd":"/nonexistent-cadence-hooks-try-sandbox","transcript_path":"/tmp/test.jsonl","tool_response":{"plan":"# Try Sample\n\nbody text","isAgent":false}}"##,
+        ),
+        // lint-plan-shape gates on tool_name == "ExitPlanMode" and a plan text;
+        // the generic PreToolUse sample carries neither, so `try` would fail
+        // open before ever judging a plan. The sample is the harness's own
+        // Context/Changes/Verification shape — the artifact the gate exists to
+        // stop — so `try session lint-plan-shape` demonstrates the block.
+        ("session", "lint-plan-shape") => Some(
+            r##"{"session_id":"test","tool_name":"ExitPlanMode","cwd":"/tmp","permission_mode":"plan","tool_input":{"plan":"# Try Sample\n\n## Context\n\nprose\n\n## Changes\n\n1. do a thing\n","planFilePath":"/nonexistent/plans/try.md"}}"##,
         ),
         // warn-subagent-worktree only engages on an Agent/Task spawn; the generic
         // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a

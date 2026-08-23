@@ -455,6 +455,8 @@ enum SessionCommands {
     NudgePlanTick,
     /// Warn on gh pr ready/merge while the branch's plan is unreconciled (PreToolUse:Bash)
     WarnPlanReadyFlip,
+    /// Block ExitPlanMode on a plan with no settled Panel: line; nudge on other missing stanzas (PreToolUse:ExitPlanMode)
+    LintPlanShape,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -564,6 +566,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::PersistPlanApproval => "persist-plan-approval",
             SessionCommands::NudgePlanTick => "nudge-plan-tick",
             SessionCommands::WarnPlanReadyFlip => "warn-plan-ready-flip",
+            SessionCommands::LintPlanShape => "lint-plan-shape",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -1366,6 +1369,11 @@ fn main() {
             ),
             SessionCommands::WarnPlanReadyFlip => dispatch::run_logged_check(
                 &cadence_hooks_session::plan_guards::WarnPlanReadyFlip,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::LintPlanShape => dispatch::run_logged_check(
+                &cadence_hooks_session::plan_guards::LintPlanShape,
                 pre,
                 canonical_hook,
             ),
