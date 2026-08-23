@@ -258,23 +258,7 @@ const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 /// binary so the wiring PR has something to point at, and reaching no event
 /// until that PR lands.
 /// (`<plugin> <subcommand>`, tracking_reference)
-const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
-    (
-        "cadence warn-changelog-entry",
-        "cameronsjo/cadence-hooks#730",
-    ),
-    // Registered here (Task 3 of the CodeRabbit-retirement plan); the
-    // guardrails hooks.json row lands in Task 5, after this binary's
-    // 0.84.0 release the row's `if:` pins by version.
-    (
-        "guardrails warn-unreviewed-ready-flip",
-        "cameronsjo/cadence#1037",
-    ),
-    // Registered here (Task 1 of the plan-shape-gate plan); the cadence
-    // hooks.json row (PreToolUse, matcher ExitPlanMode) lands in the wiring PR
-    // after this binary's 0.85.0 release.
-    ("session lint-plan-shape", "cameronsjo/cadence-hooks#751"),
-];
+const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
