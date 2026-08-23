@@ -153,7 +153,12 @@ fn judge_plan_shape(plan: &str) -> CheckResult {
     }
     if missing.contains(&plan_scan::PANEL_STANZA) {
         return CheckResult::block(format!(
-            "plan-shape gate: this plan lacks {} — the plan template's mandatory              stanzas. Add the `Panel:` line (a panel that ran: `Panel: <seats> ran — N              findings, M folded in, K declined`; none ran: `{PANEL_ESCAPE_TEMPLATE}`)              and re-call ExitPlanMode, or leave plan mode with shift-tab. The gate              checks the artifact's shape only; attune's panel and the operator's ask              to see the plan are still yours to honor.",
+            "plan-shape gate: this plan lacks {} — the plan template's mandatory stanzas. \
+             Add the `Panel:` line (a panel that ran: `Panel: <seats> ran — N findings, \
+             M folded in, K declined`; none ran: `{PANEL_ESCAPE_TEMPLATE}`) and re-call \
+             ExitPlanMode, or leave plan mode with shift-tab. The gate checks the \
+             artifact's shape only; attune's panel and the operator's ask to see the \
+             plan are still yours to honor.",
             missing.join(", ")
         ));
     }

@@ -108,6 +108,9 @@ fn harness_template_plan_is_blocked_naming_stanzas_and_escape() {
         stderr.contains("shift-tab"),
         "leave-plan-mode escape: {stderr}"
     );
+    // The message renders as one clean paragraph — a hand-wrapped literal that
+    // leaked its indentation once shipped green past the substring asserts.
+    assert!(!stderr.contains("  "), "no double spaces: {stderr}");
     // Static names only — never matched plan text (cadence-hooks#715).
     assert!(
         !stderr.contains("widget"),

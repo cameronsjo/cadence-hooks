@@ -42,6 +42,18 @@
 //! Fails open throughout (ADR-0001): an unreadable directory, an unreadable
 //! file, or a malformed frontmatter block is skipped, never surfaced as an
 //! error — a bug here must not break `session start`.
+//!
+//! **Second responsibility — the plan-shape detectors.** This module also
+//! hosts the ONE implementation of the plan template's mandatory-stanza
+//! checks ([`missing_stanzas`], built on [`panel_line_settled`],
+//! [`alternatives_stanza_present`], [`checkbox_present`], and the shared
+//! [`visible_lines`] fence/quote filter). Two gates consume it: the
+//! persist-time format-gate sentence in [`crate::persist_plan`] (after
+//! approval) and the call-time `session lint-plan-shape` block in
+//! [`crate::plan_guards`] (at `PreToolUse:ExitPlanMode`). They share one
+//! detector because two scanners drifted once already (the cadence-hooks#675
+//! polish) — a plan judged template-shaped at call time must be judged the
+//! same at persist time.
 
 use crate::identity;
 use std::fs;
@@ -127,8 +139,9 @@ pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
     (unticked, ticked)
 }
 
-/// Every detector in this module (also [`alternatives_stanza_present`],
-/// [`panel_line_settled`]) skips the same two things before inspecting a
+/// Every plan-shape detector in this module ([`alternatives_stanza_present`],
+/// [`panel_line_settled`]) and the `## Orchestrator` reader in
+/// [`crate::persist_plan`] skip the same two things before inspecting a
 /// line: fenced code (a naive ```` ``` ````/`~~~` toggle — no length
 /// matching, which errs toward skipping ambiguous lines) and block quotes
 /// (`>`). One shared filter so the discipline can't drift between detectors.
@@ -156,7 +169,7 @@ pub(crate) fn alternatives_stanza_present(body: &str) -> bool {
 /// ([`checkbox_counts`]) so this detector and the plan
 /// guards can never diverge on what counts as a box.
 pub(crate) fn checkbox_present(body: &str) -> bool {
-    let (unticked, ticked) = crate::plan_scan::checkbox_counts(body);
+    let (unticked, ticked) = checkbox_counts(body);
     unticked + ticked > 0
 }
 

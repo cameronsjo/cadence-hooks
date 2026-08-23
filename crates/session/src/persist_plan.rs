@@ -103,7 +103,7 @@ const PROVENANCE_HASH_LABEL: &str = "Plan-body-SHA256:";
 /// never appends, so ordinary growth is always EXTERNAL (another edit to a
 /// file this hook already wrote) — a laddered sibling on the rare doc that
 /// clears the cap, never a silently lost match.
-pub(crate) const IDEMPOTENCY_MAX_FILE_BYTES: u64 = 1024 * 1024;
+const IDEMPOTENCY_MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// How many lines past an opening `---` [`frontmatter_extent`] will scan for
 /// the closing fence. Real frontmatter runs well under this; the bound keeps
@@ -383,7 +383,7 @@ pub(crate) fn read_plan_store_file(path: &str) -> Option<String> {
 /// Testable core of [`read_plan_store_file`]: the containment root is
 /// injected so tests never mutate `CLAUDE_CONFIG_DIR` (a process-global other
 /// tests read concurrently).
-pub(crate) fn read_plan_store_file_within(path: &str, plan_store_root: &Path) -> Option<String> {
+fn read_plan_store_file_within(path: &str, plan_store_root: &Path) -> Option<String> {
     use std::io::Read as _;
     let path = Path::new(path);
     if path.extension().is_none_or(|ext| ext != "md") {
