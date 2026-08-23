@@ -447,6 +447,8 @@ impl std::fmt::Display for ParseFailure {
     }
 }
 
+impl std::error::Error for ParseFailure {}
+
 impl HookInput {
     /// Read and parse hook input from stdin.
     pub fn from_stdin() -> Result<Self, String> {
