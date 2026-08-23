@@ -17,11 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `CADENCE_HARNESS=codex` and diffing exit code and stderr (identical), against a
   control confirming a genuine `Deny` still exits 2.
 
-  Behaviour under Claude Code is unchanged: both arms were reachable only via a
-  Codex signal, so they were already dead there. What is genuinely gone is the
-  *mechanism* — a security-critical hook whose input cannot be parsed now fails
-  open (ADR-0001) in every case, with a diagnostic that still names why
-  normalization gave up and still never echoes the payload.
+  **Net behaviour delta is zero**, verified by a seven-case differential against
+  a binary built from the pre-change `main`. That took two rounds: the first
+  removal also dropped the fail-closed arms, on the reading that both were
+  harness-gated. They were not — `tool_name: "apply_patch"` armed the harness
+  sniff on the raw value *before* the patch rewrite errored, so both arms fired
+  with no env var set. Since `patch.rs` and its consuming guards were retained
+  deliberately, the arms are retained too, now keyed on the payload rather than
+  the harness.
 
 - **The Codex compatibility report and its CI gate** —
   `docs/codex-compatibility-report.json`, `config/codex-compatibility.json`,
@@ -36,6 +39,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer takes a harness argument. The `harness` and `sourceFormat` fields stay
   on schema-v2 rows: rows written before this change carry the other harness's
   values, and a reader of the ledger still needs the fields to interpret them.
+
+### Added
+
+- **`ParseFailure`, a typed hook-payload parse error** (`crates/core`), carrying
+  `patch_targets_unenumerable` alongside the message. `HookInput::from_stdin` and
+  `from_json` keep their `Result<_, String>` signatures; `from_stdin_detailed` /
+  `from_json_detailed` expose the classification.
+
+  It exists so the dispatcher can tell "an `apply_patch` body whose targets could
+  not be enumerated" (fail **closed** on a security-critical hook — the guard
+  cannot prove the operation safe) from "ordinary malformed JSON" (fail **open**,
+  ADR-0001) *structurally*, rather than by matching on the message. This binary
+  already has one war story about a stderr substring match deciding a verdict —
+  see the anchored `stale_signature` regex in the hook launcher.
 
 ### Changed
 

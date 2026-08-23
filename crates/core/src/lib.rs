@@ -423,23 +423,64 @@ fn resolve_apply_patch_body(value: &serde_json::Value) -> Result<Option<&str>, &
     Ok(Some(first))
 }
 
+/// Why a hook payload failed to parse, and whether the failure was specifically
+/// an `apply_patch` body whose targets could not be enumerated.
+///
+/// The distinction is load-bearing, not cosmetic: an unenumerable patch on a
+/// security-critical hook fails **closed** (the guard cannot prove the operation
+/// safe), while ordinary malformed JSON fails **open** per ADR-0001. Carrying it
+/// as a typed field rather than by matching on `message` is deliberate — this
+/// binary already has one war story about a stderr substring match deciding a
+/// verdict (see `stale_signature` in the hook launcher).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseFailure {
+    /// This binary's own diagnostic. Never contains payload or patch content.
+    pub message: String,
+    /// True when an `apply_patch` body was present but could not be resolved to
+    /// a set of targets.
+    pub patch_targets_unenumerable: bool,
+}
+
+impl std::fmt::Display for ParseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 impl HookInput {
     /// Read and parse hook input from stdin.
     pub fn from_stdin() -> Result<Self, String> {
+        Self::from_stdin_detailed().map_err(|e| e.message)
+    }
+
+    /// [`HookInput::from_stdin`], keeping the [`ParseFailure`] classification.
+    pub fn from_stdin_detailed() -> Result<Self, ParseFailure> {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
-            .map_err(|e| format!("Failed to read stdin: {e}"))?;
-        Self::from_json(&buf)
+            .map_err(|e| ParseFailure {
+                message: format!("Failed to read stdin: {e}"),
+                patch_targets_unenumerable: false,
+            })?;
+        Self::from_json_detailed(&buf)
     }
 
-    /// Parse a Claude or Codex hook payload and normalize harness aliases.
+    /// Parse a hook payload and normalize harness aliases.
     ///
     /// Raw inputs are never retained beyond this value. In particular, a patch
     /// body is parsed in memory and is not included in parse diagnostics.
     pub fn from_json(raw: &str) -> Result<Self, String> {
-        let mut value: serde_json::Value =
-            serde_json::from_str(raw).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        Self::from_json_detailed(raw).map_err(|e| e.message)
+    }
+
+    /// [`HookInput::from_json`], keeping the [`ParseFailure`] classification.
+    pub fn from_json_detailed(raw: &str) -> Result<Self, ParseFailure> {
+        let plain = |message: String| ParseFailure {
+            message,
+            patch_targets_unenumerable: false,
+        };
+        let mut value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| plain(format!("Failed to parse hook JSON: {e}")))?;
         let tool_name = value
             .get("tool_name")
             .and_then(serde_json::Value::as_str)
@@ -447,14 +488,17 @@ impl HookInput {
             .to_string();
         if tool_name == "apply_patch" {
             let patch = resolve_apply_patch_body(&value)
-                .map_err(str::to_string)?
+                .map_err(|e| ParseFailure {
+                    message: e.to_string(),
+                    patch_targets_unenumerable: true,
+                })?
                 .map(str::to_string);
             if let Some(patch) = patch {
                 value["tool_input"] = serde_json::json!({"patch": patch});
             }
         }
-        let mut input: HookInput =
-            serde_json::from_value(value).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        let mut input: HookInput = serde_json::from_value(value)
+            .map_err(|e| plain(format!("Failed to parse hook JSON: {e}")))?;
         if let Some(tool_input) = input.tool_input.as_mut()
             && tool_input.command.is_none()
         {
@@ -1444,9 +1488,11 @@ pub fn guard_interactive_terminal(
 /// silently got less enforcement.
 ///
 /// What it deliberately does NOT gain is the dispatch wrapper's telemetry tail
-/// (denial ledger, timing, panic guard) or its Codex fail-closed parse arm: those
-/// need the canonical registry hook name, which lives in the binary. So this
-/// stays the *unlogged* path, not a weaker one.
+/// (denial ledger, timing, panic guard) or its fail-closed arm for an
+/// unenumerable patch on a security-critical hook: both need the canonical
+/// registry hook name, which lives in the binary. So this stays the *unlogged*
+/// path — and, for that one arm, a genuinely weaker one; every shipped hook goes
+/// through the dispatch wrapper.
 pub fn run_check_from_stdin(check: &dyn Check, event: HookEvent) -> ! {
     guard_interactive_terminal(check.name(), Some(event), None);
     let input = match HookInput::from_stdin() {

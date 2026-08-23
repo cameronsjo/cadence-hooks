@@ -92,8 +92,11 @@ impl Logger for LogCommit {
         };
 
         let prices = Prices::load(self.prices_path.as_deref());
-        let cost = (usage.harness == "claude")
-            .then(|| compute_cost_by_model(&usage.scan.by_model, &prices));
+        // Unconditional since the unpriced harness was retired (#1040). It was
+        // `(usage.harness == "claude").then(...)`, which is now a tautology —
+        // left in place it would read as live logic while its `unwrap_or(0.0)`
+        // fallback silently rendered "unpriced" as "$0.00" in any aggregation.
+        let cost = compute_cost_by_model(&usage.scan.by_model, &prices);
 
         let since_marker = last_message_id.as_deref().unwrap_or("session-start");
         let branch = common::branch(input.cwd.as_deref());
@@ -153,7 +156,7 @@ fn build_commit_record(
     branch: &str,
     repo: &str,
     usage: &UsageScan,
-    cost: Option<f64>,
+    cost: f64,
     since_marker: &str,
     prices: &Prices,
 ) -> Value {
@@ -193,7 +196,7 @@ fn build_commit_record(
         "parentSessionId": input.parent_session_id,
         "parentAgentId": input.parent_agent_id,
     });
-    record["costUsd"] = json!(cost.unwrap_or(0.0));
+    record["costUsd"] = json!(cost);
     record
 }
 
@@ -279,7 +282,7 @@ mod tests {
             "feat/x",
             "myrepo",
             &sample_usage(),
-            Some(0.001234),
+            0.001234,
             "m1",
             &prices,
         );
@@ -321,7 +324,7 @@ mod tests {
             "",
             "myrepo",
             &sample_usage(),
-            Some(0.0),
+            0.0,
             "session-start",
             &prices,
         );
@@ -374,7 +377,7 @@ mod tests {
             "main",
             "myrepo",
             &UsageScan::claude(scan),
-            Some(cost),
+            cost,
             "m0",
             &prices,
         );
@@ -424,7 +427,7 @@ mod tests {
             "main",
             "r",
             &UsageScan::claude(scan),
-            Some(0.0),
+            0.0,
             "m0",
             &prices,
         );
@@ -444,7 +447,7 @@ mod tests {
             "main",
             "r",
             &sample_usage(),
-            Some(0.001),
+            0.001,
             "m1",
             &Prices::embedded(),
         );
@@ -471,11 +474,11 @@ mod tests {
             "main",
             "r",
             &usage,
-            None,
+            0.004_2,
             "session-start",
             &Prices::embedded(),
         );
-        assert!(rec["costUsd"].is_number(), "{rec:?}");
+        assert_eq!(rec["costUsd"], 0.004_2);
         assert!(rec.get("estimatedCostUsd").is_none());
         assert!(rec.get("pricingSource").is_none());
         assert!(rec.get("pricingVerifiedAt").is_none());

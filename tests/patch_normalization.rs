@@ -313,40 +313,45 @@ fn paired_harness_fixtures_cover_and_normalize_every_route() {
     }
 }
 
-/// A malformed patch body must never reach stderr, whatever the verdict.
+/// A malformed patch body blocks a security-critical hook, and is never echoed.
 ///
-/// Inherited from `security_critical_malformed_patch_blocks_without_echoing_patch`,
-/// which asserted the *Codex* verdict (exit 2 via the removed fail-closed arm).
-/// The verdict was harness-specific and is gone; the no-echo property belongs to
-/// `patch.rs`'s diagnostics and is retained, so it keeps its own test rather than
-/// being deleted alongside the posture it happened to be written under.
+/// Inherited from `security_critical_malformed_patch_blocks_without_echoing_patch`.
+/// The verdict looked Codex-specific and is not: the arm was armed by
+/// `tool_name: "apply_patch"` itself, so it fired with no env var set. #1040
+/// briefly turned it fail-open; the arm is now unconditional for
+/// security-critical hooks, since `patch.rs` and its guards were retained.
 #[test]
-fn a_malformed_patch_body_is_never_echoed() {
+fn a_malformed_patch_body_blocks_and_is_never_echoed() {
     let payload = r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\nSECRET_VALUE\n*** End Patch"}"#;
     let (code, stderr) = run_hook(&["cadence", "prevent-secret-writes"], &[], payload);
 
     assert_eq!(
         code,
-        Some(0),
-        "an unenumerable patch fails open (ADR-0001): {stderr}"
+        Some(2),
+        "an unenumerable patch on a security-critical hook must block: {stderr}"
     );
     assert!(
         stderr.contains("targets could not be enumerated"),
-        "the diagnostic must still name why normalization gave up: {stderr}"
+        "the diagnostic must name why normalization gave up: {stderr}"
     );
     assert!(
         !stderr.contains("SECRET_VALUE"),
         "the patch body must never be echoed: {stderr}"
     );
+
+    // Control: the same unenumerable patch on a NON-security-critical hook
+    // still fails open, so the block above is the criticality check deciding
+    // rather than the patch route erroring for everyone.
+    let (code, _) = run_hook(&["guardrails", "warn-cron-datetime"], &[], payload);
+    assert_eq!(code, Some(0), "a non-critical hook still fails open");
 }
 
 /// Conflicting `apply_patch` bodies are rejected without echoing either one.
 ///
-/// Inherited from `conflicting_patch_bodies_fail_closed_without_echoing_them`.
-/// Same split as above: the exit-2 half was the removed Codex arm, the no-echo
-/// half is `patch.rs`'s and stays. Both payload shapes are kept — a conflict
-/// nested inside `tool_input` and one hoisted to the top level — because they
-/// reach the conflict check by different paths.
+/// Inherited from `conflicting_patch_bodies_fail_closed_without_echoing_them`,
+/// and asserting the same verdict for the reason given on the sibling above.
+/// Both payload shapes are kept — a conflict nested inside `tool_input` and one
+/// hoisted to the top level — because they reach the check by different paths.
 #[test]
 fn conflicting_patch_bodies_are_rejected_without_echoing_them() {
     let benign = "*** Begin Patch\n*** Add File: benign.txt\n+ok\n*** End Patch";
@@ -370,7 +375,11 @@ fn conflicting_patch_bodies_are_rejected_without_echoing_them() {
             &[],
             &payload.to_string(),
         );
-        assert_eq!(code, Some(0), "conflicting bodies fail open: {stderr}");
+        assert_eq!(
+            code,
+            Some(2),
+            "conflicting bodies block a security-critical hook: {stderr}"
+        );
         assert!(
             stderr.contains("apply_patch payload contains conflicting patch bodies"),
             "the diagnostic must name the conflict: {stderr}"
