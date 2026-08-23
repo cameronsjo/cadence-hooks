@@ -127,6 +127,121 @@ pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
     (unticked, ticked)
 }
 
+/// Every detector in this module (also [`alternatives_stanza_present`],
+/// [`panel_line_settled`]) skips the same two things before inspecting a
+/// line: fenced code (a naive ```` ``` ````/`~~~` toggle — no length
+/// matching, which errs toward skipping ambiguous lines) and block quotes
+/// (`>`). One shared filter so the discipline can't drift between detectors.
+pub(crate) fn visible_lines(body: &str) -> impl Iterator<Item = &str> {
+    let mut in_fence = false;
+    body.lines().filter(move |line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            return false;
+        }
+        !in_fence && !line.starts_with('>')
+    })
+}
+
+/// True when the plan body carries an `## Alternatives declined` heading at
+/// line start ([`visible_lines`]'s fence/quote-skip discipline). Case-exact:
+/// the template writes it one way.
+pub(crate) fn alternatives_stanza_present(body: &str) -> bool {
+    visible_lines(body).any(|line| line.starts_with("## Alternatives declined"))
+}
+
+/// True when the plan body carries at least one checkbox task outside fenced
+/// code — delegates to the shared fence-aware reader
+/// ([`checkbox_counts`]) so this detector and the plan
+/// guards can never diverge on what counts as a box.
+pub(crate) fn checkbox_present(body: &str) -> bool {
+    let (unticked, ticked) = crate::plan_scan::checkbox_counts(body);
+    unticked + ticked > 0
+}
+
+/// True when the plan body carries a settled `Panel:` line — anchored at line
+/// start, in exactly one of the plan template's two settled forms:
+///
+/// - `Panel: <seats> ran — <counts…>` (a panel ran; both sides non-empty)
+/// - `Panel: none — <reason>` (the absence assertion; non-empty reason)
+///
+/// The separator tolerates what a human actually types: em dash (the
+/// template's canonical form), en dash, `--`, or a plain hyphen — a
+/// hand-written `Panel: none - reason` states the settled fact unambiguously,
+/// and hardcoding U+2014 would fire a false nudge on it (code review of this
+/// change).
+///
+/// Anything else — no `Panel:` line at all, a `Panel: pending…` placeholder,
+/// or a `## Panel review` heading with no settled line — is unsettled. The
+/// line-start anchor plus the required `Panel: ` prefix means a `## Panel`
+/// heading can never false-match.
+///
+/// **First match in document order decides** — the `Driver:` stamp's
+/// discipline (plan-pipeline-conventions §4/§5): the plan template's `## Panel`
+/// stanza precedes the task body, so the stanza's own line is judged, and a
+/// quoted `Panel: … ran — …` example later in the body can neither satisfy
+/// the gate (the accidental-forgery hole a whole-body `any()` scan would
+/// open) nor contradict the stanza. Lines inside fenced code blocks and
+/// block quotes are skipped before the first-match rule applies
+/// ([`visible_lines`]'s discipline) — a fenced or quoted example in a plan
+/// with no stanza at all must not mint a settled verdict (security review of
+/// this change; same class as the quoted-example hole above). The fence
+/// tracker is deliberately naive — it toggles without matching fence
+/// lengths — which errs toward skipping ambiguous lines: on a malformed
+/// document the failure mode is a spurious nudge (fail-loud), never a
+/// suppressed one. Detection only; the caller names this stanza (a static
+/// string, "a settled Panel: line") in the composed format-gate line, never
+/// any matched text.
+pub(crate) fn panel_line_settled(body: &str) -> bool {
+    let Some(rest) = visible_lines(body).find_map(|line| line.strip_prefix("Panel: ")) else {
+        return false;
+    };
+    // Dash tolerance: `--` must be tried before `-` or the second hyphen
+    // leaks into the text it precedes.
+    fn strip_dash(s: &str) -> Option<&str> {
+        let s = s.trim_start();
+        ["—", "–", "--", "-"].iter().find_map(|d| s.strip_prefix(d))
+    }
+    if let Some(after_none) = rest.strip_prefix("none") {
+        return strip_dash(after_none).is_some_and(|reason| !reason.trim().is_empty());
+    }
+    if let Some((seats, tail)) = rest.split_once(" ran ") {
+        return !seats.trim().is_empty()
+            && strip_dash(tail).is_some_and(|counts| !counts.trim().is_empty());
+    }
+    false
+}
+
+/// Static stanza names the plan-shape gates render — never matched plan
+/// text (cameronsjo/cadence-hooks#715). Both consumers (the persist-time
+/// format-gate sentence in [`crate::persist_plan`] and the call-time
+/// `session lint-plan-shape` guard in [`crate::plan_guards`]) name the same
+/// three stanzas through the same strings.
+pub(crate) const PANEL_STANZA: &str = "a settled Panel: line";
+pub(crate) const ALTERNATIVES_STANZA: &str = "an Alternatives-declined stanza";
+pub(crate) const CHECKBOX_STANZA: &str = "checkbox tasks";
+
+/// The ONE plan-shape detector both gates consume: the plan template's
+/// mandatory stanzas `body` lacks, in template order (`Panel:` line,
+/// `## Alternatives declined`, checkbox tasks). Empty for a template-shaped
+/// plan. Two scanners drifted once already (the #675 polish), which is why
+/// persist-time and call-time share this single entry point rather than
+/// each composing the list inline.
+pub(crate) fn missing_stanzas(body: &str) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !panel_line_settled(body) {
+        missing.push(PANEL_STANZA);
+    }
+    if !alternatives_stanza_present(body) {
+        missing.push(ALTERNATIVES_STANZA);
+    }
+    if !checkbox_present(body) {
+        missing.push(CHECKBOX_STANZA);
+    }
+    missing
+}
+
 /// Every plan doc whose `status:` is `in-flight` or `blocked`, under the same
 /// candidate bounds as [`scan_in_flight_plans`]. Empty on a missing or
 /// unreadable directory (fail-open).
@@ -866,5 +981,109 @@ mod tests {
         let second_pos = block.find("2026-07-02-second").unwrap();
         assert!(first_pos < second_pos, "sorted by filename: {block}");
         assert!(block.contains("[blocked]"));
+    }
+
+    #[test]
+    fn format_gate_detectors_anchor_on_real_stanzas_only() {
+        // Alternatives stanza: line-start heading, fences and quotes skipped.
+        assert!(alternatives_stanza_present(
+            "# T\n\n## Alternatives declined\n\n- none proposed\n"
+        ));
+        assert!(!alternatives_stanza_present("# T\n\nno stanza here\n"));
+        assert!(!alternatives_stanza_present(
+            "# T\n\n```\n## Alternatives declined\n```\n"
+        ));
+        assert!(!alternatives_stanza_present(
+            "# T\n\n> ## Alternatives declined\n"
+        ));
+        // Checkboxes: ticked or unticked count; fenced examples don't.
+        assert!(checkbox_present("# T\n\n- [ ] build\n"));
+        assert!(checkbox_present("# T\n\n  - [x] done\n"));
+        assert!(!checkbox_present("# T\n\nprose only\n"));
+        assert!(!checkbox_present("# T\n\n```\n- [ ] fenced example\n```\n"));
+    }
+
+    #[test]
+    fn panel_line_settled_accepts_both_settled_forms_only() {
+        // Settled: the ran form and the absence assertion.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: plan-reviewer ×2 ran — 3 findings, 2 folded in, 1 declined\n\nbody"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none — raw-draft bypass per operator ask\n"
+        ));
+        // Unsettled: absent, pending-shaped, empty reason/counts, heading-only.
+        assert!(!panel_line_settled("# T\n\nno panel line at all\n"));
+        assert!(!panel_line_settled(
+            "# T\n\nPanel: pending — seats not yet run\n"
+        ));
+        assert!(!panel_line_settled("# T\n\nPanel: none — \n"));
+        assert!(!panel_line_settled("# T\n\nPanel:  ran — 3 findings\n"));
+        assert!(!panel_line_settled(
+            "# T\n\n## Panel review — findings declined\n\n- none declined\n"
+        ));
+        // Anchored at line start: an indented or mid-line mention never matches.
+        assert!(!panel_line_settled("# T\n\n  Panel: x ran — y\n"));
+        assert!(!panel_line_settled(
+            "# T\n\nsee Panel: x ran — y for details\n"
+        ));
+        // First match in document order decides (the Driver: stamp's
+        // discipline): a settled-looking quoted example AFTER an unsettled
+        // stanza line never satisfies the gate…
+        assert!(!panel_line_settled(
+            "# T\n\nPanel: pending — seats queued\n\nExample: write\nPanel: x ran — 1 finding\n"
+        ));
+        // …and a later unsettled mention never contradicts a settled stanza.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: reviewer ran — 2 findings, 2 folded in, 0 declined\n\n\
+             Quoted form:\nPanel: pending — never do this\n"
+        ));
+        // Dash tolerance: a hand-typed hyphen, double hyphen, or en dash
+        // states the settled fact as unambiguously as the template's em dash.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none - raw-draft bypass\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: 2 reviewers ran - 3 findings, all folded in\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none -- operator bypass\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: reviewer ran – 1 finding\n"
+        ));
+        // …but the dash is still required, and an empty ran-tail is unsettled.
+        assert!(!panel_line_settled("# T\n\nPanel: none reason given\n"));
+        assert!(!panel_line_settled("# T\n\nPanel: x ran — \n"));
+        assert!(!panel_line_settled("# T\n\nPanel: x ran 3 findings\n"));
+        // Fenced and block-quoted examples never mint a settled verdict for a
+        // plan with no stanza at all (security review of this change).
+        assert!(!panel_line_settled(
+            "# Add a Panel: stanza\n\n```markdown\nPanel: reviewer ran — 3 findings\n```\n\n\
+             Approach: …\n"
+        ));
+        assert!(!panel_line_settled(
+            "# T\n\n> Panel: reviewer ran — 3 findings\n\nbody\n"
+        ));
+        // A real stanza after a closed fence still settles.
+        assert!(panel_line_settled(
+            "# T\n\n```\nexample\n```\n\nPanel: reviewer ran — 1 finding, folded\n"
+        ));
+    }
+
+    #[test]
+    fn missing_stanzas_names_every_absent_stanza_in_template_order() {
+        assert_eq!(
+            missing_stanzas("# T\n\n## Context\n\nprose\n"),
+            vec![PANEL_STANZA, ALTERNATIVES_STANZA, CHECKBOX_STANZA]
+        );
+        assert_eq!(
+            missing_stanzas("# T\n\nPanel: none — no seat warranted\n\nprose\n"),
+            vec![ALTERNATIVES_STANZA, CHECKBOX_STANZA]
+        );
+        assert!(missing_stanzas(
+            "# T\n\n## Alternatives declined\n\n- none\n\nPanel: r ran — 1 finding, folded\n\n- [ ] task\n"
+        )
+        .is_empty());
     }
 }

@@ -23,6 +23,24 @@
 //! failed git spawn all degrade to a silent allow. Plan frontmatter is
 //! untrusted committed text — everything rendered into a nudge is either
 //! static or passes [`crate::identity::sanitize_field`].
+//!
+//! A third check, the one guard here that can block:
+//!
+//! - **`lint-plan-shape` (PreToolUse:ExitPlanMode).** The call-side
+//!   plan-shape gate (the plan-shape-gate plan, 2026-08-23). A top-level
+//!   `ExitPlanMode` whose plan carries no settled `Panel:` line is blocked
+//!   before the operator ever sees it — the persist-time lint
+//!   (cadence-hooks#675) runs at PostToolUse, after approval, so it could not
+//!   catch a harness-template plan (Context/Changes/Verification, no panel,
+//!   no alternatives, no checkbox tasks) presented unasked. The block names
+//!   only the static stanza names and the in-band escape
+//!   (`Panel: none — <reason>`); a settled `Panel:` line with other stanzas
+//!   missing draws one nudge sentence instead. Subagent-originated calls
+//!   (`agent_id` on the payload) allow silently — a planner subagent
+//!   produces a pre-panel draft by design — and every internal failure (no
+//!   plan text obtainable, unreadable plan-store file) allows (ADR-0001).
+//!   The gate enforces the artifact's *shape*, not that attune ran or that
+//!   the operator asked; those stay prose-governed.
 
 use crate::plan_scan::{self, InFlightPlan};
 use cadence_hooks_core::markers;
@@ -68,6 +86,81 @@ impl Check for WarnPlanReadyFlip {
     fn run(&self, input: &HookInput) -> CheckResult {
         run_warn_plan_ready_flip(input)
     }
+}
+
+/// Block `ExitPlanMode` on a plan with no settled `Panel:` line; nudge on
+/// other missing template stanzas (the one blocking plan guard).
+pub struct LintPlanShape;
+
+impl Check for LintPlanShape {
+    fn name(&self) -> &str {
+        "lint-plan-shape"
+    }
+
+    fn run(&self, input: &HookInput) -> CheckResult {
+        // Same defense-in-depth as `persist-plan-approval`: this fires on
+        // every top-level ExitPlanMode, and a panic here must allow, never
+        // block (ADR-0001).
+        std::panic::catch_unwind(|| run_lint_plan_shape(input))
+            .unwrap_or_else(|_| CheckResult::allow())
+    }
+}
+
+/// The in-band escape the block names: one line the operator (or Claude, on
+/// the operator's say-so) adds to the plan to assert no panel ran. Static
+/// text — the block message never carries matched plan content
+/// (cameronsjo/cadence-hooks#715).
+const PANEL_ESCAPE_TEMPLATE: &str = "Panel: none — <reason>";
+
+pub fn run_lint_plan_shape(input: &HookInput) -> CheckResult {
+    if input.tool_name() != Some("ExitPlanMode") {
+        return CheckResult::allow();
+    }
+    // A subagent-originated call: attune's planner-subagent path and the
+    // harness's own Plan agent produce pre-panel drafts by design, and the
+    // top-level session is the one that presents. (On claude-code 2.1.241 a
+    // subagent cannot call ExitPlanMode at all — this arm is defensive.)
+    if input.agent_id().is_some() {
+        return CheckResult::allow();
+    }
+    let Some(plan) = plan_text(input) else {
+        return CheckResult::allow();
+    };
+    judge_plan_shape(&plan)
+}
+
+/// The plan text to judge: the call-side inline `tool_input.plan` first (what
+/// the 2.1.241 PreToolUse payload carries — Task 0 of the plan-shape-gate
+/// plan), else a bounded, containment-checked read of the harness plan-store
+/// file named by `planFilePath` (the same reader `persist_plan` trusts).
+/// `None` when neither yields text — fail open.
+fn plan_text(input: &HookInput) -> Option<String> {
+    if let Some(inline) = input.tool_input_plan().filter(|p| !p.trim().is_empty()) {
+        return Some(inline.to_string());
+    }
+    input
+        .plan_file_path()
+        .and_then(crate::persist_plan::read_plan_store_file)
+}
+
+/// The pure decision: block on an unsettled `Panel:` line (naming every
+/// missing stanza plus both escapes), nudge on a settled line with other
+/// stanzas missing, allow on a template-shaped plan.
+fn judge_plan_shape(plan: &str) -> CheckResult {
+    let missing = plan_scan::missing_stanzas(plan);
+    if missing.is_empty() {
+        return CheckResult::allow();
+    }
+    if missing.contains(&plan_scan::PANEL_STANZA) {
+        return CheckResult::block(format!(
+            "plan-shape gate: this plan lacks {} — the plan template's mandatory              stanzas. Add the `Panel:` line (a panel that ran: `Panel: <seats> ran — N              findings, M folded in, K declined`; none ran: `{PANEL_ESCAPE_TEMPLATE}`)              and re-call ExitPlanMode, or leave plan mode with shift-tab. The gate              checks the artifact's shape only; attune's panel and the operator's ask              to see the plan are still yours to honor.",
+            missing.join(", ")
+        ));
+    }
+    CheckResult::nudge(format!(
+        "plan-shape gate: plan lacks {} — see the plan template.",
+        missing.join(", ")
+    ))
 }
 
 pub fn run_nudge_plan_tick(input: &HookInput) -> CheckResult {

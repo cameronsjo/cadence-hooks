@@ -1,0 +1,13 @@
+{
+  "session_id": "test",
+  "transcript_path": "/tmp/test.jsonl",
+  "cwd": "/tmp",
+  "permission_mode": "plan",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "ExitPlanMode",
+  "tool_use_id": "toolu_test",
+  "tool_input": {
+    "plan": "# Plan: widget refresh\n\n## Context\n\nThe widget renders stale data.\n\n## Changes\n\n1. Refresh the cache on load.\n2. Add a unit test.\n\n## Verification\n\nRun the suite.\n",
+    "planFilePath": "/nonexistent/plans/harness.md"
+  }
+}

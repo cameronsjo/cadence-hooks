@@ -72,6 +72,11 @@
       "status": "unavailable",
       "applicable": false,
       "evidence": "Codex does not expose Claude ExitPlanMode approval events"
+    },
+    "lint-plan-shape": {
+      "status": "unavailable",
+      "applicable": false,
+      "evidence": "Codex does not expose Claude ExitPlanMode calls (same route as persist-plan-approval)"
     }
   },
   "capabilities": [
