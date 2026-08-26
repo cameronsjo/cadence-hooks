@@ -283,25 +283,40 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
 /// review of this change): `echo "gh pr merge"` tokenizes the quoted text
 /// into ONE token, so prose about the command never matches, while flags
 /// after the verb (`gh pr merge 42 --squash`) don't disturb the window.
+///
+/// The scan runs PER SEGMENT. `tokenize` does no operator splitting, so a
+/// whole-command token stream runs straight through `&&`/`;`/`|` into later
+/// commands — and the `--undo` slice below would then read a *following*
+/// command's flag as this invocation's, suppressing the nudge on a real ship
+/// (`gh pr ready 42 && gh pr ready --undo`). [`command_segments`] cuts the
+/// line at those separators first, so each invocation only ever sees its own
+/// operands.
+///
+/// [`command_segments`]: cadence_hooks_core::shell::command_segments
 fn is_pr_flip_command(command: &str) -> bool {
-    let tokens = cadence_hooks_core::shell::tokenize(command);
-    tokens.windows(3).enumerate().any(|(i, w)| {
-        if cadence_hooks_core::shell::basename(&w[0]) != "gh" || w[1] != "pr" {
-            return false;
-        }
-        match w[2].as_str() {
-            // `--undo` flips the PR back to DRAFT — it un-ships, the retreat
-            // FROM the reconcile point this guard names, so the unticked-box
-            // nudge is noise. Shared predicate with the ship anchor
-            // (cadence-hooks#773/#774): it skips redirect targets and
-            // here-string words, which the shell eats before gh sees them.
-            "ready" => {
-                !cadence_hooks_core::shell::carries_undo_flag(tokens.get(i + 3..).unwrap_or(&[]))
-            }
-            "merge" => true,
-            _ => false,
-        }
-    })
+    cadence_hooks_core::shell::command_segments(command)
+        .into_iter()
+        .any(|segment| {
+            let tokens = cadence_hooks_core::shell::tokenize(&segment);
+            tokens.windows(3).enumerate().any(|(i, w)| {
+                if cadence_hooks_core::shell::basename(&w[0]) != "gh" || w[1] != "pr" {
+                    return false;
+                }
+                match w[2].as_str() {
+                    // `--undo` flips the PR back to DRAFT — it un-ships, the
+                    // retreat FROM the reconcile point this guard names, so
+                    // the unticked-box nudge is noise. Shared predicate with
+                    // the ship anchor (cadence-hooks#773/#774): it skips
+                    // redirect targets and here-string words, which the shell
+                    // eats before gh ever sees them.
+                    "ready" => !cadence_hooks_core::shell::carries_undo_flag(
+                        tokens.get(i + 3..).unwrap_or(&[]),
+                    ),
+                    "merge" => true,
+                    _ => false,
+                }
+            })
+        })
 }
 
 /// Atomically claim `path` with `create_new`: `true` means this invocation
@@ -718,6 +733,37 @@ mod tests {
                 run_warn_plan_ready_flip(&input).outcome,
                 cadence_hooks_core::Outcome::Allow,
                 "{cmd} un-ships and must not nudge"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_flip_warns_when_a_later_command_carries_the_undo() {
+        // The `--undo` scan must stop at the invocation's own segment. A real
+        // ship chained ahead of an un-ship (`gh pr ready 42 && gh pr ready
+        // --undo`) still owes the nudge — reading the second command's flag as
+        // the first command's would be a MISS on a genuine flip, the costly
+        // direction for an advisory guard.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-08-11-guards.md",
+            "in-flight",
+            "main",
+            "# G\n\n- [ ] build\n- [ ] wire\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+
+        for (session, cmd) in [
+            ("flip-chain-1", "gh pr ready 42 && gh pr ready --undo"),
+            ("flip-chain-2", "gh pr ready 42 ; some-tool --undo"),
+        ] {
+            let input = bash_input(session, tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{cmd} contains a real ready flip"
             );
         }
     }
