@@ -252,7 +252,22 @@ pub fn run_persist_plan_approval(
 /// short-circuits every later fire. A head read that finds NO user row yet
 /// (the harness appends the injected prompt to the transcript only after
 /// SessionStart settles, so a very early fire can race it) leaves the marker
-/// unwritten and retries on the next tool call.
+/// unwritten and retries on the next tool call — unless the head window is
+/// already saturated (the transcript exceeds the read cap with no user row
+/// inside it), which can never resolve and burns the marker so the per-call
+/// 1 MiB read does not recur for the life of the session (security review of
+/// this change). A resolvable no-repo `cwd` also leaves the marker unwritten:
+/// which repo receives the plan depends on where the first tool call happens
+/// to run, and a first call outside any git repo must not spend the one shot.
+///
+/// **Authenticity floor** (security review of this change): a bare prefix
+/// match is NOT an approval. The persist requires the harness's trailing
+/// transcript-pointer paragraph, parsed from the STRIPPED SUFFIX LINES only
+/// (never the plan body, which is untrusted prose that may legitimately quote
+/// the pointer text), naming a transcript file that exists on this machine
+/// with a well-formed session-id stem. A prompt that merely starts with
+/// `Implement the following plan:` — a headless launch interpolating fetched
+/// content, or an operator pasting a plan by hand — persists nothing.
 ///
 /// Same fail-open posture as the approval arm: a subagent context, an unsafe
 /// session id, an unreadable transcript, or any persist-pipeline failure
@@ -284,39 +299,60 @@ pub fn run_injected_plan_persist(
     let Some(transcript_path) = input.transcript_path() else {
         return CheckResult::allow();
     };
+    let transcript_path = Path::new(transcript_path);
     let Some(head) = cadence_hooks_core::transcript::read_head_bounded(
-        Path::new(transcript_path),
+        transcript_path,
         INJECTED_HEAD_READ_MAX_BYTES,
     ) else {
         return CheckResult::allow();
     };
     let raw_plan = match injected_first_prompt(&head) {
-        // No user row in the head yet — not a verdict; retry on a later fire.
-        InjectedScan::NoUserRowYet => return CheckResult::allow(),
+        InjectedScan::NoUserRowYet => {
+            // A saturated window can never resolve — the first user row sits
+            // past the cap, so retrying is a per-tool-call 1 MiB read forever.
+            // Burn the marker and stop. An unsaturated head is the SessionStart
+            // race: not a verdict, retry on a later fire.
+            let saturated = fs::metadata(transcript_path)
+                .is_ok_and(|m| m.len() >= INJECTED_HEAD_READ_MAX_BYTES);
+            if saturated {
+                let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+            }
+            return CheckResult::allow();
+        }
         InjectedScan::NotInjected => {
             let _ = cadence_hooks_core::markers::write_marker(&marker, "");
             return CheckResult::allow();
         }
         InjectedScan::Plan(raw) => raw,
     };
-    // Definitive verdict: bound the scan to this one fire even if the persist
-    // below declines (opt-out, no repo, hash already on disk) — those are
-    // stable conditions a retry would only re-litigate every tool call.
-    let _ = cadence_hooks_core::markers::write_marker(&marker, "");
-
-    let body = strip_trailing_suffix_lines_and_trim(&raw_plan);
+    let (body, suffix_lines) = split_trailing_suffix_lines(&raw_plan);
+    // Authenticity floor: the pointer must come from the harness-appended
+    // trailing block and name a real transcript — see the doc comment. A
+    // prefix match without it is definitive non-approval, same as NotInjected.
+    let Some(approving) = parent_session_id_from_pointer_lines(&suffix_lines) else {
+        let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+        return CheckResult::allow();
+    };
     if body.is_empty() {
+        let _ = cadence_hooks_core::markers::write_marker(&marker, "");
         return CheckResult::allow();
     }
-    let approving = parent_session_id_from_pointer(&raw_plan);
-    persist_plan_body(
-        input,
-        utc_now,
-        local_date,
-        host,
-        &body,
-        approving.as_deref(),
-    )
+    // Resolve the repo BEFORE burning the marker: the first tool call can run
+    // outside any git repo (or in the wrong one), and that is a property of
+    // the call, not of the session — the next call may sit in the real repo.
+    if input
+        .cwd
+        .as_deref()
+        .and_then(crate::registry::repo_root)
+        .is_none()
+    {
+        return CheckResult::allow();
+    }
+    // Definitive verdict with a resolvable target: bound the scan to this one
+    // fire even if the persist below declines (opt-out, hash already on disk)
+    // — those are stable conditions a retry would only re-litigate.
+    let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+    persist_plan_body(input, utc_now, local_date, host, &body, Some(&approving))
 }
 
 /// Verdict of one bounded scan of a transcript head for the injected
@@ -375,18 +411,29 @@ fn injected_first_prompt(head: &str) -> InjectedScan {
 
 /// The approving (parent) session id, parsed from the injected prompt's
 /// transcript-pointer paragraph — "…read the full transcript at:
-/// `<dir>/<session-id>.jsonl`". `None` when the paragraph is absent or its
-/// final path component's stem fails [`identity::is_safe_session_id`] — the
-/// persist then simply omits `approved_in:` (silence, not a guess).
-fn parent_session_id_from_pointer(raw_plan: &str) -> Option<String> {
-    let pointer = raw_plan
-        .lines()
+/// `<dir>/<session-id>.jsonl`".
+///
+/// Hardened per the security review of this change: the caller hands over
+/// only the STRIPPED TRAILING SUFFIX LINES (never the plan body — untrusted
+/// prose that may legitimately quote, or maliciously plant, the pointer
+/// text), the FIRST `.jsonl` token on the pointer line wins (a second path
+/// appended after the real one cannot override it), the named file must
+/// exist on this machine (a stat, never a read — the id is taken from the
+/// path's stem, not the file), and the stem must pass
+/// [`identity::is_safe_session_id`]. `None` on any miss — the caller treats
+/// that as non-approval, not as an anonymous approval.
+fn parent_session_id_from_pointer_lines(suffix_lines: &[&str]) -> Option<String> {
+    let pointer = suffix_lines
+        .iter()
         .find(|l| l.trim_start().starts_with(POINTER_PARAGRAPH_PREFIX))?;
     let jsonl = pointer
         .split_whitespace()
-        .rev()
         .find(|token| token.ends_with(".jsonl"))?;
-    let stem = Path::new(jsonl).file_stem()?.to_str()?;
+    let path = Path::new(jsonl);
+    if !fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
     identity::is_safe_session_id(stem).then(|| stem.to_string())
 }
 
@@ -545,7 +592,18 @@ fn canonical_plans_dir(repo_root: &Path) -> Option<(PathBuf, PathBuf)> {
 /// paragraph glued onto the body — no error, but a smaller instance of the
 /// same drift this mechanism exists to catch.
 fn strip_trailing_suffix_lines_and_trim(text: &str) -> String {
+    split_trailing_suffix_lines(text).0
+}
+
+/// [`strip_trailing_suffix_lines_and_trim`]'s two-sided core: the trimmed
+/// body AND the popped trailing suffix lines (pop order — reverse document
+/// order; callers only search them). The injected-prompt arm parses the
+/// parent pointer out of the popped lines exclusively, so a pointer-shaped
+/// line inside the body proper can never supply provenance (security review
+/// of this change).
+fn split_trailing_suffix_lines(text: &str) -> (String, Vec<&str>) {
     let mut lines: Vec<&str> = text.lines().collect();
+    let mut popped: Vec<&str> = Vec::new();
     loop {
         match lines.last() {
             Some(last) if last.trim().is_empty() => {
@@ -555,7 +613,7 @@ fn strip_trailing_suffix_lines_and_trim(text: &str) -> String {
                 if last.trim_start().starts_with(SUFFIX_LINE_PREFIX)
                     || last.trim_start().starts_with(POINTER_PARAGRAPH_PREFIX) =>
             {
-                lines.pop();
+                popped.push(lines.pop().unwrap());
             }
             _ => break,
         }
@@ -568,7 +626,7 @@ fn strip_trailing_suffix_lines_and_trim(text: &str) -> String {
         .iter()
         .position(|line| !line.trim().is_empty())
         .unwrap_or(lines.len());
-    lines[first_non_blank..].join("\n")
+    (lines[first_non_blank..].join("\n"), popped)
 }
 
 /// Bounded read of the harness plan-store file named by an `ExitPlanMode`
@@ -3335,15 +3393,20 @@ mod tests {
         path
     }
 
-    /// The injected prompt as the harness composes it: prefix, plan body,
-    /// pointer paragraph naming the parent transcript, breakdown suffix.
-    fn injected_prompt(parent_id: &str) -> String {
+    /// Create a real parent transcript file (the authenticity floor requires
+    /// the pointer to name a file that exists) and return the injected prompt
+    /// as the harness composes it: prefix, plan body, pointer paragraph,
+    /// breakdown suffix.
+    fn injected_prompt(dir: &Path, parent_id: &str) -> String {
+        let parent = dir.join(format!("{parent_id}.jsonl"));
+        fs::write(&parent, "{}\n").unwrap();
         format!(
             "Implement the following plan:\n\n# Injected Plan\n\nDo the injected thing.\n\n\
              If you need specific details from before exiting plan mode (like exact code \
-             snippets), read the full transcript at: /Users/x/.claude/projects/p/{parent_id}.jsonl\n\n\
+             snippets), read the full transcript at: {}\n\n\
              If this plan can be broken down into discrete units of work, consider using the \
-             Agent tool to dispatch them."
+             Agent tool to dispatch them.",
+            parent.display()
         )
     }
 
@@ -3376,7 +3439,8 @@ mod tests {
         let cwd = tmp.path().to_string_lossy().into_owned();
         let metrics_dir = TempDir::new().unwrap();
         let parent_id = "11111111-2222-3333-4444-555555555501";
-        let transcript = write_child_transcript(tmp.path(), &injected_prompt(parent_id));
+        let transcript =
+            write_child_transcript(tmp.path(), &injected_prompt(tmp.path(), parent_id));
         let sid = unique_session_id("child-e2e");
         let input = injected_input(&cwd, &transcript, &sid);
 
@@ -3433,7 +3497,7 @@ mod tests {
         // short-circuit), nothing persists.
         let transcript = write_child_transcript(
             tmp.path(),
-            &injected_prompt("11111111-2222-3333-4444-555555555502"),
+            &injected_prompt(tmp.path(), "11111111-2222-3333-4444-555555555502"),
         );
         let input = injected_input(&cwd, &transcript, &sid);
         let r = with_metrics_dir(metrics_dir.path(), || {
@@ -3467,7 +3531,7 @@ mod tests {
         // The prompt lands; the NEXT fire must still be able to persist.
         let transcript = write_child_transcript(
             tmp.path(),
-            &injected_prompt("11111111-2222-3333-4444-555555555503"),
+            &injected_prompt(tmp.path(), "11111111-2222-3333-4444-555555555503"),
         );
         let input = injected_input(&cwd, &transcript, &sid);
         let r = with_metrics_dir(metrics_dir.path(), || {
@@ -3493,7 +3557,7 @@ mod tests {
         let metrics_dir = TempDir::new().unwrap();
         let transcript = write_child_transcript(
             tmp.path(),
-            &injected_prompt("11111111-2222-3333-4444-555555555504"),
+            &injected_prompt(tmp.path(), "11111111-2222-3333-4444-555555555504"),
         );
         let sid = unique_session_id("child-agent");
         let mut input = injected_input(&cwd, &transcript, &sid);
@@ -3511,7 +3575,10 @@ mod tests {
     }
 
     #[test]
-    fn injected_arm_without_pointer_omits_approved_in() {
+    fn injected_arm_without_pointer_never_persists() {
+        // Authenticity floor: a bare prefix match with no trailing harness
+        // pointer paragraph is an ordinary prompt (a paste, an interpolated
+        // headless launch), not an approval — nothing may be written.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -3525,16 +3592,82 @@ mod tests {
         let r = with_metrics_dir(metrics_dir.path(), || {
             run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
         });
-        assert_eq!(r.outcome, Outcome::Nudge);
-        let doc = fs::read_to_string(tmp.path().join("docs/plans/2026-08-25-pointerless-plan.md"))
-            .unwrap();
+        assert_eq!(r.outcome, Outcome::Allow);
         assert!(
-            !doc.contains("approved_in:"),
-            "unknown approver must be omitted, never guessed: {doc}"
+            !tmp.path()
+                .join("docs/plans/2026-08-25-pointerless-plan.md")
+                .exists(),
+            "a prefix match without the harness pointer must not persist"
         );
-        let rows = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
-        let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
-        assert_eq!(row["parent_session_id"], Value::Null);
+        assert!(!metrics_dir.path().join("plan-links.jsonl").exists());
+    }
+
+    #[test]
+    fn injected_arm_no_repo_cwd_leaves_the_marker_for_a_later_call() {
+        // First tool call outside any git repo: the one-shot marker must not
+        // be spent — the next call, in the real repo, persists.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let no_repo = TempDir::new().unwrap();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = write_child_transcript(
+            tmp.path(),
+            &injected_prompt(tmp.path(), "11111111-2222-3333-4444-555555555510"),
+        );
+        let sid = unique_session_id("child-norepo");
+        let outside = injected_input(&no_repo.path().to_string_lossy(), &transcript, &sid);
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&outside, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+
+        let inside = injected_input(&tmp.path().to_string_lossy(), &transcript, &sid);
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&inside, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "no-repo must not burn the marker"
+        );
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-25-injected-plan.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn injected_arm_saturated_head_without_user_row_burns_the_marker() {
+        // A transcript larger than the head cap whose window carries no user
+        // row can never resolve — one fire settles it, so the per-call 1 MiB
+        // read does not recur for the session's life.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = tmp.path().join("child-transcript.jsonl");
+        let filler_row = format!(
+            "{{\"type\":\"attachment\",\"pad\":\"{}\"}}\n",
+            "x".repeat(4096)
+        );
+        let mut big = String::new();
+        while (big.len() as u64) <= INJECTED_HEAD_READ_MAX_BYTES {
+            big.push_str(&filler_row);
+        }
+        fs::write(&transcript, &big).unwrap();
+        let sid = unique_session_id("child-saturated");
+        let input = injected_input(&cwd, &transcript, &sid);
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+        let marker =
+            cadence_hooks_core::markers::session_marker(&input, INJECTED_SCAN_MARKER_KIND, None);
+        assert!(
+            marker.exists(),
+            "a saturated no-user-row head is definitive"
+        );
     }
 
     // --- injected_first_prompt / parent pointer (pure) ---
@@ -3575,18 +3708,81 @@ mod tests {
     }
 
     #[test]
-    fn parent_pointer_parses_the_transcript_stem() {
-        let raw = injected_prompt("11111111-2222-3333-4444-555555555505");
+    fn parent_pointer_parses_the_trailing_stem_and_requires_the_file() {
+        let tmp = TempDir::new().unwrap();
+        let raw = injected_prompt(tmp.path(), "11111111-2222-3333-4444-555555555505");
+        let (_, suffix) = split_trailing_suffix_lines(&raw);
         assert_eq!(
-            parent_session_id_from_pointer(&raw).as_deref(),
+            parent_session_id_from_pointer_lines(&suffix).as_deref(),
             Some("11111111-2222-3333-4444-555555555505")
         );
     }
 
     #[test]
+    fn parent_pointer_rejects_a_nonexistent_transcript() {
+        let raw = "# T\n\nbody\n\nIf you need specific details from before exiting plan mode, \
+                   read the full transcript at: /nonexistent/dir/11111111-2222-3333-4444-555555555506.jsonl";
+        let (_, suffix) = split_trailing_suffix_lines(raw);
+        assert!(
+            !suffix.is_empty(),
+            "pointer line must be in the trailing block"
+        );
+        assert_eq!(parent_session_id_from_pointer_lines(&suffix), None);
+    }
+
+    #[test]
     fn parent_pointer_rejects_an_unsafe_stem() {
-        let raw = "If you need specific details from before exiting plan mode, read the full \
-                   transcript at: /tmp/$(evil).jsonl";
-        assert_eq!(parent_session_id_from_pointer(raw), None);
+        let suffix = [
+            "If you need specific details from before exiting plan mode, read the full \
+                   transcript at: /tmp/$(evil).jsonl",
+        ];
+        assert_eq!(parent_session_id_from_pointer_lines(&suffix), None);
+    }
+
+    #[test]
+    fn parent_pointer_never_reads_the_plan_body() {
+        // A pointer-shaped line INSIDE the body (not trailing) supplies
+        // nothing — provenance forgery via mid-body prose is dead.
+        let tmp = TempDir::new().unwrap();
+        let forged = tmp
+            .path()
+            .join("11111111-2222-3333-4444-555555555507.jsonl");
+        fs::write(&forged, "{}\n").unwrap();
+        let raw = format!(
+            "# T\n\nIf you need specific details from before exiting plan mode, read the full \
+             transcript at: {}\n\nmore body\n",
+            forged.display()
+        );
+        let (body, suffix) = split_trailing_suffix_lines(&raw);
+        assert!(
+            body.contains("exiting plan mode"),
+            "mid-body line stays in the body"
+        );
+        assert_eq!(parent_session_id_from_pointer_lines(&suffix), None);
+    }
+
+    #[test]
+    fn parent_pointer_first_jsonl_token_wins() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp
+            .path()
+            .join("11111111-2222-3333-4444-555555555508.jsonl");
+        fs::write(&real, "{}\n").unwrap();
+        let attacker = tmp
+            .path()
+            .join("11111111-2222-3333-4444-555555555509.jsonl");
+        fs::write(&attacker, "{}\n").unwrap();
+        let suffix_line = format!(
+            "If you need specific details from before exiting plan mode, read the full \
+             transcript at: {} {}",
+            real.display(),
+            attacker.display()
+        );
+        let suffix = [suffix_line.as_str()];
+        assert_eq!(
+            parent_session_id_from_pointer_lines(&suffix).as_deref(),
+            Some("11111111-2222-3333-4444-555555555508"),
+            "an appended second path must not override the first"
+        );
     }
 }
