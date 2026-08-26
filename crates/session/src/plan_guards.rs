@@ -153,18 +153,20 @@ fn judge_plan_shape(plan: &str) -> CheckResult {
     }
     if missing.contains(&plan_scan::PANEL_STANZA) {
         return CheckResult::block(format!(
-            "plan-shape gate: this plan lacks {} — the plan template's mandatory stanzas. \
+            "plan-shape gate: this plan lacks {} — mandatory stanzas of {}. \
              Add the `Panel:` line (a panel that ran: `Panel: <seats> ran — N findings, \
              M folded in, K declined`; none ran: `{PANEL_ESCAPE_TEMPLATE}`) and re-call \
              ExitPlanMode, or leave plan mode with shift-tab. The gate checks the \
              artifact's shape only; attune's panel and the operator's ask to see the \
              plan are still yours to honor.",
-            missing.join(", ")
+            missing.join(", "),
+            plan_scan::TEMPLATE_POINTER
         ));
     }
     CheckResult::nudge(format!(
-        "plan-shape gate: plan lacks {} — see the plan template.",
-        missing.join(", ")
+        "plan-shape gate: plan lacks {} — {}.",
+        missing.join(", "),
+        plan_scan::TEMPLATE_POINTER
     ))
 }
 
@@ -392,9 +394,48 @@ fn unticked_boxes(path: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cadence_hooks_core::{ToolInput, ToolResponse};
+    use cadence_hooks_core::{Outcome, ToolInput, ToolResponse};
     use std::fs;
     use tempfile::TempDir;
+
+    // --- judge_plan_shape message pins ---
+
+    #[test]
+    fn plan_shape_block_message_names_stanzas_and_template_home() {
+        let r = judge_plan_shape("# T\n\nprose only\n");
+        assert_eq!(r.outcome, Outcome::Block);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("plan-shape gate: this plan lacks "));
+        assert!(msg.contains("a settled Panel: line"));
+        assert!(
+            msg.contains("the plan template: `cadence:arrange` `references/plan-template.md`"),
+            "the block names the template's home: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_shape_nudge_message_names_stanzas_and_template_home() {
+        // Panel settled, everything else missing → nudge, never block.
+        let r = judge_plan_shape("# T\n\nPanel: none — trivial change\n\nprose\n");
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("plan-shape gate: plan lacks "));
+        assert!(msg.contains("an Alternatives-declined stanza"));
+        assert!(msg.contains("a ## Global Constraints section"));
+        assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
+        assert!(msg.contains("a ## Tasks section"));
+        assert!(msg.contains("checkbox tasks"));
+        assert!(
+            msg.contains("the plan template: `cadence:arrange` `references/plan-template.md`."),
+            "the nudge names the template's home: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_shape_template_shaped_plan_allows() {
+        let r = judge_plan_shape(plan_scan::TEMPLATE_SHAPED_PLAN);
+        assert_eq!(r.outcome, Outcome::Allow);
+    }
 
     fn init_repo(dir: &Path) {
         let git = |args: &[&str]| {

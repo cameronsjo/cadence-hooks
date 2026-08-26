@@ -61,7 +61,7 @@
 //! eat a same-session approval.
 
 use crate::identity;
-use crate::plan_scan::visible_lines;
+use crate::plan_scan::{Tier, recommended_tier};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use serde_json::Value;
 use std::fs;
@@ -1170,220 +1170,6 @@ fn render_document(f: &FrontmatterFields, body: &str) -> String {
     format!("{}\n\n{rest}\n", lines.join("\n"))
 }
 
-// ---------------------------------------------------------------------------
-// Driver tier (model-guard, cameronsjo/cadence-hooks — "stronger prose, not
-// teeth"): the hook can never know the LIVE model at pickup (probed
-// 2026-08-14: no `model` field on UserPromptSubmit, no structural `model` in
-// the transcript before the first assistant turn), but it CAN deterministically
-// parse the plan's own recorded intent — the `## Orchestrator` block's
-// `Driver:` line. Each party carries its half: this parser records the tier,
-// [`persist_and_nudge`] instructs Claude to compare it against the live
-// model, and Claude alone completes the comparison.
-// ---------------------------------------------------------------------------
-
-/// The plan's recorded Driver tier — a closed enum, deliberately. This is the
-/// injection wall: [`Tier::as_str`]'s canonical lowercase name is the ONLY
-/// text [`recommended_tier`]'s callers ever render (the plan-links row, the
-/// nudge directive) — never the matched source text, which is untrusted plan
-/// content (same discipline as the format-gate line's stanza names below).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tier {
-    Fable,
-    Opus,
-    Sonnet,
-    Haiku,
-}
-
-impl Tier {
-    /// The canonical lowercase family name — the sole text this enum ever
-    /// contributes to rendered output.
-    fn as_str(self) -> &'static str {
-        match self {
-            Tier::Fable => "fable",
-            Tier::Opus => "opus",
-            Tier::Sonnet => "sonnet",
-            Tier::Haiku => "haiku",
-        }
-    }
-}
-
-/// Every recognized family, in a fixed order used only for the earliest-match
-/// scan in [`find_drivable_token`] — priority BETWEEN anchors is decided by
-/// [`recommended_tier`], not by this array's order.
-const FAMILIES: [(&str, Tier); 4] = [
-    ("fable", Tier::Fable),
-    ("opus", Tier::Opus),
-    ("sonnet", Tier::Sonnet),
-    ("haiku", Tier::Haiku),
-];
-
-/// Drop every inline-code span (`` `...` ``) from `line`, non-nested. Used
-/// only by [`find_drivable_token`]'s unanchored substring search, so a
-/// paragraph merely discussing the syntax (`` `sonnet-drivable` ``) can never
-/// forge a real match. Pairing is positional (`split('`').step_by(2)` keeps
-/// even-indexed segments): with an EVEN backtick count each odd-indexed
-/// segment is a genuine code span, correctly dropped; with an ODD count the
-/// trailing segment — everything after the final, unpaired backtick — is
-/// also dropped as if it were code. Conservative for this module's one
-/// caller (an over-stripped candidate simply fails to match, never forges
-/// one), but not a general-purpose inline-code stripper: callers needing
-/// exact span semantics should not reuse this.
-fn strip_inline_code(line: &str) -> String {
-    line.split('`').step_by(2).collect::<Vec<_>>().join(" ")
-}
-
-/// Case-insensitive "does `s` begin with the whole family token `name`"
-/// check, returning the tier and the remainder past the token when it does.
-/// "Whole token" is the load-bearing word: the char immediately after the
-/// token must be absent, whitespace, or one of the tail-introducing marks
-/// tolerated elsewhere in this module (`*` \` `:` `,` `.` `(` and the dash
-/// family) — never an alphanumeric or `/`. This is what makes a multi-family
-/// value like `Opus/Fable` fail every family's boundary check and fall
-/// through to `None` (conservative, per the plan's pinned rule), while
-/// `sonnet — needs Opus fallback` still matches `sonnet` cleanly.
-fn match_family_prefix(s: &str) -> Option<(Tier, &str)> {
-    let lower = s.to_ascii_lowercase();
-    for (name, tier) in FAMILIES {
-        if let Some(after) = lower.strip_prefix(name) {
-            let real_after = &s[s.len() - after.len()..];
-            let boundary_ok = real_after
-                .chars()
-                .next()
-                .is_none_or(|c| !(c.is_alphanumeric() || c == '/'));
-            if boundary_ok {
-                return Some((tier, real_after));
-            }
-        }
-    }
-    None
-}
-
-/// Extract a `Tier` from a `Driver:`-style value, e.g. `**sonnet**`,
-/// `` `sonnet` ``, or `sonnet — needs Opus fallback`. Formatting (`**`,
-/// backticks) around the value is stripped before matching; anything after
-/// the whole token (an em/en-dash tail, a trailing colon or comma) is
-/// ignored by [`match_family_prefix`]'s boundary check.
-fn extract_family_value(rest: &str) -> Option<Tier> {
-    let trimmed = rest.trim().trim_matches(|c: char| c == '*' || c == '`');
-    match_family_prefix(trimmed.trim_start()).map(|(tier, _)| tier)
-}
-
-/// `path`, made relative to `repo_root` and forward-slash normalized (the
-/// core crate's own convention — see [`cadence_hooks_core::normalize_path`])
-/// — so a value written to `plan-links.jsonl`'s `plan_path` field is stable
-/// and cross-platform, regardless of the native separator
-/// `PathBuf::to_string_lossy` would otherwise render on Windows. Shared by
-/// [`persist_and_nudge`] and the dir-scan-skip repair so the two `plan_path`
-/// derivations can never drift onto different values for the same row.
-fn repo_relative(path: &Path, repo_root: &Path) -> String {
-    cadence_hooks_core::normalize_path(
-        &path
-            .strip_prefix(repo_root)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned()),
-    )
-}
-
-/// Is `line` exactly a level-2 `## Orchestrator` heading (surrounding
-/// whitespace and a trailing marker like `## Orchestrator ⏳` tolerated via
-/// [`str::trim`], but not a mere prefix)? A bare `starts_with("## Orchestrator")`
-/// would also open on `## OrchestratorNotes` or `## Orchestrator2` — this
-/// requires the heading TEXT to equal `"Orchestrator"` after the `## ` marker.
-fn is_orchestrator_heading(line: &str) -> bool {
-    line.trim_start().strip_prefix("## ").map(str::trim) == Some("Orchestrator")
-}
-
-/// The `## Orchestrator` block's lines — from just past the line-start
-/// heading through (but not including) the next line-start `## ` heading, or
-/// EOF. Headings inside fenced code or block quotes never open or close a
-/// block ([`visible_lines`]'s discipline). On more than one `## Orchestrator`
-/// heading, the FIRST wins.
-fn orchestrator_block(body: &str) -> Option<Vec<&str>> {
-    let mut lines = visible_lines(body).skip_while(|line| !is_orchestrator_heading(line));
-    lines.next()?; // the heading line itself, consumed but not part of the block
-    Some(lines.take_while(|line| !line.starts_with("## ")).collect())
-}
-
-/// Priority 1: a line-start `**Driver:**` or `Driver:` line inside the
-/// `## Orchestrator` block (`plan-template.md`'s canonical form). NOT
-/// inline-code-stripped: [`strip_inline_code`] is reserved for
-/// [`find_drivable_token`]'s unanchored substring search — applying it here
-/// would also erase a legitimately backtick-wrapped VALUE (`` **Driver:**
-/// `sonnet` ``, [`extract_family_value`]'s own documented syntax), and it is
-/// unneeded for decoy exclusion: a decoy anchor quoted in backticks (`` `**
-/// Driver:** Sonnet` `` or a mid-sentence `` `Driver: sonnet` `` mention)
-/// cannot satisfy the line-start `strip_prefix` below in the first place,
-/// since a leading backtick byte breaks the literal match.
-fn find_driver_line(block: &[&str]) -> Option<Tier> {
-    block.iter().find_map(|line| {
-        let rest = line
-            .strip_prefix("**Driver:**")
-            .or_else(|| line.strip_prefix("Driver:"))?;
-        extract_family_value(rest)
-    })
-}
-
-/// Priority 2: the prose token `<family>-drivable` (case-insensitive)
-/// anywhere in the `## Orchestrator` block, inline-code-stripped (unlike
-/// [`find_driver_line`] — this search is NOT line-start-anchored, so a
-/// backtick-quoted mention like `` `sonnet-drivable` `` needs the strip to
-/// stay excluded); the earliest match in document order wins (first matching
-/// line, leftmost token on that line). BOTH boundaries checked — left, so a
-/// compound like `non-sonnet-drivable` cannot false-match `sonnet-drivable`;
-/// right, so `opus-drivability` (a real word continuing past the token)
-/// cannot false-match `opus-drivable` — same "whole token" discipline as
-/// [`match_family_prefix`]'s boundary check. A decoy earlier on the line that
-/// fails either boundary check is not retried against a later, valid
-/// occurrence of the same family term on that line — conservative, matching
-/// this module's "ambiguous → skip" bias.
-fn find_drivable_token(block: &[&str]) -> Option<Tier> {
-    block.iter().find_map(|line| {
-        let stripped = strip_inline_code(line);
-        let lower = stripped.to_ascii_lowercase();
-        FAMILIES
-            .iter()
-            .filter_map(|(name, tier)| {
-                let needle = format!("{name}-drivable");
-                let idx = lower.find(&needle)?;
-                let left_ok = lower[..idx]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|c| !(c.is_alphanumeric() || c == '-'));
-                let right_ok = lower[idx + needle.len()..]
-                    .chars()
-                    .next()
-                    .is_none_or(|c| !c.is_alphanumeric());
-                (left_ok && right_ok).then_some((idx, *tier))
-            })
-            .min_by_key(|(idx, _)| *idx)
-            .map(|(_, tier)| tier)
-    })
-}
-
-/// Priority 3 (legacy fallback): a line-start `recommended_model:` line
-/// appearing before the first line-start `## ` heading. Scanning stops at
-/// the first such heading; nothing past it is a legacy header field. Not
-/// inline-code-stripped — same reasoning as [`find_driver_line`] (line-start
-/// anchored, so a decoy can't reach it, and stripping would eat a
-/// legitimately backtick-wrapped value).
-fn legacy_recommended_model(body: &str) -> Option<Tier> {
-    visible_lines(body)
-        .take_while(|line| !line.starts_with("## "))
-        .find_map(|line| extract_family_value(line.strip_prefix("recommended_model:")?))
-}
-
-/// Parse the plan's recommended Driver tier from its body, per the pinned
-/// priority order. `None` when nothing settles it — including a
-/// recognized-but-invalid capture — never a guess.
-fn recommended_tier(body: &str) -> Option<Tier> {
-    if let Some(block) = orchestrator_block(body)
-        && let Some(tier) = find_driver_line(&block).or_else(|| find_drivable_token(&block))
-    {
-        return Some(tier);
-    }
-    legacy_recommended_model(body)
-}
-
 /// The model-check directive, verbatim from the plan doc — the ONLY text
 /// [`Tier`] contributes to it is [`Tier::as_str`]'s canonical name. Shared by
 /// [`persist_and_nudge`] and the dir-scan-skip repair so the two nudge sites
@@ -1401,6 +1187,22 @@ fn model_check_directive(tier: Tier) -> String {
 /// The shared tail both triggers converge on once each has resolved its own
 /// body/session/approval fields: claim a target, append the linkage row,
 /// render the nudge. Never overwrites anything (see [`claim_target`]).
+/// `path`, made relative to `repo_root` and forward-slash normalized (the
+/// core crate's own convention — see [`cadence_hooks_core::normalize_path`])
+/// — so a value written to `plan-links.jsonl`'s `plan_path` field is stable
+/// and cross-platform, regardless of the native separator
+/// `PathBuf::to_string_lossy` would otherwise render on Windows. Shared by
+/// [`persist_and_nudge`] and the dir-scan-skip repair so the two `plan_path`
+/// derivations can never drift onto different values for the same row.
+fn repo_relative(path: &Path, repo_root: &Path) -> String {
+    cadence_hooks_core::normalize_path(
+        &path
+            .strip_prefix(repo_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned()),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn persist_and_nudge(
     plans_dir: &Path,
@@ -1458,8 +1260,9 @@ fn persist_and_nudge(
     if !missing_stanzas.is_empty() {
         nudge.push(' ');
         nudge.push_str(&format!(
-            "format gate: plan lacks {} — see the plan template.",
-            missing_stanzas.join(", ")
+            "format gate: plan lacks {} — {}.",
+            missing_stanzas.join(", "),
+            crate::plan_scan::TEMPLATE_POINTER
         ));
     }
     CheckResult::nudge(nudge)
@@ -2854,8 +2657,14 @@ mod tests {
         assert!(msg.contains("format gate: plan lacks "));
         assert!(msg.contains("a settled Panel: line"));
         assert!(msg.contains("an Alternatives-declined stanza"));
+        assert!(msg.contains("a ## Global Constraints section"));
+        assert!(msg.contains("an ## Orchestrator block with a Driver: line"));
+        assert!(msg.contains("a ## Tasks section"));
         assert!(msg.contains("checkbox tasks"));
-        assert!(msg.contains("see the plan template."));
+        assert!(
+            msg.contains("the plan template: `cadence:arrange` `references/plan-template.md`."),
+            "the gate names the template's home: {msg}"
+        );
         assert_eq!(
             msg.matches("format gate:").count(),
             1,
@@ -2865,9 +2674,7 @@ mod tests {
         // A template-conforming plan gets the plain persist nudge only.
         let full = exit_plan_mode_post_tool_use(
             "fmt-session-2",
-            "# Full Plan\n\nPanel: reviewer ran — 1 finding, \
-             1 folded in, 0 declined\n\n## Alternatives declined\n\n- none proposed — single \
-             obvious approach\n\n- [ ] build it\n",
+            crate::plan_scan::TEMPLATE_SHAPED_PLAN,
             &cwd,
             &tmp.path().join("fmt-session-2.jsonl").to_string_lossy(),
             Some(false),

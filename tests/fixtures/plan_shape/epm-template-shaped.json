@@ -7,7 +7,7 @@
   "tool_name": "ExitPlanMode",
   "tool_use_id": "toolu_test",
   "tool_input": {
-    "plan": "# Widget refresh\n\n## Goal\n\nFresh data on load.\n\n## Alternatives declined\n\n- none proposed — single obvious approach\n\n## Panel\n\nPanel: plan-reviewer ran — 2 findings, 2 folded in, 0 declined\n\n## Tasks\n\n- [ ] Refresh the cache on load\n- [ ] Add a unit test\n",
+    "plan": "# Widget refresh\n\n## Goal\n\nFresh data on load.\n\n## Alternatives declined\n\n- none proposed — single obvious approach\n\n## Panel\n\nPanel: plan-reviewer ran — 2 findings, 2 folded in, 0 declined\n\n## Global Constraints\n\n- no new dependencies\n\n## Orchestrator\n\n**Driver:** sonnet\n\n## Tasks\n\n- [ ] Refresh the cache on load\n- [ ] Add a unit test\n",
     "planFilePath": "/nonexistent/plans/template.md"
   }
 }

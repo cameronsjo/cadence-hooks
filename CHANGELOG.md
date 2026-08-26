@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+### Changed
+
+- **The plan-shape gates name the template's home and check three more stanzas.** `missing_stanzas` gains detectors for `## Global Constraints`, an `## Orchestrator` block with a parseable `Driver:` line (the legacy `recommended_model:` frontmatter field deliberately does NOT satisfy it — the nudge teaches the form the dispatcher greps, pipeline-doctrine deliverable 7 / cameronsjo/cadence#1070), and `## Tasks`. Every gate message — the `lint-plan-shape` block and nudge, and the persist-time format-gate sentence — now ends with a shared `TEMPLATE_POINTER` naming the template's location (`cadence:arrange` `references/plan-template.md`) instead of a bare "see the plan template". The block trigger is unchanged (Panel-only); only the nudge widens. The driver-tier parsing cluster (`Tier`, `recommended_tier`, the orchestrator-block scanners) moves from `persist_plan` into `plan_scan`, where the shape detectors live.
+
 - **`session persist-plan-approval` covers the approve-and-clear path again**
   (dead since 0.82.0, last real `plan-links.jsonl` row 2026-08-21T01:23Z). The
   harness's approve-and-clear flow never completes the `ExitPlanMode` call — it
