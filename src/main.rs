@@ -302,7 +302,8 @@ enum CadenceCommands {
         /// Record exactly the stated roster instead of merging with the prior
         /// marker — the clearing spelling. An omitted arm is then genuinely
         /// absent, so the pre-PR gate reads it as unknown rather than
-        /// inheriting a stale `ran` (cadence-hooks#775)
+        /// inheriting a stale `ran`. The marker carries `"fresh": true` so an
+        /// audit can tell a cleared roster from a legacy one (cadence-hooks#775)
         #[arg(long)]
         fresh: bool,
     },

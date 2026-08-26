@@ -50,12 +50,16 @@
 //!   absent → **nudge**, naming the expiry so it doesn't read as a false
 //!   positive on a branch that visibly was polished (cadence-hooks#775).
 //!
-//! Two **annotations** ride the otherwise-silent allow, as exit-0 context
-//! rather than an escalation (cadence-hooks#775): the marker's recorded
-//! `head_sha` differing from the branch's current HEAD (polish saw an older
-//! tree), and a degraded — non-private — marker directory, which silently
-//! disables the roster read on that machine. Both stay silent whenever they
-//! cannot compare faithfully.
+//! One **annotation** rides the otherwise-silent allow, as exit-0 context
+//! rather than an escalation (cadence-hooks#775): a degraded — non-private —
+//! marker directory, which silently disables the roster read on that machine.
+//!
+//! A `head_sha` reader was built and reviewed back out: `record-polish` runs at
+//! polish's wrap-up, *before* the operator commits, so HEAD differs from the
+//! recorded SHA on every honest polish → commit → ship path, and ancestry
+//! cannot discriminate an honest advance from stale cover. SHA binding belongs
+//! in the deferred attestation design (item 1 on cadence-hooks#775), where the
+//! record side can capture post-polish intent.
 //!
 //! This replaces the earlier session-transcript scan, which false-blocked a
 //! `/polish` slash-command (no `Skill` `tool_use` block to find, #154) and was
@@ -81,7 +85,7 @@ use cadence_hooks_core::markers::{
     POLISH_MARKER_TTL_DAYS, marker_dir, marker_dir_is_private, polish_marker_present,
     read_polish_marker,
 };
-use cadence_hooks_core::shell::{git_command, is_polish_ship_anchor, parse_work_dir};
+use cadence_hooks_core::shell::{is_polish_ship_anchor, parse_work_dir};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// What the branch-scoped polish marker says, as far as the gate can read it
@@ -148,19 +152,6 @@ impl Check for NudgePolishBeforePr {
             if !marker_dir_is_private() {
                 annotations.push(degraded_dir_annotation(&marker_dir().display().to_string()));
             }
-            // #775 item 2: `head_sha` had no reader, so a marker recorded on a
-            // 3-line diff covered a later 3,000-line push to the same branch.
-            // HEAD is resolved the way the record side resolves it at write
-            // time (`git rev-parse HEAD` in the command's work dir).
-            let current_head = cwd
-                .map(|cwd| parse_work_dir(command, cwd))
-                .and_then(|dir| git_command(&dir, &["rev-parse", "HEAD"]));
-            if let Some(annotation) = stale_head_annotation(
-                record.as_ref().and_then(|r| r.head_sha.as_deref()),
-                current_head.as_deref(),
-            ) {
-                annotations.push(annotation);
-            }
         }
         // The diff subprocess is ordered LAST and runs only when the roster
         // affirmatively says security was skipped — the common full-polish
@@ -216,26 +207,6 @@ fn decide(
         MarkerState::Present { .. } if annotations.is_empty() => CheckResult::allow(),
         MarkerState::Present { .. } => CheckResult::nudge(annotations.join(" ")),
     }
-}
-
-/// The #775-item-2 annotation: the marker was recorded against a different
-/// `HEAD` than the branch carries now, so the polish pass saw an older tree.
-///
-/// Silent (`None`) in every uncertain direction — a legacy marker with no
-/// `head_sha`, an empty one (a repo with no commits at record time), or an
-/// unresolvable current `HEAD`. This is annotation, not a gate: it never turns
-/// an allow into a block, and never fires on a marker it cannot compare.
-fn stale_head_annotation(recorded: Option<&str>, current: Option<&str>) -> Option<String> {
-    let recorded = recorded.filter(|sha| !sha.is_empty())?;
-    let current = current.filter(|sha| !sha.is_empty())?;
-    if recorded == current {
-        return None;
-    }
-    Some(format!(
-        "Note: the polish marker for this branch was recorded at {recorded}, but HEAD is now \
-         {current} — the marker predates the current head, so polish saw an older tree. \
-         Advisory only; re-run `/polish` if the commits since then are substantive."
-    ))
 }
 
 /// The #775-item-7 annotation: the marker directory failed its `0700`
@@ -768,33 +739,7 @@ mod tests {
         });
     }
 
-    // --- #775 item 2: the gate reads head_sha ---
-
-    #[test]
-    fn stale_head_annotation_fires_only_on_a_resolvable_mismatch() {
-        // #775 RED: `head_sha` was written and never read, so a marker
-        // recorded on a 3-line diff covered a later 3,000-line push.
-        let annotation = stale_head_annotation(Some("aaa111"), Some("bbb222"))
-            .expect("a mismatch must annotate");
-        assert!(
-            annotation.contains("older tree"),
-            "the annotation must say what it means: {annotation}"
-        );
-        // Positive control + every fail-open direction (silent pass-through).
-        assert!(stale_head_annotation(Some("aaa111"), Some("aaa111")).is_none());
-        assert!(
-            stale_head_annotation(None, Some("bbb222")).is_none(),
-            "legacy marker"
-        );
-        assert!(
-            stale_head_annotation(Some("aaa111"), None).is_none(),
-            "unresolvable HEAD"
-        );
-        assert!(
-            stale_head_annotation(Some(""), Some("bbb222")).is_none(),
-            "no HEAD at record time"
-        );
-    }
+    // --- #775 item 7: annotations ride the allow path ---
 
     #[test]
     fn decide_annotations_ride_the_allow_path_without_escalating() {
@@ -804,11 +749,11 @@ mod tests {
             "gh pr create --title x",
             PRESENT_UNKNOWN,
             false,
-            &["the marker predates the current head".to_string()],
+            &["the marker directory is not the hardened per-user one".to_string()],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
-        assert!(msg.contains("predates the current head"));
+        assert!(msg.contains("not the hardened per-user one"));
         assert!(
             !msg.contains("No polish recorded"),
             "an annotation must not present as the no-polish nudge: {msg}"
@@ -817,54 +762,6 @@ mod tests {
         let silent = decide("gh pr create --title x", PRESENT_UNKNOWN, false, &[]);
         assert_eq!(silent.outcome, Outcome::Allow);
         assert!(silent.message.is_none());
-    }
-
-    #[test]
-    fn run_marker_recorded_on_an_older_head_annotates() {
-        let (tmp, root) = init_repo_with_origin_and_files("feat/stale-head", &["src/lib.rs"]);
-        let marker_tmp = tempfile::tempdir().unwrap();
-        with_marker_dir(marker_tmp.path(), || {
-            write_marker(
-                &polish_marker(&root, "feat/stale-head"),
-                r#"{"scope":"full","head_sha":"0000000000000000000000000000000000000000"}"#,
-            )
-            .unwrap();
-
-            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
-            let result = NudgePolishBeforePr.run(&input);
-            assert_eq!(result.outcome, Outcome::Nudge);
-            assert!(
-                result.message.unwrap_or_default().contains("older tree"),
-                "a marker predating HEAD must annotate the allow"
-            );
-        });
-    }
-
-    #[test]
-    fn run_marker_recorded_on_the_current_head_stays_silent() {
-        // Positive control for the annotation above: matching SHAs → the
-        // silent allow, exactly as before #775.
-        let (tmp, root) = init_repo_with_origin_and_files("feat/current-head", &["src/lib.rs"]);
-        let head = Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        let marker_tmp = tempfile::tempdir().unwrap();
-        with_marker_dir(marker_tmp.path(), || {
-            write_marker(
-                &polish_marker(&root, "feat/current-head"),
-                &format!(r#"{{"scope":"full","head_sha":"{head}"}}"#),
-            )
-            .unwrap();
-
-            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
-            let result = NudgePolishBeforePr.run(&input);
-            assert_eq!(result.outcome, Outcome::Allow);
-            assert!(result.message.is_none());
-        });
     }
 
     // --- #775 item 5: marker TTL ---

@@ -187,7 +187,19 @@ fn merge_arms(
 /// The `arms` roster (cadence-hooks#467) is **additive and optional**: absent
 /// on a roster-less record, so legacy readers and legacy markers both keep
 /// working — an absent roster reads as *unknown*, never as *skipped*.
-fn marker_content(branch: &str, head_sha: &str, scope: &str, arms: &[(String, String)]) -> String {
+///
+/// `fresh` leaves a breadcrumb: `"fresh": true` when the record cleared a prior
+/// roster, absent otherwise (cadence-hooks#775 review). Without it, a `--fresh`
+/// record that erased a `security=skipped` is byte-indistinguishable from a
+/// legacy roster-less marker, so an audit cannot tell a *cleared* roster from
+/// one that never existed. No reader gates on it — it is provenance only.
+fn marker_content(
+    branch: &str,
+    head_sha: &str,
+    scope: &str,
+    arms: &[(String, String)],
+    fresh: bool,
+) -> String {
     let mut v = json!({
         "branch": branch,
         "head_sha": head_sha,
@@ -200,6 +212,9 @@ fn marker_content(branch: &str, head_sha: &str, scope: &str, arms: &[(String, St
             .map(|(name, state)| (name.clone(), json!(state)))
             .collect();
         v["arms"] = serde_json::Value::Object(roster);
+    }
+    if fresh {
+        v["fresh"] = json!(true);
     }
     v.to_string()
 }
@@ -279,7 +294,7 @@ pub fn run_record(
         incoming_arms,
         fresh,
     );
-    let content = marker_content(&branch, &head_sha, &scope, &arms);
+    let content = marker_content(&branch, &head_sha, &scope, &arms, fresh);
     let path = polish_marker(&repo_root, &branch);
     match write_marker(&path, &content) {
         Ok(()) => println!(
@@ -301,7 +316,7 @@ mod tests {
 
     #[test]
     fn marker_content_is_parseable_json_with_all_fields() {
-        let content = marker_content("feat/x", "abc123", "full", &[]);
+        let content = marker_content("feat/x", "abc123", "full", &[], false);
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(v["branch"], "feat/x");
         assert_eq!(v["head_sha"], "abc123");
@@ -321,7 +336,7 @@ mod tests {
             ("security".to_string(), "ran".to_string()),
             ("tests".to_string(), "skipped".to_string()),
         ];
-        let content = marker_content("feat/x", "abc123", "code", &arms);
+        let content = marker_content("feat/x", "abc123", "code", &arms, false);
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(v["arms"]["security"], "ran");
         assert_eq!(v["arms"]["tests"], "skipped");
@@ -498,6 +513,54 @@ mod tests {
             assert!(
                 v["arms"].get("security").is_none(),
                 "--fresh must record exactly the stated roster: {content}"
+            );
+        });
+    }
+
+    #[test]
+    fn fresh_record_carries_a_breadcrumb_and_the_default_does_not() {
+        // #775 review: a `--fresh` record that erased a prior
+        // `security=skipped` is otherwise byte-indistinguishable from a legacy
+        // roster-less marker, so an audit cannot tell a CLEARED roster from one
+        // that never existed. Provenance only — no reader gates on it.
+        let fresh: serde_json::Value =
+            serde_json::from_str(&marker_content("feat/x", "abc123", "full", &[], true)).unwrap();
+        assert_eq!(fresh["fresh"], true);
+
+        let default: serde_json::Value =
+            serde_json::from_str(&marker_content("feat/x", "abc123", "full", &[], false)).unwrap();
+        assert!(
+            default.get("fresh").is_none(),
+            "the additive default must carry no breadcrumb: {default}"
+        );
+    }
+
+    #[test]
+    fn run_record_fresh_breadcrumb_round_trips_and_the_gate_ignores_it() {
+        // The breadcrumb rides the written marker, and adding it changes no
+        // gate behavior: the record still reads back with its roster intact.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-breadcrumb-repo";
+            let branch = "feat/record-polish-breadcrumb";
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into()],
+                true,
+            );
+
+            let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["fresh"], true);
+
+            let record = read_polish_record(repo, branch).expect("marker reads");
+            assert_eq!(
+                record.security_ran(),
+                Some(true),
+                "the breadcrumb must not disturb the roster the gate reads"
             );
         });
     }
@@ -794,7 +857,7 @@ mod tests {
             let (repo_root, branch, head_sha) =
                 resolve(&wt_str, None, None).expect("worktree resolves repo/branch");
             assert_eq!(branch, "feat/thing");
-            let content = marker_content(&branch, &head_sha, "full", &[]);
+            let content = marker_content(&branch, &head_sha, "full", &[], false);
             write_marker(&polish_marker(&repo_root, &branch), &content).unwrap();
 
             // Free the branch from the worktree and check it out on the primary —
@@ -890,7 +953,7 @@ mod tests {
                     .expect("resolves");
             write_marker(
                 &polish_marker(&repo_root, &branch),
-                &marker_content(&branch, &head_sha, "code", &[]),
+                &marker_content(&branch, &head_sha, "code", &[], false),
             )
             .unwrap();
 

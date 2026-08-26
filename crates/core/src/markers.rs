@@ -234,10 +234,6 @@ pub struct PolishRecord {
     /// The per-arm outcome roster (`"security" -> "ran" | "skipped"`), absent
     /// on markers recorded before the roster existed.
     pub arms: Option<std::collections::BTreeMap<String, String>>,
-    /// The `HEAD` the polish pass saw, as the record side resolved it
-    /// (`git rev-parse HEAD`). Empty on a repo with no commits yet, absent on
-    /// a marker recorded before the field existed.
-    pub head_sha: Option<String>,
     /// When the marker was written — [`crate::time::utc_timestamp`]'s ISO-8601
     /// UTC instant. Absent on legacy markers and on the `"{}"` fixtures.
     pub recorded_at: Option<String>,
@@ -344,10 +340,6 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
                 .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         }),
-        head_sha: v
-            .get("head_sha")
-            .and_then(|s| s.as_str())
-            .map(str::to_string),
         recorded_at: v
             .get("recorded_at")
             .and_then(|s| s.as_str())
@@ -1178,21 +1170,20 @@ mod tests {
     }
 
     #[test]
-    fn read_polish_record_parses_head_sha_and_recorded_at() {
-        // #775 items 2 + 5: both fields are written by `record-polish` and had
-        // no reader; the gate needs them off the parsed record.
+    fn read_polish_record_parses_recorded_at() {
+        // #775 item 5: `recorded_at` is written by `record-polish` and had no
+        // reader; the TTL check needs it off the parsed record.
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
             let repo = "/tmp/keyed-polish-provenance";
             let branch = "feat/keyed-provenance";
             write_marker(
                 &polish_marker(repo, branch),
-                r#"{"scope":"full","head_sha":"abc123","recorded_at":"2026-08-26T12:00:00Z"}"#,
+                r#"{"scope":"full","recorded_at":"2026-08-26T12:00:00Z"}"#,
             )
             .unwrap();
 
             let rec = read_polish_record(repo, branch).expect("marker reads");
-            assert_eq!(rec.head_sha.as_deref(), Some("abc123"));
             assert_eq!(rec.recorded_at.as_deref(), Some("2026-08-26T12:00:00Z"));
         });
     }
