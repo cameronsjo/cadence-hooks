@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`session persist-plan-approval` covers the approve-and-clear path again**
+  (dead since 0.82.0, last real `plan-links.jsonl` row 2026-08-21T01:23Z). The
+  harness's approve-and-clear flow never completes the `ExitPlanMode` call — it
+  denies the tool and launches a fresh session whose first user message is
+  `Implement the following plan:` plus the plan (verified against the 2.1.243
+  bundle) — so `PostToolUse:ExitPlanMode` cannot see it, and 0.82.0's removal
+  of the UserPromptSubmit rescan arm removed the only coverage. A new
+  injected-prompt arm now runs behind the same subcommand on any other
+  PostToolUse tool: once per session (session marker) it reads the transcript
+  HEAD, and when the first main-chain user message is the injected
+  implement-prompt it persists that plan, attributing `approved_in` to the
+  parent session parsed from the prompt's transcript-pointer paragraph.
+  Unlike the removed arm it fires while the text is still byte-identical to
+  the approval and never re-recognizes a living document. Requires the
+  cadence plugin's PostToolUse matcher widened from `ExitPlanMode` to `*`
+  (wiring PR in the cadence monorepo).
+
+  Hardened per the polish security review: a bare prefix match is NOT an
+  approval — the persist requires the harness's trailing transcript-pointer
+  paragraph, parsed exclusively from the stripped suffix lines (a
+  pointer-shaped line inside the plan body supplies nothing), taking the
+  FIRST `.jsonl` token and requiring the named transcript to exist with a
+  well-formed session-id stem, so approval provenance cannot be forged from
+  plan prose and an interpolated headless prompt persists nothing. The
+  per-call retry is bounded (a saturated 1 MiB head with no user row burns
+  the once-per-session marker), a no-repo `cwd` no longer spends the one
+  shot, and `read_head_bounded` decides truncation on the buffer, never
+  `st_size`.
+
 ### Removed
 
 - **Codex harness detection and its fail-closed arms.** `is_codex_harness`,
