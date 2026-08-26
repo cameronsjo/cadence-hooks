@@ -193,18 +193,35 @@ impl Check for NudgePolishBeforePr {
                 annotations.push(degraded_dir_annotation(&marker_dir().display().to_string()));
             }
         }
-        // The diff subprocess is ordered LAST and runs only when the roster
-        // affirmatively says security was skipped — the common full-polish
-        // path (and every absent/unknown case) never pays for it. A timed-out
-        // or unspawnable git yields no evidence (`None`), which reads as
-        // "does not touch code" → allow (ADR-0001).
-        let touches_code = consumes_branch_diff(&marker)
-            && cwd.is_some_and(|cwd| {
+        // The diff subprocess is handed to `decide` as a LAZY predicate, so it
+        // runs only when a guard actually consults it — the common full-polish
+        // path and every absent/unknown/silent case never pay for it, and no
+        // separate precedence table can drift from `decide`'s guards
+        // (cadence-hooks#775 I2). A timed-out or unspawnable git yields no
+        // evidence (`None`), which reads as "does not touch code" → allow
+        // (ADR-0001).
+        let touches_code = || {
+            cwd.is_some_and(|cwd| {
                 let dir = parse_work_dir(command, cwd);
                 changed_files(&dir).is_some_and(|files| branch_touches_code(&files))
-            });
+            })
+        };
         decide(command, marker, touches_code, &annotations)
     }
+}
+
+/// True when `family` satisfies the security arm's independent-review
+/// requirement (Usage Principle U9). Tolerant on purpose (cadence-hooks#775
+/// I3): the record side does NOT validate the family, so `--arm-model
+/// security=Opus`, `security=opus-5`, and `security=claude-opus-4` are all
+/// legal U9-compliant records — an exact case-sensitive `== "opus"` would draw
+/// the wrong-family nudge on every one of them. Match the `opus`
+/// ([`SATISFYING_SECURITY_FAMILY`]) substring case-insensitively, in the
+/// directions the record side leaves open.
+fn satisfies_security_requirement(family: &str) -> bool {
+    family
+        .to_ascii_lowercase()
+        .contains(SATISFYING_SECURITY_FAMILY)
 }
 
 /// The attested model family for the **security** arm, or `None` when the
@@ -215,31 +232,6 @@ impl Check for NudgePolishBeforePr {
 /// an affirmative family that fails the requirement.
 fn attested_security_family(record: &cadence_hooks_core::markers::PolishRecord) -> Option<String> {
     record.attest.as_ref()?.get("security")?.model.clone()
-}
-
-/// Does this marker state consume the branch diff?
-///
-/// The diff subprocess is the only expensive thing this check does, so it runs
-/// only for the states whose verdict actually turns on it — the common
-/// full-polish path and every absent/unknown case never pay for it.
-fn consumes_branch_diff(marker: &MarkerState) -> bool {
-    match marker {
-        MarkerState::Present {
-            security_ran: Some(false),
-            ..
-        } => true,
-        MarkerState::Present {
-            security_ran: Some(true),
-            security_model: Some(family),
-            ..
-        } => family != SATISFYING_SECURITY_FAMILY,
-        MarkerState::Present {
-            security_ran: None,
-            roster_read: true,
-            ..
-        } => true,
-        _ => false,
-    }
 }
 
 /// The pure conditional — no I/O, so the gate logic is unit-tested without the
@@ -267,10 +259,18 @@ fn consumes_branch_diff(marker: &MarkerState) -> bool {
 /// security-skipped → wrong-family → unknown-roster → allow (+annotations).
 /// Each verdict names a strictly more specific gap than the one after it, so a
 /// marker that qualifies for two reports the sharper one.
+///
+/// `branch_touches_code` is a **lazy** predicate (cadence-hooks#775 I2): the
+/// branch-diff subprocess is the only expensive thing this check does, so it
+/// is paid exactly when a guard needs it — the common full-polish path and
+/// every absent/unknown/silent case never call it. Making it lazy here is what
+/// lets `run()` drop the separate `consumes_branch_diff` precedence table,
+/// which restated these guards and silently drifted whenever a verdict was
+/// added to one and not the other.
 fn decide(
     command: &str,
     marker: MarkerState,
-    branch_touches_code: bool,
+    branch_touches_code: impl Fn() -> bool,
     annotations: &[String],
 ) -> CheckResult {
     if !is_polish_ship_anchor(command) {
@@ -282,7 +282,7 @@ fn decide(
         MarkerState::Present {
             security_ran: Some(false),
             ..
-        } if branch_touches_code => CheckResult::nudge(security_nudge_message()),
+        } if branch_touches_code() => CheckResult::nudge(security_nudge_message()),
         // The security arm ran, and the marker names the family that ran it —
         // and it is not one that satisfies the independent-review requirement
         // (#775 item 1). An UNattested `ran` falls through to the allow below:
@@ -292,7 +292,7 @@ fn decide(
             security_ran: Some(true),
             security_model: Some(family),
             ..
-        } if family != SATISFYING_SECURITY_FAMILY && branch_touches_code => {
+        } if !satisfies_security_requirement(&family) && branch_touches_code() => {
             CheckResult::nudge(wrong_family_nudge_message(&family))
         }
         // The marker's content WAS read and names no roster at all (#775 item
@@ -302,7 +302,7 @@ fn decide(
             security_ran: None,
             roster_read: true,
             ..
-        } if branch_touches_code => CheckResult::nudge(unknown_roster_nudge_message()),
+        } if branch_touches_code() => CheckResult::nudge(unknown_roster_nudge_message()),
         // Polish recorded a marker for this branch, and nothing affirmatively
         // says the security arm was skipped on a code branch — allow, silent
         // unless an advisory annotation has something to add.
@@ -477,7 +477,7 @@ mod tests {
         let result = decide(
             "gh pr create --title x",
             PRESENT_SECURITY_SKIPPED,
-            true,
+            || true,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
@@ -503,7 +503,7 @@ mod tests {
         let result = decide(
             "gh pr create --title x",
             PRESENT_SECURITY_SKIPPED,
-            false,
+            || false,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Allow);
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn decide_security_ran_allows_regardless_of_code() {
         assert_eq!(
-            decide("gh pr create --title x", PRESENT_SECURITY_RAN, true, &[]).outcome,
+            decide("gh pr create --title x", PRESENT_SECURITY_RAN, || true, &[]).outcome,
             Outcome::Allow
         );
     }
@@ -526,7 +526,7 @@ mod tests {
         // what `PRESENT_UNKNOWN` now carries (`roster_read: false`). A roster
         // that was read and is simply absent draws the unknown-roster nudge —
         // `decide_read_roster_less_marker_nudges_to_record_the_roster`.
-        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, true, &[]);
+        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, || true, &[]);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
     }
@@ -536,7 +536,7 @@ mod tests {
         // A branch-scoped marker present → silent allow. #154 regression: this
         // holds with NO transcript involvement — a slash-command polish that
         // recorded a marker is honored.
-        let result = decide("gh pr create --title test", PRESENT_UNKNOWN, false, &[]);
+        let result = decide("gh pr create --title test", PRESENT_UNKNOWN, || false, &[]);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(
             result.message.is_none(),
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn decide_pr_create_without_marker_nudges() {
         // #146 RED (pure): no marker → nudge, never block. CP1 is fail-open.
-        let result = decide("gh pr create --title x", MarkerState::Absent, false, &[]);
+        let result = decide("gh pr create --title x", MarkerState::Absent, || false, &[]);
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("/polish"));
@@ -559,37 +559,37 @@ mod tests {
         // The matcher only scopes the process spawn; decide() still guards
         // against a non-anchor gh command slipping through.
         assert_eq!(
-            decide("gh pr list", MarkerState::Absent, false, &[]).outcome,
+            decide("gh pr list", MarkerState::Absent, || false, &[]).outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("git commit -m x", PRESENT_UNKNOWN, false, &[]).outcome,
+            decide("git commit -m x", PRESENT_UNKNOWN, || false, &[]).outcome,
             Outcome::Allow
         );
         // A merge that NAMES a PR is excluded — it is the orchestrator shape,
         // run from another cwd, where the branch would mis-resolve (#325). A
         // bare merge is a ship anchor and nudges; pinned just below.
         assert_eq!(
-            decide("gh pr merge 12", MarkerState::Absent, false, &[]).outcome,
+            decide("gh pr merge 12", MarkerState::Absent, || false, &[]).outcome,
             Outcome::Allow
         );
         assert_eq!(
             decide(
                 "gh --repo owner/r pr merge",
                 MarkerState::Absent,
-                false,
+                || false,
                 &[]
             )
             .outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("gh pr merge --squash", MarkerState::Absent, false, &[]).outcome,
+            decide("gh pr merge --squash", MarkerState::Absent, || false, &[]).outcome,
             Outcome::Nudge
         );
         // ...and stays silent once the branch carries a marker.
         assert_eq!(
-            decide("gh pr merge --squash", PRESENT_UNKNOWN, false, &[]).outcome,
+            decide("gh pr merge --squash", PRESENT_UNKNOWN, || false, &[]).outcome,
             Outcome::Allow
         );
     }
@@ -599,11 +599,17 @@ mod tests {
         // A `--draft` create is not the ship moment (#297) — an entry-posture
         // draft opens at zero diff, so it must allow even with no marker.
         assert_eq!(
-            decide("gh pr create --draft", MarkerState::Absent, false, &[]).outcome,
+            decide("gh pr create --draft", MarkerState::Absent, || false, &[]).outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("gh pr create -d --title x", MarkerState::Absent, false, &[]).outcome,
+            decide(
+                "gh pr create -d --title x",
+                MarkerState::Absent,
+                || false,
+                &[]
+            )
+            .outcome,
             Outcome::Allow
         );
     }
@@ -612,10 +618,10 @@ mod tests {
     fn decide_pr_ready_routes_like_create() {
         // `gh pr ready` (leaves draft) is the ship anchor: no marker → nudge,
         // marker present → silent allow.
-        let nudge = decide("gh pr ready 12", MarkerState::Absent, false, &[]);
+        let nudge = decide("gh pr ready 12", MarkerState::Absent, || false, &[]);
         assert_eq!(nudge.outcome, Outcome::Nudge);
         nudge_msg_has_loophole_clauses(&nudge.message.unwrap_or_default());
-        let allow = decide("gh pr ready 12", PRESENT_UNKNOWN, false, &[]);
+        let allow = decide("gh pr ready 12", PRESENT_UNKNOWN, || false, &[]);
         assert_eq!(allow.outcome, Outcome::Allow);
         assert!(allow.message.is_none());
     }
@@ -925,7 +931,7 @@ mod tests {
         let result = decide(
             "gh pr create --title x",
             PRESENT_ROSTER_READ_UNKNOWN,
-            true,
+            || true,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
@@ -945,7 +951,7 @@ mod tests {
         // The discrimination itself: a marker whose content could NOT be read
         // (degraded dir, garbled JSON, unreadable file) stays on the
         // presence-alone path — there is no roster question to ask.
-        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, true, &[]);
+        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, || true, &[]);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
     }
@@ -955,7 +961,7 @@ mod tests {
         let result = decide(
             "gh pr create --title x",
             PRESENT_ROSTER_READ_UNKNOWN,
-            false,
+            || false,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Allow);
@@ -1001,7 +1007,7 @@ mod tests {
         let result = decide(
             "gh pr create --title x",
             present_security_ran_by("sonnet"),
-            true,
+            || true,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
@@ -1025,11 +1031,52 @@ mod tests {
         let result = decide(
             "gh pr create --title x",
             present_security_ran_by("opus"),
-            true,
+            || true,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn decide_opus_family_match_is_case_and_variant_tolerant() {
+        // #775 I3 RED: the record side does NOT validate the family, so
+        // `--arm-model security=Opus`, `security=opus-5`, and
+        // `security=claude-opus-4` are all legal U9-compliant records — an
+        // exact case-sensitive `== "opus"` false-fired the wrong-family nudge
+        // on every one. Each must stay silent; a genuinely non-Opus family
+        // still nudges.
+        for family in ["Opus", "opus-5", "claude-opus-4"] {
+            let result = decide(
+                "gh pr create --title x",
+                present_security_ran_by(family),
+                || true,
+                &[],
+            );
+            assert_eq!(
+                result.outcome,
+                Outcome::Allow,
+                "an Opus-family variant must satisfy the requirement: {family}"
+            );
+            assert!(result.message.is_none(), "{family}");
+        }
+        for family in ["sonnet", "haiku"] {
+            let result = decide(
+                "gh pr create --title x",
+                present_security_ran_by(family),
+                || true,
+                &[],
+            );
+            assert_eq!(
+                result.outcome,
+                Outcome::Nudge,
+                "a non-Opus family must still nudge: {family}"
+            );
+            assert!(
+                result.message.unwrap_or_default().contains(family),
+                "{family}"
+            );
+        }
     }
 
     #[test]
@@ -1039,7 +1086,7 @@ mod tests {
         // the estate is unattested, so nudging them all would be a rollout
         // nag, not a finding. Escalating unattested `ran` is a dated follow-up
         // issue, deliberately not this change.
-        let result = decide("gh pr create --title x", PRESENT_SECURITY_RAN, true, &[]);
+        let result = decide("gh pr create --title x", PRESENT_SECURITY_RAN, || true, &[]);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
     }
@@ -1051,7 +1098,7 @@ mod tests {
         let result = decide(
             "gh pr create --title x",
             present_security_ran_by("sonnet"),
-            false,
+            || false,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Allow);
@@ -1198,7 +1245,7 @@ mod tests {
         let result = decide(
             "gh pr create --title x",
             PRESENT_UNKNOWN,
-            false,
+            || false,
             &["the marker directory is not the hardened per-user one".to_string()],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
@@ -1209,7 +1256,7 @@ mod tests {
             "an annotation must not present as the no-polish nudge: {msg}"
         );
         // Positive control: no annotations → the silent allow, unchanged.
-        let silent = decide("gh pr create --title x", PRESENT_UNKNOWN, false, &[]);
+        let silent = decide("gh pr create --title x", PRESENT_UNKNOWN, || false, &[]);
         assert_eq!(silent.outcome, Outcome::Allow);
         assert!(silent.message.is_none());
     }
@@ -1218,7 +1265,12 @@ mod tests {
 
     #[test]
     fn decide_expired_marker_nudges_and_names_the_ttl() {
-        let result = decide("gh pr create --title x", MarkerState::Expired, false, &[]);
+        let result = decide(
+            "gh pr create --title x",
+            MarkerState::Expired,
+            || false,
+            &[],
+        );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
         assert!(

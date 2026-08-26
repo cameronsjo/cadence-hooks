@@ -26,7 +26,7 @@
 use cadence_hooks_core::branch_diff::{WorkingTreeDigest, working_tree_digest};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::markers::{
-    ArmAttestation, MAX_TOKEN_BYTES, is_arm_token, is_report_path, polish_marker,
+    ArmAttestation, MAX_REPORT_BYTES, MAX_TOKEN_BYTES, is_arm_token, is_report_path, polish_marker,
     read_polish_record, write_marker,
 };
 use cadence_hooks_core::shell::git_command;
@@ -124,18 +124,40 @@ fn resolve(
 /// the verdict line and the marker JSON both carry these strings, so ANSI or
 /// control bytes never survive to either surface.
 fn parse_arms(raw: &[String]) -> Vec<(String, String)> {
-    parse_keyed(raw, "--arm", is_arm_token, "state")
+    parse_keyed(raw, "--arm", is_arm_token)
+}
+
+/// The value-constraint clause a malformed-`{flag}` diagnostic names — **per
+/// flag** (cadence-hooks#775 I4): `--arm-report`'s value rule (printable ASCII,
+/// ≤[`MAX_REPORT_BYTES`] bytes) differs from the arm/arm-model rule
+/// ([A-Za-z0-9_-], ≤[`MAX_TOKEN_BYTES`] bytes), and the earlier single shared
+/// message told an operator whose 600-byte or non-ASCII path dropped that the
+/// limit was 64 bytes. Each clause restores the worked example the
+/// generalization had dropped.
+fn keyed_value_constraint(flag: &str) -> String {
+    match flag {
+        "--arm-report" => format!(
+            "name=path, name in [A-Za-z0-9_-] and at most {MAX_TOKEN_BYTES} bytes, \
+             path printable ASCII and at most {MAX_REPORT_BYTES} bytes, \
+             e.g. security=/tmp/review.md"
+        ),
+        "--arm-model" => format!(
+            "name=family, both in [A-Za-z0-9_-] and at most {MAX_TOKEN_BYTES} bytes, \
+             e.g. security=opus"
+        ),
+        _ => format!(
+            "name=state, both in [A-Za-z0-9_-] and at most {MAX_TOKEN_BYTES} bytes, \
+             e.g. security=ran"
+        ),
+    }
 }
 
 /// Parse repeatable `name=value` flags, dropping (and naming, on stderr,
 /// Debug-escaped) anything whose name is not an arm token or whose value fails
-/// `value_ok` — fail-open, the rest of the record still lands (ADR-0001).
-fn parse_keyed(
-    raw: &[String],
-    flag: &str,
-    value_ok: fn(&str) -> bool,
-    value_label: &str,
-) -> Vec<(String, String)> {
+/// `value_ok` — fail-open, the rest of the record still lands (ADR-0001). The
+/// diagnostic names the *flag's own* value constraint via
+/// [`keyed_value_constraint`].
+fn parse_keyed(raw: &[String], flag: &str, value_ok: fn(&str) -> bool) -> Vec<(String, String)> {
     raw.iter()
         .filter_map(|entry| match entry.split_once('=') {
             Some((name, value)) if is_arm_token(name.trim()) && value_ok(value.trim()) => {
@@ -143,9 +165,8 @@ fn parse_keyed(
             }
             _ => {
                 eprintln!(
-                    "cadence-hooks record-polish: ignoring malformed {flag} {entry:?} \
-                     (expected name={value_label}, name in [A-Za-z0-9_-] \
-                     and at most {MAX_TOKEN_BYTES} bytes)"
+                    "cadence-hooks record-polish: ignoring malformed {flag} {entry:?} (expected {})",
+                    keyed_value_constraint(flag)
                 );
                 None
             }
@@ -159,7 +180,7 @@ fn parse_keyed(
 /// is to record what actually ran. Only the *gate's* satisfying set is closed
 /// (`opus`), and that lives on the read side.
 fn parse_arm_model(raw: &[String]) -> Vec<(String, String)> {
-    parse_keyed(raw, "--arm-model", is_arm_token, "family")
+    parse_keyed(raw, "--arm-model", is_arm_token)
 }
 
 /// Parse repeatable `--arm-report name=path` values (cadence-hooks#775).
@@ -170,7 +191,7 @@ fn parse_arm_model(raw: &[String]) -> Vec<(String, String)> {
 /// stderr note for an absent path — a filesystem-existence oracle in the agent
 /// transcript, load-bearing for nothing, removed in the #775 security review.
 fn parse_arm_report(raw: &[String]) -> Vec<(String, String)> {
-    parse_keyed(raw, "--arm-report", is_report_path, "path")
+    parse_keyed(raw, "--arm-report", is_report_path)
 }
 
 /// Merge the prior attestation map with this invocation's, under the binding
@@ -201,7 +222,11 @@ fn merge_attest(
         merged.remove(name);
     }
     let stated = |name: &str| incoming_arms.iter().any(|(arm, _)| arm == name);
-    for (flag, pairs) in [("--arm-model", models), ("--arm-report", reports)] {
+    // A typed setter per flag rather than an `if flag == "--arm-model"` string
+    // compare (cadence-hooks#775 N5): a mistyped flag can no longer silently
+    // route every model into `report`.
+    type Setter = fn(&mut ArmAttestation, String);
+    let mut apply = |flag: &str, pairs: Vec<(String, String)>, set: Setter| {
         for (name, value) in pairs {
             if !stated(&name) {
                 eprintln!(
@@ -211,14 +236,20 @@ fn merge_attest(
                 );
                 continue;
             }
-            let entry = merged.entry(name).or_default();
-            if flag == "--arm-model" {
-                entry.model = Some(value);
-            } else {
-                entry.report = Some(value);
-            }
+            set(merged.entry(name).or_default(), value);
         }
-    }
+    };
+    apply("--arm-model", models, |entry, value| {
+        entry.model = Some(value)
+    });
+    apply("--arm-report", reports, |entry, value| {
+        entry.report = Some(value)
+    });
+    // Prune all-`None` entries (cadence-hooks#775 N4): `read_attest` keeps an
+    // entry whose model/report both failed validation, and carrying it forward
+    // would serialize `"attest":{"security":{}}`, which reads to an auditor as
+    // "an attestation was attempted". An empty entry is no attestation.
+    merged.retain(|_, a| a.model.is_some() || a.report.is_some());
     merged
 }
 
@@ -502,6 +533,45 @@ mod tests {
         assert_eq!(v["arms"]["security"], "ran");
         assert_eq!(v["arms"]["tests"], "skipped");
         assert_eq!(v["scope"], "code", "existing fields unchanged");
+    }
+
+    #[test]
+    fn keyed_value_constraint_states_the_right_limit_per_flag() {
+        // #775 I4 RED: one shared message named the arm/arm-model rule for all
+        // three flags, so an operator whose 600-byte or non-ASCII
+        // `--arm-report` path dropped was told the limit was 64 bytes and
+        // [A-Za-z0-9_-]. The report clause must name its own constraint, and
+        // each clause restores a worked example.
+        let report = keyed_value_constraint("--arm-report");
+        assert!(report.contains("printable ASCII"), "{report}");
+        assert!(
+            report.contains(&MAX_REPORT_BYTES.to_string()),
+            "the report clause must name the 512-byte limit: {report}"
+        );
+        assert!(
+            report.contains("security=/tmp/review.md"),
+            "restores the report example: {report}"
+        );
+
+        let arm = keyed_value_constraint("--arm");
+        assert!(
+            arm.contains(&MAX_TOKEN_BYTES.to_string()),
+            "the arm clause names the 64-byte limit: {arm}"
+        );
+        assert!(
+            !arm.contains("printable ASCII"),
+            "the arm clause must not claim the report rule: {arm}"
+        );
+        assert!(
+            arm.contains("security=ran"),
+            "restores the arm example: {arm}"
+        );
+
+        let model = keyed_value_constraint("--arm-model");
+        assert!(
+            model.contains("security=opus"),
+            "restores the arm-model example: {model}"
+        );
     }
 
     #[test]
@@ -1092,9 +1162,13 @@ mod tests {
 
             let content = std::fs::read_to_string(&path).unwrap();
             let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            // #775 N4: the pruned entry is GONE, not kept as an empty `{}` — an
+            // empty entry reads to an auditor as "an attestation was attempted".
             assert!(
-                v["attest"]["security"].get("model").is_none(),
-                "an invalid prior attest value must not be re-persisted: {content}"
+                v.get("attest")
+                    .and_then(|attest| attest.get("security"))
+                    .is_none(),
+                "an invalid prior attest entry must be pruned, not re-persisted empty: {content}"
             );
         });
     }
