@@ -3400,9 +3400,17 @@ mod tests {
             "harness suffix paragraphs must be stripped: {doc}"
         );
         let rows = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
-        let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
-        assert_eq!(row["parent_session_id"], parent_id);
-        assert_eq!(row["child_session_id"], Value::from(sid.as_str()));
+        // Select THIS persist's row by child id rather than assuming file
+        // position — the metrics env var is process-global, and a row from a
+        // concurrently-running test landing in this dir must not fail the
+        // assertion about OUR row.
+        let own: Vec<Value> = rows
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|r: &Value| r["child_session_id"] == sid.as_str())
+            .collect();
+        assert_eq!(own.len(), 1, "one row for this persist; file: {rows}");
+        assert_eq!(own[0]["parent_session_id"], parent_id, "file: {rows}");
     }
 
     #[test]
