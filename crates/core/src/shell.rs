@@ -810,7 +810,17 @@ fn segment_ship_anchor(segment: &str) -> Option<&'static str> {
     let tokens = tokenize(strip_group_wrappers(segment));
     let invocation = gh_pr_invocation(&tokens)?;
     match invocation.subcommand {
-        "ready" => Some("ready"),
+        // `gh pr ready --undo` flips the PR back to DRAFT — it un-ships, the
+        // exact inverse of the moment this anchor names. The scan is over the
+        // invocation's OWN operands (not the whole segment) so an unrelated
+        // sibling command's `--undo` cannot suppress a real ship, the same
+        // scoping the `create` draft-flag check earns per segment.
+        //
+        // Deliberately consults neither `retargeted` nor
+        // `targets_the_current_branch()`: a retargeted `gh -R owner/r pr ready
+        // 12` is a real ship and must keep anchoring, and requiring the current
+        // branch would kill the canonical `gh pr ready <n>` spelling.
+        "ready" if !invocation.operands.iter().any(|t| t == "--undo") => Some("ready"),
         "create" if !tokens.iter().any(|t| t == "--draft" || t == "-d") => Some("create"),
         "merge" if invocation.targets_the_current_branch() => Some("merge"),
         _ => None,
@@ -4042,6 +4052,20 @@ mod tests {
         // `gh pr ready` leaves draft → the ship moment.
         assert!(is_polish_ship_anchor("gh pr ready 12"));
         assert!(is_polish_ship_anchor("cd repo && gh pr ready"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_skips_ready_undo() {
+        // `--undo` flips the PR BACK to draft — it un-ships, so it must not
+        // anchor the gate (nor count as a ship for the changelog nudge).
+        assert!(!is_polish_ship_anchor("gh pr ready --undo"));
+        assert!(!is_polish_ship_anchor("gh pr ready 12 --undo"));
+        assert!(!is_polish_ship_anchor("cd repo && gh pr ready --undo"));
+        // A retargeted un-ship is still an un-ship.
+        assert!(!is_polish_ship_anchor("gh -R owner/r pr ready 12 --undo"));
+        // The flag belongs to the ready invocation's OWN args: an unrelated
+        // sibling carrying `--undo` must not suppress a real ship.
+        assert!(is_polish_ship_anchor("some-tool --undo ; gh pr ready 12"));
     }
 
     #[test]

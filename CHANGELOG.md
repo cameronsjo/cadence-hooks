@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`gh pr ready --undo` no longer anchors the ship/polish gate.** `--undo` flips a PR back to draft — it un-ships — so the `ready` arm of the gh-pr-subcommand matcher now excludes any invocation carrying that token in its own operands. The matcher is shared, so the same invocation also stops counting as a ship for `warn-changelog-entry` and the polish-nudge logging; that is intended, since un-shipping is not a ship. A retargeted ship (`gh -R owner/r pr ready 12`) and the canonical `gh pr ready <n>` spelling keep anchoring.
+
 ## [0.86.0] - 2026-08-25
 
 ### Fixed
