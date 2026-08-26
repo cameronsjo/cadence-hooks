@@ -482,10 +482,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn working_tree_digest_survives_a_filename_with_spaces_and_quotes() {
         // NUL-split parsing is the whole point: `.lines()` would split a
         // newline-bearing name into two phantom paths, and quotePath escaping
-        // would rewrite the name out from under the hash.
+        // would rewrite the name out from under the hash. Unix-only: NTFS
+        // forbids `"` in a filename, so the fixture cannot even be created on
+        // Windows — the property under test is a POSIX-filesystem property.
         let tmp = init_repo_with_origin_main(&[]);
         let dir = tmp.path();
         write_file(dir, "src/a b \"c\".rs", "x\n");
