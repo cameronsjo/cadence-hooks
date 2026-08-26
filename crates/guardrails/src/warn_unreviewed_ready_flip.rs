@@ -16,8 +16,8 @@
 //! answer must never read as a block.
 
 use cadence_hooks_core::shell::{
-    command_segments, command_word, git_command, host_and_repo_from_url, strip_group_wrappers,
-    tokenize,
+    carries_undo_flag, command_segments, command_word, git_command, host_and_repo_from_url,
+    strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 use regex::Regex;
@@ -64,17 +64,29 @@ impl GhRunner for RealGhRunner {
 /// token-based (mirrors `warn_gh_merge_preflight::is_gh_pr_merge`) so a
 /// hyphenated script name or quoted prose never matches, while flags after
 /// the verb don't disturb the window.
+///
+/// `gh pr ready --undo` is excluded: it flips the PR back to DRAFT, the exact
+/// retreat from the ship this guard's reviewed-signal nudge is about, so the
+/// nudge would be noise. The `--undo` scan is
+/// [`carries_undo_flag`][cadence_hooks_core::shell::carries_undo_flag] — the
+/// same predicate the ship anchor uses (cadence-hooks#773/#774), which skips
+/// redirect targets and here-string words because the shell eats them and gh
+/// never sees the flag.
 fn is_pr_flip_command(command: &str) -> bool {
     command_segments(command).into_iter().any(|segment| {
         let tokens = tokenize(strip_group_wrappers(&segment));
-        tokens
+        let is_gh_pr = tokens
             .first()
             .is_some_and(|first| command_word(first).as_ref() == "gh")
-            && tokens.get(1).map(String::as_str) == Some("pr")
-            && matches!(
-                tokens.get(2).map(String::as_str),
-                Some("ready") | Some("merge")
-            )
+            && tokens.get(1).map(String::as_str) == Some("pr");
+        if !is_gh_pr {
+            return false;
+        }
+        match tokens.get(2).map(String::as_str) {
+            Some("ready") => !carries_undo_flag(tokens.get(3..).unwrap_or(&[])),
+            Some("merge") => true,
+            _ => false,
+        }
     })
 }
 
@@ -276,6 +288,29 @@ mod tests {
     #[test]
     fn gh_pr_ready_matches() {
         assert!(is_pr_flip_command("gh pr ready 5"));
+    }
+
+    #[test]
+    fn gh_pr_ready_undo_does_not_match() {
+        // `--undo` flips the PR BACK to draft — it un-ships, so the reviewed
+        // signal it would nudge about is not owed (cadence-hooks#774, sibling
+        // of the `segment_ship_anchor` fix in #773).
+        assert!(!is_pr_flip_command("gh pr ready --undo"));
+        assert!(!is_pr_flip_command("gh pr ready 12 --undo"));
+        assert!(!is_pr_flip_command("cd repo && gh pr ready --undo"));
+        // Positive controls: the real flip still matches.
+        assert!(is_pr_flip_command("gh pr ready"));
+        assert!(is_pr_flip_command("gh pr ready 12"));
+        // `--undo` is not a `gh pr merge` flag; merge never loses its match.
+        assert!(is_pr_flip_command("gh pr merge 12 --undo"));
+    }
+
+    #[test]
+    fn gh_pr_ready_undo_as_a_redirect_target_still_matches() {
+        // The shell eats a redirect target and a here-string word — gh never
+        // sees the flag, so these ship for real and still owe the nudge.
+        assert!(is_pr_flip_command("gh pr ready 12 > --undo"));
+        assert!(is_pr_flip_command("gh pr ready 12 <<< --undo"));
     }
 
     #[test]

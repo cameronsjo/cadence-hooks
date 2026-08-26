@@ -285,10 +285,22 @@ pub fn run_warn_plan_ready_flip(input: &HookInput) -> CheckResult {
 /// after the verb (`gh pr merge 42 --squash`) don't disturb the window.
 fn is_pr_flip_command(command: &str) -> bool {
     let tokens = cadence_hooks_core::shell::tokenize(command);
-    tokens.windows(3).any(|w| {
-        cadence_hooks_core::shell::basename(&w[0]) == "gh"
-            && w[1] == "pr"
-            && (w[2] == "ready" || w[2] == "merge")
+    tokens.windows(3).enumerate().any(|(i, w)| {
+        if cadence_hooks_core::shell::basename(&w[0]) != "gh" || w[1] != "pr" {
+            return false;
+        }
+        match w[2].as_str() {
+            // `--undo` flips the PR back to DRAFT — it un-ships, the retreat
+            // FROM the reconcile point this guard names, so the unticked-box
+            // nudge is noise. Shared predicate with the ship anchor
+            // (cadence-hooks#773/#774): it skips redirect targets and
+            // here-string words, which the shell eats before gh sees them.
+            "ready" => {
+                !cadence_hooks_core::shell::carries_undo_flag(tokens.get(i + 3..).unwrap_or(&[]))
+            }
+            "merge" => true,
+            _ => false,
+        }
     })
 }
 
@@ -682,6 +694,60 @@ mod tests {
         let msg = r.message.unwrap();
         assert!(msg.contains("2 unticked"));
         assert!(msg.contains("status: in-flight"));
+    }
+
+    #[test]
+    fn ready_flip_silent_on_ready_undo() {
+        // `gh pr ready --undo` flips the PR BACK to draft — it un-ships, the
+        // exact retreat from the reconcile point this guard names, so the
+        // unticked-box nudge is noise (cadence-hooks#774, sibling of #773).
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-08-11-guards.md",
+            "in-flight",
+            "main",
+            "# G\n\n- [ ] build\n- [ ] wire\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+
+        for cmd in ["gh pr ready --undo", "gh pr ready 42 --undo"] {
+            let input = bash_input("flip-undo-session", tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{cmd} un-ships and must not nudge"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_flip_warns_when_undo_is_a_redirect_target() {
+        // The shell eats a redirect target and a here-string word — gh never
+        // sees the flag, so these are real ready flips and still owe the nudge.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        write_plan(
+            tmp.path(),
+            "2026-08-11-guards.md",
+            "in-flight",
+            "main",
+            "# G\n\n- [ ] build\n- [ ] wire\n",
+        );
+        commit_all(tmp.path(), "plan lands");
+
+        for (session, cmd) in [
+            ("flip-redirect-1", "gh pr ready 42 > --undo"),
+            ("flip-redirect-2", "gh pr ready 42 <<< --undo"),
+        ] {
+            let input = bash_input(session, tmp.path(), cmd, "");
+            assert_eq!(
+                run_warn_plan_ready_flip(&input).outcome,
+                cadence_hooks_core::Outcome::Nudge,
+                "{cmd} is a real ready flip"
+            );
+        }
     }
 
     #[test]

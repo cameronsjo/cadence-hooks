@@ -961,7 +961,14 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
 /// sees them. `gh pr ready 12 > --undo` writes a file literally named `--undo`
 /// and ships the PR for real; counting it would suppress a genuine ship, which
 /// is the costly direction (a missed nudge, never a wrong block).
-fn carries_undo_flag(operands: &[String]) -> bool {
+///
+/// Public because three guards need the same predicate: this module's ship
+/// anchor, `guardrails::warn_unreviewed_ready_flip`, and
+/// `session::plan_guards`. Duplicating it is what let the two siblings drift
+/// out of step with the anchor (cadence-hooks#774). Callers pass the tokens
+/// **after** the `ready` subcommand — a token before it is not an argument to
+/// `ready`, so `gh --undo pr ready 12` still reads as a real ship.
+pub fn carries_undo_flag(operands: &[String]) -> bool {
     let mut i = 0;
     while let Some(token) = operands.get(i) {
         let token = token.as_str();

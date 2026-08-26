@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`gh pr ready --undo` no longer anchors the ship/polish gate.** `--undo` flips a PR back to draft — it un-ships — so the `ready` arm of the gh-pr-subcommand matcher now excludes any invocation carrying that token in its own operands. The matcher is shared, so the same invocation also stops counting as a ship for `warn-changelog-entry` and the polish-nudge logging; that is intended, since un-shipping is not a ship. A retargeted ship (`gh -R owner/r pr ready 12`) and the canonical `gh pr ready <n>` spelling keep anchoring, as does a `--undo` the shell eats as a redirect target or here-string word (`gh pr ready 12 > --undo`) — gh never sees it, so that is a real ship.
 
+- **`warn-unreviewed-ready-flip` and `warn-plan-ready-flip` stop firing on `gh pr ready --undo`.** Both sibling guards matched the `ready` verb without inspecting `--undo`, so un-shipping a PR drew a "no reviewed signal" nudge from one and an unticked-checkbox nudge from the other — advisory noise on the exact action that retreats from ship. The `--undo` scan is now the ship anchor's own `carries_undo_flag`, made public in `core::shell` and shared by all three call sites rather than reimplemented per guard (a third copy is how the two siblings drifted out of step in the first place). `gh pr merge` is untouched, and a `--undo` the shell eats as a redirect target or here-string word still counts as a real flip.
+
 ## [0.86.0] - 2026-08-25
 
 ### Fixed
