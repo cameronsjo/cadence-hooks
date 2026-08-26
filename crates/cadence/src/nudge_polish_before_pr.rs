@@ -515,9 +515,12 @@ mod tests {
 
     #[test]
     fn decide_legacy_roster_less_marker_allows_on_code_branch() {
-        // #467 RED: absent roster = UNKNOWN, not skipped — the whole estate
-        // carries roster-less markers, and every one must keep allowing even
-        // on a code branch.
+        // #467 RED: absent roster = UNKNOWN, not skipped — never the security
+        // nudge, even on a code branch. Narrowed by #775 item 6: `unknown`
+        // keeps allowing when the marker's content could not be READ, which is
+        // what `PRESENT_UNKNOWN` now carries (`roster_read: false`). A roster
+        // that was read and is simply absent draws the unknown-roster nudge —
+        // `decide_read_roster_less_marker_nudges_to_record_the_roster`.
         let result = decide("gh pr create --title x", PRESENT_UNKNOWN, true, &[]);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
