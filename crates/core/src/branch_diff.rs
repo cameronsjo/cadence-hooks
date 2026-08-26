@@ -45,21 +45,13 @@ pub fn merge_base_with_origin(dir: &str) -> Option<String> {
 /// failure mapping would collapse "confirmed no changes" into "no evidence".
 pub fn changed_files(dir: &str) -> Option<Vec<String>> {
     let base = merge_base_with_origin(dir)?;
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(dir)
-        .args(["diff", "--name-only", &base, "HEAD"]);
-    match run_git_bounded(&mut cmd) {
-        GitSpawn::Completed(output) if output.status.success() => Some(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        GitSpawn::Completed(_) | GitSpawn::SpawnFailed | GitSpawn::TimedOut => None,
-    }
+    // NUL-split via [`git_nul_list`] rather than `.lines()`: a newline-bearing
+    // filename would otherwise split into two phantom paths, one of which could
+    // manufacture a spurious `*.rs` and flip `branch_touches_code`. The
+    // `Some(vec![])`-is-evidence property is preserved — `git_nul_list` maps an
+    // empty *successful* listing to `Some(empty)`, never `None`.
+    git_nul_list(dir, &["diff", "--name-only", "-z", &base, "HEAD"])
+        .map(|paths| paths.into_iter().collect())
 }
 
 /// A content digest over what the branch changed **in the working tree**, with
@@ -70,14 +62,17 @@ pub fn changed_files(dir: &str) -> Option<Vec<String>> {
 pub struct WorkingTreeDigest {
     /// The merge base the change set was computed against.
     pub base: String,
-    /// `sha256:<hex>`, or the literal `skipped` when a bound was hit.
+    /// `sha256:<hex>`, the literal `skipped` when a bound was hit, or the
+    /// literal `empty` when the change set held no code paths.
     pub digest: String,
-    /// How many paths were in the change set — reported even when the digest
-    /// itself was bounded out.
+    /// How many code paths — by polish's own definition ([`is_polish_code_path`])
+    /// — were in the change set: the post-filter count, not the raw diff size.
+    /// Reported even when the digest itself was bounded out.
     pub files: usize,
 }
 
-/// Above this many changed paths, the digest is skipped rather than computed.
+/// Above this many code paths (post-[`is_polish_code_path`] filter), the digest
+/// is skipped rather than computed.
 pub const MAX_DIGEST_FILES: usize = 1000;
 
 /// Above this many bytes of content, likewise — checked **per file, before the
@@ -114,19 +109,20 @@ pub fn working_tree_digest(dir: &str) -> Option<WorkingTreeDigest> {
 /// without materializing a thousand files or 64 MiB.
 fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<WorkingTreeDigest> {
     let base = merge_base_with_origin(dir)?;
-    let mut paths: BTreeSet<String> = git_nul_list(
-        dir,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--name-only",
-            "-z",
-            &base,
-        ],
-    )?;
+    // Resolve the repo top-level ONCE and run both change-set subprocesses
+    // against it (cadence-hooks#775 C1): `git diff --name-only` yields
+    // repo-root-relative paths while `ls-files --others` yields cwd-relative,
+    // so from a subdirectory the two disagree and every path joins against the
+    // wrong base — the digest then hashes path NAMES only, blind to content.
+    // A `--show-toplevel` that can't resolve is an unresolvable base: omit the
+    // digest (the no-evidence path), fail-open (ADR-0001).
+    let root = git_command(dir, &["rev-parse", "--show-toplevel"])?;
+    // `-z` output is never path-quoted, so `core.quotePath=false` would be a
+    // no-op here (cadence-hooks#775 N1) — the NUL framing is what carries an
+    // odd filename through intact.
+    let mut paths: BTreeSet<String> = git_nul_list(&root, &["diff", "--name-only", "-z", &base])?;
     paths.extend(git_nul_list(
-        dir,
+        &root,
         &["ls-files", "--others", "--exclude-standard", "-z"],
     )?);
     let paths: Vec<String> = paths
@@ -144,8 +140,14 @@ fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<Working
     if paths.len() > max_files {
         return bounded("skipped".to_string());
     }
+    // An empty code set has no content to attest — record the literal `empty`
+    // (cadence-hooks#775 N3), distinct from a real hash and from the `skipped`
+    // bound, so the empty-string SHA never reads as provenance.
+    if paths.is_empty() {
+        return bounded("empty".to_string());
+    }
 
-    let root = Path::new(dir);
+    let root = Path::new(&root);
     let mut frames = Sha256::new();
     let mut remaining = max_bytes;
     for path in &paths {
@@ -401,6 +403,33 @@ mod tests {
         assert_ne!(before.digest, after.digest, "an edit must move the digest");
     }
 
+    #[test]
+    fn working_tree_digest_from_a_subdirectory_sees_content() {
+        // #775 C1 RED: `git diff --name-only` yields repo-root-relative paths
+        // while `ls-files --others` yields cwd-relative, so run from a
+        // SUBDIRECTORY the two spaces disagree — every tracked path joined
+        // against the subdir resolves to a nonexistent `<subdir>/<repo-rel>`,
+        // framed "absent", and the digest hashes path NAMES only (a total
+        // content rewrite left it byte-identical). Resolving the repo
+        // top-level and joining every path there is what discriminates the two
+        // orderings; every other digest test runs from the repo root, so the
+        // suite could not see this.
+        let tmp = init_repo_with_origin_main(&["sub/a.rs"]);
+        let dir = tmp.path();
+        let subdir = dir.join("sub");
+        let sub = subdir.to_str().unwrap();
+
+        write_file(dir, "sub/a.rs", "fn a() {}\n");
+        let before = working_tree_digest(sub).expect("digest resolves from a subdir");
+
+        write_file(dir, "sub/a.rs", "fn a() { todo!() }\n");
+        let after = working_tree_digest(sub).expect("digest resolves from a subdir");
+        assert_ne!(
+            before.digest, after.digest,
+            "a content edit must move the digest even when recorded from a subdirectory"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn digest_entry_hashes_a_symlink_target_string_not_the_target_file() {
@@ -462,6 +491,18 @@ mod tests {
         write_file(dir, "src/a b \"c\".rs", "x\n");
         let digest = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
         assert_eq!(digest.files, 1, "the odd name is ONE path, not two");
+    }
+
+    #[test]
+    fn working_tree_digest_records_empty_for_an_empty_code_set() {
+        // #775 N3: an empty change set has no content to attest, so the
+        // empty-string SHA must never masquerade as provenance — record the
+        // literal `empty`, distinct from a real hash and from the `skipped`
+        // bound.
+        let tmp = init_repo_with_origin_main(&[]);
+        let digest = working_tree_digest(tmp.path().to_str().unwrap()).expect("digest resolves");
+        assert_eq!(digest.digest, "empty");
+        assert_eq!(digest.files, 0);
     }
 
     #[test]
