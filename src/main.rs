@@ -299,6 +299,19 @@ enum CadenceCommands {
         /// (cadence-hooks#467)
         #[arg(long = "arm", value_name = "NAME=STATE", action = clap::ArgAction::Append)]
         arm: Vec<String>,
+        /// Model family that ran an arm, repeatable — e.g. `--arm-model
+        /// security=opus`. Recorded, not validated against a closed set: the
+        /// point is what actually ran. Accepted only alongside `--arm NAME=…`
+        /// in the same invocation, so the attestation always describes the run
+        /// stated beside it (cadence-hooks#775)
+        #[arg(long = "arm-model", value_name = "NAME=FAMILY", action = clap::ArgAction::Append)]
+        arm_model: Vec<String>,
+        /// Where an arm's report landed, repeatable — e.g. `--arm-report
+        /// security=/tmp/review.md`. Provenance only: the path is never opened
+        /// and its contents never read. Same binding rule as `--arm-model`
+        /// (cadence-hooks#775)
+        #[arg(long = "arm-report", value_name = "NAME=PATH", action = clap::ArgAction::Append)]
+        arm_report: Vec<String>,
         /// Record exactly the stated roster instead of merging with the prior
         /// marker — the clearing spelling. An omitted arm is then genuinely
         /// absent, so the pre-PR gate reads it as unknown rather than
@@ -1066,6 +1079,8 @@ fn main() {
                 branch,
                 scope,
                 arm,
+                arm_model,
+                arm_report,
                 fresh,
             } => {
                 // Exit only on a nonzero code: the success path keeps falling
@@ -1073,7 +1088,7 @@ fn main() {
                 // here is already fail-open (0). Today the one nonzero is the
                 // `--scope` usage error (exit 2, cadence-hooks#775).
                 let code = cadence_hooks_cadence::record_polish::run_record(
-                    repo_root, branch, scope, arm, fresh,
+                    repo_root, branch, scope, arm, arm_model, arm_report, fresh,
                 );
                 if code != 0 {
                     process::exit(code.into());
