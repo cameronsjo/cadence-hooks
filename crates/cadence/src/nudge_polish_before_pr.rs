@@ -41,8 +41,8 @@
 //!   `security=skipped`, or a `scope: docs` pass, which never dispatches it)
 //!   *and* the branch's diff vs `origin/main` touches code by polish's own
 //!   definition → a distinct **security nudge** (cadence-hooks#467). An absent
-//!   roster is *unknown, never skipped* — every legacy roster-less marker keeps
-//!   allowing;
+//!   roster is *unknown, never skipped* — it draws the unknown-roster nudge
+//!   below, not this one;
 //! - no marker for this branch (or the repo/branch can't be resolved) → **nudge**
 //!   (ADR-0001 fail-open; CP1 never blocks on our own missing data);
 //! - a marker older than
@@ -368,7 +368,9 @@ fn security_nudge_message() -> String {
          diff vs origin/main touches code. Run the security arm before this PR \
          ships: dispatch `cadence-forge:security-reviewer` (Opus) against the \
          branch diff, then re-run `cadence-hooks cadence record-polish` with \
-         `--arm security=ran`. {SCOPE_CLAUSES}"
+         `--arm security=ran --arm-model security=opus --arm-report \
+         security=<report-path>` so the marker attests which family ran it. \
+         {SCOPE_CLAUSES}"
     )
 }
 
