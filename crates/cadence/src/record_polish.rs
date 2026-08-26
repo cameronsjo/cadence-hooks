@@ -23,6 +23,7 @@
 //! `redact-scan` CLI convention (cadence-hooks#775): the caller mis-spelled the
 //! record, and storing it anyway lands a marker the gate silently misreads.
 
+use cadence_hooks_core::branch_diff::{WorkingTreeDigest, working_tree_digest};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::markers::{
     ArmAttestation, polish_marker, read_polish_record, write_marker,
@@ -322,6 +323,7 @@ fn marker_content(
     scope: &str,
     arms: &[(String, String)],
     attest: &BTreeMap<String, ArmAttestation>,
+    digest: Option<&WorkingTreeDigest>,
     fresh: bool,
 ) -> String {
     let mut v = json!({
@@ -352,6 +354,13 @@ fn marker_content(
             })
             .collect();
         v["attest"] = serde_json::Value::Object(entries);
+    }
+    if let Some(digest) = digest {
+        v["diff_digest"] = json!({
+            "base": digest.base,
+            "digest": digest.digest,
+            "files": digest.files,
+        });
     }
     if fresh {
         v["fresh"] = json!(true);
@@ -421,6 +430,12 @@ pub fn run_record(
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| ".".to_string());
 
+    // The checkout the digest is taken from is the same one `resolve` reads —
+    // an explicit `--repo-root` re-bases the whole resolution (#417), and a
+    // digest of the *caller's* tree beside another checkout's branch would be
+    // provenance about the wrong thing.
+    let work_dir = repo_root.clone().unwrap_or_else(|| cwd.clone());
+
     let Some((repo_root, branch, head_sha)) = resolve(&cwd, repo_root, branch) else {
         eprintln!(
             "cadence-hooks record-polish: could not resolve repo root / branch \
@@ -443,7 +458,19 @@ pub fn run_record(
         incoming_arms,
         fresh,
     );
-    let content = marker_content(&branch, &head_sha, &scope, &arms, &attest, fresh);
+    // Record-side only, by ruling: the gate never reads this (see
+    // `nudge_polish_before_pr`'s head_sha note — polish records BEFORE the
+    // operator commits, so any read-side comparison re-opens that trap).
+    let digest = working_tree_digest(&work_dir);
+    let content = marker_content(
+        &branch,
+        &head_sha,
+        &scope,
+        &arms,
+        &attest,
+        digest.as_ref(),
+        fresh,
+    );
     let path = polish_marker(&repo_root, &branch);
     match write_marker(&path, &content) {
         Ok(()) => println!(
@@ -465,7 +492,15 @@ mod tests {
 
     #[test]
     fn marker_content_is_parseable_json_with_all_fields() {
-        let content = marker_content("feat/x", "abc123", "full", &[], &BTreeMap::new(), false);
+        let content = marker_content(
+            "feat/x",
+            "abc123",
+            "full",
+            &[],
+            &BTreeMap::new(),
+            None,
+            false,
+        );
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(v["branch"], "feat/x");
         assert_eq!(v["head_sha"], "abc123");
@@ -485,7 +520,15 @@ mod tests {
             ("security".to_string(), "ran".to_string()),
             ("tests".to_string(), "skipped".to_string()),
         ];
-        let content = marker_content("feat/x", "abc123", "code", &arms, &BTreeMap::new(), false);
+        let content = marker_content(
+            "feat/x",
+            "abc123",
+            "code",
+            &arms,
+            &BTreeMap::new(),
+            None,
+            false,
+        );
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(v["arms"]["security"], "ran");
         assert_eq!(v["arms"]["tests"], "skipped");
@@ -686,6 +729,7 @@ mod tests {
             "full",
             &[],
             &BTreeMap::new(),
+            None,
             true,
         ))
         .unwrap();
@@ -697,6 +741,7 @@ mod tests {
             "full",
             &[],
             &BTreeMap::new(),
+            None,
             false,
         ))
         .unwrap();
@@ -856,12 +901,20 @@ mod tests {
         .into_iter()
         .collect();
         let arms = vec![("security".to_string(), "ran".to_string())];
-        let content = marker_content("feat/x", "abc123", "full", &arms, &attest, false);
+        let content = marker_content("feat/x", "abc123", "full", &arms, &attest, None, false);
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(v["attest"]["security"]["model"], "opus");
         assert_eq!(v["attest"]["security"]["report"], "/tmp/x.md");
 
-        let bare = marker_content("feat/x", "abc123", "full", &arms, &BTreeMap::new(), false);
+        let bare = marker_content(
+            "feat/x",
+            "abc123",
+            "full",
+            &arms,
+            &BTreeMap::new(),
+            None,
+            false,
+        );
         let v: serde_json::Value = serde_json::from_str(&bare).unwrap();
         assert!(
             v.get("attest").is_none(),
@@ -1029,6 +1082,97 @@ mod tests {
             assert_eq!(
                 record.attest.unwrap()["security"].report.as_deref(),
                 Some("/tmp/definitely-not-here-775.md")
+            );
+        });
+    }
+
+    // --- diff digest provenance (cadence-hooks#775 item 2) ---
+
+    #[test]
+    fn run_record_omits_the_diff_digest_when_no_base_resolves() {
+        // Bounded-out and no-evidence are different meanings: with no
+        // resolvable base there is nothing to say, so the field is ABSENT
+        // rather than recorded as "skipped".
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-digest-nobase-repo";
+            let branch = "feat/record-polish-digest-nobase";
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into()],
+                vec![],
+                vec![],
+                false,
+            );
+
+            let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                v.get("diff_digest").is_none(),
+                "no base → no evidence → no field: {content}"
+            );
+        });
+    }
+
+    #[test]
+    fn run_record_records_the_diff_digest_of_the_working_tree() {
+        // #775 item 2 RED: the marker says a polish ran, with nothing tying it
+        // to WHAT was polished. The digest is that tie — provenance, like
+        // head_sha; no reader gates on it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&["checkout", "-q", "-b", "feat/digest"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            run_record(
+                Some(dir.to_str().unwrap().to_string()),
+                None,
+                Some("full".into()),
+                vec!["security=ran".into()],
+                vec![],
+                vec![],
+                false,
+            );
+
+            let state = GitState::resolve(dir).expect("repo resolves");
+            let key = state.git_common_dir.to_string_lossy().into_owned();
+            let content = std::fs::read_to_string(polish_marker(&key, "feat/digest")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["diff_digest"]["files"], 1);
+            assert!(
+                v["diff_digest"]["digest"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("sha256:"),
+                "{content}"
+            );
+            assert!(
+                !v["diff_digest"]["base"].as_str().unwrap().is_empty(),
+                "the base commit is recorded beside the digest: {content}"
             );
         });
     }
@@ -1315,7 +1459,15 @@ mod tests {
             let (repo_root, branch, head_sha) =
                 resolve(&wt_str, None, None).expect("worktree resolves repo/branch");
             assert_eq!(branch, "feat/thing");
-            let content = marker_content(&branch, &head_sha, "full", &[], &BTreeMap::new(), false);
+            let content = marker_content(
+                &branch,
+                &head_sha,
+                "full",
+                &[],
+                &BTreeMap::new(),
+                None,
+                false,
+            );
             write_marker(&polish_marker(&repo_root, &branch), &content).unwrap();
 
             // Free the branch from the worktree and check it out on the primary —
@@ -1411,7 +1563,15 @@ mod tests {
                     .expect("resolves");
             write_marker(
                 &polish_marker(&repo_root, &branch),
-                &marker_content(&branch, &head_sha, "code", &[], &BTreeMap::new(), false),
+                &marker_content(
+                    &branch,
+                    &head_sha,
+                    "code",
+                    &[],
+                    &BTreeMap::new(),
+                    None,
+                    false,
+                ),
             )
             .unwrap();
 

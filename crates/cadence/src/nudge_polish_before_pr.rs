@@ -947,6 +947,40 @@ mod tests {
         });
     }
 
+    #[test]
+    fn run_ignores_the_diff_digest_field_entirely() {
+        // PINS the no-gate-reader ruling (#775 item 2): `diff_digest` is
+        // record-side provenance, like `head_sha`. Nothing here reads it, so a
+        // marker carrying one — or carrying a hostile-looking one — decides
+        // exactly as the same marker without it. Making the gate compare a
+        // digest would re-open the head_sha trap: polish records BEFORE the
+        // operator commits, so the tree legitimately moves afterward.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/digest-blind", &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let path = polish_marker(&root, "feat/digest-blind");
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+
+            write_marker(&path, r#"{"scope":"full","arms":{"security":"ran"}}"#).unwrap();
+            let without = NudgePolishBeforePr.run(&input).outcome;
+
+            write_marker(
+                &path,
+                r#"{"scope":"full","arms":{"security":"ran"},
+                    "diff_digest":{"base":"deadbeef","digest":"sha256:0000","files":99}}"#,
+            )
+            .unwrap();
+            assert_eq!(NudgePolishBeforePr.run(&input).outcome, without);
+
+            write_marker(
+                &path,
+                r#"{"scope":"full","arms":{"security":"ran"},"diff_digest":"skipped"}"#,
+            )
+            .unwrap();
+            assert_eq!(NudgePolishBeforePr.run(&input).outcome, without);
+        });
+    }
+
     // --- #775 item 7: annotations ride the allow path ---
 
     #[test]
