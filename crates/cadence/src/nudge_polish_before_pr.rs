@@ -50,6 +50,12 @@
 //!   absent → **nudge**, naming the expiry so it doesn't read as a false
 //!   positive on a branch that visibly was polished (cadence-hooks#775).
 //!
+//! - a marker whose content was **read** and names no arm roster at all, on a
+//!   branch that touches code → the **unknown-roster nudge** (cadence-hooks#775
+//!   item 6): a pass ran and recorded nothing about its arms, so the ask is the
+//!   record, not the work. A marker whose content could not be read (degraded
+//!   dir, garbled JSON) stays on the presence-alone path — that discrimination
+//!   is the whole of item 6;
 //! - a marker whose attestation says the security arm ran, but names a model
 //!   family that is not Opus, on a branch that touches code → the
 //!   **wrong-family nudge** (cadence-hooks#775 item 1). An *unattested*
@@ -118,9 +124,17 @@ pub enum MarkerState {
     /// `security_model` is the attested model family for the security arm
     /// (cadence-hooks#775 item 1), `None` on every unattested marker — which is
     /// every marker the estate carries today, and which stays silent.
+    ///
+    /// `roster_read` discriminates the two ways `security_ran` reaches `None`
+    /// (cadence-hooks#775 item 6): `true` means the marker's content was
+    /// genuinely read and simply names no roster — a question the recorder can
+    /// answer, so the gate asks; `false` means the content could not be read at
+    /// all (a degraded marker dir, garbled JSON, an unreadable file), which
+    /// stays on the presence-alone path because there is nothing to ask about.
     Present {
         security_ran: Option<bool>,
         security_model: Option<String>,
+        roster_read: bool,
     },
 }
 
@@ -161,6 +175,10 @@ impl Check for NudgePolishBeforePr {
             (true, record) => MarkerState::Present {
                 security_ran: record.as_ref().and_then(|r| r.security_ran()),
                 security_model: record.as_ref().and_then(attested_security_family),
+                // Exactly `record.is_some()`: a degraded dir, garbled JSON, and
+                // an unreadable file all yield `None` here and stay on the
+                // presence-alone path (#775 item 6).
+                roster_read: record.is_some(),
             },
         };
         // Advisory annotations ride the otherwise-silent allow — they never
@@ -213,7 +231,13 @@ fn consumes_branch_diff(marker: &MarkerState) -> bool {
         MarkerState::Present {
             security_ran: Some(true),
             security_model: Some(family),
+            ..
         } => family != SATISFYING_SECURITY_FAMILY,
+        MarkerState::Present {
+            security_ran: None,
+            roster_read: true,
+            ..
+        } => true,
         _ => false,
     }
 }
@@ -230,9 +254,19 @@ fn consumes_branch_diff(marker: &MarkerState) -> bool {
 ///   not run, on a branch that touches code (polish's own definition — the
 ///   caller computes it) → the security nudge (#467).
 /// - ship anchor + a marker past the TTL → nudge, naming the expiry (#775).
-/// - ship anchor + any other marker (security ran, or unknown — the legacy
-///   roster-less shape the whole estate carries) → allow (silent), carrying
+/// - ship anchor + a marker attesting a non-Opus family for a security arm
+///   that ran, on a branch that touches code → the wrong-family nudge (#775
+///   item 1).
+/// - ship anchor + a marker whose content was READ and names no roster, on a
+///   branch that touches code → the unknown-roster nudge (#775 item 6).
+/// - ship anchor + any other marker (security ran, or unknown because the
+///   content could not be read at all) → allow (silent), carrying
 ///   `annotations` as exit-0 context when the caller resolved any.
+///
+/// **The match order IS the precedence, and it is total**: absent → expired →
+/// security-skipped → wrong-family → unknown-roster → allow (+annotations).
+/// Each verdict names a strictly more specific gap than the one after it, so a
+/// marker that qualifies for two reports the sharper one.
 fn decide(
     command: &str,
     marker: MarkerState,
@@ -257,9 +291,18 @@ fn decide(
         MarkerState::Present {
             security_ran: Some(true),
             security_model: Some(family),
+            ..
         } if family != SATISFYING_SECURITY_FAMILY && branch_touches_code => {
             CheckResult::nudge(wrong_family_nudge_message(&family))
         }
+        // The marker's content WAS read and names no roster at all (#775 item
+        // 6) — a question the recorder can answer, unlike a marker whose
+        // content could not be read, which falls through to the allow below.
+        MarkerState::Present {
+            security_ran: None,
+            roster_read: true,
+            ..
+        } if branch_touches_code => CheckResult::nudge(unknown_roster_nudge_message()),
         // Polish recorded a marker for this branch, and nothing affirmatively
         // says the security arm was skipped on a code branch — allow, silent
         // unless an advisory annotation has something to add.
@@ -329,6 +372,23 @@ fn security_nudge_message() -> String {
     )
 }
 
+/// The #775-item-6 nudge: the marker's content was read and names no arm
+/// roster at all, on a branch that touches code.
+///
+/// Distinct from the security nudge (which knows the arm was skipped) and from
+/// the no-polish nudge (which knows nothing ran): here a pass *did* run and
+/// simply recorded nothing about its arms, so the ask is the record, not the
+/// work.
+fn unknown_roster_nudge_message() -> String {
+    format!(
+        "Polish recorded a marker for this branch but no arm roster, so nothing says whether the \
+         security arm ran — and this branch's diff vs origin/main touches code. Re-record the \
+         roster: `cadence-hooks cadence record-polish --arm security=ran|skipped --arm tests=… \
+         --arm simplify=…` (add `--arm-model security=opus` to attest which family ran it). \
+         {SCOPE_CLAUSES}"
+    )
+}
+
 /// The #775-item-1 escalation: the security arm ran and the marker attests
 /// *which family ran it*, and that family is not the one the requirement names.
 ///
@@ -391,14 +451,17 @@ mod tests {
     const PRESENT_UNKNOWN: MarkerState = MarkerState::Present {
         security_ran: None,
         security_model: None,
+        roster_read: false,
     };
     const PRESENT_SECURITY_RAN: MarkerState = MarkerState::Present {
         security_ran: Some(true),
         security_model: None,
+        roster_read: true,
     };
     const PRESENT_SECURITY_SKIPPED: MarkerState = MarkerState::Present {
         security_ran: Some(false),
         security_model: None,
+        roster_read: true,
     };
 
     #[test]
@@ -769,10 +832,19 @@ mod tests {
     }
 
     #[test]
-    fn run_legacy_roster_less_marker_stays_silent_on_code_branch() {
-        // #467 positive control (SILENT): the estate's existing markers carry
-        // no roster and no scope worth reading ("{}") — unknown must keep
-        // allowing on a code branch, exactly the pre-#467 behavior.
+    fn run_read_roster_less_marker_nudges_to_record_the_roster_on_code_branch() {
+        // SANCTIONED FLIP (#775 item 6). This test was
+        // `run_legacy_roster_less_marker_stays_silent_on_code_branch` and
+        // encoded the pre-item-6 ruling: a readable roster-less marker allowed
+        // silently, because presence alone carried the verdict and #467 could
+        // not tell "no roster recorded" from "roster not readable".
+        //
+        // Item 6 draws that line: the content here IS read, so an absent
+        // roster is a question the recorder can answer, and the gate asks.
+        // A marker whose content cannot be read (garbled JSON, degraded dir)
+        // still stays on the presence-alone path — pinned by
+        // `run_garbled_marker_content_stays_silent` and
+        // `run_degraded_marker_dir_announces_itself`.
         let (tmp, root) = init_repo_with_origin_and_files("feat/legacy", &["src/main.rs"]);
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
@@ -780,8 +852,14 @@ mod tests {
 
             let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
             let result = NudgePolishBeforePr.run(&input);
-            assert_eq!(result.outcome, Outcome::Allow);
-            assert!(result.message.is_none());
+            assert_eq!(result.outcome, Outcome::Nudge);
+            assert!(
+                result
+                    .message
+                    .unwrap_or_default()
+                    .contains("--arm security="),
+                "the nudge must show the record command shape"
+            );
         });
     }
 
@@ -820,6 +898,82 @@ mod tests {
         });
     }
 
+    // --- #775 item 6: the unknown-roster nudge ---
+
+    /// A marker whose content WAS read and carries no roster — the case item 6
+    /// discriminates from a marker whose content could not be read at all.
+    const PRESENT_ROSTER_READ_UNKNOWN: MarkerState = MarkerState::Present {
+        security_ran: None,
+        security_model: None,
+        roster_read: true,
+    };
+
+    #[test]
+    fn decide_read_roster_less_marker_nudges_to_record_the_roster() {
+        // #775 item 6 RED: presence alone used to carry the allow, so a marker
+        // recorded with no `--arm` at all was indistinguishable from a full
+        // pass. Once the content is genuinely READ, an absent roster is a
+        // question the recorder can answer — ask for it.
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_ROSTER_READ_UNKNOWN,
+            true,
+            &[],
+        );
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap_or_default();
+        assert!(
+            msg.contains("--arm security="),
+            "the nudge must show the record command shape: {msg}"
+        );
+        assert!(
+            !msg.contains("No polish recorded"),
+            "must not present as the no-polish nudge: {msg}"
+        );
+    }
+
+    #[test]
+    fn decide_unread_roster_less_marker_stays_silent_on_a_code_branch() {
+        // The discrimination itself: a marker whose content could NOT be read
+        // (degraded dir, garbled JSON, unreadable file) stays on the
+        // presence-alone path — there is no roster question to ask.
+        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, true, &[]);
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn decide_read_roster_less_marker_on_docs_only_branch_stays_silent() {
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_ROSTER_READ_UNKNOWN,
+            false,
+            &[],
+        );
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn run_security_ran_roster_on_code_branch_is_unchanged_by_the_roster_nudge() {
+        // Positive control: a marker that DOES carry a roster is untouched by
+        // item 6 — silent, as before.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/roster-ran", &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/roster-ran"),
+                r#"{"scope":"full","arms":{"security":"ran"}}"#,
+            )
+            .unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(result.message.is_none());
+        });
+    }
+
     // --- #775 item 1: the wrong-family gate ---
 
     /// `security=ran` with an attested model family beside it.
@@ -827,6 +981,7 @@ mod tests {
         MarkerState::Present {
             security_ran: Some(true),
             security_model: Some(family.to_string()),
+            roster_read: true,
         }
     }
 
