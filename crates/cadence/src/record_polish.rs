@@ -24,7 +24,9 @@
 //! record, and storing it anyway lands a marker the gate silently misreads.
 
 use cadence_hooks_core::gitstate::GitState;
-use cadence_hooks_core::markers::{polish_marker, read_polish_record, write_marker};
+use cadence_hooks_core::markers::{
+    ArmAttestation, polish_marker, read_polish_record, write_marker,
+};
 use cadence_hooks_core::shell::git_command;
 use cadence_hooks_core::time::utc_timestamp;
 use serde_json::json;
@@ -117,25 +119,141 @@ fn resolve(
 /// the verdict line and the marker JSON both carry these strings, so ANSI or
 /// control bytes never survive to either surface.
 fn parse_arms(raw: &[String]) -> Vec<(String, String)> {
-    let sane = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    };
+    parse_keyed(raw, "--arm", is_arm_token, "state", |_, _| {})
+}
+
+/// The longest an arm name, state, or attested model family may be. Names and
+/// states were unbounded until cadence-hooks#775 — a megabyte of `[A-Za-z0-9]`
+/// passed the charset check and rode the marker JSON and the verdict line.
+const MAX_TOKEN_BYTES: usize = 64;
+
+/// The longest an attested report path may be — generous for a real path, and
+/// still a bound (cadence-hooks#775). The path is provenance only: never
+/// opened, never echoed as content.
+const MAX_REPORT_BYTES: usize = 512;
+
+/// The `--arm` charset: `[A-Za-z0-9_-]+`, at most [`MAX_TOKEN_BYTES`]. This is
+/// what keeps every recorded token safe to echo — the verdict line and the
+/// marker JSON both carry them, so ANSI or control bytes never survive to
+/// either surface.
+fn is_arm_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_TOKEN_BYTES
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// A report path: printable ASCII (0x20–0x7E) only, at most
+/// [`MAX_REPORT_BYTES`]. Spaces are legal in a path, control bytes are not, and
+/// non-ASCII is rejected rather than transcoded — a rejected path costs a
+/// stderr note, a smuggled one rides every future read of the marker.
+fn is_report_path(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_REPORT_BYTES && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+/// Parse repeatable `name=value` flags, dropping (and naming, on stderr,
+/// Debug-escaped) anything whose name is not an arm token or whose value fails
+/// `value_ok` — fail-open, the rest of the record still lands (ADR-0001).
+///
+/// `note` runs on each accepted pair, for the one advisory a value can carry
+/// without being rejected (a report path that does not exist yet).
+fn parse_keyed(
+    raw: &[String],
+    flag: &str,
+    value_ok: fn(&str) -> bool,
+    value_label: &str,
+    note: fn(&str, &str),
+) -> Vec<(String, String)> {
     raw.iter()
         .filter_map(|entry| match entry.split_once('=') {
-            Some((name, state)) if sane(name.trim()) && sane(state.trim()) => {
-                Some((name.trim().to_string(), state.trim().to_string()))
+            Some((name, value)) if is_arm_token(name.trim()) && value_ok(value.trim()) => {
+                note(name.trim(), value.trim());
+                Some((name.trim().to_string(), value.trim().to_string()))
             }
             _ => {
                 eprintln!(
-                    "cadence-hooks record-polish: ignoring malformed --arm {entry:?} \
-                     (expected name=state in [A-Za-z0-9_-], e.g. security=ran)"
+                    "cadence-hooks record-polish: ignoring malformed {flag} {entry:?} \
+                     (expected name={value_label}, name in [A-Za-z0-9_-] \
+                     and at most {MAX_TOKEN_BYTES} bytes)"
                 );
                 None
             }
         })
         .collect()
+}
+
+/// Parse repeatable `--arm-model name=family` values (cadence-hooks#775).
+///
+/// The family is **recorded, not validated against a closed set** — the point
+/// is to record what actually ran. Only the *gate's* satisfying set is closed
+/// (`opus`), and that lives on the read side.
+fn parse_arm_model(raw: &[String]) -> Vec<(String, String)> {
+    parse_keyed(raw, "--arm-model", is_arm_token, "family", |_, _| {})
+}
+
+/// Parse repeatable `--arm-report name=path` values (cadence-hooks#775).
+///
+/// A path that does not exist at record time is *noted* on stderr and recorded
+/// anyway: the record may legitimately precede the write, and no code ever
+/// opens the path or echoes its contents.
+fn parse_arm_report(raw: &[String]) -> Vec<(String, String)> {
+    parse_keyed(raw, "--arm-report", is_report_path, "path", |name, path| {
+        if !Path::new(path).exists() {
+            eprintln!(
+                "cadence-hooks record-polish: --arm-report {name}={path:?} does not exist \
+                 — recording the path anyway (provenance only; it is never read)."
+            );
+        }
+    })
+}
+
+/// Merge the prior attestation map with this invocation's, under the binding
+/// rule that makes `attest.NAME` trustworthy: **an attestation describes the
+/// run stated beside it** (cadence-hooks#775).
+///
+/// Two directions, both required for that invariant:
+///
+/// - an attestation for `NAME` is kept only when this same invocation states
+///   `--arm NAME=…` — a bare `--arm-model`/`--arm-report` drops with a note;
+/// - an incoming `--arm NAME=…` drops any *prior* attestation for `NAME`, so a
+///   re-run that reports no model cannot inherit the previous run's.
+///
+/// `fresh` clears the map entirely, matching [`merge_arms`].
+fn merge_attest(
+    existing: Option<&BTreeMap<String, ArmAttestation>>,
+    incoming_arms: &[(String, String)],
+    models: Vec<(String, String)>,
+    reports: Vec<(String, String)>,
+    fresh: bool,
+) -> BTreeMap<String, ArmAttestation> {
+    let mut merged = if fresh {
+        BTreeMap::new()
+    } else {
+        existing.cloned().unwrap_or_default()
+    };
+    for (name, _) in incoming_arms {
+        merged.remove(name);
+    }
+    let stated = |name: &str| incoming_arms.iter().any(|(arm, _)| arm == name);
+    for (flag, pairs) in [("--arm-model", models), ("--arm-report", reports)] {
+        for (name, value) in pairs {
+            if !stated(&name) {
+                eprintln!(
+                    "cadence-hooks record-polish: ignoring {flag} {name}={value:?} — no \
+                     matching --arm {name}=<state> in this invocation, and an attestation \
+                     only ever describes the run stated beside it."
+                );
+                continue;
+            }
+            let entry = merged.entry(name).or_default();
+            if flag == "--arm-model" {
+                entry.model = Some(value);
+            } else {
+                entry.report = Some(value);
+            }
+        }
+    }
+    merged
 }
 
 /// The closed set `--scope` accepts, and the only values the gate can read:
@@ -188,6 +306,11 @@ fn merge_arms(
 /// on a roster-less record, so legacy readers and legacy markers both keep
 /// working — an absent roster reads as *unknown*, never as *skipped*.
 ///
+/// The `attest` map (cadence-hooks#775) is additive and optional the same way:
+/// `"attest": {"security": {"model": "opus", "report": "…"}}`, absent when the
+/// invocation attested nothing. Either half may be absent — a partial
+/// attestation is legal.
+///
 /// `fresh` leaves a breadcrumb: `"fresh": true` when the record cleared a prior
 /// roster, absent otherwise (cadence-hooks#775 review). Without it, a `--fresh`
 /// record that erased a `security=skipped` is byte-indistinguishable from a
@@ -198,6 +321,7 @@ fn marker_content(
     head_sha: &str,
     scope: &str,
     arms: &[(String, String)],
+    attest: &BTreeMap<String, ArmAttestation>,
     fresh: bool,
 ) -> String {
     let mut v = json!({
@@ -212,6 +336,22 @@ fn marker_content(
             .map(|(name, state)| (name.clone(), json!(state)))
             .collect();
         v["arms"] = serde_json::Value::Object(roster);
+    }
+    if !attest.is_empty() {
+        let entries: serde_json::Map<String, serde_json::Value> = attest
+            .iter()
+            .map(|(name, a)| {
+                let mut entry = serde_json::Map::new();
+                if let Some(model) = &a.model {
+                    entry.insert("model".to_string(), json!(model));
+                }
+                if let Some(report) = &a.report {
+                    entry.insert("report".to_string(), json!(report));
+                }
+                (name.clone(), serde_json::Value::Object(entry))
+            })
+            .collect();
+        v["attest"] = serde_json::Value::Object(entries);
     }
     if fresh {
         v["fresh"] = json!(true);
@@ -258,6 +398,8 @@ pub fn run_record(
     branch: Option<String>,
     scope: Option<String>,
     arm: Vec<String>,
+    arm_model: Vec<String>,
+    arm_report: Vec<String>,
     fresh: bool,
 ) -> u8 {
     // Validated BEFORE any resolution or write — mirrors `redact-scan`, whose
@@ -289,12 +431,19 @@ pub fn run_record(
 
     let incoming_arms = parse_arms(&arm);
     let prior = read_polish_record(&repo_root, &branch);
+    let attest = merge_attest(
+        prior.as_ref().and_then(|record| record.attest.as_ref()),
+        &incoming_arms,
+        parse_arm_model(&arm_model),
+        parse_arm_report(&arm_report),
+        fresh,
+    );
     let arms = merge_arms(
         prior.as_ref().and_then(|record| record.arms.as_ref()),
         incoming_arms,
         fresh,
     );
-    let content = marker_content(&branch, &head_sha, &scope, &arms, fresh);
+    let content = marker_content(&branch, &head_sha, &scope, &arms, &attest, fresh);
     let path = polish_marker(&repo_root, &branch);
     match write_marker(&path, &content) {
         Ok(()) => println!(
@@ -316,7 +465,7 @@ mod tests {
 
     #[test]
     fn marker_content_is_parseable_json_with_all_fields() {
-        let content = marker_content("feat/x", "abc123", "full", &[], false);
+        let content = marker_content("feat/x", "abc123", "full", &[], &BTreeMap::new(), false);
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(v["branch"], "feat/x");
         assert_eq!(v["head_sha"], "abc123");
@@ -336,7 +485,7 @@ mod tests {
             ("security".to_string(), "ran".to_string()),
             ("tests".to_string(), "skipped".to_string()),
         ];
-        let content = marker_content("feat/x", "abc123", "code", &arms, false);
+        let content = marker_content("feat/x", "abc123", "code", &arms, &BTreeMap::new(), false);
         let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
         assert_eq!(v["arms"]["security"], "ran");
         assert_eq!(v["arms"]["tests"], "skipped");
@@ -419,6 +568,8 @@ mod tests {
                 Some(branch.into()),
                 Some("Docs".into()),
                 vec!["security=ran".into()],
+                vec![],
+                vec![],
                 false,
             );
 
@@ -443,6 +594,8 @@ mod tests {
                     Some(repo.into()),
                     Some(branch.clone()),
                     Some(scope.into()),
+                    vec![],
+                    vec![],
                     vec![],
                     false,
                 );
@@ -497,6 +650,8 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["security=ran".into(), "tests=ran".into()],
+                vec![],
+                vec![],
                 false,
             );
             run_record(
@@ -504,6 +659,8 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["tests=ran".into()],
+                vec![],
+                vec![],
                 true,
             );
 
@@ -523,12 +680,26 @@ mod tests {
         // `security=skipped` is otherwise byte-indistinguishable from a legacy
         // roster-less marker, so an audit cannot tell a CLEARED roster from one
         // that never existed. Provenance only — no reader gates on it.
-        let fresh: serde_json::Value =
-            serde_json::from_str(&marker_content("feat/x", "abc123", "full", &[], true)).unwrap();
+        let fresh: serde_json::Value = serde_json::from_str(&marker_content(
+            "feat/x",
+            "abc123",
+            "full",
+            &[],
+            &BTreeMap::new(),
+            true,
+        ))
+        .unwrap();
         assert_eq!(fresh["fresh"], true);
 
-        let default: serde_json::Value =
-            serde_json::from_str(&marker_content("feat/x", "abc123", "full", &[], false)).unwrap();
+        let default: serde_json::Value = serde_json::from_str(&marker_content(
+            "feat/x",
+            "abc123",
+            "full",
+            &[],
+            &BTreeMap::new(),
+            false,
+        ))
+        .unwrap();
         assert!(
             default.get("fresh").is_none(),
             "the additive default must carry no breadcrumb: {default}"
@@ -549,6 +720,8 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["security=ran".into()],
+                vec![],
+                vec![],
                 true,
             );
 
@@ -580,12 +753,16 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["security=ran".into()],
+                vec![],
+                vec![],
                 false,
             );
             run_record(
                 Some(repo.into()),
                 Some(branch.into()),
                 Some("full".into()),
+                vec![],
+                vec![],
                 vec![],
                 true,
             );
@@ -595,6 +772,263 @@ mod tests {
             assert!(
                 v.get("arms").is_none(),
                 "no roster survives --fresh: {content}"
+            );
+        });
+    }
+
+    // --- attestation flags (cadence-hooks#775 item 1) ---
+
+    #[test]
+    fn parse_arm_model_accepts_the_arm_charset_and_drops_everything_else() {
+        // #775 item 1 RED: the family is recorded, not validated against a
+        // closed set — what ran is provenance. The charset bound is what keeps
+        // it safe to echo into the verdict line and the marker JSON.
+        let raw = vec![
+            "security=opus".to_string(),
+            "tests=sonnet-4_5".to_string(),
+            "bogus".to_string(),
+            "security=".to_string(),
+            "security=opus\u{1b}[31m".to_string(),
+            format!("security={}", "o".repeat(65)),
+            format!("{}=opus", "n".repeat(65)),
+        ];
+        assert_eq!(
+            parse_arm_model(&raw),
+            vec![
+                ("security".to_string(), "opus".to_string()),
+                ("tests".to_string(), "sonnet-4_5".to_string()),
+            ],
+            "malformed, over-long, and control-byte values drop without failing the record"
+        );
+    }
+
+    #[test]
+    fn parse_arm_report_accepts_printable_ascii_paths_only() {
+        // The path is provenance — never opened, never echoed as content — but
+        // it DOES ride the marker JSON and the verdict line, so it is bounded
+        // to printable ASCII and 512 bytes.
+        let raw = vec![
+            "security=/tmp/security review.md".to_string(),
+            "tests=/tmp/t.md\u{7f}".to_string(),
+            "docs=/tmp/caf\u{e9}.md".to_string(),
+            "simplify=/tmp/a\nb.md".to_string(),
+            format!("lint=/tmp/{}.md", "p".repeat(512)),
+        ];
+        assert_eq!(
+            parse_arm_report(&raw),
+            vec![(
+                "security".to_string(),
+                "/tmp/security review.md".to_string()
+            )],
+            "non-printable, non-ASCII, and over-long paths drop"
+        );
+    }
+
+    #[test]
+    fn parse_arms_caps_name_and_state_at_64_bytes() {
+        // Arm names and states were unbounded — capped in the same pass, same
+        // drop-and-continue behavior as every other malformed value.
+        let raw = vec![
+            "security=ran".to_string(),
+            format!("{}=ran", "n".repeat(65)),
+            format!("security={}", "s".repeat(65)),
+            format!("{}={}", "n".repeat(64), "s".repeat(64)),
+        ];
+        let arms = parse_arms(&raw);
+        assert_eq!(
+            arms,
+            vec![
+                ("security".to_string(), "ran".to_string()),
+                ("n".repeat(64), "s".repeat(64)),
+            ]
+        );
+    }
+
+    #[test]
+    fn marker_content_serializes_the_attest_map_and_omits_an_empty_one() {
+        let attest: BTreeMap<String, ArmAttestation> = [(
+            "security".to_string(),
+            ArmAttestation {
+                model: Some("opus".to_string()),
+                report: Some("/tmp/x.md".to_string()),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let arms = vec![("security".to_string(), "ran".to_string())];
+        let content = marker_content("feat/x", "abc123", "full", &arms, &attest, false);
+        let v: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        assert_eq!(v["attest"]["security"]["model"], "opus");
+        assert_eq!(v["attest"]["security"]["report"], "/tmp/x.md");
+
+        let bare = marker_content("feat/x", "abc123", "full", &arms, &BTreeMap::new(), false);
+        let v: serde_json::Value = serde_json::from_str(&bare).unwrap();
+        assert!(
+            v.get("attest").is_none(),
+            "no attestation → no attest key: {bare}"
+        );
+    }
+
+    #[test]
+    fn run_record_drops_attest_with_no_matching_arm_in_the_same_invocation() {
+        // The binding invariant: `attest.NAME` always describes the run stated
+        // beside it, so a bare `--arm-model` with no `--arm NAME=…` in the same
+        // invocation records nothing.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-attest-unbound-repo";
+            let branch = "feat/record-polish-attest-unbound";
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["tests=ran".into()],
+                vec!["security=opus".into()],
+                vec!["security=/tmp/x.md".into()],
+                false,
+            );
+
+            let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                v.get("attest").is_none(),
+                "an attest with no matching --arm in the same invocation must drop: {content}"
+            );
+        });
+    }
+
+    #[test]
+    fn run_record_restating_an_arm_without_attest_drops_the_prior_attest() {
+        // The other half of the binding: a re-run that states `--arm
+        // security=ran` with no attestation must not inherit the previous
+        // run's attestation — the map would then describe a run that never
+        // reported one.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-attest-restate-repo";
+            let branch = "feat/record-polish-attest-restate";
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into(), "tests=ran".into()],
+                vec!["security=opus".into(), "tests=sonnet".into()],
+                vec![],
+                false,
+            );
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into()],
+                vec![],
+                vec![],
+                false,
+            );
+
+            let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                v["attest"].get("security").is_none(),
+                "a restated arm drops its prior attestation: {content}"
+            );
+            assert_eq!(
+                v["attest"]["tests"]["model"], "sonnet",
+                "an untouched arm keeps its attestation: {content}"
+            );
+        });
+    }
+
+    #[test]
+    fn run_record_fresh_clears_the_attest_map_too() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-attest-fresh-repo";
+            let branch = "feat/record-polish-attest-fresh";
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into()],
+                vec!["security=opus".into()],
+                vec![],
+                false,
+            );
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["tests=ran".into()],
+                vec![],
+                vec![],
+                true,
+            );
+
+            let content = std::fs::read_to_string(polish_marker(repo, branch)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                v.get("attest").is_none(),
+                "--fresh clears the arms map AND the attest map: {content}"
+            );
+        });
+    }
+
+    #[test]
+    fn run_record_round_trips_a_bound_attestation_through_the_marker() {
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-attest-roundtrip-repo";
+            let branch = "feat/record-polish-attest-roundtrip";
+            let report = marker_tmp.path().join("security-review.md");
+            std::fs::write(&report, "findings").unwrap();
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into()],
+                vec!["security=opus".into()],
+                vec![format!("security={}", report.display())],
+                false,
+            );
+
+            let record = read_polish_record(repo, branch).expect("marker reads");
+            let attest = record.attest.expect("attest round-trips");
+            assert_eq!(attest["security"].model.as_deref(), Some("opus"));
+            assert_eq!(
+                attest["security"].report.as_deref(),
+                Some(report.display().to_string().as_str())
+            );
+        });
+    }
+
+    #[test]
+    fn run_record_records_a_report_path_that_does_not_exist() {
+        // A missing report file is a stderr note, never a rejection — the path
+        // is provenance, and no code ever opens it.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-attest-missing-repo";
+            let branch = "feat/record-polish-attest-missing";
+
+            let code = run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into()],
+                vec![],
+                vec!["security=/tmp/definitely-not-here-775.md".into()],
+                false,
+            );
+
+            assert_eq!(code, 0, "a missing report must not fail the record");
+            let record = read_polish_record(repo, branch).expect("marker reads");
+            assert_eq!(
+                record.attest.unwrap()["security"].report.as_deref(),
+                Some("/tmp/definitely-not-here-775.md")
             );
         });
     }
@@ -635,6 +1069,8 @@ mod tests {
                 Some(branch.into()),
                 Some("code".into()),
                 vec!["security=ran".into()],
+                vec![],
+                vec![],
                 false,
             );
 
@@ -665,6 +1101,8 @@ mod tests {
                     "security=skipped".into(),
                     "simplify=ran".into(),
                 ],
+                vec![],
+                vec![],
                 false,
             );
             run_record(
@@ -672,6 +1110,8 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["security=ran".into()],
+                vec![],
+                vec![],
                 false,
             );
 
@@ -696,12 +1136,16 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["tests=ran".into()],
+                vec![],
+                vec![],
                 false,
             );
             run_record(
                 Some(repo.into()),
                 Some(branch.into()),
                 Some("docs".into()),
+                vec![],
+                vec![],
                 vec![],
                 false,
             );
@@ -726,6 +1170,8 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec![],
+                vec![],
+                vec![],
                 false,
             );
 
@@ -749,6 +1195,8 @@ mod tests {
                 Some(branch.into()),
                 Some("code".into()),
                 vec!["security=ran".into()],
+                vec![],
+                vec![],
                 false,
             );
 
@@ -772,6 +1220,8 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["security=skipped".into(), "security=ran".into()],
+                vec![],
+                vec![],
                 false,
             );
 
@@ -789,7 +1239,15 @@ mod tests {
         // every other write-path test in this module.
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
-            run_record(None, None, Some("full".into()), vec![], false);
+            run_record(
+                None,
+                None,
+                Some("full".into()),
+                vec![],
+                vec![],
+                vec![],
+                false,
+            );
         });
     }
 
@@ -857,7 +1315,7 @@ mod tests {
             let (repo_root, branch, head_sha) =
                 resolve(&wt_str, None, None).expect("worktree resolves repo/branch");
             assert_eq!(branch, "feat/thing");
-            let content = marker_content(&branch, &head_sha, "full", &[], false);
+            let content = marker_content(&branch, &head_sha, "full", &[], &BTreeMap::new(), false);
             write_marker(&polish_marker(&repo_root, &branch), &content).unwrap();
 
             // Free the branch from the worktree and check it out on the primary —
@@ -953,7 +1411,7 @@ mod tests {
                     .expect("resolves");
             write_marker(
                 &polish_marker(&repo_root, &branch),
-                &marker_content(&branch, &head_sha, "code", &[], false),
+                &marker_content(&branch, &head_sha, "code", &[], &BTreeMap::new(), false),
             )
             .unwrap();
 

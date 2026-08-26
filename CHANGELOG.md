@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Polish-marker attestation: `record-polish --arm-model` / `--arm-report`** (cadence-hooks#775 item 1). `security=ran` was a self-report with nothing beside it; the marker now carries an additive `attest` map (`"attest": {"security": {"model": "opus", "report": "…"}}`) recording which model family ran an arm and where its report landed. The family is recorded, not validated against a closed set — the point is what actually ran. A partial attestation (one half only) is legal. The report path is provenance only: nothing opens it or reads its contents. Binding rule, both directions: an attestation is accepted only when the same invocation states `--arm NAME=…`, and a restated `--arm NAME=…` drops any prior attestation for that arm — so `attest.NAME` always describes the run stated beside it. `--fresh` clears the attest map along with the roster. Reads are lenient: any unexpected `attest` shape reads as absent, never as an error.
+
+### Changed
+
+- **`record-polish` arm names and states are capped at 64 bytes** (cadence-hooks#775). Both were charset-bounded but length-unbounded, so a megabyte of `[A-Za-z0-9]` rode the marker JSON and the verdict line. Over-long values drop with a stderr note and the rest of the record still lands (ADR-0001) — the `--arm` precedent, not the `--scope` exit-2 path.
+
 ## [0.86.1] - 2026-08-26
 
 ### Added

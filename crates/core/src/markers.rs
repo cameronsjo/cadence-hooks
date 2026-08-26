@@ -23,6 +23,7 @@ use crate::paths;
 use crate::shell::parse_work_dir;
 use crate::{HookEvent, HookInput};
 use jiff::Timestamp;
+use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -237,6 +238,26 @@ pub struct PolishRecord {
     /// When the marker was written — [`crate::time::utc_timestamp`]'s ISO-8601
     /// UTC instant. Absent on legacy markers and on the `"{}"` fixtures.
     pub recorded_at: Option<String>,
+    /// Per-arm attestation (cadence-hooks#775 item 1): what the recorder says
+    /// *ran* the arm, keyed by the same arm name the roster uses. Absent on
+    /// every marker recorded before attestation existed, and — by the record
+    /// side's binding rule — never present for an arm the same invocation did
+    /// not state.
+    pub attest: Option<std::collections::BTreeMap<String, ArmAttestation>>,
+}
+
+/// One arm's attestation: the model family that ran it and where its report
+/// landed. Both halves are optional — a partial attestation is legal, because
+/// a recorder that can name only one of the two should still record it.
+///
+/// The report path is **provenance only**: nothing in this codebase opens it,
+/// reads it, or echoes its contents.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ArmAttestation {
+    /// The model family the recorder says ran this arm (e.g. `opus`).
+    pub model: Option<String>,
+    /// Where the arm's report landed. Never opened — a breadcrumb for a human.
+    pub report: Option<String>,
 }
 
 /// How long a polish marker stays evidence that this branch was polished.
@@ -344,7 +365,37 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
             .get("recorded_at")
             .and_then(|s| s.as_str())
             .map(str::to_string),
+        attest: read_attest(&v),
     })
+}
+
+/// Read the optional `attest` map leniently (cadence-hooks#775 item 1).
+///
+/// Every unexpected shape reads as *absent*, never as an error: a non-object
+/// `attest`, a non-object entry, and a non-string `model`/`report` all drop
+/// the offending level rather than failing the record. The map only ever
+/// *causes* a nudge (a non-Opus security family), so degrading toward absent
+/// is the fail-open direction (ADR-0001).
+fn read_attest(v: &serde_json::Value) -> Option<BTreeMap<String, ArmAttestation>> {
+    let field = |entry: &serde_json::Map<String, serde_json::Value>, key: &str| {
+        entry.get(key).and_then(|s| s.as_str()).map(str::to_string)
+    };
+    Some(
+        v.get("attest")?
+            .as_object()?
+            .iter()
+            .filter_map(|(name, entry)| {
+                let entry = entry.as_object()?;
+                Some((
+                    name.clone(),
+                    ArmAttestation {
+                        model: field(entry, "model"),
+                        report: field(entry, "report"),
+                    },
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// The daily-gate marker path for `kind`: `<marker_dir>/daily-{kind}`.
@@ -1132,6 +1183,67 @@ mod tests {
                 Some("ran")
             );
             assert!(!rec.arms.as_ref().unwrap().contains_key("tests"));
+        });
+    }
+
+    // --- attestation (cadence-hooks#775 item 1) ---
+
+    #[test]
+    fn read_polish_record_parses_the_attest_map() {
+        // #775 item 1 RED: `security=ran` is a self-report; the attest map is
+        // the provenance beside it — which model family ran the arm, and where
+        // its report landed. Partial attest (one half only) is legal.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/keyed-polish-attest";
+            let branch = "feat/attest-read";
+            write_marker(
+                &polish_marker(repo, branch),
+                r#"{"scope":"full","arms":{"security":"ran","tests":"ran"},
+                    "attest":{"security":{"model":"opus","report":"/tmp/x.md"},
+                              "tests":{"model":"sonnet"}}}"#,
+            )
+            .unwrap();
+
+            let rec = read_polish_record(repo, branch).expect("marker reads");
+            let attest = rec.attest.as_ref().expect("attest map present");
+            assert_eq!(attest["security"].model.as_deref(), Some("opus"));
+            assert_eq!(attest["security"].report.as_deref(), Some("/tmp/x.md"));
+            assert_eq!(attest["tests"].model.as_deref(), Some("sonnet"));
+            assert_eq!(
+                attest["tests"].report, None,
+                "a partial attest is legal — report may be absent"
+            );
+        });
+    }
+
+    #[test]
+    fn read_polish_record_reads_a_garbage_attest_shape_as_absent() {
+        // Untrusted content: any unexpected JSON shape degrades to *absent*,
+        // never an error and never a fabricated attestation (ADR-0001).
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/keyed-polish-attest-garbage";
+            for (i, body) in [
+                r#"{"attest":"opus"}"#,
+                r#"{"attest":["opus"]}"#,
+                r#"{"attest":{"security":"opus"}}"#,
+                r#"{"attest":{"security":{"model":7,"report":[]}}}"#,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let branch = format!("feat/attest-garbage-{i}");
+                write_marker(&polish_marker(repo, &branch), body).unwrap();
+                let rec = read_polish_record(repo, &branch).expect("marker still reads");
+                let absent = match &rec.attest {
+                    None => true,
+                    Some(map) => map
+                        .get("security")
+                        .is_none_or(|a| a.model.is_none() && a.report.is_none()),
+                };
+                assert!(absent, "garbage attest must read as absent: {body}");
+            }
         });
     }
 
