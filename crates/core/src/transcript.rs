@@ -33,6 +33,38 @@ pub fn read_tail(path: &Path) -> Option<String> {
     read_tail_bounded(path, TAIL_READ_MAX_BYTES)
 }
 
+/// Read at most `max_bytes` from the START of `path`, returning whole lines.
+///
+/// [`read_tail_bounded`]'s head-side sibling, for consumers that resolve a
+/// field off the transcript's FIRST rows (e.g. the injected implement-plan
+/// prompt an approve-and-clear launch writes as the session's first user
+/// line). Same containment posture: the cap is enforced with `take`, a
+/// non-regular target is rejected on the pre-open `stat`, and when the file
+/// is larger than the cap the trailing partial line — a fragment the caller
+/// would not have parsed anyway — is dropped, so every returned line is
+/// complete. `None` on any open/stat/read failure or non-UTF-8 content.
+pub fn read_head_bounded(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read as _;
+
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None; // FIFO / device / dir / broken symlink
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(meta.len().min(max_bytes) as usize);
+    file.take(max_bytes).read_to_end(&mut buf).ok()?;
+
+    if meta.len() > max_bytes {
+        // Drop the trailing partial line: `\n` cannot occur inside a
+        // multi-byte UTF-8 sequence, so truncating after the last `\n` keeps
+        // the remainder valid and line-complete. A window with no newline at
+        // all is entirely one fragment, so all of it goes.
+        let cut = buf.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1);
+        buf.truncate(cut);
+    }
+    String::from_utf8(buf).ok()
+}
+
 /// Read at most `max_bytes` from the END of `path`, returning whole lines.
 ///
 /// The transcript resolvers in this module all scan from the tail

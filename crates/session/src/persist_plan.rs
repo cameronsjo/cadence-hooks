@@ -1,27 +1,46 @@
-//! `session persist-plan-approval` (PostToolUse:ExitPlanMode) — persist an
-//! approved plan whose approving turn would otherwise leave no durable trace
-//! (cadence#505, cadence-hooks#396).
+//! `session persist-plan-approval` (PostToolUse) — persist an approved plan
+//! whose approving turn would otherwise leave no durable trace (cadence#505,
+//! cadence-hooks#396).
 //!
-//! One trigger, fired once at approval. Live probe (2026-07-25,
-//! cadence-hooks#396 comment 5080816947) established that
-//! `PostToolUse:ExitPlanMode` fires on a same-session approval carrying the
-//! plan text in `tool_response.plan`; the current harness also fills
-//! `tool_input.plan` and names the plan-store copy in `planFilePath`
-//! (cadence-hooks#672), so the source chain is response → input → store file.
+//! Two recognition paths behind one PostToolUse wiring:
 //!
-//! A second, UserPromptSubmit-driven arm (`session persist-plan`) used to
-//! re-scan every prompt for the harness's approve-and-clear re-injection and
-//! re-persist it. It held the RAW approved text — stale the moment a plan
-//! starts living (ticked boxes, a settled `Panel:`, `## Deviations`,
-//! `status:`) — and so every later fire wrote or stamped that stale copy where
-//! a consumer reads first: raw duplicate siblings (cadence-hooks#703, #724,
-//! #729), a second frontmatter block over a ticked plan (#738), writes into
-//! the primary checkout (#739). Three rounds of "is this plan already on
-//! disk" recognition heuristics could not keep up with a document that drifts
-//! away from every hash by design, so the arm was removed (2026-08-20) rather
-//! than fixed a fourth time. The approve-and-clear path now relies on the
-//! rules' copy rule (cadence-rules § Plans) when no approval-time persist
-//! happened.
+//! 1. **Same-session approval** (`tool_name == ExitPlanMode`). Live probe
+//!    (2026-07-25, cadence-hooks#396 comment 5080816947) established that
+//!    `PostToolUse:ExitPlanMode` fires on a same-session approval carrying
+//!    the plan text in `tool_response.plan`; the current harness also fills
+//!    `tool_input.plan` and names the plan-store copy in `planFilePath`
+//!    (cadence-hooks#672), so the source chain is response → input → store
+//!    file.
+//! 2. **Approve-and-clear** (any other tool). The harness's
+//!    approve-and-clear path never completes the `ExitPlanMode` call — it
+//!    DENIES the tool (recorded as "User rejected tool use") and launches a
+//!    fresh session whose first user message is `Implement the following
+//!    plan:\n\n<plan>` (verified against the 2.1.243 bundle and the
+//!    2026-08-24 silver-fugue → brisk-scale approval), and no
+//!    UserPromptSubmit fires for that injected message. So path 1 never sees
+//!    it. This arm runs on the child session's PostToolUse events: once per
+//!    session (a [`cadence_hooks_core::markers::session_marker`]) it reads
+//!    the transcript HEAD, and when the session's first user message is the
+//!    injected implement-prompt it persists that plan, attributing
+//!    `approved_in` to the parent session named by the prompt's
+//!    transcript-pointer paragraph.
+//!
+//! A previous UserPromptSubmit-driven arm (`session persist-plan`) covered
+//! approve-and-clear by re-scanning EVERY prompt and re-persisting. It held
+//! the RAW approved text — stale the moment a plan starts living (ticked
+//! boxes, a settled `Panel:`, `## Deviations`, `status:`) — and so every
+//! later fire wrote or stamped that stale copy where a consumer reads first:
+//! raw duplicate siblings (cadence-hooks#703, #724, #729), a second
+//! frontmatter block over a ticked plan (#738), writes into the primary
+//! checkout (#739). Three rounds of "is this plan already on disk"
+//! recognition heuristics could not keep up with a document that drifts away
+//! from every hash by design, so the arm was removed in 0.82.0 rather than
+//! fixed a fourth time — which killed ALL approve-and-clear coverage (the
+//! regression this arm repairs). Path 2 differs from that arm in the two
+//! ways that made it unmaintainable: it fires from the FIRST transcript rows
+//! (text still byte-identical to the approval, so the hash-idempotency tiers
+//! hold), and the session marker bounds it to one scan per session — never a
+//! per-prompt re-recognition of a document that has started living.
 //!
 //! The write is body-hash-idempotent through [`persist_and_nudge`]:
 //! `claim_target`'s `O_EXCL` collision ladder, the frontmatter render
@@ -64,6 +83,23 @@ const SUFFIX_LINE_PREFIX: &str = "If this plan can be broken down";
 /// carries either paragraph. Stripped by the same trailing-line-prefix
 /// mechanism as `SUFFIX_LINE_PREFIX` — a line matching EITHER prefix pops.
 const POINTER_PARAGRAPH_PREFIX: &str = "If you need specific details from before exiting plan mode";
+
+/// Prefix of the first user message an approve-and-clear launch injects into
+/// the child session — `Implement the following plan:\n\n<plan>` in the
+/// 2.1.243 bundle (`initialMessage` template, `clearContext:!0` branch).
+/// Matched on the prefix so template drift after the colon never blinds the
+/// arm.
+const INJECTED_PLAN_PREFIX: &str = "Implement the following plan:";
+
+/// Marker kind bounding the injected-prompt scan to once per session — see
+/// [`run_injected_plan_persist`].
+const INJECTED_SCAN_MARKER_KIND: &str = "persist-plan-injected";
+
+/// Bound on the transcript HEAD read the injected-prompt arm performs. The
+/// injected prompt is among the first rows; 1 MiB (the plan-store cap's
+/// sibling) covers any real plan plus the handful of preceding
+/// SessionStart-attachment rows many times over.
+const INJECTED_HEAD_READ_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Cap on the generated slug's length (before the date prefix).
 const MAX_SLUG_LEN: usize = 60;
@@ -141,10 +177,16 @@ impl Check for PersistPlanApproval {
         let utc_now = cadence_hooks_core::time::utc_timestamp();
         let local_date = cadence_hooks_core::time::local_date();
         // Narrow defense-in-depth on top of the dispatch-layer panic guard
-        // (cameronsjo/cadence-hooks#349): this fires on every `ExitPlanMode`
-        // call, and a bug here must not eat the approval.
-        std::panic::catch_unwind(|| run_persist_plan_approval(input, &utc_now, &local_date, &host))
-            .unwrap_or_else(|_| CheckResult::allow())
+        // (cameronsjo/cadence-hooks#349): this fires on every PostToolUse
+        // call, and a bug here must not eat the approval (or the tool call).
+        std::panic::catch_unwind(|| {
+            if input.tool_name() == Some("ExitPlanMode") {
+                run_persist_plan_approval(input, &utc_now, &local_date, &host)
+            } else {
+                run_injected_plan_persist(input, &utc_now, &local_date, &host)
+            }
+        })
+        .unwrap_or_else(|_| CheckResult::allow())
     }
 }
 
@@ -197,6 +239,171 @@ pub fn run_persist_plan_approval(
     if body.is_empty() {
         return CheckResult::allow();
     }
+    // Same-session approval: the approving identity IS the executing session
+    // — no sibling-transcript scan needed (Design record item 2).
+    persist_plan_body(input, utc_now, local_date, host, &body, input.session_id())
+}
+
+/// The injected-prompt arm — approve-and-clear coverage (module doc path 2).
+///
+/// Fires on every non-`ExitPlanMode` PostToolUse, but does real work at most
+/// once per session: a definitive verdict about the transcript's first user
+/// message — injected implement-prompt or not — writes a session marker that
+/// short-circuits every later fire. A head read that finds NO user row yet
+/// (the harness appends the injected prompt to the transcript only after
+/// SessionStart settles, so a very early fire can race it) leaves the marker
+/// unwritten and retries on the next tool call.
+///
+/// Same fail-open posture as the approval arm: a subagent context, an unsafe
+/// session id, an unreadable transcript, or any persist-pipeline failure
+/// degrades to `CheckResult::allow()`.
+pub fn run_injected_plan_persist(
+    input: &HookInput,
+    utc_now: &str,
+    local_date: &str,
+    host: &str,
+) -> CheckResult {
+    // A subagent's PostToolUse stream never persists — its transcript head is
+    // its task prompt, which an orchestrator can legitimately open with plan
+    // text; only the top-level session's injected prompt is an approval.
+    if input.agent_id().is_some() {
+        return CheckResult::allow();
+    }
+    if input
+        .session_id()
+        .filter(|s| identity::is_safe_session_id(s))
+        .is_none()
+    {
+        return CheckResult::allow();
+    }
+    let marker =
+        cadence_hooks_core::markers::session_marker(input, INJECTED_SCAN_MARKER_KIND, None);
+    if marker.exists() {
+        return CheckResult::allow();
+    }
+    let Some(transcript_path) = input.transcript_path() else {
+        return CheckResult::allow();
+    };
+    let Some(head) = cadence_hooks_core::transcript::read_head_bounded(
+        Path::new(transcript_path),
+        INJECTED_HEAD_READ_MAX_BYTES,
+    ) else {
+        return CheckResult::allow();
+    };
+    let raw_plan = match injected_first_prompt(&head) {
+        // No user row in the head yet — not a verdict; retry on a later fire.
+        InjectedScan::NoUserRowYet => return CheckResult::allow(),
+        InjectedScan::NotInjected => {
+            let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+            return CheckResult::allow();
+        }
+        InjectedScan::Plan(raw) => raw,
+    };
+    // Definitive verdict: bound the scan to this one fire even if the persist
+    // below declines (opt-out, no repo, hash already on disk) — those are
+    // stable conditions a retry would only re-litigate every tool call.
+    let _ = cadence_hooks_core::markers::write_marker(&marker, "");
+
+    let body = strip_trailing_suffix_lines_and_trim(&raw_plan);
+    if body.is_empty() {
+        return CheckResult::allow();
+    }
+    let approving = parent_session_id_from_pointer(&raw_plan);
+    persist_plan_body(
+        input,
+        utc_now,
+        local_date,
+        host,
+        &body,
+        approving.as_deref(),
+    )
+}
+
+/// Verdict of one bounded scan of a transcript head for the injected
+/// implement-prompt — see [`injected_first_prompt`].
+enum InjectedScan {
+    /// The head carries no user row at all yet — scan again later.
+    NoUserRowYet,
+    /// The first user message exists and is NOT the injected implement-prompt.
+    NotInjected,
+    /// The first user message is the injected implement-prompt; the payload is
+    /// its full text (prefix stripped, harness suffix paragraphs still on).
+    Plan(String),
+}
+
+/// Resolve the transcript's first main-chain user message and classify it
+/// against [`INJECTED_PLAN_PREFIX`].
+///
+/// Rows are newline-delimited JSON; anything unparseable, sidechain
+/// (`isSidechain: true`), or non-`user` is skipped. The first user row whose
+/// `message.content` yields text decides — string content directly, array
+/// content via its first `{"type":"text"}` item (both shapes are live). A
+/// first user row with no text at all (e.g. a bare tool-result row after a
+/// resume) reads as [`InjectedScan::NotInjected`]: whatever this session is,
+/// its first message is not the injected approval.
+fn injected_first_prompt(head: &str) -> InjectedScan {
+    for line in head.lines() {
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if row.get("type").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        if row.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let content = row.get("message").and_then(|m| m.get("content"));
+        let text = match content {
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(Value::Array(items)) => items
+                .iter()
+                .find(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .and_then(|item| item.get("text"))
+                .and_then(Value::as_str),
+            _ => None,
+        };
+        return match text {
+            Some(text) => match text.strip_prefix(INJECTED_PLAN_PREFIX) {
+                Some(rest) => InjectedScan::Plan(rest.to_string()),
+                None => InjectedScan::NotInjected,
+            },
+            None => InjectedScan::NotInjected,
+        };
+    }
+    InjectedScan::NoUserRowYet
+}
+
+/// The approving (parent) session id, parsed from the injected prompt's
+/// transcript-pointer paragraph — "…read the full transcript at:
+/// `<dir>/<session-id>.jsonl`". `None` when the paragraph is absent or its
+/// final path component's stem fails [`identity::is_safe_session_id`] — the
+/// persist then simply omits `approved_in:` (silence, not a guess).
+fn parent_session_id_from_pointer(raw_plan: &str) -> Option<String> {
+    let pointer = raw_plan
+        .lines()
+        .find(|l| l.trim_start().starts_with(POINTER_PARAGRAPH_PREFIX))?;
+    let jsonl = pointer
+        .split_whitespace()
+        .rev()
+        .find(|token| token.ends_with(".jsonl"))?;
+    let stem = Path::new(jsonl).file_stem()?.to_str()?;
+    identity::is_safe_session_id(stem).then(|| stem.to_string())
+}
+
+/// Shared persist tail for both recognition paths: resolve the repo, render
+/// the frontmatter, write once, append the plan-links row, nudge.
+/// `approving_session_id` names the session whose operator approved the plan
+/// — the executing session itself on a same-session approval, the parent on
+/// an approve-and-clear pickup, `None` when unknown (then `approved_in:` is
+/// omitted and the row carries a null parent).
+fn persist_plan_body(
+    input: &HookInput,
+    utc_now: &str,
+    local_date: &str,
+    host: &str,
+    body: &str,
+    approving_session_id: Option<&str>,
+) -> CheckResult {
     let Some(cwd) = input.cwd.as_deref() else {
         return CheckResult::allow();
     };
@@ -217,7 +424,7 @@ pub fn run_persist_plan_approval(
     };
 
     let body_hash = sha256_hex(body.as_bytes());
-    let slug = slugify(&body);
+    let slug = slugify(body);
     let Some((repo_root, plans_dir)) = canonical_plans_dir(&repo_root) else {
         return CheckResult::allow();
     };
@@ -225,9 +432,11 @@ pub fn run_persist_plan_approval(
 
     let own_name = identity::generate_name(session_id);
     let machine_digest = crate::provenance::machine_digest(host);
-    // Same-session approval: the executing transcript HAS just recorded the
-    // approving turn (no wipe occurred), so it's a reliable model/harness
-    // source with no sibling-transcript fallback needed.
+    // The executing transcript is a reliable model/harness source on both
+    // paths: same-session it has just recorded the approving turn, and on an
+    // approve-and-clear pickup the child session's own rows carry its model
+    // and harness — which are what `model:`/`harness:` describe (the
+    // executing session, not the approving one).
     let transcript_content = input
         .transcript_path()
         .and_then(|tp| cadence_hooks_core::transcript::read_tail(Path::new(tp)));
@@ -235,6 +444,12 @@ pub fn run_persist_plan_approval(
     let harness = crate::warn_commit_provenance::resolve_harness(transcript_content.as_deref());
     let branch = current_branch(cwd);
 
+    let approving = approving_session_id.filter(|s| identity::is_safe_session_id(s));
+    let approving_name = approving.map(identity::generate_name);
+    let approved_in = match (approving_name.as_deref(), approving) {
+        (Some(name), Some(id)) => Some((name, id)),
+        _ => None,
+    };
     let fields = FrontmatterFields {
         updated: local_date,
         branch: branch.as_deref(),
@@ -244,11 +459,9 @@ pub fn run_persist_plan_approval(
         model: model.as_deref(),
         harness: harness.as_deref(),
         machine_digest: &machine_digest,
-        // Same-session approval: the approving identity IS the executing
-        // session — no sibling-transcript scan needed (Design record item 2).
-        approved_in: Some((own_name.as_str(), session_id)),
+        approved_in,
     };
-    let document = render_document(&fields, &body);
+    let document = render_document(&fields, body);
 
     persist_and_nudge(
         &plans_dir,
@@ -257,13 +470,13 @@ pub fn run_persist_plan_approval(
         &body_hash,
         &document,
         utc_now,
-        Some(session_id),
+        approving,
         session_id,
         &machine_digest,
         &repo_root,
-        &own_name,
-        &body,
-        recommended_tier(&body),
+        approving_name.as_deref().unwrap_or("an earlier session"),
+        body,
+        recommended_tier(body),
     )
 }
 
@@ -3099,5 +3312,273 @@ mod tests {
             first_write, second_write,
             "the file must never be rewritten"
         );
+    }
+
+    // --- injected-prompt arm (approve-and-clear coverage) ---
+
+    /// A transcript whose rows mirror the live approve-and-clear shape: a few
+    /// non-user rows first, then the first user row carrying `text` as string
+    /// content.
+    fn write_child_transcript(dir: &Path, first_user_text: &str) -> PathBuf {
+        let path = dir.join("child-transcript.jsonl");
+        let user_row = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": first_user_text},
+        });
+        let content = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"mode","mode":"normal"}"#,
+            r#"{"type":"attachment","attachment":{"type":"hook_success","hookName":"SessionStart:clear"}}"#,
+            user_row,
+        );
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The injected prompt as the harness composes it: prefix, plan body,
+    /// pointer paragraph naming the parent transcript, breakdown suffix.
+    fn injected_prompt(parent_id: &str) -> String {
+        format!(
+            "Implement the following plan:\n\n# Injected Plan\n\nDo the injected thing.\n\n\
+             If you need specific details from before exiting plan mode (like exact code \
+             snippets), read the full transcript at: /Users/x/.claude/projects/p/{parent_id}.jsonl\n\n\
+             If this plan can be broken down into discrete units of work, consider using the \
+             Agent tool to dispatch them."
+        )
+    }
+
+    /// Session ids must be unique per test INVOCATION, not just per test:
+    /// the injected arm's session marker lives in the stable marker temp dir
+    /// and survives across `cargo test` runs, so a reused id inherits a
+    /// marker an earlier run wrote and every persist assertion reads Allow.
+    fn unique_session_id(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{tag}-{}-{nanos}", std::process::id())
+    }
+
+    fn injected_input(cwd: &str, transcript: &Path, session_id: &str) -> HookInput {
+        HookInput {
+            tool_name: Some("Bash".into()),
+            cwd: Some(cwd.into()),
+            session_id: Some(session_id.into()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn injected_arm_persists_the_implement_prompt_plan() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let parent_id = "11111111-2222-3333-4444-555555555501";
+        let transcript = write_child_transcript(tmp.path(), &injected_prompt(parent_id));
+        let sid = unique_session_id("child-e2e");
+        let input = injected_input(&cwd, &transcript, &sid);
+
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge, "injected plan must persist");
+        let doc =
+            fs::read_to_string(tmp.path().join("docs/plans/2026-08-25-injected-plan.md")).unwrap();
+        let parent_name = identity::generate_name(parent_id);
+        assert!(
+            doc.contains(&format!("approved_in: \"{parent_name}\"")),
+            "approved_in must name the PARENT session, not the child: {doc}"
+        );
+        assert!(
+            doc.contains(&format!("approved_session_id: \"{parent_id}\"")),
+            "approved_session_id must carry the parent id: {doc}"
+        );
+        assert!(
+            doc.ends_with("Do the injected thing.\n"),
+            "harness suffix paragraphs must be stripped: {doc}"
+        );
+        let rows = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
+        assert_eq!(row["parent_session_id"], parent_id);
+        assert_eq!(row["child_session_id"], Value::from(sid.as_str()));
+    }
+
+    #[test]
+    fn injected_arm_marker_bounds_the_scan_to_once_per_session() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        // First fire: an ordinary greeting — definitive NotInjected.
+        let transcript = write_child_transcript(tmp.path(), "good morning");
+        let sid = unique_session_id("child-marker");
+        let input = injected_input(&cwd, &transcript, &sid);
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+
+        // Second fire: even if the transcript now LOOKS injected (it can't in
+        // reality — the first row is immutable — but this pins the marker
+        // short-circuit), nothing persists.
+        let transcript = write_child_transcript(
+            tmp.path(),
+            &injected_prompt("11111111-2222-3333-4444-555555555502"),
+        );
+        let input = injected_input(&cwd, &transcript, &sid);
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Allow, "marker must short-circuit");
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-08-25-injected-plan.md")
+                .exists(),
+            "a NotInjected verdict is final for the session"
+        );
+    }
+
+    #[test]
+    fn injected_arm_no_user_row_yet_leaves_no_marker_and_retries() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        // Head with no user row at all — the SessionStart race window.
+        let transcript = tmp.path().join("child-transcript.jsonl");
+        fs::write(&transcript, "{\"type\":\"mode\",\"mode\":\"normal\"}\n").unwrap();
+        let sid = unique_session_id("child-race");
+        let input = injected_input(&cwd, &transcript, &sid);
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+
+        // The prompt lands; the NEXT fire must still be able to persist.
+        let transcript = write_child_transcript(
+            tmp.path(),
+            &injected_prompt("11111111-2222-3333-4444-555555555503"),
+        );
+        let input = injected_input(&cwd, &transcript, &sid);
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(
+            r.outcome,
+            Outcome::Nudge,
+            "no-user-row must not burn the marker"
+        );
+        assert!(
+            tmp.path()
+                .join("docs/plans/2026-08-25-injected-plan.md")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn injected_arm_subagent_context_never_persists() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = write_child_transcript(
+            tmp.path(),
+            &injected_prompt("11111111-2222-3333-4444-555555555504"),
+        );
+        let sid = unique_session_id("child-agent");
+        let mut input = injected_input(&cwd, &transcript, &sid);
+        input.agent_id = Some("a1".into());
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Allow);
+        assert!(
+            !tmp.path()
+                .join("docs/plans/2026-08-25-injected-plan.md")
+                .exists(),
+            "a subagent's task prompt is not an approval"
+        );
+    }
+
+    #[test]
+    fn injected_arm_without_pointer_omits_approved_in() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let metrics_dir = TempDir::new().unwrap();
+        let transcript = write_child_transcript(
+            tmp.path(),
+            "Implement the following plan:\n\n# Pointerless Plan\n\nJust the body.",
+        );
+        let sid = unique_session_id("child-noptr");
+        let input = injected_input(&cwd, &transcript, &sid);
+        let r = with_metrics_dir(metrics_dir.path(), || {
+            run_injected_plan_persist(&input, "2026-08-25T00:00:00Z", "2026-08-25", "test-host")
+        });
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let doc = fs::read_to_string(tmp.path().join("docs/plans/2026-08-25-pointerless-plan.md"))
+            .unwrap();
+        assert!(
+            !doc.contains("approved_in:"),
+            "unknown approver must be omitted, never guessed: {doc}"
+        );
+        let rows = fs::read_to_string(metrics_dir.path().join("plan-links.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
+        assert_eq!(row["parent_session_id"], Value::Null);
+    }
+
+    // --- injected_first_prompt / parent pointer (pure) ---
+
+    #[test]
+    fn injected_scan_array_content_reads_first_text_item() {
+        let head = concat!(
+            "{\"type\":\"attachment\"}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\
+             \"text\":\"Implement the following plan:\\n\\n# A\\n\\nb\"}]}}\n",
+        );
+        match injected_first_prompt(head) {
+            InjectedScan::Plan(rest) => assert!(rest.contains("# A")),
+            _ => panic!("array-shaped content must classify as Plan"),
+        }
+    }
+
+    #[test]
+    fn injected_scan_skips_sidechain_user_rows() {
+        let head = concat!(
+            "{\"type\":\"user\",\"isSidechain\":true,\"message\":{\"content\":\
+             \"Implement the following plan:\\n\\nsub-task\"}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":\"good morning\"}}\n",
+        );
+        assert!(
+            matches!(injected_first_prompt(head), InjectedScan::NotInjected),
+            "a sidechain row must not decide the verdict"
+        );
+    }
+
+    #[test]
+    fn injected_scan_first_user_row_without_text_is_not_injected() {
+        let head = "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\"}]}}\n";
+        assert!(matches!(
+            injected_first_prompt(head),
+            InjectedScan::NotInjected
+        ));
+    }
+
+    #[test]
+    fn parent_pointer_parses_the_transcript_stem() {
+        let raw = injected_prompt("11111111-2222-3333-4444-555555555505");
+        assert_eq!(
+            parent_session_id_from_pointer(&raw).as_deref(),
+            Some("11111111-2222-3333-4444-555555555505")
+        );
+    }
+
+    #[test]
+    fn parent_pointer_rejects_an_unsafe_stem() {
+        let raw = "If you need specific details from before exiting plan mode, read the full \
+                   transcript at: /tmp/$(evil).jsonl";
+        assert_eq!(parent_session_id_from_pointer(raw), None);
     }
 }
