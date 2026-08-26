@@ -150,7 +150,15 @@ fn settled_panel_none_with_no_boxes_nudges_once_and_allows() {
         !ctx.contains("an Alternatives-declined stanza"),
         "alternatives present: {ctx}"
     );
-    assert_eq!(ctx.matches('.').count(), 1, "one sentence: {ctx}");
+    assert_eq!(
+        ctx.matches("plan-shape gate:").count(),
+        1,
+        "one composed line, not one per stanza: {ctx}"
+    );
+    assert!(
+        ctx.ends_with("the plan template: `cadence:arrange` `references/plan-template.md`."),
+        "the nudge ends at the template's home: {ctx}"
+    );
 }
 
 #[test]
