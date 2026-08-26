@@ -810,7 +810,26 @@ fn segment_ship_anchor(segment: &str) -> Option<&'static str> {
     let tokens = tokenize(strip_group_wrappers(segment));
     let invocation = gh_pr_invocation(&tokens)?;
     match invocation.subcommand {
-        "ready" => Some("ready"),
+        // `gh pr ready --undo` flips the PR back to DRAFT — it un-ships, the
+        // exact inverse of the moment this anchor names.
+        //
+        // Two separate scopings are at work, and neither is the other:
+        //
+        // - **Sibling isolation comes from segmentation**, not from this scan.
+        //   [`command_segments`] has already cut the line at `;`/`&&`/`|`, so
+        //   `some-tool --undo ; gh pr ready 12` never presents the sibling's
+        //   flag to this function at all.
+        // - **Scanning `operands` rather than the whole token stream** buys the
+        //   pre-subcommand region: `gh --undo pr ready 12` still anchors,
+        //   because a token before `pr ready` is not an argument to `ready`.
+        //   (This is NOT the scoping the `create` arm uses — that one scans
+        //   whole-segment `tokens`.)
+        //
+        // Deliberately consults neither `retargeted` nor
+        // `targets_the_current_branch()`: a retargeted `gh -R owner/r pr ready
+        // 12` is a real ship and must keep anchoring, and requiring the current
+        // branch would kill the canonical `gh pr ready <n>` spelling.
+        "ready" if !carries_undo_flag(invocation.operands) => Some("ready"),
         "create" if !tokens.iter().any(|t| t == "--draft" || t == "-d") => Some("create"),
         "merge" if invocation.targets_the_current_branch() => Some("merge"),
         _ => None,
@@ -932,6 +951,47 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
         i += 1;
     }
     true
+}
+
+/// True when `operands` carry a `--undo` that **gh will actually receive** —
+/// the un-ship spelling of `gh pr ready`, which flips a PR back to draft.
+///
+/// Redirect targets and here-string words are skipped for the same reason
+/// [`operands_are_flags_only`] skips them: the shell consumes them, so gh never
+/// sees them. `gh pr ready 12 > --undo` writes a file literally named `--undo`
+/// and ships the PR for real; counting it would suppress a genuine ship, which
+/// is the costly direction (a missed nudge, never a wrong block).
+fn carries_undo_flag(operands: &[String]) -> bool {
+    let mut i = 0;
+    while let Some(token) = operands.get(i) {
+        let token = token.as_str();
+        // A comment ends the command — nothing after it reaches gh. Equality,
+        // not a prefix, for the reason spelled out in [`operands_are_flags_only`]:
+        // a quoted flag value may merely begin with `#`.
+        if token == "#" {
+            return false;
+        }
+        if is_redirect_token(token) {
+            // A bare operator (`>`, `2>`, `<<<`) takes the NEXT token as its
+            // target; an attached one (`>log`, `2>&1`) carries its own.
+            if token.ends_with('>') || token.ends_with('<') {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // EQUALITY, not a prefix or a `split('=')` normalization. The attached
+        // form is left deliberately unhandled and errs toward the FALSE NUDGE:
+        // `--undo=false` is a real ship, and a prefix match would suppress it
+        // (the costly direction), while `--undo=true` merely anchors wrongly —
+        // one spurious nudge on a fail-open advisory, the same accepted gap the
+        // `create` arm carries for `--draft=true`.
+        if token == "--undo" {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// True for a shell redirection token in any spelling `tokenize` can produce:
@@ -4042,6 +4102,33 @@ mod tests {
         // `gh pr ready` leaves draft → the ship moment.
         assert!(is_polish_ship_anchor("gh pr ready 12"));
         assert!(is_polish_ship_anchor("cd repo && gh pr ready"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_skips_ready_undo() {
+        // `--undo` flips the PR BACK to draft — it un-ships, so it must not
+        // anchor the gate (nor count as a ship for the changelog nudge).
+        assert!(!is_polish_ship_anchor("gh pr ready --undo"));
+        assert!(!is_polish_ship_anchor("gh pr ready 12 --undo"));
+        assert!(!is_polish_ship_anchor("cd repo && gh pr ready --undo"));
+        // A retargeted un-ship is still an un-ship.
+        assert!(!is_polish_ship_anchor("gh -R owner/r pr ready 12 --undo"));
+        // Wrapper expansion must reach it, matching the `sh -c` draft case.
+        assert!(!is_polish_ship_anchor("sh -c 'gh pr ready --undo'"));
+        // Segmentation — not this scan — isolates an unrelated sibling's flag.
+        assert!(is_polish_ship_anchor("some-tool --undo ; gh pr ready 12"));
+        // Scanning OPERANDS, not the whole segment: a token before the
+        // subcommand is not an argument to `ready`, so this is a real ship.
+        assert!(is_polish_ship_anchor("gh --undo pr ready 12"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_ready_undo_as_a_redirect_target_still_anchors() {
+        // The shell eats a redirect target and a here-string word — gh never
+        // sees the flag, so these ship for real. Suppressing them would be the
+        // costly direction (a missed nudge on a genuine ship).
+        assert!(is_polish_ship_anchor("gh pr ready 12 > --undo"));
+        assert!(is_polish_ship_anchor("gh pr ready 12 <<< --undo"));
     }
 
     #[test]
