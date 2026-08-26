@@ -50,6 +50,12 @@
 //!   absent → **nudge**, naming the expiry so it doesn't read as a false
 //!   positive on a branch that visibly was polished (cadence-hooks#775).
 //!
+//! - a marker whose attestation says the security arm ran, but names a model
+//!   family that is not Opus, on a branch that touches code → the
+//!   **wrong-family nudge** (cadence-hooks#775 item 1). An *unattested*
+//!   `security=ran` stays silent — every marker the estate carries today is
+//!   unattested, so escalating those is a rollout nag, not a finding.
+//!
 //! One **annotation** rides the otherwise-silent allow, as exit-0 context
 //! rather than an escalation (cadence-hooks#775): a degraded — non-private —
 //! marker directory, which silently disables the roster read on that machine.
@@ -97,7 +103,7 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 /// pre-#467 behavior. Only an affirmative `Some(false)` (an explicit
 /// `security=skipped` roster entry, or a `scope: docs` pass, which never
 /// dispatches the security arm) can escalate to the security nudge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerState {
     /// No polish marker for this branch (or repo/branch/cwd unresolved).
     Absent,
@@ -108,8 +114,23 @@ pub enum MarkerState {
     /// (cadence-hooks#775).
     Expired,
     /// A marker exists; `security_ran` per the roster/scope, `None` = unknown.
-    Present { security_ran: Option<bool> },
+    ///
+    /// `security_model` is the attested model family for the security arm
+    /// (cadence-hooks#775 item 1), `None` on every unattested marker — which is
+    /// every marker the estate carries today, and which stays silent.
+    Present {
+        security_ran: Option<bool>,
+        security_model: Option<String>,
+    },
 }
+
+/// The one model family that satisfies the security arm's independent-review
+/// requirement (Usage Principle U9 — security judgment does not economize).
+///
+/// Closed on the READ side only: the record side records what actually ran,
+/// whatever it was. A recorded family outside this set is what the gate
+/// escalates on.
+const SATISFYING_SECURITY_FAMILY: &str = "opus";
 
 /// Gates `/polish` (cadence-forge:polish) before opening a PR — conditional on a
 /// branch-scoped polish marker recorded by a completed polish pass.
@@ -139,6 +160,7 @@ impl Check for NudgePolishBeforePr {
             (true, Some(record)) if record.is_expired() => MarkerState::Expired,
             (true, record) => MarkerState::Present {
                 security_ran: record.as_ref().and_then(|r| r.security_ran()),
+                security_model: record.as_ref().and_then(attested_security_family),
             },
         };
         // Advisory annotations ride the otherwise-silent allow — they never
@@ -158,16 +180,41 @@ impl Check for NudgePolishBeforePr {
         // path (and every absent/unknown case) never pays for it. A timed-out
         // or unspawnable git yields no evidence (`None`), which reads as
         // "does not touch code" → allow (ADR-0001).
-        let touches_code = matches!(
-            marker,
-            MarkerState::Present {
-                security_ran: Some(false)
-            }
-        ) && cwd.is_some_and(|cwd| {
-            let dir = parse_work_dir(command, cwd);
-            changed_files(&dir).is_some_and(|files| branch_touches_code(&files))
-        });
+        let touches_code = consumes_branch_diff(&marker)
+            && cwd.is_some_and(|cwd| {
+                let dir = parse_work_dir(command, cwd);
+                changed_files(&dir).is_some_and(|files| branch_touches_code(&files))
+            });
         decide(command, marker, touches_code, &annotations)
+    }
+}
+
+/// The attested model family for the **security** arm, or `None` when the
+/// marker attests nothing for it (cadence-hooks#775 item 1).
+///
+/// Every marker the estate carries today is unattested, so `None` is the
+/// overwhelming common case and it keeps allowing — the gate escalates only on
+/// an affirmative family that fails the requirement.
+fn attested_security_family(record: &cadence_hooks_core::markers::PolishRecord) -> Option<String> {
+    record.attest.as_ref()?.get("security")?.model.clone()
+}
+
+/// Does this marker state consume the branch diff?
+///
+/// The diff subprocess is the only expensive thing this check does, so it runs
+/// only for the states whose verdict actually turns on it — the common
+/// full-polish path and every absent/unknown case never pay for it.
+fn consumes_branch_diff(marker: &MarkerState) -> bool {
+    match marker {
+        MarkerState::Present {
+            security_ran: Some(false),
+            ..
+        } => true,
+        MarkerState::Present {
+            security_ran: Some(true),
+            security_model: Some(family),
+        } => family != SATISFYING_SECURITY_FAMILY,
+        _ => false,
     }
 }
 
@@ -200,7 +247,19 @@ fn decide(
         MarkerState::Expired => CheckResult::nudge(expired_nudge_message()),
         MarkerState::Present {
             security_ran: Some(false),
+            ..
         } if branch_touches_code => CheckResult::nudge(security_nudge_message()),
+        // The security arm ran, and the marker names the family that ran it —
+        // and it is not one that satisfies the independent-review requirement
+        // (#775 item 1). An UNattested `ran` falls through to the allow below:
+        // every legacy marker is unattested, so escalating those would be a
+        // rollout nag rather than a finding.
+        MarkerState::Present {
+            security_ran: Some(true),
+            security_model: Some(family),
+        } if family != SATISFYING_SECURITY_FAMILY && branch_touches_code => {
+            CheckResult::nudge(wrong_family_nudge_message(&family))
+        }
         // Polish recorded a marker for this branch, and nothing affirmatively
         // says the security arm was skipped on a code branch — allow, silent
         // unless an advisory annotation has something to add.
@@ -270,6 +329,23 @@ fn security_nudge_message() -> String {
     )
 }
 
+/// The #775-item-1 escalation: the security arm ran and the marker attests
+/// *which family ran it*, and that family is not the one the requirement names.
+///
+/// `family` is charset-bounded by the record side (`[A-Za-z0-9_-]`, ≤64 bytes),
+/// so it is safe to echo into this message — that bound is exactly what this
+/// interpolation depends on.
+fn wrong_family_nudge_message(family: &str) -> String {
+    format!(
+        "Polish recorded the SECURITY arm as run by model family `{family}` — which does not \
+         satisfy the independent Opus-family requirement for security judgment (Usage Principle \
+         U9: security judgment does not economize), and this branch's diff vs origin/main touches \
+         code. Re-run the arm with an Opus-family reviewer: dispatch \
+         `cadence-forge:security-reviewer` against the branch diff, then re-record with \
+         `--arm security=ran --arm-model security=opus`. {SCOPE_CLAUSES}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,12 +388,17 @@ mod tests {
 
     /// The legacy shape: a marker exists, roster unknown. Pre-#467 behavior
     /// must hold for it everywhere a bare `true` used to.
-    const PRESENT_UNKNOWN: MarkerState = MarkerState::Present { security_ran: None };
+    const PRESENT_UNKNOWN: MarkerState = MarkerState::Present {
+        security_ran: None,
+        security_model: None,
+    };
     const PRESENT_SECURITY_RAN: MarkerState = MarkerState::Present {
         security_ran: Some(true),
+        security_model: None,
     };
     const PRESENT_SECURITY_SKIPPED: MarkerState = MarkerState::Present {
         security_ran: Some(false),
+        security_model: None,
     };
 
     #[test]
@@ -736,6 +817,133 @@ mod tests {
             let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
             let result = NudgePolishBeforePr.run(&input);
             assert_eq!(result.outcome, Outcome::Allow);
+        });
+    }
+
+    // --- #775 item 1: the wrong-family gate ---
+
+    /// `security=ran` with an attested model family beside it.
+    fn present_security_ran_by(family: &str) -> MarkerState {
+        MarkerState::Present {
+            security_ran: Some(true),
+            security_model: Some(family.to_string()),
+        }
+    }
+
+    #[test]
+    fn decide_non_opus_attested_security_family_nudges_and_names_it() {
+        // #775 item 1 RED: the recorded pass names a family that does not
+        // satisfy the independent Opus-family requirement (U9) — say so, and
+        // name the family, so the reader knows which gap to close.
+        let result = decide(
+            "gh pr create --title x",
+            present_security_ran_by("sonnet"),
+            true,
+            &[],
+        );
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap_or_default();
+        assert!(
+            msg.contains("sonnet"),
+            "the nudge must name the recorded family: {msg}"
+        );
+        assert!(
+            msg.contains("Opus"),
+            "the nudge must name the requirement it fails: {msg}"
+        );
+        assert!(
+            !msg.contains("No polish recorded"),
+            "must not present as the no-polish nudge: {msg}"
+        );
+    }
+
+    #[test]
+    fn decide_opus_attested_security_family_stays_silent() {
+        let result = decide(
+            "gh pr create --title x",
+            present_security_ran_by("opus"),
+            true,
+            &[],
+        );
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn decide_unattested_security_ran_stays_silent() {
+        // PINS the no-transitional-nudge ruling (#775): an UNattested
+        // `security=ran` is today's behavior and stays silent. Every marker in
+        // the estate is unattested, so nudging them all would be a rollout
+        // nag, not a finding. Escalating unattested `ran` is a dated follow-up
+        // issue, deliberately not this change.
+        let result = decide("gh pr create --title x", PRESENT_SECURITY_RAN, true, &[]);
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn decide_non_opus_attested_family_on_docs_only_branch_stays_silent() {
+        // Same shape as every other escalation here: no code in the diff, no
+        // nudge.
+        let result = decide(
+            "gh pr create --title x",
+            present_security_ran_by("sonnet"),
+            false,
+            &[],
+        );
+        assert_eq!(result.outcome, Outcome::Allow);
+        assert!(result.message.is_none());
+    }
+
+    #[test]
+    fn run_non_opus_attested_marker_on_code_branch_fires() {
+        // Integration: the attestation rides a real marker, and the gate reads
+        // it the same way it reads the roster.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/wrong-family", &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/wrong-family"),
+                r#"{"scope":"full","arms":{"security":"ran"},
+                    "attest":{"security":{"model":"sonnet"}}}"#,
+            )
+            .unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            assert!(result.message.unwrap_or_default().contains("sonnet"));
+        });
+    }
+
+    #[test]
+    fn run_degraded_marker_dir_does_not_read_the_attestation() {
+        // #775 item 7 regression: content is untrusted on a non-private marker
+        // dir, so the attestation is not read at all — the degrade annotation
+        // is the only message, never the wrong-family nudge.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/degraded-attest", &["src/lib.rs"]);
+        let base = tempfile::tempdir().unwrap();
+        with_marker_dir(base.path(), || {
+            let hashed = marker_dir();
+            let _ = std::fs::remove_dir_all(&hashed);
+            std::fs::write(&hashed, "").unwrap();
+            assert!(
+                !marker_dir_is_private(),
+                "precondition: this must be the degraded path"
+            );
+
+            write_marker(
+                &polish_marker(&root, "feat/degraded-attest"),
+                r#"{"scope":"full","arms":{"security":"ran"},
+                    "attest":{"security":{"model":"sonnet"}}}"#,
+            )
+            .unwrap();
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let msg = NudgePolishBeforePr.run(&input).message.unwrap_or_default();
+            assert!(
+                !msg.contains("sonnet"),
+                "a degraded dir must not read the attestation: {msg}"
+            );
         });
     }
 
