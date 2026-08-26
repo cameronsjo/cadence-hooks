@@ -16,9 +16,12 @@
 //! versa), and branch-scoped (a marker for branch A cannot satisfy a PR on
 //! branch B).
 //!
-//! Advisory, always — this must never fail the user's polish pass. Every error
-//! path (not a repo, detached HEAD, unwritable marker dir) prints one stderr
-//! line and exits 0 (ADR-0001).
+//! Advisory, always — this must never fail the user's polish pass. Every
+//! *environment* error path (not a repo, detached HEAD, unwritable marker dir)
+//! prints one stderr line and exits 0 (ADR-0001). A **usage** error — today
+//! only an invalid `--scope` — exits 2 and records nothing, matching the
+//! `redact-scan` CLI convention (cadence-hooks#775): the caller mis-spelled the
+//! record, and storing it anyway lands a marker the gate silently misreads.
 
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::markers::{polish_marker, read_polish_record, write_marker};
@@ -135,13 +138,44 @@ fn parse_arms(raw: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The closed set `--scope` accepts, and the only values the gate can read:
+/// `docs` settles the security arm ([`cadence_hooks_core::markers::PolishRecord::security_ran`]),
+/// `full`/`code` leave it to the roster. Anything else recorded as free text is
+/// a silent near-miss — `Docs` reads as *unknown*, not as a docs pass — so the
+/// value is rejected rather than stored (cadence-hooks#775).
+const VALID_SCOPES: [&str; 3] = ["full", "code", "docs"];
+
+/// Resolve `--scope` against [`VALID_SCOPES`], defaulting to `full`.
+///
+/// `Err` carries the rejected value **Debug-escaped**, matching [`parse_arms`]:
+/// the raw string would otherwise reach the terminal through the error line,
+/// which is the ANSI/control-byte surface the arm charset bound was added to
+/// close.
+fn validate_scope(scope: Option<&str>) -> Result<String, String> {
+    match scope {
+        None => Ok("full".to_string()),
+        Some(value) if VALID_SCOPES.contains(&value) => Ok(value.to_string()),
+        Some(value) => Err(format!("{value:?}")),
+    }
+}
+
 /// Merge a trusted prior roster with the incoming delta. Existing names survive;
 /// incoming entries override in argument order, preserving last-value-wins.
+///
+/// `fresh` is the clearing spelling (cadence-hooks#775): it drops the prior
+/// roster entirely, so the record carries exactly the stated arms and an
+/// omitted arm is genuinely *absent* — which the gate reads as unknown rather
+/// than inheriting a stale `security=ran`.
 fn merge_arms(
     existing: Option<&BTreeMap<String, String>>,
     incoming: Vec<(String, String)>,
+    fresh: bool,
 ) -> Vec<(String, String)> {
-    let mut merged = existing.cloned().unwrap_or_default();
+    let mut merged = if fresh {
+        BTreeMap::new()
+    } else {
+        existing.cloned().unwrap_or_default()
+    };
     for (name, state) in incoming {
         merged.insert(name, state);
     }
@@ -194,15 +228,37 @@ fn record_verdict(
 }
 
 /// Write the branch-scoped polish marker, resolving repo/branch/HEAD from the
-/// current directory unless overridden. Fail-open: any missing context or write
-/// error prints one stderr line and returns without error — a CLI action must
-/// never fail the polish pass it is recording (ADR-0001).
+/// current directory unless overridden. Returns the process exit code.
+///
+/// Fail-open on *environment*: any missing context or write error prints one
+/// stderr line and returns 0 — a CLI action must never fail the polish pass it
+/// is recording (ADR-0001).
+///
+/// **Usage errors are the one exception** (exit 2, the `redact-scan` CLI
+/// convention): an invalid `--scope` is the caller mis-spelling the record, not
+/// the environment degrading, and recording it anyway would land a marker whose
+/// scope the gate silently reads as unknown (cadence-hooks#775).
 pub fn run_record(
     repo_root: Option<String>,
     branch: Option<String>,
     scope: Option<String>,
     arm: Vec<String>,
-) {
+    fresh: bool,
+) -> u8 {
+    // Validated BEFORE any resolution or write — mirrors `redact-scan`, whose
+    // `--audience` check precedes even `--init`.
+    let scope = match validate_scope(scope.as_deref()) {
+        Ok(scope) => scope,
+        Err(rejected) => {
+            eprintln!(
+                "cadence-hooks record-polish: invalid --scope {rejected} (expected {}) \
+                 — no marker recorded.",
+                VALID_SCOPES.join("|")
+            );
+            return 2;
+        }
+    };
+
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
@@ -213,15 +269,15 @@ pub fn run_record(
             "cadence-hooks record-polish: could not resolve repo root / branch \
              (not a git repo, or detached HEAD) — no marker recorded."
         );
-        return;
+        return 0;
     };
 
-    let scope = scope.unwrap_or_else(|| "full".to_string());
     let incoming_arms = parse_arms(&arm);
     let prior = read_polish_record(&repo_root, &branch);
     let arms = merge_arms(
         prior.as_ref().and_then(|record| record.arms.as_ref()),
         incoming_arms,
+        fresh,
     );
     let content = marker_content(&branch, &head_sha, &scope, &arms);
     let path = polish_marker(&repo_root, &branch);
@@ -234,6 +290,7 @@ pub fn run_record(
             "cadence-hooks record-polish: marker write failed ({e}) — pre-PR gate may re-nudge."
         ),
     }
+    0
 }
 
 #[cfg(test)]
@@ -309,6 +366,176 @@ mod tests {
         assert!(verdict.contains("arms=security=skipped"), "{verdict}");
     }
 
+    // --- --scope validation (cadence-hooks#775 item 4) ---
+
+    #[test]
+    fn validate_scope_accepts_the_closed_set_and_defaults_to_full() {
+        assert_eq!(validate_scope(None).unwrap(), "full");
+        assert_eq!(validate_scope(Some("full")).unwrap(), "full");
+        assert_eq!(validate_scope(Some("code")).unwrap(), "code");
+        assert_eq!(validate_scope(Some("docs")).unwrap(), "docs");
+    }
+
+    #[test]
+    fn validate_scope_rejects_anything_outside_the_closed_set() {
+        // #775 RED: `--scope Docs` used to sail through as free text and
+        // defeat the docs settle in `PolishRecord::security_ran` — the gate
+        // reads `docs` exactly, so a near-miss recorded as "unknown".
+        assert!(validate_scope(Some("Docs")).is_err());
+        assert!(validate_scope(Some("")).is_err());
+        assert!(validate_scope(Some("full code")).is_err());
+        // ...and the ANSI/control-byte surface the verdict line would echo.
+        assert!(validate_scope(Some("full\u{1b}[31m")).is_err());
+    }
+
+    #[test]
+    fn run_record_rejects_an_invalid_scope_as_a_usage_error_and_writes_nothing() {
+        // #775 RED: a usage error (exit 2, the `redact-scan` CLI convention),
+        // and NO marker — a rejected scope must not land a record whose
+        // roster the gate would then trust.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-bad-scope-repo";
+            let branch = "feat/record-polish-bad-scope";
+            let path = polish_marker(repo, branch);
+
+            let code = run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("Docs".into()),
+                vec!["security=ran".into()],
+                false,
+            );
+
+            assert_eq!(code, 2, "an invalid --scope is a usage error");
+            assert!(
+                !path.exists(),
+                "no marker may be written for a rejected scope"
+            );
+        });
+    }
+
+    #[test]
+    fn run_record_accepts_every_valid_scope() {
+        // Positive control for the rejection above: each member of the closed
+        // set still records, exit 0.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            for scope in ["full", "code", "docs"] {
+                let repo = "/tmp/record-polish-valid-scope-repo";
+                let branch = format!("feat/record-polish-scope-{scope}");
+                let code = run_record(
+                    Some(repo.into()),
+                    Some(branch.clone()),
+                    Some(scope.into()),
+                    vec![],
+                    false,
+                );
+                assert_eq!(code, 0, "{scope} must be accepted");
+                let content = std::fs::read_to_string(polish_marker(repo, &branch)).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+                assert_eq!(v["scope"], scope);
+            }
+        });
+    }
+
+    // --- --fresh: the clearing spelling (cadence-hooks#775 item 3) ---
+
+    #[test]
+    fn merge_arms_fresh_records_exactly_the_stated_roster() {
+        // #775 RED: without a clearing spelling, a stale `security=ran` can
+        // only be overridden by an explicit `security=skipped`.
+        let prior: BTreeMap<String, String> = [
+            ("security".to_string(), "ran".to_string()),
+            ("tests".to_string(), "ran".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let incoming = vec![("tests".to_string(), "ran".to_string())];
+
+        let fresh = merge_arms(Some(&prior), incoming.clone(), true);
+        assert_eq!(fresh, vec![("tests".to_string(), "ran".to_string())]);
+
+        // Positive control: the DEFAULT is still additive.
+        let merged = merge_arms(Some(&prior), incoming, false);
+        assert_eq!(
+            merged,
+            vec![
+                ("security".to_string(), "ran".to_string()),
+                ("tests".to_string(), "ran".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_record_fresh_drops_an_omitted_prior_arm() {
+        // #775: an omitted arm under --fresh is genuinely ABSENT, so the gate
+        // reads it as unknown rather than inheriting the prior "ran".
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-fresh-repo";
+            let branch = "feat/record-polish-fresh";
+            let path = polish_marker(repo, branch);
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into(), "tests=ran".into()],
+                false,
+            );
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["tests=ran".into()],
+                true,
+            );
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert_eq!(v["arms"]["tests"], "ran");
+            assert!(
+                v["arms"].get("security").is_none(),
+                "--fresh must record exactly the stated roster: {content}"
+            );
+        });
+    }
+
+    #[test]
+    fn run_record_fresh_with_no_arms_leaves_no_roster() {
+        // The full clearing case: `--fresh` with no `--arm` at all wipes the
+        // roster, so every arm reads as unknown.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-fresh-empty-repo";
+            let branch = "feat/record-polish-fresh-empty";
+            let path = polish_marker(repo, branch);
+
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec!["security=ran".into()],
+                false,
+            );
+            run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec![],
+                true,
+            );
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+            assert!(
+                v.get("arms").is_none(),
+                "no roster survives --fresh: {content}"
+            );
+        });
+    }
+
     #[test]
     fn resolve_uses_explicit_overrides_without_touching_git() {
         // Explicit repo_root + branch supply both halves of the KEY without a
@@ -345,6 +572,7 @@ mod tests {
                 Some(branch.into()),
                 Some("code".into()),
                 vec!["security=ran".into()],
+                false,
             );
 
             assert!(path.is_file(), "marker should exist at {path:?}");
@@ -374,12 +602,14 @@ mod tests {
                     "security=skipped".into(),
                     "simplify=ran".into(),
                 ],
+                false,
             );
             run_record(
                 Some(repo.into()),
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["security=ran".into()],
+                false,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -403,12 +633,14 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["tests=ran".into()],
+                false,
             );
             run_record(
                 Some(repo.into()),
                 Some(branch.into()),
                 Some("docs".into()),
                 vec![],
+                false,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -431,6 +663,7 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec![],
+                false,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -453,6 +686,7 @@ mod tests {
                 Some(branch.into()),
                 Some("code".into()),
                 vec!["security=ran".into()],
+                false,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -475,6 +709,7 @@ mod tests {
                 Some(branch.into()),
                 Some("full".into()),
                 vec!["security=skipped".into(), "security=ran".into()],
+                false,
             );
 
             let content = std::fs::read_to_string(&path).unwrap();
@@ -491,7 +726,7 @@ mod tests {
         // every other write-path test in this module.
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
-            run_record(None, None, Some("full".into()), vec![]);
+            run_record(None, None, Some("full".into()), vec![], false);
         });
     }
 

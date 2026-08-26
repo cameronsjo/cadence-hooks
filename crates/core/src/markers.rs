@@ -22,6 +22,7 @@ use crate::gitstate::GitState;
 use crate::paths;
 use crate::shell::parse_work_dir;
 use crate::{HookEvent, HookInput};
+use jiff::Timestamp;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -233,9 +234,53 @@ pub struct PolishRecord {
     /// The per-arm outcome roster (`"security" -> "ran" | "skipped"`), absent
     /// on markers recorded before the roster existed.
     pub arms: Option<std::collections::BTreeMap<String, String>>,
+    /// The `HEAD` the polish pass saw, as the record side resolved it
+    /// (`git rev-parse HEAD`). Empty on a repo with no commits yet, absent on
+    /// a marker recorded before the field existed.
+    pub head_sha: Option<String>,
+    /// When the marker was written — [`crate::time::utc_timestamp`]'s ISO-8601
+    /// UTC instant. Absent on legacy markers and on the `"{}"` fixtures.
+    pub recorded_at: Option<String>,
+}
+
+/// How long a polish marker stays evidence that this branch was polished.
+///
+/// **Threat: branch-name recycling.** Markers are keyed on `(repo, branch)`
+/// and nothing sweeps them — only `dedupe-` markers are reaped — so a fresh
+/// `feat/fix-thing` cut months after its long-merged predecessor inherits that
+/// predecessor's roster and ships with the gate silent. 30 days is the ruled
+/// window: long enough that a genuinely long-running branch is not re-nudged
+/// for a polish it really had, short enough that a recycled name almost never
+/// lands inside it.
+pub const POLISH_MARKER_TTL_DAYS: i64 = 30;
+
+/// Is `recorded_at` older than `ttl_days` as of `now`?
+///
+/// **Fails open in every direction** (ADR-0001) — an expired marker is treated
+/// as absent, which *nudges*, so every uncertainty degrades toward "fresh":
+/// an absent field (every legacy marker), an unparseable stamp, and a
+/// future-dated stamp (clock skew) all read as not expired.
+fn recorded_at_is_expired(recorded_at: Option<&str>, now: Timestamp, ttl_days: i64) -> bool {
+    let Some(stamp) = recorded_at else {
+        return false;
+    };
+    let Ok(recorded) = stamp.parse::<Timestamp>() else {
+        return false;
+    };
+    now.as_second().saturating_sub(recorded.as_second()) > ttl_days * 86_400
 }
 
 impl PolishRecord {
+    /// Is this marker past [`POLISH_MARKER_TTL_DAYS`]? Consumers treat an
+    /// expired marker as *unknown* — as if no marker existed at all.
+    pub fn is_expired(&self) -> bool {
+        recorded_at_is_expired(
+            self.recorded_at.as_deref(),
+            Timestamp::now(),
+            POLISH_MARKER_TTL_DAYS,
+        )
+    }
+
     /// Did the security arm run, as far as this marker can say?
     ///
     /// - roster names `security` → `Some(state == "ran")` — deliberately
@@ -299,6 +344,14 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
                 .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         }),
+        head_sha: v
+            .get("head_sha")
+            .and_then(|s| s.as_str())
+            .map(str::to_string),
+        recorded_at: v
+            .get("recorded_at")
+            .and_then(|s| s.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -1048,6 +1101,7 @@ mod tests {
                     .into_iter()
                     .collect()
             }),
+            ..Default::default()
         };
         assert_eq!(rec(Some("full"), Some("ran")).security_ran(), Some(true));
         assert_eq!(
@@ -1086,6 +1140,60 @@ mod tests {
                 Some("ran")
             );
             assert!(!rec.arms.as_ref().unwrap().contains_key("tests"));
+        });
+    }
+
+    // --- marker TTL (cadence-hooks#775 item 5) ---
+
+    #[test]
+    fn recorded_at_older_than_the_ttl_is_expired() {
+        // #775 RED: nothing sweeps polish markers, so a recycled branch name
+        // inherits its predecessor's roster — the TTL is what stops that.
+        let now: Timestamp = "2026-08-26T12:00:00Z".parse().unwrap();
+        assert!(recorded_at_is_expired(
+            Some("2026-07-01T12:00:00Z"),
+            now,
+            POLISH_MARKER_TTL_DAYS
+        ));
+    }
+
+    #[test]
+    fn recorded_at_within_the_ttl_and_every_unknown_reads_as_fresh() {
+        // Positive control plus the fail-open directions (ADR-0001): an
+        // expired marker NUDGES, so uncertainty must degrade toward "fresh".
+        let now: Timestamp = "2026-08-26T12:00:00Z".parse().unwrap();
+        let fresh =
+            |stamp: Option<&str>| !recorded_at_is_expired(stamp, now, POLISH_MARKER_TTL_DAYS);
+        assert!(fresh(Some("2026-08-20T12:00:00Z")), "inside the window");
+        assert!(
+            fresh(Some("2026-07-27T12:00:00Z")),
+            "exactly 30 days is not yet expired"
+        );
+        assert!(fresh(None), "a legacy marker carries no stamp");
+        assert!(fresh(Some("not a timestamp")), "an unparseable stamp");
+        assert!(
+            fresh(Some("2027-01-01T00:00:00Z")),
+            "clock skew into the future"
+        );
+    }
+
+    #[test]
+    fn read_polish_record_parses_head_sha_and_recorded_at() {
+        // #775 items 2 + 5: both fields are written by `record-polish` and had
+        // no reader; the gate needs them off the parsed record.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/keyed-polish-provenance";
+            let branch = "feat/keyed-provenance";
+            write_marker(
+                &polish_marker(repo, branch),
+                r#"{"scope":"full","head_sha":"abc123","recorded_at":"2026-08-26T12:00:00Z"}"#,
+            )
+            .unwrap();
+
+            let rec = read_polish_record(repo, branch).expect("marker reads");
+            assert_eq!(rec.head_sha.as_deref(), Some("abc123"));
+            assert_eq!(rec.recorded_at.as_deref(), Some("2026-08-26T12:00:00Z"));
         });
     }
 

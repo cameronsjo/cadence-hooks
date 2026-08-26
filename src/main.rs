@@ -288,14 +288,23 @@ enum CadenceCommands {
         /// Branch to record against (default: the checked-out branch)
         #[arg(long, value_name = "NAME")]
         branch: Option<String>,
-        /// What the pass covered — `full`, `code`, or `docs` (default: full)
+        /// What the pass covered — `full`, `code`, or `docs` (default: full).
+        /// Anything else is a usage error (exit 2), not a free-text value
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
         /// Per-arm outcome, repeatable — e.g. `--arm security=ran --arm
-        /// tests=skipped`. Recorded additively; a marker without a roster
-        /// reads as unknown, never as skipped (cadence-hooks#467)
+        /// tests=skipped`. Merged additively into any prior roster by
+        /// default, so an omitted arm keeps its previous state; a marker
+        /// without a roster reads as unknown, never as skipped
+        /// (cadence-hooks#467)
         #[arg(long = "arm", value_name = "NAME=STATE", action = clap::ArgAction::Append)]
         arm: Vec<String>,
+        /// Record exactly the stated roster instead of merging with the prior
+        /// marker — the clearing spelling. An omitted arm is then genuinely
+        /// absent, so the pre-PR gate reads it as unknown rather than
+        /// inheriting a stale `ran` (cadence-hooks#775)
+        #[arg(long)]
+        fresh: bool,
     },
 }
 
@@ -1056,8 +1065,18 @@ fn main() {
                 branch,
                 scope,
                 arm,
+                fresh,
             } => {
-                cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope, arm);
+                // Exit only on a nonzero code: the success path keeps falling
+                // through to main's own exit, and every environment failure
+                // here is already fail-open (0). Today the one nonzero is the
+                // `--scope` usage error (exit 2, cadence-hooks#775).
+                let code = cadence_hooks_cadence::record_polish::run_record(
+                    repo_root, branch, scope, arm, fresh,
+                );
+                if code != 0 {
+                    process::exit(code.into());
+                }
             }
             CadenceCommands::RedactScan {
                 file,

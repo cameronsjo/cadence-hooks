@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`record-polish --fresh` — the clearing spelling for the arm roster** (cadence-hooks#775 item 3). The default stays additive: an omitted arm inherits its prior state, so a stale `security=ran` could previously only be overridden by an explicit `security=skipped`. With `--fresh` the record carries exactly the stated roster, and an omitted arm is genuinely absent — which the pre-PR gate reads as unknown.
+
+### Changed
+
+- **`record-polish --scope` is validated against `full|code|docs`** (cadence-hooks#775 item 4). It was free text on a bare `unwrap_or("full")`, so `--scope Docs` recorded a near-miss the gate reads as *unknown* rather than as a docs pass — defeating the docs settle — and the raw value was echoed into the verdict line (an ANSI/control-byte surface). An invalid value is now a usage error: exit 2, no marker written, the rejected value Debug-escaped in the message. Environment failures stay fail-open at exit 0 (ADR-0001).
+- **The pre-PR polish gate reads `head_sha`** (cadence-hooks#775 item 2). The field was recorded and had no reader, so a marker written against a 3-line diff covered a later 3,000-line push to the same branch. When the marker satisfies the gate but its recorded SHA differs from the branch's current HEAD, the allow now carries one advisory line saying polish saw an older tree. A legacy marker with no `head_sha`, an empty SHA, or an unresolvable HEAD passes through silently.
+- **Polish markers expire after 30 days** (cadence-hooks#775 item 5). Nothing sweeps this marker family — only `dedupe-` markers are reaped — so a recycled branch name inherited its predecessor's roster indefinitely. A marker past the TTL is treated as absent, and the nudge names the expiry so it doesn't read as a false positive. A missing or unparseable `recorded_at`, and a future-dated one, all read as fresh (fail-open).
+- **A degraded marker directory announces itself** (cadence-hooks#775 item 7). When `marker_dir` fails its `0700` hardening, marker content is untrusted and the arm roster is silently not read while presence still passes. The gate now names the degraded directory (the path only — never its contents) in one advisory line. Fail-open stands.
+
 ### Fixed
 
 - **`gh pr ready --undo` no longer anchors the ship/polish gate.** `--undo` flips a PR back to draft — it un-ships — so the `ready` arm of the gh-pr-subcommand matcher now excludes any invocation carrying that token in its own operands. The matcher is shared, so the same invocation also stops counting as a ship for `warn-changelog-entry` and the polish-nudge logging; that is intended, since un-shipping is not a ship. A retargeted ship (`gh -R owner/r pr ready 12`) and the canonical `gh pr ready <n>` spelling keep anchoring, as does a `--undo` the shell eats as a redirect target or here-string word (`gh pr ready 12 > --undo`) — gh never sees it, so that is a real ship.

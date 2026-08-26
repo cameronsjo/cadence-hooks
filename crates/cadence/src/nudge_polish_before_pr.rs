@@ -44,7 +44,18 @@
 //!   roster is *unknown, never skipped* — every legacy roster-less marker keeps
 //!   allowing;
 //! - no marker for this branch (or the repo/branch can't be resolved) → **nudge**
-//!   (ADR-0001 fail-open; CP1 never blocks on our own missing data).
+//!   (ADR-0001 fail-open; CP1 never blocks on our own missing data);
+//! - a marker older than
+//!   [`cadence_hooks_core::markers::POLISH_MARKER_TTL_DAYS`] → treated as
+//!   absent → **nudge**, naming the expiry so it doesn't read as a false
+//!   positive on a branch that visibly was polished (cadence-hooks#775).
+//!
+//! Two **annotations** ride the otherwise-silent allow, as exit-0 context
+//! rather than an escalation (cadence-hooks#775): the marker's recorded
+//! `head_sha` differing from the branch's current HEAD (polish saw an older
+//! tree), and a degraded — non-private — marker directory, which silently
+//! disables the roster read on that machine. Both stay silent whenever they
+//! cannot compare faithfully.
 //!
 //! This replaces the earlier session-transcript scan, which false-blocked a
 //! `/polish` slash-command (no `Skill` `tool_use` block to find, #154) and was
@@ -66,8 +77,11 @@
 //! write has propagated.
 
 use cadence_hooks_core::branch_diff::{branch_touches_code, changed_files};
-use cadence_hooks_core::markers::{polish_marker_present, read_polish_marker};
-use cadence_hooks_core::shell::{is_polish_ship_anchor, parse_work_dir};
+use cadence_hooks_core::markers::{
+    POLISH_MARKER_TTL_DAYS, marker_dir, marker_dir_is_private, polish_marker_present,
+    read_polish_marker,
+};
+use cadence_hooks_core::shell::{git_command, is_polish_ship_anchor, parse_work_dir};
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
 /// What the branch-scoped polish marker says, as far as the gate can read it
@@ -83,6 +97,12 @@ use cadence_hooks_core::{Check, CheckResult, HookInput};
 pub enum MarkerState {
     /// No polish marker for this branch (or repo/branch/cwd unresolved).
     Absent,
+    /// A marker exists but its `recorded_at` is past
+    /// [`cadence_hooks_core::markers::POLISH_MARKER_TTL_DAYS`] — treated as
+    /// unknown, i.e. as if absent, because nothing sweeps the marker family and
+    /// a recycled branch name would otherwise inherit its predecessor's record
+    /// (cadence-hooks#775).
+    Expired,
     /// A marker exists; `security_ran` per the roster/scope, `None` = unknown.
     Present { security_ran: Option<bool> },
 }
@@ -104,13 +124,44 @@ impl Check for NudgePolishBeforePr {
         // bare `gh pr merge`) pays the git-resolution cost; every other command
         // short-circuits to allow inside `decide`.
         let cwd = input.cwd.as_deref();
-        let marker = if is_polish_ship_anchor(command) && polish_marker_present(command, cwd) {
-            MarkerState::Present {
-                security_ran: read_polish_marker(command, cwd).and_then(|r| r.security_ran()),
-            }
+        let present = is_polish_ship_anchor(command) && polish_marker_present(command, cwd);
+        let record = if present {
+            read_polish_marker(command, cwd)
         } else {
-            MarkerState::Absent
+            None
         };
+        let marker = match (present, &record) {
+            (false, _) => MarkerState::Absent,
+            (true, Some(record)) if record.is_expired() => MarkerState::Expired,
+            (true, record) => MarkerState::Present {
+                security_ran: record.as_ref().and_then(|r| r.security_ran()),
+            },
+        };
+        // Advisory annotations ride the otherwise-silent allow — they never
+        // escalate a verdict (ADR-0001).
+        let mut annotations = Vec::new();
+        if present {
+            // #775 item 7: a non-private marker dir makes `read_polish_marker`
+            // return `None` while presence still passes, so the whole roster
+            // mechanism dies with no signal. Only the dir path is named — never
+            // its contents.
+            if !marker_dir_is_private() {
+                annotations.push(degraded_dir_annotation(&marker_dir().display().to_string()));
+            }
+            // #775 item 2: `head_sha` had no reader, so a marker recorded on a
+            // 3-line diff covered a later 3,000-line push to the same branch.
+            // HEAD is resolved the way the record side resolves it at write
+            // time (`git rev-parse HEAD` in the command's work dir).
+            let current_head = cwd
+                .map(|cwd| parse_work_dir(command, cwd))
+                .and_then(|dir| git_command(&dir, &["rev-parse", "HEAD"]));
+            if let Some(annotation) = stale_head_annotation(
+                record.as_ref().and_then(|r| r.head_sha.as_deref()),
+                current_head.as_deref(),
+            ) {
+                annotations.push(annotation);
+            }
+        }
         // The diff subprocess is ordered LAST and runs only when the roster
         // affirmatively says security was skipped — the common full-polish
         // path (and every absent/unknown case) never pays for it. A timed-out
@@ -125,7 +176,7 @@ impl Check for NudgePolishBeforePr {
             let dir = parse_work_dir(command, cwd);
             changed_files(&dir).is_some_and(|files| branch_touches_code(&files))
         });
-        decide(command, marker, touches_code)
+        decide(command, marker, touches_code, &annotations)
     }
 }
 
@@ -140,21 +191,65 @@ impl Check for NudgePolishBeforePr {
 /// - ship anchor + marker whose roster affirmatively says the security arm did
 ///   not run, on a branch that touches code (polish's own definition — the
 ///   caller computes it) → the security nudge (#467).
+/// - ship anchor + a marker past the TTL → nudge, naming the expiry (#775).
 /// - ship anchor + any other marker (security ran, or unknown — the legacy
-///   roster-less shape the whole estate carries) → allow (silent).
-fn decide(command: &str, marker: MarkerState, branch_touches_code: bool) -> CheckResult {
+///   roster-less shape the whole estate carries) → allow (silent), carrying
+///   `annotations` as exit-0 context when the caller resolved any.
+fn decide(
+    command: &str,
+    marker: MarkerState,
+    branch_touches_code: bool,
+    annotations: &[String],
+) -> CheckResult {
     if !is_polish_ship_anchor(command) {
         return CheckResult::allow();
     }
     match marker {
         MarkerState::Absent => CheckResult::nudge(nudge_message()),
+        MarkerState::Expired => CheckResult::nudge(expired_nudge_message()),
         MarkerState::Present {
             security_ran: Some(false),
         } if branch_touches_code => CheckResult::nudge(security_nudge_message()),
         // Polish recorded a marker for this branch, and nothing affirmatively
-        // says the security arm was skipped on a code branch — silent allow.
-        MarkerState::Present { .. } => CheckResult::allow(),
+        // says the security arm was skipped on a code branch — allow, silent
+        // unless an advisory annotation has something to add.
+        MarkerState::Present { .. } if annotations.is_empty() => CheckResult::allow(),
+        MarkerState::Present { .. } => CheckResult::nudge(annotations.join(" ")),
     }
+}
+
+/// The #775-item-2 annotation: the marker was recorded against a different
+/// `HEAD` than the branch carries now, so the polish pass saw an older tree.
+///
+/// Silent (`None`) in every uncertain direction — a legacy marker with no
+/// `head_sha`, an empty one (a repo with no commits at record time), or an
+/// unresolvable current `HEAD`. This is annotation, not a gate: it never turns
+/// an allow into a block, and never fires on a marker it cannot compare.
+fn stale_head_annotation(recorded: Option<&str>, current: Option<&str>) -> Option<String> {
+    let recorded = recorded.filter(|sha| !sha.is_empty())?;
+    let current = current.filter(|sha| !sha.is_empty())?;
+    if recorded == current {
+        return None;
+    }
+    Some(format!(
+        "Note: the polish marker for this branch was recorded at {recorded}, but HEAD is now \
+         {current} — the marker predates the current head, so polish saw an older tree. \
+         Advisory only; re-run `/polish` if the commits since then are substantive."
+    ))
+}
+
+/// The #775-item-7 annotation: the marker directory failed its `0700`
+/// hardening, so marker *content* is not trusted and the arm roster is not
+/// consulted at all — presence alone carries the verdict.
+///
+/// Names the directory path and nothing else: no marker contents, no file
+/// listing. Advisory; the gate stays fail-open either way.
+fn degraded_dir_annotation(dir: &str) -> String {
+    format!(
+        "Note: the polish marker directory ({dir}) is not the hardened per-user one, so marker \
+         CONTENT is not trusted — the arm roster (e.g. security=skipped) is not being read on \
+         this machine, and presence alone decides. Advisory only."
+    )
 }
 
 /// The loophole-closing clauses the nudge carries, so the "it's just markdown"
@@ -173,6 +268,19 @@ fn nudge_message() -> String {
          records the marker when it completes. {SCOPE_CLAUSES} Skip ONLY for a \
          trivial one-liner or an already-polished branch — say so and why, don't \
          skip silently."
+    )
+}
+
+/// The #775 TTL nudge: a marker exists for this branch but is older than
+/// [`POLISH_MARKER_TTL_DAYS`], so it is treated as no marker at all. The reason
+/// is named, because otherwise a nudge on a branch that visibly *was* polished
+/// reads as a false positive.
+fn expired_nudge_message() -> String {
+    format!(
+        "The polish marker for this branch is older than {POLISH_MARKER_TTL_DAYS} days, so it no \
+         longer counts — nothing sweeps these markers, and a recycled branch name inherits its \
+         predecessor's record. {}",
+        nudge_message()
     )
 }
 
@@ -246,7 +354,12 @@ mod tests {
         // #467 RED: a recorded polish whose roster says the security arm did
         // not run, on a branch touching code, must nudge — with the security
         // message, not the no-polish one.
-        let result = decide("gh pr create --title x", PRESENT_SECURITY_SKIPPED, true);
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_SECURITY_SKIPPED,
+            true,
+            &[],
+        );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
         assert!(
@@ -267,7 +380,12 @@ mod tests {
     fn decide_security_skipped_on_docs_only_branch_allows() {
         // #467 positive control (silent side): a docs-scoped polish on a
         // branch whose diff touches no code is exactly right — no nudge.
-        let result = decide("gh pr create --title x", PRESENT_SECURITY_SKIPPED, false);
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_SECURITY_SKIPPED,
+            false,
+            &[],
+        );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
     }
@@ -275,7 +393,7 @@ mod tests {
     #[test]
     fn decide_security_ran_allows_regardless_of_code() {
         assert_eq!(
-            decide("gh pr create --title x", PRESENT_SECURITY_RAN, true).outcome,
+            decide("gh pr create --title x", PRESENT_SECURITY_RAN, true, &[]).outcome,
             Outcome::Allow
         );
     }
@@ -285,7 +403,7 @@ mod tests {
         // #467 RED: absent roster = UNKNOWN, not skipped — the whole estate
         // carries roster-less markers, and every one must keep allowing even
         // on a code branch.
-        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, true);
+        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, true, &[]);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
     }
@@ -295,7 +413,7 @@ mod tests {
         // A branch-scoped marker present → silent allow. #154 regression: this
         // holds with NO transcript involvement — a slash-command polish that
         // recorded a marker is honored.
-        let result = decide("gh pr create --title test", PRESENT_UNKNOWN, false);
+        let result = decide("gh pr create --title test", PRESENT_UNKNOWN, false, &[]);
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(
             result.message.is_none(),
@@ -306,7 +424,7 @@ mod tests {
     #[test]
     fn decide_pr_create_without_marker_nudges() {
         // #146 RED (pure): no marker → nudge, never block. CP1 is fail-open.
-        let result = decide("gh pr create --title x", MarkerState::Absent, false);
+        let result = decide("gh pr create --title x", MarkerState::Absent, false, &[]);
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("/polish"));
@@ -318,31 +436,37 @@ mod tests {
         // The matcher only scopes the process spawn; decide() still guards
         // against a non-anchor gh command slipping through.
         assert_eq!(
-            decide("gh pr list", MarkerState::Absent, false).outcome,
+            decide("gh pr list", MarkerState::Absent, false, &[]).outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("git commit -m x", PRESENT_UNKNOWN, false).outcome,
+            decide("git commit -m x", PRESENT_UNKNOWN, false, &[]).outcome,
             Outcome::Allow
         );
         // A merge that NAMES a PR is excluded — it is the orchestrator shape,
         // run from another cwd, where the branch would mis-resolve (#325). A
         // bare merge is a ship anchor and nudges; pinned just below.
         assert_eq!(
-            decide("gh pr merge 12", MarkerState::Absent, false).outcome,
+            decide("gh pr merge 12", MarkerState::Absent, false, &[]).outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("gh --repo owner/r pr merge", MarkerState::Absent, false).outcome,
+            decide(
+                "gh --repo owner/r pr merge",
+                MarkerState::Absent,
+                false,
+                &[]
+            )
+            .outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("gh pr merge --squash", MarkerState::Absent, false).outcome,
+            decide("gh pr merge --squash", MarkerState::Absent, false, &[]).outcome,
             Outcome::Nudge
         );
         // ...and stays silent once the branch carries a marker.
         assert_eq!(
-            decide("gh pr merge --squash", PRESENT_UNKNOWN, false).outcome,
+            decide("gh pr merge --squash", PRESENT_UNKNOWN, false, &[]).outcome,
             Outcome::Allow
         );
     }
@@ -352,11 +476,11 @@ mod tests {
         // A `--draft` create is not the ship moment (#297) — an entry-posture
         // draft opens at zero diff, so it must allow even with no marker.
         assert_eq!(
-            decide("gh pr create --draft", MarkerState::Absent, false).outcome,
+            decide("gh pr create --draft", MarkerState::Absent, false, &[]).outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("gh pr create -d --title x", MarkerState::Absent, false).outcome,
+            decide("gh pr create -d --title x", MarkerState::Absent, false, &[]).outcome,
             Outcome::Allow
         );
     }
@@ -365,10 +489,10 @@ mod tests {
     fn decide_pr_ready_routes_like_create() {
         // `gh pr ready` (leaves draft) is the ship anchor: no marker → nudge,
         // marker present → silent allow.
-        let nudge = decide("gh pr ready 12", MarkerState::Absent, false);
+        let nudge = decide("gh pr ready 12", MarkerState::Absent, false, &[]);
         assert_eq!(nudge.outcome, Outcome::Nudge);
         nudge_msg_has_loophole_clauses(&nudge.message.unwrap_or_default());
-        let allow = decide("gh pr ready 12", PRESENT_UNKNOWN, false);
+        let allow = decide("gh pr ready 12", PRESENT_UNKNOWN, false, &[]);
         assert_eq!(allow.outcome, Outcome::Allow);
         assert!(allow.message.is_none());
     }
@@ -641,6 +765,194 @@ mod tests {
             let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
             let result = NudgePolishBeforePr.run(&input);
             assert_eq!(result.outcome, Outcome::Allow);
+        });
+    }
+
+    // --- #775 item 2: the gate reads head_sha ---
+
+    #[test]
+    fn stale_head_annotation_fires_only_on_a_resolvable_mismatch() {
+        // #775 RED: `head_sha` was written and never read, so a marker
+        // recorded on a 3-line diff covered a later 3,000-line push.
+        let annotation = stale_head_annotation(Some("aaa111"), Some("bbb222"))
+            .expect("a mismatch must annotate");
+        assert!(
+            annotation.contains("older tree"),
+            "the annotation must say what it means: {annotation}"
+        );
+        // Positive control + every fail-open direction (silent pass-through).
+        assert!(stale_head_annotation(Some("aaa111"), Some("aaa111")).is_none());
+        assert!(
+            stale_head_annotation(None, Some("bbb222")).is_none(),
+            "legacy marker"
+        );
+        assert!(
+            stale_head_annotation(Some("aaa111"), None).is_none(),
+            "unresolvable HEAD"
+        );
+        assert!(
+            stale_head_annotation(Some(""), Some("bbb222")).is_none(),
+            "no HEAD at record time"
+        );
+    }
+
+    #[test]
+    fn decide_annotations_ride_the_allow_path_without_escalating() {
+        // An annotation is exit-0 context on an otherwise-silent allow — never
+        // the polish nudge, never a block.
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_UNKNOWN,
+            false,
+            &["the marker predates the current head".to_string()],
+        );
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap_or_default();
+        assert!(msg.contains("predates the current head"));
+        assert!(
+            !msg.contains("No polish recorded"),
+            "an annotation must not present as the no-polish nudge: {msg}"
+        );
+        // Positive control: no annotations → the silent allow, unchanged.
+        let silent = decide("gh pr create --title x", PRESENT_UNKNOWN, false, &[]);
+        assert_eq!(silent.outcome, Outcome::Allow);
+        assert!(silent.message.is_none());
+    }
+
+    #[test]
+    fn run_marker_recorded_on_an_older_head_annotates() {
+        let (tmp, root) = init_repo_with_origin_and_files("feat/stale-head", &["src/lib.rs"]);
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/stale-head"),
+                r#"{"scope":"full","head_sha":"0000000000000000000000000000000000000000"}"#,
+            )
+            .unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            assert!(
+                result.message.unwrap_or_default().contains("older tree"),
+                "a marker predating HEAD must annotate the allow"
+            );
+        });
+    }
+
+    #[test]
+    fn run_marker_recorded_on_the_current_head_stays_silent() {
+        // Positive control for the annotation above: matching SHAs → the
+        // silent allow, exactly as before #775.
+        let (tmp, root) = init_repo_with_origin_and_files("feat/current-head", &["src/lib.rs"]);
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/current-head"),
+                &format!(r#"{{"scope":"full","head_sha":"{head}"}}"#),
+            )
+            .unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(result.message.is_none());
+        });
+    }
+
+    // --- #775 item 5: marker TTL ---
+
+    #[test]
+    fn decide_expired_marker_nudges_and_names_the_ttl() {
+        let result = decide("gh pr create --title x", MarkerState::Expired, false, &[]);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        let msg = result.message.unwrap_or_default();
+        assert!(
+            msg.contains("30 days"),
+            "the flipped verdict must name its reason: {msg}"
+        );
+        nudge_msg_has_loophole_clauses(&msg);
+    }
+
+    #[test]
+    fn run_marker_older_than_the_ttl_nudges() {
+        // #775 RED: a recycled branch name inherits its predecessor's marker,
+        // and nothing sweeps the family — the TTL is the only expiry.
+        let (tmp, root) = init_repo_on_branch("feat/recycled");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/recycled"),
+                r#"{"scope":"full","recorded_at":"2020-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            assert!(result.message.unwrap_or_default().contains("30 days"));
+        });
+    }
+
+    #[test]
+    fn run_marker_within_the_ttl_stays_silent() {
+        // Positive control: a marker stamped now allows silently.
+        let (tmp, root) = init_repo_on_branch("feat/fresh-marker");
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            write_marker(
+                &polish_marker(&root, "feat/fresh-marker"),
+                &format!(
+                    r#"{{"scope":"full","recorded_at":"{}"}}"#,
+                    cadence_hooks_core::time::utc_timestamp()
+                ),
+            )
+            .unwrap();
+
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Allow);
+            assert!(result.message.is_none());
+        });
+    }
+
+    // --- #775 item 7: the roster degrade announces itself ---
+
+    #[test]
+    fn run_degraded_marker_dir_announces_itself() {
+        // #775 RED: on a non-private marker dir `read_polish_record` returns
+        // None while presence still passes, so the roster mechanism dies
+        // silently — every gate read degrades with no signal at all.
+        let (tmp, root) = init_repo_on_branch("feat/degraded-dir");
+        let base = tempfile::tempdir().unwrap();
+        // Occupy the per-user hashed subdir with a regular file so
+        // `create_dir_all` fails and `marker_dir()` falls open to `base` — a
+        // real, writable directory, so the marker itself still lands.
+        with_marker_dir(base.path(), || {
+            let hashed = marker_dir();
+            let _ = std::fs::remove_dir_all(&hashed);
+            std::fs::write(&hashed, "").unwrap();
+            assert!(
+                !marker_dir_is_private(),
+                "precondition: this must be the degraded path"
+            );
+
+            write_marker(&polish_marker(&root, "feat/degraded-dir"), "{}").unwrap();
+            let input = make_bash_with_cwd("gh pr create --title x", tmp.path().to_str().unwrap());
+            let result = NudgePolishBeforePr.run(&input);
+            assert_eq!(result.outcome, Outcome::Nudge);
+            let msg = result.message.unwrap_or_default();
+            assert!(
+                msg.contains(&marker_dir().display().to_string()),
+                "the degrade must name the marker dir: {msg}"
+            );
         });
     }
 
