@@ -29,6 +29,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cadence plugin's PostToolUse matcher widened from `ExitPlanMode` to `*`
   (wiring PR in the cadence monorepo).
 
+  Hardened per the polish security review: a bare prefix match is NOT an
+  approval — the persist requires the harness's trailing transcript-pointer
+  paragraph, parsed exclusively from the stripped suffix lines (a
+  pointer-shaped line inside the plan body supplies nothing), taking the
+  FIRST `.jsonl` token and requiring the named transcript to exist with a
+  well-formed session-id stem, so approval provenance cannot be forged from
+  plan prose and an interpolated headless prompt persists nothing. The
+  per-call retry is bounded (a saturated 1 MiB head with no user row burns
+  the once-per-session marker), a no-repo `cwd` no longer spends the one
+  shot, and `read_head_bounded` decides truncation on the buffer, never
+  `st_size`.
+
 ### Removed
 
 - **Codex harness detection and its fail-closed arms.** `is_codex_harness`,

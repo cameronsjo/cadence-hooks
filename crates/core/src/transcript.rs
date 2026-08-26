@@ -54,11 +54,16 @@ pub fn read_head_bounded(path: &Path, max_bytes: u64) -> Option<String> {
     let mut buf = Vec::with_capacity(meta.len().min(max_bytes) as usize);
     file.take(max_bytes).read_to_end(&mut buf).ok()?;
 
-    if meta.len() > max_bytes {
+    if buf.len() as u64 == max_bytes {
         // Drop the trailing partial line: `\n` cannot occur inside a
         // multi-byte UTF-8 sequence, so truncating after the last `\n` keeps
         // the remainder valid and line-complete. A window with no newline at
-        // all is entirely one fragment, so all of it goes.
+        // all is entirely one fragment, so all of it goes. Decided on the
+        // BUFFER length, not `st_size` — a file lying about its size (the
+        // `/proc`-style case) must not skip the truncation and leak a
+        // fragment past the documented whole-lines guarantee. (A file of
+        // exactly `max_bytes` whose last line lacks a trailing newline loses
+        // that final line — an acceptable edge for a bound this size.)
         let cut = buf.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1);
         buf.truncate(cut);
     }
