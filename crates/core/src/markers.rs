@@ -394,7 +394,17 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
         scope: v.get("scope").and_then(|s| s.as_str()).map(str::to_string),
         arms: v.get("arms").and_then(|a| a.as_object()).map(|obj| {
             obj.iter()
-                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .filter_map(|(k, val)| {
+                    // Charset-bound BOTH halves on the read side, matching
+                    // `read_attest` (cadence-hooks#775 I1): `record_verdict`
+                    // echoes every roster pair into the stdout success line and
+                    // `merge_arms` carries prior arms forward, so a hand-edited
+                    // marker's `arms` value would otherwise launder ANSI /
+                    // control bytes into the agent transcript. A failing entry
+                    // drops; the rest of the roster survives.
+                    let state = val.as_str()?;
+                    (is_arm_token(k) && is_arm_token(state)).then(|| (k.clone(), state.to_string()))
+                })
                 .collect()
         }),
         recorded_at: v
@@ -1236,6 +1246,72 @@ mod tests {
     }
 
     // --- attestation (cadence-hooks#775 item 1) ---
+
+    #[test]
+    fn read_polish_record_drops_an_arm_that_fails_its_charset_bound() {
+        // #775 I1 RED: the `arms` roster was read with only an `as_str()`
+        // filter — no charset/length bound — while `read_attest` applies the
+        // full predicate. `record_verdict` echoes every roster pair into the
+        // stdout success line (`arms=<name>=<state>`), which lands in the agent
+        // transcript, and `merge_arms` carries prior `arms` forward — so a
+        // hand-edited `"arms":{"security":"ran<ESC>[31m"}` survived every
+        // re-record and echoed unescaped. Validation lives on the read side
+        // now: the offending entry drops, the rest of the roster survives.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/keyed-polish-arms-hostile";
+            // NOTE: control bytes ride as JSON `\u` escapes, never literal
+            // bytes — a literal 0x1b makes the fixture invalid JSON, dropping
+            // the whole record and passing for the wrong reason.
+            let cases = [
+                (
+                    r#"{"arms":{"tests":"ran","security":"ran\u001b[31m"}}"#.to_string(),
+                    "control byte in a state",
+                ),
+                (
+                    format!(
+                        r#"{{"arms":{{"tests":"ran","security":"{}"}}}}"#,
+                        "r".repeat(MAX_TOKEN_BYTES + 1)
+                    ),
+                    "over-long state",
+                ),
+                (
+                    format!(
+                        r#"{{"arms":{{"tests":"ran","{}":"ran"}}}}"#,
+                        "s".repeat(MAX_TOKEN_BYTES + 1)
+                    ),
+                    "over-long name",
+                ),
+            ];
+            for (i, (body, label)) in cases.iter().enumerate() {
+                let branch = format!("feat/arms-hostile-{i}");
+                write_marker(&polish_marker(repo, &branch), body).unwrap();
+                let rec = read_polish_record(repo, &branch).expect("marker still reads");
+                let arms = rec.arms.expect("the valid arm survives");
+                assert_eq!(
+                    arms.get("tests").map(String::as_str),
+                    Some("ran"),
+                    "dropping one arm must not drop the rest: {label}"
+                );
+                assert!(
+                    !arms.contains_key("security"),
+                    "an out-of-charset arm must be dropped on read: {label}"
+                );
+            }
+
+            // Positive control: a fully valid roster still reads intact.
+            let branch = "feat/arms-hostile-ok";
+            write_marker(
+                &polish_marker(repo, branch),
+                r#"{"arms":{"security":"ran","tests":"skipped"}}"#,
+            )
+            .unwrap();
+            let rec = read_polish_record(repo, branch).expect("marker reads");
+            let arms = rec.arms.expect("valid arms present");
+            assert_eq!(arms.get("security").map(String::as_str), Some("ran"));
+            assert_eq!(arms.get("tests").map(String::as_str), Some("skipped"));
+        });
+    }
 
     #[test]
     fn read_polish_record_parses_the_attest_map() {
