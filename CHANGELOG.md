@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.87.0] - 2026-08-26
+
 ### Added
 
 - **Polish-marker attestation: `record-polish --arm-model` / `--arm-report`** (cadence-hooks#775 item 1). `security=ran` was a self-report with nothing beside it; the marker now carries an additive `attest` map (`"attest": {"security": {"model": "opus", "report": "…"}}`) recording which model family ran an arm and where its report landed. The family is recorded, not validated against a closed set — the point is what actually ran. A partial attestation (one half only) is legal. **The limit is stated, not implied: attestation narrows no self-report path — the recording actor can state any flags, no code reads the running model, and the gate never opens the report. Its value is provenance for a human audit, never gate-verified evidence.** The report path is provenance only: nothing opens it or reads its contents. Binding rule, both directions: an attestation is accepted only when the same invocation states `--arm NAME=…`, and a restated `--arm NAME=…` drops any prior attestation for that arm — so `attest.NAME` always describes the run stated beside it. `--fresh` clears the attest map along with the roster. Reads are lenient: any unexpected `attest` shape reads as absent, never as an error.
@@ -16,9 +18,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **The pre-PR gate nudges when a readable marker records no arm roster** (cadence-hooks#775 item 6). Presence alone used to carry the allow, so a marker recorded with no `--arm` at all was indistinguishable from a full pass. The gate now discriminates the two ways the roster reads as unknown: content that was genuinely **read** and names no roster is a question the recorder can answer, so on a branch touching code it draws a nudge showing the record command shape; content that could **not** be read (degraded marker dir, garbled JSON, unreadable file) stays on the presence-alone path exactly as before. Verdict precedence is now the total order absent → expired → security-skipped → wrong-family → unknown-roster → allow.
 
+- **`record-polish --fresh` — the clearing spelling for the arm roster** (cadence-hooks#775 item 3). The default stays additive: an omitted arm inherits its prior state, so a stale `security=ran` could previously only be overridden by an explicit `security=skipped`. With `--fresh` the record carries exactly the stated roster, and an omitted arm is genuinely absent — which the pre-PR gate reads as unknown. A fresh record also carries `"fresh": true` in the marker (absent otherwise), so an audit can tell a *cleared* roster from a legacy roster-less one; no reader gates on it.
+
 ### Changed
 
 - **`record-polish` arm names and states are capped at 64 bytes** (cadence-hooks#775). Both were charset-bounded but length-unbounded, so a megabyte of `[A-Za-z0-9]` rode the marker JSON and the verdict line. Over-long values drop with a stderr note and the rest of the record still lands (ADR-0001) — the `--arm` precedent, not the `--scope` exit-2 path.
+- **`record-polish --scope` is validated against `full|code|docs`** (cadence-hooks#775 item 4). It was free text on a bare `unwrap_or("full")`, so `--scope Docs` recorded a near-miss the gate reads as *unknown* rather than as a docs pass — defeating the docs settle — and the raw value was echoed into the verdict line (an ANSI/control-byte surface). An invalid value is now a usage error: exit 2, no marker written, the rejected value Debug-escaped in the message. Environment failures stay fail-open at exit 0 (ADR-0001).
+- **Polish markers expire after 30 days** (cadence-hooks#775 item 5). Nothing sweeps this marker family — only `dedupe-` markers are reaped — so a recycled branch name inherited its predecessor's roster indefinitely. A marker past the TTL is treated as absent, and the nudge names the expiry so it doesn't read as a false positive. A missing or unparseable `recorded_at`, and a future-dated one, all read as fresh (fail-open).
+- **A degraded marker directory announces itself** (cadence-hooks#775 item 7). When `marker_dir` fails its `0700` hardening, marker content is untrusted and the arm roster is silently not read while presence still passes. The gate now names the degraded directory (the path only — never its contents) in one advisory line. Fail-open stands.
 
 ### Fixed
 
@@ -31,16 +38,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **A malformed `record-polish` flag diagnostic states that flag's own value limit** (cadence-hooks#775 review, I4). One shared message named the arm/arm-model rule (`[A-Za-z0-9_-]`, ≤64 bytes) for all three flags, so an operator whose 600-byte or non-ASCII `--arm-report` path dropped was told the wrong limit. Each flag's message now names its own value rule (printable ASCII, ≤512 bytes for `--arm-report`) and restores a worked example.
 
 ## [0.86.1] - 2026-08-26
-
-### Added
-
-- **`record-polish --fresh` — the clearing spelling for the arm roster** (cadence-hooks#775 item 3). The default stays additive: an omitted arm inherits its prior state, so a stale `security=ran` could previously only be overridden by an explicit `security=skipped`. With `--fresh` the record carries exactly the stated roster, and an omitted arm is genuinely absent — which the pre-PR gate reads as unknown. A fresh record also carries `"fresh": true` in the marker (absent otherwise), so an audit can tell a *cleared* roster from a legacy roster-less one; no reader gates on it.
-
-### Changed
-
-- **`record-polish --scope` is validated against `full|code|docs`** (cadence-hooks#775 item 4). It was free text on a bare `unwrap_or("full")`, so `--scope Docs` recorded a near-miss the gate reads as *unknown* rather than as a docs pass — defeating the docs settle — and the raw value was echoed into the verdict line (an ANSI/control-byte surface). An invalid value is now a usage error: exit 2, no marker written, the rejected value Debug-escaped in the message. Environment failures stay fail-open at exit 0 (ADR-0001).
-- **Polish markers expire after 30 days** (cadence-hooks#775 item 5). Nothing sweeps this marker family — only `dedupe-` markers are reaped — so a recycled branch name inherited its predecessor's roster indefinitely. A marker past the TTL is treated as absent, and the nudge names the expiry so it doesn't read as a false positive. A missing or unparseable `recorded_at`, and a future-dated one, all read as fresh (fail-open).
-- **A degraded marker directory announces itself** (cadence-hooks#775 item 7). When `marker_dir` fails its `0700` hardening, marker content is untrusted and the arm roster is silently not read while presence still passes. The gate now names the degraded directory (the path only — never its contents) in one advisory line. Fail-open stands.
 
 ### Fixed
 
