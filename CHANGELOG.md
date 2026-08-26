@@ -20,6 +20,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`record-polish` arm names and states are capped at 64 bytes** (cadence-hooks#775). Both were charset-bounded but length-unbounded, so a megabyte of `[A-Za-z0-9]` rode the marker JSON and the verdict line. Over-long values drop with a stderr note and the rest of the record still lands (ADR-0001) — the `--arm` precedent, not the `--scope` exit-2 path.
 
+### Fixed
+
+- **Attestation values are charset-bounded on READ, not only at record time** (cadence-hooks#775 security review). A polish marker is a plain file, so the record side's `[A-Za-z0-9_-]` / printable-ASCII bounds said nothing about a hand-edited one — and the pre-PR gate interpolates the attested family straight into the session's `additionalContext`, making control bytes, backticks, newline-borne injection prose, and multi-kilobyte payloads a live channel into the model's context. The predicates now live beside the marker primitive in `core` and both sides call them: a `model` or `report` value failing its predicate drops that field on read (the rest of the record survives), so a poisoned value reads as *unattested*, the gate falls through to its normal verdict, and a re-record cannot launder the value back onto disk through the merge path.
+- **The working-tree digest's byte budget is checked before each file is read.** `MAX_DIGEST_BYTES` was enforced after `fs::read` returned, so one multi-gigabyte file in the change set was pulled whole into memory before anything said no — a report, not a bound. A regular file larger than the remaining budget is now bounded out on its metadata alone, recording the same `"skipped"` digest the aggregate bound records.
+- **`record-polish` no longer probes whether an `--arm-report` path exists.** The probe printed a distinguishable stderr note for an absent path — a filesystem-existence oracle in the agent's transcript — while being load-bearing for nothing: the record lands either way, and no code ever opens the path. Its two remaining raw diagnostics (`--repo-root` in the not-a-repository note, and the repo root in the success verdict) are Debug-escaped like every other value this module echoes.
+
 ## [0.86.1] - 2026-08-26
 
 ### Added

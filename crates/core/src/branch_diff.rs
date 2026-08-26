@@ -80,7 +80,10 @@ pub struct WorkingTreeDigest {
 /// Above this many changed paths, the digest is skipped rather than computed.
 pub const MAX_DIGEST_FILES: usize = 1000;
 
-/// Above this many bytes of aggregate content, likewise.
+/// Above this many bytes of content, likewise — checked **per file, before the
+/// file is read** (cadence-hooks#775 security review), so the budget bounds
+/// resident memory rather than merely reporting after the fact. A single entry
+/// larger than the remaining budget is bounded out on its metadata alone.
 pub const MAX_DIGEST_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Digest the branch's **working-tree** change set vs its merge base with
@@ -144,13 +147,16 @@ fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<Working
 
     let root = Path::new(dir);
     let mut frames = Sha256::new();
-    let mut bytes = 0u64;
+    let mut remaining = max_bytes;
     for path in &paths {
-        let (entry, size) = digest_entry(&root.join(path));
-        bytes = bytes.saturating_add(size);
-        if bytes > max_bytes {
+        // The budget is spent BEFORE the read, not after it: `digest_entry`
+        // returns `None` for a regular file whose metadata already exceeds what
+        // is left, so no single file is ever pulled whole into memory to find
+        // out that it did not fit.
+        let Some((entry, size)) = digest_entry(&root.join(path), remaining) else {
             return bounded("skipped".to_string());
-        }
+        };
+        remaining = remaining.saturating_sub(size);
         frames.update(path.as_bytes());
         frames.update(b"\0");
         frames.update(entry.as_bytes());
@@ -159,7 +165,9 @@ fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<Working
     bounded(format!("sha256:{:x}", frames.finalize()))
 }
 
-/// One change-set entry's frame content, plus the bytes it cost.
+/// One change-set entry's frame content, plus the bytes it cost — or `None`
+/// when a regular file is larger than `remaining`, the caller's unspent byte
+/// budget.
 ///
 /// `symlink_metadata` first, deliberately: following a symlink would hash a
 /// file that is not in the diff — possibly not even in the repo. A symlink
@@ -167,22 +175,30 @@ fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<Working
 /// A non-regular path (FIFO, device) and a listed-but-absent one are each
 /// framed by a literal rather than hashed, because they mean different things
 /// and neither has content to read.
-fn digest_entry(path: &Path) -> (String, u64) {
+///
+/// The size check reads the metadata already in hand and runs **before**
+/// `fs::read` (cadence-hooks#775 security review): checking afterwards makes
+/// the budget a report rather than a bound, and one hostile or accidental
+/// multi-gigabyte file in the change set is read whole first.
+fn digest_entry(path: &Path, remaining: u64) -> Option<(String, u64)> {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return ("absent".to_string(), 0);
+        return Some(("absent".to_string(), 0));
     };
     if meta.is_symlink() {
         let Ok(target) = std::fs::read_link(path) else {
-            return ("absent".to_string(), 0);
+            return Some(("absent".to_string(), 0));
         };
-        return (sha256_hex(target.to_string_lossy().as_bytes()), 0);
+        return Some((sha256_hex(target.to_string_lossy().as_bytes()), 0));
     }
     if !meta.is_file() {
-        return ("nonregular".to_string(), 0);
+        return Some(("nonregular".to_string(), 0));
+    }
+    if meta.len() > remaining {
+        return None;
     }
     match std::fs::read(path) {
-        Ok(content) => (sha256_hex(&content), content.len() as u64),
-        Err(_) => ("absent".to_string(), 0),
+        Ok(content) => Some((sha256_hex(&content), content.len() as u64)),
+        Err(_) => Some(("absent".to_string(), 0)),
     }
 }
 
@@ -401,13 +417,13 @@ mod tests {
         std::fs::write(&plain, target.to_string_lossy().as_bytes()).unwrap();
 
         assert_eq!(
-            digest_entry(&link).0,
-            digest_entry(&plain).0,
+            digest_entry(&link, u64::MAX).unwrap().0,
+            digest_entry(&plain, u64::MAX).unwrap().0,
             "a symlink hashes its TARGET STRING, like the blob git would store"
         );
         assert_ne!(
-            digest_entry(&link).0,
-            digest_entry(&target).0,
+            digest_entry(&link, u64::MAX).unwrap().0,
+            digest_entry(&target, u64::MAX).unwrap().0,
             "a symlink must not hash the target file's contents"
         );
     }
@@ -425,11 +441,14 @@ mod tests {
             .map(|s| s.success())
             .unwrap_or(false);
         if made {
-            assert_eq!(digest_entry(&fifo), ("nonregular".to_string(), 0));
+            assert_eq!(
+                digest_entry(&fifo, u64::MAX),
+                Some(("nonregular".to_string(), 0))
+            );
         }
         assert_eq!(
-            digest_entry(&tmp.path().join("not-here")),
-            ("absent".to_string(), 0)
+            digest_entry(&tmp.path().join("not-here"), u64::MAX),
+            Some(("absent".to_string(), 0))
         );
     }
 
@@ -477,6 +496,37 @@ mod tests {
         let over_bytes =
             digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 1).expect("still resolves");
         assert_eq!(over_bytes.digest, "skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_over_the_remaining_budget_is_bounded_out_before_it_is_read() {
+        // #775 security review (I1) RED: the byte bound was checked AFTER
+        // `fs::read` returned, so one huge file was pulled whole into memory
+        // before anything said no. The bound is a pre-read check on the file's
+        // metadata now.
+        //
+        // An unreadable file is what discriminates the two orderings: reading
+        // it fails, which the old code framed as "absent" (0 bytes) and
+        // digested happily; the pre-read check sees its metadata size and
+        // records "skipped".
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = init_repo_with_origin_main(&[]);
+        let dir = tmp.path();
+        write_file(dir, "src/big.rs", &"x".repeat(4096));
+        let big = dir.join("src/big.rs");
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&big).is_ok() {
+            // Running as root: the discriminating precondition does not hold.
+            return;
+        }
+
+        let bounded = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 64)
+            .expect("a bounded-out digest still resolves");
+        assert_eq!(bounded.digest, "skipped");
+        assert_eq!(bounded.files, 1, "the file count still reports");
+
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
