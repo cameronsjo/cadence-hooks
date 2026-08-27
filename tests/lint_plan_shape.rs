@@ -13,8 +13,8 @@
 //! | payload | verdict |
 //! |---|---|
 //! | top-level, harness-template plan (no `Panel:` line) | exit 2, stderr names the three stanzas + the in-band escape |
-//! | top-level, template-shaped plan | exit 0, silent |
-//! | top-level, `Panel: none — reason`, no checkbox tasks | exit 0, one nudge sentence |
+//! | top-level, template-shaped plan | exit 0, reminders-only nudge (subagents stopped, operator asked) |
+//! | top-level, `Panel: none — reason`, no checkbox tasks | exit 0, one nudge sentence + the reminders |
 //! | subagent-originated (`agent_id` present), harness-template plan | exit 0, silent |
 //! | empty `tool_input`, no plan path | exit 0, silent (fail-open, ADR-0001) |
 //! | no inline plan, `planFilePath` inside the plan store | read through the bounded reader; judged |
@@ -74,6 +74,9 @@ fn additional_context(stdout: &str) -> String {
         .to_string()
 }
 
+const SUBAGENTS_REMINDER: &str = "Make sure all your subagents have stopped.";
+const OPERATOR_ASK_REMINDER: &str = "Did your operator ask to see the plan?";
+
 fn assert_silent_allow(out: &Output, case: &str) {
     assert_eq!(out.status.code(), Some(0), "{case}: expected exit 0");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -108,6 +111,10 @@ fn harness_template_plan_is_blocked_naming_stanzas_and_escape() {
         stderr.contains("shift-tab"),
         "leave-plan-mode escape: {stderr}"
     );
+    assert!(
+        stderr.contains(SUBAGENTS_REMINDER) && stderr.contains(OPERATOR_ASK_REMINDER),
+        "the block carries both presentation reminders: {stderr}"
+    );
     // The message renders as one clean paragraph — a hand-wrapped literal that
     // leaked its indentation once shipped green past the substring asserts.
     assert!(!stderr.contains("  "), "no double spaces: {stderr}");
@@ -123,9 +130,27 @@ fn harness_template_plan_is_blocked_naming_stanzas_and_escape() {
 }
 
 #[test]
-fn template_shaped_plan_passes_silently() {
+fn template_shaped_plan_nudges_the_presentation_reminders_only() {
     let out = run_fixture("epm-template-shaped.json");
-    assert_silent_allow(&out, "template-shaped");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "template-shaped plan must allow"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim().is_empty(),
+        "a nudge rides stdout, not stderr: {stderr}"
+    );
+    let ctx = additional_context(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        ctx.contains(SUBAGENTS_REMINDER) && ctx.contains(OPERATOR_ASK_REMINDER),
+        "the clean-plan nudge carries both presentation reminders: {ctx}"
+    );
+    assert!(
+        !ctx.contains("lacks"),
+        "a template-shaped plan draws no missing-stanza text: {ctx}"
+    );
 }
 
 #[test]
@@ -156,8 +181,12 @@ fn settled_panel_none_with_no_boxes_nudges_once_and_allows() {
         "one composed line, not one per stanza: {ctx}"
     );
     assert!(
-        ctx.ends_with("the plan template: `cadence:arrange` `references/plan-template.md`."),
-        "the nudge ends at the template's home: {ctx}"
+        ctx.contains("the plan template: `cadence:arrange` `references/plan-template.md`."),
+        "the nudge names the template's home: {ctx}"
+    );
+    assert!(
+        ctx.contains(SUBAGENTS_REMINDER) && ctx.ends_with(OPERATOR_ASK_REMINDER),
+        "the stanza nudge ends with the presentation reminders: {ctx}"
     );
 }
 

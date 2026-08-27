@@ -40,7 +40,12 @@
 //!   produces a pre-panel draft by design — and every internal failure (no
 //!   plan text obtainable, unreadable plan-store file) allows (ADR-0001).
 //!   The gate enforces the artifact's *shape*, not that attune ran or that
-//!   the operator asked; those stay prose-governed.
+//!   the operator asked; those stay prose-governed — but every judged
+//!   outcome (block, stanza nudge, and a reminders-only nudge on a
+//!   template-shaped plan) carries two static presentation-time reminders:
+//!   subagents stopped, operator asked to see the plan (the
+//!   presentation-reminders plan, 2026-08-26; deliberately not
+//!   telemetry-driven).
 
 use crate::plan_scan::{self, InFlightPlan};
 use cadence_hooks_core::markers;
@@ -112,6 +117,15 @@ impl Check for LintPlanShape {
 /// (cameronsjo/cadence-hooks#715).
 const PANEL_ESCAPE_TEMPLATE: &str = "Panel: none — <reason>";
 
+/// Presentation-time reminders, carried on every top-level `ExitPlanMode`
+/// outcome (the presentation-reminders plan, 2026-08-26). Static text by
+/// ruling — deliberately NOT telemetry-driven: `subagents.jsonl` is not
+/// reliable enough to gate on, so the guard reminds instead of detecting.
+const SUBAGENTS_REMINDER: &str = "Make sure all your subagents have stopped.";
+
+/// The attune presentation-hold doctrine, surfaced at the call that presents.
+const OPERATOR_ASK_REMINDER: &str = "Did your operator ask to see the plan?";
+
 pub fn run_lint_plan_shape(input: &HookInput) -> CheckResult {
     if input.tool_name() != Some("ExitPlanMode") {
         return CheckResult::allow();
@@ -145,26 +159,29 @@ fn plan_text(input: &HookInput) -> Option<String> {
 
 /// The pure decision: block on an unsettled `Panel:` line (naming every
 /// missing stanza plus both escapes), nudge on a settled line with other
-/// stanzas missing, allow on a template-shaped plan.
+/// stanzas missing, nudge just the presentation reminders on a
+/// template-shaped plan — every outcome carries both reminders.
 fn judge_plan_shape(plan: &str) -> CheckResult {
     let missing = plan_scan::missing_stanzas(plan);
     if missing.is_empty() {
-        return CheckResult::allow();
+        return CheckResult::nudge(format!(
+            "plan-shape gate: {SUBAGENTS_REMINDER} {OPERATOR_ASK_REMINDER}"
+        ));
     }
     if missing.contains(&plan_scan::PANEL_STANZA) {
         return CheckResult::block(format!(
             "plan-shape gate: this plan lacks {} — mandatory stanzas of {}. \
              Add the `Panel:` line (a panel that ran: `Panel: <seats> ran — N findings, \
              M folded in, K declined`; none ran: `{PANEL_ESCAPE_TEMPLATE}`) and re-call \
-             ExitPlanMode, or leave plan mode with shift-tab. The gate checks the \
-             artifact's shape only; attune's panel and the operator's ask to see the \
-             plan are still yours to honor.",
+             ExitPlanMode, or leave plan mode with shift-tab. {SUBAGENTS_REMINDER} The \
+             gate checks the artifact's shape only; attune's panel is still yours to \
+             honor. {OPERATOR_ASK_REMINDER}",
             missing.join(", "),
             plan_scan::TEMPLATE_POINTER
         ));
     }
     CheckResult::nudge(format!(
-        "plan-shape gate: plan lacks {} — {}.",
+        "plan-shape gate: plan lacks {} — {}. {SUBAGENTS_REMINDER} {OPERATOR_ASK_REMINDER}",
         missing.join(", "),
         plan_scan::TEMPLATE_POINTER
     ))
@@ -438,6 +455,15 @@ mod tests {
             msg.contains("the plan template: `cadence:arrange` `references/plan-template.md`"),
             "the block names the template's home: {msg}"
         );
+        assert!(
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
+            "the block carries both presentation reminders: {msg}"
+        );
+        assert_eq!(
+            msg.matches("ask to see the plan").count(),
+            1,
+            "the operator-ask question is stated once, folded into the tail: {msg}"
+        );
     }
 
     #[test]
@@ -456,12 +482,25 @@ mod tests {
             msg.contains("the plan template: `cadence:arrange` `references/plan-template.md`."),
             "the nudge names the template's home: {msg}"
         );
+        assert!(
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
+            "the stanza nudge carries both presentation reminders: {msg}"
+        );
     }
 
     #[test]
-    fn plan_shape_template_shaped_plan_allows() {
+    fn plan_shape_template_shaped_plan_nudges_reminders_only() {
         let r = judge_plan_shape(plan_scan::TEMPLATE_SHAPED_PLAN);
-        assert_eq!(r.outcome, Outcome::Allow);
+        assert_eq!(r.outcome, Outcome::Nudge);
+        let msg = r.message.unwrap();
+        assert!(
+            msg.contains(SUBAGENTS_REMINDER) && msg.contains(OPERATOR_ASK_REMINDER),
+            "the clean-plan nudge carries both presentation reminders: {msg}"
+        );
+        assert!(
+            !msg.contains("lacks"),
+            "a template-shaped plan draws no missing-stanza text: {msg}"
+        );
     }
 
     fn init_repo(dir: &Path) {
