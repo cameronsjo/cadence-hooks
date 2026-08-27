@@ -431,7 +431,7 @@ pub const HOOKS: &[HookEntry] = &[
     },
     HookEntry {
         name: "lint-plan-shape",
-        description: "Block ExitPlanMode when the plan carries no settled Panel: line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
+        description: "Block ExitPlanMode when the plan carries no settled Panel: line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every outcome carries the presentation reminders (subagents stopped, operator asked to see the plan); subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
         plugin: "session",
         event: Some(HookEvent::PreToolUse),
     },

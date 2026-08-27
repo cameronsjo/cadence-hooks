@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`session lint-plan-shape` carries two presentation-time reminders on every judged outcome** — "Make sure all your subagents have stopped." and "Did your operator ask to see the plan?" A template-shaped plan, previously a silent allow, now draws a reminders-only nudge; the missing-stanza nudge appends both lines; the block appends the subagent line and folds the operator-ask question into its existing tail. Static text by ruling — deliberately not telemetry-driven (`subagents.jsonl` is not reliable enough to gate on). Telemetry note: with nudge logging on (the default), every clean top-level `ExitPlanMode` now writes a `nudge` row to `denials.jsonl`, so `lint-plan-shape`'s nudge rate stops being a plan-shape-problem signal.
+
 ## [0.87.0] - 2026-08-26
 
 ### Added
