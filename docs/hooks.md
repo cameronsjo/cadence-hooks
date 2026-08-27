@@ -162,6 +162,22 @@ Liveness is mtime-based: a session that crashes or closes simply stops heartbeat
 and is presumed dead after 10 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
 deregistration ceremony. Stale entries are swept on the next `session start`.
 
+### Living-plan guards
+
+Three more `session` hooks serve the living-plan lifecycle (ADR-0038) rather than
+multi-session identity. They are wired by the **cadence** plugin, not cadence-canon,
+and all three bind to the plan doc for the current branch.
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `nudge-plan-tick` | PostToolUse (Bash, `git commit`) | Nudge once per session when a successful commit left the branch's in-flight plan untouched |
+| `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip |
+| `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan carries no settled `Panel:` line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every judged outcome carries the presentation reminders (subagents stopped, operator asked to see the plan) |
+
+`nudge-plan-tick` and `warn-plan-ready-flip` only ever warn. `lint-plan-shape` is the
+one plan guard that blocks, and only on the `Panel:` line; subagent-originated calls
+(`agent_id` present) and every internal failure allow (ADR-0001).
+
 ### CLI actions (not hooks)
 
 A few `cadence-hooks` subcommands are operator commands, not hooks — they take

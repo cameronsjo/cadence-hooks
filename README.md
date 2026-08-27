@@ -17,7 +17,7 @@ Claude Code hooks run on every tool invocation. Shell scripts accumulate startup
 | `rules` | cadence-rules | 4 | Frontmatter validation + a security anti-pattern scan |
 | `obsidian` | cadence-obsidian | 1 | Block `rm` inside the Obsidian vault |
 | `metrics` | cadence-metrics | 9 | Cost-per-commit and subagent JSONL loggers (never block) |
-| `session` | cadence-canon | 12 | Multi-session identity, peer disclosure, lane warnings |
+| `session` | cadence-canon | 13 | Multi-session identity, peer disclosure, lane warnings, living-plan guards |
 
 **Full catalog:** [docs/hooks.md](docs/hooks.md) — every hook with its event and behavior, plus the CLI actions (`session declare`/`status`, `dismiss-main-branch-warn`) that are commands rather than hooks.
 
