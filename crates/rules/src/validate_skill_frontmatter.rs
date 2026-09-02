@@ -176,7 +176,7 @@ fn classify_path(path: &str) -> FileType {
     // `contains("/skills/")` blocks `<repo>/docs/skills/<x>/SKILL.md`, which is
     // documentation about skills, for the same reason and by the same mechanism.
     // It is deliberately left alone here and filed separately
-    // (cameronsjo/cadence-hooks#805).
+    // (cameronsjo/cadence-hooks#806).
     //
     // Why not both at once: routing this arm through `is_definition_root` turns
     // ~20 existing fixtures red, because they assert against plugin-skill paths
