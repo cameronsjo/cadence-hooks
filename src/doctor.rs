@@ -1932,11 +1932,19 @@ fn orphan_findings(
             // readers to `cadence:tend`, which has no plugin-cache handling at
             // all — so the one warning that also carries the safety
             // precondition pointed away from both the tool and the gate
-            // (cameronsjo/cadence-hooks#803). `--prune` alone is a dry run;
-            // `--apply` is what removes, and the liveness precondition is still
-            // the operator's to satisfy — it is not enforced in code.
-            remediation: "prune only when no other sessions are live across checkouts: \
-                 `cadence-hooks doctor --prune` previews, `--prune --apply` removes"
+            // (cameronsjo/cadence-hooks#803).
+            //
+            // Liveness IS enforced: `prune_liveness_gate` refuses `--apply`
+            // while any non-stale peer is registered, names them, and offers
+            // `CADENCE_DOCTOR_PRUNE_FORCE=1`. What it cannot see is the other
+            // half of this line's own precondition — the registry is
+            // repo-scoped, so sessions in OTHER checkouts sharing the same
+            // global cache are invisible to it (cameronsjo/cadence-hooks#804).
+            // That residue is why the text still asks the operator to look
+            // across checkouts rather than trusting the refusal alone.
+            remediation: "`cadence-hooks doctor --prune` previews; `--prune --apply` removes. \
+                 Apply refuses while this repo has live sessions — but the registry is \
+                 repo-scoped, so check other checkouts yourself"
                 .to_string(),
         });
     }
@@ -3996,6 +4004,49 @@ mod tests {
             orphan_finding.diagnosis.contains("2 orphaned"),
             "diagnosis: {}",
             orphan_finding.diagnosis
+        );
+    }
+
+    /// The remediation must name the command that actually prunes.
+    ///
+    /// It previously named a skill with no plugin-cache handling of any kind
+    /// (cadence-hooks#803), and nothing in the suite could observe that — a
+    /// remediation pointing at the wrong tool is invisible in both directions,
+    /// so it could rot again with no red anywhere. This is the assertion that
+    /// makes the recurrence detectable.
+    #[test]
+    fn orphan_finding_remediation_names_the_prune_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        for sha in ["sha1", "sha2"] {
+            let dir = plugin_dir.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+        let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
+
+        let findings = orphan_findings(
+            &pinned,
+            false,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
+        let orphan_finding = findings
+            .iter()
+            .find(|f| f.diagnosis.contains("orphaned"))
+            .expect("should report orphans");
+
+        assert!(
+            orphan_finding
+                .remediation
+                .contains("cadence-hooks doctor --prune"),
+            "remediation must name the command that does the work, got: {}",
+            orphan_finding.remediation
+        );
+        assert!(
+            orphan_finding.remediation.contains("--apply"),
+            "remediation must distinguish the dry run from the removal, got: {}",
+            orphan_finding.remediation
         );
     }
 

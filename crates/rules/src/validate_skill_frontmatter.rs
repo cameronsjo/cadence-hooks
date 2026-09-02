@@ -76,63 +76,123 @@ enum FileType {
     Other,
 }
 
-/// Does this `.md` sit in a directory that actually holds slash-command
-/// DEFINITIONS, as opposed to any directory a project happened to name
-/// `commands`?
+/// Upper bound on a path we will scan. Past this we classify as `Other` rather
+/// than walk it: `file_path` is unbounded agent-supplied input, and the scan
+/// below pays a `stat` per candidate directory, so an absurd path is a way to
+/// stall the hook. Failing open here matches ADR-0001 — a guard that times out
+/// protects nobody either.
+const MAX_PATH_BYTES: usize = 4096;
+
+/// Split a path into segments, dropping what carries no meaning (`//` and
+/// `/./`) and folding `..`, so the classifier sees the directory the write
+/// actually lands in.
 ///
-/// Three shapes are real, and they are the only three:
+/// `normalize_path` upstream (`crates/core`) only maps `\` to `/`, strips NULs,
+/// and trims trailing slashes — it does none of this — so `/repo/.claude//commands/x.md`
+/// and `/repo/.claude/./commands/x.md` arrive verbatim. Comparing raw segments
+/// would see `""` or `"."` as the parent and miss a real command definition.
 ///
-/// 1. `<anything>/.claude/commands/**` — user (`~/.claude`) and project
-///    (`<repo>/.claude`) commands.
-/// 2. `<anything>/plugins/<plugin>/commands/**` — the plugin monorepo layout.
-///    A cheap string fast path for the case rule 3 would otherwise pay I/O for.
-/// 3. A plugin root's own `commands/`, identified by its sibling
-///    `.claude-plugin/` marker directory. This is what the installed plugin
-///    cache looks like (`<cache>/<marketplace>/<plugin>/<sha>/commands/`) and
-///    what a standalone plugin repo looks like, neither of which carries a
-///    `plugins/` segment.
+/// `None` means "do not classify": a relative path, or one past the size bound.
+/// Relative paths are refused because the marker probe below resolves against
+/// the hook process's cwd, so the same path would classify differently
+/// depending on where the process happens to stand.
+fn normalized_segments(path: &str) -> Option<Vec<&str>> {
+    if !path.starts_with('/') || path.len() > MAX_PATH_BYTES {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for raw in path.split('/') {
+        match raw {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    Some(segments)
+}
+
+/// Is `segments` — the directory that holds a `commands/` or `skills/` tree —
+/// somewhere Claude Code actually loads definitions from?
+///
+/// Two shapes, and they are the only two:
+///
+/// 1. A `.claude/` directory: user (`~/.claude`) or project (`<repo>/.claude`).
+/// 2. A plugin root, identified by its sibling `.claude-plugin/` marker. This
+///    covers the installed cache (`<cache>/<marketplace>/<plugin>/<sha>/`), the
+///    monorepo's `plugins/<plugin>/`, and a standalone plugin repo root alike —
+///    all 14 plugins in the cadence monorepo carry the marker, so nothing needs
+///    a `plugins/` path-segment rule to be recognised.
+///
+/// An earlier draft of this fix DID carry that extra rule — accept any
+/// `plugins/<name>/commands/` triple — as a fast path to skip the `stat`. It
+/// reintroduced the very bug being fixed one directory deeper:
+/// `<repo>/docs/plugins/<name>/commands/overview.md` is documentation ABOUT
+/// plugins and was hard-blocked by it. The marker covers every real instance,
+/// so the fast path bought one `stat` and cost a false block.
+///
+/// Comparisons are ASCII-case-insensitive because APFS and NTFS are: a write to
+/// `/repo/.Claude/commands/x.md` lands in the real `.claude` directory, and a
+/// case-sensitive compare would let it skip validation.
+///
+/// Fails OPEN: an absent or unreadable marker classifies as `Other`, so the
+/// guard's own I/O trouble can never block an edit (ADR-0001). The known cost is
+/// a missed nudge on a plugin being scaffolded whose `.claude-plugin/` does not
+/// exist yet — the cheaper failure, since a guardrail's real price is a false
+/// block on legitimate work, not a missed nudge.
+fn is_definition_root(segments: &[&str]) -> bool {
+    if segments
+        .last()
+        .is_some_and(|parent| parent.eq_ignore_ascii_case(".claude"))
+    {
+        return true;
+    }
+    if segments.is_empty() {
+        return false;
+    }
+    let root = format!("/{}", segments.join("/"));
+    std::path::Path::new(&root).join(".claude-plugin").is_dir()
+}
+
+/// Does this `.md` hold a slash-command DEFINITION, as opposed to living in any
+/// directory a project happened to name `commands`?
 ///
 /// The predicate this replaces was a bare `path.contains("/commands/")`, which
 /// swept in ordinary project documentation. `<repo>/docs/commands/*.md` is a
-/// natural place to document a CLI's command groups — forgectl keeps nine such
+/// natural home for a CLI's per-command-group pages — forgectl keeps nine such
 /// files, none of which has or should have YAML frontmatter — and every edit to
-/// them was hard-blocked for "missing frontmatter" with no way forward except
+/// them was hard-blocked for "missing frontmatter", with no way forward except
 /// adding meaningless frontmatter or bypassing the guard
 /// (cameronsjo/cadence-hooks#802).
-///
-/// Rule 3 touches the filesystem and fails OPEN: an unreadable or absent marker
-/// classifies the file as `Other`, so the guard's own I/O trouble can never
-/// block an edit (ADR-0001). The cost of that choice is a missed nudge on a
-/// genuinely new plugin whose `.claude-plugin/` does not exist yet — cheaper
-/// than a false block, per the guardrail-cost principle.
-fn is_command_definition(path: &str) -> bool {
-    let segments: Vec<&str> = path.split('/').collect();
-
-    for (i, segment) in segments.iter().enumerate() {
-        if *segment != "commands" || i == 0 {
-            continue;
-        }
-        if segments[i - 1] == ".claude" {
-            return true;
-        }
-        if i >= 2 && segments[i - 2] == "plugins" {
-            return true;
-        }
-        // The `commands` dir's parent is the candidate plugin root; a
-        // `.claude-plugin/` beside it is what makes it one.
-        let root = segments[..i].join("/");
-        if !root.is_empty() && std::path::Path::new(&root).join(".claude-plugin").is_dir() {
-            return true;
-        }
-    }
-
-    false
+fn is_command_definition(segments: &[&str]) -> bool {
+    segments.iter().enumerate().any(|(i, segment)| {
+        segment.eq_ignore_ascii_case("commands") && is_definition_root(&segments[..i])
+    })
 }
 
 fn classify_path(path: &str) -> FileType {
+    // The skill arm carries the MIRROR of the bug fixed below: a bare
+    // `contains("/skills/")` blocks `<repo>/docs/skills/<x>/SKILL.md`, which is
+    // documentation about skills, for the same reason and by the same mechanism.
+    // It is deliberately left alone here and filed separately
+    // (cameronsjo/cadence-hooks#805).
+    //
+    // Why not both at once: routing this arm through `is_definition_root` turns
+    // ~20 existing fixtures red, because they assert against plugin-skill paths
+    // like `/plugins/cadence/skills/my-skill/SKILL.md` that have no marker on
+    // disk. Making them pass means either restating them as project skills —
+    // which quietly drops the plugin case they exist to cover — or standing up
+    // real on-disk plugin roots for each. That is a different change with a
+    // different blast radius, and burying it in a guard fix is how a mistake
+    // gets in. The two defects are the same class, not the same lifecycle.
     if path.contains("/skills/") && path.ends_with("/SKILL.md") {
-        FileType::Skill
-    } else if path.ends_with(".md") && is_command_definition(path) {
+        return FileType::Skill;
+    }
+    let Some(segments) = normalized_segments(path) else {
+        return FileType::Other;
+    };
+    if path.ends_with(".md") && is_command_definition(&segments) {
         FileType::Command
     } else {
         FileType::Other
@@ -358,7 +418,7 @@ mod tests {
     #[test]
     fn classify_command_path() {
         assert_eq!(
-            classify_path("/plugins/cadence/commands/my-cmd.md"),
+            classify_path("/repo/.claude/commands/my-cmd.md"),
             FileType::Command
         );
     }
@@ -410,12 +470,9 @@ mod tests {
     /// would pass for a reason that has nothing to do with the marker.
     #[test]
     fn plugin_root_marker_classifies_commands() {
-        let tmp = std::env::temp_dir().join(format!(
-            "cadence-frontmatter-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let commands = tmp.join("some-plugin").join("commands");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("some-plugin");
+        let commands = root.join("commands");
         std::fs::create_dir_all(&commands).expect("fixture dirs");
         let cmd_path = commands.join("my-cmd.md");
         let cmd_str = cmd_path.to_str().expect("utf-8 fixture path");
@@ -427,15 +484,105 @@ mod tests {
             "without .claude-plugin/ this is not a plugin root"
         );
 
-        std::fs::create_dir_all(tmp.join("some-plugin").join(".claude-plugin"))
-            .expect("marker dir");
+        std::fs::create_dir_all(root.join(".claude-plugin")).expect("marker dir");
         assert_eq!(
             classify_path(cmd_str),
             FileType::Command,
             "the .claude-plugin/ marker is what makes it a plugin root"
         );
+    }
 
-        std::fs::remove_dir_all(&tmp).ok();
+    /// The installed-cache shape, which is the reason the marker rule exists —
+    /// and which carries a DECOY `plugins` segment at a non-matching offset
+    /// (`.../plugins/cache/<marketplace>/<plugin>/<sha>/commands/`).
+    ///
+    /// An earlier draft accepted any `plugins/<name>/commands/` triple as a fast
+    /// path. That rule could not reach this shape (the offsets do not line up)
+    /// while it DID reach `docs/plugins/<name>/commands/`, which is exactly
+    /// backwards. This test pins the real shape so a future "simplify the
+    /// predicate" edit cannot quietly reintroduce the substring form.
+    #[test]
+    fn installed_cache_shape_with_decoy_plugins_segment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp
+            .path()
+            .join("plugins")
+            .join("cache")
+            .join("workbench")
+            .join("cadence-forge")
+            .join("960c588950a6-7712fab0");
+        std::fs::create_dir_all(root.join("commands")).expect("fixture dirs");
+        std::fs::create_dir_all(root.join(".claude-plugin")).expect("marker dir");
+
+        let cmd = root.join("commands").join("polish.md");
+        assert_eq!(
+            classify_path(cmd.to_str().expect("utf-8")),
+            FileType::Command,
+            "the installed cache layout is a real command definition location"
+        );
+    }
+
+    /// Documentation ABOUT plugins is still documentation.
+    ///
+    /// This is the second half of cadence-hooks#802 and the reason the
+    /// `plugins/<name>/commands/` fast path was dropped rather than kept: that
+    /// rule reintroduced the identical false block one directory deeper, on a
+    /// path shape (`docs/plugins/…`) that is if anything more likely than the
+    /// original.
+    #[test]
+    fn docs_about_plugins_is_not_a_command_definition() {
+        for path in [
+            "/repo/docs/plugins/my-plugin/commands/overview.md",
+            "/repo/node_modules/foo/plugins/bar/commands/doc.md",
+            "/repo/plugins/some-plugin/commands/x.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Other,
+                "{path} has no .claude-plugin/ marker, so it is not a plugin root"
+            );
+        }
+    }
+
+    /// `normalize_path` upstream does not collapse `//`, resolve `.`/`..`, or
+    /// case-fold, so these reach the classifier verbatim — and every one of them
+    /// writes to a real `.claude/commands/` file on disk. Comparing raw segments
+    /// saw `""`, `"."`, or `".."` as the parent and let a genuine command
+    /// definition skip validation entirely.
+    #[test]
+    fn unnormalized_shapes_still_reach_the_command_arm() {
+        for path in [
+            "/repo/.claude//commands/x.md",
+            "/repo/.claude/./commands/x.md",
+            "/repo/.claude/sub/../commands/x.md",
+            "/repo/.Claude/commands/x.md",
+            "/repo/.claude/COMMANDS/x.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Command,
+                "{path} resolves into a real .claude/commands tree"
+            );
+        }
+    }
+
+    /// A relative path would make the marker probe resolve against whatever
+    /// directory the hook process is standing in, so the same path could
+    /// classify two ways in one session. Refuse rather than answer
+    /// inconsistently — and refuse an absurd path rather than walk it.
+    #[test]
+    fn relative_and_oversized_paths_are_not_classified() {
+        assert_eq!(
+            classify_path("repo/.claude/commands/x.md"),
+            FileType::Other,
+            "a relative path has no stable meaning here"
+        );
+        let huge = format!("/{}/commands/x.md", "a".repeat(MAX_PATH_BYTES));
+        assert_eq!(
+            classify_path(&huge),
+            FileType::Other,
+            "past the size bound we decline to scan"
+        );
     }
 
     #[test]
@@ -588,7 +735,7 @@ mod tests {
     #[test]
     fn run_command_with_name_field_blocks() {
         let input = make_write_input(
-            "/plugins/cadence/commands/my-cmd.md",
+            "/repo/.claude/commands/my-cmd.md",
             "---\nname: my-cmd\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -599,7 +746,7 @@ mod tests {
     #[test]
     fn run_command_without_name_passes() {
         let input = make_write_input(
-            "/plugins/cadence/commands/my-cmd.md",
+            "/repo/.claude/commands/my-cmd.md",
             "---\ndescription: A command\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
