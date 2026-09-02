@@ -1928,9 +1928,16 @@ fn orphan_findings(
             diagnosis: format!(
                 "{orphan_count} orphaned version dir(s) (~{mib:.1} MiB) left in cache"
             ),
-            remediation:
-                "prune only when no other sessions are live across checkouts; use cadence:tend"
-                    .to_string(),
+            // Name the command that actually does this. The previous text sent
+            // readers to `cadence:tend`, which has no plugin-cache handling at
+            // all — so the one warning that also carries the safety
+            // precondition pointed away from both the tool and the gate
+            // (cameronsjo/cadence-hooks#803). `--prune` alone is a dry run;
+            // `--apply` is what removes, and the liveness precondition is still
+            // the operator's to satisfy — it is not enforced in code.
+            remediation: "prune only when no other sessions are live across checkouts: \
+                 `cadence-hooks doctor --prune` previews, `--prune --apply` removes"
+                .to_string(),
         });
     }
 

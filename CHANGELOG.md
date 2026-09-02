@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rules validate-frontmatter` no longer blocks edits to ordinary `docs/commands/` prose** (cadence-hooks#802). The command arm matched a bare `/commands/` substring anywhere in the path, so any project documenting its CLI's command groups under `docs/commands/` had every edit hard-blocked for "missing YAML frontmatter" — forgectl keeps nine such files, none of which has or should have any. The predicate now splits on path segments and recognises the three real command-definition locations: a `.claude/commands/` tree, the `plugins/<plugin>/commands/` monorepo layout, and a plugin root identified by its sibling `.claude-plugin/` marker (the installed-cache and standalone-plugin-repo shapes, neither of which carries a `plugins/` segment). The marker probe fails **open** — an absent or unreadable marker classifies as `Other` — so the guard's own I/O trouble can never block an edit (ADR-0001); the cost is a missed nudge on a plugin whose `.claude-plugin/` does not exist yet, which is the cheaper failure. Two prior tests used `/plugins/commands/my-cmd.md`, a plugin with no name and not a real layout; they now use `/plugins/cadence/commands/my-cmd.md`, which fixes one outright failure and one test that would otherwise have passed vacuously.
+- **`doctor`'s orphaned-cache warning now names the command that does the work** (cadence-hooks#803). Its remediation read "use cadence:tend", but that skill has no plugin-cache handling of any kind — so the single warning that also carries the safety precondition pointed away from both the tool and the gate. It now names `cadence-hooks doctor --prune` (a dry run) and `--prune --apply` (the removal), which have existed all along. The liveness precondition remains the operator's to satisfy; it is stated, not enforced in code.
+
 ## [0.88.0] - 2026-08-27
 
 ### Added

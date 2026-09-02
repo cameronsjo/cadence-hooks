@@ -76,10 +76,63 @@ enum FileType {
     Other,
 }
 
+/// Does this `.md` sit in a directory that actually holds slash-command
+/// DEFINITIONS, as opposed to any directory a project happened to name
+/// `commands`?
+///
+/// Three shapes are real, and they are the only three:
+///
+/// 1. `<anything>/.claude/commands/**` — user (`~/.claude`) and project
+///    (`<repo>/.claude`) commands.
+/// 2. `<anything>/plugins/<plugin>/commands/**` — the plugin monorepo layout.
+///    A cheap string fast path for the case rule 3 would otherwise pay I/O for.
+/// 3. A plugin root's own `commands/`, identified by its sibling
+///    `.claude-plugin/` marker directory. This is what the installed plugin
+///    cache looks like (`<cache>/<marketplace>/<plugin>/<sha>/commands/`) and
+///    what a standalone plugin repo looks like, neither of which carries a
+///    `plugins/` segment.
+///
+/// The predicate this replaces was a bare `path.contains("/commands/")`, which
+/// swept in ordinary project documentation. `<repo>/docs/commands/*.md` is a
+/// natural place to document a CLI's command groups — forgectl keeps nine such
+/// files, none of which has or should have YAML frontmatter — and every edit to
+/// them was hard-blocked for "missing frontmatter" with no way forward except
+/// adding meaningless frontmatter or bypassing the guard
+/// (cameronsjo/cadence-hooks#802).
+///
+/// Rule 3 touches the filesystem and fails OPEN: an unreadable or absent marker
+/// classifies the file as `Other`, so the guard's own I/O trouble can never
+/// block an edit (ADR-0001). The cost of that choice is a missed nudge on a
+/// genuinely new plugin whose `.claude-plugin/` does not exist yet — cheaper
+/// than a false block, per the guardrail-cost principle.
+fn is_command_definition(path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').collect();
+
+    for (i, segment) in segments.iter().enumerate() {
+        if *segment != "commands" || i == 0 {
+            continue;
+        }
+        if segments[i - 1] == ".claude" {
+            return true;
+        }
+        if i >= 2 && segments[i - 2] == "plugins" {
+            return true;
+        }
+        // The `commands` dir's parent is the candidate plugin root; a
+        // `.claude-plugin/` beside it is what makes it one.
+        let root = segments[..i].join("/");
+        if !root.is_empty() && std::path::Path::new(&root).join(".claude-plugin").is_dir() {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn classify_path(path: &str) -> FileType {
     if path.contains("/skills/") && path.ends_with("/SKILL.md") {
         FileType::Skill
-    } else if path.contains("/commands/") && path.ends_with(".md") {
+    } else if path.ends_with(".md") && is_command_definition(path) {
         FileType::Command
     } else {
         FileType::Other
@@ -311,6 +364,81 @@ mod tests {
     }
 
     #[test]
+    fn classify_dot_claude_command_path() {
+        assert_eq!(
+            classify_path("/Users/x/.claude/commands/my-cmd.md"),
+            FileType::Command
+        );
+        assert_eq!(
+            classify_path("/repo/.claude/commands/nested/my-cmd.md"),
+            FileType::Command
+        );
+    }
+
+    /// The cameronsjo/cadence-hooks#802 regression, pinned.
+    ///
+    /// `docs/commands/` is ordinary project documentation — a natural home for
+    /// a CLI's per-command-group pages, and forgectl keeps nine of them with no
+    /// frontmatter by convention. The old bare `contains("/commands/")`
+    /// predicate classified every one as a command DEFINITION, so the check
+    /// hard-blocked each edit for "missing YAML frontmatter".
+    ///
+    /// This is the control for the fix: it fails on the old predicate and is
+    /// the reason the new one splits on path segments instead of substrings.
+    #[test]
+    fn docs_commands_dir_is_not_a_command_definition() {
+        for path in [
+            "/repo/docs/commands/projects-and-review.md",
+            "/repo/docs/commands/pr.md",
+            "/repo/documentation/commands/index.md",
+            "/srv/commands/readme.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Other,
+                "{path} is documentation, not a command definition"
+            );
+        }
+    }
+
+    /// A plugin root is identified by its sibling `.claude-plugin/` marker —
+    /// the installed-cache and standalone-plugin-repo layouts, neither of which
+    /// carries a `plugins/` path segment for the string fast paths to catch.
+    ///
+    /// The negative half is what keeps the marker load-bearing: the identical
+    /// tree WITHOUT `.claude-plugin/` must classify as `Other`, or this test
+    /// would pass for a reason that has nothing to do with the marker.
+    #[test]
+    fn plugin_root_marker_classifies_commands() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cadence-frontmatter-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let commands = tmp.join("some-plugin").join("commands");
+        std::fs::create_dir_all(&commands).expect("fixture dirs");
+        let cmd_path = commands.join("my-cmd.md");
+        let cmd_str = cmd_path.to_str().expect("utf-8 fixture path");
+
+        // No marker yet — indistinguishable from any other `commands` dir.
+        assert_eq!(
+            classify_path(cmd_str),
+            FileType::Other,
+            "without .claude-plugin/ this is not a plugin root"
+        );
+
+        std::fs::create_dir_all(tmp.join("some-plugin").join(".claude-plugin"))
+            .expect("marker dir");
+        assert_eq!(
+            classify_path(cmd_str),
+            FileType::Command,
+            "the .claude-plugin/ marker is what makes it a plugin root"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
     fn skill_dir_extraction() {
         assert_eq!(
             skill_dir_name("/plugins/skills/my-skill/SKILL.md"),
@@ -460,7 +588,7 @@ mod tests {
     #[test]
     fn run_command_with_name_field_blocks() {
         let input = make_write_input(
-            "/plugins/commands/my-cmd.md",
+            "/plugins/cadence/commands/my-cmd.md",
             "---\nname: my-cmd\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -471,7 +599,7 @@ mod tests {
     #[test]
     fn run_command_without_name_passes() {
         let input = make_write_input(
-            "/plugins/commands/my-cmd.md",
+            "/plugins/cadence/commands/my-cmd.md",
             "---\ndescription: A command\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
