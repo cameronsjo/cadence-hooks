@@ -140,14 +140,23 @@ fn normalized_segments(path: &str) -> Option<(&str, Vec<&str>)> {
 /// Is `segments` — the directory that holds a `commands/` or `skills/` tree —
 /// somewhere Claude Code actually loads definitions from?
 ///
-/// Two shapes, and they are the only two:
+/// Three shapes:
 ///
-/// 1. A `.claude/` directory: user (`~/.claude`) or project (`<repo>/.claude`).
+/// 1. A config directory: user (`~/.claude`) or project (`<repo>/.claude`) —
+///    and whatever `CLAUDE_CONFIG_DIR` names, per [`CONFIG_DIR_NAME`].
 /// 2. A plugin root, identified by its sibling `.claude-plugin/` marker. This
 ///    covers the installed cache (`<cache>/<marketplace>/<plugin>/<sha>/`), the
 ///    monorepo's `plugins/<plugin>/`, and a standalone plugin repo root alike —
 ///    all 14 plugins in the cadence monorepo carry the marker, so nothing needs
 ///    a `plugins/` path-segment rule to be recognised.
+/// 3. A repo that is itself a Claude workspace, identified by a sibling
+///    `.claude/` directory. This is the SYMLINK-FARM layout: `cmux` keeps its
+///    20 skills at `cmux/skills/<name>/` and links them in from
+///    `cmux/.claude/skills/<name>`, so the canonical path an agent edits — the
+///    link TARGET — has no `.claude` ancestor at all and rule 1 never sees it.
+///    Narrow by construction: the candidate root is the `skills/` or
+///    `commands/` parent, so `<repo>/docs/skills/…` asks about `<repo>/docs`,
+///    which is not a workspace, and stays documentation.
 ///
 /// An earlier draft of this fix DID carry that extra rule — accept any
 /// `plugins/<name>/commands/` triple — as a fast path to skip the `stat`. It
@@ -165,19 +174,48 @@ fn normalized_segments(path: &str) -> Option<(&str, Vec<&str>)> {
 /// a missed nudge on a plugin being scaffolded whose `.claude-plugin/` does not
 /// exist yet — the cheaper failure, since a guardrail's real price is a false
 /// block on legitimate work, not a missed nudge.
+/// Is this path segment a Claude config directory?
+///
+/// Pure and parameterised over the config-dir name **so it can be tested**.
+/// [`CONFIG_DIR_NAME`] is a process-lifetime cache, and on a machine whose
+/// `CLAUDE_CONFIG_DIR` is unset it resolves to `.claude` — so a test written
+/// against the cache passes identically whether or not the relocated-dir rule
+/// exists, which is no test at all. Passing the name in is what lets a control
+/// go red.
+fn is_config_dir_segment(segment: &str, config_dir_name: &str) -> bool {
+    segment.eq_ignore_ascii_case(".claude") || segment.eq_ignore_ascii_case(config_dir_name)
+}
+
 fn is_definition_root(prefix: &str, segments: &[&str]) -> bool {
     if segments
         .last()
-        .is_some_and(|parent| parent.eq_ignore_ascii_case(".claude"))
+        .is_some_and(|parent| is_config_dir_segment(parent, &CONFIG_DIR_NAME))
     {
         return true;
     }
     if segments.is_empty() {
         return false;
     }
-    let root = format!("{prefix}{}", segments.join("/"));
-    std::path::Path::new(&root).join(".claude-plugin").is_dir()
+    let root = std::path::Path::new(prefix).join(segments.join("/"));
+    root.join(".claude-plugin").is_dir() || root.join(".claude").is_dir()
 }
+
+/// The basename of the ACTIVE config dir, which is `.claude` by default but is
+/// whatever `CLAUDE_CONFIG_DIR` names when a second subscription profile is in
+/// use (`claude-as` runs one; `~/.claude-alt` holds 26 live skills). Matching
+/// only the literal `.claude` silently stops validating every definition in
+/// that profile — the same six rules, no error, no signal.
+///
+/// The binary already resolves this correctly for every other purpose
+/// (`cadence_hooks_core::paths::claude_config_dir`); the classifier simply
+/// never asked. Cached because a hook is a short-lived process and the env does
+/// not move underneath it.
+static CONFIG_DIR_NAME: LazyLock<String> = LazyLock::new(|| {
+    cadence_hooks_core::paths::claude_config_dir()
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| ".claude".to_string())
+});
 
 /// Does this path pass through a `<kind>/` directory that a definition root
 /// actually owns — `commands` for slash commands, `skills` for skills?
@@ -205,9 +243,21 @@ fn classify_path(path: &str) -> FileType {
     let Some((prefix, segments)) = normalized_segments(path) else {
         return FileType::Other;
     };
-    if path.ends_with("/SKILL.md") && is_definition_of("skills", prefix, &segments) {
+    // The filename tests are ASCII-case-insensitive for the same reason the
+    // directory tests are: on APFS and NTFS a write to `Skill.md` lands in the
+    // loaded `SKILL.md`, so a case-sensitive compare here would let it skip
+    // validation while the case-folding rationale on `is_definition_root`
+    // claimed otherwise.
+    let is_skill_file = segments
+        .last()
+        .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
+    let is_markdown = segments
+        .last()
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".md"));
+
+    if is_skill_file && is_definition_of("skills", prefix, &segments) {
         FileType::Skill
-    } else if path.ends_with(".md") && is_definition_of("commands", prefix, &segments) {
+    } else if is_markdown && is_definition_of("commands", prefix, &segments) {
         FileType::Command
     } else {
         FileType::Other
@@ -245,8 +295,23 @@ fn extract_frontmatter(content: &str) -> Option<Vec<(String, String)>> {
 
 /// Extract directory name for a skill path (parent of SKILL.md).
 fn skill_dir_name(path: &str) -> Option<&str> {
-    let parent = path.strip_suffix("/SKILL.md")?;
-    parent.rsplit('/').next()
+    // Derive from the SAME normalised view `classify_path` uses, not from the
+    // raw string. The two were on different path models, and the gap was a
+    // false BLOCK: `/repo/.claude/skills/my-skill/./SKILL.md` classifies as a
+    // skill (that is what normalisation is for), but a raw
+    // `strip_suffix` + `rsplit` then reported the directory as "." and rejected
+    // a perfectly valid `name: my-skill` with "must match directory '.'".
+    // `//` gave the same result with an empty string.
+    //
+    // `normalize_path` upstream does not collapse those shapes, so they do
+    // reach production — `unnormalized_shapes_still_reach_the_command_arm` is
+    // the standing evidence. Deriving both from one view is what keeps the
+    // classifier and the name rule from disagreeing about the same path.
+    let (_prefix, segments) = normalized_segments(path)?;
+    if !segments.last()?.eq_ignore_ascii_case("SKILL.md") {
+        return None;
+    }
+    segments.get(segments.len().checked_sub(2)?).copied()
 }
 
 /// Strip a trailing inline YAML comment from a scalar value. Per YAML, `#`
@@ -439,16 +504,18 @@ mod tests {
         assert!(!NAME_PATTERN.is_match("cadence:At")); // uppercase suffix
     }
 
+    /// Both arms of the shared predicate stay live — a `.claude/` tree owns its
+    /// `skills/` and its `commands/` alike, and neither noun may quietly stop
+    /// being recognised while the other keeps working. Fixing one arm and
+    /// leaving its twin is the exact failure cadence-hooks#806 exists to close,
+    /// so the two assertions belong in one test rather than in two that can be
+    /// updated independently.
     #[test]
-    fn classify_skill_path() {
+    fn both_arms_recognise_a_claude_tree() {
         assert_eq!(
             classify_path("/repo/.claude/skills/my-skill/SKILL.md"),
             FileType::Skill
         );
-    }
-
-    #[test]
-    fn classify_command_path() {
         assert_eq!(
             classify_path("/repo/.claude/commands/my-cmd.md"),
             FileType::Command
@@ -578,22 +645,6 @@ mod tests {
         }
     }
 
-    /// Both arms of the shared predicate stay live — a `.claude/` tree owns its
-    /// `skills/` and its `commands/` alike, and neither noun may quietly stop
-    /// being recognised while the other keeps working. Fixing one arm and
-    /// leaving its twin is the exact failure #806 exists to close.
-    #[test]
-    fn both_arms_recognise_a_claude_tree() {
-        assert_eq!(
-            classify_path("/repo/.claude/skills/my-skill/SKILL.md"),
-            FileType::Skill
-        );
-        assert_eq!(
-            classify_path("/repo/.claude/commands/my-cmd.md"),
-            FileType::Command
-        );
-    }
-
     /// A plugin root's `skills/` is a definition location, identified by the
     /// same `.claude-plugin/` marker the command arm uses — and the negative
     /// half keeps the marker load-bearing rather than incidental.
@@ -617,6 +668,129 @@ mod tests {
             FileType::Skill,
             "the .claude-plugin/ marker is what makes it a plugin root"
         );
+    }
+
+    /// The symlink-farm layout: a repo that is itself a Claude workspace keeps
+    /// its definitions at `<repo>/skills/<name>/` and links them in from
+    /// `<repo>/.claude/skills/<name>`. The path an agent actually edits is the
+    /// link TARGET, which has no `.claude` ancestor — so a `.claude`-only rule
+    /// stops validating all 20 of cmux's skills while the symlinked spelling
+    /// keeps working, which is exactly the kind of split nobody notices.
+    ///
+    /// The negative half is what keeps the rule narrow: the identical tree
+    /// WITHOUT the sibling `.claude/` is not a workspace, and `docs/skills/`
+    /// asks about `docs`, which never is.
+    #[test]
+    fn workspace_repo_owns_its_top_level_definitions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("cmux-like");
+        std::fs::create_dir_all(repo.join("skills").join("my-skill")).expect("fixture dirs");
+        std::fs::create_dir_all(repo.join("docs").join("skills").join("about"))
+            .expect("fixture dirs");
+        let target = as_hook_path(&repo.join("skills/my-skill/SKILL.md"));
+        let docs = as_hook_path(&repo.join("docs/skills/about/SKILL.md"));
+
+        assert_eq!(
+            classify_path(&target),
+            FileType::Other,
+            "without a sibling .claude/ this repo is not a workspace"
+        );
+
+        std::fs::create_dir_all(repo.join(".claude")).expect("workspace marker");
+        assert_eq!(
+            classify_path(&target),
+            FileType::Skill,
+            "the sibling .claude/ is what makes the repo a definition root"
+        );
+        assert_eq!(
+            classify_path(&docs),
+            FileType::Other,
+            "docs/skills asks about docs/, which is still not a workspace"
+        );
+    }
+
+    /// A relocated config dir (`CLAUDE_CONFIG_DIR`, as `claude-as` uses for a
+    /// second subscription profile) is still a config dir. Matching only the
+    /// literal `.claude` silently stops validating every definition in that
+    /// profile — 26 live skills under `~/.claude-alt` at the time of writing.
+    ///
+    /// The rule itself, proved against a name this machine does not use.
+    ///
+    /// The wiring test below cannot carry this: `CONFIG_DIR_NAME` caches for
+    /// the process, and where `CLAUDE_CONFIG_DIR` is unset it resolves to
+    /// `.claude` — so the literal arm already answers every case and deleting
+    /// the relocated arm changes nothing. Verified: mutating the rule away left
+    /// that test green. This one is parameterised, so it goes red.
+    #[test]
+    fn a_relocated_config_dir_is_still_a_config_dir() {
+        assert!(is_config_dir_segment(".claude-alt", ".claude-alt"));
+        assert!(
+            is_config_dir_segment(".CLAUDE-ALT", ".claude-alt"),
+            "case-folded like every other segment compare"
+        );
+        assert!(
+            is_config_dir_segment(".claude", ".claude-alt"),
+            "the default stays a config dir even when another is active"
+        );
+        assert!(
+            !is_config_dir_segment(".claude-alt", ".claude"),
+            "a lookalike is not a config dir just because it shares a prefix"
+        );
+        assert!(!is_config_dir_segment("docs", ".claude-alt"));
+    }
+
+    /// Asserted through the same accessor production reads, rather than by
+    /// setting the env var: `CONFIG_DIR_NAME` is a process-lifetime cache, so a
+    /// test that mutated the env would race every other test in the binary and
+    /// prove nothing repeatable. This pins the WIRING; the test above pins the
+    /// RULE.
+    #[test]
+    fn config_dir_name_tracks_the_resolved_config_dir() {
+        let resolved = cadence_hooks_core::paths::claude_config_dir();
+        let expected = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| ".claude".to_string());
+        assert_eq!(
+            *CONFIG_DIR_NAME, expected,
+            "the classifier must use the config dir the rest of the binary resolves"
+        );
+
+        let path = format!("/Users/x/{}/skills/my-skill/SKILL.md", *CONFIG_DIR_NAME);
+        assert_eq!(
+            classify_path(&path),
+            FileType::Skill,
+            "{path} is a real skill definition under the active config dir"
+        );
+    }
+
+    /// The skill arm inherits normalisation, case-folding, the Windows drive
+    /// branch, and the relative/oversize refusals from the shared predicate —
+    /// but inheritance is a claim until something pins it. Every other control
+    /// in this file exercises `commands` only, so drift would land here unseen.
+    #[test]
+    fn skill_arm_inherits_the_shared_path_handling() {
+        for path in [
+            "/repo/.claude//skills/my-skill/SKILL.md",
+            "/repo/.claude/./skills/my-skill/SKILL.md",
+            "/repo/.claude/x/../skills/my-skill/SKILL.md",
+            "/repo/.Claude/SKILLS/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/Skill.md",
+            "C:/repo/.claude/skills/my-skill/SKILL.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Skill,
+                "{path} resolves into a real skills tree"
+            );
+        }
+        assert_eq!(
+            classify_path("repo/.claude/skills/my-skill/SKILL.md"),
+            FileType::Other,
+            "a relative path has no stable meaning on either arm"
+        );
+        let huge = format!("/{}/skills/x/SKILL.md", "a".repeat(MAX_PATH_BYTES));
+        assert_eq!(classify_path(&huge), FileType::Other, "past the size bound");
     }
 
     /// Documentation ABOUT plugins is still documentation.
@@ -688,6 +862,35 @@ mod tests {
             skill_dir_name("/repo/.claude/skills/my-skill/SKILL.md"),
             Some("my-skill")
         );
+    }
+
+    /// The classifier and the name rule must agree about the same path.
+    ///
+    /// `classify_path` normalises; `skill_dir_name` used to read the raw string.
+    /// So `/repo/.claude/skills/my-skill/./SKILL.md` classified as a skill and
+    /// then reported its directory as ".", rejecting a valid `name: my-skill`
+    /// with "must match directory '.'" — a FALSE BLOCK, the exact defect class
+    /// this whole change exists to remove. `//` gave an empty string.
+    #[test]
+    fn skill_dir_name_uses_the_normalised_view() {
+        for path in [
+            "/repo/.claude/skills/my-skill/./SKILL.md",
+            "/repo/.claude/skills/my-skill//SKILL.md",
+            "/repo/.claude/skills/sub/../my-skill/SKILL.md",
+            "C:/repo/.claude/skills/my-skill/SKILL.md",
+        ] {
+            assert_eq!(
+                skill_dir_name(path),
+                Some("my-skill"),
+                "{path} names the my-skill directory"
+            );
+            assert_eq!(
+                classify_path(path),
+                FileType::Skill,
+                "{path} must also classify as a skill, or the pair disagrees"
+            );
+        }
+        assert_eq!(skill_dir_name("/SKILL.md"), None, "no directory to name");
     }
 
     #[test]
@@ -1011,7 +1214,18 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).unwrap();
         let path = skill_dir.join("SKILL.md");
         std::fs::write(&path, content).unwrap();
-        (dir, as_hook_path(&path))
+        let hook_path = as_hook_path(&path);
+        // Self-guarding, so every present and future caller carries its own
+        // proof rather than depending on one block-expecting neighbour to
+        // notice. A fixture that stops classifying as a skill makes ALLOW-
+        // expecting callers pass while exercising nothing — the failure mode
+        // this helper already had once.
+        assert_eq!(
+            classify_path(&hook_path),
+            FileType::Skill,
+            "fixture must classify as a skill or every caller is vacuous"
+        );
+        (dir, hook_path)
     }
 
     #[test]
@@ -1221,7 +1435,7 @@ mod tests {
     #[test]
     fn command_valid_with_description_only() {
         let input = make_write_input(
-            "/plugins/commands/deploy.md",
+            "/repo/.claude/commands/deploy.md",
             "---\ndescription: Deploy the app\nallowed-tools: Bash\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
