@@ -179,44 +179,35 @@ fn is_definition_root(prefix: &str, segments: &[&str]) -> bool {
     std::path::Path::new(&root).join(".claude-plugin").is_dir()
 }
 
-/// Does this `.md` hold a slash-command DEFINITION, as opposed to living in any
-/// directory a project happened to name `commands`?
+/// Does this path pass through a `<kind>/` directory that a definition root
+/// actually owns — `commands` for slash commands, `skills` for skills?
 ///
-/// The predicate this replaces was a bare `path.contains("/commands/")`, which
-/// swept in ordinary project documentation. `<repo>/docs/commands/*.md` is a
-/// natural home for a CLI's per-command-group pages — forgectl keeps nine such
-/// files, none of which has or should have YAML frontmatter — and every edit to
-/// them was hard-blocked for "missing frontmatter", with no way forward except
-/// adding meaningless frontmatter or bypassing the guard
-/// (cameronsjo/cadence-hooks#802).
-fn is_command_definition(prefix: &str, segments: &[&str]) -> bool {
+/// Both arms were once a bare substring test (`contains("/commands/")`,
+/// `contains("/skills/")`), and both swept in ordinary project documentation:
+/// `<repo>/docs/commands/*.md` is a natural home for a CLI's per-command-group
+/// pages (forgectl keeps nine, none of which has or should have YAML
+/// frontmatter), and `<repo>/docs/skills/<x>/SKILL.md` is the same thing one
+/// noun over. Every edit to those files was hard-blocked for "missing
+/// frontmatter", with no way forward but adding meaningless frontmatter or
+/// bypassing the guard (cameronsjo/cadence-hooks#802 for commands,
+/// cameronsjo/cadence-hooks#806 for skills).
+///
+/// One predicate rather than two near-identical ones, deliberately: the whole
+/// lesson of #806 is that fixing one arm and leaving its twin is how the defect
+/// survives. A shared function cannot drift apart.
+fn is_definition_of(kind: &str, prefix: &str, segments: &[&str]) -> bool {
     segments.iter().enumerate().any(|(i, segment)| {
-        segment.eq_ignore_ascii_case("commands") && is_definition_root(prefix, &segments[..i])
+        segment.eq_ignore_ascii_case(kind) && is_definition_root(prefix, &segments[..i])
     })
 }
 
 fn classify_path(path: &str) -> FileType {
-    // The skill arm carries the MIRROR of the bug fixed below: a bare
-    // `contains("/skills/")` blocks `<repo>/docs/skills/<x>/SKILL.md`, which is
-    // documentation about skills, for the same reason and by the same mechanism.
-    // It is deliberately left alone here and filed separately
-    // (cameronsjo/cadence-hooks#806).
-    //
-    // Why not both at once: routing this arm through `is_definition_root` turns
-    // ~20 existing fixtures red, because they assert against plugin-skill paths
-    // like `/plugins/cadence/skills/my-skill/SKILL.md` that have no marker on
-    // disk. Making them pass means either restating them as project skills —
-    // which quietly drops the plugin case they exist to cover — or standing up
-    // real on-disk plugin roots for each. That is a different change with a
-    // different blast radius, and burying it in a guard fix is how a mistake
-    // gets in. The two defects are the same class, not the same lifecycle.
-    if path.contains("/skills/") && path.ends_with("/SKILL.md") {
-        return FileType::Skill;
-    }
     let Some((prefix, segments)) = normalized_segments(path) else {
         return FileType::Other;
     };
-    if path.ends_with(".md") && is_command_definition(prefix, &segments) {
+    if path.ends_with("/SKILL.md") && is_definition_of("skills", prefix, &segments) {
+        FileType::Skill
+    } else if path.ends_with(".md") && is_definition_of("commands", prefix, &segments) {
         FileType::Command
     } else {
         FileType::Other
@@ -451,7 +442,7 @@ mod tests {
     #[test]
     fn classify_skill_path() {
         assert_eq!(
-            classify_path("/plugins/cadence/skills/my-skill/SKILL.md"),
+            classify_path("/repo/.claude/skills/my-skill/SKILL.md"),
             FileType::Skill
         );
     }
@@ -564,6 +555,70 @@ mod tests {
         );
     }
 
+    /// The cameronsjo/cadence-hooks#806 regression, pinned — the mirror of the
+    /// `docs/commands/` case below.
+    ///
+    /// `docs/skills/<x>/SKILL.md` is documentation about skills. The old
+    /// `contains("/skills/")` predicate classified every one as a skill
+    /// DEFINITION and hard-blocked each edit for missing frontmatter, by the
+    /// same mechanism and for the same reason as #802.
+    #[test]
+    fn docs_skills_dir_is_not_a_skill_definition() {
+        for path in [
+            "/repo/docs/skills/attune/SKILL.md",
+            "/repo/documentation/skills/my-skill/SKILL.md",
+            "/repo/docs/plugins/p/skills/x/SKILL.md",
+            "/srv/skills/whatever/SKILL.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Other,
+                "{path} is documentation, not a skill definition"
+            );
+        }
+    }
+
+    /// Both arms of the shared predicate stay live — a `.claude/` tree owns its
+    /// `skills/` and its `commands/` alike, and neither noun may quietly stop
+    /// being recognised while the other keeps working. Fixing one arm and
+    /// leaving its twin is the exact failure #806 exists to close.
+    #[test]
+    fn both_arms_recognise_a_claude_tree() {
+        assert_eq!(
+            classify_path("/repo/.claude/skills/my-skill/SKILL.md"),
+            FileType::Skill
+        );
+        assert_eq!(
+            classify_path("/repo/.claude/commands/my-cmd.md"),
+            FileType::Command
+        );
+    }
+
+    /// A plugin root's `skills/` is a definition location, identified by the
+    /// same `.claude-plugin/` marker the command arm uses — and the negative
+    /// half keeps the marker load-bearing rather than incidental.
+    #[test]
+    fn plugin_root_marker_classifies_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("some-plugin");
+        let skill = root.join("skills").join("my-skill");
+        std::fs::create_dir_all(&skill).expect("fixture dirs");
+        let skill_md = as_hook_path(&skill.join("SKILL.md"));
+
+        assert_eq!(
+            classify_path(&skill_md),
+            FileType::Other,
+            "without .claude-plugin/ this is not a plugin root"
+        );
+
+        std::fs::create_dir_all(root.join(".claude-plugin")).expect("marker dir");
+        assert_eq!(
+            classify_path(&skill_md),
+            FileType::Skill,
+            "the .claude-plugin/ marker is what makes it a plugin root"
+        );
+    }
+
     /// Documentation ABOUT plugins is still documentation.
     ///
     /// This is the second half of cadence-hooks#802 and the reason the
@@ -630,14 +685,14 @@ mod tests {
     #[test]
     fn skill_dir_extraction() {
         assert_eq!(
-            skill_dir_name("/plugins/skills/my-skill/SKILL.md"),
+            skill_dir_name("/repo/.claude/skills/my-skill/SKILL.md"),
             Some("my-skill")
         );
     }
 
     #[test]
     fn skill_dir_name_none_for_non_skill() {
-        assert_eq!(skill_dir_name("/plugins/commands/my-cmd.md"), None);
+        assert_eq!(skill_dir_name("/repo/docs/commands/my-cmd.md"), None);
     }
 
     /// `normalize_path` maps `\` to `/` but leaves the drive letter, so a
@@ -700,7 +755,7 @@ mod tests {
 
     #[test]
     fn run_skill_missing_frontmatter_blocks() {
-        let input = make_write_input("/plugins/skills/my-skill/SKILL.md", "# No frontmatter");
+        let input = make_write_input("/repo/.claude/skills/my-skill/SKILL.md", "# No frontmatter");
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
@@ -708,7 +763,7 @@ mod tests {
     #[test]
     fn run_skill_missing_name_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\ndescription: A test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -719,7 +774,7 @@ mod tests {
     #[test]
     fn run_skill_missing_description_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -735,7 +790,7 @@ mod tests {
     #[test]
     fn run_skill_invalid_name_format_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: My-Skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -746,7 +801,7 @@ mod tests {
     #[test]
     fn run_skill_name_dir_mismatch_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: other-name\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -760,7 +815,7 @@ mod tests {
         // suffix equals the directory — this is the form 0.19.0 through
         // 0.63.0 accepted, and the one that renders `/cadence:cadence:my-skill`.
         let input = make_write_input(
-            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: cadence:my-skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -773,7 +828,7 @@ mod tests {
         // Still blocks, now for two reasons rather than one: the colon fails
         // the format check AND `cadence:wrong` is not the directory `my-skill`.
         let input = make_write_input(
-            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: cadence:wrong\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -785,7 +840,7 @@ mod tests {
     fn run_skill_bare_name_matching_dir_passes() {
         // The correct form as of Claude Code 2.1.216.
         let input = make_write_input(
-            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -795,7 +850,7 @@ mod tests {
     #[test]
     fn run_valid_skill_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -826,7 +881,7 @@ mod tests {
     #[test]
     fn run_unknown_field_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\nunknown-field: value\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -856,7 +911,7 @@ mod tests {
         let input = HookInput {
             tool_name: Some("Write".into()),
             tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: Some("/plugins/skills/my-skill/SKILL.md".into()),
+                file_path: Some("/repo/.claude/skills/my-skill/SKILL.md".into()),
                 path: None,
                 command: None,
                 content: None,
@@ -914,7 +969,7 @@ mod tests {
     #[test]
     fn run_multiple_errors_all_reported() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nunknown1: val\nunknown2: val\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -933,15 +988,30 @@ mod tests {
     const VALID_SKILL: &str =
         "---\nname: my-skill\ndescription: A test skill\n---\n# My Skill\n\nBody text here.\n";
 
-    /// Write a valid SKILL.md into a temp dir shaped like a plugin skill tree.
-    /// Returns (tempdir guard, absolute SKILL.md path).
+    /// Write a valid SKILL.md into a temp dir shaped like a REAL plugin skill
+    /// tree — a plugin root carrying a `.claude-plugin/` marker, with the skill
+    /// beneath it. Returns (tempdir guard, absolute SKILL.md path).
+    ///
+    /// The marker is load-bearing, not decoration. This helper previously built
+    /// a bare `<tmp>/skills/my-skill/SKILL.md`, which under the pre-#806
+    /// substring predicate classified as a skill purely because the string
+    /// `/skills/` appeared. Once the predicate started requiring a definition
+    /// root, that shape became `Other` — so every caller expecting a BLOCK
+    /// failed, and, more quietly, every caller expecting an ALLOW kept passing
+    /// while exercising nothing at all. Only one test went red; several went
+    /// vacuous. Building the marker is what keeps this helper's whole cohort
+    /// meaningful, and it is also the on-disk plugin-skill coverage the fixture
+    /// migration would otherwise have dropped when the string fixtures moved to
+    /// project-skill paths.
     fn on_disk_skill(content: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join("skills/my-skill");
+        let plugin_root = dir.path().join("some-plugin");
+        std::fs::create_dir_all(plugin_root.join(".claude-plugin")).unwrap();
+        let skill_dir = plugin_root.join("skills/my-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let path = skill_dir.join("SKILL.md");
         std::fs::write(&path, content).unwrap();
-        (dir, path.to_str().unwrap().to_string())
+        (dir, as_hook_path(&path))
     }
 
     #[test]
@@ -981,7 +1051,7 @@ mod tests {
         // Fail open (ADR-0001): if the file can't be read, the edit can't be
         // simulated — allow rather than block on incomplete information.
         let input = make_edit(
-            "/nonexistent/plugins/skills/my-skill/SKILL.md",
+            "/nonexistent/.claude/skills/my-skill/SKILL.md",
             "old",
             "new",
         );
@@ -994,7 +1064,7 @@ mod tests {
         // Regression for #63 (bug 2): nested keys under `metadata:` are not
         // unknown top-level fields.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\nmetadata:\n  author: cameron\n  version: 1.0.0\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1004,7 +1074,7 @@ mod tests {
     #[test]
     fn valid_skill_with_optional_fields() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A skill\nmodel: opus\nallowed-tools: Read,Grep\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1017,7 +1087,7 @@ mod tests {
         // (scopes a skill to activate only when matching files are touched).
         // It must not be rejected as an unknown frontmatter field.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\npaths: src/**/*.rs\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1029,7 +1099,7 @@ mod tests {
     #[test]
     fn run_skill_with_background_true_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1039,7 +1109,7 @@ mod tests {
     #[test]
     fn run_skill_with_background_false_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: false\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1051,7 +1121,7 @@ mod tests {
         // The platform loosened boolean parsing (yes/no/on/off/1/0) in
         // 2.1.218; cadence house style stays strict true/false.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: yes\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1069,7 +1139,7 @@ mod tests {
         // One rule for all boolean fields — pre-existing booleans get the
         // same strictness as the new `background` field.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\nuser-invocable: yes\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1085,7 +1155,7 @@ mod tests {
     #[test]
     fn run_skill_disable_model_invocation_numeric_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ndisable-model-invocation: 1\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1101,7 +1171,7 @@ mod tests {
     #[test]
     fn run_skill_boolean_true_false_still_pass() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\nuser-invocable: false\ndisable-model-invocation: true\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1113,7 +1183,7 @@ mod tests {
         // A trailing YAML comment is not part of the value — `true  # why`
         // is the boolean true, not a malformed spelling.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true  # opt out later\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1125,7 +1195,7 @@ mod tests {
         // Deliberate: `"true"` is a string spelling, not the house boolean.
         // Unquoted true/false is the one greppable form.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: \"true\"\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1161,7 +1231,7 @@ mod tests {
     #[test]
     fn skill_dir_name_deeply_nested() {
         assert_eq!(
-            skill_dir_name("/a/b/c/d/skills/deep-skill/SKILL.md"),
+            skill_dir_name("/a/b/c/.claude/skills/deep-skill/SKILL.md"),
             Some("deep-skill")
         );
     }
@@ -1185,7 +1255,7 @@ mod tests {
     #[test]
     fn run_skill_with_when_to_use_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\nwhen_to_use: Use when doing X\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1195,7 +1265,7 @@ mod tests {
     #[test]
     fn run_skill_with_arguments_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\narguments: issue branch\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1205,7 +1275,7 @@ mod tests {
     #[test]
     fn run_skill_with_disallowed_tools_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\ndisallowed-tools: AskUserQuestion\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1217,7 +1287,7 @@ mod tests {
         for level in ["low", "medium", "high", "xhigh", "max"] {
             let content =
                 format!("---\nname: my-skill\ndescription: test\neffort: {level}\n---\n# Content");
-            let input = make_write_input("/plugins/skills/my-skill/SKILL.md", &content);
+            let input = make_write_input("/repo/.claude/skills/my-skill/SKILL.md", &content);
             let result = ValidateSkillFrontmatter.run(&input);
             assert_eq!(
                 result.outcome,
@@ -1230,7 +1300,7 @@ mod tests {
     #[test]
     fn run_skill_with_invalid_effort_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\neffort: extreme\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1243,7 +1313,7 @@ mod tests {
         for shell in ["bash", "powershell"] {
             let content =
                 format!("---\nname: my-skill\ndescription: test\nshell: {shell}\n---\n# Content");
-            let input = make_write_input("/plugins/skills/my-skill/SKILL.md", &content);
+            let input = make_write_input("/repo/.claude/skills/my-skill/SKILL.md", &content);
             let result = ValidateSkillFrontmatter.run(&input);
             assert_eq!(
                 result.outcome,
@@ -1256,7 +1326,7 @@ mod tests {
     #[test]
     fn run_skill_with_invalid_shell_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\nshell: zsh\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -1269,7 +1339,7 @@ mod tests {
         // The new fields don't loosen the allowlist — an unrelated unknown
         // key is still rejected.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\neffort: high\ntotally-made-up: value\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
