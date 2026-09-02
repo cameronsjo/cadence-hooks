@@ -622,7 +622,6 @@ mod tests {
         assert_eq!(skill_dir_name("/plugins/commands/my-cmd.md"), None);
     }
 
-    #[test]
     /// `normalize_path` maps `\` to `/` but leaves the drive letter, so a
     /// Windows path arrives as `C:/Users/...` and does not start with `/`.
     /// An absolute-path test written as `starts_with('/')` therefore declines
