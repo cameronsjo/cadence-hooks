@@ -395,6 +395,23 @@ impl Check for ValidateSkillFrontmatter {
 mod tests {
     use super::*;
 
+    /// Render an on-disk fixture path the way the check actually receives one.
+    ///
+    /// `classify_path` is fed by `HookInput::file_path()`, which runs
+    /// `normalize_path` first — and that maps `\` to `/`. A test that hands a
+    /// raw `PathBuf` straight to `classify_path` skips that step, so on Windows
+    /// it passes `C:\Users\…\Temp\…` into a function that splits on `/`, gets
+    /// one segment, and finds no `commands`. The assertion then fails for a
+    /// reason that has nothing to do with the behaviour under test.
+    ///
+    /// Deliberately NOT solved by making the production splitter accept `\` as
+    /// well: a backslash is a legal filename character on Unix, so a file named
+    /// `a\commands\b.md` would gain a phantom `commands` segment and could be
+    /// falsely blocked. The fixture is what is wrong here, not the splitter.
+    fn as_hook_path(p: &std::path::Path) -> String {
+        p.to_str().expect("utf-8 fixture path").replace('\\', "/")
+    }
+
     #[test]
     fn valid_skill_passes() {
         let content = "---\nname: my-skill\ndescription: A test skill\n---\n# Content";
@@ -499,7 +516,8 @@ mod tests {
         let commands = root.join("commands");
         std::fs::create_dir_all(&commands).expect("fixture dirs");
         let cmd_path = commands.join("my-cmd.md");
-        let cmd_str = cmd_path.to_str().expect("utf-8 fixture path");
+        let cmd_str = as_hook_path(&cmd_path);
+        let cmd_str = cmd_str.as_str();
 
         // No marker yet — indistinguishable from any other `commands` dir.
         assert_eq!(
@@ -540,7 +558,7 @@ mod tests {
 
         let cmd = root.join("commands").join("polish.md");
         assert_eq!(
-            classify_path(cmd.to_str().expect("utf-8")),
+            classify_path(&as_hook_path(&cmd)),
             FileType::Command,
             "the installed cache layout is a real command definition location"
         );
