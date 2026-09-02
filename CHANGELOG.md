@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rules validate-frontmatter` no longer blocks edits to ordinary `docs/commands/` prose** (cadence-hooks#802). The command arm matched a bare `/commands/` substring anywhere in a path, so any project documenting its CLI's command groups under `docs/commands/` had every edit hard-blocked for "missing YAML frontmatter" — forgectl keeps nine such files, none of which has or should have any. A command definition is now recognised by its directory: a `.claude/` tree, or a plugin root carrying a sibling `.claude-plugin/` marker (which covers the installed cache, the monorepo's `plugins/<plugin>/`, and a standalone plugin repo alike). Path segments are normalised first — `//`, `/./`, `/../`, and case differences all reach real `.claude/commands/` files on APFS and previously slipped past a raw segment compare. Relative and oversized paths are declined rather than scanned, and Windows drive-letter roots (`C:/…`, which is how a Windows path arrives once `normalize_path` maps the separators) are handled explicitly — an absolute-path test written as "starts with `/`" would have disabled the command arm on Windows entirely, with the suite green, since every fixture here is a Unix-style string. The marker probe fails **open** per ADR-0001; the known cost is a missed nudge on a plugin being scaffolded before its `.claude-plugin/` exists.
+- **`doctor`'s orphaned-cache warning now names the command that does the work** (cadence-hooks#803). Its remediation read "use cadence:tend", which has no plugin-cache handling of any kind, while `cadence-hooks doctor --prune` had done exactly this job all along. It now names the dry run and `--prune --apply`, and states the one real limit: `--apply` already refuses while live sessions are registered, but that registry is repo-scoped, so sessions in other checkouts sharing the global cache stay invisible to it (tracked in cadence-hooks#634). A regression test pins the remediation text, which nothing previously observed.
+
 ## [0.88.0] - 2026-08-27
 
 ### Added
