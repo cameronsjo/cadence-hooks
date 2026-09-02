@@ -92,16 +92,40 @@ const MAX_PATH_BYTES: usize = 4096;
 /// and `/repo/.claude/./commands/x.md` arrive verbatim. Comparing raw segments
 /// would see `""` or `"."` as the parent and miss a real command definition.
 ///
+/// Returns the absolute ROOT PREFIX alongside the segments, because the two
+/// supported platforms spell it differently and the marker probe has to
+/// reconstruct a real path from them. On Unix the prefix is `/`; on Windows a
+/// path reaches us as `C:/Users/...` — `normalize_path` maps `\` to `/` but
+/// leaves the drive letter — so the prefix is `C:/` and rebuilding with a
+/// leading slash would produce `/C:/Users/...`, which stats nothing.
+///
 /// `None` means "do not classify": a relative path, or one past the size bound.
 /// Relative paths are refused because the marker probe below resolves against
 /// the hook process's cwd, so the same path would classify differently
 /// depending on where the process happens to stand.
-fn normalized_segments(path: &str) -> Option<Vec<&str>> {
-    if !path.starts_with('/') || path.len() > MAX_PATH_BYTES {
+///
+/// The Windows case is easy to lose and expensive when lost: every test fixture
+/// in this file is a Unix-style string, which is a perfectly valid input on
+/// either platform, so a predicate that rejects `C:/...` disables the whole
+/// command arm on Windows with the suite fully green. `windows_drive_paths_still_classify`
+/// is the control for that.
+fn normalized_segments(path: &str) -> Option<(&str, Vec<&str>)> {
+    if path.len() > MAX_PATH_BYTES {
         return None;
     }
+    let (prefix, rest) = if let Some(rest) = path.strip_prefix('/') {
+        ("/", rest)
+    } else if path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && path.as_bytes().get(1) == Some(&b':')
+        && path.as_bytes().get(2) == Some(&b'/')
+    {
+        (&path[..3], &path[3..])
+    } else {
+        return None;
+    };
+
     let mut segments: Vec<&str> = Vec::new();
-    for raw in path.split('/') {
+    for raw in rest.split('/') {
         match raw {
             "" | "." => {}
             ".." => {
@@ -110,7 +134,7 @@ fn normalized_segments(path: &str) -> Option<Vec<&str>> {
             s => segments.push(s),
         }
     }
-    Some(segments)
+    Some((prefix, segments))
 }
 
 /// Is `segments` — the directory that holds a `commands/` or `skills/` tree —
@@ -141,7 +165,7 @@ fn normalized_segments(path: &str) -> Option<Vec<&str>> {
 /// a missed nudge on a plugin being scaffolded whose `.claude-plugin/` does not
 /// exist yet — the cheaper failure, since a guardrail's real price is a false
 /// block on legitimate work, not a missed nudge.
-fn is_definition_root(segments: &[&str]) -> bool {
+fn is_definition_root(prefix: &str, segments: &[&str]) -> bool {
     if segments
         .last()
         .is_some_and(|parent| parent.eq_ignore_ascii_case(".claude"))
@@ -151,7 +175,7 @@ fn is_definition_root(segments: &[&str]) -> bool {
     if segments.is_empty() {
         return false;
     }
-    let root = format!("/{}", segments.join("/"));
+    let root = format!("{prefix}{}", segments.join("/"));
     std::path::Path::new(&root).join(".claude-plugin").is_dir()
 }
 
@@ -165,9 +189,9 @@ fn is_definition_root(segments: &[&str]) -> bool {
 /// them was hard-blocked for "missing frontmatter", with no way forward except
 /// adding meaningless frontmatter or bypassing the guard
 /// (cameronsjo/cadence-hooks#802).
-fn is_command_definition(segments: &[&str]) -> bool {
+fn is_command_definition(prefix: &str, segments: &[&str]) -> bool {
     segments.iter().enumerate().any(|(i, segment)| {
-        segment.eq_ignore_ascii_case("commands") && is_definition_root(&segments[..i])
+        segment.eq_ignore_ascii_case("commands") && is_definition_root(prefix, &segments[..i])
     })
 }
 
@@ -189,10 +213,10 @@ fn classify_path(path: &str) -> FileType {
     if path.contains("/skills/") && path.ends_with("/SKILL.md") {
         return FileType::Skill;
     }
-    let Some(segments) = normalized_segments(path) else {
+    let Some((prefix, segments)) = normalized_segments(path) else {
         return FileType::Other;
     };
-    if path.ends_with(".md") && is_command_definition(&segments) {
+    if path.ends_with(".md") && is_command_definition(prefix, &segments) {
         FileType::Command
     } else {
         FileType::Other
@@ -596,6 +620,35 @@ mod tests {
     #[test]
     fn skill_dir_name_none_for_non_skill() {
         assert_eq!(skill_dir_name("/plugins/commands/my-cmd.md"), None);
+    }
+
+    #[test]
+    /// `normalize_path` maps `\` to `/` but leaves the drive letter, so a
+    /// Windows path arrives as `C:/Users/...` and does not start with `/`.
+    /// An absolute-path test written as `starts_with('/')` therefore declines
+    /// every real Windows path and disables the command arm entirely — with the
+    /// whole suite green, because every other fixture here is a Unix-style
+    /// string that is equally valid as a test input on either platform.
+    ///
+    /// The negative half is what stops this passing for the wrong reason: the
+    /// drive-letter branch must still discriminate, not classify everything.
+    #[test]
+    fn windows_drive_paths_still_classify() {
+        assert_eq!(
+            classify_path("C:/Users/x/.claude/commands/my-cmd.md"),
+            FileType::Command,
+            "a Windows path must not silently disable the command arm"
+        );
+        assert_eq!(
+            classify_path("C:/repo/docs/commands/pr.md"),
+            FileType::Other,
+            "the drive-letter branch must still tell docs from definitions"
+        );
+        assert_eq!(
+            classify_path("C:/repo/.claude/./commands/x.md"),
+            FileType::Command,
+            "normalisation applies on the drive-letter branch too"
+        );
     }
 
     #[test]
