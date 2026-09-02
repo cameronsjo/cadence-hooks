@@ -36,6 +36,18 @@ pub struct SessionRecord {
     /// Unix epoch seconds of registration — for age math.
     #[serde(default)]
     pub started_epoch: u64,
+    /// Repo root this session registered from.
+    ///
+    /// Redundant in the per-checkout registry — the directory already says it —
+    /// and load-bearing in the cross-checkout mirror, where a reader has no
+    /// other way to tell WHICH checkout a live session belongs to. Without it
+    /// the prune refusal can name a session but not where to go release it,
+    /// which is the whole action the message asks for.
+    ///
+    /// Optional and serde-defaulted, so records written by an older binary
+    /// still parse and simply carry no repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 /// Workshop tools and instruments — the Artificer's bench.
@@ -332,6 +344,7 @@ mod tests {
             touching: vec!["crates/guardrails/".into()],
             started: "2026-06-02T01:26:05Z".into(),
             started_epoch: 1_780_000_000,
+            repo: Some("/Users/x/Projects/cadence-hooks".into()),
         };
         let json = serde_json::to_string(&record).unwrap();
         let back: SessionRecord = serde_json::from_str(&json).unwrap();

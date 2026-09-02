@@ -202,10 +202,34 @@ pub fn run_start(
             ..Default::default()
         },
     };
+    // Stamp the repo on every write, not just on first registration: a record
+    // created before this field existed carries none, and a session that only
+    // ever heartbeats would keep it empty forever. In the cross-checkout mirror
+    // an empty repo makes the refusal unactionable — it can name the session but
+    // not where to go release it.
+    let mut record = record;
+    if record.repo.is_none() {
+        record.repo =
+            registry::repo_root_of_registry(dir).map(|p| p.to_string_lossy().into_owned());
+    }
+    let record = record;
     if registry::write_record(dir, &record).is_err() {
         // Fail open: a read-only filesystem must not break session start.
         return finish(posture, None, plan_disclosure, failopen, staleness);
     }
+
+    // Mirror into the cross-checkout registry, for readers reasoning about a
+    // resource shared by every session on the machine rather than about this
+    // repo — the plugin cache prune gate is the first (cadence-hooks#634).
+    //
+    // Best-effort BY CONSTRUCTION: the result is discarded, and this sits after
+    // the local write so a failure here can never turn a successful local
+    // registration into a failed session start. Worst case the mirror stays
+    // empty and the cross-checkout reader is exactly as blind as it was before
+    // this existed (ADR-0001).
+    let global = registry::global_sessions_dir();
+    let _ = registry::write_record(&global, &record);
+    registry::sweep_stale(&global, stale_secs, sid, "start");
 
     // Housekeeping: presumed-dead peers leave the room before roll call. Our
     // own (just-refreshed) file is excluded by sid as defense-in-depth.

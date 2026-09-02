@@ -2103,22 +2103,59 @@ enum PruneGate {
 /// as a live peer — a prune must not delete dirs the caller is pinned to —
 /// matching how `run_status` enumerates peers.
 ///
-/// Limitation: the session registry is repo-scoped (`<repo>/.claude/sessions`),
-/// so sessions running in other checkouts against the same global plugin cache
-/// are invisible here — the gate is under-protective across repos, never
-/// over-destructive.
-fn prune_liveness_gate(sessions_dir: Option<&Path>, stale_secs: u64, force: bool) -> PruneGate {
+/// Reads TWO registries and unions them (cadence-hooks#634). The per-checkout
+/// one answers "who else is in this repo"; the cross-checkout mirror
+/// (`session_registry::global_sessions_dir`) answers the question this gate
+/// actually has, which is "who else on this machine is reading the plugin
+/// cache" — a resource no single checkout owns. Gating on the local registry
+/// alone was under-protective by construction: the sessions most likely to be
+/// pinned to a retired version dir are the long-running ones, and there is no
+/// reason those sit in the repo you happen to be pruning from.
+///
+/// A `None` local dir no longer short-circuits. Not being inside a git
+/// repository says nothing about whether other sessions are live, and treating
+/// it as "nothing to protect" is exactly the reasoning that made this
+/// repo-scoped in the first place — the mirror is still consulted.
+///
+/// Deduplicated by session id, because a session registers in BOTH and would
+/// otherwise be named twice in a refusal that counts what it names.
+/// `global_dir` is a PARAMETER, not resolved in here, and that is load-bearing
+/// for the tests rather than a style preference. Resolving it internally would
+/// make every case read the machine's real cross-checkout registry — a
+/// directory that is empty today only because nothing has written it yet, so
+/// `prune_liveness_gate_empty_dir_proceeds` and its siblings would pass now and
+/// go red on a real machine the moment sessions start mirroring, with CI still
+/// green. Injecting it keeps each case hermetic and lets the union itself be
+/// asserted.
+fn prune_liveness_gate(
+    sessions_dir: Option<&Path>,
+    global_dir: Option<&Path>,
+    stale_secs: u64,
+    force: bool,
+) -> PruneGate {
     if force {
         return PruneGate::Proceed;
     }
-    let Some(dir) = sessions_dir else {
-        return PruneGate::Proceed;
-    };
-    let live = session_registry::live_peers(dir, "", stale_secs);
-    if live.is_empty() {
+
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut names: Vec<String> = Vec::new();
+
+    for dir in sessions_dir.into_iter().chain(global_dir) {
+        for peer in session_registry::live_peers(dir, "", stale_secs) {
+            if !seen.insert(peer.record.session_id.clone()) {
+                continue;
+            }
+            names.push(match peer.record.repo.as_deref() {
+                Some(repo) => format!("{} ({repo})", peer.record.name),
+                None => peer.record.name,
+            });
+        }
+    }
+
+    if names.is_empty() {
         return PruneGate::Proceed;
     }
-    PruneGate::Blocked(live.into_iter().map(|p| p.record.name).collect())
+    PruneGate::Blocked(names)
 }
 
 /// `doctor --prune` entry point: list (or, with `apply`, remove) orphaned
@@ -2206,9 +2243,13 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         let sessions_dir = std::env::current_dir()
             .ok()
             .and_then(|cwd| session_registry::sessions_dir(&cwd.to_string_lossy()));
-        if let PruneGate::Blocked(names) =
-            prune_liveness_gate(sessions_dir.as_deref(), stale_secs, force)
-        {
+        let global_dir = session_registry::global_sessions_dir();
+        if let PruneGate::Blocked(names) = prune_liveness_gate(
+            sessions_dir.as_deref(),
+            Some(global_dir.as_path()),
+            stale_secs,
+            force,
+        ) {
             eprintln!(
                 "cadence-hooks doctor --prune --apply: refusing to prune — {} live session(s) may be pinned to these version dirs: {}. \
                  Run /reload-plugins in any live session first to release the retired dirs, then re-run. \
@@ -5272,7 +5313,7 @@ mod tests {
         let tmp = seed_session("forge-anvil", "peer-session");
         let dir = tmp.path().join(".claude").join("sessions");
         assert!(matches!(
-            prune_liveness_gate(Some(&dir), 600, true),
+            prune_liveness_gate(Some(&dir), None, 600, true),
             PruneGate::Proceed
         ));
     }
@@ -5280,7 +5321,7 @@ mod tests {
     #[test]
     fn prune_liveness_gate_none_dir_proceeds() {
         assert!(matches!(
-            prune_liveness_gate(None, 600, false),
+            prune_liveness_gate(None, None, 600, false),
             PruneGate::Proceed
         ));
     }
@@ -5289,7 +5330,7 @@ mod tests {
     fn prune_liveness_gate_empty_dir_proceeds() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(matches!(
-            prune_liveness_gate(Some(tmp.path()), 600, false),
+            prune_liveness_gate(Some(tmp.path()), None, 600, false),
             PruneGate::Proceed
         ));
     }
@@ -5299,7 +5340,7 @@ mod tests {
         let tmp = seed_session("forge-anvil", "peer-session");
         let dir = tmp.path().join(".claude").join("sessions");
         // Large stale window so the just-written record counts as live.
-        match prune_liveness_gate(Some(&dir), 600, false) {
+        match prune_liveness_gate(Some(&dir), None, 600, false) {
             PruneGate::Blocked(names) => {
                 assert!(
                     names.contains(&"forge-anvil".to_string()),
@@ -5310,6 +5351,116 @@ mod tests {
         }
     }
 
+    /// The cadence-hooks#634 case: a session live in ANOTHER checkout.
+    ///
+    /// This is the whole point of the mirror. The local registry is empty — the
+    /// operator is pruning from a repo with no peers — while a session is live
+    /// somewhere else on the machine, pinned to version dirs the prune would
+    /// delete out from under it. The old gate proceeded here.
+    ///
+    /// It also asserts the refusal names the REPO, because "a session called
+    /// forge-anvil is live" is not actionable when the reader cannot tell which
+    /// of a dozen checkouts to go release it in.
+    #[test]
+    fn prune_liveness_gate_blocks_on_a_peer_in_another_checkout() {
+        let local = tempfile::tempdir().unwrap();
+        let local_dir = local.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&local_dir).unwrap();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "distant-anvil".into(),
+            session_id: "other-checkout-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            repo: Some("/Users/x/Projects/other-repo".into()),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        // Control: without the mirror this is the old, under-protective answer.
+        assert!(
+            matches!(
+                prune_liveness_gate(Some(&local_dir), None, 600, false),
+                PruneGate::Proceed
+            ),
+            "local registry alone sees nothing — this is the defect"
+        );
+
+        match prune_liveness_gate(Some(&local_dir), Some(&global_dir), 600, false) {
+            PruneGate::Blocked(names) => {
+                assert_eq!(names.len(), 1, "one live peer: {names:?}");
+                assert!(
+                    names[0].contains("distant-anvil"),
+                    "must name the session: {names:?}"
+                );
+                assert!(
+                    names[0].contains("/Users/x/Projects/other-repo"),
+                    "must name the repo, or the reader cannot act on it: {names:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a peer in another checkout must block the prune"),
+        }
+    }
+
+    /// A session registers in BOTH registries, so the naive union counts it
+    /// twice — and the refusal reports a count of what it names, so a duplicate
+    /// inflates "2 live session(s)" for one session. Dedupe is by session id,
+    /// not by name, because names are generated from the id and two records for
+    /// one session are the same session however they are spelled.
+    #[test]
+    fn prune_liveness_gate_counts_a_session_once_across_both_registries() {
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let local_dir = tmp.path().join(".claude").join("sessions");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "forge-anvil".into(),
+            session_id: "peer-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        match prune_liveness_gate(Some(&local_dir), Some(&global_dir), 600, false) {
+            PruneGate::Blocked(names) => assert_eq!(
+                names.len(),
+                1,
+                "one session mirrored into both registries is still one session: {names:?}"
+            ),
+            PruneGate::Proceed => panic!("a live session must block the prune"),
+        }
+    }
+
+    /// A cwd outside any git repository used to short-circuit to Proceed, on
+    /// the reasoning that there was "nothing to protect". That reasoning is the
+    /// repo-scoped assumption itself: not being in a repo says nothing about
+    /// whether other sessions on the machine are live, and the cache they share
+    /// is not owned by any checkout.
+    #[test]
+    fn prune_liveness_gate_consults_the_mirror_with_no_local_registry() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "distant-anvil".into(),
+            session_id: "some-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        assert!(
+            matches!(
+                prune_liveness_gate(None, Some(&global_dir), 600, false),
+                PruneGate::Blocked(_)
+            ),
+            "no local registry must not mean no live sessions"
+        );
+    }
+
     #[test]
     fn prune_liveness_gate_only_stale_proceeds() {
         let tmp = seed_session("forge-anvil", "peer-session");
@@ -5317,7 +5468,7 @@ mod tests {
         // stale_secs = 0: any measurable mtime age makes the peer stale.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(matches!(
-            prune_liveness_gate(Some(&dir), 0, false),
+            prune_liveness_gate(Some(&dir), None, 0, false),
             PruneGate::Proceed
         ));
     }

@@ -80,6 +80,11 @@ pub fn run_end(hook_event_name: Option<&str>, dir: &std::path::Path, session_id:
         return;
     }
     let _ = registry::remove_own(dir, session_id);
+    // Deregister from the cross-checkout mirror too, or a cleanly-ended session
+    // keeps blocking a prune until it ages out — a stale-but-not-yet-swept
+    // record is indistinguishable from a live one to any reader, and the whole
+    // point of the mirror is that a reader trusts it (cadence-hooks#634).
+    let _ = registry::remove_own(&registry::global_sessions_dir(), session_id);
 }
 
 #[cfg(test)]

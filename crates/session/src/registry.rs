@@ -42,6 +42,51 @@ pub fn repo_root(cwd: &str) -> Option<PathBuf> {
     git_command(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
+/// The repo root a per-checkout registry directory belongs to — the inverse of
+/// [`sessions_dir`], which builds `<repo>/.claude/sessions`.
+///
+/// Pure, and deliberately not a second `git rev-parse`: the caller that has the
+/// registry directory already paid for that resolution, and re-deriving it from
+/// a cwd could disagree with the directory actually being written (a worktree,
+/// a session started elsewhere). Returns `None` unless the shape matches
+/// exactly, so a caller cannot mistake an arbitrary directory for a repo root.
+pub fn repo_root_of_registry(dir: &Path) -> Option<PathBuf> {
+    if dir.file_name()? != "sessions" {
+        return None;
+    }
+    let claude = dir.parent()?;
+    if claude.file_name()? != ".claude" {
+        return None;
+    }
+    claude.parent().map(PathBuf::from)
+}
+
+/// The CROSS-CHECKOUT registry: `<config>/cadence/live-sessions`.
+///
+/// [`sessions_dir`] is per-checkout by design, which is right for the questions
+/// it was built to answer — peer disclosure and lane warnings are about the repo
+/// you are standing in. It is wrong for anything reasoning about a resource
+/// SHARED across checkouts, and the plugin cache is exactly that: one global
+/// tree that every session on the machine reads, whatever repo it sits in. A
+/// prune gated only on the local registry is under-protective by construction
+/// (cameronsjo/cadence-hooks#634).
+///
+/// This is a MIRROR, not a second format. The same [`write_record`],
+/// [`touch_own`], [`remove_own`], and [`sweep_stale`] operate on it, so mtime
+/// stays the heartbeat and staleness stays one rule — there is no second
+/// mechanism to drift. Record filenames carry the session id, which is unique
+/// across repos, so two checkouts cannot collide here.
+///
+/// Mirroring is strictly BEST-EFFORT at every call site: if this directory
+/// cannot be resolved or written, behaviour is exactly what it was before the
+/// mirror existed. A guard's own bookkeeping must never break a session start
+/// (ADR-0001).
+pub fn global_sessions_dir() -> PathBuf {
+    cadence_hooks_core::paths::claude_config_dir()
+        .join("cadence")
+        .join("live-sessions")
+}
+
 /// A peer session discovered in the registry.
 #[derive(Debug)]
 pub struct Peer {
@@ -279,6 +324,15 @@ pub fn touch_own(
             ..Default::default()
         },
     };
+    // The heartbeat IS the mtime refresh, so the mirror has to be touched on
+    // the same beat as the local record — otherwise a long-lived session goes
+    // stale in the cross-checkout view while still working, and the prune gate
+    // that trusts that view stops protecting it (cadence-hooks#634).
+    //
+    // Best-effort and ordered after nothing: the local write's Result is what
+    // this function returns, so a mirror failure cannot change the caller's
+    // outcome (ADR-0001).
+    let _ = write_record(&global_sessions_dir(), &record);
     write_record(dir, &record)
 }
 
