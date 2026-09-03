@@ -70,7 +70,13 @@ pub fn repo_root_of_registry(dir: &Path) -> Option<PathBuf> {
     }
     claude
         .parent()
-        .filter(|p| p.is_absolute())
+        // Emptiness, NOT `is_absolute()`. The intent is only to reject the
+        // empty root a relative `".claude/sessions"` produces — and
+        // `is_absolute()` is platform-dependent, so it also rejects `/repo` on
+        // Windows, which needs a drive or UNC prefix. That broke nothing in
+        // production (Windows paths arrive as `C:/...`) and everything in a
+        // suite whose fixtures are Unix-style strings.
+        .filter(|p| !p.as_os_str().is_empty())
         .map(PathBuf::from)
 }
 

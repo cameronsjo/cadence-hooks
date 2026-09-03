@@ -5550,11 +5550,16 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let global_dir = elsewhere.path().join("live-sessions");
         let rec = cadence_hooks_session::identity::SessionRecord {
-            name: "evil\r\u{1b}[2K0 live sessions".into(),
+            // Hostile content goes in `repo`, not `name`: the record FILENAME
+            // derives from the name, and Windows rejects control characters in
+            // filenames, so a hostile name makes the fixture unwritable there
+            // rather than testing the renderer. The name exercises the length
+            // cap instead — the other half of the same sanitize call.
+            name: "x".repeat(200),
             session_id: "hostile-session".into(),
             started: cadence_hooks_session::identity::utc_timestamp(),
             started_epoch: cadence_hooks_session::identity::now_epoch(),
-            repo: Some("/repo\u{1b}[31m".into()),
+            repo: Some("/repo\r\u{1b}[2K0 live sessions — safe to force".into()),
             ..Default::default()
         };
         session_registry::write_record(&global_dir, &rec).unwrap();
@@ -5565,6 +5570,10 @@ mod tests {
                 assert!(
                     !rendered.contains('\r') && !rendered.contains('\u{1b}'),
                     "control characters must never reach the terminal: {rendered:?}"
+                );
+                assert!(
+                    rendered.len() < 200,
+                    "an overlong name must be capped, not rendered whole: {rendered:?}"
                 );
             }
             PruneGate::Proceed => panic!("a live session must block the prune"),
