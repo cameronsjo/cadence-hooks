@@ -30,13 +30,24 @@ impl Logger for End {
         else {
             return;
         };
+        // Deregister from the cross-checkout mirror FIRST, and unconditionally.
+        // It needs only the session id, while everything below needs a repo —
+        // and a session that ends from a cwd outside any git repository (the
+        // operator cd'd to ~ before exiting) would otherwise leave a ghost
+        // record blocking every liveness-gated operation for the full stale
+        // window, naming a session that has ended. The read side was
+        // deliberately changed to consult the mirror when not in a repo, so the
+        // removal side has to agree (cadence-hooks#634).
+        if input.hook_event_name.as_deref() == Some("SessionEnd") {
+            let _ = registry::remove_own(&registry::global_sessions_dir(), sid);
+        }
         let Some(cwd) = input.cwd.as_deref() else {
             return;
         };
         let Some(dir) = registry::sessions_dir(cwd) else {
             return;
         };
-        run_end(input.hook_event_name.as_deref(), &dir, sid);
+        run_end(input.hook_event_name.as_deref(), &dir, None, sid);
     }
 }
 
@@ -75,16 +86,22 @@ impl Logger for End {
 /// resume is a tombstone / soft-delete, deliberately deferred (P3) until the loss
 /// proves to matter in practice. (Compaction uses the separate `PreCompact` hook,
 /// not SessionEnd, so a live session never self-deregisters mid-work.)
-pub fn run_end(hook_event_name: Option<&str>, dir: &std::path::Path, session_id: &str) {
+pub fn run_end(
+    hook_event_name: Option<&str>,
+    dir: &std::path::Path,
+    global_dir: Option<&std::path::Path>,
+    session_id: &str,
+) {
     if hook_event_name != Some("SessionEnd") {
         return;
     }
     let _ = registry::remove_own(dir, session_id);
-    // Deregister from the cross-checkout mirror too, or a cleanly-ended session
-    // keeps blocking a prune until it ages out — a stale-but-not-yet-swept
-    // record is indistinguishable from a live one to any reader, and the whole
-    // point of the mirror is that a reader trusts it (cadence-hooks#634).
-    let _ = registry::remove_own(&registry::global_sessions_dir(), session_id);
+    // Injected rather than resolved here, so a test cannot reach the machine's
+    // real mirror. `End::run` does the unconditional removal above, before it
+    // needs a repo; this arm exists for callers that already hold both dirs.
+    if let Some(global) = global_dir {
+        let _ = registry::remove_own(global, session_id);
+    }
 }
 
 #[cfg(test)]
@@ -107,7 +124,7 @@ mod tests {
     fn run_end_on_session_end_removes_lane() {
         let tmp = TempDir::new().unwrap();
         registry::write_record(tmp.path(), &record("quiet-loom", "self-session")).unwrap();
-        run_end(Some("SessionEnd"), tmp.path(), "self-session");
+        run_end(Some("SessionEnd"), tmp.path(), None, "self-session");
         assert!(
             registry::find_own(tmp.path(), "self-session").is_none(),
             "SessionEnd deregisters the session's lane"
@@ -122,7 +139,7 @@ mod tests {
         // first tool call.
         let tmp = TempDir::new().unwrap();
         registry::write_record(tmp.path(), &record("quiet-loom", "self-session")).unwrap();
-        run_end(Some("PostToolUse"), tmp.path(), "self-session");
+        run_end(Some("PostToolUse"), tmp.path(), None, "self-session");
         assert!(
             registry::find_own(tmp.path(), "self-session").is_some(),
             "a non-SessionEnd event must NOT deregister the live session"
@@ -133,7 +150,7 @@ mod tests {
     fn run_end_ignores_missing_event() {
         let tmp = TempDir::new().unwrap();
         registry::write_record(tmp.path(), &record("quiet-loom", "self-session")).unwrap();
-        run_end(None, tmp.path(), "self-session");
+        run_end(None, tmp.path(), None, "self-session");
         assert!(
             registry::find_own(tmp.path(), "self-session").is_some(),
             "an absent hook_event_name must NOT deregister the session"

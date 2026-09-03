@@ -19,6 +19,16 @@ use std::time::SystemTime;
 /// session out of the sweep's reach far more reliably than the original 10.
 pub const DEFAULT_STALE_MINUTES: u64 = 30;
 
+/// The DEFAULT staleness window in seconds, ignoring any per-session override.
+///
+/// The shared cross-checkout registry is swept on this, never on
+/// [`stale_minutes`]: an override is a statement about one repo's own lanes,
+/// and applying it to a directory holding other checkouts' records lets a
+/// session with a short threshold reap a peer that is alive but merely quiet.
+pub fn default_stale_secs() -> u64 {
+    DEFAULT_STALE_MINUTES * 60
+}
+
 /// Staleness threshold from `CADENCE_SESSION_STALE_MINUTES`, default 30.
 /// Zero or unparsable values fall back to the default.
 pub fn stale_minutes() -> u64 {
@@ -58,7 +68,10 @@ pub fn repo_root_of_registry(dir: &Path) -> Option<PathBuf> {
     if claude.file_name()? != ".claude" {
         return None;
     }
-    claude.parent().map(PathBuf::from)
+    claude
+        .parent()
+        .filter(|p| p.is_absolute())
+        .map(PathBuf::from)
 }
 
 /// The CROSS-CHECKOUT registry: `<config>/cadence/live-sessions`.
@@ -99,7 +112,16 @@ pub struct Peer {
     pub stale: bool,
 }
 
-/// Seconds since a file's mtime. `None` when metadata is unreadable.
+/// Seconds since a file's mtime. `None` when metadata is unreadable **or when
+/// the mtime is in the FUTURE** (`duration_since` errors), which a backward
+/// clock correction, a restored backup, or a stray `touch -d` all produce.
+///
+/// Callers must read `None` as "assume stale", never as "assume fresh". A
+/// future mtime read as age 0 is never stale and never swept: the record
+/// blocks liveness-gated operations forever, naming a session that may not
+/// exist, with no self-healing path. Treating it as stale is self-healing in
+/// both directions — a poison record ages out, and a genuinely live session
+/// simply rewrites its record on the next heartbeat.
 fn mtime_age_secs(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     SystemTime::now()
@@ -132,7 +154,10 @@ pub fn read_peers(dir: &Path, own_session_id: &str, stale_secs: u64) -> Vec<Peer
         if record.session_id == own_session_id {
             continue;
         }
-        let idle_secs = mtime_age_secs(&path).unwrap_or(0);
+        // Unreadable or future mtime => maximally stale, per `mtime_age_secs`.
+        // The previous `unwrap_or(0)` made such a record permanently live and
+        // permanently unswept.
+        let idle_secs = mtime_age_secs(&path).unwrap_or(u64::MAX);
         let age_secs = now.saturating_sub(record.started_epoch);
         peers.push(Peer {
             stale: idle_secs > stale_secs,
@@ -298,6 +323,7 @@ pub fn read_own(dir: &Path, session_id: &str) -> Option<SessionRecord> {
 /// the divergence stays detectable at `git commit`.
 pub fn touch_own(
     dir: &Path,
+    global_dir: Option<&Path>,
     session_id: &str,
     branch: Option<String>,
     is_self_switch: bool,
@@ -324,16 +350,27 @@ pub fn touch_own(
             ..Default::default()
         },
     };
-    // The heartbeat IS the mtime refresh, so the mirror has to be touched on
-    // the same beat as the local record — otherwise a long-lived session goes
-    // stale in the cross-checkout view while still working, and the prune gate
-    // that trusts that view stops protecting it (cadence-hooks#634).
-    //
-    // Best-effort and ordered after nothing: the local write's Result is what
-    // this function returns, so a mirror failure cannot change the caller's
-    // outcome (ADR-0001).
-    let _ = write_record(&global_sessions_dir(), &record);
-    write_record(dir, &record)
+    // Stamp the repo the same way `run_start` does — `touch_own` can CREATE a
+    // record (the `None` branch above), and a session whose first write came
+    // from a heartbeat would otherwise carry no repo forever, which is the
+    // unactionable-refusal case the field exists to prevent.
+    let mut record = record;
+    record.repo = repo_root_of_registry(dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .or(record.repo);
+
+    // Local FIRST, then the mirror. The heartbeat is the mtime refresh, so a
+    // slow mirror write — `CLAUDE_CONFIG_DIR` on a network mount is a supported
+    // configuration — would delay the local refresh behind it, ageing the local
+    // record past `stale_secs` while the session is working and letting peers
+    // sweep its lane. Ordering the local write first bounds that to the mirror
+    // alone; the returned Result is the local one, so a mirror failure cannot
+    // change the caller's outcome either (ADR-0001).
+    let local = write_record(dir, &record);
+    if let Some(global) = global_dir {
+        let _ = write_record(global, &record);
+    }
+    local
 }
 
 /// Delete registry files whose mtime is older than `stale_secs`, never the
@@ -374,9 +411,13 @@ pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str, trigger: &
         {
             continue;
         }
-        if let Some(age) = mtime_age_secs(&path)
-            && age > stale_secs
-        {
+        // `unwrap_or(u64::MAX)`, not `if let Some` — an unreadable or FUTURE
+        // mtime must be reapable. Skipping it (the previous behaviour) is what
+        // made a future-dated record permanently unswept, and `read_peers` now
+        // reads the same state as maximally stale, so the two agree: such a
+        // record neither counts as live nor survives a sweep.
+        let age = mtime_age_secs(&path).unwrap_or(u64::MAX);
+        if age > stale_secs {
             let record = fs::read_to_string(&path)
                 .ok()
                 .and_then(|t| serde_json::from_str::<SessionRecord>(&t).ok());
@@ -717,6 +758,137 @@ mod tests {
         assert!(peers.is_empty());
     }
 
+    /// The mirror write is the whole feature, and nothing asserted it — the
+    /// three lifecycle writes were covered only by a live probe, so any
+    /// refactor dropping one would leave CI fully green while the prune gate
+    /// silently reverted to under-protective.
+    #[test]
+    fn touch_own_mirrors_into_the_global_registry() {
+        let local = TempDir::new().unwrap();
+        let global = TempDir::new().unwrap();
+        touch_own(
+            local.path(),
+            Some(global.path()),
+            "mirrored-session",
+            Some("main".into()),
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            find_own(local.path(), "mirrored-session").is_some(),
+            "the local record is the caller's contract"
+        );
+        assert!(
+            find_own(global.path(), "mirrored-session").is_some(),
+            "and the mirror carries it across checkouts"
+        );
+    }
+
+    /// `None` means do not mirror — the state every test runs in, and the
+    /// reason a test can no longer reach the machine's real registry.
+    #[test]
+    fn touch_own_without_a_global_dir_writes_only_locally() {
+        let local = TempDir::new().unwrap();
+        let global = TempDir::new().unwrap();
+        touch_own(local.path(), None, "solo-session", None, false).unwrap();
+
+        assert!(find_own(local.path(), "solo-session").is_some());
+        assert!(
+            find_own(global.path(), "solo-session").is_none(),
+            "an un-passed mirror must stay untouched"
+        );
+    }
+
+    /// A heartbeat can CREATE a record, so it has to stamp `repo` too — a
+    /// session whose first write came from a heartbeat would otherwise carry
+    /// none forever, which is the unactionable-refusal case the field exists to
+    /// prevent.
+    #[test]
+    fn touch_own_stamps_the_repo_from_the_registry_path() {
+        let repo = TempDir::new().unwrap();
+        let dir = repo.path().join(".claude").join("sessions");
+        touch_own(&dir, None, "stamped-session", None, false).unwrap();
+
+        let rec = read_own(&dir, "stamped-session").expect("record written");
+        assert_eq!(
+            rec.repo.as_deref(),
+            repo.path().to_str(),
+            "the heartbeat path must name its repo, not leave it empty"
+        );
+    }
+
+    /// A FUTURE mtime used to be permanently live and permanently unswept: the
+    /// record blocked every liveness-gated operation forever, naming a session
+    /// that need not exist, with no self-healing path. Both halves now read it
+    /// as maximally stale, so it ages out and a real session simply rewrites
+    /// its record on the next heartbeat.
+    #[test]
+    fn a_future_mtime_reads_stale_and_is_reapable() {
+        let dir = TempDir::new().unwrap();
+        write_record(
+            dir.path(),
+            &SessionRecord {
+                name: "clock-skewed".into(),
+                session_id: "future-session".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = find_own(dir.path(), "future-session").expect("record written");
+        // stdlib rather than a new dependency for one test.
+        let future = SystemTime::now() + std::time::Duration::from_secs(86_400);
+        let times = fs::FileTimes::new().set_modified(future);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_times(times))
+            .expect("set a future mtime");
+
+        // Guard against a false pass: if the platform did not actually take the
+        // future mtime, this test proves nothing and should say so rather than
+        // report green.
+        assert!(
+            mtime_age_secs(&path).is_none(),
+            "fixture precondition: the mtime must actually be in the future"
+        );
+        assert!(
+            live_peers(dir.path(), "", 600).is_empty(),
+            "a future-dated record must not count as live"
+        );
+        sweep_stale(dir.path(), 600, "someone-else", "test");
+        assert!(
+            find_own(dir.path(), "future-session").is_none(),
+            "and must be reapable, or it blocks forever"
+        );
+    }
+
+    /// The inverse of `sessions_dir`. Every `None` is the safe direction — no
+    /// repo in the refusal beats a confidently wrong one.
+    #[test]
+    fn repo_root_of_registry_accepts_only_the_real_shape() {
+        assert_eq!(
+            repo_root_of_registry(Path::new("/repo/.claude/sessions")),
+            Some(PathBuf::from("/repo"))
+        );
+        assert_eq!(
+            repo_root_of_registry(Path::new("/a/b/c/.claude/sessions")),
+            Some(PathBuf::from("/a/b/c"))
+        );
+        for bad in [
+            "/repo/.claude/other",
+            "/repo/notclaude/sessions",
+            "/repo/sessions",
+            ".claude/sessions",
+        ] {
+            assert_eq!(
+                repo_root_of_registry(Path::new(bad)),
+                None,
+                "{bad} is not a registry directory"
+            );
+        }
+    }
+
     #[test]
     fn fresh_peer_is_live() {
         let tmp = TempDir::new().unwrap();
@@ -755,7 +927,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         write_record(&dir, &record("quiet-loom", "self-session")).unwrap();
-        touch_own(&dir, "self-session", Some("feat/new-branch".into()), false).unwrap();
+        touch_own(
+            &dir,
+            None,
+            "self-session",
+            Some("feat/new-branch".into()),
+            false,
+        )
+        .unwrap();
         let back = read_own(&dir, "self-session").unwrap();
         assert_eq!(back.branch.as_deref(), Some("feat/new-branch"));
     }
@@ -765,7 +944,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         write_record(&dir, &record("quiet-loom", "self-session")).unwrap();
-        touch_own(&dir, "self-session", None, false).unwrap();
+        touch_own(&dir, None, "self-session", None, false).unwrap();
         let back = read_own(&dir, "self-session").unwrap();
         assert_eq!(back.branch.as_deref(), Some("main"));
     }
@@ -774,7 +953,7 @@ mod tests {
     fn touch_own_creates_record_when_missing() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("sessions");
-        touch_own(&dir, "brand-new-session", Some("main".into()), false).unwrap();
+        touch_own(&dir, None, "brand-new-session", Some("main".into()), false).unwrap();
         let back = read_own(&dir, "brand-new-session").unwrap();
         assert_eq!(back.session_id, "brand-new-session");
         assert!(!back.name.is_empty());
@@ -790,7 +969,14 @@ mod tests {
         rec.intent = Some("cadence-hooks#54".into());
         rec.touching = vec!["crates/session/".into()];
         write_record(&dir, &rec).unwrap();
-        touch_own(&dir, "self-session", Some("other-branch".into()), false).unwrap();
+        touch_own(
+            &dir,
+            None,
+            "self-session",
+            Some("other-branch".into()),
+            false,
+        )
+        .unwrap();
         let back = read_own(&dir, "self-session").unwrap();
         assert_eq!(back.intent.as_deref(), Some("cadence-hooks#54"));
         assert_eq!(back.touching, vec!["crates/session/"]);

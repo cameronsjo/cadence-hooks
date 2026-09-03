@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::registry;
 // The session crate's `registry` (peer-session liveness) — aliased because the
 // bare name is already taken by the binary's hook-catalog `registry` above.
+use cadence_hooks_session::identity as session_identity;
 use cadence_hooks_session::registry as session_registry;
 
 /// Severity of a finding: errors block (shell bugs), warnings advise (version skew).
@@ -49,6 +50,11 @@ struct Finding {
 /// prose around an already-`display_safe_bounded`-clamped 200-char error
 /// string from `log_failopen` (`MAX_ERROR_CHARS`), so 500 leaves real
 /// content intact while still bounding a pathological one.
+/// Cap on how many live peers the prune refusal NAMES. The count it reports is
+/// the true total; this only bounds the rendered list, so a directory seeded
+/// with records cannot flood an operator's terminal.
+const MAX_NAMED_PEERS: usize = 10;
+
 const MAX_FINDING_FIELD_CHARS: usize = 500;
 
 impl Finding {
@@ -2097,9 +2103,8 @@ enum PruneGate {
 /// testable without a live registry.
 ///
 /// `force` overrides everything (the `CADENCE_DOCTOR_PRUNE_FORCE` escape hatch).
-/// A `None` sessions dir means there is nothing to protect (not inside a repo),
-/// so it proceeds. Otherwise it blocks when any non-stale peer is registered,
-/// naming them. `own_session_id` is `""` so the invoking session itself counts
+/// It blocks when any non-stale peer is registered in EITHER registry, naming
+/// them. `own_session_id` is `""` so the invoking session itself counts
 /// as a live peer — a prune must not delete dirs the caller is pinned to —
 /// matching how `run_status` enumerates peers.
 ///
@@ -2137,19 +2142,52 @@ fn prune_liveness_gate(
         return PruneGate::Proceed;
     }
 
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut names: Vec<String> = Vec::new();
+    // Collect by session id, PREFERRING the record that carries a repo.
+    //
+    // First-wins would take whichever registry we happened to read first — the
+    // local one — and during rollout that is exactly the record written by a
+    // pre-`repo` binary, while the mirrored one has the field. The refusal
+    // would then drop the only part a reader can act on. Which registry a
+    // record came from is not the question; whether it can be acted on is.
+    let mut by_session: std::collections::BTreeMap<String, (String, Option<String>)> =
+        std::collections::BTreeMap::new();
 
     for dir in sessions_dir.into_iter().chain(global_dir) {
         for peer in session_registry::live_peers(dir, "", stale_secs) {
-            if !seen.insert(peer.record.session_id.clone()) {
-                continue;
+            let entry = by_session
+                .entry(peer.record.session_id.clone())
+                .or_insert_with(|| (peer.record.name.clone(), None));
+            if entry.1.is_none() && peer.record.repo.is_some() {
+                entry.1 = peer.record.repo.clone();
+                entry.0 = peer.record.name.clone();
             }
-            names.push(match peer.record.repo.as_deref() {
-                Some(repo) => format!("{} ({repo})", peer.record.name),
-                None => peer.record.name,
-            });
         }
+    }
+
+    // SANITIZE both fields. They come from JSON files this process did not
+    // write — in a shared directory, from other sessions entirely — and land on
+    // an interactive terminal in the refusal for a DESTRUCTIVE command. A `\r`
+    // plus crafted text can rewrite the rendered line, e.g. appending "0 live
+    // sessions — safe to force", which talks the operator into
+    // CADENCE_DOCTOR_PRUNE_FORCE=1 and a remove_dir_all. Every other consumer
+    // of these fields already sanitizes; this call site was the lone exception.
+    //
+    // The list is capped so a seeded directory cannot flood the terminal; the
+    // count reported alongside it is the true total.
+    let total = by_session.len();
+    let mut names: Vec<String> = by_session
+        .into_values()
+        .take(MAX_NAMED_PEERS)
+        .map(|(name, repo)| {
+            let name = session_identity::sanitize_field(&name, 40);
+            match repo {
+                Some(repo) => format!("{name} ({})", session_identity::sanitize_field(&repo, 120)),
+                None => name,
+            }
+        })
+        .collect();
+    if total > names.len() {
+        names.push(format!("and {} more", total - names.len()));
     }
 
     if names.is_empty() {
@@ -2252,7 +2290,8 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         ) {
             eprintln!(
                 "cadence-hooks doctor --prune --apply: refusing to prune — {} live session(s) may be pinned to these version dirs: {}. \
-                 Run /reload-plugins in any live session first to release the retired dirs, then re-run. \
+                 The gate blocks while any session is REGISTERED, including this one, so /reload-plugins does not clear it: \
+                 end those sessions, or wait out the staleness window, then re-run. \
                  Or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway.",
                 names.len(),
                 names.join(", ")
@@ -5420,16 +5459,27 @@ mod tests {
             session_id: "peer-session".into(),
             started: cadence_hooks_session::identity::utc_timestamp(),
             started_epoch: cadence_hooks_session::identity::now_epoch(),
+            // Only the MIRROR record carries a repo here, deliberately: a local
+            // record written by a pre-`repo` binary paired with a mirrored one
+            // that has it is the real state during rollout. Asserting only the
+            // count would pass while silently dropping the actionable field.
+            repo: Some("/Users/x/Projects/some-repo".into()),
             ..Default::default()
         };
         session_registry::write_record(&global_dir, &rec).unwrap();
 
         match prune_liveness_gate(Some(&local_dir), Some(&global_dir), 600, false) {
-            PruneGate::Blocked(names) => assert_eq!(
-                names.len(),
-                1,
-                "one session mirrored into both registries is still one session: {names:?}"
-            ),
+            PruneGate::Blocked(names) => {
+                assert_eq!(
+                    names.len(),
+                    1,
+                    "one session mirrored into both registries is still one session: {names:?}"
+                );
+                assert!(
+                    names[0].contains("/Users/x/Projects/some-repo"),
+                    "dedupe must keep the record that can be acted on: {names:?}"
+                );
+            }
             PruneGate::Proceed => panic!("a live session must block the prune"),
         }
     }
@@ -5459,6 +5509,66 @@ mod tests {
             ),
             "no local registry must not mean no live sessions"
         );
+    }
+
+    /// The escape hatch has to work against the NEW arm too, or an operator
+    /// facing a cross-checkout block has no way through at all.
+    #[test]
+    fn prune_liveness_gate_force_overrides_a_global_peer() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "distant-anvil".into(),
+            session_id: "blocking-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        assert!(
+            matches!(
+                prune_liveness_gate(None, Some(&global_dir), 600, false),
+                PruneGate::Blocked(_)
+            ),
+            "control: without force this blocks"
+        );
+        assert!(
+            matches!(
+                prune_liveness_gate(None, Some(&global_dir), 600, true),
+                PruneGate::Proceed
+            ),
+            "force must override the cross-checkout arm too"
+        );
+    }
+
+    /// Record fields come from JSON this process did not write and land on an
+    /// interactive terminal in a DESTRUCTIVE command's refusal. A control
+    /// character there can rewrite the rendered line.
+    #[test]
+    fn prune_refusal_sanitizes_record_fields() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "evil\r\u{1b}[2K0 live sessions".into(),
+            session_id: "hostile-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            repo: Some("/repo\u{1b}[31m".into()),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        match prune_liveness_gate(None, Some(&global_dir), 600, false) {
+            PruneGate::Blocked(names) => {
+                let rendered = names.join(" ");
+                assert!(
+                    !rendered.contains('\r') && !rendered.contains('\u{1b}'),
+                    "control characters must never reach the terminal: {rendered:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a live session must block the prune"),
+        }
     }
 
     #[test]

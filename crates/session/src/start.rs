@@ -76,7 +76,14 @@ impl Check for Start {
         }
         let branch = git_command(cwd, &["branch", "--show-current"]);
         let stale_secs = registry::stale_minutes() * 60;
-        run_start(input, &dir, branch, stale_secs, machine)
+        run_start(
+            input,
+            &dir,
+            Some(registry::global_sessions_dir().as_path()),
+            branch,
+            stale_secs,
+            machine,
+        )
     }
 }
 
@@ -132,6 +139,7 @@ fn rules_absence_line_from(config_dir: &Path) -> Option<String> {
 pub fn run_start(
     input: &HookInput,
     dir: &std::path::Path,
+    global_dir: Option<&std::path::Path>,
     branch: Option<String>,
     stale_secs: u64,
     failopen: Option<String>,
@@ -208,11 +216,15 @@ pub fn run_start(
     // an empty repo makes the refusal unactionable — it can name the session but
     // not where to go release it.
     let mut record = record;
-    if record.repo.is_none() {
-        record.repo =
-            registry::repo_root_of_registry(dir).map(|p| p.to_string_lossy().into_owned());
-    }
-    let record = record;
+    // Unconditionally, not only when absent: `dir` is authoritative about where
+    // this session is registering RIGHT NOW, so a record carried across a
+    // worktree move would otherwise keep naming the old checkout and send a
+    // reader of the prune refusal to the wrong place. Falls back to the
+    // existing value when the shape does not resolve, so a good repo is never
+    // replaced by nothing.
+    record.repo = registry::repo_root_of_registry(dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .or(record.repo);
     if registry::write_record(dir, &record).is_err() {
         // Fail open: a read-only filesystem must not break session start.
         return finish(posture, None, plan_disclosure, failopen, staleness);
@@ -227,9 +239,17 @@ pub fn run_start(
     // registration into a failed session start. Worst case the mirror stays
     // empty and the cross-checkout reader is exactly as blind as it was before
     // this existed (ADR-0001).
-    let global = registry::global_sessions_dir();
-    let _ = registry::write_record(&global, &record);
-    registry::sweep_stale(&global, stale_secs, sid, "start");
+    if let Some(global) = global_dir {
+        let _ = registry::write_record(global, &record);
+        // The shared registry is swept on the DEFAULT threshold, never this
+        // session's `CADENCE_SESSION_STALE_MINUTES`. A per-session override is
+        // a statement about one repo's own lanes; applying it to a directory
+        // holding other checkouts' records lets one session with a short
+        // threshold reap a peer that is alive but quiet — and a reaped mirror
+        // record is exactly what makes the prune gate proceed against a live
+        // session. A shared directory cannot take a per-session threshold.
+        registry::sweep_stale(global, registry::default_stale_secs(), sid, "start");
+    }
 
     // Housekeeping: presumed-dead peers leave the room before roll call. Our
     // own (just-refreshed) file is excluded by sid as defense-in-depth.
@@ -566,7 +586,7 @@ mod tests {
             cwd: Some("/tmp".into()),
             ..Default::default()
         };
-        let r = run_start(&input, tmp.path(), None, 600, None);
+        let r = run_start(&input, tmp.path(), None, None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -574,7 +594,7 @@ mod tests {
     fn unsafe_session_id_allows() {
         let tmp = TempDir::new().unwrap();
         let input = make_session_with_cwd("../escape", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), None, 600, None);
+        let r = run_start(&input, tmp.path(), None, None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
             std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
@@ -588,7 +608,7 @@ mod tests {
     fn empty_room_registers_silently() {
         let tmp = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        let r = run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         assert_eq!(r.outcome, Outcome::Allow, "no peers → no disclosure");
         let own = registry::read_own(tmp.path(), "solo-session").unwrap();
         assert_eq!(own.branch.as_deref(), Some("main"));
@@ -600,7 +620,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // First registration + declaration.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         let mut rec = registry::read_own(tmp.path(), "self-session").unwrap();
         rec.intent = Some("cadence-hooks#54".into());
         rec.touching = vec!["crates/session/".into()];
@@ -608,7 +628,7 @@ mod tests {
 
         // Re-register (e.g. after /clear) on a new branch.
         let input = make_session_with_cwd("self-session", "clear", "/tmp");
-        run_start(&input, tmp.path(), Some("feat/x".into()), 600, None);
+        run_start(&input, tmp.path(), None, Some("feat/x".into()), 600, None);
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
         assert_eq!(back.intent.as_deref(), Some("cadence-hooks#54"));
@@ -631,7 +651,7 @@ mod tests {
 
         // First registration + declaration.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         let mut rec = registry::read_own(tmp.path(), "self-session").unwrap();
         rec.intent = Some("cadence-hooks#69".into());
         rec.touching = vec!["crates/session/".into()];
@@ -641,7 +661,7 @@ mod tests {
         // the OLD sweep-first ordering would have deleted it before read_own.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let input = make_session_with_cwd("self-session", "clear", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 0, None);
+        run_start(&input, tmp.path(), None, Some("main".into()), 0, None);
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
         assert_eq!(
@@ -662,6 +682,7 @@ mod tests {
         run_start(
             &peer_input,
             tmp.path(),
+            None,
             Some("feat/issue-52".into()),
             600,
             None,
@@ -669,7 +690,7 @@ mod tests {
 
         // We arrive.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        let r = run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(msg.contains("feat/issue-52"), "peer branch named: {msg}");
@@ -687,7 +708,7 @@ mod tests {
     fn stale_peer_does_not_trigger_disclosure() {
         let tmp = TempDir::new().unwrap();
         let peer_input = make_session_with_cwd("peer-session", "startup", "/tmp");
-        run_start(&peer_input, tmp.path(), None, 600, None);
+        run_start(&peer_input, tmp.path(), None, None, 600, None);
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
         // stale_secs = 0: any measurable age (whole seconds) counts as stale.
@@ -696,7 +717,7 @@ mod tests {
         // process-global CADENCE_METRICS_DIR.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
         let r = registry::test_metrics_env::with_scratch_metrics_dir(|| {
-            run_start(&input, tmp.path(), None, 0, None)
+            run_start(&input, tmp.path(), None, None, 0, None)
         });
         assert_eq!(r.outcome, Outcome::Allow, "stale peers are ignored");
         assert!(
@@ -710,8 +731,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Same session re-starting (e.g. compact) must not see itself as a peer.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), None, 600, None);
-        let r = run_start(&input, tmp.path(), None, 600, None);
+        run_start(&input, tmp.path(), None, None, 600, None);
+        let r = run_start(&input, tmp.path(), None, None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -731,6 +752,7 @@ mod tests {
         let r = run_start(
             &input,
             tmp.path(),
+            None,
             Some("main".into()),
             600,
             Some("guards are NOT enforcing".into()),
@@ -747,7 +769,7 @@ mod tests {
     fn no_failopen_line_leaves_the_start_silent() {
         let tmp = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        let r = run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         assert_eq!(r.outcome, Outcome::Allow, "healthy telemetry adds nothing");
     }
 
@@ -799,6 +821,7 @@ mod tests {
         run_start(
             &peer_input,
             tmp.path(),
+            None,
             Some("feat/issue-52".into()),
             600,
             None,
@@ -808,6 +831,7 @@ mod tests {
         let r = run_start(
             &input,
             tmp.path(),
+            None,
             Some("main".into()),
             600,
             Some("FAILOPEN-MARKER".into()),
@@ -845,7 +869,14 @@ mod tests {
         let registry_dir = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo", "startup", &scratch.path().to_string_lossy());
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
+            run_start(
+                &input,
+                registry_dir.path(),
+                None,
+                Some("main".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -911,7 +942,14 @@ mod tests {
         // posture_line_* tests below, which fail locally for the identical
         // environment reason and pass in CI).
         let r = with_worktree_env(Some("true"), None, || {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
+            run_start(
+                &input,
+                registry_dir.path(),
+                None,
+                Some("main".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(
             r.outcome,
@@ -1374,7 +1412,14 @@ mod tests {
         let registry_dir = tempfile::TempDir::new().unwrap();
         let input = make_session_with_cwd("solo", "startup", &scratch.path().to_string_lossy());
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
+            run_start(
+                &input,
+                registry_dir.path(),
+                None,
+                Some("main".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge, "posture alone still nudges");
         let msg = r.message.unwrap();
@@ -1396,6 +1441,7 @@ mod tests {
         run_start(
             &peer_input,
             registry_dir.path(),
+            None,
             Some("feat/x".into()),
             600,
             None,
@@ -1403,7 +1449,14 @@ mod tests {
 
         let input = make_session_with_cwd("self-session", "startup", &cwd);
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
+            run_start(
+                &input,
+                registry_dir.path(),
+                None,
+                Some("main".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -1430,6 +1483,7 @@ mod tests {
             run_start(
                 &input,
                 registry_dir.path(),
+                None,
                 Some("feat/y".into()),
                 600,
                 None,
