@@ -38,7 +38,14 @@ impl Logger for Heartbeat {
         };
         let branch = git_command(cwd, &["branch", "--show-current"]);
         let stale_secs = registry::stale_minutes() * 60;
-        run_heartbeat(&dir, sid, branch, input.command(), stale_secs);
+        run_heartbeat(
+            &dir,
+            Some(registry::global_sessions_dir().as_path()),
+            sid,
+            branch,
+            input.command(),
+            stale_secs,
+        );
     }
 }
 
@@ -70,6 +77,7 @@ impl Logger for Heartbeat {
 /// any fresh SessionStart.
 pub fn run_heartbeat(
     dir: &std::path::Path,
+    global_dir: Option<&std::path::Path>,
     session_id: &str,
     branch: Option<String>,
     command: Option<&str>,
@@ -83,8 +91,21 @@ pub fn run_heartbeat(
     // never sweep its own aged file in the call below (#69). The own-sid
     // exclusion in `sweep_stale` is then defense-in-depth — our file is fresh
     // regardless.
-    let _ = registry::touch_own(dir, session_id, branch, is_self_switch);
+    let _ = registry::touch_own(dir, global_dir, session_id, branch, is_self_switch);
     registry::sweep_stale(dir, stale_secs, session_id, "heartbeat");
+    // Sweep the mirror on the same beat, on the DEFAULT threshold rather than
+    // this session's override. Without this, a crashed session's mirror record
+    // (no SessionEnd fires) is reaped only at some other session's next
+    // SessionStart — so the CHANGELOG's parity claim would hold per function
+    // and not per call site, which is the kind of gap that reads as covered.
+    if let Some(global) = global_dir {
+        registry::sweep_stale(
+            global,
+            registry::default_stale_secs(),
+            session_id,
+            "heartbeat",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +135,7 @@ mod tests {
 
         run_heartbeat(
             tmp.path(),
+            None,
             "self-session",
             Some("feat/peer-moved".into()),
             Some("cargo build"),
@@ -150,6 +172,7 @@ mod tests {
 
         run_heartbeat(
             tmp.path(),
+            None,
             "self-session",
             Some("feat/mine".into()),
             Some("git checkout -b feat/mine"),
@@ -183,6 +206,7 @@ mod tests {
 
         run_heartbeat(
             tmp.path(),
+            None,
             "self-session",
             Some("feat/mine".into()),
             Some("git checkout 'feat/mine'"),
@@ -216,6 +240,7 @@ mod tests {
         // Peer moved HEAD to feat/peer; this session only echoes prose about it.
         run_heartbeat(
             tmp.path(),
+            None,
             "self-session",
             Some("feat/peer".into()),
             Some("echo run git checkout feat/peer to reproduce"),
@@ -253,6 +278,7 @@ mod tests {
 
         run_heartbeat(
             tmp.path(),
+            None,
             "self-session",
             Some("feat/peer".into()),
             Some("git -C ../other-plugin checkout main"),
@@ -273,7 +299,14 @@ mod tests {
         // must still register the session.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("sessions");
-        run_heartbeat(&dir, "unregistered-session", Some("main".into()), None, 600);
+        run_heartbeat(
+            &dir,
+            None,
+            "unregistered-session",
+            Some("main".into()),
+            None,
+            600,
+        );
         let back = registry::read_own(&dir, "unregistered-session").unwrap();
         // A pre-start heartbeat seeds the drift baseline from live HEAD — this
         // is the invariant run_drift relies on (code-review N4).
@@ -323,7 +356,7 @@ mod tests {
         // (#259) — scratch-dir-scoped so this doesn't race the sweep-telemetry
         // tests in `registry` over the process-global CADENCE_METRICS_DIR.
         registry::test_metrics_env::with_scratch_metrics_dir(|| {
-            run_heartbeat(dir, "self-session", Some("main".into()), None, 0);
+            run_heartbeat(dir, None, "self-session", Some("main".into()), None, 0);
         });
 
         assert!(
@@ -362,7 +395,7 @@ mod tests {
         // Reaping fires log_sweep (#259) — scratch-dir-scoped, see the
         // sibling test above.
         registry::test_metrics_env::with_scratch_metrics_dir(|| {
-            run_heartbeat(dir, "self-session", Some("main".into()), None, 0);
+            run_heartbeat(dir, None, "self-session", Some("main".into()), None, 0);
         });
 
         assert!(
@@ -394,7 +427,7 @@ mod tests {
         let peers = registry::read_peers(tmp.path(), "other", 0);
         assert!(peers[0].stale);
 
-        run_heartbeat(tmp.path(), "self-session", None, None, 600);
+        run_heartbeat(tmp.path(), None, "self-session", None, None, 600);
 
         let peers = registry::read_peers(tmp.path(), "other", 0);
         assert!(!peers[0].stale, "heartbeat resets liveness");

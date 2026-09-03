@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Cross-checkout session liveness, and `doctor --prune --apply` now gates on it** (cadence-hooks#634). The session registry is per-checkout by design — right for peer disclosure and lane warnings, which are about the repo you are standing in, and wrong for anything reasoning about a resource *shared* across checkouts. The plugin cache is exactly that: one global tree every session on the machine reads. So the prune gate was under-protective by construction, and the sessions most likely to be pinned to a retired version dir are the long-running ones, which have no reason to sit in the repo you happen to be pruning from.
+  - Sessions now mirror their record into `<config>/cadence/live-sessions` on start, on every heartbeat, and remove it on end. **This is a mirror, not a second format**: the same `write_record`/`touch_own`/`remove_own`/`sweep_stale` operate on it, so mtime stays the heartbeat and staleness stays one rule — there is no second mechanism to drift out of step. Record filenames carry the session id, which is unique across repos.
+  - Mirroring is **best-effort at every call site** and ordered so it can never turn a successful local registration into a failed session start. If the directory cannot be written, behaviour is exactly what it was before the mirror existed (ADR-0001).
+  - `SessionRecord` gains an optional `repo`, serde-defaulted so older records still parse. It is redundant per-checkout and load-bearing in the mirror: without it a refusal can name a live session but not which checkout to go release it in, which is the action the message asks for.
+  - A cwd outside any git repository no longer short-circuits the gate to *proceed*. Not being in a repo says nothing about whether other sessions are live.
+  - The shared registry is swept on the **default** staleness window, never a session's `CADENCE_SESSION_STALE_MINUTES` override — a per-session threshold is a statement about one repo's own lanes, and applying it to a directory holding other checkouts' records lets one session reap a peer that is alive but merely quiet.
+  - An unreadable or **future** mtime now reads as maximally stale in both `read_peers` and `sweep_stale`. It previously read as age 0: permanently live and permanently unswept, so one clock-skewed record blocked liveness-gated operations forever with no self-healing path.
+  - The prune refusal **sanitizes** the record fields it renders and caps the list. Those fields come from JSON this process did not write — in a shared directory, from other sessions — and land on a terminal in a destructive command's refusal, where a control character can rewrite the line.
+  - Rollout note: the gate sees only sessions started by a binary carrying this change. Until older sessions cycle, it is exactly as protective as before — never less.
+
 ## [0.88.1] - 2026-09-02
 
 ### Fixed

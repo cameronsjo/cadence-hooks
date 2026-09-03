@@ -100,7 +100,18 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
         ..Default::default()
     });
     apply_declaration(&mut record, intent, touching);
-    match registry::write_record(&dir, &record) {
+    // `declare` can CREATE a record from scratch (the `unwrap_or_else` above),
+    // so a session that registers only this way — SessionStart unwired, or an
+    // id passed in from a Bash tool — would be live locally and invisible to
+    // the cross-checkout mirror, which is precisely the state that lets a prune
+    // delete dirs it is pinned to. Best-effort, after the local write's result
+    // is what the caller sees (cadence-hooks#634).
+    record.repo = registry::repo_root_of_registry(&dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .or(record.repo);
+    let local = registry::write_record(&dir, &record);
+    let _ = registry::write_record(&registry::global_sessions_dir(), &record);
+    match local {
         Ok(()) => {
             // The record may have been seeded by another process — sanitize
             // everything echoed back, same discipline as the hook paths.

@@ -296,7 +296,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_record(tmp.path(), "self-session", Some("main"));
         // Non-switch heartbeat absorbing the peer-moved HEAD.
-        registry::touch_own(tmp.path(), "self-session", Some("feat/peer".into()), false).unwrap();
+        registry::touch_own(
+            tmp.path(),
+            None,
+            "self-session",
+            Some("feat/peer".into()),
+            false,
+        )
+        .unwrap();
 
         let r = run_drift(tmp.path(), "self-session", Some("feat/peer"));
         assert_eq!(r.outcome, Outcome::Nudge, "peer-moved HEAD is flagged");
@@ -313,7 +320,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         seed_record(tmp.path(), "self-session", Some("main"));
         // Self-switch heartbeat re-baselines to the new branch.
-        registry::touch_own(tmp.path(), "self-session", Some("feat/mine".into()), true).unwrap();
+        registry::touch_own(
+            tmp.path(),
+            None,
+            "self-session",
+            Some("feat/mine".into()),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(
             run_drift(tmp.path(), "self-session", Some("feat/mine")).outcome,
