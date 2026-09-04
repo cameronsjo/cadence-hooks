@@ -6,8 +6,11 @@ name: Probe self-hosted macOS
 #      and idle since it was built, so nothing has ever run on it
 # Deleted in this same PR once both are observed.
 
+# push, not workflow_dispatch: a dispatchable workflow must already exist on the
+# default branch, and the whole point is to measure before merging.
 on:
-  workflow_dispatch:
+  push:
+    branches: [ci/self-hosted-macos]
 
 permissions:
   contents: read
