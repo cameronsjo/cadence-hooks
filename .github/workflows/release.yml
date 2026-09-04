@@ -34,12 +34,16 @@ jobs:
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             use-cross: true
+          # Both macOS targets build on the M1 Max fleet's `ghr-cadence-hooks`
+          # account. `os` is an array here and a string elsewhere, which
+          # `runs-on: ${{ matrix.os }}` accepts — a label set and a single label
+          # are both valid runs-on values.
           - name: macos-x86_64
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64]
             target: x86_64-apple-darwin
             use-cross: false
           - name: macos-aarch64
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64]
             target: aarch64-apple-darwin
             use-cross: false
           - name: windows-x86_64
