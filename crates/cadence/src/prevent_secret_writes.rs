@@ -6,8 +6,8 @@
 //! Safe templates (.env.example, .env.test) are always allowed.
 
 use crate::secret_patterns::{
-    command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
-    is_dangerous_secret_token, is_safe_template, is_secret_scan_exempt, scan_secret_values,
+    envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_secret_token, is_safe_template,
+    is_secret_scan_exempt, scan_secret_values,
 };
 use cadence_hooks_core::shell::{
     command_segments, command_word, redirect_targets, skip_git_global_options, tokenize,
@@ -161,12 +161,14 @@ fn find_writes(args: &[String]) -> bool {
 
 /// Check if a bash command targets .env files destructively.
 fn bash_targets_env_file(command: &str) -> bool {
-    // Quick reject: nothing to guard if no deny-set secret file is mentioned
-    // anywhere (the `.env` family plus the non-`.env` credential stores) (#138).
-    let lower = command.to_lowercase();
-    if !command_may_reference_secret(&lower) {
-        return false;
-    }
+    // No raw-substring prefilter here, deliberately (#655). A quote-split
+    // target (`.en''v`) resolves to `.env` only AFTER tokenizing, so any gate
+    // that reads the raw command text vetoes the resolver that would have
+    // caught it — a silent miss, not a fail-open. Cost of running the parser
+    // unconditionally, measured over a 76-char benign command on an M3: ~4 µs
+    // versus ~0.14 µs for the prefilter — both irrelevant beside the
+    // millisecond process spawn this guard already pays. Longer commands cost
+    // more; the comparison, not the figure, is the argument.
 
     // Judge each command segment independently so a benign first redirect can't
     // shield a dangerous one later in the chain, and a write hidden in
@@ -1003,6 +1005,60 @@ mod tests {
         let result =
             SecretWritesGuard.run(&make_bash_input("echo ok > safe.txt && echo SECRET > .env"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    // --- #655: the resolver runs regardless of raw-substring appearance ---
+
+    #[test]
+    fn quote_split_redirect_target_blocked() {
+        // `.en''v` is the file `.env`; the empty quote pair exists only to
+        // defeat a raw-substring reader. Red before #655.
+        assert!(bash_targets_env_file("echo foo > .en''v"));
+        assert!(bash_targets_env_file(r#"echo foo > .en""v"#));
+        assert!(bash_targets_env_file("echo foo > '.en'v"));
+        assert!(bash_targets_env_file(r#"echo foo > "."env"#));
+    }
+
+    #[test]
+    fn quote_split_writer_verb_target_blocked() {
+        assert!(bash_targets_env_file("echo foo | tee .en''v"));
+        assert!(bash_targets_env_file("rm .en''v"));
+        assert!(bash_targets_env_file("cp x .en''v"));
+    }
+
+    #[test]
+    fn quote_split_non_env_credential_blocked() {
+        // The deny set is wider than the .env family.
+        assert!(bash_targets_env_file("echo foo > .ssh/id_''rsa"));
+    }
+
+    #[test]
+    fn quote_split_target_blocks_via_run() {
+        let result = SecretWritesGuard.run(&make_bash_input("echo foo > .en''v"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn removing_the_prefilter_does_not_over_block() {
+        // Controls: these must stay ALLOW with the parser now running on
+        // every command. A safe template survives quote-splitting, and a
+        // component-based classifier keeps `settings.environment` clean.
+        assert!(!bash_targets_env_file("echo foo > .en''v.example"));
+        assert!(!bash_targets_env_file("cat settings.environment"));
+        assert!(!bash_targets_env_file("echo foo > out.txt"));
+        assert!(!bash_targets_env_file("cargo test"));
+    }
+
+    #[test]
+    fn write_edit_arm_unaffected_by_the_bash_change() {
+        // #655 touches only `bash_targets_env_file`. Assert through the guard
+        // so the `"Write" | "Edit"` match arm itself executes — a direct call
+        // to `is_blocked` would stay green even if that arm were deleted.
+        let blocked = SecretWritesGuard.run(&make_write_input("/project/.env"));
+        assert_eq!(blocked.outcome, cadence_hooks_core::Outcome::Block);
+
+        let allowed = SecretWritesGuard.run(&make_write_input("/project/.env.example"));
+        assert_eq!(allowed.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     // --- #116: expansion modeling ---

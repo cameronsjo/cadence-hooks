@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`prevent-secret-writes` no longer lets a quote-split target through** (cadence-hooks#655). The Bash arm ran a raw-substring prefilter over the lowercased command before parsing anything, so a redirect or writer-verb target that only resolves to a secret name after quote removal — `.en''v`, `.en""v`, `'.en'v`, `"."env`, `.ssh/id_''rsa` — was vetoed before the quote-aware resolver ever saw it. Eight spellings measured ALLOW on 0.89.0, including `rm .en''v`. The prefilter is gone; the parser now runs on every Bash command, at ~4 µs for a 76-char command against a millisecond process spawn. The Write/Edit arm never used the prefilter and is unchanged.
+  - **Still open, and not closed by this change:** backslash- and ANSI-C-escaped spellings (`\.env`, `$'.\x65nv'`, `$'\056env'`) resolve past the guard because `tokenize` does not decode those escapes — a separate `core::shell` defect. The sibling `prevent-secret-leaks` read guard also still carries the identical raw-substring prefilter, so `cat .en''v` remains allowed. Both are tracked separately.
+
 ## [0.89.0] - 2026-09-02
 
 ### Added

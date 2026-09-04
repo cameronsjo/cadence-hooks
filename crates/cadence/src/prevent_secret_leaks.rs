@@ -812,10 +812,12 @@ fn bash_leaks_secrets(command: &str, cwd: Option<&str>) -> Option<CheckResult> {
         // expanded into a segment this guard could see — five other guards
         // caught it while this one alone read the unexpanded outer line.
         // `-S` survived only by coincidence (it folds to `-s`, a distinct,
-        // also-argument-free allowlist member). This mirrors what the sibling
-        // `prevent_secret_writes::bash_targets_env_file` already does: `lower`
-        // still backs `command_may_reference_secret` and
-        // `command_changes_directory` above, and every downstream comparison
+        // also-argument-free allowlist member). Segmenting from the original
+        // command is what the sibling
+        // `prevent_secret_writes::bash_targets_env_file` also does — though it
+        // no longer keeps a `lower` at all, having dropped its own raw-text
+        // pre-filter in #655. Here `lower` still backs
+        // `command_may_reference_secret` above, and every downstream comparison
         // that needs case-insensitivity (`command_word`'s verb fold,
         // `is_dangerous_secret_token`, `METADATA_SAFE_COMMANDS`) folds at its
         // own comparison site rather than depending on pre-lowered input.
