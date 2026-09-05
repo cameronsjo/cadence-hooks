@@ -564,36 +564,29 @@ fn peel_env_options<'a>(tokens: &'a [&'a str]) -> Option<&'a [&'a str]> {
     peel_env(tokens).map(|peel| peel.rest)
 }
 
-/// Did `env`'s own options ask it to change directory before exec'ing?
-///
-/// `true` for `-C <dir>`, `-C` clustered as the first value-taking letter
-/// (`-iC /usr`), `--chdir <dir>`, and `--chdir=<dir>`. `false` for everything
-/// else, INCLUDING `-uC`: there the `C` is `-u`'s value (the name of the
-/// variable to unset), which is why this reads [`peel_env`]'s single cluster
-/// grammar rather than testing for a `C` anywhere in the token. Measured:
-/// `env -uC pwd` prints the original directory, `env -iC /usr pwd` prints
-/// `/usr`.
-///
-/// `None` from the peel — an `-S`/`--split-string`, whose value is itself a
-/// command line — reports `false`. The walk stopped, so no chdir was observed;
-/// a `cd` spelled inside that string is the same accepted miss the peel's own
-/// doc names.
-fn env_options_chdir(tokens: &[&str]) -> bool {
-    peel_env(tokens).is_some_and(|peel| peel.saw_chdir)
-}
-
 /// What one walk of `env`'s option grammar found: the tokens from the command
 /// operand onward, and whether the options included a chdir.
+///
+/// `saw_chdir` is `true` for `-C <dir>`, `-C` clustered as the first
+/// value-taking letter (`-iC /usr`), `--chdir <dir>`, `--chdir=<dir>`, and any
+/// unambiguous GNU abbreviation of the long form. It is `false` for everything
+/// else, INCLUDING `-uC`: there the `C` is `-u`'s value (the name of the
+/// variable to unset). Measured: `env -uC pwd` prints the original directory,
+/// `env -iC /usr pwd` prints `/usr`.
 struct EnvPeel<'a> {
     rest: &'a [&'a str],
     saw_chdir: bool,
 }
 
-/// The single walk behind [`peel_env_options`] and [`env_options_chdir`].
+/// The single walk behind [`peel_env_options`] and the `env` arm of
+/// [`command_changes_directory`].
 ///
-/// Deliberately one function: the two questions share the same grammar, and a
-/// second copy that disagreed about clustering would reintroduce the `env -uC`
-/// false positive the chdir arm was measured against.
+/// Deliberately one function: both questions — "what does `env` exec?" and "did
+/// `env` chdir first?" — read the same grammar, and a second copy that
+/// disagreed about clustering would reintroduce the `env -uC` false positive
+/// the chdir arm was measured against. `None` (an `-S`/`--split-string`, whose
+/// value is itself a command line) means the walk stopped, so no chdir was
+/// observed and none is reported — the same accepted miss named below.
 fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
     let mut idx = 0;
     let mut options_ended = false;
@@ -640,7 +633,14 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
             // Linux hosts: macOS BSD `env --chdir=/usr pwd` exits 1 with
             // `env: illegal option -- c`. Do not "simplify" this arm away after
             // testing only on a Mac.
-            saw_chdir |= name == "chdir";
+            //
+            // Matched as a PREFIX, because `getopt_long` accepts any unambiguous
+            // abbreviation — `env --chd /x` is `--chdir` on GNU. Only the chdir
+            // FLAG is prefix-matched; value consumption below stays exact, so
+            // this can add a block and never change how a value is peeled.
+            // `--check` does not prefix `chdir` (`che` vs `chd`), so the
+            // non-chdir controls are unaffected.
+            saw_chdir |= !name.is_empty() && "chdir".starts_with(name);
             let takes_separate_value =
                 !value_attached && matches!(name, "unset" | "chdir" | "default-path");
             idx += if takes_separate_value { 2 } else { 1 };
@@ -734,11 +734,12 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
 /// safely. Widening `COMMAND_WRAPPERS` to serve both would hand
 /// `builtin`/`exec`/`eval` the metadata-only exemption and open a real leak.
 ///
-/// `env` is judged by a FLAG, not a verb, so it is a separate arm:
-/// [`env_options_chdir`] runs `env`'s own option grammar over the remaining
-/// tokens. That grammar is shared with [`peel_env_options`] on purpose —
-/// `env -uC cat .envrc` is NOT a chdir (the `C` is `-u`'s value), and a
-/// hand-rolled "does any token contain a C" test called it one.
+/// `env` is judged by a FLAG, not a verb, so it is a separate arm: [`peel_env`]
+/// runs `env`'s own option grammar over the remaining tokens, re-entering while
+/// the surviving head is another `env` because `env` stacks. That grammar is
+/// shared with [`peel_env_options`] on purpose — `env -uC cat .envrc` is NOT a
+/// chdir (the `C` is `-u`'s value), and a hand-rolled "does any token contain a
+/// C" test called it one.
 ///
 /// The whole segment is deliberately NOT lowercased. [`command_word`] folds the
 /// verb and only the verb, which is the posture the rest of this file holds;
@@ -760,11 +761,32 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
 ///   a shell builtin and those three are external programs. The wrapper peel
 ///   reaches them anyway.
 ///
-/// Named misses, all in the silent direction: a `cd` behind a substitution
-/// (`$(echo cd) /x`) or a variable (`$CD /x`); `eval "cd /x"`, where the quoted
-/// body stays one token so `command_word` yields `cd /x` rather than `cd`; and
-/// `env -S 'cd /x; …'`, which the `-S` posture stops the walk on — measured, it
-/// does not chdir on macOS anyway.
+/// Named misses, all in the silent direction, and **this list is not a claim of
+/// exhaustiveness** — it is what has been measured. Each was `Allow` on 0.89.0
+/// too, so none is opened by #538; they are named because a reader who sees
+/// `command cd` fixed will otherwise assume `command -p cd` is:
+///
+/// - A leading REDIRECTION parks itself in `argv[0]`, so `>/tmp/o cd /x` and
+///   `2>/dev/null cd /x` hide the verb. [`command_words`] already strips
+///   redirections for the dump arm ([`redirection_of`]); this scan does not
+///   compose that strip with [`executable_tokens`].
+/// - A WRAPPER'S OWN FLAG stops the peel one token short: `command -p cd /x`,
+///   `time -p cd /x`. The loop skips a `CD_WRAPPERS` word, not a flag behind it.
+/// - A MID-WORD backslash is not folded. `command_word` strips one LEADING
+///   backslash, while bash removes every unquoted one, so `c\d /x` is a `cd`
+///   the resolver reads as `c\d`. The quote path is sound — `'cd'`, `"cd"`,
+///   `c""d`, `\cd` all resolve.
+/// - A `cd` behind a substitution (`$(echo cd) /x`) or a variable (`$CD /x`).
+/// - A `cd` inside a SOURCED script (`source s.sh`, `. s.sh`), which really does
+///   move the parent shell but lives in a file no string scan can see.
+/// - `eval "cd /x"`, where the quoted body stays one token so `command_word`
+///   yields `cd /x` rather than `cd`.
+/// - `env -S 'cd /x; …'`, which the `-S` posture stops the walk on — measured,
+///   it does not chdir on macOS anyway.
+///
+/// The first three are closeable in this function alone and in the
+/// blocks-only direction; they are held back from #538 so each widening keeps
+/// its own differential, which is this file's standing rule.
 fn command_changes_directory(command: &str) -> bool {
     command_segments(command).into_iter().any(|segment| {
         let tokens = executable_tokens(&segment);
@@ -782,13 +804,38 @@ fn command_changes_directory(command: &str) -> bool {
         let Some(head) = argv.first() else {
             return false;
         };
-        let word = command_word(head);
-        matches!(word.as_ref(), "cd" | "pushd" | "popd") || {
-            word == "env" && {
-                let view: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-                env_options_chdir(&view)
-            }
+        if matches!(command_word(head).as_ref(), "cd" | "pushd" | "popd") {
+            return true;
         }
+        // The `env` arm is a FLAG test, not a verb test, which is why it is
+        // separate. It re-enters while the peeled rest is itself another `env`,
+        // mirroring `tokens_dump_env`'s loop over the same grammar: `env` stacks
+        // (`env env -C /x`, `env -u FOO env -C /x`), and a single pass reads the
+        // inner `env` as the command operand and returns with the chdir unseen.
+        // Iterative for the same reason the dump loop is — every hop drops at
+        // least the leading `env`, so the slice strictly shrinks, while a
+        // recursive spelling would grow the stack once per hop on a long enough
+        // `env env env …` line.
+        let view: Vec<&str> = argv.iter().map(String::as_str).collect();
+        // Walked by index rather than by reslicing, so the peel's borrow of
+        // `view` never has to outlive a rebind of it.
+        let mut start = 0;
+        while view
+            .get(start)
+            .is_some_and(|head| command_word(head) == "env")
+        {
+            let Some(peel) = peel_env(&view[start + 1..]) else {
+                return false;
+            };
+            if peel.saw_chdir {
+                return true;
+            }
+            // How many tokens the peel consumed, so `start` lands on the first
+            // surviving token. `rest` is always a suffix of the slice handed in.
+            let consumed = view.len() - (start + 1) - peel.rest.len();
+            start += 1 + consumed;
+        }
+        false
     })
 }
 
@@ -842,9 +889,13 @@ fn envrc_bash_read_allowed(resolve_token: &str, cwd: Option<&str>, command_has_c
 /// an `echo`/`printf` in the SAME segment, not anywhere in the whole command.
 /// That decoupling is the #332/#333/#334/#321 fix — the prior whole-command
 /// keyword substring check fired whenever any keyword appeared alongside an
-/// echo/printf elsewhere in the chain. Uses the same per-segment,
-/// group-punctuation-trimming command-word detection [`command_words`] does, so
-/// a benign arg or path containing "echo"/"printf" doesn't over-fire.
+/// echo/printf elsewhere in the chain. The head test is a bare
+/// `split_whitespace` over a group-punctuation-trimmed segment — deliberately
+/// NOT [`command_words`], which additionally tokenizes quote-aware and skips
+/// redirections, so `'echo' $SECRET` and a leading-redirection `echo` reach that
+/// function and not this one. Trimming the group punctuation is enough for the
+/// only thing this arm claims: that a benign arg or path containing
+/// "echo"/"printf" does not over-fire.
 fn echo_or_printf_leaks_secret_var(lower: &str) -> bool {
     for segment in split_segments(lower) {
         let segment = segment.trim_start_matches(['(', '{', ' ', '\t']);
@@ -897,8 +948,9 @@ fn bash_leaks_secrets(command: &str, cwd: Option<&str>) -> Option<CheckResult> {
         // `-S` survived only by coincidence (it folds to `-s`, a distinct,
         // also-argument-free allowlist member). This mirrors what the sibling
         // `prevent_secret_writes::bash_targets_env_file` already does: `lower`
-        // still backs `command_may_reference_secret` and
-        // `command_changes_directory` above, and every downstream comparison
+        // still backs `command_may_reference_secret` above — `#538` ended the
+        // cd scan's use of it, so `command_changes_directory` now folds only
+        // the verb, like everything else here — and every downstream comparison
         // that needs case-insensitivity (`command_word`'s verb fold,
         // `is_dangerous_secret_token`, `METADATA_SAFE_COMMANDS`) folds at its
         // own comparison site rather than depending on pre-lowered input.
@@ -3271,7 +3323,7 @@ mod tests {
     #[test]
     fn bash_grouped_subshell_cd_then_cat_relative_envrc_still_blocks() {
         // A subshell-grouped cd glues `(` onto the cd token; the group-strip in
-        // is_executed_command must still surface it so the relative read blocks.
+        // `executable_tokens` must still surface it so the relative read blocks.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".envrc"), "use flake\n").unwrap();
         let result = SecretLeaksGuard.run(&make_bash_with_cwd(
@@ -3511,8 +3563,35 @@ mod tests {
             "env -iC /usr cat .envrc",
             "env --chdir=/usr cat .envrc",
             "env --chdir /usr cat .envrc",
+            // `getopt_long` takes any unambiguous abbreviation, so these are
+            // `--chdir` on a GNU host — which Linux CI and Linux users are.
+            // `--che…` would be a different option, and `--check` above stays
+            // Allow, so the prefix match is not a blanket `--c*`.
+            "env --chd /usr cat .envrc",
+            "env --ch /usr cat .envrc",
         ] {
             assert_cd_form_blocks(command);
+        }
+    }
+
+    #[test]
+    fn stacked_env_still_finds_the_chdir_flag() {
+        // `env` stacks, so the chdir flag can sit behind another `env`. A single
+        // peel reads the inner `env` as the command operand and returns with the
+        // flag unseen — the same shape `tokens_dump_env` loops for, which is why
+        // this arm loops too. Both forms chdir for real: `env env -C /usr pwd`
+        // prints `/usr` under bash 3.2.57 and 5.3.15.
+        for command in [
+            "env env -C /x cat .envrc",
+            "env -u FOO env -C /x cat .envrc",
+            "env env env -C /x cat .envrc",
+        ] {
+            assert_cd_form_blocks(command);
+        }
+        // Control: stacking alone is not a chdir, so the loop above is evidence
+        // about the flag rather than about `env env` blocking on sight.
+        for command in ["env env cat .envrc", "env -u FOO env -i cat .envrc"] {
+            assert_envrc_read_allowed(command);
         }
     }
 
