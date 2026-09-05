@@ -11,22 +11,32 @@
 #   text they saw before, so a verdict may move ALLOW -> BLOCK and must never
 #   move BLOCK -> ALLOW.
 #
-# Three assertions, each able to go red:
+# Four assertions, each able to go red:
 #   1. no row/subcommand pair flips BLOCK -> ALLOW  (the safety invariant)
-#   2. `session guard` — which calls `split_segments` only and never reaches
-#      `substitution_bodies` — is byte-identical old vs new (the null control;
-#      any movement there means the change leaked past its intended reach)
-#   3. the stay-allowed rows are ALLOW on BOTH binaries (the over-block control;
-#      a recursion that swallowed the rest of the line on a failed nested scan
-#      would turn these red)
+#   2. the stay-allowed rows do not MOVE between the two binaries (the
+#      over-block control; a recursion that swallowed the rest of the line on a
+#      failed nested scan turns these red). The assertion is "did not move", not
+#      "is ALLOW": a row can block on both binaries for a reason unrelated to
+#      this change, and demanding an absolute ALLOW makes that a false finding.
+#   3. `session warn-branch-drift` — which imports only `git_command` and
+#      `strip_quotes` and reaches NEITHER changed primitive — does not move.
+#      This is the leak control, and it is deliberately weak: it can only ever
+#      catch a change that escaped the substitution scanners entirely.
+#      `session guard` is NOT a valid control and was one in the first cut of
+#      this script: `split_segments_with_ops` calls `strip_heredoc_bodies`,
+#      which calls `substitution_spans`, so a CORRECT fix can move it.
+#   4. the run produced at least one ALLOW -> BLOCK and at least one BLOCK
+#      anywhere (a run that could not have gone red is not evidence)
 #
 # Usage:
 #   bash scripts/consumer-differential.sh [BASE_REF]
 #
-# BASE_REF defaults to origin/main. The base tree is exported with `git archive`
-# into a temp dir and built there — nothing is checked out, no worktree is
-# registered, and the repo's own branch and index are never touched. The "new"
-# binary is built from the current working tree.
+# BASE_REF defaults to origin/main and MUST be a ref you trust: the base tree is
+# built, so its `build.rs`, proc macros, and `.cargo/config.toml` execute. The
+# tree is exported with `git archive` into a temp dir — nothing is checked out,
+# no worktree is registered, and the repo's own branch and index are never
+# touched — but "does not touch your checkout" is not "safe against any ref".
+# The "new" binary is built from the current working tree.
 #
 # Guard verdicts are read from the exit status: 2 = BLOCK, 0 = ALLOW, anything
 # else is a HARNESS-ERROR that must never be scored as a verdict. `set -e` is
@@ -49,6 +59,18 @@ trap 'rm -rf "$WORK"' EXIT
 say() { printf '\033[1m%s\033[0m\n' "$*" >&2; }
 
 # --- build both binaries -----------------------------------------------------
+
+# A ref beginning with `-` is parsed by git as an option, not an operand, so
+# `--output=/tmp/x` would reach `git archive` as a flag. Nothing here is a shell
+# sink, but an allowlist is cheaper than reasoning about which git subcommand
+# accepts what, and `--` alone does not help `rev-parse`.
+case "$BASE_REF" in
+    -* | *[!A-Za-z0-9._/-]* | "")
+        printf 'FATAL: refusing BASE_REF [%s] — must match [A-Za-z0-9._/-] and not start with -\n' \
+            "$BASE_REF" >&2
+        exit 1
+        ;;
+esac
 
 say "Exporting ${BASE_REF} and building the base binary (this takes a minute)"
 BASE_SHA=$(git -C "$REPO_ROOT" rev-parse --short "$BASE_REF")
@@ -113,8 +135,20 @@ CORPUS="$WORK/corpus.tsv"
     printf '491-even-escaped-clobber\techo hi \\\\>| cat .env\n'
     printf '551-ansi-c-escaped-quote\techo $'"'"'a\\'"'"'b'"'"' $(cat .env)\n'
     printf '653-backtick-unterminated\techo `echo '"'"'` && cat .env\n'
-    # Deep nesting: the recursion cap must not turn into a swallow.
-    printf '652-deep-nesting\techo $(echo "$(echo "$(echo "$(cat .env)")")")\n'
+    # Deep nesting at and past MAX_SUBSTITUTION_DEPTH (16), with the payload as
+    # a SIBLING outside the deep chain — that placement is what makes the row
+    # able to fail. The first cut of this script nested four levels against a
+    # cap of sixteen, so the row named for the cap could never reach it, and the
+    # differential ran green while a BLOCK -> ALLOW flip was live. The heredoc
+    # wrapper is the shape that actually flipped: `substitution_spans` dropped
+    # the construct where `substitution_bodies` widened.
+    CHAIN=''; CLOSE=''
+    for _ in $(seq 1 17); do CHAIN="\$(${CHAIN}"; CLOSE="${CLOSE})"; done
+    CHAIN="${CHAIN}echo x${CLOSE}"
+    printf '652-cap-plain\techo $(cat .env; %s)\n' "$CHAIN"
+    printf '652-cap-heredoc\tcat <<EOF\001$(cat .env; %s)\001EOF\n' "$CHAIN"
+    printf '652-cap-under\techo $(cat .env; %s)\n' \
+        "$(c=''; e=''; for _ in $(seq 1 14); do c="\$(${c}"; e="${e})"; done; printf '%secho x%s' "$c" "$e")"
 } > "$CORPUS"
 
 # Stay-allowed rows: ordinary nested substitutions with no secret read. More
@@ -134,9 +168,19 @@ STAY_ALLOWED="$WORK/allowed.tsv"
 # --- consumers ---------------------------------------------------------------
 #
 # Every non-comment call site of command_segments / child_scripts /
-# split_segments / expand_segments / strip_heredoc_bodies across crates/*/src.
-# `session guard` is the null control: it calls split_segments only, which never
-# reaches substitution_bodies, so its verdicts must not move at all.
+# split_segments / expand_segments / strip_heredoc_bodies across crates/*/src,
+# mapped to the subcommand that reaches it. Derive this list, do not trust it:
+# the first cut listed `session warn-branch-drift`, which imports only
+# `git_command`/`strip_quotes` and is not a consumer at all, and omitted
+# `session warn-plan-ready-flip` (crates/session/src/plan_guards.rs), which is.
+#
+# `session guard` belongs HERE, not in a control slot: `split_segments_with_ops`
+# calls `strip_heredoc_bodies`, which calls `substitution_spans`, so this change
+# reaches it.
+#
+# `src/doctor.rs` also calls `command_segments`, but `doctor` takes no hook
+# payload on stdin, so it cannot be driven by this harness. Out of scope by
+# mechanism, named here so its absence is a decision rather than an oversight.
 
 AFFECTED=(
     "cadence git-safety"
@@ -156,9 +200,12 @@ AFFECTED=(
     "guardrails warn-unreviewed-ready-flip"
     "guardrails warn-untracked"
     "obsidian trash-guard"
-    "session warn-branch-drift"
+    "session guard"
+    "session warn-plan-ready-flip"
 )
-NULL_CONTROL="session guard"
+# Reaches neither changed primitive. Weak by construction (see the header):
+# it can only catch a change that escaped the substitution scanners entirely.
+LEAK_CONTROL="session warn-branch-drift"
 
 # --- verdict -----------------------------------------------------------------
 
@@ -187,7 +234,9 @@ PY
         CADENCE_METRICS_DIR="$SCRATCH/metrics" CADENCE_MARKER_DIR="$SCRATCH/markers" \
         CADENCE_NO_FEEDBACK_FOOTER=1 \
         "$bin" $sub < "$WORK/payload.json" 2>&1)
-    rc=$?   # captured BEFORE the pipe below
+    # Captured immediately, before the `grep` pipe further down — that pipe
+    # would otherwise be the last command and `$?` would be grep's.
+    rc=$?
     # clap exits 2 on an unrecognized subcommand, which is byte-identical to a
     # guard's BLOCK contract. Scoring that as BLOCK is what made an earlier
     # probe's controls read false, so it is checked first.
@@ -197,9 +246,15 @@ PY
         printf 'BLOCK'
     elif [ "$rc" -eq 0 ]; then
         printf 'ALLOW'
+    elif [ "$rc" -eq 1 ]; then
+        # Guards fail open on their own internal errors (ADR-0001), so exit 1 is
+        # a defined non-blocking outcome, not a fault — eight of the entries
+        # above are `warn-*`/`inject-*` nudges. It is its own category: it must
+        # never be scored ALLOW (that would hide a real movement), and it must
+        # never fail the run (that would be a red unrelated to the change).
+        printf 'SOFT'
     else
-        # Neither verdict. A nudge that exits 1, a panic, a missing binary —
-        # none of these are an ALLOW and none may be scored as one.
+        # A panic, a signal, a missing binary. Not a verdict, and never an ALLOW.
         printf 'HARNESS-ERROR(rc=%s)' "$rc"
     fi
 }
@@ -207,25 +262,37 @@ PY
 # --- run ---------------------------------------------------------------------
 
 flips=0
-null_moves=0
+leak_moves=0
 overblocks=0
 harness_errors=0
 fixed=0
+blocks_seen=0
 
 printf '\n%-28s %-34s %-8s %-8s %s\n' ROW SUBCOMMAND BASE NEW NOTE
 printf '%.0s-' {1..92}; printf '\n'
 
-score() { # $1=label $2=sub $3=cmd $4=mode(affected|null|allowed)
+score() { # $1=label $2=sub $3=cmd $4=mode(affected|leak|allowed)
     local label="$1" sub="$2" cmd="$3" mode="$4" b n note=''
     b=$(verdict "$BASE_BIN" "$sub" "$cmd")
     n=$(verdict "$NEW_BIN"  "$sub" "$cmd")
+    if [ "$b" = BLOCK ] || [ "$n" = BLOCK ]; then
+        blocks_seen=$((blocks_seen+1))
+    fi
     case "$b:$n" in
-        HARNESS-ERROR*|*:HARNESS-ERROR*) note='HARNESS-ERROR'; harness_errors=$((harness_errors+1)) ;;
-        BLOCK:ALLOW) note='FLIP BLOCK->ALLOW'; flips=$((flips+1)) ;;
-        ALLOW:BLOCK) note='fixed (ALLOW->BLOCK)'; fixed=$((fixed+1)) ;;
+        HARNESS-ERROR*|*:HARNESS-ERROR*)
+            note='HARNESS-ERROR'; harness_errors=$((harness_errors+1)) ;;
+        BLOCK:ALLOW|BLOCK:SOFT)
+            note='FLIP BLOCK->ALLOW'; flips=$((flips+1)) ;;
+        # Only an affected row counts toward "the fix landed". A stay-allowed
+        # row that moved this way is an over-block, and must not be able to
+        # satisfy the could-this-have-gone-red gate below.
+        ALLOW:BLOCK|SOFT:BLOCK)
+            if [ "$mode" != allowed ]; then
+                note='fixed (ALLOW->BLOCK)'; fixed=$((fixed+1))
+            fi ;;
     esac
-    if [ "$mode" = null ] && [ "$b" != "$n" ]; then
-        note='NULL CONTROL MOVED'; null_moves=$((null_moves+1))
+    if [ "$mode" = leak ] && [ "$b" != "$n" ]; then
+        note='LEAK CONTROL MOVED'; leak_moves=$((leak_moves+1))
     fi
     # An ordinary nested substitution must not become newly blocked. The
     # assertion is that the verdict did not MOVE, not that it is ALLOW: a row
@@ -244,29 +311,40 @@ while IFS=$'\t' read -r label cmd; do
     for sub in "${AFFECTED[@]}"; do
         score "$label" "$sub" "$cmd" affected
     done
-    score "$label" "$NULL_CONTROL" "$cmd" null
+    score "$label" "$LEAK_CONTROL" "$cmd" leak
 done < "$CORPUS"
 
 while IFS=$'\t' read -r label cmd; do
     [ -n "${label:-}" ] || continue
+    # Decoded here as well as in the corpus loop. No stay-allowed row is
+    # multi-line today; leaving the two loops asymmetric is a trap for whoever
+    # adds the first one.
+    cmd=${cmd//$'\001'/$'\n'}
     for sub in "${AFFECTED[@]}"; do
         score "$label" "$sub" "$cmd" allowed
     done
 done < "$STAY_ALLOWED"
 
 printf '%.0s-' {1..92}; printf '\n'
-printf 'rows scored: %s corpus x %s subcommands (+ null control), %s stay-allowed rows\n' \
+printf 'rows scored: %s corpus x %s subcommands (+ leak control), %s stay-allowed rows\n' \
     "$(wc -l < "$CORPUS" | tr -d ' ')" "${#AFFECTED[@]}" "$(wc -l < "$STAY_ALLOWED" | tr -d ' ')"
-printf 'ALLOW->BLOCK (the fix landing): %s\n' "$fixed"
-printf 'BLOCK->ALLOW flips: %s   null-control moves: %s   over-blocks: %s   harness errors: %s\n' \
-    "$flips" "$null_moves" "$overblocks" "$harness_errors"
+printf 'ALLOW->BLOCK (the fix landing): %s   BLOCK verdicts seen: %s\n' "$fixed" "$blocks_seen"
+printf 'BLOCK->ALLOW flips: %s   leak-control moves: %s   over-blocks: %s   harness errors: %s\n' \
+    "$flips" "$leak_moves" "$overblocks" "$harness_errors"
 
+# Could this run have gone red? Two independent ways it could not: the fix never
+# landed on any row, or the harness never produced a BLOCK at all (a corpus that
+# no guard reacts to scores every row ALLOW:ALLOW and reports a confident PASS).
 if [ "$fixed" -eq 0 ]; then
     printf '\nVERDICT: FAIL — no row moved ALLOW->BLOCK, so this run could not have gone red.\n'
     exit 1
 fi
-if [ "$flips" -ne 0 ] || [ "$null_moves" -ne 0 ] || [ "$overblocks" -ne 0 ] || [ "$harness_errors" -ne 0 ]; then
+if [ "$blocks_seen" -eq 0 ]; then
+    printf '\nVERDICT: FAIL — no BLOCK verdict anywhere; the harness is not reaching the guards.\n'
+    exit 1
+fi
+if [ "$flips" -ne 0 ] || [ "$leak_moves" -ne 0 ] || [ "$overblocks" -ne 0 ] || [ "$harness_errors" -ne 0 ]; then
     printf '\nVERDICT: FAIL\n'
     exit 1
 fi
-printf '\nVERDICT: PASS — no BLOCK->ALLOW flip, null control unmoved, stay-allowed rows unmoved.\n'
+printf '\nVERDICT: PASS — no BLOCK->ALLOW flip, leak control unmoved, stay-allowed rows unmoved.\n'

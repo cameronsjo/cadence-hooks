@@ -1778,15 +1778,41 @@ fn substitution_spans(body: &str) -> Vec<String> {
             // its span at the wrong paren and the read reached no guard, while
             // bash executed it (cameronsjo/cadence-hooks#652). One reader means
             // the two sites cannot diverge on that again.
-            if let Some((_, end)) = scan_substitution_body(&chars, i + 2, true) {
-                spans.push(chars[start..end].iter().collect());
-                i = end;
-                continue;
+            match scan_substitution_body(&chars, i + 2, true) {
+                Ok((_, end)) => {
+                    spans.push(chars[start..end].iter().collect());
+                    i = end;
+                    continue;
+                }
+                // Our own recursion cap stopped the scan, not the input. The
+                // shell runs this text, so a span MUST still come out — carry
+                // the rest of the body whole and let the guards read it.
+                //
+                // Skipping the `$` here instead is a total bypass, measured:
+                // the scan restarts one character later, finds the INNER chain
+                // (which fits the budget), emits a span for that alone, and
+                // `strip_heredoc_bodies` then replaces the body with it —
+                // deleting the outer substitution's payload before any guard
+                // runs. At 16 levels of filler nesting inside a heredoc,
+                // `cat .env` and `git reset --hard` both went from blocked to
+                // allowed that way. The sibling arm in `substitution_bodies`
+                // has always widened on an unlocatable boundary; this one has
+                // to as well, or the cap becomes an attacker's tool.
+                Err(ScanStop::DepthExceeded) => {
+                    push_nonblank(&mut spans, &chars[start..]);
+                    break;
+                }
+                // An unclosed `$(` is not a substitution the shell would run —
+                // bash rejects the line — so skip the `$` and keep scanning
+                // rather than carrying a truncated span. Unchanged behavior,
+                // and deliberately NOT merged with the arm above: widening here
+                // would splice unterminated heredoc PROSE into the segment
+                // stream, which is the false-block cost #475 already paid once.
+                Err(ScanStop::Unterminated) => {
+                    i += 1;
+                    continue;
+                }
             }
-            // An unclosed `$(` is not a substitution the shell would run; skip
-            // the `$` and keep scanning rather than carrying a truncated span.
-            i += 1;
-            continue;
         }
         if chars[i] == '`' {
             let start = i;
@@ -2568,11 +2594,14 @@ pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
     out
 }
 
-/// Push `text` as a substitution body when it carries anything but whitespace.
-fn push_body(bodies: &mut Vec<String>, text: &[char]) {
+/// Push `text` onto `out` when it carries anything but whitespace.
+///
+/// Shared by the two arms that surface an unlocatable boundary — the
+/// substitution-body dual emission and `substitution_spans`' depth-cap widening.
+fn push_nonblank(out: &mut Vec<String>, text: &[char]) {
     let body: String = text.iter().collect();
     if !body.trim().is_empty() {
-        bodies.push(body);
+        out.push(body);
     }
 }
 
@@ -2605,20 +2634,38 @@ fn span_quoting_unterminated(chars: &[char]) -> bool {
 }
 
 /// How many `$( … )` levels [`scan_substitution_body`] will descend before it
-/// gives up and reports the substitution unterminated. Bounds the recursion so
-/// a pathological `$($($($(…` input cannot exhaust the stack; at the cap the
-/// scan returns `None`, which routes [`substitution_bodies`] onto its
-/// dual-emission fallback and surfaces MORE text to the guards, never less.
+/// stops, so a pathological `$($($($(…` input cannot exhaust the stack.
+///
+/// Reaching the cap is [`ScanStop::DepthExceeded`], which is deliberately NOT
+/// the same signal as an unterminated substitution: a caller must widen what it
+/// surfaces rather than drop the construct. Collapsing the two is what turned a
+/// heredoc substitution into a total guard bypass at exactly this depth —
+/// `substitution_spans` skipped the unlocatable `$(` and the payload after it
+/// was deleted before any guard ran, while bash executed it.
 ///
 /// Whether the quote-blind fallback and the `expand_segments` recursion are
 /// bounded on the same axis is tracked separately as cadence-hooks#821; this
 /// cap covers nesting inside a single `scan_substitution_body` call only.
 const MAX_SUBSTITUTION_DEPTH: usize = 16;
 
+/// Why a substitution scan stopped without locating a terminator.
+///
+/// The distinction is load-bearing, not bookkeeping. `Unterminated` is a fact
+/// about the INPUT — bash rejects such a line outright — so a caller may keep
+/// whatever reading it had. `DepthExceeded` is a fact about THIS SCANNER: the
+/// input is well-formed and the shell runs it, and only our own limit stopped
+/// us. A caller must never delete a construct on that second signal (ADR-0001:
+/// a guard's own limit must not hide a command the shell runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanStop {
+    /// Input ran out with the substitution still open.
+    Unterminated,
+    /// Nesting exceeded [`MAX_SUBSTITUTION_DEPTH`].
+    DepthExceeded,
+}
+
 /// Scan a `$(…)` body starting at `start` (just past the `$(`), returning the
-/// body text and the index just past its `)`. `None` when input runs out with
-/// the substitution still open, or when nesting exceeds
-/// [`MAX_SUBSTITUTION_DEPTH`].
+/// body text and the index just past its `)`.
 ///
 /// With `quote_aware`, a `)` inside a quoted run is data rather than the
 /// terminator, and a nested `$(` starts a substitution that is scanned
@@ -2630,7 +2677,7 @@ fn scan_substitution_body(
     chars: &[char],
     start: usize,
     quote_aware: bool,
-) -> Option<(String, usize)> {
+) -> Result<(String, usize), ScanStop> {
     scan_substitution_body_bounded(chars, start, quote_aware, MAX_SUBSTITUTION_DEPTH)
 }
 
@@ -2640,12 +2687,12 @@ fn scan_substitution_body_bounded(
     start: usize,
     quote_aware: bool,
     budget: usize,
-) -> Option<(String, usize)> {
-    // Fail the scan rather than the process. A `None` here is the same signal
-    // an unterminated substitution gives, and its handling already errs toward
-    // showing the guards more (ADR-0001: a guard's own limit must not hide a
-    // command the shell runs).
-    let budget = budget.checked_sub(1)?;
+) -> Result<(String, usize), ScanStop> {
+    // Fail the scan rather than the process, and say WHICH failure it was —
+    // every caller has to tell "the shell would reject this" from "we gave up".
+    let Some(budget) = budget.checked_sub(1) else {
+        return Err(ScanStop::DepthExceeded);
+    };
     let mut depth = 1usize;
     let mut j = start;
     let mut body = String::new();
@@ -2677,6 +2724,10 @@ fn scan_substitution_body_bounded(
                 && chars[j] == '$'
                 && chars.get(j + 1) == Some(&'(')
             {
+                // `?` propagates the nested stop reason unchanged. A nested
+                // `DepthExceeded` must not reach the caller looking like an
+                // unterminated input: the caller's two responses differ, and
+                // only one of them is safe when the shell would run the text.
                 let (_, nested_end) = scan_substitution_body_bounded(chars, j + 2, true, budget)?;
                 body.extend(&chars[j..nested_end]);
                 j = nested_end;
@@ -2696,7 +2747,7 @@ fn scan_substitution_body_bounded(
             ')' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((body, j + 1));
+                    return Ok((body, j + 1));
                 }
                 body.push(')');
             }
@@ -2704,7 +2755,7 @@ fn scan_substitution_body_bounded(
         }
         j += 1;
     }
-    None
+    Err(ScanStop::Unterminated)
 }
 
 /// Extract command-substitution bodies from a segment: `$(…)` (tracking nested
@@ -2757,7 +2808,7 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
         // its `<`. Reached in executed context only — unquoted or inside double
         // quotes, both of which run the substitution.
         if c == '$' && chars.get(i + 1) == Some(&'(') {
-            if let Some((body, end)) = scan_substitution_body(&chars, i + 2, true) {
+            if let Ok((body, end)) = scan_substitution_body(&chars, i + 2, true) {
                 if !body.trim().is_empty() {
                     bodies.push(body);
                 }
@@ -2779,12 +2830,12 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
             // tail downstream — it is the quote-blind reading plus its post-`)`
             // text that actually surfaces the hidden command. Both are emitted
             // for completeness; do not assume the quote-aware one is load-bearing.
-            push_body(&mut bodies, &chars[i + 2..]);
-            if let Some((blind_body, blind_end)) = scan_substitution_body(&chars, i + 2, false) {
+            push_nonblank(&mut bodies, &chars[i + 2..]);
+            if let Ok((blind_body, blind_end)) = scan_substitution_body(&chars, i + 2, false) {
                 if !blind_body.trim().is_empty() {
                     bodies.push(blind_body);
                 }
-                push_body(&mut bodies, &chars[blind_end..]);
+                push_nonblank(&mut bodies, &chars[blind_end..]);
             }
             break;
         }
@@ -2816,7 +2867,7 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
             // re-scanned, and continuing the outer loop here would re-walk —
             // and could double-emit — the same text char by char.
             if j < chars.len() && span_quoting_unterminated(&chars[i + 1..j]) {
-                push_body(&mut bodies, &chars[j + 1..]);
+                push_nonblank(&mut bodies, &chars[j + 1..]);
                 break;
             }
             i = j + 1;
@@ -5700,17 +5751,61 @@ mod tests {
         // as a literal, and the `)` right after the closing `"` was mistaken for
         // the terminator. `cat .env` fell outside every body while bash — which
         // re-parses the inner substitution recursively — runs it.
-        for input in [
-            r#"echo $(echo "$(echo '")'; cat .env)")"#,
-            r#"echo $(echo "x$(echo '")'; cat .env)")"#,
-        ] {
+        //
+        // Asserted on the EXACT body, not `contains("cat .env")`. A body
+        // truncated at the wrong paren can still contain the sentinel, so a
+        // `contains` assertion cannot see the class of bug this is about — it
+        // is the terminator's position that is under test.
+        assert_eq!(
+            substitution_bodies(r#"echo $(echo "$(echo '")'; cat .env)")"#),
+            vec![r#"echo "$(echo '")'; cat .env)""#.to_string()],
+            "nested `$(` inside double quotes ended the body at the wrong paren"
+        );
+        assert_eq!(
+            substitution_bodies(r#"echo $(echo "x$(echo '")'; cat .env)")"#),
+            vec![r#"echo "x$(echo '")'; cat .env)""#.to_string()],
+            "leading text before the nested opener moved the terminator"
+        );
+    }
+
+    #[test]
+    fn substitution_scan_widens_at_the_depth_cap_rather_than_dropping_the_construct() {
+        // The regression the first cut of #652 shipped, caught by review: at
+        // exactly `MAX_SUBSTITUTION_DEPTH` levels of filler nesting, the scan
+        // gives up — and `substitution_spans` used to respond by skipping the
+        // `$(` entirely. It then re-found the INNER chain (which fits the
+        // budget), emitted a span for that alone, and `strip_heredoc_bodies`
+        // replaced the heredoc body with it. `cat .env` was deleted before any
+        // guard ran, while bash executed it: a measured BLOCK -> ALLOW flip.
+        //
+        // The boundary is the test. One level under the cap must locate the
+        // real terminator; one level over must widen, never drop.
+        let filler = |n: usize| format!("{}echo x{}", "$(".repeat(n), ")".repeat(n));
+        let payload = |n: usize| format!("$(cat .env; {})", filler(n));
+
+        let under = payload(MAX_SUBSTITUTION_DEPTH - 2);
+        assert_eq!(
+            substitution_spans(&under),
+            vec![under.clone()],
+            "under the cap the scan must locate the real terminator"
+        );
+
+        for over in [MAX_SUBSTITUTION_DEPTH, MAX_SUBSTITUTION_DEPTH + 4] {
+            let input = payload(over);
+            let spans = substitution_spans(&input);
             assert!(
-                substitution_bodies(input)
-                    .iter()
-                    .any(|b| b.contains("cat .env")),
-                "nested `$(` inside double quotes hid the tail: {input}"
+                spans.iter().any(|s| s.contains("cat .env")),
+                "at {over} levels the depth cap deleted the payload: {spans:?}"
             );
         }
+
+        // A genuinely unterminated `$(` is a different signal and keeps its
+        // existing handling — bash rejects such a line, and widening here would
+        // splice unterminated heredoc prose into the segment stream (#475).
+        assert!(
+            substitution_spans("prose $(cat .env").is_empty(),
+            "an unterminated `$(` must not start carrying prose forward"
+        );
     }
 
     #[test]
@@ -5735,12 +5830,11 @@ mod tests {
 
     #[test]
     fn substitution_bodies_deep_nesting_does_not_recurse_without_bound() {
-        // The recursion is bounded by `MAX_SUBSTITUTION_DEPTH`; past the cap the
-        // scan reports the substitution unterminated rather than exhausting the
-        // stack. Unterminated routes onto the dual-emission fallback, which
-        // surfaces more text, so the cap cannot hide a command (ADR-0001).
-        // Balanced and deep enough that an uncapped recursion exhausts the
-        // stack. It must return, and it must still surface the buried command.
+        // This test is about STACK SAFETY only — the cap's effect on what the
+        // guards see is the boundary test above, which is the one that fails if
+        // the cap value changes. 200,000 levels aborts the process on a stack
+        // overflow with the cap removed (verified by setting the constant to
+        // `usize::MAX`), so returning at all is the assertion.
         let levels = 200_000;
         let deep = format!("{}cat .env{}", "$(".repeat(levels), ")".repeat(levels));
         assert!(
@@ -5749,20 +5843,25 @@ mod tests {
                 .any(|b| b.contains("cat .env")),
             "a command under pathological nesting must still reach the guards"
         );
-        // Unbalanced: the scan runs out of input rather than budget, and the
-        // dual-emission fallback still has something to say.
+        // The recursion arm fires in the unquoted state too, so this input
+        // exhausts the BUDGET at level 17 — it never reaches the end of input.
+        // It passes byte-identically on the pre-cap code, so it is a control
+        // for the fallback still having something to say, not evidence about
+        // the cap.
         assert!(
             !substitution_bodies(&"$(".repeat(levels)).is_empty(),
-            "deep unterminated nesting must still emit the ambiguous readings"
+            "deep nesting must still emit the ambiguous readings"
         );
     }
 
     #[test]
     fn substitution_bodies_nested_dollar_paren_controls_still_block() {
         // The trigger is precise: a nested `$(` opened inside a double-quoted
-        // run inside a substitution body, whose own body carries a `"`. These
-        // five shapes were already surfaced before #652 and must stay surfaced —
-        // a future widening of the recursion shows up here as a diff.
+        // run inside a substitution body, whose own body carries a `"`. Each
+        // shape below misses at least one of those conditions — the last three
+        // have no nested `$(` at all — and each was already surfaced before
+        // #652. They must stay surfaced: a future widening of the recursion
+        // shows up here as a diff.
         for input in [
             r#"echo $(echo "$(cat .env)")"#,
             r#"echo $(echo "`cat .env`")"#,
