@@ -25,6 +25,15 @@
 //! - **2** — a usage error: a `--scope` outside the closed set, or a `--branch`
 //!   git itself would refuse.
 //!
+//! One case deliberately still exits **0** without a usable key: an explicit
+//! `--repo-root` naming no git repository, *together with* an explicit
+//! `--branch`. Both halves are then caller-supplied literals, so nothing is
+//! unresolved and a marker really is written — over a literal key the pre-PR
+//! gate matches only if it is handed the same literal (cadence-hooks#417). That
+//! is the test-override affordance the suite depends on, and the command warns
+//! on stderr when it takes that path. With `--branch` omitted the same root is
+//! a [`Unresolved::NotARepo`] and exits 1.
+//!
 //! Non-zero is safe here because this is a **CLI action, not a hook**: no tool
 //! call is gated on this exit, so ADR-0001's "a guard's failure must never block
 //! the user" does not apply. Exiting 0 having recorded nothing was the defect —
@@ -408,6 +417,14 @@ fn marker_content(
 /// `branch` was the one raw value here until cadence-hooks#801 — a newline in
 /// it forged a second `recorded polish marker:` line, which is the exact string
 /// a caller greps for when the exit code cannot be trusted.
+///
+/// The marker **path** is deliberately left unescaped. It is not caller-supplied
+/// through a flag: its filename is a hash, and its directory comes from the
+/// operator's own `CADENCE_MARKER_DIR`, so the only way to get a control byte
+/// into it is to put one in your own environment. It is also the one field
+/// callers consume programmatically — a probe reads this path to confirm the
+/// gate is satisfied — and escaping it would change that contract for a value
+/// no untrusted party controls.
 fn record_verdict(
     repo_root: &str,
     branch: &str,
@@ -468,16 +485,20 @@ pub fn run_record(
     // git's ref grammar would be a maintained duplicate whose every wrong rule
     // is a false block on the mechanism the whole polish gate depends on.
     //
-    // This arm is *slightly* wider than git's own rule, and deliberately so.
-    // Measured 2026-09-04: git refuses C0 (`git check-ref-format --branch
-    // $'ev\033il'`) and DEL, but ACCEPTS the C1 block — `git branch` really
-    // creates a branch containing U+0085 or U+009B. `char::is_control` is
-    // Unicode `Cc`, so it covers C1 too. Keeping it that way is the point:
-    // U+009B *is* CSI, the same terminal-control surface as ESC-[, so narrowing
-    // to git's exact rule would re-admit the injection this change closes. The
-    // cost is refusing a git-legal branch no human types by accident.
+    // `is_ascii_control`, not `is_control`, so this matches git exactly and
+    // refuses nothing git would accept. Measured 2026-09-04: git refuses C0
+    // (`git check-ref-format --branch $'ev\033il'`) and DEL, but ACCEPTS the C1
+    // block — `git branch` really creates a branch containing U+0085 or U+009B,
+    // which Unicode `Cc` (`is_control`) would have false-blocked.
+    //
+    // Rejecting C1 is not needed for terminal safety, which is the tempting
+    // reason to widen it: the verdict line Debug-escapes the branch, and
+    // `{:?}` renders U+009B as `\u{9b}`, so CSI never reaches a terminal
+    // whether this arm refuses it or not. Escaping is the containment; this
+    // arm exists only to refuse a key no `polish_marker_present` lookup can
+    // ever match.
     if let Some(value) = branch.as_deref()
-        && (value.is_empty() || value.chars().any(char::is_control))
+        && (value.is_empty() || value.chars().any(|c| c.is_ascii_control()))
     {
         eprintln!(
             "cadence-hooks record-polish: invalid --branch {value:?} (a branch name \
@@ -557,8 +578,14 @@ pub fn run_record(
         }
         Err(e) => {
             eprintln!(
-                "cadence-hooks record-polish: marker write failed ({e}) — no marker \
-                 recorded; the pre-PR gate will nudge."
+                // Deliberately does NOT promise a nudge: a marker from an
+                // earlier pass on this same (repo, branch) may still be on
+                // disk, in which case the gate reads *that* one and stays
+                // quiet. All this invocation can honestly claim is that its
+                // own record did not land.
+                "cadence-hooks record-polish: marker write failed ({e}) — this record did \
+                 not land; any marker from an earlier pass on this branch may still be \
+                 present."
             );
             1
         }
@@ -1544,17 +1571,23 @@ mod tests {
     }
 
     #[test]
-    fn run_record_writes_from_the_ambient_checkout() {
-        // Renamed from `run_record_degrades_to_noop_when_repo_unresolved`
-        // (cadence-hooks#801): no overrides, and `cargo test`'s cwd IS this real
-        // git checkout, so `resolve` succeeds and `run_record` really does write
-        // a marker — the unresolved case it claimed to cover is now genuinely
-        // tested by `run_record_exits_non_zero_and_records_nothing_on_a_detached_head`.
-        // Isolated (#302), same as every other write-path test in this module.
+    fn run_record_records_from_an_attached_checkout() {
+        // Replaces `run_record_degrades_to_noop_when_repo_unresolved`
+        // (cadence-hooks#801), which asserted nothing and read its branch from
+        // the *ambient* cwd. That made it environment-dependent in the worst
+        // direction: CI checks out a detached HEAD, so on CI it silently
+        // exercised the `DetachedHead` arm while claiming to cover the happy
+        // path — and any assertion added to it would have gone red there.
+        // This builds its own attached checkout, so the branch it resolves is
+        // one the test created.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_primary_with_commit(&repo);
+
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
             let code = run_record(
-                None,
+                Some(repo.to_string_lossy().into_owned()),
                 None,
                 Some("full".into()),
                 vec![],
@@ -1562,7 +1595,7 @@ mod tests {
                 vec![],
                 false,
             );
-            assert_eq!(code, 0, "an attached ambient checkout records");
+            assert_eq!(code, 0, "an attached checkout records");
             // Also the positive control for `marker_dir_has_any_file`: the
             // "no marker was written" assertions elsewhere in this section are
             // only worth anything if this helper can return `true` at all.
@@ -1698,6 +1731,38 @@ mod tests {
             );
             assert_eq!(code, 2, "an empty --branch is a usage error");
             assert!(!marker_dir_has_any_file(marker_tmp.path()));
+        });
+    }
+
+    #[test]
+    fn run_record_accepts_a_c1_branch_because_git_does() {
+        // The false-block control for the arm above: the rejection is
+        // `is_ascii_control`, not Unicode `Cc`. Measured 2026-09-04 — git
+        // really creates a branch containing U+0085, so refusing one here
+        // would break a legitimate record. Terminal safety does not depend on
+        // this arm: the verdict Debug-escapes the branch either way, which the
+        // second assertion pins.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-801-c1";
+            let branch = "feat/ev\u{85}il";
+            let code = run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec![],
+                vec![],
+                vec![],
+                false,
+            );
+            assert_eq!(code, 0, "a C1 branch is git-legal and must record");
+            assert!(polish_marker(repo, branch).is_file());
+
+            let verdict = record_verdict(repo, branch, "full", &[], &polish_marker(repo, branch));
+            assert!(
+                !verdict.contains('\u{85}'),
+                "escaping, not the charset bound, is what keeps C1 off the terminal: {verdict:?}"
+            );
         });
     }
 

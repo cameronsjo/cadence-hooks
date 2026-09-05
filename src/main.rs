@@ -1087,10 +1087,13 @@ fn main() {
                 arm_report,
                 fresh,
             } => {
-                // Exit only on a nonzero code: the success path keeps falling
-                // through to main's own exit, and every environment failure
-                // here is already fail-open (0). Today the one nonzero is the
-                // `--scope` usage error (exit 2, cadence-hooks#775).
+                // Exit only on a nonzero code; the success path keeps falling
+                // through to main's own exit. `run_record` returns 0 when a
+                // marker was written, 1 when the environment prevented the
+                // record and nothing was written (not a repo, detached HEAD,
+                // write failed — cadence-hooks#801), and 2 on a usage error
+                // (`--scope`, `--branch` — cadence-hooks#775, #801). This is a
+                // CLI action, not a hook, so a nonzero exit gates no tool call.
                 let code = cadence_hooks_cadence::record_polish::run_record(
                     repo_root, branch, scope, arm, arm_model, arm_report, fresh,
                 );
