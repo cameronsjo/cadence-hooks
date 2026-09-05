@@ -259,7 +259,8 @@ enum CadenceCommands {
     },
     /// Scan text (stdin or --file) for redaction hits at a destination
     /// audience tier. CLI action — the single engine behind the redaction
-    /// skill's pre-post scan (exit 0 clean / 1 hits on stderr / 2 usage)
+    /// skill's pre-post scan; scans the identity tier and the four shaped
+    /// categories (exit 0 clean / 1 hits on stderr / 2 usage)
     RedactScan {
         /// Scan a file instead of stdin
         #[arg(long, value_name = "PATH")]
