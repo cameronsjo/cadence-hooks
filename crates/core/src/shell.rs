@@ -1727,6 +1727,13 @@ fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
 /// their `$(…)` / `` `…` `` delimiters intact so they can be spliced onto the
 /// introducing line and re-parsed downstream.
 ///
+/// **One span is not delimited: the depth-cap carry.** When nesting exceeds
+/// [`MAX_SUBSTITUTION_DEPTH`] the scan cannot locate a closing paren, but the
+/// shell still runs the text, so the rest of the body is returned whole rather
+/// than dropped. A caller must not assume every returned span is a balanced
+/// construct. Dropping it instead was a measured guard bypass
+/// (cameronsjo/cadence-hooks#652): the payload vanished before any guard ran.
+///
 /// **Pass the WHOLE body, not one line.** A substitution ends at its closing
 /// delimiter, and a newline is not one — `` `cmd ⏎ cmd` `` is a single
 /// substitution running two commands, exactly as the shell reads it. Scanning
@@ -2815,9 +2822,16 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
                 i = end;
                 continue;
             }
-            // Unterminated: the quoting inside the substitution never resolved,
-            // so where it ends is genuinely ambiguous and bash rejects the line
-            // outright. Emit BOTH readings rather than picking one — the
+            // The scan located no terminator. Two ways to arrive here, and this
+            // arm deliberately treats them alike: the quoting inside the
+            // substitution never resolved (bash rejects such a line outright),
+            // or nesting hit `MAX_SUBSTITUTION_DEPTH` (bash runs the line
+            // fine — only this scanner gave up). Widening is right for both,
+            // which is why they share an arm here. `substitution_spans` has to
+            // tell them apart, because its two responses differ; do not read
+            // this arm as evidence the distinction is cosmetic.
+            //
+            // Emit BOTH readings rather than picking one — the
             // quote-aware body (everything left) and the quote-blind one (up to
             // the first depth-0 `)`, plus the text after it, which under that
             // reading is a sibling command. Picking only the quote-blind
