@@ -89,6 +89,14 @@ echo '{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"
   | cadence-hooks guardrails guard-push-remote; echo "exit: $?"
 ```
 
+**Pin `PATH` on the child when you are comparing block TEXT rather than exit
+codes.** The two secret guards tailor their message to whether `forgectl` is
+installed, so the same payload produces a longer block on a machine that has
+it. Probe with `env PATH=/usr/bin:/bin <absolute-path-to-binary> …` — an
+absolute path, because a bare name under a reduced `PATH` exits 127 and proves
+nothing. A missing `Or: forgectl env …` line means the tool is absent, never
+that the guard misfired; the exit code is 2 either way.
+
 A `2` there is a real block from the binary. If it's `0` with no output, the
 binary allowed it — but if guards feel inert across the board, the wrapper is
 the next suspect, not the binary. A failed-open wrapper now emits a once/day

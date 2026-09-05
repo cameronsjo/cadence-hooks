@@ -1017,12 +1017,12 @@ fn main() {
                 canonical_hook,
             ),
             CadenceCommands::PreventSecretLeaks => dispatch::run_logged_check(
-                &cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard,
+                &cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard::default(),
                 pre,
                 canonical_hook,
             ),
             CadenceCommands::PreventSecretWrites => dispatch::run_logged_check(
-                &cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard,
+                &cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard::default(),
                 pre,
                 canonical_hook,
             ),

@@ -50,7 +50,7 @@ stable with `cargo uninstall cadence-hooks` followed by
 
 - **Conventional Commits**: `type(scope): description` (e.g., `fix(cadence): scope safe-template check to target`)
 - **cargo fmt** and **cargo clippy** must pass with zero warnings
-- Tests are in-file `#[cfg(test)] mod tests` blocks, not separate files
+- Unit tests are in-file `#[cfg(test)] mod tests` blocks; integration tests that spawn the built binary live in `tests/`
 - Each check implements the `Check` trait from `cadence-hooks-core`
 
 ## Adding a New Hook
