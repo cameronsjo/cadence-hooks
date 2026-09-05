@@ -280,13 +280,17 @@ enum CadenceCommands {
         status: bool,
     },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
+    /// Exit: 0 recorded, 1 nothing recorded (detached HEAD, not a repo, write failed),
+    /// 2 usage error.
     RecordPolish {
         /// Repository to record against (default: the current directory's).
         /// Resolved to the repo's shared git dir, so any worktree of it works
         /// and the marker stays readable by the pre-PR gate
         #[arg(long, value_name = "PATH")]
         repo_root: Option<String>,
-        /// Branch to record against (default: the checked-out branch)
+        /// Branch to record against (default: the checked-out branch). A value
+        /// carrying control characters is a usage error (exit 2) — git refuses
+        /// such a ref itself, and the marker would key a branch nothing can read
         #[arg(long, value_name = "NAME")]
         branch: Option<String>,
         /// What the pass covered — `full`, `code`, or `docs` (default: full).
@@ -1084,10 +1088,13 @@ fn main() {
                 arm_report,
                 fresh,
             } => {
-                // Exit only on a nonzero code: the success path keeps falling
-                // through to main's own exit, and every environment failure
-                // here is already fail-open (0). Today the one nonzero is the
-                // `--scope` usage error (exit 2, cadence-hooks#775).
+                // Exit only on a nonzero code; the success path keeps falling
+                // through to main's own exit. `run_record` returns 0 when a
+                // marker was written, 1 when the environment prevented the
+                // record and nothing was written (not a repo, detached HEAD,
+                // write failed — cadence-hooks#801), and 2 on a usage error
+                // (`--scope`, `--branch` — cadence-hooks#775, #801). This is a
+                // CLI action, not a hook, so a nonzero exit gates no tool call.
                 let code = cadence_hooks_cadence::record_polish::run_record(
                     repo_root, branch, scope, arm, arm_model, arm_report, fresh,
                 );
