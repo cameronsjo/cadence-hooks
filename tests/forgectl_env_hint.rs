@@ -105,7 +105,11 @@ fn a_real_forgectl_on_path_produces_the_hint() {
             .expect("chmod stub");
     }
 
-    let path = format!("{}:/usr/bin:/bin", dir.path().display());
+    // `join_paths`, not a hardcoded `:` — Windows separates PATH entries with
+    // `;`, so a colon-joined string arrives there as one nonexistent directory
+    // and the probe correctly finds nothing, which reads as a broken guard.
+    let joined = std::env::join_paths([dir.path()]).expect("join PATH");
+    let path = joined.to_str().expect("PATH is utf-8").to_string();
     let payload = r#"{"tool_name":"Edit","tool_input":{"file_path":".env","old_string":"a","new_string":"b"}}"#;
     let (code, stderr) = run_guard("prevent-secret-writes", payload, &path);
 
@@ -134,7 +138,11 @@ fn a_non_executable_forgectl_on_path_produces_no_hint() {
             .expect("chmod stub");
     }
 
-    let path = format!("{}:/usr/bin:/bin", dir.path().display());
+    // `join_paths`, not a hardcoded `:` — Windows separates PATH entries with
+    // `;`, so a colon-joined string arrives there as one nonexistent directory
+    // and the probe correctly finds nothing, which reads as a broken guard.
+    let joined = std::env::join_paths([dir.path()]).expect("join PATH");
+    let path = joined.to_str().expect("PATH is utf-8").to_string();
     let payload = r#"{"tool_name":"Edit","tool_input":{"file_path":".env","old_string":"a","new_string":"b"}}"#;
     let (code, stderr) = run_guard("prevent-secret-writes", payload, &path);
 
