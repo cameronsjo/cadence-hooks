@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`cadence record-polish` no longer exits 0 having recorded nothing** (cadence-hooks#801). A detached `HEAD` resolved every git fact except the branch, so the command printed one stderr line and returned success while writing no marker — a false green in the mechanism the whole pre-PR polish gate depends on, and inert against the standard `cmd || handle` idiom. It now exits **1** and names the actual condition: the detached-HEAD and not-a-git-repo cases carried a single conflated message, and the detached line now states both remedies (re-attach, or pass `--branch`). The marker-write-failure path returned 0 the same way and is corrected with it. The read side is unchanged and was never wrong — `polish_marker_present` already read the absence as no marker, so the gate nudges rather than allowing.
+- **`record-polish`'s verdict line Debug-escapes the branch.** `--branch` was the one caller-supplied value echoed raw where `--repo-root`, `--arm`, `--arm-model`, `--arm-report`, and `--scope` are all escaped, so an ESC byte reached the terminal and a newline could forge a second `recorded polish marker:` line — the exact string a caller greps for when the exit code cannot be trusted. A `--branch` carrying control characters is additionally rejected as a usage error (exit 2): git refuses such a ref itself, so the marker would key a branch nothing can ever read.
+
 ## [0.89.0] - 2026-09-02
 
 ### Added

@@ -16,12 +16,22 @@
 //! versa), and branch-scoped (a marker for branch A cannot satisfy a PR on
 //! branch B).
 //!
-//! Advisory, always — this must never fail the user's polish pass. Every
-//! *environment* error path (not a repo, detached HEAD, unwritable marker dir)
-//! prints one stderr line and exits 0 (ADR-0001). A **usage** error — today
-//! only an invalid `--scope` — exits 2 and records nothing, matching the
-//! `redact-scan` CLI convention (cadence-hooks#775): the caller mis-spelled the
-//! record, and storing it anyway lands a marker the gate silently misreads.
+//! Exit codes say whether a marker exists, because that is the only fact a
+//! caller can act on (cadence-hooks#801):
+//!
+//! - **0** — a marker was written.
+//! - **1** — the environment prevented the record (not a git repo, detached
+//!   `HEAD`, marker write failed). Nothing was written.
+//! - **2** — a usage error: a `--scope` outside the closed set, or a `--branch`
+//!   git itself would refuse.
+//!
+//! Non-zero is safe here because this is a **CLI action, not a hook**: no tool
+//! call is gated on this exit, so ADR-0001's "a guard's failure must never block
+//! the user" does not apply. Exiting 0 having recorded nothing was the defect —
+//! it made `record-polish || handle` inert and left the gate nudging a branch
+//! the operator believed was recorded. The usage arm matches the `redact-scan`
+//! CLI convention (cadence-hooks#775): the caller mis-spelled the record, and
+//! storing it anyway lands a marker the gate silently misreads.
 
 use cadence_hooks_core::branch_diff::{WorkingTreeDigest, working_tree_digest};
 use cadence_hooks_core::gitstate::GitState;
@@ -34,6 +44,15 @@ use cadence_hooks_core::time::utc_timestamp;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
+
+/// Why [`resolve`] could not produce a marker key. The two conditions have
+/// different fixes and the single conflated message (cadence-hooks#801) sent a
+/// reader checking whether they were in a git repo at all.
+#[derive(Debug, PartialEq, Eq)]
+enum Unresolved {
+    NotARepo,
+    DetachedHead,
+}
 
 /// The canonical marker key for a directory: the canonicalized
 /// `git_common_dir` from [`GitState::resolve`]. `None` when `dir` is not inside
@@ -54,7 +73,8 @@ fn repo_key(dir: &str) -> Option<String> {
 /// the key, and best-effort — a repo with no commits yet has no `HEAD`, so it
 /// resolves to `None` and the field is recorded as an empty string rather than
 /// failing the record. `repo_root` and `branch` are the load-bearing key; when
-/// either can't be resolved the caller degrades to a no-op (exit 0).
+/// either can't be resolved this returns [`Unresolved`] naming which one, and
+/// the caller records nothing and exits 1 (cadence-hooks#801).
 ///
 /// An explicit `repo_root` is resolved through that same canonicalization
 /// rather than used verbatim (cadence-hooks#417), so the flag can only ever
@@ -86,7 +106,7 @@ fn resolve(
     dir: &str,
     repo_root: Option<String>,
     branch: Option<String>,
-) -> Option<(String, String, String)> {
+) -> Result<(String, String, String), Unresolved> {
     let base = repo_root.as_deref().unwrap_or(dir).to_string();
     let git_state = || GitState::resolve(std::path::Path::new(&base));
     let repo_root = repo_root
@@ -108,13 +128,26 @@ fn resolve(
                 explicit
             })
         })
-        .or_else(|| git_state().map(|state| state.git_common_dir.to_string_lossy().into_owned()))?;
-    let branch = branch.or_else(|| git_state().and_then(|state| state.branch))?;
+        .or_else(|| git_state().map(|state| state.git_common_dir.to_string_lossy().into_owned()))
+        .ok_or(Unresolved::NotARepo)?;
+    // Spelled out rather than chained: the earlier `?` over an `Option`
+    // collapsed "no repo" and "repo, but no branch" into one verdict, and the
+    // two have different fixes (cadence-hooks#801). The inner `None` arm is
+    // load-bearing — `--repo-root <non-repo>` with no `--branch` is a
+    // `NotARepo`, not a detached `HEAD`.
+    let branch = match branch {
+        Some(explicit) => explicit,
+        None => match git_state() {
+            Some(state) => state.branch.ok_or(Unresolved::DetachedHead)?,
+            None => return Err(Unresolved::NotARepo),
+        },
+    };
     // Polish does not commit (SKILL.md), so this is the pre-polish base SHA — a
     // provenance breadcrumb for CP2, never an exact-match key. Empty when the
-    // repo has no HEAD yet.
+    // repo has no HEAD yet. Read last, so a resolution that will not produce a
+    // marker never spawns a `git` process whose result is discarded.
     let head_sha = git_command(&base, &["rev-parse", "HEAD"]).unwrap_or_default();
-    Some((repo_root, branch, head_sha))
+    Ok((repo_root, branch, head_sha))
 }
 
 /// Parse repeatable `--arm name=state` values into the roster, dropping (and
@@ -369,9 +402,12 @@ fn marker_content(
 /// and the arm roster when one was recorded, so the caller sees what the gate
 /// will see.
 ///
-/// `repo_root` is Debug-escaped, matching the rest of this module: it is
-/// derived from a caller-supplied `--repo-root` (or a filesystem path), and a
-/// path can carry newlines and control bytes.
+/// `repo_root` **and** `branch` are Debug-escaped, matching the rest of this
+/// module: both are caller-supplied free text (a `--repo-root` path, a
+/// `--branch` name), and either can carry newlines and control bytes.
+/// `branch` was the one raw value here until cadence-hooks#801 — a newline in
+/// it forged a second `recorded polish marker:` line, which is the exact string
+/// a caller greps for when the exit code cannot be trusted.
 fn record_verdict(
     repo_root: &str,
     branch: &str,
@@ -386,7 +422,7 @@ fn record_verdict(
         format!(" arms={}", list.join(","))
     };
     format!(
-        "recorded polish marker: {} ({repo_root:?}@{branch} scope={scope}{roster})",
+        "recorded polish marker: {} ({repo_root:?}@{branch:?} scope={scope}{roster})",
         path.display()
     )
 }
@@ -394,14 +430,14 @@ fn record_verdict(
 /// Write the branch-scoped polish marker, resolving repo/branch/HEAD from the
 /// current directory unless overridden. Returns the process exit code.
 ///
-/// Fail-open on *environment*: any missing context or write error prints one
-/// stderr line and returns 0 — a CLI action must never fail the polish pass it
-/// is recording (ADR-0001).
+/// **0** when a marker was written; **1** when the environment prevented the
+/// record (not a repo, detached `HEAD`, write failed) and nothing was written;
+/// **2** on a usage error — an invalid `--scope`, or a `--branch` carrying
+/// control characters. See the module docs for why non-zero is safe here.
 ///
-/// **Usage errors are the one exception** (exit 2, the `redact-scan` CLI
-/// convention): an invalid `--scope` is the caller mis-spelling the record, not
-/// the environment degrading, and recording it anyway would land a marker whose
-/// scope the gate silently reads as unknown (cadence-hooks#775).
+/// A usage error is the caller mis-spelling the record rather than the
+/// environment degrading, and recording it anyway would land a marker the gate
+/// silently misreads (cadence-hooks#775).
 pub fn run_record(
     repo_root: Option<String>,
     branch: Option<String>,
@@ -425,6 +461,31 @@ pub fn run_record(
         }
     };
 
+    // A branch git itself would refuse keys a marker no `polish_marker_present`
+    // lookup can ever produce — the cadence-hooks#417 failure (a success verdict
+    // over a key nothing will read), reached through a different flag. Bounded
+    // to control characters and the empty string on purpose: a full mirror of
+    // git's ref grammar would be a maintained duplicate whose every wrong rule
+    // is a false block on the mechanism the whole polish gate depends on.
+    //
+    // This arm is *slightly* wider than git's own rule, and deliberately so.
+    // Measured 2026-09-04: git refuses C0 (`git check-ref-format --branch
+    // $'ev\033il'`) and DEL, but ACCEPTS the C1 block — `git branch` really
+    // creates a branch containing U+0085 or U+009B. `char::is_control` is
+    // Unicode `Cc`, so it covers C1 too. Keeping it that way is the point:
+    // U+009B *is* CSI, the same terminal-control surface as ESC-[, so narrowing
+    // to git's exact rule would re-admit the injection this change closes. The
+    // cost is refusing a git-legal branch no human types by accident.
+    if let Some(value) = branch.as_deref()
+        && (value.is_empty() || value.chars().any(char::is_control))
+    {
+        eprintln!(
+            "cadence-hooks record-polish: invalid --branch {value:?} (a branch name \
+             carries no control characters — git refuses one itself) — no marker recorded."
+        );
+        return 2;
+    }
+
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
@@ -436,12 +497,26 @@ pub fn run_record(
     // provenance about the wrong thing.
     let work_dir = repo_root.clone().unwrap_or_else(|| cwd.clone());
 
-    let Some((repo_root, branch, head_sha)) = resolve(&cwd, repo_root, branch) else {
-        eprintln!(
-            "cadence-hooks record-polish: could not resolve repo root / branch \
-             (not a git repo, or detached HEAD) — no marker recorded."
-        );
-        return 0;
+    // `work_dir` is the directory resolution actually reads (it honors
+    // `--repo-root`), Debug-escaped for the same reason `repo_root` is above.
+    let (repo_root, branch, head_sha) = match resolve(&cwd, repo_root, branch) {
+        Ok(resolved) => resolved,
+        Err(Unresolved::DetachedHead) => {
+            eprintln!(
+                "cadence-hooks record-polish: HEAD is detached in {work_dir:?} — the polish \
+                 marker is keyed on (repo, branch) and a detached HEAD has no branch to key \
+                 it on. No marker recorded. Re-attach (git checkout <branch>) or pass \
+                 --branch <name>."
+            );
+            return 1;
+        }
+        Err(Unresolved::NotARepo) => {
+            eprintln!(
+                "cadence-hooks record-polish: {work_dir:?} is not inside a git repository \
+                 — no marker recorded."
+            );
+            return 1;
+        }
     };
 
     let incoming_arms = parse_arms(&arm);
@@ -473,15 +548,21 @@ pub fn run_record(
     );
     let path = polish_marker(&repo_root, &branch);
     match write_marker(&path, &content) {
-        Ok(()) => println!(
-            "{}",
-            record_verdict(&repo_root, &branch, &scope, &arms, &path)
-        ),
-        Err(e) => eprintln!(
-            "cadence-hooks record-polish: marker write failed ({e}) — pre-PR gate may re-nudge."
-        ),
+        Ok(()) => {
+            println!(
+                "{}",
+                record_verdict(&repo_root, &branch, &scope, &arms, &path)
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "cadence-hooks record-polish: marker write failed ({e}) — no marker \
+                 recorded; the pre-PR gate will nudge."
+            );
+            1
+        }
     }
-    0
 }
 
 #[cfg(test)]
@@ -600,7 +681,7 @@ mod tests {
         assert!(verdict.contains(&path.display().to_string()));
         // Debug-escaped (#775 security review) — the repo root is a path, and a
         // path can carry newlines.
-        assert!(verdict.contains("\"/tmp/repo\"@feat/x"), "{verdict}");
+        assert!(verdict.contains("\"/tmp/repo\"@\"feat/x\""), "{verdict}");
         assert!(verdict.contains("scope=full"));
         assert!(!verdict.contains("arms="), "no roster → no arms clause");
     }
@@ -1463,14 +1544,16 @@ mod tests {
     }
 
     #[test]
-    fn run_record_degrades_to_noop_when_repo_unresolved() {
-        // No overrides, and `cargo test`'s cwd IS this real git checkout, so
-        // `resolve` actually succeeds here (unlike the name implies) and
-        // `run_record` really does write a marker — isolate it (#302), same as
-        // every other write-path test in this module.
+    fn run_record_writes_from_the_ambient_checkout() {
+        // Renamed from `run_record_degrades_to_noop_when_repo_unresolved`
+        // (cadence-hooks#801): no overrides, and `cargo test`'s cwd IS this real
+        // git checkout, so `resolve` succeeds and `run_record` really does write
+        // a marker — the unresolved case it claimed to cover is now genuinely
+        // tested by `run_record_exits_non_zero_and_records_nothing_on_a_detached_head`.
+        // Isolated (#302), same as every other write-path test in this module.
         let marker_tmp = tempfile::tempdir().unwrap();
         with_marker_dir(marker_tmp.path(), || {
-            run_record(
+            let code = run_record(
                 None,
                 None,
                 Some("full".into()),
@@ -1479,7 +1562,205 @@ mod tests {
                 vec![],
                 false,
             );
+            assert_eq!(code, 0, "an attached ambient checkout records");
+            // Also the positive control for `marker_dir_has_any_file`: the
+            // "no marker was written" assertions elsewhere in this section are
+            // only worth anything if this helper can return `true` at all.
+            assert!(
+                marker_dir_has_any_file(marker_tmp.path()),
+                "a successful record must leave a file the helper can see"
+            );
         });
+    }
+
+    // --- exiting non-zero when nothing was recorded (cadence-hooks#801) ---
+
+    #[test]
+    fn resolve_distinguishes_a_detached_head_from_a_non_repo() {
+        // RED (#801): does not compile against the old `Option` return — the
+        // two conditions shared one `None` and one stderr line, so a reader
+        // with a detached HEAD went checking whether they were in a repo.
+        assert_eq!(
+            resolve("/nonexistent/not-a-repo-801", None, None),
+            Err(Unresolved::NotARepo)
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_primary_with_commit(&repo);
+        detach_head(&repo);
+        let repo_str = repo.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve(&repo_str, None, None),
+            Err(Unresolved::DetachedHead)
+        );
+    }
+
+    #[test]
+    fn resolve_reports_not_a_repo_for_an_explicit_non_repo_root() {
+        // The inner `None` arm of the three-way match: `--repo-root <non-repo>`
+        // with no `--branch` is a missing repository, not a detached HEAD.
+        assert_eq!(
+            resolve(
+                "/nonexistent/cwd-801",
+                Some("/nonexistent/explicit-801".into()),
+                None
+            ),
+            Err(Unresolved::NotARepo)
+        );
+    }
+
+    #[test]
+    fn run_record_exits_non_zero_and_records_nothing_on_a_detached_head() {
+        // RED (#801 case B): returned 0 with an empty stdout and no marker, so
+        // `record-polish || handle` was inert and the caller believed the
+        // polish was recorded.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_primary_with_commit(&repo);
+        detach_head(&repo);
+
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let code = run_record(
+                Some(repo.to_string_lossy().into_owned()),
+                None,
+                Some("full".into()),
+                vec![],
+                vec![],
+                vec![],
+                false,
+            );
+            assert_eq!(code, 1, "a detached HEAD records nothing, so it is not 0");
+            assert!(
+                !marker_dir_has_any_file(marker_tmp.path()),
+                "no marker may be written for a detached HEAD"
+            );
+        });
+    }
+
+    #[test]
+    fn record_verdict_debug_escapes_the_branch() {
+        // RED (#801 case E): the raw ESC survived to stdout — `cat -v` showed
+        // `@evil^[[31mRED` — while every other value on the line was escaped.
+        let branch = "evil\u{1b}[31m";
+        let path = polish_marker("/tmp/repo", branch);
+        let verdict = record_verdict("/tmp/repo", branch, "full", &[], &path);
+        assert!(
+            !verdict.contains('\u{1b}'),
+            "no raw control byte may reach the terminal: {verdict:?}"
+        );
+        assert!(
+            verdict.contains("\\u{1b}"),
+            "the branch must appear Debug-escaped: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn run_record_rejects_a_control_byte_branch_as_a_usage_error() {
+        // RED (#801 case G): exited 0 and wrote a marker, while the newline
+        // forged a second `recorded polish marker:` line on stdout — the exact
+        // string the issue records callers grepping for.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let branch = "a\nrecorded polish marker: fake";
+            let code = run_record(
+                Some("/tmp/record-polish-801-forge".into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec![],
+                vec![],
+                vec![],
+                false,
+            );
+            assert_eq!(code, 2, "a branch git itself refuses is a usage error");
+            assert!(
+                !marker_dir_has_any_file(marker_tmp.path()),
+                "no marker may be written under any key for a rejected --branch"
+            );
+        });
+    }
+
+    #[test]
+    fn run_record_rejects_an_empty_branch_as_a_usage_error() {
+        // The other half of the same arm: an empty `--branch` keys a marker no
+        // lookup can produce, the #417 failure through a different flag.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let code = run_record(
+                Some("/tmp/record-polish-801-empty".into()),
+                Some(String::new()),
+                Some("full".into()),
+                vec![],
+                vec![],
+                vec![],
+                false,
+            );
+            assert_eq!(code, 2, "an empty --branch is a usage error");
+            assert!(!marker_dir_has_any_file(marker_tmp.path()));
+        });
+    }
+
+    #[test]
+    fn run_record_exits_non_zero_when_the_marker_write_fails() {
+        // RED (#801): the write-failure arm fell through to a bare `0`, so a
+        // failed write reported success exactly as the detached-HEAD path did.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        with_marker_dir(marker_tmp.path(), || {
+            let repo = "/tmp/record-polish-801-writefail";
+            let branch = "feat/record-polish-801";
+            // A directory at the marker's own path: `write_marker`'s rename
+            // cannot replace it, so the write fails without any permission or
+            // filesystem trickery.
+            let path = polish_marker(repo, branch);
+            std::fs::create_dir_all(&path).unwrap();
+
+            let code = run_record(
+                Some(repo.into()),
+                Some(branch.into()),
+                Some("full".into()),
+                vec![],
+                vec![],
+                vec![],
+                false,
+            );
+            assert_eq!(code, 1, "a failed write recorded nothing, so it is not 0");
+            assert!(path.is_dir(), "the blocker must still be what it was");
+        });
+    }
+
+    /// Put an existing checkout on a detached `HEAD`.
+    fn detach_head(repo: &std::path::Path) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["checkout", "-q", "--detach", "HEAD"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git checkout --detach failed");
+    }
+
+    /// Whether any regular file exists anywhere under the marker directory —
+    /// the assertion "no marker was written under *any* key", which a single
+    /// recomputed path cannot make.
+    ///
+    /// Panics rather than returning `false` on an unreadable directory: a
+    /// swallowed read error would make every "no marker was written" assertion
+    /// pass for the wrong reason, which is the fallback-instead-of-assertion
+    /// shape these tests exist to rule out.
+    fn marker_dir_has_any_file(dir: &std::path::Path) -> bool {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("marker dir {dir:?} must be readable to assert on it: {e}"));
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                marker_dir_has_any_file(&path)
+            } else {
+                true
+            }
+        })
     }
 
     // --- worktree-stable keying (cadence-hooks#324) ---
