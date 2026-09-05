@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::registry;
+use cadence_hooks_core::capability::on_path;
 // The session crate's `registry` (peer-session liveness) — aliased because the
 // bare name is already taken by the binary's hook-catalog `registry` above.
 use cadence_hooks_session::identity as session_identity;
@@ -1059,52 +1060,10 @@ fn referenced_clis(command: &str) -> std::collections::BTreeSet<String> {
     out
 }
 
-/// True when `name` resolves on the current `PATH`.
-///
-/// A plain PATH walk rather than shelling to `which`/`command -v`: this check
-/// exists precisely because a CLI may be absent, and asking a subprocess to
-/// answer that question adds a second dependency to the dependency check.
-fn on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| is_executable_at(&dir.join(name)))
-}
-
-/// True when `candidate` is something the shell could actually exec.
-///
-/// On unix that means the executable bit, not merely `is_file()`: a stray
-/// `chmod 644` placeholder earlier on PATH would otherwise read as present
-/// while the shell fails to run it — the check would report health where there
-/// is none.
-#[cfg(unix)]
-fn is_executable_at(candidate: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(candidate)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-/// True when `candidate`, or `candidate` plus any `PATHEXT` suffix, is a file.
-///
-/// Windows resolves an extensionless name through `PATHEXT`, and the default
-/// list is not just `.exe`. Node's global installs ship `.cmd` shims —
-/// `prettier.cmd`, `eslint.cmd`, `markdownlint-cli2.cmd` — so hardcoding `.exe`
-/// would report a large share of the CLIs hooks actually shell to as missing.
-/// No executable-bit concept applies here; presence is the whole test.
-#[cfg(windows)]
-fn is_executable_at(candidate: &Path) -> bool {
-    if candidate.is_file() {
-        return true;
-    }
-    let pathext = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC".to_string());
-    pathext.split(';').filter(|e| !e.is_empty()).any(|ext| {
-        let mut with_ext = candidate.as_os_str().to_os_string();
-        with_ext.push(ext);
-        Path::new(&with_ext).is_file()
-    })
-}
+// `on_path` and `is_executable_at` moved to `cadence_hooks_core::capability`
+// (imported at the top of this file) when the secret guards grew a second need
+// for the same PATH walk. One copy, so the two consumers cannot drift on what
+// "installed" means.
 
 /// Warn once per CLI that an installed hook shells to but PATH cannot resolve.
 ///
@@ -2803,6 +2762,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_hooks_core::capability::is_executable_at;
     use std::fs;
 
     // ── Finding::render sanitization (#440) ─────────────────────────────────

@@ -5,6 +5,8 @@
 
 /// Require `MARKER(#issue):` format for TODO, FIXME, HACK, and other code markers.
 pub mod block_orphaned_todos;
+/// The `forgectl env` line the secret guards append to an env-file block.
+mod forgectl_hint;
 /// Block dangerous git operations (force-push main, reset --hard, etc.).
 pub mod git_safety;
 /// Run markdownlint on markdown files being written.
