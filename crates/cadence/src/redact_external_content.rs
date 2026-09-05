@@ -1,21 +1,34 @@
-//! Nudge before internal harness vocabulary leaks into an external post.
+//! Catch internal vocabulary and work-identifiable terms before they leak into
+//! an external post.
 //!
-//! A PreToolUse **nudge** (never a block) that scans the *body text* of
-//! external-posting Bash commands — `gh pr/issue/release/gist/discussion`
-//! create/comment/edit, `git commit`, `tea pr/issue` — for vocabulary that is
-//! meaningful only inside this harness: skill/plugin IDs (`cadence:attune`),
-//! local filesystem paths (`/Users/…`, `~/.claude/…`), marketplace/cache paths,
-//! and harness-shaped identifiers (`tool_input`, `tool_response`). When it finds any, it
-//! suggests rephrasing before the content ships to a public issue/PR/commit.
+//! A PreToolUse check over the *body text* of external-posting Bash commands —
+//! `gh pr/issue/release/gist/discussion` create/comment/edit, `git commit`,
+//! `tea pr/issue` — running **two type-separated tiers with opposite
+//! outcomes** (ADR-0041):
 //!
-//! ## Why a nudge, never a block (developing-guards "block vs nudge")
+//! - The **shaped** tier **nudges, never blocks**. It matches vocabulary that
+//!   is meaningful only inside this harness: skill/plugin IDs
+//!   (`cadence:attune`), local filesystem paths (`/Users/…`, `~/.claude/…`),
+//!   marketplace/cache paths, and harness-shaped identifiers (`tool_input`,
+//!   `tool_response`). It suggests rephrasing before the content ships.
+//! - The **identity** tier **blocks** ([`identity`]). It matches
+//!   work-identifiable terms from `~/.config/cadence/redaction.toml`, outside
+//!   every repo, and is config-blind by signature — no per-repo file can
+//!   soften it. `mode = "warn"` downgrades it to advisory, and it is inert
+//!   when the term source is absent or unreadable (fail-open per ADR-0001).
+//!
+//! Both tiers run on every body, deliberately without a short-circuit, and
+//! [`combine`] folds them: only the identity tier can produce a block.
+//!
+//! ## Why the SHAPED tier is a nudge, never a block (developing-guards "block vs nudge")
 //!
 //! There is a routine, intentional workflow that legitimately mentions these
 //! terms in an external post — documenting the harness itself, an issue *about*
 //! `cadence:writing-skills`, a commit that renames `tool_input`. The condition
 //! is detectable but the policy is advisory, so this is a nudge. The per-repo
 //! `.claude/cadence.json` `redaction.allowlist` is the escape hatch for the
-//! recurring legitimate case.
+//! recurring legitimate case. None of that reasoning reaches the identity tier,
+//! whose terms have no legitimate external mention and no per-repo escape.
 //!
 //! ## Body extraction is scoped to the posting segment (#424)
 //!
