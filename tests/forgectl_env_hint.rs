@@ -89,6 +89,65 @@ fn a_path_qualified_forgectl_read_blocks() {
 }
 
 #[test]
+fn a_real_forgectl_on_path_produces_the_hint() {
+    // The other tests here only exercise the PATH-WITHOUT-forgectl arm, and
+    // every "hint appears" assertion elsewhere injects a stub detector. Without
+    // this, a broken real probe — a failed thread spawn, a PATH-walk
+    // regression, an executable-bit check that stopped working — would be
+    // silent in CI, and the absent-arm tests above would still pass.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fake = dir.path().join("forgectl");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+    }
+
+    let path = format!("{}:/usr/bin:/bin", dir.path().display());
+    let payload = r#"{"tool_name":"Edit","tool_input":{"file_path":".env","old_string":"a","new_string":"b"}}"#;
+    let (code, stderr) = run_guard("prevent-secret-writes", payload, &path);
+
+    assert_eq!(code, 2, "the outcome is unchanged by detection: {stderr}");
+    assert!(
+        stderr.contains(TODAYS_WRITE_BLOCK),
+        "the original text is appended to, never replaced: {stderr}"
+    );
+    assert!(
+        stderr.contains("Or: forgectl env set <KEY> --file .env "),
+        "a real forgectl on PATH must produce the hint: {stderr}"
+    );
+}
+
+#[test]
+fn a_non_executable_forgectl_on_path_produces_no_hint() {
+    // The executable-bit half of the probe, end to end: a mode-644 file the
+    // shell could not run must not count as installed.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fake = dir.path().join("forgectl");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod stub");
+    }
+
+    let path = format!("{}:/usr/bin:/bin", dir.path().display());
+    let payload = r#"{"tool_name":"Edit","tool_input":{"file_path":".env","old_string":"a","new_string":"b"}}"#;
+    let (code, stderr) = run_guard("prevent-secret-writes", payload, &path);
+
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains(TODAYS_WRITE_BLOCK), "{stderr}");
+    #[cfg(unix)]
+    assert!(
+        !stderr.contains("forgectl"),
+        "a non-executable file is not an installed CLI: {stderr}"
+    );
+}
+
+#[test]
 fn the_bare_forgectl_reader_is_still_allowed() {
     // Control: without this, the test above would pass on a guard that had
     // simply stopped exempting anything at all.

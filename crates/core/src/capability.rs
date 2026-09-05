@@ -88,25 +88,47 @@ const PROBE_BUDGET: Duration = Duration::from_millis(250);
 /// one-shot process that is about to exit.
 pub fn forgectl_present() -> bool {
     static PRESENT: OnceLock<bool> = OnceLock::new();
-    *PRESENT.get_or_init(|| bounded_on_path("forgectl", PROBE_BUDGET))
+    *PRESENT.get_or_init(|| bounded(|| on_path("forgectl"), PROBE_BUDGET))
 }
 
-/// [`on_path`] with a deadline: `false` if it has not answered in `budget`.
+/// Run `work` with a deadline, answering `false` if it has not returned in
+/// `budget` — or if it could not be started, or panicked.
 ///
 /// Not `shell::run_bounded_with`, and not the `deadline` module: both bound a
 /// **subprocess** — they spawn, poll `try_wait`, and kill. There is no process
-/// here to kill. `on_path` is an in-process `stat` loop, and the only way to
+/// here to kill. The work is an in-process `stat` loop, and the only way to
 /// stop waiting on a blocking syscall without a process to signal is to stop
 /// waiting on the *thread* running it. The budget is local and small for the
 /// same reason: this is a message-composition probe, not a git spawn, so it
 /// does not draw on the shared hook budget those helpers divide up.
-fn bounded_on_path(name: &'static str, budget: Duration) -> bool {
+///
+/// **`Builder::spawn`, not `thread::spawn`**, which unwraps the OS result and
+/// panics when thread creation fails (`EAGAIN` under fd or thread exhaustion).
+/// The caller's panic hook converts an unwind to exit **1**, so that panic
+/// would turn an already-decided block into a non-blocking error — the precise
+/// outcome this module promises cannot happen. A spawn failure is just
+/// "absent".
+///
+/// Generic over `work` so a test can bound something that will not answer;
+/// a zero budget cannot test the timeout arm, because the work may finish and
+/// queue its value before the receiver ever waits.
+fn bounded<F>(work: F, budget: Duration) -> bool
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
     let (tx, rx) = mpsc::channel();
     // A send into a dropped channel is an ordinary `Err` here, not a panic —
-    // the receiver having timed out is the expected outcome, not a fault.
-    std::thread::spawn(move || {
-        let _ = tx.send(on_path(name));
-    });
+    // the receiver having timed out is the expected outcome, not a fault. A
+    // panic *inside* the thread drops `tx`, which the receiver reads as
+    // `Disconnected` and answers `false`.
+    if std::thread::Builder::new()
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .is_err()
+    {
+        return false;
+    }
     rx.recv_timeout(budget).unwrap_or(false)
 }
 
@@ -146,17 +168,37 @@ mod tests {
     }
 
     #[test]
-    fn presence_is_stable_within_a_process() {
-        assert_eq!(forgectl_present(), forgectl_present());
+    fn work_that_outruns_its_budget_answers_absent() {
+        // Stands in for the stalled mount a test cannot create: work that
+        // will not answer inside the budget. NOT a zero budget — the work
+        // could finish and queue its value before the receiver ever waits,
+        // which makes a zero-budget assertion a race rather than a probe of
+        // the timeout arm.
+        assert!(!bounded(
+            || {
+                std::thread::sleep(Duration::from_millis(500));
+                true
+            },
+            Duration::from_millis(10)
+        ));
     }
 
     #[test]
-    fn an_exhausted_budget_answers_absent() {
-        // A zero budget cannot be met, so this asserts the timeout arm itself
-        // rather than the walk — the arm that stands in for a stalled mount,
-        // which a test cannot create. The control is the same probe with a
-        // real budget, which must be able to answer either way.
-        assert!(!bounded_on_path("sh", Duration::ZERO));
-        let _ = bounded_on_path("sh", Duration::from_millis(250));
+    fn work_inside_its_budget_answers_truthfully() {
+        // The control: without it, the test above would pass on a `bounded`
+        // that had simply been hardcoded to `false`.
+        assert!(bounded(|| true, Duration::from_secs(5)));
+        assert!(!bounded(|| false, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_panicking_probe_answers_absent_rather_than_unwinding() {
+        // A panic in the thread drops the sender; the receiver reads
+        // `Disconnected` and answers absent. It must not reach the caller,
+        // whose panic hook would convert it to a non-blocking exit 1.
+        assert!(!bounded(
+            || panic!("probe exploded"),
+            Duration::from_secs(5)
+        ));
     }
 }

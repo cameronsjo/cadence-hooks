@@ -7,7 +7,7 @@
 //! metadata-safe allowlist (#65, #66). Safe templates (.env.example,
 //! .env.test) are always allowed.
 
-use crate::forgectl_hint::{HintKind, with_forgectl_hint};
+use crate::forgectl_hint::{HintKind, is_forgectl_env_file, with_forgectl_hint};
 use crate::secret_patterns::{
     command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
     is_dangerous_secret_token, is_safe_template, is_secret_shaped_var_name,
@@ -403,10 +403,17 @@ const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check", "redact"]
 /// `forgectl env keys --file safe.txt < .env` measured ALLOW that way — the
 /// first hands a second secret to a command that was only ever audited for its
 /// `--file` target, the second reads one through a redirection `forgectl` never
-/// sees. So the scan always runs, and a recognized call merely exempts the
-/// files it was audited to handle; a segment carrying any redirection is
-/// refused outright, since what the shell opens is no longer what the
-/// subcommand was audited on.
+/// sees. So the scan always runs, and a recognized call exempts only the files
+/// it was audited to handle.
+///
+/// "Audited to handle" is a **shape**, not "whatever follows `--file`". The
+/// forgectl#82 audit is about dotenv files: `redact` masks `KEY=value` lines,
+/// and a file with no such lines — `id_rsa` is exactly that shape — has no
+/// masking rule to apply. Exempting an arbitrary `--file` value would have made
+/// this guard depend on forgectl's own `--file` restriction, an external
+/// control this code neither knows about nor tests and which could relax
+/// without a word here. Each value is gated on
+/// [`is_forgectl_env_file`] instead, so the guard's own predicate decides.
 ///
 /// debt: the safe set is CLOSED — the five subcommands named in
 /// [`SAFE_ENV_SUBCOMMANDS`], each audited value-free — so a new `forgectl env`
@@ -426,12 +433,20 @@ fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
 /// values of its `--file`/`-f` operand — or empty when this is not such a call.
 ///
 /// Empty is the safe answer and the default: every other shape (another command
-/// group, an unaudited `env` subcommand, no subcommand at all, or any
-/// redirection in the segment) exempts nothing and lets the standard scan
-/// judge every operand.
+/// group, an unaudited `env` subcommand, no subcommand at all, or a stand-alone
+/// redirection operator in the segment) exempts nothing and lets the standard
+/// scan judge every operand.
 fn exempt_file_operands(tokens: &[String]) -> Vec<&str> {
     // A redirection means the shell, not `forgectl`, decides which file is
     // opened — nothing about the audited subcommand covers that.
+    //
+    // Bounded by the tokenizer, which splits on whitespace: an ATTACHED
+    // operator (`--file safe.txt<.env`) arrives as one token and is not seen
+    // here. Nothing rides on that today — the value is then judged by the
+    // shape gate below, which no more accepts `safe.txt<.env` than
+    // `is_dangerous_secret_token` does — but the claim is "a stand-alone
+    // redirection operator", not "any redirection", and the difference is the
+    // tokenizer's, not this function's.
     if tokens.iter().any(|t| redirection_of(t).is_some()) {
         return Vec::new();
     }
@@ -456,15 +471,19 @@ fn exempt_file_operands(tokens: &[String]) -> Vec<&str> {
     let mut exempt = Vec::new();
     let mut rest = &tokens[1..];
     while let Some(token) = rest.first() {
-        if let Some(value) = token
+        let value = token
             .strip_prefix("--file=")
             .or_else(|| token.strip_prefix("-f="))
-        {
+            .or_else(|| {
+                if token == "--file" || token == "-f" {
+                    rest.get(1).map(String::as_str)
+                } else {
+                    None
+                }
+            });
+        // The shape gate: only a dotenv-shaped file is one the audit covers.
+        if let Some(value) = value.filter(|v| is_forgectl_env_file(v)) {
             exempt.push(value);
-        } else if (token == "--file" || token == "-f")
-            && let Some(value) = rest.get(1)
-        {
-            exempt.push(value.as_str());
         }
         rest = &rest[1..];
     }
@@ -1930,6 +1949,30 @@ mod tests {
         let result = SecretLeaksGuard::default()
             .run(&make_bash_input("forgectl env keys --file safe.txt < .env"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_forgectl_file_operand_must_be_env_shaped() {
+        // The audit behind the exemption (forgectl#82) is about dotenv files:
+        // `redact` masks KEY=value lines, and a file with none — an SSH key,
+        // a `.pgpass` — has no masking rule to apply. Exempting whatever
+        // follows `--file` would have made this guard depend on forgectl's own
+        // `--file` restriction, an external control it neither knows about nor
+        // tests.
+        for command in [
+            "forgectl env keys --file /home/u/.aws/credentials",
+            "forgectl env redact --file /home/u/.aws/credentials",
+            "forgectl env get x --file /home/u/.pgpass",
+            "forgectl env keys --file /home/u/.ssh/id_rsa",
+            "sh -c \"forgectl env keys --file /home/u/.aws/credentials\"",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
     }
 
     #[test]
