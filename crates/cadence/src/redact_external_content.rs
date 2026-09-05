@@ -961,6 +961,17 @@ fn identity_scan_lines(
     for hit in hits {
         // Derived from the byte offset rather than a loop index, so this stays
         // correct if `term_regex` ever admits a newline into a term.
+        //
+        // The `map_or(1, …)` fallback keeps release builds fail-open, but it is
+        // silent — a hit computed against a *different* string than `text` would
+        // degrade to a plausible-looking line 1 with nothing to notice. Today
+        // that is unreachable (both come from the same `input`), so the assert
+        // costs nothing and turns a future refactor's drift loud in tests.
+        debug_assert!(
+            text.get(..hit.offset).is_some(),
+            "identity hit offset {} is not a boundary in the scanned text",
+            hit.offset
+        );
         let lineno = text
             .get(..hit.offset)
             .map_or(1, |prefix| prefix.matches('\n').count() + 1);
@@ -1341,6 +1352,58 @@ fn write_config_atomically(
     0
 }
 
+// --- Shared test-only env guard -------------------------------------------
+//
+// `CADENCE_REDACTION_TERMS` is process-global, and BOTH test modules below
+// touch it: `tests` mutates it through `with_terms`, and `cli_scan_tests`
+// reaches it as a *reader* because `run_scan` now calls `identity::load()`.
+// One variable, one mutex, one home — a second lock over the same global is a
+// race no critical section can fix (cadence-hooks#446), and an unguarded
+// reader is the same defect wearing the other costume. These live in the
+// parent module precisely so neither child can mint its own.
+
+#[cfg(test)]
+static TERMS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Removes the named env vars when dropped — including on unwind.
+///
+/// An `assert!` inside a test closure panics, and a plain set-call-remove
+/// sequence never reaches its remove. That leak is currently harmless (every
+/// reader of these vars takes `TERMS_ENV_LOCK` first, and the next locker
+/// overwrites), but it is harmless by coincidence rather than by construction,
+/// and a test added outside this helper would silently inherit a stale path.
+#[cfg(test)]
+struct EnvCleanup(&'static [&'static str]);
+
+#[cfg(test)]
+impl Drop for EnvCleanup {
+    fn drop(&mut self) {
+        for k in self.0 {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+}
+
+/// Hold [`TERMS_ENV_LOCK`] with the term-source override explicitly CLEARED,
+/// then run `f`.
+///
+/// For a test that does not care about the identity tier but whose code path
+/// reads the tier's env var anyway. Clearing is the point: inheriting whatever
+/// fixture a concurrent test had transiently set is exactly the flake this
+/// prevents, and it also pins the run to the real machine's term source being
+/// irrelevant rather than accidentally absent.
+#[cfg(test)]
+fn with_terms_cleared<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let _guard = TERMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = EnvCleanup(&["CADENCE_REDACTION_TERMS"]);
+    // SAFETY: serialized by TERMS_ENV_LOCK, held for this whole scope.
+    unsafe { std::env::remove_var("CADENCE_REDACTION_TERMS") };
+    f()
+}
+
 #[cfg(test)]
 mod cli_scan_tests {
     use super::*;
@@ -1367,32 +1430,40 @@ mod cli_scan_tests {
         // Exercises the full glue: file read, per-line loop, exit
         // aggregation. Uses a skill-id hit (this repo's own allowlist covers
         // only the harness-noun identifiers, so skill-id is cwd-robust).
-        let dir = tempfile::tempdir().unwrap();
-        let hit = dir.path().join("hit.txt");
-        std::fs::write(&hit, "line one\nsee cadence:attune here\n").unwrap();
-        assert_eq!(
-            run_scan(hit.to_str().map(String::from), Some("public".into()), false),
-            1
-        );
-        let clean = dir.path().join("clean.txt");
-        std::fs::write(&clean, "nothing to see\n").unwrap();
-        assert_eq!(
-            run_scan(
-                clean.to_str().map(String::from),
-                Some("public".into()),
-                false
-            ),
-            0
-        );
-        // owned-internal destination: the default ceiling suppresses.
-        assert_eq!(
-            run_scan(
-                hit.to_str().map(String::from),
-                Some("owned-internal".into()),
-                false
-            ),
-            0
-        );
+        //
+        // Wrapped in `with_terms_cleared` because `run_scan` now reaches
+        // `identity::load()`. This test asserts SHAPED-tier exit codes, so it
+        // must not observe whichever fixture term source a concurrent identity
+        // test has transiently installed — an identity hit would turn every
+        // expectation below into a wrong answer, including the two zeros.
+        with_terms_cleared(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let hit = dir.path().join("hit.txt");
+            std::fs::write(&hit, "line one\nsee cadence:attune here\n").unwrap();
+            assert_eq!(
+                run_scan(hit.to_str().map(String::from), Some("public".into()), false),
+                1
+            );
+            let clean = dir.path().join("clean.txt");
+            std::fs::write(&clean, "nothing to see\n").unwrap();
+            assert_eq!(
+                run_scan(
+                    clean.to_str().map(String::from),
+                    Some("public".into()),
+                    false
+                ),
+                0
+            );
+            // owned-internal destination: the default ceiling suppresses.
+            assert_eq!(
+                run_scan(
+                    hit.to_str().map(String::from),
+                    Some("owned-internal".into()),
+                    false
+                ),
+                0
+            );
+        });
     }
 
     // --- Parity rulings vs the deleted redact-check.sh (Rust semantics win) ---
@@ -2474,25 +2545,6 @@ mod tests {
     // These drive the real `run()`, so they set `CADENCE_REDACTION_TERMS` and
     // must not run concurrently with each other (process-wide env). Everything
     // reachable without env goes in `identity::tests` instead.
-
-    static TERMS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Removes the named env vars when dropped — including on unwind.
-    ///
-    /// An `assert!` inside a test closure panics, and a plain
-    /// set-call-remove sequence never reaches its remove. That leak is
-    /// currently harmless (every reader of these vars takes `TERMS_ENV_LOCK`
-    /// first, and the next locker overwrites), but it is harmless by
-    /// coincidence rather than by construction, and a test added outside this
-    /// helper would silently inherit a stale path.
-    struct EnvCleanup(&'static [&'static str]);
-    impl Drop for EnvCleanup {
-        fn drop(&mut self) {
-            for k in self.0 {
-                unsafe { std::env::remove_var(k) };
-            }
-        }
-    }
 
     /// Run `body` through the guard with a fixture term source. Returns the
     /// full result so a caller can assert on outcome, message, and bypass.
