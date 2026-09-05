@@ -60,9 +60,11 @@ BASE_REF="${1:-origin/main}"
 export PATH="$HOME/.cargo/bin:$PATH"
 
 # The guards read these from the real process environment, and a Claude session
-# routinely carries them. Left set, every blocks-assertion below false-passes
-# with the reason buried in stderr.
-unset CADENCE_DISABLE CADENCE_ALLOW_MAIN CADENCE_BYPASS
+# routinely carries them. Left set, a blocks-assertion below false-passes with
+# the reason buried in stderr. `CADENCE_ALLOW_SENSITIVE_TERMS` cannot fail this
+# run open — the assertion is movement, and it would move both binaries alike —
+# but it can silently mask a row, which is enough to clear it too.
+unset CADENCE_DISABLE CADENCE_ALLOW_MAIN CADENCE_BYPASS CADENCE_ALLOW_SENSITIVE_TERMS
 
 WORK=$(mktemp -d) || exit 1
 trap 'rm -rf "$WORK"' EXIT
@@ -146,37 +148,66 @@ CORPUS="$WORK/corpus.tsv"
     printf '491-even-escaped-clobber\techo hi \\\\>| cat .env\n'
     printf '551-ansi-c-escaped-quote\techo $'"'"'a\\'"'"'b'"'"' $(cat .env)\n'
     printf '653-backtick-unterminated\techo `echo '"'"'` && cat .env\n'
-    # Deep nesting at and past MAX_SUBSTITUTION_DEPTH (16), with the payload as
-    # a SIBLING outside the deep chain — that placement is what makes the row
-    # able to fail. The first cut of this script nested four levels against a
-    # cap of sixteen, so the row named for the cap could never reach it, and the
+    # Deep nesting straddling MAX_SUBSTITUTION_DEPTH, with the payload as a
+    # SIBLING outside the deep chain — that placement is what makes the row able
+    # to fail. The outer substitution spends one budget unit, so 15 nested levels
+    # is the last that locates a terminator and 16 is the first that widens; the
+    # rows below sit at 15, 16 and 17 so the transition itself is covered rather
+    # than straddled at a distance. The first cut nested four levels against a
+    # cap of sixteen, so the row named for the cap could never reach it and the
     # differential ran green while a BLOCK -> ALLOW flip was live. The heredoc
     # wrapper is the shape that actually flipped: `substitution_spans` dropped
     # the construct where `substitution_bodies` widened.
-    CHAIN=''; CLOSE=''
-    for _ in $(seq 1 17); do CHAIN="\$(${CHAIN}"; CLOSE="${CLOSE})"; done
-    CHAIN="${CHAIN}echo x${CLOSE}"
-    printf '652-cap-plain\techo $(cat .env; %s)\n' "$CHAIN"
-    printf '652-cap-heredoc\tcat <<EOF\001$(cat .env; %s)\001EOF\n' "$CHAIN"
-    printf '652-cap-under\techo $(cat .env; %s)\n' \
-        "$(c=''; e=''; for _ in $(seq 1 14); do c="\$(${c}"; e="${e})"; done; printf '%secho x%s' "$c" "$e")"
-    # A nested body this scanner cannot TERMINATE — the other way to reach the
-    # give-up arm, and the one the first cut of these rows could not reach. Every
-    # 652-* row above nests substitutions whose scan succeeds, so assertion 1 ran
-    # green over the exact gap the recursion opened. The trap is a `#` comment
-    # carrying an apostrophe inside the nested body: bash and zsh read it as a
-    # comment, the scanner opens a single-quoted run on the apostrophe and never
-    # closes it. Both rows are lines the shells run.
+    chain() { # $1 = nesting levels
+        local c='' e='' _i
+        for _i in $(seq 1 "$1"); do c="\$(${c}"; e="${e})"; done
+        printf '%secho x%s' "$c" "$e"
+    }
+    printf '652-cap-under\techo $(cat .env; %s)\n' "$(chain 15)"
+    printf '652-cap-at\techo $(cat .env; %s)\n' "$(chain 16)"
+    printf '652-cap-plain\techo $(cat .env; %s)\n' "$(chain 17)"
+    printf '652-cap-heredoc\tcat <<EOF\001$(cat .env; %s)\001EOF\n' "$(chain 17)"
+    # A nested body this scanner cannot TERMINATE, and its top-level twin — the
+    # other two ways to reach the give-up arm. Every 652-* row above nests
+    # substitutions whose scan succeeds, plus cap rows, so the no-flip assertion
+    # ran green over these shapes entirely. The trap is a `#` comment carrying an
+    # apostrophe: the shells read it as a comment, the scanner opens a
+    # single-quoted run on the apostrophe and never closes it.
+    #
+    # `$'…'` is what puts real newlines in these, NOT a `\001` written into a
+    # variable. `printf` decodes escapes in its FORMAT only, so a `\001` inside
+    # an assignment survives as four literal characters and the comment never
+    # ends — which silently demoted both rows to inputs no shell will run, i.e.
+    # to the class the row below is explicitly labelled as.
     APOS=\'
-    TRAP="echo \"\$(echo hi\001# don${APOS}t\001)\""
+    TRAP=$'echo "$(echo hi\001# don'${APOS}$'t\001)"'
     printf '652-nested-unterminated\tcat <<EOF\001$(%s ; cat .env)\001EOF\n' "$TRAP"
     printf '652-nested-unterminated-before\tcat <<EOF\001$(cat .env ; %s)\001EOF\n' "$TRAP"
+    printf '652-toplevel-comment-quote\tcat <<EOF\001$(cat .env # don%st\001)\001EOF\n' "$APOS"
+    printf '652-toplevel-comment-dquote\tcat <<EOF\001$(cat .env # say "hi\001)\001EOF\n'
     # Same class, but both shells reject these. Widening only removes a false
     # block rather than closing a bypass — they are here because the stated
     # invariant is that a consumer never sees LESS text, which has to hold
     # whether or not the input happens to be runnable.
     printf '652-nested-unclosed-quote\tcat <<EOF\001$(echo "$(echo x" ; cat .env)\001EOF\n'
 } > "$CORPUS"
+
+# Assert the corpus is the shape its comments claim. `printf`'s escape handling
+# is subtle enough that two rows already shipped as single-line text reading
+# `hi\001# don't` verbatim, which quietly removed the only runnable coverage of
+# a give-up path. A row that cannot be what it says is not evidence.
+for want in 652-nested-unterminated 652-toplevel-comment-quote; do
+    if ! command grep -q "^${want}"$'\t'".*"$'\001' "$CORPUS"; then
+        printf 'FATAL: corpus row %s carries no encoded newline — check the printf quoting\n' \
+            "$want" >&2
+        exit 1
+    fi
+done
+if command grep -q '\\001' "$CORPUS"; then
+    printf 'FATAL: corpus carries a LITERAL backslash-001; a row is not the shape it claims\n' >&2
+    command grep -n '\\001' "$CORPUS" >&2
+    exit 1
+fi
 
 # Stay-allowed rows: ordinary nested substitutions with no secret read. More
 # text reaching a guard means more chances of a false block, so these are the

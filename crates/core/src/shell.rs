@@ -1813,15 +1813,19 @@ fn substitution_spans(body: &str) -> Vec<String> {
                     push_nonblank(&mut spans, &chars[start..]);
                     break;
                 }
-                // A top-level `$(` that runs off the end of the input is not a
-                // substitution the shell would run — bash rejects the line — so
-                // skip the `$` and keep scanning rather than carrying a
-                // truncated span. Unchanged behavior, and deliberately NOT
-                // merged with the arm above: widening here would splice
-                // unterminated heredoc PROSE into the segment stream, which is
-                // the false-block cost #475 already paid once. The arm is
-                // narrow on purpose — it is only reached when nothing nested
-                // failed, which is what `NestedUnresolved` is there to say.
+                // A top-level `$(` that ran off the end with NO quote open and
+                // nothing nested failed — the one shape where the shell agrees
+                // there is no terminator. Skip the `$` and keep scanning rather
+                // than carrying a truncated span.
+                //
+                // The asymmetry with the arm above is a security tradeoff, not
+                // a prose-splicing one: that arm splices body prose too. What
+                // separates them is that its drop was a measured bypass on text
+                // the shell executes, while nothing here is. Widening this arm
+                // as well would splice genuinely unterminated heredoc prose
+                // into the segment stream for no guard benefit, which is the
+                // #475 false-block cost. The arm is narrow on purpose, and the
+                // three [`ScanStop`] variants above are what keep it narrow.
                 Err(_) => {
                     i += 1;
                     continue;
@@ -2664,15 +2668,23 @@ const MAX_SUBSTITUTION_DEPTH: usize = 16;
 
 /// Why a substitution scan stopped without locating a terminator.
 ///
-/// The split is load-bearing, not bookkeeping, and it separates **facts about
-/// the input** from **facts about this scanner**.
+/// The split is load-bearing, not bookkeeping. Three variants say **this
+/// scanner gave up on text the shell may well run**, and a caller must never
+/// answer those by deleting a construct (ADR-0001: a guard's own limit must not
+/// hide a command the shell runs). `Unterminated` is the lone exception, and it
+/// says something much narrower than it looks: the scan ran off the end of the
+/// input **at this level, with no quote left open and nothing nested having
+/// failed**. That is the one shape where the shell agrees there is no closing
+/// paren, so a caller may keep whatever reading it had.
 ///
-/// Only `Unterminated` is the first kind: the scan ran out of input at its own
-/// level with nothing nested having failed, and bash rejects such a line, so a
-/// caller may keep whatever reading it had. The other two are the second kind —
-/// the shell runs the text and only this code gave up — and a caller must never
-/// answer them by deleting a construct (ADR-0001: a guard's own limit must not
-/// hide a command the shell runs).
+/// Every qualifier in that sentence was bought. Three review passes found three
+/// different ways to arrive at "no terminator" on a line the shell runs, and
+/// each time the deleting arm was reached because the stop reason had been
+/// flattened. Nesting past the cap. A nested scan that failed. A quoted run
+/// **this scanner opened and the shell did not** — `# don't` inside a
+/// substitution body is a comment to bash and zsh, and an apostrophe that opens
+/// `Quote::Single` here. Ask [`ScanStop::is_scanner_limit`] rather than matching
+/// variants, so the next one has to state its own answer.
 ///
 /// `NestedUnresolved` exists because the recursion created a way to reach the
 /// unterminated arm that has nothing to do with the input being unterminated.
@@ -2686,28 +2698,40 @@ const MAX_SUBSTITUTION_DEPTH: usize = 16;
 /// is that gap turning into a deletion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanStop {
-    /// Input ran out at this level with the substitution still open, and
-    /// nothing nested failed. The only variant that describes the input.
+    /// Input ran out at this level with no quote open and nothing nested
+    /// failed. The only variant the shell agrees with.
     Unterminated,
+    /// Input ran out inside a quoted run this scanner opened. The shell often
+    /// disagrees that a quote was open at all — a `#` comment's apostrophe is
+    /// the common case — so this says nothing about whether it runs the line.
+    QuoteUnresolved,
     /// A nested `$( )` scan failed, for any reason. Says nothing about whether
     /// the shell runs the outer construct — usually it does.
     NestedUnresolved,
     /// Nesting exceeded [`MAX_SUBSTITUTION_DEPTH`].
+    ///
+    /// Internal to the recursion: the nested arm relabels every nested failure
+    /// as `NestedUnresolved`, and the outermost call always enters with a
+    /// non-zero budget, so no caller outside
+    /// `scan_substitution_body_bounded` can observe this variant. Kept distinct
+    /// because collapsing it is how the first flip happened.
     DepthExceeded,
 }
 
 impl ScanStop {
-    /// Whether the stop is a limit of this scanner rather than a property of
-    /// the input, so a caller must widen what it surfaces instead of dropping
-    /// the construct.
+    /// Whether the stop is a limit of this scanner rather than something the
+    /// shell would also refuse, so a caller must widen what it surfaces instead
+    /// of dropping the construct.
     ///
     /// Callers ask this rather than matching the variants one by one. A variant
     /// added later then has to state its own answer, instead of silently
     /// falling into whichever arm the author happened to write last — which is
-    /// exactly how `NestedUnresolved` came to be needed.
+    /// how both `NestedUnresolved` and `QuoteUnresolved` came to be needed.
     fn is_scanner_limit(self) -> bool {
         match self {
-            ScanStop::NestedUnresolved | ScanStop::DepthExceeded => true,
+            ScanStop::QuoteUnresolved | ScanStop::NestedUnresolved | ScanStop::DepthExceeded => {
+                true
+            }
             ScanStop::Unterminated => false,
         }
     }
@@ -2812,6 +2836,18 @@ fn scan_substitution_body_bounded(
             other => body.push(other),
         }
         j += 1;
+    }
+    // Running out of input inside a quote this scanner opened is not the shell
+    // agreeing there is no terminator. `$(cat .env # don't⏎)` is a comment to
+    // bash and zsh, which close the substitution on the next line and run it;
+    // here the apostrophe opens `Quote::Single`, the `)` becomes quoted data,
+    // and the scan runs off the end. Reported as the scanner limit it is, so
+    // `substitution_spans` widens instead of deleting the construct — measured
+    // as a live miss on both the read and the write guard inside a heredoc.
+    // The underlying divergence (no `#` arm) is cadence-hooks#831 and is not
+    // fixed here; what is fixed is it costing the guards the whole span.
+    if quote.is_some() {
+        return Err(ScanStop::QuoteUnresolved);
     }
     Err(ScanStop::Unterminated)
 }
@@ -5843,24 +5879,34 @@ mod tests {
         // replaced the heredoc body with it. `cat .env` was deleted before any
         // guard ran, while bash executed it: a measured BLOCK -> ALLOW flip.
         //
-        // The boundary is the test. One level under the cap must locate the
-        // real terminator; one level over must widen, never drop.
+        // The boundary is the test, and it is pinned to the exact transition:
+        // the outer substitution spends one budget unit, so 15 nested levels is
+        // the last that locates a terminator and 16 is the first that widens.
+        // A trailing command after the substitution is what makes the two
+        // distinguishable — without it a widened span runs to the end of the
+        // input and is byte-identical to a correctly located one, which is a
+        // probe that cannot fail. Testing one level off the boundary would let
+        // a fencepost change in the budget arithmetic pass unnoticed.
         let filler = |n: usize| format!("{}echo x{}", "$(".repeat(n), ")".repeat(n));
-        let payload = |n: usize| format!("$(cat .env; {})", filler(n));
+        let subst = |n: usize| format!("$(cat .env; {})", filler(n));
+        let line = |n: usize| format!("{} ; echo tail", subst(n));
 
-        let under = payload(MAX_SUBSTITUTION_DEPTH - 2);
+        let last_ok = MAX_SUBSTITUTION_DEPTH - 1;
         assert_eq!(
-            substitution_spans(&under),
-            vec![under.clone()],
-            "under the cap the scan must locate the real terminator"
+            substitution_spans(&line(last_ok)),
+            vec![subst(last_ok)],
+            "at {last_ok} levels the scan must still locate the real terminator"
         );
 
         for over in [MAX_SUBSTITUTION_DEPTH, MAX_SUBSTITUTION_DEPTH + 4] {
-            let input = payload(over);
-            let spans = substitution_spans(&input);
+            let spans = substitution_spans(&line(over));
             assert!(
                 spans.iter().any(|s| s.contains("cat .env")),
                 "at {over} levels the depth cap deleted the payload: {spans:?}"
+            );
+            assert!(
+                spans.iter().any(|s| s.contains("echo tail")),
+                "at {over} levels the scan located a terminator it should not have: {spans:?}"
             );
         }
 
@@ -5882,10 +5928,12 @@ mod tests {
         // both bash and zsh run, and the read reached no guard.
         //
         // The trap is a `#` comment carrying an apostrophe inside the nested
-        // substitution: the shells read it as a comment, `scan_quote_syntax`
+        // substitution: the shell reads it as a comment, `scan_quote_syntax`
         // opens `Quote::Single` on the apostrophe and runs to end of input.
-        // The comment gap itself is #831 and is older than this branch; what is
-        // under test here is that the gap does not become a deletion.
+        // Measured: zsh runs this nested form, bash 5.3 rejects it — the
+        // top-level twin below is the one all three shells run. The comment gap
+        // itself is #831 and is older than this branch; what is under test here
+        // is that the gap does not become a deletion.
         for input in [
             // payload after the trap
             "$(echo \"$(echo hi\n# don't\n)\" ; cat .env)",
@@ -5908,6 +5956,24 @@ mod tests {
             spans.iter().any(|s| s.contains("cat .env")),
             "an unterminated nested quote deleted the span: {spans:?}"
         );
+
+        // The top-level twin, and the third distinct way to reach "no
+        // terminator" on a line the shell runs. No nesting is involved: the
+        // apostrophe in a `#` comment opens a quoted run bash and zsh never
+        // opened, the `)` on the next line becomes quoted data, and the scan
+        // runs off the end. Measured live before the fix: the read guard and
+        // the write guard both allowed a heredoc payload all three shells parse.
+        for input in [
+            "$(cat .env # don't\n)",
+            "$(echo x > .env # don't\n)",
+            "$(cat .env # say \"hi\n)",
+        ] {
+            let spans = substitution_spans(input);
+            assert!(
+                spans.iter().any(|s| s.contains(".env")),
+                "a quote this scanner opened deleted the span: {spans:?}"
+            );
+        }
 
         // Control: the nested scan SUCCEEDS here, and it is the outer `$(` that
         // runs off the end — a top-level unterminated input, which keeps the
@@ -5976,6 +6042,12 @@ mod tests {
         // have no nested `$(` at all — and each was already surfaced before
         // #652. They must stay surfaced: a future widening of the recursion
         // shows up here as a diff.
+        //
+        // `contains` is deliberate here, unlike the exact-body assertion in the
+        // headline test above. These rows assert the body is still REACHED at
+        // all; where its terminator lands is that test's job, and pinning exact
+        // bodies for five shapes would make this block fail on any harmless
+        // change to where they end.
         for input in [
             r#"echo $(echo "$(cat .env)")"#,
             r#"echo $(echo "`cat .env`")"#,
