@@ -52,6 +52,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-issue-tracker` | PreToolUse (Bash) | Nudge when `gh issue create` targets an owned repo that is not a known ecosystem tracker |
 | `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge |
 | `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed |
+| `guard-sops-decrypt` | PreToolUse (Bash) | Block a `sops` decrypt whose plaintext is not consumed by an allowed tool (key-name lister, `curl --config -`); `sops edit`/`set`/`-e` are untouched. Escape: `CADENCE_ALLOW_SOPS_DECRYPT=1` |
 | `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
 | `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) |
 | `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker) |

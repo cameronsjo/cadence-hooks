@@ -119,6 +119,8 @@ pub mod guard_read_model;
 pub mod guard_rm;
 /// SessionStart assertion that `guard-rm` is present and classifying correctly.
 pub mod guard_rm_liveness;
+/// Block a `sops` decrypt whose plaintext would reach the transcript.
+pub mod guard_sops_decrypt;
 /// Re-inject the gh-write allowlist + `-R` rule just before an untargeted gh write.
 pub mod inject_gh_write_context;
 /// Shared closing-keyword detection for GitHub issue references.
