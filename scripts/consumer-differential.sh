@@ -6,10 +6,21 @@
 # asserts the property the fix is supposed to have rather than the outcomes the
 # author happened to think of:
 #
-#   The recursion can only move a substitution's located terminator LATER in the
-#   input or leave it where it was. Consumers therefore see a SUPERSET of the
-#   text they saw before, so a verdict may move ALLOW -> BLOCK and must never
-#   move BLOCK -> ALLOW.
+#   WHEN THE SCAN SUCCEEDS, the recursion can only move a substitution's located
+#   terminator LATER in the input or leave it where it was, so consumers see a
+#   SUPERSET of the text they saw before.
+#
+#   The qualifier is the whole difficulty. The recursion also created new ways
+#   for a scan to FAIL — a nested body that cannot be terminated, or one that
+#   exhausts the depth cap — and on those paths a caller that drops the
+#   construct shows the guards LESS. Both were measured as real BLOCK -> ALLOW
+#   flips during review, and stating the invariant without the qualifier is what
+#   made a green run here read as proof of a property the code did not have.
+#   Every give-up path now widens, which is what restores the invariant; the
+#   rows below are what let this script notice if one stops.
+#
+#   Either way the assertion is the same: a verdict may move ALLOW -> BLOCK and
+#   must never move BLOCK -> ALLOW.
 #
 # Four assertions, each able to go red:
 #   1. no row/subcommand pair flips BLOCK -> ALLOW  (the safety invariant)
@@ -149,6 +160,22 @@ CORPUS="$WORK/corpus.tsv"
     printf '652-cap-heredoc\tcat <<EOF\001$(cat .env; %s)\001EOF\n' "$CHAIN"
     printf '652-cap-under\techo $(cat .env; %s)\n' \
         "$(c=''; e=''; for _ in $(seq 1 14); do c="\$(${c}"; e="${e})"; done; printf '%secho x%s' "$c" "$e")"
+    # A nested body this scanner cannot TERMINATE — the other way to reach the
+    # give-up arm, and the one the first cut of these rows could not reach. Every
+    # 652-* row above nests substitutions whose scan succeeds, so assertion 1 ran
+    # green over the exact gap the recursion opened. The trap is a `#` comment
+    # carrying an apostrophe inside the nested body: bash and zsh read it as a
+    # comment, the scanner opens a single-quoted run on the apostrophe and never
+    # closes it. Both rows are lines the shells run.
+    APOS=\'
+    TRAP="echo \"\$(echo hi\001# don${APOS}t\001)\""
+    printf '652-nested-unterminated\tcat <<EOF\001$(%s ; cat .env)\001EOF\n' "$TRAP"
+    printf '652-nested-unterminated-before\tcat <<EOF\001$(cat .env ; %s)\001EOF\n' "$TRAP"
+    # Same class, but both shells reject these. Widening only removes a false
+    # block rather than closing a bypass — they are here because the stated
+    # invariant is that a consumer never sees LESS text, which has to hold
+    # whether or not the input happens to be runnable.
+    printf '652-nested-unclosed-quote\tcat <<EOF\001$(echo "$(echo x" ; cat .env)\001EOF\n'
 } > "$CORPUS"
 
 # Stay-allowed rows: ordinary nested substitutions with no secret read. More
