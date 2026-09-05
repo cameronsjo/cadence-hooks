@@ -9,8 +9,8 @@
 
 use crate::forgectl_hint::{HintKind, is_forgectl_env_file, with_forgectl_hint};
 use crate::secret_patterns::{
-    command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
-    is_dangerous_secret_token, is_safe_template, is_secret_shaped_var_name,
+    Filename, command_may_reference_secret, envrc_carveout_allows, is_ambiguous, is_blocked,
+    is_dangerous_secret_token_at, is_safe_template, is_secret_shaped_var_name,
 };
 use cadence_hooks_core::shell::{
     command_segments, command_word, executable_tokens, is_assignment_word, split_segments, tokenize,
@@ -329,8 +329,17 @@ fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
     if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
         return Vec::new();
     }
+    // A pure file reader vouches for its operands: `cat prod.env` names a
+    // file, while `rg process.env src` names a pattern. Everything else is
+    // judged as an unqualified word, so only the unambiguous `.env` spellings
+    // apply — a path-qualified token still resolves on its own evidence.
+    let position = if PURE_FILE_READERS.contains(&cmd_word.as_ref()) {
+        Filename::Known
+    } else {
+        Filename::Unqualified
+    };
     argv.iter()
-        .filter_map(|t| dangerous_secret_operand(t))
+        .filter_map(|t| dangerous_secret_operand(t, position))
         .map(|value| (cmd_word.to_string(), value.to_string()))
         .collect()
 }
@@ -373,9 +382,14 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
     if METADATA_SAFE_COMMANDS.contains(&sub_word.as_ref()) {
         return None;
     }
+    let position = if PURE_FILE_READERS.contains(&sub_word.as_ref()) {
+        Filename::Known
+    } else {
+        Filename::Unqualified
+    };
     tokens
         .iter()
-        .find_map(|t| dangerous_secret_operand(t))
+        .find_map(|t| dangerous_secret_operand(t, position))
         .map(|value| (sub_word.to_string(), value.to_string()))
 }
 
@@ -432,7 +446,13 @@ fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
         // happens to peel to the same name. A peel-then-compare would let a
         // shell-opened read inherit the exemption written for a forgectl one.
         .filter(|t| !exempt.contains(&t.as_str()))
-        .filter_map(|t| dangerous_secret_operand(t))
+        // NOT vouched: these operands are a mix of flags and values, and an
+        // attached `--file=.env` is a flag, not a file named `.env` — vouching
+        // here turned the ordinary `forgectl env keys --file=.env` into a
+        // block, caught by the control test that exists for that call. The
+        // `--file` value is already exempted by name; a path-qualified token
+        // still resolves on its own evidence.
+        .filter_map(|t| dangerous_secret_operand(t, Filename::Unqualified))
         .map(|value| ("forgectl".to_string(), value.to_string()))
         .collect()
 }
@@ -480,7 +500,7 @@ fn exempt_file_operands(tokens: &[String]) -> Vec<&str> {
     // function's.
     if redirection_file_targets(tokens)
         .into_iter()
-        .any(is_dangerous_secret_token)
+        .any(|target| is_dangerous_secret_token_at(target, Filename::Known))
     {
         return Vec::new();
     }
@@ -660,10 +680,53 @@ fn attached_input_redirection_target(token: &str) -> Option<&str> {
 /// firewall described on [`segment_env_reads`]: quoted prose stays glued into
 /// one token by [`tokenize`] and is skipped, while a quoted filename stays a
 /// clean single token and is caught.
-fn dangerous_secret_operand(token: &str) -> Option<&str> {
+fn dangerous_secret_operand(token: &str, position: Filename) -> Option<&str> {
     let value = attached_input_redirection_target(token).unwrap_or(token);
-    (!value.chars().any(char::is_whitespace) && is_dangerous_secret_token(value)).then_some(value)
+    (!value.chars().any(char::is_whitespace) && is_dangerous_secret_token_at(value, position))
+        .then_some(value)
 }
+
+/// Commands whose every non-flag operand is a FILE THEY READ — nothing else.
+///
+/// Membership vouches that a bare operand names a file, which is what lets the
+/// `<name>.env` shape be recognized without a path separator: `cat prod.env` is
+/// a read, and `cat` takes nothing but filenames.
+///
+/// **An allowlist, and it fails OPEN.** A reader missing from this list means a
+/// real `<name>.env` read goes unrecognized — a missed nudge, cheap, and the
+/// `.env`/`.env.*` spellings still block through it. The alternative shape, a
+/// denylist of commands whose operands are not files, fails the other way: one
+/// unlisted tool turns `rg process.env src` into a hard block, which is the
+/// defect this list exists to prevent (cadence-hooks#854 review).
+///
+/// `grep`, `rg`, `sed`, and `awk` are excluded ON PURPOSE — their first operand
+/// is a PATTERN, and a pattern is where `process.env` lives. So
+/// `grep KEY prod.env` is an accepted miss; closing it needs per-command
+/// operand grammar, which is its own change (cadence-hooks#858). The pagers
+/// are excluded for the same reason one flag deeper; see the note below.
+/// `less` and `more` are deliberately ABSENT: both take a search PATTERN
+/// (`less -p <pattern>`, `more +/<pattern>`), which is the `grep` defect one
+/// flag deeper — `less -p process.env app.js` would block. A pager is also not
+/// something a non-interactive session runs, so their absence costs nothing.
+const PURE_FILE_READERS: &[&str] = &[
+    "cat",
+    "bat",
+    "head",
+    "tail",
+    "nl",
+    "od",
+    "xxd",
+    "hexdump",
+    "strings",
+    "source",
+    ".",
+    "shasum",
+    "md5sum",
+    "sha256sum",
+    "base64",
+    "tac",
+    "rev",
+];
 
 /// Is `token` a redirection, and if so does its target live in the NEXT token?
 ///
@@ -2149,6 +2212,135 @@ mod tests {
                 "{command} must be allowed"
             );
         }
+    }
+
+    #[test]
+    fn bash_suffix_env_is_a_read() {
+        // #854: `forgectl env --file` accepts `<name>.env`, and the shipped
+        // guidance names that shape as guarded, but the guard's own predicate
+        // recognized only `.env` and `.env.*` — so `cat prod.env` printed a
+        // dotenv file and exited 0.
+        for command in [
+            "cat prod.env",
+            "cat staging.env",
+            "cat app.env",
+            "cat <prod.env",
+            "head prod.env",
+            "cat ./prod.env",
+            "cat config/prod.env",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_suffix_env_is_a_named_miss_behind_a_pattern_taking_command() {
+        // `grep`/`rg`/`sed` take a PATTERN first, and a pattern is where
+        // `process.env` lives — so they are outside PURE_FILE_READERS and a
+        // bare `<name>.env` operand behind one is not recognized. Fail-open by
+        // choice: the alternative made `rg process.env src` a hard block.
+        // Pinned so the miss is a decision on the record, not a surprise.
+        for command in ["grep KEY prod.env", "rg KEY prod.env", "sed -n 1p prod.env"] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command} is an accepted miss"
+            );
+        }
+        // The controls that keep the miss narrow: a path-qualified token
+        // resolves on its own evidence, and the unambiguous `.env` spellings
+        // block through the same commands.
+        for command in [
+            "grep KEY ./prod.env",
+            "grep KEY config/prod.env",
+            "grep KEY .env",
+            "rg KEY .env.production",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{command} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_dotted_identifiers_are_not_filenames() {
+        // The false block this design exists to prevent. `process.env` is the
+        // most-typed identifier in JavaScript and is the same shape as
+        // `prod.env`; a first draft blocked every one of these.
+        for command in [
+            "grep -rn \"process.env\" src",
+            "rg -n process.env",
+            "grep -rn \"import.meta.env\" src",
+            "grep -rn \"Rails.env\" app",
+            "node -e \"console.log(process.env)\"",
+            "python -m app.env",
+            // A pager's search flag is the same defect one level deeper, which
+            // is why `less`/`more` are outside PURE_FILE_READERS.
+            "less -p process.env app.js",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_suffix_env_template_is_allowed() {
+        // The paired control for the widening. Same shape, template word, and
+        // the templates already trusted in the `.env.<suffix>` position must
+        // be trusted in the `<stem>.env` position too — otherwise this is a
+        // false block on a file that exists to be read.
+        for command in [
+            "cat example.env",
+            "cat sample.env",
+            "cat template.env",
+            "cat app.example.env",
+            "cat .env.example",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn read_tool_suffix_env_blocked_and_template_allowed() {
+        // The Read arm of the same gap, with its control beside it.
+        let blocked = SecretLeaksGuard::default().run(&make_read_input("/project/prod.env"));
+        assert_eq!(blocked.outcome, cadence_hooks_core::Outcome::Block);
+        let allowed = SecretLeaksGuard::default().run(&make_read_input("/project/example.env"));
+        assert_eq!(allowed.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    #[test]
+    fn bash_forgectl_suffix_env_redirect_target_is_refused() {
+        // #854 reaches the #853 exemption: a redirection whose target is
+        // `<name>.env` is a redirection to a secret file, so it must refuse
+        // the exemption the same way `> .env` does. Before this, `prod.env`
+        // classified clean and the exemption survived.
+        let refused = SecretLeaksGuard::default()
+            .run(&make_bash_input("forgectl env keys --file .env > prod.env"));
+        assert_eq!(refused.outcome, cadence_hooks_core::Outcome::Block);
+        // Control: a template target is not a secret, so the exemption stands.
+        let exempt = SecretLeaksGuard::default().run(&make_bash_input(
+            "forgectl env keys --file .env > example.env",
+        ));
+        assert_eq!(exempt.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]

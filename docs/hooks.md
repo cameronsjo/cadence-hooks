@@ -15,8 +15,8 @@ For how hooks communicate with Claude Code (stdin/stdout/exit codes), see
 |------|-------|--------------|
 | `terminology` | PreToolUse (Write, Edit) | Block inclusive terminology violations |
 | `orphaned-todos` | PreToolUse (Write, Edit) | Require `MARKER(#issue):` format for TODO/FIXME/HACK |
-| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading .env, credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check\|redact` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) |
-| `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting .env and credential files |
+| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path), credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check\|redact` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) |
+| `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path) and credential files |
 | `memory-guard` | PreToolUse (Write, Edit) | Enforce MEMORY.md line limits |
 | `git-safety` | PreToolUse (Bash) | Block force-push to main, reset --hard, etc. |
 | `line-endings` | PreToolUse (Write) | Validate shell script line endings (LF, not CRLF) |
