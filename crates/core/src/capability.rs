@@ -92,6 +92,14 @@ pub fn forgectl_present() -> bool {
 }
 
 /// [`on_path`] with a deadline: `false` if it has not answered in `budget`.
+///
+/// Not `shell::run_bounded_with`, and not the `deadline` module: both bound a
+/// **subprocess** — they spawn, poll `try_wait`, and kill. There is no process
+/// here to kill. `on_path` is an in-process `stat` loop, and the only way to
+/// stop waiting on a blocking syscall without a process to signal is to stop
+/// waiting on the *thread* running it. The budget is local and small for the
+/// same reason: this is a message-composition probe, not a git spawn, so it
+/// does not draw on the shared hook budget those helpers divide up.
 fn bounded_on_path(name: &'static str, budget: Duration) -> bool {
     let (tx, rx) = mpsc::channel();
     // A send into a dropped channel is an ordinary `Err` here, not a panic —
