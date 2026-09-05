@@ -269,10 +269,16 @@ pub fn is_dangerous_secret_token(token: &str) -> bool {
             .any(|frag| trimmed.contains(frag))
 }
 
-/// Cheap superset pre-filter for the Bash arms: might this lowercased command
-/// mention any deny-set secret file? A false positive only costs a tokenize.
+/// Cheap superset pre-filter for `prevent-secret-leaks`' Bash arm — its only
+/// production caller: might this lowercased command mention any deny-set
+/// secret file? A false positive only costs a tokenize.
 /// Generalizes the old `command.contains(".env")` gate (#138). Input must be
 /// already lowercased.
+///
+/// `prevent-secret-writes` deliberately does NOT use this (#655): it reads the
+/// raw command text, so a quote-split target (`.en''v`) — which only resolves
+/// to a secret name after tokenizing — reads as clean here and vetoes the
+/// resolver that would have caught it. Do not re-add it there.
 pub fn command_may_reference_secret(lower_command: &str) -> bool {
     BLOCKED_FILENAMES.iter().any(|&f| lower_command.contains(f))
         || BLOCKED_PATH_FRAGMENTS
