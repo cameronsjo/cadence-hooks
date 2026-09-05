@@ -390,7 +390,11 @@ const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check", "redact"]
 /// manager: every subcommand (`keys`, `set`, `get`, `check`, `redact`) is
 /// structurally value-free on stdout by design — `set`/`get` require piped
 /// stdin/`--clipboard` and print only a confirmation line (key name, not
-/// value), `redact` masks every value, and `keys`/`check` print names only.
+/// value), `redact` masks every `KEY=value` line, and `keys`/`check` print
+/// names only. Measured against forgectl 0.17.3, `redact` passes `#` COMMENT
+/// lines through verbatim, so a secret written into a comment is not masked
+/// (cadence-hooks#855) — the exemption's premise is about value lines, and
+/// this comment says so rather than overclaiming.
 /// A `.env`-shaped `--file` operand is therefore safe under exactly those five
 /// subcommands (#315). Every other spelling — another `forgectl` command group,
 /// an unrecognized `env` subcommand, or a bare `forgectl env` with none — falls
@@ -437,22 +441,47 @@ fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
 /// values of its `--file`/`-f` operand — or empty when this is not such a call.
 ///
 /// Empty is the safe answer and the default: every other shape (another command
-/// group, an unaudited `env` subcommand, no subcommand at all, or a stand-alone
-/// redirection operator that opens a file) exempts nothing and lets the
-/// standard scan judge every operand.
+/// group, an unaudited `env` subcommand, no subcommand at all, or a redirection
+/// whose target is itself a secret file) exempts nothing and lets the standard
+/// scan judge every operand.
 fn exempt_file_operands(tokens: &[String]) -> Vec<&str> {
-    // A redirection that OPENS A FILE means the shell, not `forgectl`, decides
-    // which file is read or written — nothing about the audited subcommand
-    // covers that.
+    // A redirection whose TARGET IS A SECRET FILE means the shell, not
+    // `forgectl`, decides what is read or written — nothing about the audited
+    // subcommand covers that. `set` reads stdin, so
+    // `forgectl env set K --file safe.txt < <env-file>` turns the whole secret
+    // into values written somewhere else (#842); `> <env-file>` is the write
+    // side of the same thing.
+    //
+    // The target is what matters, not the operator (#853), and the argument
+    // runs separately for each direction.
+    //
+    // OUT: every audited subcommand is value-free on stdout ([`SAFE_ENV_SUBCOMMANDS`]),
+    // so sending that stdout to a file which is not itself a secret cannot
+    // expose a value the transcript would not already have shown. Refusing on
+    // `>/dev/null` bought nothing and cost every script that writes one.
+    //
+    // IN: an input redirection genuinely feeds `set`, so the source file's
+    // contents do become values written elsewhere — which is exactly #842. The
+    // reason a non-secret source is nevertheless allowed is narrower and worth
+    // stating on its own: a file this guard's own patterns do not recognize is
+    // one it does not protect ANYWHERE, so `< /tmp/creds.txt` is allowed for
+    // the same reason `cat /tmp/creds.txt` is. The recognition set is the
+    // control; the redirection gate cannot be stricter than it without
+    // pretending to a coverage the guard does not have.
+    //
+    // The earlier "any path target" gate was wider than either reason.
     //
     // Bounded by the tokenizer, which splits on whitespace: an ATTACHED
     // operator (`--file safe.txt<.env`) arrives as one token and is not seen
     // here. Nothing rides on that today — the value is then judged by the
     // shape gate below, which no more accepts `safe.txt<.env` than
-    // `is_dangerous_secret_token` does — but the claim is "a stand-alone
-    // redirection operator that opens a file", not "any redirection", and the
-    // difference is the tokenizer's, not this function's.
-    if redirection_opens_a_file(tokens) {
+    // `is_dangerous_secret_token` does — but the claim is about a stand-alone
+    // redirection operator, and the difference is the tokenizer's, not this
+    // function's.
+    if redirection_file_targets(tokens)
+        .into_iter()
+        .any(is_dangerous_secret_token)
+    {
         return Vec::new();
     }
 
@@ -655,17 +684,23 @@ fn redirection_of(token: &str) -> Option<bool> {
     Some(rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '|')))
 }
 
-/// Does any redirection in `tokens` OPEN A FILE?
+/// Every FILE the redirections in `tokens` open, in order.
 ///
 /// [`redirection_of`] answers a different question — *where does the target
 /// live* (next token or attached) — which is all the dump arm's operand walk
 /// needs. It deliberately says nothing about *what* the target is, so
 /// `2>&1` and `>out.sh` are both `Some(false)` there. The `forgectl env`
-/// exemption needs the distinction the other function does not draw: an fd
-/// duplication or close (`2>&1`, `>&2`, `1>&2`, `2>&-`) has no path operand and
-/// opens nothing, while `< .env`, `> .env`, `2> .env`, and `>> .env` hand the
-/// shell a file `forgectl` never sees (#842). Only the second kind refuses the
-/// exemption (#846).
+/// exemption needs the target itself, which the other function does not
+/// surface: an fd duplication or close (`2>&1`, `>&2`, `1>&2`, `2>&-`) has no
+/// path operand and contributes nothing, while `< .env`, `> .env`, `2> .env`,
+/// and `>> .env` each name a file `forgectl` never sees (#842).
+///
+/// **A target, not a verdict.** The caller decides what a target means, and
+/// today the only caller refuses the exemption when a target is itself a
+/// secret file (#853) — `>/dev/null` and `> /tmp/out.txt` name files that
+/// cannot expose a value the audited subcommand never prints. Returning the
+/// names rather than a boolean is what let that judgment move to the caller
+/// without a second parser.
 ///
 /// **The tokens arrive already cut at `&`.** `core::shell::split_segments`
 /// treats a bare `&` as a control operator, so `forgectl env check --file .env
@@ -689,14 +724,15 @@ fn redirection_of(token: &str) -> Option<bool> {
 /// whose next token is not a bare fd number or `-` counts as opening a file,
 /// because bash reads `ls >& f` as a file redirect. Those branches are live
 /// only for a quoted or escaped `&`, which the segmenter does not cut — which
-/// is why `redirection_opens_a_file_classifies_each_operator_shape` exercises
+/// is why `redirection_file_targets_extracts_each_operator_shape` exercises
 /// this function directly rather than through the guard.
 // debt: a trailing bare `>` cannot tell `2>&1` from `>& out.txt`; containment
 // rests on the target's own segment being scanned. Upgrade trigger: the
 // `core::shell` segmenter learning to keep `>&` joined (cadence-hooks#848),
 // after which the `Some(true)` fd branch below becomes reachable and this
 // ceases to be an approximation.
-fn redirection_opens_a_file(tokens: &[String]) -> bool {
+fn redirection_file_targets(tokens: &[String]) -> Vec<&str> {
+    let mut targets = Vec::new();
     let mut rest = tokens.iter().peekable();
     while let Some(token) = rest.next() {
         match redirection_of(token) {
@@ -712,25 +748,40 @@ fn redirection_opens_a_file(tokens: &[String]) -> bool {
                     && (target == "-"
                         || (!target.is_empty() && target.chars().all(|c| c.is_ascii_digit())));
                 if !target_is_fd {
-                    return true;
+                    targets.push(target);
                 }
             }
-            // `>out.sh`, `2>&1`, `>&2` — the operator carries its own target.
-            // Strip the fd prefix, the `&>` prefix, and the operator run; an
-            // `&`-led remainder duplicates or closes a descriptor, anything
-            // else names a file.
+            // `>out.sh`, `2>&1`, `>&2`, `>|clobber.txt` — the operator carries
+            // its own target. Strip the fd prefix, the `&>` prefix, and the
+            // operator run; an `&`-led remainder duplicates or closes a
+            // descriptor, anything else names a file.
+            //
+            // The trim set must match [`redirection_of`]'s punctuation set, or
+            // the two disagree about where the operator ends and this function
+            // returns a target the shell never opens. `|` is the force-clobber
+            // operator's second character (`>|`), and trimming only `>`/`<`
+            // yielded `|.env` — a token whose basename matches no secret
+            // pattern, so a real `.env` write target classified clean and
+            // regained the exemption. `&` stays out of the set deliberately:
+            // there it is the fd sigil this arm tests for, not punctuation to
+            // discard.
             Some(false) => {
                 let target = token.trim_start_matches(|c: char| c.is_ascii_digit());
                 let target = target.strip_prefix('&').unwrap_or(target);
-                let target = target.trim_start_matches(['>', '<']);
-                if !target.starts_with('&') {
-                    return true;
+                let target = target.trim_start_matches(['>', '<', '|']);
+                // Unreachable by construction — `redirection_of` returns
+                // `Some(true)`, not `Some(false)`, for a token that is entirely
+                // operator punctuation, so something always survives the trim.
+                // Kept so a future change to that function cannot silently push
+                // an empty target into a caller's classifier.
+                if !target.is_empty() && !target.starts_with('&') {
+                    targets.push(target);
                 }
             }
             None => {}
         }
     }
-    false
+    targets
 }
 
 /// The dump decision for one segment's tokens.
@@ -2124,69 +2175,121 @@ mod tests {
     }
 
     #[test]
-    fn redirection_opens_a_file_classifies_each_operator_shape() {
+    fn redirection_file_targets_extracts_each_operator_shape() {
         // A table over the function itself, because every case below that
         // carries an unquoted `&` is unreachable through `run` — the shared
         // segmenter cuts there — and a guard-level test could not tell a
         // working branch from a dead one.
         let tokens = |line: &str| -> Vec<String> { tokenize(line) };
-        for (line, opens) in [
-            // Attached fd duplication and close: no file.
-            ("cmd 2>&1", false),
-            ("cmd >&2", false),
-            ("cmd 1>&2", false),
-            ("cmd 2>&-", false),
-            // Bare `>&`/`<&` with an fd or close target: no file.
-            ("cmd >& 2", false),
-            ("cmd <& 0", false),
-            ("cmd >& -", false),
+        for (line, expected) in [
+            // Attached fd duplication and close: no file opened, so no target.
+            ("cmd 2>&1", vec![]),
+            ("cmd >&2", vec![]),
+            ("cmd 1>&2", vec![]),
+            ("cmd 2>&-", vec![]),
+            // Bare `>&`/`<&` with an fd or close target: still no file.
+            ("cmd >& 2", vec![]),
+            ("cmd <& 0", vec![]),
+            ("cmd >& -", vec![]),
             // A trailing bare operator is what an `&`-split fd duplication
-            // leaves behind.
-            ("cmd 2>", false),
-            ("cmd >", false),
+            // leaves behind — its target is in the next segment, not here.
+            ("cmd 2>", vec![]),
+            ("cmd >", vec![]),
             // Bash reads `>& word` as redirecting BOTH descriptors to a file.
-            ("cmd >& out.txt", true),
-            // Every path-target spelling.
-            ("cmd < .env", true),
-            ("cmd > .env", true),
-            ("cmd >> .env", true),
-            ("cmd 2> .env", true),
-            ("cmd <>.env", true),
-            ("cmd <<< word", true),
-            ("cmd >out.sh", true),
-            ("cmd 2>>log", true),
-            ("cmd &>out.txt", true),
+            ("cmd >& out.txt", vec!["out.txt"]),
+            // Every path-target spelling, spaced and attached.
+            ("cmd < .env", vec![".env"]),
+            ("cmd > .env", vec![".env"]),
+            ("cmd >> .env", vec![".env"]),
+            ("cmd 2> .env", vec![".env"]),
+            ("cmd <>.env", vec![".env"]),
+            ("cmd <<< word", vec!["word"]),
+            ("cmd >out.sh", vec!["out.sh"]),
+            ("cmd 2>>log", vec!["log"]),
+            ("cmd &>out.txt", vec!["out.txt"]),
+            ("cmd >/dev/null", vec!["/dev/null"]),
+            // `>|` is the force-clobber operator: `|` is part of the operator,
+            // not the first character of the filename. Trimming only `>`/`<`
+            // yielded `|.env`, whose basename matches no secret pattern, so a
+            // secret target regained the exemption.
+            ("cmd >|.env", vec![".env"]),
+            ("cmd >| .env", vec![".env"]),
+            ("cmd 2>|log", vec!["log"]),
+            // A heredoc's word is a delimiter, not a filename. It is returned
+            // anyway, which is fail-closed: the cost is a false block on a
+            // delimiter that happens to be named like a secret.
+            ("cmd << EOF", vec!["EOF"]),
+            // Several redirections in one command: every target, in order.
+            ("cmd < .env > /tmp/out", vec![".env", "/tmp/out"]),
+            ("cmd 2>&1 > /tmp/out", vec!["/tmp/out"]),
             // No redirection at all.
-            ("cmd --file .env", false),
+            ("cmd --file .env", vec![]),
         ] {
             assert_eq!(
-                redirection_opens_a_file(&tokens(line)),
-                opens,
-                "{line} must{} open a file",
-                if opens { "" } else { " not" }
+                redirection_file_targets(&tokens(line)),
+                expected,
+                "{line} target extraction"
             );
         }
     }
 
     #[test]
-    fn bash_forgectl_path_redirection_is_still_refused() {
+    fn bash_forgectl_harmless_redirect_target_is_still_exempt() {
+        // #853: the exemption's premise is that every allowed subcommand is
+        // value-free ON STDOUT, so sending that stdout to a file which is not
+        // itself a secret cannot expose a value. `>/dev/null` is the one that
+        // costs daily — it is what a script writes.
+        for command in [
+            "forgectl env set PORT --file .env >/dev/null",
+            "forgectl env keys --file .env > /tmp/out.txt",
+            "forgectl env keys --file .env >> /tmp/log",
+            "forgectl env check --file .env --json > report.json",
+            "forgectl env keys --file .env < /dev/null",
+            // A here-string feeds literal text, so it opens no file at all.
+            "forgectl env keys --file .env <<< hi",
+            // The #846 controls, unchanged by the narrowing.
+            "forgectl env check --file .env --json 2>&1",
+            "forgectl env keys --file .env 1>&2",
+            "forgectl env keys --file .env 2>&-",
+        ] {
+            let result = SecretLeaksGuard::default().run(&make_bash_input(command));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{command} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_forgectl_secret_redirection_target_is_still_refused() {
         // The control for the case above, and the #842 finding it must not
-        // reopen: every one of these opens a FILE, so the shell — not
-        // forgectl — decides what is read or written, and the exemption is
-        // refused.
+        // reopen: in every one of these the redirection's target is ITSELF a
+        // secret file, so the shell — not forgectl — decides what is read or
+        // written, and the exemption is refused. `< .env` is #842's own
+        // finding: `set` reads stdin, so the whole file becomes a value
+        // written somewhere else.
         //
-        // The last three pair an fd duplication with a path redirection. They
-        // do NOT exercise the mixed case inside one segment — the shared
+        // The last three pair an fd duplication with a secret target. They do
+        // NOT exercise the mixed case inside one segment — the shared
         // segmenter cuts at the `&`, so `< .env` lands in a segment of its own
         // and blocks there, through the standard scan. That is the honest
         // account of why they are red-if-broken, and it is the reason the
-        // attached spellings are here: they were the shape that regressed.
+        // attached spellings are here: they were the shape that regressed
+        // under #846.
         for command in [
             "forgectl env keys --file safe.txt < .env",
             "forgectl env keys --file safe.txt > .env",
             "forgectl env keys --file safe.txt 2> .env",
-            "forgectl env keys --file .env > /tmp/out",
+            "forgectl env keys --file .env > .env.backup",
             "forgectl env keys --file safe.txt <.env",
+            // The ATTACHED output spellings, including the force-clobber `>|`
+            // whose `|` belongs to the operator. `>|.env` allowed at one point
+            // in this fix's own history, for exactly one untrimmed character.
+            "forgectl env keys --file .env >.env.backup",
+            "forgectl env keys --file .env >>.env.backup",
+            "forgectl env keys --file .env >|.env",
+            "forgectl env keys --file .env >| .env",
             "forgectl env keys --file safe.txt 2>&1 < .env",
             "forgectl env keys --file .env 2>&1 <.env",
             "forgectl env keys --file .env 2>&1 0<.env",

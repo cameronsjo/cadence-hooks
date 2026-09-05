@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The `forgectl env` exemption refused on a harmless redirection target, so `>/dev/null` blocked** (`prevent-secret-leaks`, cadence-hooks#853). 0.92.0 refused the exemption for **any** redirection with a path target, which is wider than the reason behind it: the audited subcommands (`keys`, `set`, `get`, `check`, `redact`) are value-free **on stdout**, so sending that stdout to a file which is not itself a secret cannot expose a value. `forgectl env set PORT --file <env-file> >/dev/null`, `> /tmp/out.txt`, `>> /tmp/log`, `> report.json`, and `< /dev/null` all blocked; `>/dev/null` is the one that cost daily, because it is what a script writes. The refusal now keys on the **target**: a redirection whose target is itself a secret file refuses the exemption, in either direction. Every #842 and #846 control is unchanged — `< <env-file>` still blocks (the original finding: `set` reads stdin, so the whole file becomes values written elsewhere), as do `> <env-file>`, `2> <env-file>`, `2>&1 < <env-file>`, a path-qualified `./forgectl`, an unaudited subcommand, and a plain `cat`. A here-string is now allowed when its word is not secret-shaped (`<<< hi`); `<<< .env` still blocks, because the extractor hands the word to the same classifier without knowing a here-string names no file — fail-closed, and the cost is a false block on a delimiter that happens to be named like a secret. **Both directions are covered but by different arguments:** stdout is safe because the subcommands print no values, while a non-secret *source* file is allowed only because a file the guard's patterns do not recognize is one it does not protect anywhere — `< /tmp/creds.txt` is allowed for the same reason `cat /tmp/creds.txt` is.
+
 ## [0.92.0] - 2026-09-05
 
 ### Fixed
