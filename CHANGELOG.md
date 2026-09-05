@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`cat <.env` printed the file and `prevent-secret-leaks` allowed it.** An ATTACHED redirection operator glues onto its target, so the whole thing arrives as the single token `<.env` — and the dangerous-token test takes a basename by splitting on `/`, so it saw `<.env`, which matches no secret-file pattern. Measured: `bash -c 'cat <.env'` printed the file's contents while the guard exited 0, and `head <.env`, `grep KEY <.env`, `cat 0<.env`, and `cat <.env.local` all did the same. The spaced spelling `cat < .env` always blocked, which is what kept this hidden. An attached **input** redirection (`<`, `n<`, `<>`) is now peeled before the file is classified, so the guard judges the `.env` it opens. Output operators are deliberately not peeled — `prevent-secret-writes` owns `echo x >.env` and blocks it — and `<<`/`<<<` are not either, because a heredoc and a here-string take a literal word rather than a filename. **Known cost:** `tokenize` strips quotes, so a search for the literal string (`grep -F '<.env' notes.txt`, `rg "<.env" src`) is indistinguishable from a redirection and now blocks. That is the same widening `grep '.env' notes.txt` already carried, and the `Or:` hint names the way through.
+
+- **An fd duplication no longer refuses the `forgectl env` read exemption** (`prevent-secret-leaks`, cadence-hooks#846). The 0.91.0 refusal keyed on redirection *syntax*, so `forgectl env check --file <env-file> --json 2>&1` blocked with the generic env-file message — whose own hint recommends that command. `2>&1`, `1>&2`, `>&2`, and `2>&-` duplicate or close a descriptor and open no file, so none of them lets the shell read or write a secret the subcommand was not audited on. A redirection whose target is a **path** still refuses the exemption, which is what 0.91.0 was protecting: `< <env-file>`, `> <env-file>`, `2> <env-file>`, `>> <path>`, `<<< <word>`, and an fd duplication sitting beside a path redirection in the same command all keep blocking.
+
 ## [0.91.0] - 2026-09-05
 
 ### Changed
