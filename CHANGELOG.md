@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`prevent-secret-leaks` now resolves its `cd` scan through the same command-word path as its operand scan** (cadence-hooks#538). The scan that decides whether a chained directory change invalidates the relative-`.envrc` carve-out split on bare whitespace and read `argv[0]` only, while the operand scan beside it already tokenized quote-aware, peeled wrapper words, and took a basename. Sixteen forms exploited the gap — `command cd`, `builtin cd`, `eval cd`, `\cd`, `'cd'`, `c""d`, `time cd`, `if`/`while`/`until`/`for`/`case`/function-body compounds, a leading `VAR=value` assignment, and `env -C` in both bare and path-spelled spellings — each measured `Allow` on 0.89.0 and each confirmed to change the working directory under bash 3.2 and 5.3, leaving the guard to prove a `.envrc` the shell never read. All sixteen now block; 29 benign controls (`cdk`, `cdrecord`, `abcd`, `make cd`, `find . -name cd`, `docker run -w`, every ordinary loader read) stay allowed. `env`'s chdir flag is judged by `env`'s own option grammar rather than a substring test, so `env -uC` — where the `C` is `-u`'s value — is correctly not a chdir. Detector-only and blocks-only: the single verdict it can change is `Allow` → `Block` on a relative `.envrc` read.
+
 ## [0.89.0] - 2026-09-02
 
 ### Added
