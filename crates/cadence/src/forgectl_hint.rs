@@ -19,6 +19,8 @@
 //!   sites render a literal placeholder precisely because the only path they
 //!   could interpolate is one parsed out of the agent's own command.
 
+use crate::secret_patterns::is_dotenv_shaped;
+
 /// Which of the two guards is speaking — they recommend different verbs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HintKind {
@@ -48,21 +50,27 @@ fn path_is_renderable(path: &str) -> bool {
 /// Is `token` a file `forgectl env --file` accepts — the `.env`, `.env.*`, and
 /// `*.env` shapes?
 ///
-/// Deliberately narrower than the guards' own deny-set: `.envrc` is a direnv
-/// loader, not a dotenv file, and every non-`.env` credential store is out of
-/// scope. Takes the final path component and tolerates the operand decorations
-/// the Bash arms already strip (`@.env`, `.env)`).
+/// Deliberately narrower than the guards' own deny-set in one direction and
+/// wider in another: `.envrc` is a direnv loader, not a dotenv file, and every
+/// non-`.env` credential store is out of scope — while a `.env.example` IS
+/// something `forgectl env` will manage, though the deny-set exempts it. Those
+/// two differences are the reason this predicate and
+/// `is_env_family_secret` stay separate functions.
+///
+/// **The SHAPE question is shared** ([`is_dotenv_shaped`]), because the two
+/// predicates silently disagreed about it: this one accepted `<name>.env` and
+/// the deny-set did not, so `prod.env` was a file `forgectl env --file` would
+/// take and the guards would not protect (cadence-hooks#854).
+///
+/// Takes the final path component and tolerates the operand decorations the
+/// Bash arms already strip (`@.env`, `.env)`).
 pub(crate) fn is_forgectl_env_file(token: &str) -> bool {
     let lower = token.to_lowercase();
     let trimmed = lower.strip_prefix('@').unwrap_or(&lower);
     let trimmed = trimmed.trim_end_matches(')');
     let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
 
-    component == ".env"
-        || component
-            .strip_prefix(".env.")
-            .is_some_and(|r| !r.is_empty())
-        || (component.ends_with(".env") && component.len() > ".env".len())
+    is_dotenv_shaped(component)
 }
 
 /// The line appended to an env-file block. Pure: same inputs, same string,

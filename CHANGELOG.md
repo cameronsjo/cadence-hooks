@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`cat prod.env` printed a dotenv file and a `Write` to it was allowed — on both guards** (cadence-hooks#854). Two predicates in the same file disagreed about what a dotenv file is: `is_forgectl_env_file` (which decides what `forgectl env --file` accepts) knew all three shapes — `.env`, `.env.*`, and `<name>.env` — while the guards' deny-set predicate knew only the first two. So `prod.env`, `staging.env`, and `app.env` were readable and writable while `.env` blocked, and the guidance that names `*.env` among the guarded env files was false for exactly that shape. Measured on 0.93.0: `cat prod.env`, `grep KEY prod.env`, `cat <prod.env`, a `Write` to `prod.env`, `rm prod.env`, and `cp secrets prod.env` all exited 0.
+  - **The shape question now has one home** (`is_dotenv_shaped`), consumed by both predicates. They are deliberately **not** merged: the deny-set adds `.envrc` and subtracts templates, while the forgectl predicate does neither — `forgectl env` will manage a `.env.example` and will not touch a direnv loader. Merging them would force one of those four answers to be wrong; sharing the shape is what stops them drifting again.
+  - **Templates stay allowed in both positions.** `SAFE_SUFFIXES` was written for `.env.<word>`, where a plain `ends_with` is the whole test — but `example.env` ends with `.env`, not with `.example`, so the same words needed checking on the other side of the name. `example.env`, `sample.env`, `template.env`, `defaults.env`, `test.env`, `ci.env`, and `app.example.env` are allowed exactly as `.env.example` always was.
+  - **`<name>.env` is recognized only where the caller knows it holds a path**, because that shape is not filename-only: `process.env` is the most-typed identifier in JavaScript, `Rails.env` in Ruby, `import.meta.env` in Vite — dotted expressions, not files, and indistinguishable from `prod.env` by any charset or pattern rule. So a tool's `file_path`, a redirection target, a writer verb's operand, an operand of a command that reads nothing but files (`cat`, `head`, `tail`, `less`, …), and any token carrying a `/` all qualify; a bare word off a command line does not. `.env` and `.env.*` stay unconditional — nothing is *spelled* that way but a dotenv file.
+  - **Named misses, fail-open by choice.** `grep`, `rg`, `sed`, and `awk` take a **pattern** first, and a pattern is where `process.env` lives, so a bare `grep KEY prod.env` is not recognized — `grep KEY ./prod.env` and `grep KEY .env` still block. Closing that needs per-command operand grammar, filed as cadence-hooks#858. `dd if=prod.env` likewise stays with the `dd if=.env` gap in cadence-hooks#850.
+  - **This reaches the #853 exemption too:** a redirection whose target is `<name>.env` is a redirection to a secret file, so `forgectl env keys --file .env > prod.env` now refuses the exemption and blocks, where before the target classified clean. `> example.env` and `> /tmp/out.txt` still stand.
+  - **Known costs, both named rather than discovered later:** `echo KEY=v > build.env` now blocks, and GitLab CI's `artifacts:reports:dotenv` convention writes exactly that filename — usually with non-secret job variables. That is intended scope (a `<name>.env` written by a job is a dotenv file). And a token carrying a `/` counts as a path on its own evidence, so `more +/process.env app.js` blocks on its search flag; `less -p process.env app.js` does not, and neither pager is in the vouching set.
+
 ## [0.93.0] - 2026-09-05
 
 ### Fixed

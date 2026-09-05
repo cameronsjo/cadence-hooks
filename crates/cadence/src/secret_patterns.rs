@@ -77,6 +77,16 @@ pub fn ambiguous_key_material_message(prefix: &str, filename: &str) -> String {
 }
 
 /// Check if a filename is a safe template (e.g., `.env.example`).
+///
+/// **Suffix position only** — this is the general template test, not the dotenv
+/// one. It answers `false` for `example.env`, because `example.env` ends with
+/// `.env`, not with `.example`; [`is_dotenv_template`] is the predicate that
+/// knows a template word can sit in the stem. The two are kept apart on
+/// purpose: this one runs on any filename, while the stem arm is meaningful
+/// only once a component is already dotenv-shaped. A `SAFE_SUFFIXES` edit
+/// reaches both, which is the coupling worth remembering — two template
+/// predicates disagreeing about a shape is how cadence-hooks#854 happened one
+/// level up.
 pub fn is_safe_template(filename: &str) -> bool {
     let lower = filename.to_lowercase();
     SAFE_SUFFIXES.iter().any(|s| lower.ends_with(s))
@@ -126,8 +136,9 @@ pub fn is_ambiguous(filename: &str) -> bool {
 }
 
 /// True if a lowercased path component is a dangerous `.env`-family secret:
-/// `.env`, `.envrc`, or `.env.<x>` where `<x>` is non-empty and the component
-/// does not end in a [`SAFE_SUFFIXES`] template suffix (`.env.example`, etc.).
+/// `.envrc`, or any [`is_dotenv_shaped`] component (`.env`, `.env.<x>`,
+/// `<name>.env`) that is not a template ([`is_dotenv_template`] —
+/// `.env.example`, `example.env`).
 ///
 /// Shared by [`is_blocked`] (the Read/Grep/Write/Edit tool paths) and
 /// [`is_dangerous_env_token`] (the Bash path) so the tool and shell guards
@@ -136,12 +147,116 @@ pub fn is_ambiguous(filename: &str) -> bool {
 /// `.env.development.local`, … and let the tools read what the shell blocked
 /// (#64). Callers pass an already-lowercased basename/component.
 pub(crate) fn is_env_family_secret(component: &str) -> bool {
-    if component == ".env" || component == ".envrc" {
+    is_env_family_secret_at(component, Filename::Known)
+}
+
+/// [`is_env_family_secret`], told whether the caller knows this names a file.
+pub(crate) fn is_env_family_secret_at(component: &str, position: Filename) -> bool {
+    // `.envrc` is a direnv loader rather than a dotenv file. It is in the deny
+    // set and NOT in the dotenv shape — exactly the kind of difference the
+    // shared shape test exists to keep separable from the shape question.
+    if component == ".envrc" {
         return true;
     }
+    is_dotenv_shaped_at(component, position) && !is_dotenv_template(component)
+}
 
-    match component.strip_prefix(".env.") {
-        Some(rest) if !rest.is_empty() => !SAFE_SUFFIXES.iter().any(|s| component.ends_with(s)),
+/// Is this lowercased component DOTENV-SHAPED — `.env`, `.env.<x>`, or
+/// `<name>.env`? **Shape only; no policy.**
+///
+/// The single home for the three spellings, because two predicates need the
+/// same shape question and disagreed about it for months. `is_forgectl_env_file`
+/// (which decides what `forgectl env --file` accepts) knew all three;
+/// [`is_env_family_secret`] knew only the first two, so `prod.env` was readable
+/// and writable while `.env` blocked, and the shipped guidance naming `*.env`
+/// as guarded was false for that shape (cadence-hooks#854).
+///
+/// The two callers are **not** merged and must not be: they layer different
+/// policy on the same shape. The deny-set predicate adds `.envrc` and subtracts
+/// templates; the forgectl predicate does neither, because `forgectl env` will
+/// happily manage a `.env.example` and will not touch a direnv loader. Merging
+/// them would force one of those four answers to be wrong. Sharing the shape is
+/// what stops them drifting again.
+pub(crate) fn is_dotenv_shaped(component: &str) -> bool {
+    is_dotenv_shaped_at(component, Filename::Known)
+}
+
+/// Does the caller KNOW this string names a file, or is it an unqualified word
+/// off a command line that might name anything?
+///
+/// **This distinction is what makes the `<name>.env` shape safe to recognize.**
+/// `<name>.env` is not a filename-only spelling: `process.env` is the
+/// most-typed identifier in JavaScript, `Rails.env` in Ruby,
+/// `import.meta.env` in Vite — dotted expressions, not files, and
+/// indistinguishable from `prod.env` by any charset or pattern rule. A first
+/// draft of this fix recognized the shape everywhere and turned
+/// `rg process.env src` into a hard block whose remediation line advised
+/// `forgectl env keys --file` on a grep pattern. That is the exact cost a
+/// guardrail is meant not to impose.
+///
+/// `.env` and `.env.<x>` need no such care — nothing is *spelled* that way but
+/// a dotenv file — which is why those two arms stay unconditional and only the
+/// third is gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filename {
+    /// A real path: a tool's `file_path`, a redirection target, an operand of
+    /// a writer verb, an operand of a pure file-reading command, or any token
+    /// carrying a `/`. All three shapes apply.
+    Known,
+    /// An unqualified word off a command line, which may name anything. Only
+    /// the unambiguous `.env` spellings apply; `<name>.env` is left alone.
+    Unqualified,
+}
+
+/// [`is_dotenv_shaped`], with the third arm gated on the caller vouching that
+/// the string names a file.
+pub(crate) fn is_dotenv_shaped_at(component: &str, position: Filename) -> bool {
+    if component == ".env"
+        || component
+            .strip_prefix(".env.")
+            .is_some_and(|rest| !rest.is_empty())
+    {
+        return true;
+    }
+    position == Filename::Known
+        && component
+            .strip_suffix(".env")
+            .is_some_and(|stem| !stem.is_empty())
+}
+
+/// Is this dotenv-shaped component a TEMPLATE — a file that exists to be read?
+///
+/// [`SAFE_SUFFIXES`] was written for the `.env.<word>` position, where a plain
+/// `ends_with` is the whole test. The `<name>.env` shape puts the same words on
+/// the other side of the name, where `ends_with` cannot see them: `example.env`
+/// ends with `.env`, not with `.example`. A widening that trusted a word in one
+/// position and not the other would block `example.env` — a file whose entire
+/// purpose is to be committed and read — so the stem is checked against the
+/// same list, both as a bare word (`example.env`) and as a suffix of a longer
+/// stem (`app.example.env`).
+fn is_dotenv_template(component: &str) -> bool {
+    // The `.env.<word>` position: `.env.example`, `.env.test`.
+    if SAFE_SUFFIXES.iter().any(|s| component.ends_with(s)) {
+        return true;
+    }
+    // The `<stem>.env` position: `example.env`, `app.example.env`.
+    match component.strip_suffix(".env") {
+        Some(stem) if !stem.is_empty() => SAFE_SUFFIXES.iter().any(|suffix| {
+            // `.pub` is in SAFE_SUFFIXES to spare `id_rsa.pub`; in the STEM
+            // position it means nothing — `pub.env` and `keys.pub.env` are not
+            // a template convention anyone uses, so borrowing the word here
+            // would exempt a real dotenv file for no benefit.
+            if *suffix == ".pub" {
+                return false;
+            }
+            // `".example"` -> `"example"`. `strip_prefix` rather than a byte
+            // slice: `&suffix[1..]` is only safe while every entry is ASCII and
+            // dot-led, and nothing pins that — a future non-ASCII entry would
+            // panic on a non-char-boundary inside a PreToolUse hook, and a
+            // dot-less one would silently compute the wrong word.
+            let word = suffix.strip_prefix('.').unwrap_or(suffix);
+            stem == word || stem.ends_with(suffix)
+        }),
         _ => false,
     }
 }
@@ -238,12 +353,28 @@ pub(crate) fn envrc_carveout_allows(filename: &str, content: Option<&str>) -> bo
 /// Strips one leading `@` (the curl/httpie upload-operand idiom `@.env`) and
 /// trailing `)` (subshell close) before classifying via [`is_env_family_secret`].
 pub fn is_dangerous_env_token(token: &str) -> bool {
+    is_dangerous_env_token_at(token, Filename::Unqualified)
+}
+
+/// [`is_dangerous_env_token`], told whether the caller already knows the token
+/// names a file. A token carrying a `/` is path-qualified on its own evidence,
+/// so `cat dir/prod.env` needs no vouching from the caller.
+pub fn is_dangerous_env_token_at(token: &str, position: Filename) -> bool {
     let lower = token.to_lowercase();
     let trimmed = lower.strip_prefix('@').unwrap_or(&lower);
     let trimmed = trimmed.trim_end_matches(')');
     let component = trimmed.rsplit('/').next().unwrap_or(trimmed);
 
-    is_env_family_secret(component)
+    is_env_family_secret_at(component, resolve_position(trimmed, position))
+}
+
+/// A token holding a `/` is a path whatever the caller believed.
+fn resolve_position(trimmed: &str, position: Filename) -> Filename {
+    if position == Filename::Known || trimmed.contains('/') {
+        Filename::Known
+    } else {
+        Filename::Unqualified
+    }
 }
 
 /// True if a shell token resolves to ANY deny-set secret file — the whole
@@ -255,6 +386,13 @@ pub fn is_dangerous_env_token(token: &str) -> bool {
 /// stay clean. Filenames match the final path component exactly; fragments
 /// match as a substring of the whole token.
 pub fn is_dangerous_secret_token(token: &str) -> bool {
+    is_dangerous_secret_token_at(token, Filename::Unqualified)
+}
+
+/// [`is_dangerous_secret_token`], told whether the caller already knows the
+/// token names a file — a redirection target, a writer verb's operand, or an
+/// operand of a command that does nothing but read files.
+pub fn is_dangerous_secret_token_at(token: &str, position: Filename) -> bool {
     let lower = token.to_lowercase();
     let trimmed = lower.strip_prefix('@').unwrap_or(&lower);
     let trimmed = trimmed.trim_end_matches(')');
@@ -262,7 +400,7 @@ pub fn is_dangerous_secret_token(token: &str) -> bool {
     if is_safe_template(component) {
         return false;
     }
-    is_env_family_secret(component)
+    is_env_family_secret_at(component, resolve_position(trimmed, position))
         || BLOCKED_FILENAMES.contains(&component)
         || BLOCKED_PATH_FRAGMENTS
             .iter()
@@ -419,6 +557,106 @@ mod tests {
         // Lookalikes that aren't the family.
         assert!(!is_env_family_secret(".environment"));
         assert!(!is_env_family_secret("settings.environment"));
+    }
+
+    #[test]
+    fn env_family_secret_covers_the_suffix_form() {
+        // #854: `forgectl env --file` accepts three dotenv shapes — `.env`,
+        // `.env.*`, and `*.env` — and this predicate recognized only the first
+        // two, so `cat prod.env` and a Write to `prod.env` both passed while
+        // `.env` blocked. The shipped guidance names `*.env` as guarded, which
+        // made that sentence false for exactly this shape.
+        assert!(is_env_family_secret("prod.env"));
+        assert!(is_env_family_secret("staging.env"));
+        assert!(is_env_family_secret("app.env"));
+        assert!(is_env_family_secret("my-service.env"));
+        // The control that proves the green above could have gone red: a name
+        // ending in `env` without the dot is NOT the family.
+        assert!(!is_env_family_secret("prodenv"));
+        assert!(!is_env_family_secret("environment"));
+        assert!(!is_env_family_secret("myenv"));
+        assert!(!is_env_family_secret("--env-file"));
+        // A real filename with a dash inside it still blocks.
+        assert!(is_env_family_secret("my-service.env"));
+    }
+
+    #[test]
+    fn suffix_form_needs_the_caller_to_vouch_that_it_is_a_filename() {
+        // `<name>.env` is not a filename-only spelling — `process.env` is the
+        // same shape — so the third arm applies only where the caller knows it
+        // holds a path. This is the whole defence against blocking
+        // `rg process.env src`, and it is asserted on the predicate because a
+        // guard-level test cannot show WHY the verdict differs.
+        assert!(is_env_family_secret_at("prod.env", Filename::Known));
+        assert!(!is_env_family_secret_at("prod.env", Filename::Unqualified));
+        assert!(!is_env_family_secret_at(
+            "process.env",
+            Filename::Unqualified
+        ));
+        // The unambiguous spellings ignore the position entirely — nothing is
+        // spelled `.env` or `.env.<x>` but a dotenv file.
+        for position in [Filename::Known, Filename::Unqualified] {
+            assert!(is_env_family_secret_at(".env", position), "{position:?}");
+            assert!(
+                is_env_family_secret_at(".env.production", position),
+                "{position:?}"
+            );
+            assert!(is_env_family_secret_at(".envrc", position), "{position:?}");
+            assert!(
+                !is_env_family_secret_at(".env.example", position),
+                "{position:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_carrying_a_slash_vouches_for_itself() {
+        // A caller need not vouch for something the token already proves.
+        assert!(is_dangerous_env_token("./prod.env"));
+        assert!(is_dangerous_env_token("config/prod.env"));
+        assert!(is_dangerous_env_token("/etc/app/prod.env"));
+        // The paired control: the same name with no path separator is left to
+        // the caller's judgment, and the default is not to guess.
+        assert!(!is_dangerous_env_token("prod.env"));
+        assert!(is_dangerous_env_token_at("prod.env", Filename::Known));
+        // A dash- or `=`-led name IS a real filename once a path proves it,
+        // which the earlier flag heuristic wrongly exempted.
+        assert!(is_dangerous_env_token("./-prod.env"));
+        assert!(is_dangerous_env_token("/tmp/x=y.env"));
+    }
+
+    #[test]
+    fn env_family_secret_still_allows_templates_in_both_positions() {
+        // The widening's whole risk is a false block on legitimate work, so
+        // every template word already trusted as a SUFFIX must be trusted as a
+        // STEM too. `.env.example` was always allowed; `example.env` is the
+        // same file with the same words on the other side of the name.
+        for template in [
+            "example.env",
+            "sample.env",
+            "template.env",
+            "defaults.env",
+            "test.env",
+            "ci.env",
+            "app.example.env",
+            "service.template.env",
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            ".env.test",
+        ] {
+            assert!(
+                !is_env_family_secret(template),
+                "{template} is a template and must stay allowed"
+            );
+        }
+        // Paired controls: the same names without the template word block.
+        for secret in ["app.env", "service.env", ".env.production", ".env"] {
+            assert!(
+                is_env_family_secret(secret),
+                "{secret} is not a template and must block"
+            );
+        }
     }
 
     #[test]

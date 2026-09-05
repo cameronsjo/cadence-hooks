@@ -7,8 +7,8 @@
 
 use crate::forgectl_hint::{HintKind, with_forgectl_hint};
 use crate::secret_patterns::{
-    envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_secret_token, is_safe_template,
-    is_secret_scan_exempt, scan_secret_values,
+    Filename, envrc_carveout_allows, is_ambiguous, is_blocked, is_dangerous_secret_token_at,
+    is_safe_template, is_secret_scan_exempt, scan_secret_values,
 };
 use cadence_hooks_core::shell::{
     command_segments, command_word, redirect_targets, skip_git_global_options, tokenize,
@@ -195,7 +195,10 @@ fn matched_secret_write_target(command: &str) -> Option<String> {
         if let Some(target) = redirect_targets(&segment)
             .iter()
             .chain(writer_targets(&segment).iter())
-            .find(|t| is_dangerous_secret_token(t))
+            // Every token here is a redirection target or a writer verb's
+            // operand, so the shell has already told us it names a file — the
+            // `<name>.env` shape applies without further qualification.
+            .find(|t| is_dangerous_secret_token_at(t, Filename::Known))
         {
             return Some(target.clone());
         }
@@ -504,6 +507,59 @@ mod tests {
     fn write_env_blocked() {
         let result = SecretWritesGuard::default().run(&make_write_input("/project/.env"));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn write_suffix_env_blocked() {
+        // #854: a Write to `prod.env` was allowed while `.env` blocked, so the
+        // gap was on the tool path too, not only the Bash path.
+        for path in [
+            "/project/prod.env",
+            "/project/staging.env",
+            "/project/app.env",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_write_input(path));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Block,
+                "{path} must block"
+            );
+        }
+    }
+
+    #[test]
+    fn write_suffix_env_template_allowed() {
+        // The paired control. These are the same shape as the block cases
+        // above and differ only by carrying a template word, so a change that
+        // blocked everything `*.env` would fail here.
+        for path in [
+            "/project/example.env",
+            "/project/sample.env",
+            "/project/template.env",
+            "/project/.env.example",
+        ] {
+            let result = SecretWritesGuard::default().run(&make_write_input(path));
+            assert_eq!(
+                result.outcome,
+                cadence_hooks_core::Outcome::Allow,
+                "{path} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_write_to_suffix_env_blocked() {
+        // The Bash arm of the same gap: a redirect to `prod.env`.
+        let result =
+            SecretWritesGuard::default().run(&make_bash_input("echo KEY=value > prod.env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_write_to_suffix_env_template_allowed() {
+        let result =
+            SecretWritesGuard::default().run(&make_bash_input("echo KEY=value > example.env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
     }
 
     #[test]
