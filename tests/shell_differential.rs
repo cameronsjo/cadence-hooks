@@ -134,6 +134,32 @@ const CASES: &[Case] = &[
         "#511 commented-out heredoc introducer",
         "echo hi # cat <<EOF\nPAYLOAD\nEOF",
     ),
+    // #652: a nested `$(` opened inside a double-quoted run inside a
+    // substitution body, whose own body carries a `"`. That `"` closes the
+    // outer double-quoted run early under a quote-blind reading of the nested
+    // opener, so the next `)` was mistaken for the terminator and the payload
+    // fell outside every body. The `"` is the trigger — drop it and the row
+    // blocks on the pre-fix binary too, proving nothing.
+    Case::executes(
+        "#652 nested substitution inside double quotes",
+        "echo $(echo \"$(echo '\")'; PAYLOAD)\")",
+    ),
+    Case::executes(
+        "#652 nested substitution with leading text",
+        "echo $(echo \"x$(echo '\")'; PAYLOAD)\")",
+    ),
+    Case::executes(
+        "#652 nested substitution inside a heredoc body",
+        "cat <<EOF\n$(echo \"$(echo '\")'; PAYLOAD)\")\nEOF",
+    ),
+    // Control for the recursion's `\$` arm: bash reads `\$(` inside `"…"` as a
+    // literal, ends the substitution at the `)` after the closing quote, and
+    // runs the payload as a sibling. Descending into the escaped opener instead
+    // would find no terminator.
+    Case::executes(
+        "#652 escaped opener inside double quotes stays literal",
+        "echo $(echo \"\\$(\") ; PAYLOAD",
+    ),
 ];
 
 struct BashObservation {
