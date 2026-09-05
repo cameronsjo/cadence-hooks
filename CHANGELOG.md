@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A nested `$( )` opened inside a double-quoted run was invisible to the substitution scan, so a command the shell runs reached no guard** (cadence-hooks#652). Inside `Quote::Double` the shared quote reader consumes one character at a time, so the nested `$(` was swallowed as plain text and its `(` never bumped the paren depth. The first `)` after the closing quote was then taken as the terminator — earlier than bash, which re-parses the inner substitution recursively. In `echo $(echo "$(echo '")'; cat .env)")` the read fell outside every emitted body while bash executed it, and because a terminator *was* found, the existing dual-emission fallback for an ambiguous substitution never fired.
+  - `scan_substitution_body` now recurses into a nested `$(` in exactly the two states where the shell expands one — unquoted and inside a double-quoted run — and treats `\$`, `` \` ``, `\"` and `\\` inside `"…"` as literal, which the shared reader's double-quote escape rule does not cover on its own. A nested scan that finds no terminator fails the whole scan, so the caller emits both readings rather than acting on a terminator this code invented.
+  - The recursion is bounded by `MAX_SUBSTITUTION_DEPTH`. At the cap the scan reports the substitution unterminated, which routes onto the same dual-emission fallback and surfaces more text, never less (ADR-0001).
+  - `substitution_spans` — reached from `strip_heredoc_bodies`, and the path an expanding heredoc body takes — carried a hand-rolled copy of the same loop and bypassed identically. It now calls the shared scanner, so the two sites cannot diverge on this again. The backtick arm's deliberate, bash-verified asymmetry (cadence-hooks#653) is untouched.
+  - Verdicts can only move `ALLOW` → `BLOCK`: the change extends where a substitution body ends, so every consumer sees a superset of the text it saw before. `scripts/consumer-differential.sh` asserts that across all 18 hook subcommands reaching the changed primitives, with `session guard` as a null control.
+
 ## [0.89.0] - 2026-09-02
 
 ### Added

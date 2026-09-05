@@ -1761,69 +1761,30 @@ fn substitution_spans(body: &str) -> Vec<String> {
         }
         if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
             let start = i;
-            let mut depth = 1;
-            let mut j = i + 2;
             // Quote tracking flips ON here, and the asymmetry is the point: the
             // prose OUTSIDE a substitution is heredoc data with no quoting, but
             // the text INSIDE one is shell code the shell will run, so a `)` in
             // a quoted string there does not close it. Counting blind ended the
             // span early and dropped every command after the quoted paren.
-            // Same [`Quote`] modes the tokenizer and the segmenter use. Rolling
-            // a private two-state tracker here is exactly what produced the
-            // earlier desyncs: `$'a\'b'` inside a substitution closed on the
-            // ESCAPED quote, the real one reopened a string that ate the
-            // closing paren, and every command after it was dropped — bash runs
-            // them (checked directly).
-            let mut quoted: Option<Quote> = None;
-            while j < chars.len() && depth > 0 {
-                let c = chars[j];
-                match quoted {
-                    Some(q) => {
-                        let escapes = match q {
-                            Quote::Double => matches!(chars.get(j + 1), Some('"' | '\\')),
-                            Quote::AnsiC => chars.get(j + 1).is_some(),
-                            Quote::Single => false,
-                        };
-                        if c == '\\' && escapes {
-                            j += 2;
-                            continue;
-                        }
-                        let closes = match q {
-                            Quote::Single | Quote::AnsiC => c == '\'',
-                            Quote::Double => c == '"',
-                        };
-                        if closes {
-                            quoted = None;
-                        }
-                    }
-                    None => match c {
-                        // `$'` opens ANSI-C; `$(` is a nested substitution and
-                        // falls through so the `(` bumps depth next pass.
-                        '$' if chars.get(j + 1) == Some(&'\'') => {
-                            quoted = Some(Quote::AnsiC);
-                            j += 2;
-                            continue;
-                        }
-                        '\'' => quoted = Some(Quote::Single),
-                        '"' => quoted = Some(Quote::Double),
-                        '\\' => {
-                            j += 2;
-                            continue;
-                        }
-                        '(' => depth += 1,
-                        ')' => depth -= 1,
-                        _ => {}
-                    },
-                }
-                j += 1;
+            //
+            // [`scan_substitution_body`] is that reader, and calling it rather
+            // than rolling a private one here is the point: a private tracker is
+            // exactly what produced the earlier desyncs. `$'a\'b'` inside a
+            // substitution closed on the ESCAPED quote, the real one reopened a
+            // string that ate the closing paren, and every command after it was
+            // dropped — bash runs them (checked directly). The private copy this
+            // replaced had also missed nested `$(` inside a double-quoted run,
+            // so a heredoc body carrying `$(echo "$(echo '")'; cat .env)")` ended
+            // its span at the wrong paren and the read reached no guard, while
+            // bash executed it (cameronsjo/cadence-hooks#652). One reader means
+            // the two sites cannot diverge on that again.
+            if let Some((_, end)) = scan_substitution_body(&chars, i + 2, true) {
+                spans.push(chars[start..end].iter().collect());
+                i = end;
+                continue;
             }
             // An unclosed `$(` is not a substitution the shell would run; skip
             // the `$` and keep scanning rather than carrying a truncated span.
-            if depth == 0 {
-                spans.push(chars[start..j].iter().collect());
-                i = j;
-                continue;
-            }
             i += 1;
             continue;
         }
@@ -2643,28 +2604,89 @@ fn span_quoting_unterminated(chars: &[char]) -> bool {
     quote.is_some()
 }
 
+/// How many `$( … )` levels [`scan_substitution_body`] will descend before it
+/// gives up and reports the substitution unterminated. Bounds the recursion so
+/// a pathological `$($($($(…` input cannot exhaust the stack; at the cap the
+/// scan returns `None`, which routes [`substitution_bodies`] onto its
+/// dual-emission fallback and surfaces MORE text to the guards, never less.
+///
+/// Whether the quote-blind fallback and the `expand_segments` recursion are
+/// bounded on the same axis is tracked separately as cadence-hooks#821; this
+/// cap covers nesting inside a single `scan_substitution_body` call only.
+const MAX_SUBSTITUTION_DEPTH: usize = 16;
+
 /// Scan a `$(…)` body starting at `start` (just past the `$(`), returning the
 /// body text and the index just past its `)`. `None` when input runs out with
-/// the substitution still open.
+/// the substitution still open, or when nesting exceeds
+/// [`MAX_SUBSTITUTION_DEPTH`].
 ///
 /// With `quote_aware`, a `)` inside a quoted run is data rather than the
-/// terminator — the shell's own reading. Without it, only paren depth counts;
-/// that reading exists so [`substitution_bodies`] can surface both when an
-/// unterminated quote makes the two disagree.
+/// terminator, and a nested `$(` starts a substitution that is scanned
+/// recursively — including inside a double-quoted run, which is where bash
+/// re-parses one and this scan used not to. Without `quote_aware`, only paren
+/// depth counts; that reading exists so [`substitution_bodies`] can surface
+/// both when an unterminated quote makes the two disagree.
 fn scan_substitution_body(
     chars: &[char],
     start: usize,
     quote_aware: bool,
 ) -> Option<(String, usize)> {
+    scan_substitution_body_bounded(chars, start, quote_aware, MAX_SUBSTITUTION_DEPTH)
+}
+
+/// [`scan_substitution_body`] with an explicit remaining-nesting budget.
+fn scan_substitution_body_bounded(
+    chars: &[char],
+    start: usize,
+    quote_aware: bool,
+    budget: usize,
+) -> Option<(String, usize)> {
+    // Fail the scan rather than the process. A `None` here is the same signal
+    // an unterminated substitution gives, and its handling already errs toward
+    // showing the guards more (ADR-0001: a guard's own limit must not hide a
+    // command the shell runs).
+    let budget = budget.checked_sub(1)?;
     let mut depth = 1usize;
     let mut j = start;
     let mut body = String::new();
     let mut quote: Option<Quote> = None;
     while j < chars.len() {
-        if quote_aware && let Some(next) = scan_quote_syntax(chars, j, &mut quote) {
-            body.extend(&chars[j..next]);
-            j = next;
-            continue;
+        if quote_aware {
+            // Inside `"…"` bash treats `\$`, `` \` ``, `\"` and `\\` as literal.
+            // `Quote::Double::escapes_next` only covers `"` and `\`, so without
+            // this arm a `\$(` would be read as a nested opener below and
+            // recursed into — which bash does not do.
+            if quote == Some(Quote::Double)
+                && chars[j] == '\\'
+                && matches!(chars.get(j + 1), Some('$' | '`' | '"' | '\\'))
+            {
+                body.extend(&chars[j..j + 2]);
+                j += 2;
+                continue;
+            }
+            // A nested `$(` runs a substitution in exactly the two states where
+            // the shell expands one: unquoted, and inside a double-quoted run.
+            // Scanning it recursively is what makes the terminator agree with
+            // bash — `scan_quote_syntax` alone swallows `$(` as plain text
+            // inside `Quote::Double`, so its `(` never bumped `depth` and the
+            // first `)` after the closing `"` was mistaken for the terminator
+            // (cameronsjo/cadence-hooks#652). A nested scan that fails takes the
+            // whole call down with it, so the caller's dual emission runs
+            // instead of a terminator this function invented.
+            if matches!(quote, None | Some(Quote::Double))
+                && chars[j] == '$'
+                && chars.get(j + 1) == Some(&'(')
+            {
+                let (_, nested_end) = scan_substitution_body_bounded(chars, j + 2, true, budget)?;
+                body.extend(&chars[j..nested_end]);
+                j = nested_end;
+                continue;
+            }
+            if let Some(next) = scan_quote_syntax(chars, j, &mut quote) {
+                body.extend(&chars[j..next]);
+                j = next;
+                continue;
+            }
         }
         match chars[j] {
             '(' => {
@@ -5668,6 +5690,112 @@ mod tests {
         assert!(
             substitution_bodies(r"echo $'literal $(cat .env)'").is_empty(),
             "a `$(` inside a single-quoted ANSI-C run must stay literal"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_nested_dollar_paren_inside_double_quotes_surfaces_the_tail() {
+        // #652: `scan_quote_syntax` swallows `$(` as plain text inside
+        // `Quote::Double`, so the nested `(` never bumped depth, the `'")'` read
+        // as a literal, and the `)` right after the closing `"` was mistaken for
+        // the terminator. `cat .env` fell outside every body while bash — which
+        // re-parses the inner substitution recursively — runs it.
+        for input in [
+            r#"echo $(echo "$(echo '")'; cat .env)")"#,
+            r#"echo $(echo "x$(echo '")'; cat .env)")"#,
+        ] {
+            assert!(
+                substitution_bodies(input)
+                    .iter()
+                    .any(|b| b.contains("cat .env")),
+                "nested `$(` inside double quotes hid the tail: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn substitution_bodies_escaped_dollar_paren_inside_double_quotes_is_literal() {
+        // Control for the recursion above: bash treats `\$` inside `"…"` as a
+        // literal dollar, so `\$(` opens no substitution and must not be
+        // recursed into. `Quote::Double::escapes_next` covers only `"` and `\`,
+        // so this needs its own arm.
+        //
+        // An UNBALANCED escaped opener is what discriminates — with a balanced
+        // one the recursion lands on the same terminator either way. Here bash
+        // ends the substitution at the `)` after the closing quote and runs
+        // `cat .env` as a sibling; descending into `\$(` instead finds no
+        // terminator, and the scan reports the whole line unterminated.
+        let bodies = substitution_bodies(r#"echo $(echo "\$(") && cat .env"#);
+        assert_eq!(
+            bodies,
+            vec![r#"echo "\$(""#.to_string()],
+            "an escaped `\\$(` inside double quotes must stay literal"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_deep_nesting_does_not_recurse_without_bound() {
+        // The recursion is bounded by `MAX_SUBSTITUTION_DEPTH`; past the cap the
+        // scan reports the substitution unterminated rather than exhausting the
+        // stack. Unterminated routes onto the dual-emission fallback, which
+        // surfaces more text, so the cap cannot hide a command (ADR-0001).
+        // Balanced and deep enough that an uncapped recursion exhausts the
+        // stack. It must return, and it must still surface the buried command.
+        let levels = 200_000;
+        let deep = format!("{}cat .env{}", "$(".repeat(levels), ")".repeat(levels));
+        assert!(
+            substitution_bodies(&deep)
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "a command under pathological nesting must still reach the guards"
+        );
+        // Unbalanced: the scan runs out of input rather than budget, and the
+        // dual-emission fallback still has something to say.
+        assert!(
+            !substitution_bodies(&"$(".repeat(levels)).is_empty(),
+            "deep unterminated nesting must still emit the ambiguous readings"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_nested_dollar_paren_controls_still_block() {
+        // The trigger is precise: a nested `$(` opened inside a double-quoted
+        // run inside a substitution body, whose own body carries a `"`. These
+        // five shapes were already surfaced before #652 and must stay surfaced —
+        // a future widening of the recursion shows up here as a diff.
+        for input in [
+            r#"echo $(echo "$(cat .env)")"#,
+            r#"echo $(echo "`cat .env`")"#,
+            r#"echo "$(echo '")'; cat .env)""#,
+            r#"echo $(echo ")" ; cat .env)"#,
+            r#"echo $(echo "`echo )`" ; cat .env)"#,
+        ] {
+            assert!(
+                substitution_bodies(input)
+                    .iter()
+                    .any(|b| b.contains("cat .env")),
+                "control shape stopped surfacing its body: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn substitution_spans_nested_dollar_paren_inside_double_quotes_keeps_the_span() {
+        // The heredoc twin of #652: `substitution_spans` carried a hand-rolled
+        // copy of the same loop, so an expanding heredoc body hid the read the
+        // same way. The span must reach the substitution's real closing paren.
+        let spans = substitution_spans(r#"$(echo "$(echo '")'; cat .env)")"#);
+        assert_eq!(
+            spans,
+            vec![r#"$(echo "$(echo '")'; cat .env)")"#.to_string()],
+            "nested `$(` inside double quotes truncated the heredoc span"
+        );
+        // Control: the deliberate backtick asymmetry (#653) is untouched — a
+        // backtick span still ends at the first unescaped backtick.
+        assert_eq!(
+            substitution_spans("`echo 'a`b'`"),
+            vec!["`echo 'a`".to_string()],
+            "the backtick arm's bash-verified asymmetry must not change"
         );
     }
 
