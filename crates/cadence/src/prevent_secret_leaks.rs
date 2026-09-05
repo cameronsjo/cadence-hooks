@@ -641,6 +641,14 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
             // `--check` does not prefix `chdir` (`che` vs `chd`), so the
             // non-chdir controls are unaffected.
             saw_chdir |= !name.is_empty() && "chdir".starts_with(name);
+            // Deliberately EXACT while the flag test above is a prefix, so the
+            // two halves of this grammar disagree about `--chd`. Consumption
+            // decides `rest`, which feeds `unwrap_command_prefixes` and the
+            // metadata-safe EXEMPTION, where matching more SUBTRACTS blocks —
+            // an abbreviated `--chd /x ls .env` currently blocks (measured on
+            // 0.89.0 too), which is the fail-closed side of that disagreement.
+            // Making this prefix-aware is a separate widening with its own
+            // differential, not a tidy-up.
             let takes_separate_value =
                 !value_attached && matches!(name, "unset" | "chdir" | "default-path");
             idx += if takes_separate_value { 2 } else { 1 };
