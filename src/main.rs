@@ -93,6 +93,7 @@ const PROTECTED_GUARDS: &[&str] = &[
     "guard-gh-dangerous",
     "guard-gh-write",
     "guard-op-vault-scan",
+    "guard-sops-decrypt",
     "guard-browser-device",
     "guard-dotfiles",
     "guard-read-model",
@@ -367,6 +368,8 @@ enum GuardrailsCommands {
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
     GuardOpVaultScan,
+    /// Block a sops decrypt whose plaintext is not consumed by an allowed tool
+    GuardSopsDecrypt,
     /// Warn when bare curl (aliased to curlie) is used with custom headers
     WarnCurlAlias,
     /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
@@ -547,6 +550,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnGoingPublic => "warn-going-public",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
+            GuardrailsCommands::GuardSopsDecrypt => "guard-sops-decrypt",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
             GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
             GuardrailsCommands::WarnUnreviewedReadyFlip => "warn-unreviewed-ready-flip",
@@ -1212,6 +1216,11 @@ fn main() {
             ),
             GuardrailsCommands::GuardOpVaultScan => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_op_vault_scan::OpVaultScanGuard,
+                pre,
+                canonical_hook,
+            ),
+            GuardrailsCommands::GuardSopsDecrypt => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_sops_decrypt::SopsDecryptGuard,
                 pre,
                 canonical_hook,
             ),

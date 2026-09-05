@@ -228,6 +228,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PostToolUse),
     },
     HookEntry {
+        name: "guard-sops-decrypt",
+        description: "Block a sops decrypt whose plaintext is not consumed by an allowed tool",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "guard-op-vault-scan",
         description: "Block uninvited 1Password vault enumeration (op item list)",
         plugin: "guardrails",
@@ -458,6 +464,7 @@ const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "guard-gh-dangerous",
     "guard-gh-write",
     "guard-op-vault-scan",
+    "guard-sops-decrypt",
     "guard-browser-device",
     "guard-dotfiles",
     "guard-rm",
