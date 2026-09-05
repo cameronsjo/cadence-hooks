@@ -297,7 +297,13 @@ fn segment_env_reads(segment: &str) -> Vec<(String, String)> {
     if cmd_word == "find" {
         return find_exec_leak(argv).into_iter().collect();
     }
-    if cmd_word == "forgectl" {
+    // The exemption keys on the head token AS WRITTEN, before `command_word`'s
+    // basename/backslash normalization — a path-qualified or respelled head
+    // (`./forgectl`, `/tmp/x/forgectl`, `\forgectl`) names an executable the
+    // agent can create, so it earns no trust. A bare `forgectl` resolves
+    // through PATH like every other trusted binary. Anything else falls
+    // through to the operand scan below and blocks on a dangerous operand.
+    if cmd_word == "forgectl" && argv.first().is_some_and(|head| head == "forgectl") {
         return forgectl_env_leak(argv);
     }
     if METADATA_SAFE_COMMANDS.contains(&cmd_word.as_ref()) {
@@ -353,35 +359,40 @@ fn find_exec_leak(tokens: &[String]) -> Option<(String, String)> {
         .map(|t| (sub_word.to_string(), t.clone()))
 }
 
+/// The CLOSED set of `forgectl env` subcommands audited to emit no secret
+/// VALUE on stdout. Anything outside it fails closed: an unknown subcommand is
+/// an unaudited one, and the exemption is a metadata-only carve-out from an
+/// otherwise-blocking scan, so refusing it costs a false block on a legitimate
+/// new reader and nothing else.
+const SAFE_ENV_SUBCOMMANDS: &[&str] = &["keys", "set", "get", "check", "redact"];
+
 /// `forgectl env` (cameronsjo/forgectl#82) is a purpose-built safe `.env`
 /// manager: every subcommand (`keys`, `set`, `get`, `check`, `redact`) is
 /// structurally value-free on stdout by design — `set`/`get` require piped
 /// stdin/`--clipboard` and print only a confirmation line (key name, not
 /// value), `redact` masks every value, and `keys`/`check` print names only.
-/// A `.env`-shaped `--file` operand is therefore safe under `forgectl env
-/// <sub>` regardless of subcommand (#315). Other `forgectl` command groups
-/// (not `env`) have no such guarantee and fall through to the standard
-/// dangerous-token scan, same as any non-allowlisted command.
+/// A `.env`-shaped `--file` operand is therefore safe under exactly those five
+/// subcommands (#315). Every other spelling — another `forgectl` command group,
+/// an unrecognized `env` subcommand, or a bare `forgectl env` with none — falls
+/// through to the standard dangerous-token scan, same as any non-allowlisted
+/// command.
 ///
-/// The subcommand check skips leading global flags (`forgectl --no-icons env
-/// redact …`) by taking the first token that doesn't look like a flag,
-/// rather than assuming `env` sits at a fixed position — `forgectl`'s only
-/// persistent flag (`--no-icons`) is boolean, so this is unambiguous today;
-/// a future *valued* global flag (`--foo bar`) would need this taught to
-/// skip the value too.
-///
-/// debt: blanket-trusts the whole `env` group rather than enumerating the 5
-/// known-safe subcommands by name — mirrors this file's existing accepted
-/// `git` gap (`git show <ref>:.env` would print contents). If `forgectl env`
-/// ever grows a value-emitting subcommand, this allowlist needs to shrink to
-/// name only the proven-safe ones.
+/// debt: the safe set is CLOSED — the five subcommands named in
+/// [`SAFE_ENV_SUBCOMMANDS`], each audited value-free — so a new `forgectl env`
+/// subcommand fails closed and blocks until it is reviewed and added here.
+/// The upgrade trigger is a legitimate new value-free reader being blocked.
 fn forgectl_env_leak(tokens: &[String]) -> Vec<(String, String)> {
-    let is_env_subcommand = tokens[1..]
-        .iter()
-        .find(|t| !t.starts_with('-'))
-        .map(String::as_str)
-        == Some("env");
-    if is_env_subcommand {
+    // The subcommand walk skips leading global flags (`forgectl --no-icons env
+    // redact …`) by taking non-flag tokens in order, rather than assuming `env`
+    // sits at a fixed position — `forgectl`'s only persistent flag
+    // (`--no-icons`) is boolean, so this is unambiguous today; a future *valued*
+    // global flag (`--foo bar`) would need this taught to skip the value too.
+    let mut operands = tokens[1..].iter().filter(|t| !t.starts_with('-'));
+    let is_safe_env_call = operands.next().map(String::as_str) == Some("env")
+        && operands
+            .next()
+            .is_some_and(|sub| SAFE_ENV_SUBCOMMANDS.contains(&sub.as_str()));
+    if is_safe_env_call {
         return Vec::new();
     }
     tokens[1..]
@@ -1555,6 +1566,55 @@ mod tests {
             "forgectl --no-icons env redact --file .env",
         ));
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Allow);
+    }
+
+    // --- #315 hardening: the allowlist keys on the BARE name and a CLOSED
+    // subcommand set. Pre-hardening, all four of these exited 0 while
+    // `cat .env` blocked — a repo-committed `forgectl` script was a complete
+    // read bypass.
+
+    #[test]
+    fn bash_forgectl_relative_path_head_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("./forgectl env keys --file .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_forgectl_absolute_path_head_blocked() {
+        let result = SecretLeaksGuard.run(&make_bash_input("/tmp/x/forgectl env keys --file .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_sudo_forgectl_relative_path_head_blocked() {
+        // The wrapper peel exposes `./forgectl` as the head — still
+        // path-qualified, still an executable the agent controls.
+        let result = SecretLeaksGuard.run(&make_bash_input("sudo ./forgectl env keys --file .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_forgectl_backslash_escaped_head_blocked() {
+        // `command_word` strips one leading backslash, so the resolved verb is
+        // `forgectl`; the head AS WRITTEN is not, so the exemption is refused.
+        let result = SecretLeaksGuard.run(&make_bash_input(r"\forgectl env keys --file .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_forgectl_unknown_env_subcommand_blocked() {
+        // `frobnicate` is not in the closed set — an unknown subcommand fails
+        // closed rather than inheriting the whole group's exemption.
+        let result = SecretLeaksGuard.run(&make_bash_input("forgectl env frobnicate --file .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
+    }
+
+    #[test]
+    fn bash_forgectl_env_with_no_subcommand_does_not_exempt() {
+        // A bare `forgectl env` names no proven-safe reader; the operand scan
+        // runs, and here it finds a dangerous one.
+        let result = SecretLeaksGuard.run(&make_bash_input("forgectl env .env"));
+        assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
 
     #[test]
