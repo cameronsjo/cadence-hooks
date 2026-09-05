@@ -1814,9 +1814,14 @@ fn substitution_spans(body: &str) -> Vec<String> {
                     break;
                 }
                 // A top-level `$(` that ran off the end with NO quote open and
-                // nothing nested failed — the one shape where the shell agrees
-                // there is no terminator. Skip the `$` and keep scanning rather
+                // nothing nested failed. Skip the `$` and keep scanning rather
                 // than carrying a truncated span.
+                //
+                // This is the residue, not a verdict that the shell agrees:
+                // [`ScanStop::Unterminated`] documents a route that still lands
+                // here on a line both shells run (an opening paren the scanner
+                // counts and they do not, cadence-hooks#831). The arm is the
+                // status quo for that shape, not an endorsement of it.
                 //
                 // The asymmetry with the arm above is a security tradeoff, not
                 // a prose-splicing one: that arm splices body prose too. What
@@ -2674,8 +2679,9 @@ const MAX_SUBSTITUTION_DEPTH: usize = 16;
 /// hide a command the shell runs). `Unterminated` is the lone exception, and it
 /// says something much narrower than it looks: the scan ran off the end of the
 /// input **at this level, with no quote left open and nothing nested having
-/// failed**. That is the one shape where the shell agrees there is no closing
-/// paren, so a caller may keep whatever reading it had.
+/// failed**. It is the residue left once the known scanner limits have been
+/// named, not a positive finding that the shell agrees — see its own doc for a
+/// route that still reaches it on a line both shells run.
 ///
 /// Every qualifier in that sentence was bought. Three review passes found three
 /// different ways to arrive at "no terminator" on a line the shell runs, and
@@ -2699,7 +2705,19 @@ const MAX_SUBSTITUTION_DEPTH: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanStop {
     /// Input ran out at this level with no quote open and nothing nested
-    /// failed. The only variant the shell agrees with.
+    /// failed.
+    ///
+    /// The residue — what is left once the known scanner limits below have been
+    /// named — and NOT a positive finding that the shell also sees no
+    /// terminator. A fourth route is known and open: the same missing `#` and
+    /// backtick handling that produced [`ScanStop::QuoteUnresolved`] also
+    /// over-counts OPENING parens, so a `(` inside a comment, inside a backtick
+    /// span, or inside `${x:-(}` — text to both shells — ends the scan with
+    /// `depth > 0`, no quote open, and nothing nested failed, on a line the
+    /// shells run. That is cadence-hooks#831's other face; it is unchanged by
+    /// the work that added these variants and still costs a heredoc span. A
+    /// `depth > 1` at end of input is the obvious discriminator for routing it
+    /// to a widening stop without building real comment parsing.
     Unterminated,
     /// Input ran out inside a quoted run this scanner opened. The shell often
     /// disagrees that a quote was open at all — a `#` comment's apostrophe is

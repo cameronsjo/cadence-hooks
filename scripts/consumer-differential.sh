@@ -208,6 +208,27 @@ if command grep -q '\\001' "$CORPUS"; then
     command grep -n '\\001' "$CORPUS" >&2
     exit 1
 fi
+# The cap rows carry this script's whole war story, and until now they were the
+# rows with no shape assertion of their own. `chain()` builds their nesting from
+# `seq`; if `seq` were absent, shadowed, or non-zero, `c` would stay empty and
+# every cap row would silently collapse to a one-level substitution that blocks
+# on both binaries for unrelated reasons. The run would still print PASS, and
+# the could-this-have-gone-red gate would be satisfied by other rows. Count the
+# openers instead of trusting the loop.
+check_depth() { # $1=row label  $2=expected nested openers
+    local got
+    got=$(command grep -m1 "^$1"$'\t' "$CORPUS" | command grep -o '[$](' | command grep -c .)
+    # One opener is the row's own outer substitution; the rest are the chain.
+    if [ "$got" -ne "$(( $2 + 1 ))" ]; then
+        printf 'FATAL: corpus row %s has %s openers, expected %s — chain() did not build\n' \
+            "$1" "$got" "$(( $2 + 1 ))" >&2
+        exit 1
+    fi
+}
+check_depth 652-cap-under 15
+check_depth 652-cap-at 16
+check_depth 652-cap-plain 17
+check_depth 652-cap-heredoc 17
 
 # Stay-allowed rows: ordinary nested substitutions with no secret read. More
 # text reaching a guard means more chances of a false block, so these are the
@@ -348,6 +369,11 @@ score() { # $1=label $2=sub $3=cmd $4=mode(affected|leak|allowed)
             if [ "$mode" != allowed ]; then
                 note='fixed (ALLOW->BLOCK)'; fixed=$((fixed+1))
             fi ;;
+        # A guard that stopped erroring and started allowing. Exit 1 is the
+        # guard's own fail-open, so this is not a safety regression — but
+        # unreported it looks identical to no movement at all.
+        SOFT:ALLOW|ALLOW:SOFT)
+            note='note: soft/allow movement (guard fail-open changed)' ;;
     esac
     if [ "$mode" = leak ] && [ "$b" != "$n" ]; then
         note='LEAK CONTROL MOVED'; leak_moves=$((leak_moves+1))
