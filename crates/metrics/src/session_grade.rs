@@ -1873,6 +1873,34 @@ mod fixture_gate {
         ],
     ];
 
+    /// Line endings must survive checkout, or every digest below is a lie.
+    ///
+    /// `include_str!` reads from the **working tree**, so a checkout that
+    /// rewrites line endings changes the bytes the digests see. A Windows
+    /// runner with the default `core.autocrlf=true` did exactly that: all 27
+    /// lines gained a `\r`, the file measured 3,698 bytes instead of 3,671,
+    /// and the byte-identity assertion failed reporting *drift* — blaming the
+    /// file for something the checkout did to it.
+    ///
+    /// `.gitattributes` pins both fixtures `-text`. This test is the
+    /// diagnosis: it fails first and says why, so nobody re-derives that from
+    /// a digest mismatch again.
+    #[test]
+    fn the_fixtures_carry_no_carriage_returns() {
+        for (name, body) in [
+            ("contract-cases.jsonl", FIXTURE),
+            ("contract-cases.expected.json", EXPECTED),
+        ] {
+            assert!(
+                !body.contains('\r'),
+                "{name} contains CR bytes — the checkout converted its line \
+                 endings, so every digest assertion here is measuring the \
+                 wrong bytes. Check that .gitattributes still marks \
+                 crates/metrics/testdata/grading/* as -text."
+            );
+        }
+    }
+
     #[test]
     fn the_fixture_is_byte_identical_to_the_reviewed_copy() {
         let digest = format!("{:x}", Sha256::digest(FIXTURE.as_bytes()));
