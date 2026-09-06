@@ -228,11 +228,16 @@ impl Check for NudgePolishBeforePr {
         // (cadence-hooks#775 I2). A timed-out or unspawnable git yields no
         // evidence (`None`), which reads as "does not touch code" → allow
         // (ADR-0001).
+        //
+        // Both lazy predicates need the same `cd`-aware working directory, so
+        // it is resolved ONCE here rather than inside each. This is string
+        // parsing with no I/O — the cost the laziness protects against is the
+        // git work below, not this.
+        let work_dir = cwd.map(|cwd| parse_work_dir(command, cwd));
         let touches_code = || {
-            cwd.is_some_and(|cwd| {
-                let dir = parse_work_dir(command, cwd);
-                changed_files(&dir).is_some_and(|files| branch_touches_code(&files))
-            })
+            work_dir
+                .as_ref()
+                .is_some_and(|dir| changed_files(dir).is_some_and(|f| branch_touches_code(&f)))
         };
         // The cadence-hooks#874 digest comparison, lazy for the same reason
         // (three git subprocesses plus a content hash — strictly more than
@@ -241,8 +246,7 @@ impl Check for NudgePolishBeforePr {
         // qualifies for one of those never pays for this.
         let digest_moved = || {
             let recorded = recorded_digest(record.as_ref())?;
-            let dir = parse_work_dir(command, cwd?);
-            let live = working_tree_digest(&dir)
+            let live = working_tree_digest(work_dir.as_ref()?)
                 .map(|d| d.digest)
                 .filter(|d| live_digest_is_comparable(d))?;
             Some(live != recorded)

@@ -104,7 +104,7 @@ pub const MAX_DIGEST_BYTES: u64 = 64 * 1024 * 1024;
 ///   mid-hash → `None`, so the caller omits the field entirely. *Bounded out*
 ///   and *no evidence* must not collapse into one another.
 pub fn working_tree_digest(dir: &str) -> Option<WorkingTreeDigest> {
-    digest_bounded(dir, MAX_DIGEST_FILES, MAX_DIGEST_BYTES, hash_budget())
+    digest_bounded(dir, MAX_DIGEST_FILES, MAX_DIGEST_BYTES, hash_budget)
 }
 
 /// How long the content-hash loop may run before abandoning the digest.
@@ -112,6 +112,13 @@ pub fn working_tree_digest(dir: &str) -> Option<WorkingTreeDigest> {
 /// `Armed` already has the hook's elapsed time subtracted, so it is what
 /// remains from here; `Unarmed` (the CLI path) caps at the full budget;
 /// `Disabled` means no bound at all.
+///
+/// **Read immediately before the loop, never earlier.** `Armed` shrinks as
+/// time passes, and `digest_bounded` runs four git subprocesses before it
+/// hashes anything. Reading the budget at the top would hand the loop the
+/// pre-subprocess allotment, so the subprocess time and the hash time would
+/// each fit the budget while their sum overran it — the exact overrun the
+/// internal deadline exists to keep inside the external `hooks.json` kill.
 fn hash_budget() -> Option<Duration> {
     match deadline::state() {
         deadline::BudgetState::Disabled => None,
@@ -124,11 +131,15 @@ fn hash_budget() -> Option<Duration> {
 /// [`working_tree_digest`] with explicit bounds, so all three bounds — files,
 /// bytes, and time — are testable without materializing a thousand files, 64
 /// MiB, or a real deadline.
+///
+/// `hash_budget` is a **closure, not a value**: it is called once, immediately
+/// before the hash loop, after every subprocess this function runs. See
+/// [`hash_budget`] for why the timing is load-bearing.
 fn digest_bounded(
     dir: &str,
     max_files: usize,
     max_bytes: u64,
-    hash_budget: Option<Duration>,
+    hash_budget: impl Fn() -> Option<Duration>,
 ) -> Option<WorkingTreeDigest> {
     let base = merge_base_with_origin(dir)?;
     // Resolve the repo top-level ONCE and run both change-set subprocesses
@@ -179,6 +190,12 @@ fn digest_bounded(
     // path; cadence-hooks#874 put it on the hook path, where an external
     // hooks.json timeout would kill the process outright (the pre-#271 silent
     // kill this module exists to prevent).
+    //
+    // The budget is read HERE, after the four subprocesses above, not at the
+    // call site — an `Armed` budget shrinks as those run, and handing the loop
+    // a pre-subprocess allotment lets the two phases each fit while their sum
+    // overruns. Every early return above this line therefore never reads it.
+    let hash_budget = hash_budget();
     let hash_start = Instant::now();
     for path in &paths {
         // Out of budget → `None`, the no-evidence shape. Deliberately NOT
@@ -431,6 +448,57 @@ mod tests {
     }
 
     #[test]
+    fn the_hash_budget_is_read_at_the_loop_not_before_the_subprocesses() {
+        // cadence-hooks#874 second review: the budget used to be evaluated as
+        // an ARGUMENT, before `digest_bounded` ran merge-base, rev-parse, and
+        // the two listing subprocesses. An `Armed` budget shrinks while those
+        // run, so the loop got the pre-subprocess allotment and the two phases
+        // could each fit the budget while their sum overran it.
+        //
+        // The deadline module's clock and budget are process-global `OnceLock`s
+        // with no test setter, so this cannot be driven through a real
+        // shrinking budget. Call ORDER is the observable that settles it
+        // instead: every early return in `digest_bounded` sits BEFORE the loop,
+        // so an empty code set must return without ever asking for a budget. An
+        // argument-evaluated budget is asked for unconditionally, so this test
+        // is red the moment the read moves back up.
+        let calls = std::cell::Cell::new(0);
+        let counted = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+
+        // No code paths at all → the `empty` early return, above the loop.
+        let tmp = init_repo_with_origin_main(&[]);
+        let empty = digest_bounded(
+            tmp.path().to_str().unwrap(),
+            MAX_DIGEST_FILES,
+            MAX_DIGEST_BYTES,
+            &counted,
+        )
+        .expect("digest resolves");
+        assert_eq!(empty.digest, "empty", "precondition: the early return");
+        assert_eq!(
+            calls.get(),
+            0,
+            "a return above the loop must not read the budget"
+        );
+
+        // Positive control: with a file to hash, the loop runs and asks once —
+        // otherwise the zero above would prove nothing.
+        write_file(tmp.path(), "src/a.rs", "fn a() {}\n");
+        let hashed = digest_bounded(
+            tmp.path().to_str().unwrap(),
+            MAX_DIGEST_FILES,
+            MAX_DIGEST_BYTES,
+            &counted,
+        )
+        .expect("digest resolves");
+        assert!(hashed.digest.starts_with("sha256:"));
+        assert_eq!(calls.get(), 1, "the loop reads the budget exactly once");
+    }
+
+    #[test]
     fn a_spent_hash_budget_yields_no_evidence_not_a_skipped_record() {
         // cadence-hooks#874 security review: the content-hash loop now runs on
         // the HOOK path, where it previously ran only on the record-polish CLI
@@ -454,7 +522,7 @@ mod tests {
             dir.to_str().unwrap(),
             MAX_DIGEST_FILES,
             MAX_DIGEST_BYTES,
-            None,
+            || None,
         )
         .expect("digest resolves with no time bound");
         assert!(unbounded.digest.starts_with("sha256:"));
@@ -463,7 +531,7 @@ mod tests {
             dir.to_str().unwrap(),
             MAX_DIGEST_FILES,
             MAX_DIGEST_BYTES,
-            Some(Duration::ZERO),
+            || Some(Duration::ZERO),
         );
         assert!(
             spent.is_none(),
@@ -692,12 +760,12 @@ mod tests {
         write_file(dir, "src/a.rs", "aaaa\n");
         write_file(dir, "src/b.rs", "bbbb\n");
 
-        let over_files = digest_bounded(dir.to_str().unwrap(), 1, MAX_DIGEST_BYTES, None)
+        let over_files = digest_bounded(dir.to_str().unwrap(), 1, MAX_DIGEST_BYTES, || None)
             .expect("a bounded-out digest still resolves");
         assert_eq!(over_files.digest, "skipped");
         assert_eq!(over_files.files, 2, "the file count still reports");
 
-        let over_bytes = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 1, None)
+        let over_bytes = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 1, || None)
             .expect("still resolves");
         assert_eq!(over_bytes.digest, "skipped");
     }
@@ -725,7 +793,7 @@ mod tests {
             return;
         }
 
-        let bounded = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 64, None)
+        let bounded = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 64, || None)
             .expect("a bounded-out digest still resolves");
         assert_eq!(bounded.digest, "skipped");
         assert_eq!(bounded.files, 1, "the file count still reports");

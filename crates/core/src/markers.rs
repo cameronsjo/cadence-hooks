@@ -501,6 +501,12 @@ fn read_diff_digest(v: &serde_json::Value) -> Option<DiffDigest> {
     Some(DiffDigest {
         base,
         digest,
+        // `files` needs no charset bound and no ceiling: serde has already
+        // proven it is a `u64`, so it carries no escapes, no control bytes,
+        // and no injection prose — the whole reason the string fields are
+        // bounded. Any value in range is a legitimate count, and nothing reads
+        // it. This is the exemption from both-sides parity, stated rather than
+        // left as an omission.
         files: entry.get("files").and_then(serde_json::Value::as_u64),
     })
 }
