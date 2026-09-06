@@ -123,10 +123,19 @@ impl Logger for LogSession {
             .append(true)
             .open(&sessions_path)
         {
-            // Build the whole line (record + newline) and write it in a single
-            // `write_all`, so concurrent appends from other sessions can't
-            // interleave a record with its trailing newline. `record` is compact
-            // JSON, so this is one line with no embedded newlines.
+            // Build the whole line (record + newline) and hand it to one
+            // `write_all`, so a concurrent append from another session is
+            // unlikely to interleave. `record` is compact JSON, so this is one
+            // line with no embedded newlines.
+            //
+            // `write_all` is a LOOP, not one syscall: it retries until the
+            // buffer drains, and each retry is a separate append-offset write.
+            // A short write therefore still admits interleaving. That was
+            // effectively unreachable while every field was bounded; the
+            // `grading` key makes record size input-dependent for the first
+            // time (~110 bytes per idle gap, uncapped), so the guarantee is
+            // now "regular-file writes do not return short except on signal or
+            // a space limit" rather than anything this code enforces.
             let mut line = record.to_string();
             line.push('\n');
             let _ = file.write_all(line.as_bytes());

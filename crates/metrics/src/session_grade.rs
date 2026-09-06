@@ -89,15 +89,15 @@ const SYNTHETIC_MODEL: &str = "<synthetic>";
 struct Record {
     /// Unknown values are accepted — the platform adds record types, and one
     /// it adds next month must not fail a line.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     r#type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     timestamp: Option<String>,
     #[serde(default, rename = "isSidechain")]
     is_sidechain: Option<bool>,
     #[serde(default, rename = "isMeta")]
     is_meta: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     subtype: Option<String>,
     #[serde(default, rename = "compactMetadata")]
     compact_metadata: Option<CompactMetadata>,
@@ -107,15 +107,15 @@ struct Record {
 
 #[derive(Deserialize)]
 struct CompactMetadata {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     trigger: Option<String>,
-    #[serde(default, rename = "preTokens")]
+    #[serde(default, rename = "preTokens", deserialize_with = "lenient_u64")]
     pre_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct Message {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     model: Option<String>,
     #[serde(default)]
     usage: Option<Usage>,
@@ -131,22 +131,165 @@ struct Message {
     content_is_string: Option<bool>,
 }
 
-/// Token counts, every field `Option` on purpose.
+/// Token counts, every field `Option` and read through [`lenient_u64`].
 ///
-/// `#[serde(default)]` covers a *missing* key but not a present `null` — serde
-/// answers that with `invalid type: null, expected u64`, which fails the whole
-/// `Record` and drops the line. That costs far more than the field: the
-/// record's **timestamp** vanishes from the event stream too, so `wallClockMs`
-/// shrinks and a gap that record bounded is merged with its neighbour or lost
-/// outright. A null must cost one field, never one record.
+/// `#[serde(default)]` covers a *missing* key; `Option` adds `null`; the
+/// lenient reader adds every other wrong shape. All three are needed, because
+/// serde answers any of them by failing the whole `Record` — and that costs
+/// far more than the field: the record's **timestamp** vanishes from the event
+/// stream too, so `wallClockMs` shrinks and a gap that record bounded is
+/// merged with its neighbour or lost outright. A malformed field must cost one
+/// field, never one record.
 #[derive(Deserialize)]
 struct Usage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     input_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     cache_read_input_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     cache_creation_input_tokens: Option<u64>,
+}
+
+/// Read a number, or nothing — never fail the record.
+///
+/// `Option<u64>` alone covers a `null`, but not a *wrong type*:
+/// `"input_tokens": "10"` yields `invalid type: string, expected u64`, which
+/// fails the whole [`Record`] and drops the line. That costs the record's
+/// **timestamp** too, so `wallClockMs` shrinks and whatever gap the record
+/// bounded is merged with its neighbour or lost — a session can be made to
+/// look shorter, or a cold restart made to disappear, by one malformed field.
+/// Every unexpected shape is drained through [`serde::de::IgnoredAny`] and
+/// answered `None`.
+fn lenient_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    struct NumberOrNothing;
+
+    impl<'de> Visitor<'de> for NumberOrNothing {
+        type Value = Option<u64>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a token count, or any other JSON value (read as absent)")
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(u64::try_from(v).ok())
+        }
+        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+            // A count arriving as `1.0` is still a count; `1.5` and NaN are not.
+            Ok((v.is_finite() && v >= 0.0 && v.fract() == 0.0).then_some(v as u64))
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2>(self, d: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            d.deserialize_any(NumberOrNothing)
+        }
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(NumberOrNothing)
+}
+
+/// Read a string, or nothing — never fail the record.
+///
+/// The sibling of [`lenient_u64`], for the same reason: a non-string `type`,
+/// `subtype`, `model`, or `trigger` must cost that field, not the line and its
+/// timestamp. `timestamp` itself is covered too — an unparseable one already
+/// drops the record by design, and this only changes *which* rule does it.
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+    struct StringOrNothing;
+
+    impl<'de> Visitor<'de> for StringOrNothing {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string, or any other JSON value (read as absent)")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D2>(self, d: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            d.deserialize_any(StringOrNothing)
+        }
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrNothing)
 }
 
 /// Answer "was this a JSON string?" without binding the value.
@@ -1315,6 +1458,64 @@ mod tests {
         );
     }
 
+    /// The module owns two transcript-supplied strings — `message.model` and
+    /// `compactMetadata.trigger`. Neither reaches an emitted surface today.
+    /// This pins that, because nothing else does.
+    ///
+    /// `prompt_text_is_read_for_shape_only` covers `message.content`, and
+    /// `transcript.rs`'s `prompt_content_is_not_deserialized_or_emitted`
+    /// covers `scan_transcript`, not this module. Adding `"model": …` to
+    /// `Gap::to_json` is a plausible future ask — a reader wants to know which
+    /// model a restart was priced on — and without this test it would leak a
+    /// transcript string with nothing going red.
+    #[test]
+    fn transcript_supplied_strings_never_reach_the_emitted_grading() {
+        let sentinel = "SENTINEL-must-not-be-emitted";
+        let t = format!(
+            concat!(
+                r#"{{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}}"#,
+                "\n",
+                r#"{{"type":"system","subtype":"compact_boundary","timestamp":"2020-01-01T00:30:00Z","compactMetadata":{{"trigger":"{s}","preTokens":42}}}}"#,
+                "\n",
+                r#"{{"type":"assistant","timestamp":"2020-01-01T02:00:00Z","message":{{"model":"{s}","usage":{{"input_tokens":1,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}}}}}}"#,
+            ),
+            s = sentinel
+        );
+
+        let grade = grade_transcript(&t, &contract_prices());
+        // The sentinel was genuinely read — otherwise this test proves nothing.
+        assert_eq!(grade.assistant_turns, 1, "the model string was parsed");
+        assert_eq!(
+            grade.compactions.other, 1,
+            "the trigger string was parsed and bucketed"
+        );
+
+        let emitted = grade.to_json().to_string();
+        assert!(
+            !emitted.contains(sentinel),
+            "a transcript-supplied string reached the grading: {emitted}"
+        );
+    }
+
+    /// A wrong *type* must cost the field, not the record — the same rule as
+    /// `null`, which `Option` alone does not give.
+    #[test]
+    fn a_wrong_typed_field_costs_the_field_not_the_record() {
+        let t = concat!(
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T03:00:00Z","message":{"model":"claude-opus-5","usage":{"input_tokens":"10","cache_read_input_tokens":[1,2],"cache_creation_input_tokens":{"nested":true}}}}"#,
+        );
+        let grade = grade_transcript(t, &contract_prices());
+        assert_eq!(
+            grade.wall_clock_ms, 10_800_000,
+            "the record kept its timestamp despite three wrong-typed counts"
+        );
+        assert_eq!(grade.gaps.len(), 1, "the gap it bounded still exists");
+        assert_eq!(grade.assistant_turns, 1, "it is still a turn");
+        assert_eq!(grade.peak_context_tokens, 0, "only the bad fields are lost");
+    }
+
     /// The grind flag compares against the emitted, rounded value, so the flag
     /// and the number printed beside it can never disagree.
     #[test]
@@ -1605,21 +1806,43 @@ pub fn run_grade(
 ///    1,512 records of leaked prose under exactly that key once passed a gate
 ///    built that way.
 ///
+/// **Read the second one narrowly: it inspects keys, never values.** Five of
+/// the fifteen permitted paths are free-form strings (`type`, `subtype`,
+/// `timestamp`, `message.model`, `compactMetadata.trigger`), so a *future*
+/// fixture could carry prose, a home-directory path, or a credential inside
+/// one of those values and pass unchanged. Nor are value types checked —
+/// `compactMetadata.preTokens` could be a paragraph. "Every leaf path is
+/// permitted" is a real property and a smaller one than it sounds.
+///
 /// What this deliberately does **not** carry is the remote gate's prose
-/// detector. That gap only matters for a fixture that is not this one, so it is
-/// filed as a follow-up rather than reimplemented from prose here — two
-/// independent readers rebuilding that gate's sibling from a written
-/// description produced three different programs.
+/// detector, which is exactly the value-side check the paragraph above is
+/// missing. That gap only matters for a fixture that is not this one — these
+/// bytes are pinned — so it is filed as cadence-ecosystem#546 rather than
+/// reimplemented from prose here: two independent readers rebuilding that
+/// gate's sibling from a written description produced three different
+/// programs.
+///
+/// Both embedded files are digest-pinned, not just the transcript one. The
+/// expected-output file is loaded by the same `include_str!` mechanism and is
+/// equally worth knowing to be the reviewed copy.
 #[cfg(test)]
 mod fixture_gate {
     use serde_json::Value;
     use sha2::{Digest, Sha256};
 
     const FIXTURE: &str = include_str!("../testdata/grading/contract-cases.jsonl");
+    const EXPECTED: &str = include_str!("../testdata/grading/contract-cases.expected.json");
 
-    /// The digest recorded in the contract, section 2.
+    /// The transcript fixture's digest, recorded in the contract, section 2.
     const REVIEWED_SHA256: &str =
         "124b7c9e21cde80a4a1ea7f348a63d009c1e706afac0b8078bc00598396db52c";
+
+    /// The expected-output file's digest. The contract records no value for
+    /// this one, so it is pinned here at the bytes reviewed alongside the
+    /// transcript — otherwise the second embedded file is guarded by nothing
+    /// while the first looks thoroughly covered.
+    const REVIEWED_EXPECTED_SHA256: &str =
+        "38fde929a1b4b4c59fb8bdaba01815df0912843a2a7c967cc8d87958f0b9719a";
 
     /// The fifteen paths the grading record contract permits.
     const ALLOWED: &[&[&str]] = &[
@@ -1658,6 +1881,17 @@ mod fixture_gate {
             "the grading fixture has drifted from the copy the contract reviewed; \
              re-copy it from cadence-ecosystem or re-run the leak gate and update \
              the contract's recorded digest"
+        );
+    }
+
+    #[test]
+    fn the_expected_output_is_byte_identical_to_the_reviewed_copy() {
+        let digest = format!("{:x}", Sha256::digest(EXPECTED.as_bytes()));
+        assert_eq!(
+            digest, REVIEWED_EXPECTED_SHA256,
+            "the expected-output fixture has drifted; it is what the acceptance \
+             test grades against, so an unreviewed edit here silently redefines \
+             correct"
         );
     }
 
