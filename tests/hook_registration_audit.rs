@@ -333,6 +333,7 @@ const KNOWN_DUPLICATE_REGISTRATIONS: &[&str] = &[
     "guardrails warn-going-public",
     "guardrails warn-issue-tracker",
     "metrics log-polish-nudge",
+    "obsidian trash-guard",
     "session guard",
 ];
 
