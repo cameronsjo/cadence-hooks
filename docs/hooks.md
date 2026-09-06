@@ -132,6 +132,20 @@ exit 0. They never block a tool call (see
 | `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` |
 | `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` |
 
+`metrics grade` is a **CLI action, not a hook** — it has no `hooks.json` wiring,
+reads no stdin payload, and is not subject to `CADENCE_DISABLE`. It grades one
+transcript deterministically and prints the JSON:
+
+```bash
+cadence-hooks metrics grade --transcript path/to/transcript.jsonl
+cadence-hooks metrics grade --session-id <uuid>   # searches every projects/* dir
+cadence-hooks metrics grade                        # defaults to $CLAUDE_CODE_SESSION_ID
+```
+
+The same grading is written to every `sessions.jsonl` row under a `grading` key.
+Unlike a guard, `grade` fails closed: a transcript it cannot identify or read
+exits 1 with the reason on stderr rather than printing a partial grading.
+
 `log-commit` and `log-session` both read the price table from the embedded
 default, overridable with `--prices <path>` (or `CADENCE_METRICS_PRICES`). Set
 `CADENCE_METRICS_DEBUG=1` to add a `_keys` array of raw payload keys to

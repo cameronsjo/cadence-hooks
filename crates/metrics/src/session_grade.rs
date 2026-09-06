@@ -511,10 +511,11 @@ fn find_gaps(events: &[Event], turns: &[&Turn], prices: &Prices) -> Vec<Gap> {
                 start_ms,
                 end_ms,
                 gap_ms,
+                // Turns are sorted ascending, so the last one at or before the
+                // gap's start is the nearest preceding turn.
                 context_tokens_at_gap: turns
                     .iter()
-                    .filter(|t| t.ts_ms <= start_ms)
-                    .next_back()
+                    .rfind(|t| t.ts_ms <= start_ms)
                     .map(|t| t.context),
                 cold_restart_usd: basis.map(|(t, r)| usd_per_mtok(t, r)),
                 cold_restart_usd_exact: basis.map(|(t, r)| t as f64 * r / 1_000_000.0),
@@ -1421,5 +1422,183 @@ pub fn run_grade(
             eprintln!("metrics grade: cannot serialize the grading: {e}");
             1
         }
+    }
+}
+
+/// Containment gate for the embedded grading fixture.
+///
+/// The contract requires the reviewed leak gate
+/// (`scripts/assert-fixture-keys.sh` in `cameronsjo/cadence-ecosystem`) to run
+/// in CI against this copy, and calls that a blocking acceptance criterion. That
+/// script is 249 lines of security-critical `jq` and lives in another repo;
+/// copying it here would put two copies of one gate on two release cadences,
+/// which is how a gate goes quietly stale.
+///
+/// So this asserts the two properties that make the remote gate's verdict
+/// transferable instead:
+///
+/// 1. **Byte-identity.** The digest below is the reviewed file's. Any edit to
+///    the fixture fails here, loudly, naming the digest — so the remote gate's
+///    "this file is clean" continues to describe *this* file.
+/// 2. **Containment.** Every leaf path in every record is one of the fifteen
+///    the contract permits, compared as path *arrays* rather than dot-joined
+///    strings — a flat key named `usage.input_tokens` inside `message` renders
+///    identically to an allowlisted path when joined, and a fixture carrying
+///    1,512 records of leaked prose under exactly that key once passed a gate
+///    built that way.
+///
+/// What this deliberately does **not** carry is the remote gate's prose
+/// detector. That gap only matters for a fixture that is not this one, so it is
+/// filed as a follow-up rather than reimplemented from prose here — two
+/// independent readers rebuilding that gate's sibling from a written
+/// description produced three different programs.
+#[cfg(test)]
+mod fixture_gate {
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    const FIXTURE: &str = include_str!("../testdata/grading/contract-cases.jsonl");
+
+    /// The digest recorded in the contract, section 2.
+    const REVIEWED_SHA256: &str =
+        "124b7c9e21cde80a4a1ea7f348a63d009c1e706afac0b8078bc00598396db52c";
+
+    /// The fifteen paths the grading record contract permits.
+    const ALLOWED: &[&[&str]] = &[
+        &["type"],
+        &["timestamp"],
+        &["isSidechain"],
+        &["isMeta"],
+        &["subtype"],
+        &["compactMetadata", "trigger"],
+        &["compactMetadata", "preTokens"],
+        &["message", "model"],
+        &["message", "contentIsString"],
+        &["message", "usage", "input_tokens"],
+        &["message", "usage", "output_tokens"],
+        &["message", "usage", "cache_read_input_tokens"],
+        &["message", "usage", "cache_creation_input_tokens"],
+        &[
+            "message",
+            "usage",
+            "cache_creation",
+            "ephemeral_1h_input_tokens",
+        ],
+        &[
+            "message",
+            "usage",
+            "cache_creation",
+            "ephemeral_5m_input_tokens",
+        ],
+    ];
+
+    #[test]
+    fn the_fixture_is_byte_identical_to_the_reviewed_copy() {
+        let digest = format!("{:x}", Sha256::digest(FIXTURE.as_bytes()));
+        assert_eq!(
+            digest, REVIEWED_SHA256,
+            "the grading fixture has drifted from the copy the contract reviewed; \
+             re-copy it from cadence-ecosystem or re-run the leak gate and update \
+             the contract's recorded digest"
+        );
+    }
+
+    /// Collect every leaf path, including `false`- and `null`-valued ones.
+    ///
+    /// A `paths(scalars)`-style filter cannot see those — the select drops
+    /// them — and `isSidechain: false` sits on most records here. A gate blind
+    /// to a third of its input is not a gate.
+    fn leaves(value: &Value, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    prefix.push(k.clone());
+                    leaves(v, prefix, out);
+                    prefix.pop();
+                }
+            }
+            Value::Array(items) => {
+                // An array under an allowlisted key is still a container the
+                // path check must see; index it so the leaf carries a path.
+                for (i, v) in items.iter().enumerate() {
+                    prefix.push(format!("[{i}]"));
+                    leaves(v, prefix, out);
+                    prefix.pop();
+                }
+                if items.is_empty() {
+                    out.push(prefix.clone());
+                }
+            }
+            _ => out.push(prefix.clone()),
+        }
+    }
+
+    #[test]
+    fn every_fixture_path_is_one_the_contract_permits() {
+        let allowed: Vec<Vec<String>> = ALLOWED
+            .iter()
+            .map(|p| p.iter().map(|s| (*s).to_string()).collect())
+            .collect();
+
+        for (n, line) in FIXTURE.lines().enumerate() {
+            let record: Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("line {}: {e}", n + 1));
+            assert!(
+                record.is_object(),
+                "line {}: a non-object record is skipped by every name-based check",
+                n + 1
+            );
+
+            let mut found = Vec::new();
+            leaves(&record, &mut Vec::new(), &mut found);
+            for path in found {
+                assert!(
+                    allowed.contains(&path),
+                    "line {}: path {:?} is not one of the fifteen the contract permits",
+                    n + 1,
+                    path
+                );
+            }
+        }
+    }
+
+    /// The containment check must be able to fail — otherwise it is decoration.
+    #[test]
+    fn the_containment_check_can_go_red() {
+        let allowed: Vec<Vec<String>> = ALLOWED
+            .iter()
+            .map(|p| p.iter().map(|s| (*s).to_string()).collect())
+            .collect();
+
+        // A dotted key impersonating a nested path: byte-identical to an
+        // allowlisted path once joined, and a different path as an array.
+        let smuggled: Value =
+            serde_json::from_str(r#"{"message":{"usage.input_tokens":"leaked prose"}}"#)
+                .expect("parses");
+        let mut found = Vec::new();
+        leaves(&smuggled, &mut Vec::new(), &mut found);
+        assert_eq!(found, vec![vec!["message", "usage.input_tokens"]]);
+        assert!(
+            !allowed.contains(&found[0]),
+            "a dotted key must not pass as a nested path"
+        );
+
+        // A false-valued leaf must be visible, not silently dropped.
+        let falsey: Value =
+            serde_json::from_str(r#"{"secretFlag":false,"nested":{"x":null}}"#).expect("parses");
+        let mut found = Vec::new();
+        leaves(&falsey, &mut Vec::new(), &mut found);
+        assert_eq!(found.len(), 2, "false and null leaves must both be seen");
+        for path in &found {
+            assert!(!allowed.contains(path), "{path:?} must be rejected");
+        }
+
+        // An empty container has no scalar leaf; it must still be seen.
+        let empty: Value =
+            serde_json::from_str(r#"{"message":{"usage":{"iterations":[]}}}"#).expect("parses");
+        let mut found = Vec::new();
+        leaves(&empty, &mut Vec::new(), &mut found);
+        assert_eq!(found, vec![vec!["message", "usage", "iterations"]]);
+        assert!(!allowed.contains(&found[0]));
     }
 }
