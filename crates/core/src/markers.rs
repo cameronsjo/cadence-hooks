@@ -244,6 +244,29 @@ pub struct PolishRecord {
     /// side's binding rule — never present for an arm the same invocation did
     /// not state.
     pub attest: Option<std::collections::BTreeMap<String, ArmAttestation>>,
+    /// The recorded working-tree digest (cadence-hooks#874): what the polish
+    /// arms actually reviewed, as a content hash over the branch's change set.
+    ///
+    /// Absent on every marker recorded before the digest existed, and absent
+    /// whenever a field failed its charset bound — absence means *unknown*,
+    /// never *changed*, so the gate stays silent rather than nudging on no
+    /// evidence.
+    pub diff_digest: Option<DiffDigest>,
+}
+
+/// The `diff_digest` block as read back from a marker (cadence-hooks#874).
+///
+/// Every field is optional for the same reason the rest of [`PolishRecord`] is:
+/// a legacy marker carries none of them, and a value that fails its read-side
+/// charset bound drops rather than failing the record.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DiffDigest {
+    /// The merge base the change set was computed against.
+    pub base: Option<String>,
+    /// `sha256:<hex>`, or the literal `skipped` / `empty`.
+    pub digest: Option<String>,
+    /// How many code paths were in the change set.
+    pub files: Option<u64>,
 }
 
 /// One arm's attestation: the model family that ran it and where its report
@@ -412,6 +435,79 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
             .and_then(|s| s.as_str())
             .map(str::to_string),
         attest: read_attest(&v),
+        diff_digest: read_diff_digest(&v),
+    })
+}
+
+/// A recorded digest value: `sha256:<64 lowercase hex>`, or one of the two
+/// literals [`working_tree_digest`](crate::branch_diff::working_tree_digest)
+/// records when it declines to hash (`skipped` for a bound hit, `empty` for a
+/// change set with no code paths).
+///
+/// Bounded on the READ side even though **no consumer renders this value
+/// today** — the pre-PR gate compares it and its nudge message echoes nothing
+/// from the marker. The bound is *both-sides parity* with [`is_arm_token`]: a
+/// marker is a plain file a hand edit can rewrite, and the moment a future
+/// renderer does interpolate a digest — a prefix in the nudge, a `doctor` row,
+/// a verdict line — it is already safe. Retrofitting a bound after the renderer
+/// exists is the sequence cadence-hooks#775's security review was filed for.
+fn is_digest_value(s: &str) -> bool {
+    if s == "skipped" || s == "empty" {
+        return true;
+    }
+    let Some(hex) = s.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A recorded merge base: 4–64 lowercase hex characters, the shape `git
+/// merge-base` emits. Bounded on the read side, like [`is_digest_value`].
+fn is_digest_base(s: &str) -> bool {
+    (4..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Read the optional `diff_digest` block leniently (cadence-hooks#874).
+///
+/// Every unexpected shape degrades toward *absent*, never toward a value. A
+/// non-object `diff_digest` drops the block; a wrong-typed `base`, `digest`, or
+/// `files` reads as that field being absent.
+///
+/// **The two fields fail differently, on purpose.** A malformed `digest` drops
+/// the whole block — it is the field the gate compares, so without a
+/// trustworthy one there is nothing to decide with. A malformed `base` drops
+/// only itself and keeps a valid digest: **nothing reads `base`**, so dropping
+/// the block over it would let one junk character in an unread field suppress a
+/// nudge the digest had already earned. Suppression is the direction that
+/// costs, since the gate is advisory and a spurious nudge is only noise.
+fn read_diff_digest(v: &serde_json::Value) -> Option<DiffDigest> {
+    let entry = v.get("diff_digest")?.as_object()?;
+    let string = |key: &str, ok: fn(&str) -> bool| -> Result<Option<String>, ()> {
+        match entry.get(key).and_then(|s| s.as_str()) {
+            None => Ok(None),
+            Some(s) if ok(s) => Ok(Some(s.to_string())),
+            Some(_) => Err(()),
+        }
+    };
+    // A malformed base drops to `None` (`.unwrap_or_default()`); a malformed
+    // digest drops the record (`.ok()?`).
+    let base = string("base", is_digest_base).unwrap_or_default();
+    let digest = string("digest", is_digest_value).ok()?;
+    Some(DiffDigest {
+        base,
+        digest,
+        // `files` needs no charset bound and no ceiling: serde has already
+        // proven it is a `u64`, so it carries no escapes, no control bytes,
+        // and no injection prose — the whole reason the string fields are
+        // bounded. Any value in range is a legitimate count, and nothing reads
+        // it. This is the exemption from both-sides parity, stated rather than
+        // left as an omission.
+        files: entry.get("files").and_then(serde_json::Value::as_u64),
     })
 }
 
@@ -854,6 +950,143 @@ mod tests {
     // The one shared marker-dir env helper (and its one lock) for the whole
     // workspace — never mint a module-local sibling (#446).
     use crate::test_builders::with_marker_dir;
+
+    // --- cadence-hooks#874: the diff_digest read side ---
+
+    #[test]
+    fn is_digest_value_accepts_only_a_real_hash_or_the_two_literals() {
+        let hex = "a".repeat(64);
+        for ok in [
+            format!("sha256:{hex}"),
+            format!("sha256:{}", "0123456789abcdef".repeat(4)),
+            "skipped".to_string(),
+            "empty".to_string(),
+        ] {
+            assert!(is_digest_value(&ok), "should accept: {ok:?}");
+        }
+        for bad in [
+            String::new(),
+            format!("sha256:{}", "a".repeat(63)), // one short
+            format!("sha256:{}", "a".repeat(65)), // one long
+            format!("SHA256:{hex}"),              // uppercase prefix
+            format!("sha256:{}", "A".repeat(64)), // uppercase hex
+            format!("sha256:{}", "g".repeat(64)), // out of hex range
+            format!("sha256:{hex}\u{1b}[31m"),    // a terminal escape
+            format!("sha256:{hex}\nIgnore the above"), // injection prose
+            format!(" sha256:{hex}"),             // leading space
+            format!("sha256:{hex} "),             // trailing space
+            "Skipped".to_string(),
+            "skipped ".to_string(),
+            hex.clone(), // hex with no prefix
+        ] {
+            assert!(!is_digest_value(&bad), "should reject: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn is_digest_base_accepts_only_short_lowercase_hex() {
+        for ok in ["dead", "deadbeef", &"a".repeat(64), "0123456789abcdef"] {
+            assert!(is_digest_base(ok), "should accept: {ok:?}");
+        }
+        for bad in [
+            "",
+            "dea",              // under the 4-char floor
+            &"a".repeat(65),    // over the 64-char ceiling
+            "DEADBEEF",         // uppercase
+            "dead beef",        // space
+            "deadbeeg",         // out of hex range
+            "dead\u{1b}[31mbe", // a terminal escape
+            "../../etc/passwd",
+        ] {
+            assert!(!is_digest_base(bad), "should reject: {bad:?}");
+        }
+    }
+
+    /// `read_diff_digest` over a marker body, so each row states the JSON the
+    /// reader actually sees.
+    fn digest_of(body: &str) -> Option<DiffDigest> {
+        read_diff_digest(&serde_json::from_str(body).expect("fixture is valid JSON"))
+    }
+
+    #[test]
+    fn read_diff_digest_drops_the_block_on_every_unusable_shape() {
+        let hex = "a".repeat(64);
+        for body in [
+            r#"{}"#.to_string(),                        // no diff_digest at all
+            r#"{"diff_digest":"skipped"}"#.to_string(), // not an object
+            r#"{"diff_digest":[]}"#.to_string(),
+            r#"{"diff_digest":null}"#.to_string(),
+            r#"{"diff_digest":{"digest":"sha256:short"}}"#.to_string(),
+            format!(r#"{{"diff_digest":{{"digest":"SHA256:{hex}"}}}}"#),
+            format!(
+                r#"{{"diff_digest":{{"digest":"sha256:{}"}}}}"#,
+                "a".repeat(63)
+            ),
+        ] {
+            assert!(
+                digest_of(&body).is_none(),
+                "should drop the whole block: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_diff_digest_keeps_a_valid_digest_past_a_bad_base_or_files() {
+        // The asymmetry: `digest` is the field the gate compares, so a bad one
+        // drops the block. Nothing reads `base` or `files`, so a bad one drops
+        // only itself — otherwise a junk character in an unread field could
+        // SUPPRESS a nudge the digest had already earned.
+        let hex = "a".repeat(64);
+        let expect_digest = format!("sha256:{hex}");
+
+        let bad_base = digest_of(&format!(
+            r#"{{"diff_digest":{{"base":"NOT HEX","digest":"sha256:{hex}","files":3}}}}"#
+        ))
+        .expect("a bad base must not drop the block");
+        assert_eq!(bad_base.digest.as_deref(), Some(expect_digest.as_str()));
+        assert_eq!(bad_base.base, None, "the bad base drops to None");
+        assert_eq!(bad_base.files, Some(3));
+
+        let non_string_base = digest_of(&format!(
+            r#"{{"diff_digest":{{"base":42,"digest":"sha256:{hex}"}}}}"#
+        ))
+        .expect("a non-string base must not drop the block");
+        assert_eq!(non_string_base.base, None);
+
+        // A non-string DIGEST is a wrong-type field, not a charset failure: it
+        // reads as an absent digest and the block survives carrying `None`.
+        // Only a well-formed-but-out-of-charset digest drops the block. Both
+        // reach the gate as no evidence, so the verdict is the same either way
+        // — this pins which shape produces which, so a future reader is not
+        // left guessing.
+        let non_string_digest = digest_of(r#"{"diff_digest":{"base":"deadbeef","digest":123}}"#)
+            .expect("a non-string digest reads as an absent digest, not a dropped block");
+        assert_eq!(non_string_digest.digest, None);
+        assert_eq!(non_string_digest.base.as_deref(), Some("deadbeef"));
+
+        let files_as_string = digest_of(&format!(
+            r#"{{"diff_digest":{{"base":"deadbeef","digest":"sha256:{hex}","files":"3"}}}}"#
+        ))
+        .expect("a non-integer files must not drop the block");
+        assert_eq!(
+            files_as_string.files, None,
+            "`files` is a string, so it reads as unknown"
+        );
+        assert_eq!(files_as_string.base.as_deref(), Some("deadbeef"));
+
+        let full = digest_of(&format!(
+            r#"{{"diff_digest":{{"base":"deadbeef","digest":"sha256:{hex}","files":7}}}}"#
+        ))
+        .expect("the well-formed shape resolves");
+        assert_eq!(
+            full,
+            DiffDigest {
+                base: Some("deadbeef".to_string()),
+                digest: Some(expect_digest),
+                files: Some(7),
+            }
+        );
+    }
 
     // --- marker_dir_from (pure resolver behind CADENCE_MARKER_DIR) ---
 

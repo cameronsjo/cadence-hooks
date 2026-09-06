@@ -7,7 +7,7 @@ Rust workspace (8 crates) compiling to a single `cadence-hooks` binary. Dispatch
 - `make ci` = fmt-check + clippy `-D warnings` + all tests. Run before every commit — the pre-commit hook also needs cargo on PATH.
 - cargo lives at `~/.cargo/bin` — `export PATH="$HOME/.cargo/bin:$PATH"` in every shell invocation, including git commits (the pre-commit hook runs cargo and aborts silently without it).
 - `cargo fmt --all` before `make ci` after writing long assert lines — fmt-check fails CI otherwise.
-- **Local `make ci` green does NOT guarantee CI green when the local Rust toolchain trails CI's.** CI runs the latest stable clippy, which flags lints the older local clippy doesn't (e.g. `collapsible_match` on 1.96). Treat the first CI run as the real clippy verdict, or `rustup update` before a PR.
+- **Local `make ci` green does NOT guarantee CI green — and toolchain drift is the SECOND cause to check, not the first.** Until 2026-09-06 the `clippy` target ran `cargo clippy --workspace` with no `--all-targets`, so it never linted test code at all while CI did: a lint in a `#[cfg(test)]` module passed locally and failed CI with matching toolchains on both sides. That misreads as toolchain drift every time, and the `rustup update` it prescribes fixes nothing. The target now carries `--all-targets` (cadence-hooks#874). **Before blaming the toolchain, compare the two invocations and confirm `cargo clippy --version` actually differs from CI's** — the real drift case is real (CI runs latest stable, which flags lints an older local clippy doesn't, e.g. `collapsible_match` on 1.96), so `rustup update` before a PR is still worth it, but only after the flags match.
 
 ## Release (fully automated — do NOT create tags or edit the tap formula manually)
 

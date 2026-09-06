@@ -14,11 +14,13 @@
 //! naive `.md == docs` classifier would re-open exactly the loophole the gate's
 //! SCOPE_CLAUSES exist to close.
 
+use crate::deadline;
 use crate::shell::{GitSpawn, git_command, run_git_bounded};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// The merge base with `origin/main` (falling back to `origin/master`) for the
 /// branch checked out at `dir`. The base refs are spelled fully qualified
@@ -98,16 +100,47 @@ pub const MAX_DIGEST_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// - a bound hit ([`MAX_DIGEST_FILES`] / [`MAX_DIGEST_BYTES`]) → `digest` is
 ///   the literal `"skipped"` — a real value the reader can see;
-/// - an unresolvable base or any subprocess failure → `None`, so the caller
-///   omits the field entirely. *Bounded out* and *no evidence* must not
-///   collapse into one another.
+/// - an unresolvable base, any subprocess failure, or a spent deadline budget
+///   mid-hash → `None`, so the caller omits the field entirely. *Bounded out*
+///   and *no evidence* must not collapse into one another.
 pub fn working_tree_digest(dir: &str) -> Option<WorkingTreeDigest> {
-    digest_bounded(dir, MAX_DIGEST_FILES, MAX_DIGEST_BYTES)
+    digest_bounded(dir, MAX_DIGEST_FILES, MAX_DIGEST_BYTES, hash_budget)
 }
 
-/// [`working_tree_digest`] with explicit bounds, so both bounds are testable
-/// without materializing a thousand files or 64 MiB.
-fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<WorkingTreeDigest> {
+/// How long the content-hash loop may run before abandoning the digest.
+///
+/// `Armed` already has the hook's elapsed time subtracted, so it is what
+/// remains from here; `Unarmed` (the CLI path) caps at the full budget;
+/// `Disabled` means no bound at all.
+///
+/// **Read immediately before the loop, never earlier.** `Armed` shrinks as
+/// time passes, and `digest_bounded` runs four git subprocesses before it
+/// hashes anything. Reading the budget at the top would hand the loop the
+/// pre-subprocess allotment, so the subprocess time and the hash time would
+/// each fit the budget while their sum overran it — the exact overrun the
+/// internal deadline exists to keep inside the external `hooks.json` kill.
+fn hash_budget() -> Option<Duration> {
+    match deadline::state() {
+        deadline::BudgetState::Disabled => None,
+        deadline::BudgetState::Armed(remaining) | deadline::BudgetState::Unarmed(remaining) => {
+            Some(remaining)
+        }
+    }
+}
+
+/// [`working_tree_digest`] with explicit bounds, so all three bounds — files,
+/// bytes, and time — are testable without materializing a thousand files, 64
+/// MiB, or a real deadline.
+///
+/// `hash_budget` is a **closure, not a value**: it is called once, immediately
+/// before the hash loop, after every subprocess this function runs. See
+/// [`hash_budget`] for why the timing is load-bearing.
+fn digest_bounded(
+    dir: &str,
+    max_files: usize,
+    max_bytes: u64,
+    hash_budget: impl Fn() -> Option<Duration>,
+) -> Option<WorkingTreeDigest> {
     let base = merge_base_with_origin(dir)?;
     // Resolve the repo top-level ONCE and run both change-set subprocesses
     // against it (cadence-hooks#775 C1): `git diff --name-only` yields
@@ -150,7 +183,30 @@ fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<Working
     let root = Path::new(&root);
     let mut frames = Sha256::new();
     let mut remaining = max_bytes;
+    // The content-hash loop is the only unbounded work in this function — the
+    // two subprocesses above go through the deadline-aware spawn helpers, but
+    // reading and hashing up to MAX_DIGEST_FILES files consulted no clock at
+    // all. That was tolerable while this ran only on the `record-polish` CLI
+    // path; cadence-hooks#874 put it on the hook path, where an external
+    // hooks.json timeout would kill the process outright (the pre-#271 silent
+    // kill this module exists to prevent).
+    //
+    // The budget is read HERE, after the four subprocesses above, not at the
+    // call site — an `Armed` budget shrinks as those run, and handing the loop
+    // a pre-subprocess allotment lets the two phases each fit while their sum
+    // overruns. Every early return above this line therefore never reads it.
+    let hash_budget = hash_budget();
+    let hash_start = Instant::now();
     for path in &paths {
+        // Out of budget → `None`, the no-evidence shape. Deliberately NOT
+        // `"skipped"`: that is a real recorded value meaning "a declared bound
+        // was hit", and writing it here would attest a bound the operator can
+        // reason about when what actually happened is that the clock ran out.
+        // `None` omits the field, which every consumer already reads as silent.
+        if hash_budget.is_some_and(|budget| hash_start.elapsed() >= budget) {
+            deadline::note_hit();
+            return None;
+        }
         // The budget is spent BEFORE the read, not after it: `digest_entry`
         // returns `None` for a regular file whose metadata already exceeds what
         // is left, so no single file is ever pulled whole into memory to find
@@ -329,6 +385,19 @@ mod tests {
         git_in(dir, &["init", "-q", "-b", "main"]);
         git_in(dir, &["config", "user.email", "t@t"]);
         git_in(dir, &["config", "user.name", "t"]);
+        // Windows git defaults to `core.autocrlf=true`, which rewrites LF to
+        // CRLF in the working tree on every checkout. These fixtures write
+        // their files with `std::fs::write` (LF), so any test that checks out
+        // — the merge-up pair — got a digest over LF bytes before and CRLF
+        // bytes after, and `working_tree_digest` correctly reported a move that
+        // was purely a line-ending rewrite. Measured: `src/a.rs` goes 10 bytes
+        // to 11 across a merge under `autocrlf=true`, and stays 10 under
+        // `false`. This is a FIXTURE artifact, not gate behavior — a real repo
+        // has its content checked out consistently — so it is pinned off here
+        // rather than worked around in the digest. `safecrlf` is set too so a
+        // future fixture with mixed endings cannot abort a `git add` instead.
+        git_in(dir, &["config", "core.autocrlf", "false"]);
+        git_in(dir, &["config", "core.safecrlf", "false"]);
         git_in(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
         git_in(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git_in(dir, &["checkout", "-q", "-b", "feat/x"]);
@@ -389,6 +458,178 @@ mod tests {
 
         assert_eq!(before.digest, after.digest);
         assert_eq!(before.files, 1);
+    }
+
+    #[test]
+    fn the_hash_budget_is_read_at_the_loop_not_before_the_subprocesses() {
+        // cadence-hooks#874 second review: the budget used to be evaluated as
+        // an ARGUMENT, before `digest_bounded` ran merge-base, rev-parse, and
+        // the two listing subprocesses. An `Armed` budget shrinks while those
+        // run, so the loop got the pre-subprocess allotment and the two phases
+        // could each fit the budget while their sum overran it.
+        //
+        // The deadline module's clock and budget are process-global `OnceLock`s
+        // with no test setter, so this cannot be driven through a real
+        // shrinking budget. Call ORDER is the observable that settles it
+        // instead: every early return in `digest_bounded` sits BEFORE the loop,
+        // so an empty code set must return without ever asking for a budget. An
+        // argument-evaluated budget is asked for unconditionally, so this test
+        // is red the moment the read moves back up.
+        let calls = std::cell::Cell::new(0);
+        let counted = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+
+        // No code paths at all → the `empty` early return, above the loop.
+        let tmp = init_repo_with_origin_main(&[]);
+        let empty = digest_bounded(
+            tmp.path().to_str().unwrap(),
+            MAX_DIGEST_FILES,
+            MAX_DIGEST_BYTES,
+            counted,
+        )
+        .expect("digest resolves");
+        assert_eq!(empty.digest, "empty", "precondition: the early return");
+        assert_eq!(
+            calls.get(),
+            0,
+            "a return above the loop must not read the budget"
+        );
+
+        // Positive control: with a file to hash, the loop runs and asks once —
+        // otherwise the zero above would prove nothing.
+        write_file(tmp.path(), "src/a.rs", "fn a() {}\n");
+        let hashed = digest_bounded(
+            tmp.path().to_str().unwrap(),
+            MAX_DIGEST_FILES,
+            MAX_DIGEST_BYTES,
+            counted,
+        )
+        .expect("digest resolves");
+        assert!(hashed.digest.starts_with("sha256:"));
+        assert_eq!(calls.get(), 1, "the loop reads the budget exactly once");
+    }
+
+    #[test]
+    fn a_spent_hash_budget_yields_no_evidence_not_a_skipped_record() {
+        // cadence-hooks#874 security review: the content-hash loop now runs on
+        // the HOOK path, where it previously ran only on the record-polish CLI
+        // path, and it consulted no clock at all. Without a budget check an
+        // external hooks.json timeout kills the process outright — the silent
+        // external kill the deadline module exists to prevent.
+        //
+        // A zero budget is spent before the first file, so the loop abandons
+        // immediately. The result must be `None` (no evidence — the caller
+        // omits the field and the gate stays silent), never a `"skipped"`
+        // record: `skipped` is a real recorded value asserting a DECLARED bound
+        // was hit, and writing it here would attest a bound the operator can
+        // reason about when the clock simply ran out.
+        let tmp = init_repo_with_origin_main(&[]);
+        let dir = tmp.path();
+        write_file(dir, "src/a.rs", "fn a() {}\n");
+
+        // Positive control: the same call with no budget resolves a real hash,
+        // so the `None` below is the budget's doing and not a broken fixture.
+        let unbounded = digest_bounded(
+            dir.to_str().unwrap(),
+            MAX_DIGEST_FILES,
+            MAX_DIGEST_BYTES,
+            || None,
+        )
+        .expect("digest resolves with no time bound");
+        assert!(unbounded.digest.starts_with("sha256:"));
+
+        let spent = digest_bounded(
+            dir.to_str().unwrap(),
+            MAX_DIGEST_FILES,
+            MAX_DIGEST_BYTES,
+            || Some(Duration::ZERO),
+        );
+        assert!(
+            spent.is_none(),
+            "a spent budget is no evidence, not a bounded-out record: {spent:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_overlapping_merge_up_leaves_the_digest_unchanged() {
+        // cadence-hooks#874: the pre-PR gate now COMPARES this digest against a
+        // marker's recorded one, so the merge-up invariant stopped being
+        // provenance trivia and became load-bearing. Merging an advanced
+        // `origin/main` into the branch moves the merge BASE, which the digest
+        // is computed against — but the branch's own change set is unchanged,
+        // so the digest must not move. Were it to move, every branch that
+        // merged main up after polishing would draw the stale-marker nudge.
+        //
+        // The invariant is CONDITIONAL on the merge not overlapping the
+        // branch's change set — the upstream commit here touches a different
+        // file. The overlapping case genuinely moves the digest and is pinned
+        // by `a_merge_up_that_overlaps_the_branch_change_set_does_move_the_digest`.
+        let tmp = init_repo_with_origin_main(&[]);
+        let dir = tmp.path();
+        write_file(dir, "src/a.rs", "fn a() {}\n");
+        git_in(dir, &["add", "src/a.rs"]);
+        git_in(dir, &["commit", "-q", "-m", "branch work"]);
+        let before = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
+
+        // Advance `origin/main` with an unrelated commit, then merge it up.
+        git_in(dir, &["checkout", "-q", "main"]);
+        write_file(dir, "src/upstream.rs", "fn upstream() {}\n");
+        git_in(dir, &["add", "src/upstream.rs"]);
+        git_in(dir, &["commit", "-q", "-m", "upstream work"]);
+        git_in(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(dir, &["checkout", "-q", "feat/x"]);
+        git_in(dir, &["merge", "-q", "--no-edit", "main"]);
+
+        let after = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
+        assert_ne!(
+            before.base, after.base,
+            "precondition: the merge-up must have moved the base"
+        );
+        assert_eq!(
+            before.digest, after.digest,
+            "a merge-up must not move the digest"
+        );
+        assert_eq!(after.files, 1, "only the branch's own change set is hashed");
+    }
+
+    #[test]
+    fn a_merge_up_that_overlaps_the_branch_change_set_does_move_the_digest() {
+        // cadence-hooks#874 code review: the merge-up invariant above is
+        // CONDITIONAL. It holds only while the merged upstream commits touch no
+        // file the branch also changed. When they overlap, git's auto-merge
+        // rewrites that file in the working tree, so its content genuinely
+        // differs from what polish reviewed — and the digest moves.
+        //
+        // This is the boundary, pinned rather than hidden: the gate will nudge
+        // after such a merge. That is an accepted false positive on an advisory
+        // verdict, and it is not even clearly false — the shipping content of a
+        // reviewed file really did change.
+        let tmp = init_repo_with_origin_main(&[]);
+        let dir = tmp.path();
+        write_file(dir, "src/shared.rs", "fn branch_side() {}\n");
+        git_in(dir, &["add", "src/shared.rs"]);
+        git_in(dir, &["commit", "-q", "-m", "branch work"]);
+        let before = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
+
+        // Advance `origin/main` with a commit touching the SAME file, in a
+        // non-conflicting region so the auto-merge succeeds.
+        git_in(dir, &["checkout", "-q", "main"]);
+        write_file(dir, "src/shared.rs", "fn upstream_side() {}\n");
+        git_in(dir, &["add", "src/shared.rs"]);
+        git_in(dir, &["commit", "-q", "-m", "upstream work"]);
+        git_in(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(dir, &["checkout", "-q", "feat/x"]);
+        // Take the upstream side wholesale, so the merge lands without a
+        // conflict and the file's content demonstrably changes.
+        git_in(dir, &["merge", "-q", "--no-edit", "-X", "theirs", "main"]);
+
+        let after = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
+        assert_ne!(
+            before.digest, after.digest,
+            "an OVERLAPPING merge-up rewrites a reviewed file, so the digest moves"
+        );
     }
 
     #[test]
@@ -532,13 +773,13 @@ mod tests {
         write_file(dir, "src/a.rs", "aaaa\n");
         write_file(dir, "src/b.rs", "bbbb\n");
 
-        let over_files = digest_bounded(dir.to_str().unwrap(), 1, MAX_DIGEST_BYTES)
+        let over_files = digest_bounded(dir.to_str().unwrap(), 1, MAX_DIGEST_BYTES, || None)
             .expect("a bounded-out digest still resolves");
         assert_eq!(over_files.digest, "skipped");
         assert_eq!(over_files.files, 2, "the file count still reports");
 
-        let over_bytes =
-            digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 1).expect("still resolves");
+        let over_bytes = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 1, || None)
+            .expect("still resolves");
         assert_eq!(over_bytes.digest, "skipped");
     }
 
@@ -565,7 +806,7 @@ mod tests {
             return;
         }
 
-        let bounded = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 64)
+        let bounded = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 64, || None)
             .expect("a bounded-out digest still resolves");
         assert_eq!(bounded.digest, "skipped");
         assert_eq!(bounded.files, 1, "the file count still reports");
