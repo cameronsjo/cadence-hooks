@@ -221,6 +221,7 @@ mod tests {
             tokens: Tokens {
                 input: 100,
                 cache_create: 50,
+                cache_create_1h: 0,
                 cache_read: 200,
                 output: 30,
             },
@@ -232,6 +233,7 @@ mod tests {
                 Tokens {
                     input: 100,
                     cache_create: 50,
+                    cache_create_1h: 0,
                     cache_read: 200,
                     output: 30,
                 },

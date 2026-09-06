@@ -45,6 +45,7 @@ mod tests {
         Tokens {
             input: 1_000_000,
             cache_create: 0,
+            cache_create_1h: 0,
             cache_read: 0,
             output: 0,
         }
@@ -68,6 +69,7 @@ mod tests {
         let tokens = Tokens {
             input: 1_000_000,
             cache_create: 1_000_000,
+            cache_create_1h: 0,
             cache_read: 1_000_000,
             output: 1_000_000,
         };
@@ -110,6 +112,7 @@ mod tests {
                 Tokens {
                     input: 1_000_000,
                     cache_create: 0,
+                    cache_create_1h: 0,
                     cache_read: 0,
                     output: 0,
                 },
@@ -119,6 +122,7 @@ mod tests {
                 Tokens {
                     input: 1_000_000,
                     cache_create: 0,
+                    cache_create_1h: 0,
                     cache_read: 0,
                     output: 0,
                 },
@@ -143,6 +147,7 @@ mod tests {
                 Tokens {
                     input: 1_000_000,
                     cache_create: 0,
+                    cache_create_1h: 0,
                     cache_read: 0,
                     output: 0,
                 },
@@ -152,6 +157,7 @@ mod tests {
                 Tokens {
                     input: 1_000_000,
                     cache_create: 0,
+                    cache_create_1h: 0,
                     cache_read: 0,
                     output: 0,
                 },
@@ -217,6 +223,7 @@ mod tests {
         let tokens = Tokens {
             input: 500_000,
             cache_create: 100_000,
+            cache_create_1h: 0,
             cache_read: 200_000,
             output: 50_000,
         };
