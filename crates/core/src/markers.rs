@@ -244,6 +244,29 @@ pub struct PolishRecord {
     /// side's binding rule — never present for an arm the same invocation did
     /// not state.
     pub attest: Option<std::collections::BTreeMap<String, ArmAttestation>>,
+    /// The recorded working-tree digest (cadence-hooks#874): what the polish
+    /// arms actually reviewed, as a content hash over the branch's change set.
+    ///
+    /// Absent on every marker recorded before the digest existed, and absent
+    /// whenever a field failed its charset bound — absence means *unknown*,
+    /// never *changed*, so the gate stays silent rather than nudging on no
+    /// evidence.
+    pub diff_digest: Option<DiffDigest>,
+}
+
+/// The `diff_digest` block as read back from a marker (cadence-hooks#874).
+///
+/// Every field is optional for the same reason the rest of [`PolishRecord`] is:
+/// a legacy marker carries none of them, and a value that fails its read-side
+/// charset bound drops rather than failing the record.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DiffDigest {
+    /// The merge base the change set was computed against.
+    pub base: Option<String>,
+    /// `sha256:<hex>`, or the literal `skipped` / `empty`.
+    pub digest: Option<String>,
+    /// How many code paths were in the change set.
+    pub files: Option<u64>,
 }
 
 /// One arm's attestation: the model family that ran it and where its report
@@ -412,6 +435,63 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
             .and_then(|s| s.as_str())
             .map(str::to_string),
         attest: read_attest(&v),
+        diff_digest: read_diff_digest(&v),
+    })
+}
+
+/// A recorded digest value: `sha256:<64 lowercase hex>`, or one of the two
+/// literals [`working_tree_digest`](crate::branch_diff::working_tree_digest)
+/// records when it declines to hash (`skipped` for a bound hit, `empty` for a
+/// change set with no code paths).
+///
+/// Bounded on the READ side for the same reason [`is_arm_token`] is: the pre-PR
+/// gate interpolates a prefix of this value into the session's
+/// `additionalContext` (cadence-hooks#775 security review), and a marker is a
+/// plain file a hand edit can rewrite.
+fn is_digest_value(s: &str) -> bool {
+    if s == "skipped" || s == "empty" {
+        return true;
+    }
+    let Some(hex) = s.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A recorded merge base: 4–64 lowercase hex characters, the shape `git
+/// merge-base` emits. Bounded on the read side, like [`is_digest_value`].
+fn is_digest_base(s: &str) -> bool {
+    (4..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Read the optional `diff_digest` block leniently (cadence-hooks#874).
+///
+/// Every unexpected shape reads as *absent*: a non-object `diff_digest`, a
+/// non-string `base`/`digest`, a non-integer `files`. A `base` or `digest` that
+/// fails its charset bound drops the WHOLE block rather than only that field —
+/// a digest with no trustworthy base, or a base with no trustworthy digest, is
+/// not evidence, and half a block would let a hand edit steer the comparison.
+/// Dropping the block reads as unknown, which keeps the gate silent (ADR-0001).
+fn read_diff_digest(v: &serde_json::Value) -> Option<DiffDigest> {
+    let entry = v.get("diff_digest")?.as_object()?;
+    let string = |key: &str, ok: fn(&str) -> bool| -> Result<Option<String>, ()> {
+        match entry.get(key).and_then(|s| s.as_str()) {
+            None => Ok(None),
+            Some(s) if ok(s) => Ok(Some(s.to_string())),
+            Some(_) => Err(()),
+        }
+    };
+    let base = string("base", is_digest_base).ok()?;
+    let digest = string("digest", is_digest_value).ok()?;
+    Some(DiffDigest {
+        base,
+        digest,
+        files: entry.get("files").and_then(serde_json::Value::as_u64),
     })
 }
 

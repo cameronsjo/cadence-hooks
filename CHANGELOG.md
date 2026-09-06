@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A stale polish marker read as fresh — `nudge-polish-before-pr` now compares the recorded change-set digest against the live working tree** (cadence-hooks#874). A marker satisfied the gate for as long as it sat on the branch, so work committed after the pass shipped with the arms having reviewed something else. The gate reads the marker's `diff_digest` (recorded since #775) and nudges when it differs from a live `working_tree_digest`. **It never compares `head_sha`** — that reader was refuted and stays refuted: polish never commits, so HEAD moves on every honest polish → commit → ship path. The digest does not: committing polish's own fixes leaves it unchanged, and merging an advanced `origin/main` up moves the base without moving the digest. This lifts the hold cadence-hooks#784 placed on a read-side digest comparison, which the operator ruled lifted on 2026-09-06 on #874's evidence.
+  - **Advisory, and silent without evidence.** Every arm of the decision is a nudge (ADR-0001), and the new verdict fires only when the marker carries a well-formed digest naming a real hash, a live digest resolves, and the two differ. A legacy marker with no `diff_digest`, a `skipped` record (the recorder hit a bound), an `empty` one (no code paths in the change set), and an unresolvable live digest all read as unknown and stay quiet. Precedence: absent → expired → security-skipped → wrong-family → digest-moved → unknown-roster → allow.
+  - **The recorded digest is charset-bound on the READ side**, like the attested model family before it: `digest` must be `sha256:<64 lowercase hex>`, `skipped`, or `empty`, and `base` 4–64 lowercase hex. A marker is a plain file a hand edit can rewrite, and the nudge lands in the session's `additionalContext`. A failing value drops the whole `diff_digest` block, never the record — and no recorded value reaches the message surface at all.
+  - **An untracked scratch code file added after the pass moves the digest too**, and will draw the nudge. Accepted: the verdict is advisory, and re-recording is one command.
+
 ## [0.96.0] - 2026-09-06
 
 ### Added

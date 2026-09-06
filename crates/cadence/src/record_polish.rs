@@ -554,9 +554,13 @@ pub fn run_record(
         incoming_arms,
         fresh,
     );
-    // Record-side only, by ruling: the gate never reads this (see
-    // `nudge_polish_before_pr`'s head_sha note — polish records BEFORE the
-    // operator commits, so any read-side comparison re-opens that trap).
+    // The gate READS this (cadence-hooks#874) — unlike `head_sha`, which stays
+    // reader-less because it is pre-polish by construction: polish never
+    // commits, so HEAD moves on every honest polish → commit → ship path.
+    // The digest does not move there. It is invariant across committing
+    // polish's own fixes and across merging an advanced `origin/main` up (the
+    // base moves, the digest does not), and it moves on a real new commit
+    // touching code — which is the case the gate reports.
     let digest = working_tree_digest(&work_dir);
     let content = marker_content(
         &branch,
