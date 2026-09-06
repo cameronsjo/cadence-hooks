@@ -968,6 +968,14 @@ mod tests {
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
+        // Same reason as `branch_diff`'s fixture: Windows git defaults to
+        // `core.autocrlf=true` and rewrites LF to CRLF on checkout, which moves
+        // a content digest for a line-ending reason alone. The digest tests
+        // below compare recorded against live, so pin it off here too — none of
+        // them checks out today, and this is what keeps that from becoming a
+        // latent Windows-only failure the next time one does.
+        git(&["config", "core.autocrlf", "false"]);
+        git(&["config", "core.safecrlf", "false"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(&["checkout", "-q", "-b", branch]);

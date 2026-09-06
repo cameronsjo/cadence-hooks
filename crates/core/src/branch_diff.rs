@@ -385,6 +385,19 @@ mod tests {
         git_in(dir, &["init", "-q", "-b", "main"]);
         git_in(dir, &["config", "user.email", "t@t"]);
         git_in(dir, &["config", "user.name", "t"]);
+        // Windows git defaults to `core.autocrlf=true`, which rewrites LF to
+        // CRLF in the working tree on every checkout. These fixtures write
+        // their files with `std::fs::write` (LF), so any test that checks out
+        // — the merge-up pair — got a digest over LF bytes before and CRLF
+        // bytes after, and `working_tree_digest` correctly reported a move that
+        // was purely a line-ending rewrite. Measured: `src/a.rs` goes 10 bytes
+        // to 11 across a merge under `autocrlf=true`, and stays 10 under
+        // `false`. This is a FIXTURE artifact, not gate behavior — a real repo
+        // has its content checked out consistently — so it is pinned off here
+        // rather than worked around in the digest. `safecrlf` is set too so a
+        // future fixture with mixed endings cannot abort a `git add` instead.
+        git_in(dir, &["config", "core.autocrlf", "false"]);
+        git_in(dir, &["config", "core.safecrlf", "false"]);
         git_in(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
         git_in(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git_in(dir, &["checkout", "-q", "-b", "feat/x"]);
