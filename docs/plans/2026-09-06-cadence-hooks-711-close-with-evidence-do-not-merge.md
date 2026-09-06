@@ -1,5 +1,7 @@
 ---
 status: "done"
+next: "none — #711 closed without merging, archive/worktree-b74fc92c deleted (tip b74fc92c recoverable at refs/pull/711/head)"
+pr: "cameronsjo/cadence-hooks#864"
 updated: "2026-09-06"
 branch: "docs/711-close-verdict"
 body_sha256: "4d23b1e304f68f1b0c2f8c3498d21c36d5f890a43f5ab96e7e0ab886a67f7f98"
