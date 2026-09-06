@@ -73,6 +73,13 @@ const TOKENS_PER_RATE_UNIT: f64 = 1_000_000.0;
 /// record. Such a record carries `usage` but is not a turn.
 const SYNTHETIC_MODEL: &str = "<synthetic>";
 
+/// The charge basis of a gap that cost a **measured** nothing.
+///
+/// One spelling, because two arms produce it — an under-TTL gap and a
+/// duplicate the dedup zeroed — and the [`Gap::cold_restart_basis`] doc already
+/// warns what happens when one arm is edited and the other is not.
+const NO_CHARGE: (u64, f64) = (0, 0.0);
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -417,9 +424,29 @@ pub struct Gap {
     /// discrepancy no test shape would catch.
     ///
     /// `None` is unmeasurable: no turn followed the gap, or its model is
-    /// absent from the price table. `Some((0, _))` is a *measured* zero — the
-    /// gap never exceeded the TTL, or the cache survived it.
+    /// absent from the price table. `Some((0, _))` is a *measured* zero, with
+    /// three causes a consumer cannot tell apart from the emitted value alone:
+    /// the gap never exceeded the TTL, the cache survived it, or its rebuild
+    /// was already billed to a later gap by [`charge_each_rebuild_once`]. All
+    /// three mean the same thing for a total — this gap added nothing — which
+    /// is why they are not separated.
     pub cold_restart_basis: Option<(u64, f64)>,
+    /// Which assistant turn's rebuild this gap was charged for, if any.
+    ///
+    /// **Private on purpose.** It exists so [`charge_each_rebuild_once`] can
+    /// spot two gaps reading the same turn, and it is useless to anyone else:
+    /// after that pass no two gaps can share a `Some(index)`, the index points
+    /// into a `turns` vec that is never exposed, and `Gap::to_json` does not
+    /// emit it. An earlier version made it `pub` and claimed a consumer could
+    /// use it to see that two gaps were not double-counted — which the dedup
+    /// itself makes unobservable.
+    ///
+    /// `None` carries **three** distinct meanings and distinguishes none of
+    /// them: a zeroed duplicate, an under-TTL gap that involves no turn, and a
+    /// gap whose charge was unmeasurable. Read
+    /// [`Gap::cold_restart_basis`] for that — `Some((0, _))` is a measured
+    /// zero and `None` is unmeasurable.
+    charged_turn: Option<usize>,
 }
 
 impl Gap {
@@ -706,7 +733,7 @@ fn to_event(r: Record) -> Option<Event> {
 /// gap to be an assistant turn and missed 25 of 28 real gaps, because a
 /// hook-summary record almost always follows a turn.
 fn find_gaps(events: &[Event], turns: &[&Turn], prices: &Prices) -> Vec<Gap> {
-    events
+    let mut gaps: Vec<Gap> = events
         .windows(2)
         .filter_map(|w| {
             let gap_ms = w[1].ts_ms - w[0].ts_ms;
@@ -715,7 +742,7 @@ fn find_gaps(events: &[Event], turns: &[&Turn], prices: &Prices) -> Vec<Gap> {
             }
             let start_ms = w[0].ts_ms;
             let end_ms = w[1].ts_ms;
-            let basis = cold_restart_basis(gap_ms, end_ms, turns, prices);
+            let charge = cold_restart_charge(gap_ms, end_ms, turns, prices);
             Some(Gap {
                 start_ms,
                 end_ms,
@@ -728,10 +755,83 @@ fn find_gaps(events: &[Event], turns: &[&Turn], prices: &Prices) -> Vec<Gap> {
                     .partition_point(|t| t.ts_ms <= start_ms)
                     .checked_sub(1)
                     .map(|i| turns[i].context),
-                cold_restart_basis: basis,
+                cold_restart_basis: charge.map(|c| (c.tokens, c.rate)),
+                charged_turn: charge.and_then(|c| c.turn),
             })
         })
-        .collect()
+        .collect();
+
+    charge_each_rebuild_once(&mut gaps);
+    gaps
+}
+
+/// A rebuild is billed once, to the gap nearest the turn that paid for it.
+///
+/// Several consecutive gaps resolve to the same turn whenever nothing `turns`
+/// can see separates them. Usually that is bookkeeping — an `away_summary`, a
+/// `mode` record, a hook summary — but `turns` is a filtered view, so a
+/// sidechain (subagent) record, a `<synthetic>` model, or an assistant record
+/// with no `usage` sits in that same blind spot. Each such gap then reads the
+/// one visible turn's `cache_creation_input_tokens` and reports it as its own
+/// cost, so a single rebuild is billed two or three times.
+///
+/// The bookkeeping case is the honest one: nothing ran, so nothing was billed.
+/// A **sidechain** turn between two gaps genuinely did pay for a rebuild, and
+/// this pass zeroes the earlier gap anyway — a pre-existing under-report driven
+/// by turn *visibility*, not by this pass, and one this pass shrinks rather
+/// than creates (the previous code charged that gap the wrong turn's tokens).
+///
+/// **Measured, not hypothetical:** one session in a 399-transcript scan does
+/// exactly this — two gaps (74 min and 19 hours) separated only by bookkeeping,
+/// both resolving to one turn whose `cache_read_input_tokens` is `0` and whose
+/// `cache_creation_input_tokens` is 125,406. One cold rebuild, billed once by
+/// Anthropic, reported twice by the grader.
+///
+/// The earlier gaps keep a **measured zero** rather than becoming unmeasurable:
+/// no rebuild *this grader prices* was billed during them, and `0` says that
+/// precisely while `null` would claim the question was unanswerable.
+///
+/// Read "no rebuild this grader prices" strictly. `turns` is a filtered view —
+/// sidechain records and `<synthetic>` models are both dropped upstream — so a
+/// subagent can run between two gaps, rebuild its own cache, and still leave
+/// both gaps resolving to the same retained turn. That cost is out of this
+/// metric's scope by the contract's own record rule, not absent from the
+/// world; the zero is scoped to what is graded, and is not a claim that the
+/// machine was idle.
+///
+/// Ruled by the operator 2026-09-06 (cadence-ecosystem#545). The one-hour gate
+/// is unchanged and keeps deciding *whether* a gap is a restart at all — the
+/// corpus backs it: all 44 gaps over an hour rebuilt at least 85% of their
+/// context, while the only genuinely warm resumes were under an hour.
+fn charge_each_rebuild_once(gaps: &mut [Gap]) {
+    // Walk backwards so the FIRST gap seen for a turn is the last in time —
+    // the one nearest the turn that actually paid.
+    //
+    // One variable, not a set of every turn seen: gap ends are strictly
+    // ascending (they come from `windows(2)` over a sorted event list), and
+    // the charged index is `partition_point(|t| t.ts_ms < end_ms)`, which is
+    // monotonically non-decreasing in `end_ms`. So gaps sharing an index are
+    // always a CONTIGUOUS RUN, and comparing against the immediately previous
+    // charged index is sufficient. That makes the pass linear; a `contains`
+    // over a growing vec measured ~6s on a crafted 400k-gap transcript, inside
+    // a hook that must not block.
+    //
+    // A gap with no charged turn (under the TTL, or unmeasurable) is skipped
+    // without clearing the previous index — deliberately. Such a gap can sit
+    // between two that share a turn, and clearing would let the earlier one
+    // keep a duplicate charge.
+    let mut last_charged: Option<usize> = None;
+    for gap in gaps.iter_mut().rev() {
+        let Some(turn) = gap.charged_turn else {
+            continue;
+        };
+        if last_charged == Some(turn) {
+            gap.cold_restart_basis = Some(NO_CHARGE);
+            gap.charged_turn = None;
+        } else {
+            last_charged = Some(turn);
+        }
+    }
 }
 
 /// What resuming after this gap is charged on: `(tokens, rate spread)`.
@@ -746,22 +846,39 @@ fn find_gaps(events: &[Event], turns: &[&Turn], prices: &Prices) -> Vec<Gap> {
 /// whose next turn reports zero cache creation *also* cost a measured nothing —
 /// the cache survived. `None` means the question could not be answered at all:
 /// no turn followed, or its model is not in the table.
-fn cold_restart_basis(
+///
+/// `turn` names which turn was charged, so [`charge_each_rebuild_once`] can
+/// tell two gaps reading the *same* rebuild from two gaps reading different
+/// ones. It is `None` for the under-TTL case, where no turn is involved at all.
+#[derive(Clone, Copy)]
+struct ColdRestartCharge {
+    turn: Option<usize>,
+    tokens: u64,
+    rate: f64,
+}
+
+fn cold_restart_charge(
     gap_ms: i64,
     end_ms: i64,
     turns: &[&Turn],
     prices: &Prices,
-) -> Option<(u64, f64)> {
+) -> Option<ColdRestartCharge> {
     if gap_ms <= CACHE_TTL_MS {
-        return Some((0, 0.0));
+        return Some(ColdRestartCharge {
+            turn: None,
+            tokens: NO_CHARGE.0,
+            rate: NO_CHARGE.1,
+        });
     }
     // Sorted, as above — the first turn at or after the gap's end.
-    let next = turns.get(turns.partition_point(|t| t.ts_ms < end_ms))?;
+    let index = turns.partition_point(|t| t.ts_ms < end_ms);
+    let next = turns.get(index)?;
     let price = prices.get(&next.model)?;
-    Some((
-        next.cache_creation,
-        price.cache_write_1h() - price.cache_read_per_mtok,
-    ))
+    Some(ColdRestartCharge {
+        turn: Some(index),
+        tokens: next.cache_creation,
+        rate: price.cache_write_1h() - price.cache_read_per_mtok,
+    })
 }
 
 /// `tokens x rate / 1e6`, rounded half-away-from-zero to six places.
@@ -1212,6 +1329,177 @@ mod tests {
             usd_per_mtok(93_161, 9.5),
             0.885029,
             "the divide-first answer, which the contract records"
+        );
+    }
+
+    /// One rebuild is billed once, to the gap nearest the turn that paid it.
+    ///
+    /// Two gaps separated only by a bookkeeping record both resolve to the same
+    /// following turn, because no turn ran in between — which is precisely why
+    /// no second rebuild was billed. Reading that one turn's
+    /// `cache_creation_input_tokens` from both gaps reports twice what
+    /// Anthropic charged.
+    ///
+    /// Shaped after the real session this was measured on: two over-TTL gaps,
+    /// an `away_summary` between them, one turn afterwards.
+    #[test]
+    fn one_rebuild_is_billed_once_across_consecutive_gaps() {
+        let t = concat!(
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}"#,
+            "\n",
+            // 2h gap ends here — a bookkeeping record, NOT a turn, so nothing
+            // was rebuilt and nothing was billed.
+            r#"{"type":"system","subtype":"away_summary","timestamp":"2020-01-01T02:00:00Z"}"#,
+            "\n",
+            // A second 2h gap ends at the one turn that actually ran.
+            r#"{"type":"assistant","timestamp":"2020-01-01T04:00:00Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000}}}"#,
+        );
+
+        let grade = grade_transcript(t, &contract_prices());
+        assert_eq!(grade.gaps.len(), 2, "both spans are still gaps");
+        assert!(
+            grade.gaps.iter().all(|g| g.gap_ms > CACHE_TTL_MS),
+            "both are over the TTL — the one-hour gate is unchanged"
+        );
+
+        // 1,000,000 x (10.00 - 0.50) / 1e6 = 9.50, charged once.
+        assert_eq!(
+            grade.gaps[0].cold_restart_usd(),
+            Some(0.0),
+            "the earlier gap rebuilt nothing — a measured zero, never a null, \
+             because the question is answerable and the answer is zero"
+        );
+        assert_eq!(
+            grade.gaps[1].cold_restart_usd(),
+            Some(9.5),
+            "the gap nearest the turn carries the whole charge"
+        );
+        assert_eq!(
+            grade.cold_restart_usd_total, 9.5,
+            "one rebuild, one charge — 19.0 would be the double-count"
+        );
+
+        // Both gaps still report as restarts; only the money moved.
+        assert!(grade.flags.cold_restart);
+        assert_eq!(
+            grade.gaps[0].charged_turn, None,
+            "zeroed gaps carry no turn"
+        );
+        assert_eq!(grade.gaps[1].charged_turn, Some(0));
+    }
+
+    /// A non-charging gap between two duplicates must not break the dedup.
+    ///
+    /// The linear pass tracks only the previous charged index, so it must skip
+    /// a gap with no charged turn *without* clearing that memory. Clearing
+    /// would let the earlier duplicate keep its charge — the exact bug the
+    /// pass exists to remove, reintroduced by an optimisation.
+    ///
+    /// Layout: a 2h gap, then a 55-minute gap (over GAP_MIN_MS, under the TTL,
+    /// so a measured zero with no turn), then a 2h gap ending on the session's
+    /// only assistant turn. The first and last both resolve to that one turn.
+    #[test]
+    fn a_non_charging_gap_between_duplicates_does_not_reset_the_dedup() {
+        let t = concat!(
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T02:00:00Z"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T02:05:00Z"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T03:00:00Z"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T03:05:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T05:05:00Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000}}}"#,
+        );
+
+        let grade = grade_transcript(t, &contract_prices());
+        assert_eq!(grade.gaps.len(), 3, "2h, 55m, 2h");
+        assert_eq!(grade.gaps[1].gap_ms, 55 * 60 * 1000);
+        assert!(
+            grade.gaps[1].gap_ms > GAP_MIN_MS && grade.gaps[1].gap_ms <= CACHE_TTL_MS,
+            "the middle gap must be a gap that charges nothing"
+        );
+
+        assert_eq!(
+            grade.gaps[0].cold_restart_usd(),
+            Some(0.0),
+            "the earlier duplicate is zeroed across the non-charging gap"
+        );
+        assert_eq!(grade.gaps[1].cold_restart_usd(), Some(0.0), "under the TTL");
+        assert_eq!(
+            grade.gaps[2].cold_restart_usd(),
+            Some(9.5),
+            "the gap nearest the turn keeps the whole charge"
+        );
+        assert_eq!(
+            grade.cold_restart_usd_total, 9.5,
+            "19.0 would mean the middle gap reset the dedup"
+        );
+    }
+
+    /// A measured zero and an unmeasurable gap must stay distinguishable.
+    ///
+    /// `charged_turn` is `None` for three different reasons — a zeroed
+    /// duplicate, an under-TTL gap, and a gap nothing could price — so it
+    /// cannot answer "did this cost nothing?". `cold_restart_basis` can, and
+    /// this pins that: `Some((0, _))` is a measured zero, `None` is
+    /// unmeasurable, and converting one into the other turns "we could not
+    /// price this" into "this was free".
+    #[test]
+    fn a_measured_zero_is_distinguishable_from_an_unmeasurable_gap() {
+        // Over the TTL, but no turn follows at all -> unmeasurable.
+        let no_turn = concat!(
+            r#"{"type":"assistant","timestamp":"2020-01-01T00:00:00Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"away_summary","timestamp":"2020-01-01T09:00:00Z"}"#,
+        );
+        let g = grade_transcript(no_turn, &contract_prices());
+        assert_eq!(g.gaps.len(), 1);
+        assert_eq!(g.gaps[0].cold_restart_basis, None, "unmeasurable");
+        assert_eq!(g.gaps[0].cold_restart_usd(), None);
+
+        // Under the TTL -> a measured zero, same `charged_turn`, different basis.
+        let under = concat!(
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T00:50:00Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":900000}}}"#,
+        );
+        let g2 = grade_transcript(under, &contract_prices());
+        assert_eq!(g2.gaps.len(), 1);
+        assert_eq!(
+            g2.gaps[0].cold_restart_basis,
+            Some(NO_CHARGE),
+            "measured zero"
+        );
+        assert_eq!(g2.gaps[0].cold_restart_usd(), Some(0.0));
+
+        // The two are indistinguishable by charged_turn — which is the point.
+        assert_eq!(g.gaps[0].charged_turn, g2.gaps[0].charged_turn);
+        assert_ne!(
+            g.gaps[0].cold_restart_basis, g2.gaps[0].cold_restart_basis,
+            "the basis is what separates them"
+        );
+    }
+
+    /// The dedup must not touch gaps that resolve to *different* turns.
+    #[test]
+    fn separate_rebuilds_are_each_billed() {
+        let t = concat!(
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T02:00:00Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T05:00:00Z","message":{"model":"claude-opus-5","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":2000000}}}"#,
+        );
+        let grade = grade_transcript(t, &contract_prices());
+        assert_eq!(grade.gaps.len(), 2);
+        assert_eq!(grade.gaps[0].cold_restart_usd(), Some(9.5));
+        assert_eq!(grade.gaps[1].cold_restart_usd(), Some(19.0));
+        assert_eq!(
+            grade.cold_restart_usd_total, 28.5,
+            "two turns ran, two rebuilds were billed, both are charged"
         );
     }
 
