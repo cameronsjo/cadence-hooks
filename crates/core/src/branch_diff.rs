@@ -392,6 +392,43 @@ mod tests {
     }
 
     #[test]
+    fn working_tree_digest_is_stable_across_merging_an_advanced_origin_main_up() {
+        // cadence-hooks#874: the pre-PR gate now COMPARES this digest against a
+        // marker's recorded one, so the merge-up invariant stopped being
+        // provenance trivia and became load-bearing. Merging an advanced
+        // `origin/main` into the branch moves the merge BASE, which the digest
+        // is computed against — but the branch's own change set is unchanged,
+        // so the digest must not move. Were it to move, every branch that
+        // merged main up after polishing would draw the stale-marker nudge.
+        let tmp = init_repo_with_origin_main(&[]);
+        let dir = tmp.path();
+        write_file(dir, "src/a.rs", "fn a() {}\n");
+        git_in(dir, &["add", "src/a.rs"]);
+        git_in(dir, &["commit", "-q", "-m", "branch work"]);
+        let before = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
+
+        // Advance `origin/main` with an unrelated commit, then merge it up.
+        git_in(dir, &["checkout", "-q", "main"]);
+        write_file(dir, "src/upstream.rs", "fn upstream() {}\n");
+        git_in(dir, &["add", "src/upstream.rs"]);
+        git_in(dir, &["commit", "-q", "-m", "upstream work"]);
+        git_in(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(dir, &["checkout", "-q", "feat/x"]);
+        git_in(dir, &["merge", "-q", "--no-edit", "main"]);
+
+        let after = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
+        assert_ne!(
+            before.base, after.base,
+            "precondition: the merge-up must have moved the base"
+        );
+        assert_eq!(
+            before.digest, after.digest,
+            "a merge-up must not move the digest"
+        );
+        assert_eq!(after.files, 1, "only the branch's own change set is hashed");
+    }
+
+    #[test]
     fn working_tree_digest_changes_on_a_content_edit() {
         let tmp = init_repo_with_origin_main(&[]);
         let dir = tmp.path();
