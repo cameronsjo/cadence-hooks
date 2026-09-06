@@ -1,51 +1,79 @@
 {
   "_meta": {
-    "lastVerified": "2026-06-26",
-    "source": "https://www.anthropic.com/pricing",
-    "notes": "All prices in USD per million tokens. input/output for opus-4-8, opus-4-7, opus-4-6, and fable-5 from the claude-api skill; cache tiers derived input*1.25 / input*0.10 per the table convention. Update lastVerified when bumping rates."
+    "lastVerified": "2026-09-06",
+    "source": "https://platform.claude.com/docs/en/about-claude/pricing.md",
+    "notes": "All prices in USD per million tokens, read from the published pricing table rather than derived. Cache multipliers over base input are 1.25x for a 5-minute write, 2x for a 1-hour write, and 0.1x for a read — except claude-fable-5-1 and claude-mythos-5-1, whose cache read is 0.025x of input, so deriving it from 0.1x overstates it by 4x. Update lastVerified when bumping rates."
   },
   "models": {
     "claude-opus-4-8": {
       "inputPerMTok": 5.00,
       "outputPerMTok": 25.00,
       "cacheWritePerMTok": 6.25,
+      "cacheWrite1hPerMTok": 10.00,
       "cacheReadPerMTok": 0.50
     },
     "claude-fable-5": {
       "inputPerMTok": 10.00,
       "outputPerMTok": 50.00,
       "cacheWritePerMTok": 12.50,
+      "cacheWrite1hPerMTok": 20.00,
       "cacheReadPerMTok": 1.00
     },
     "claude-opus-4-7": {
       "inputPerMTok": 5.00,
       "outputPerMTok": 25.00,
       "cacheWritePerMTok": 6.25,
+      "cacheWrite1hPerMTok": 10.00,
       "cacheReadPerMTok": 0.50
     },
     "claude-opus-4-6": {
       "inputPerMTok": 5.00,
       "outputPerMTok": 25.00,
       "cacheWritePerMTok": 6.25,
+      "cacheWrite1hPerMTok": 10.00,
       "cacheReadPerMTok": 0.50
     },
     "claude-sonnet-4-6": {
       "inputPerMTok": 3.00,
       "outputPerMTok": 15.00,
       "cacheWritePerMTok": 3.75,
+      "cacheWrite1hPerMTok": 6.00,
       "cacheReadPerMTok": 0.30
     },
     "claude-sonnet-4-5": {
       "inputPerMTok": 3.00,
       "outputPerMTok": 15.00,
       "cacheWritePerMTok": 3.75,
+      "cacheWrite1hPerMTok": 6.00,
       "cacheReadPerMTok": 0.30
     },
     "claude-haiku-4-5": {
       "inputPerMTok": 1.00,
       "outputPerMTok": 5.00,
       "cacheWritePerMTok": 1.25,
+      "cacheWrite1hPerMTok": 2.00,
       "cacheReadPerMTok": 0.10
+    },
+    "claude-opus-5": {
+      "inputPerMTok": 5.00,
+      "outputPerMTok": 25.00,
+      "cacheWritePerMTok": 6.25,
+      "cacheWrite1hPerMTok": 10.00,
+      "cacheReadPerMTok": 0.50
+    },
+    "claude-fable-5-1": {
+      "inputPerMTok": 10.00,
+      "outputPerMTok": 50.00,
+      "cacheWritePerMTok": 12.50,
+      "cacheWrite1hPerMTok": 20.00,
+      "cacheReadPerMTok": 0.25
+    },
+    "claude-sonnet-5": {
+      "inputPerMTok": 2.00,
+      "outputPerMTok": 10.00,
+      "cacheWritePerMTok": 2.50,
+      "cacheWrite1hPerMTok": 4.00,
+      "cacheReadPerMTok": 0.20
     }
   }
 }

@@ -181,6 +181,7 @@ mod tests {
             input_per_mtok: 1.5,
             output_per_mtok: 0.0,
             cache_write_per_mtok: 0.0,
+            cache_write_1h_per_mtok: Some(0.0),
             cache_read_per_mtok: 0.0,
         };
         let prices = Prices {
