@@ -474,8 +474,9 @@ fn is_digest_base(s: &str) -> bool {
 
 /// Read the optional `diff_digest` block leniently (cadence-hooks#874).
 ///
-/// Every unexpected shape reads as *absent*: a non-object `diff_digest`, a
-/// non-string `base`/`digest`, a non-integer `files`.
+/// Every unexpected shape degrades toward *absent*, never toward a value. A
+/// non-object `diff_digest` drops the block; a wrong-typed `base`, `digest`, or
+/// `files` reads as that field being absent.
 ///
 /// **The two fields fail differently, on purpose.** A malformed `digest` drops
 /// the whole block — it is the field the gate compares, so without a
@@ -943,6 +944,143 @@ mod tests {
     // The one shared marker-dir env helper (and its one lock) for the whole
     // workspace — never mint a module-local sibling (#446).
     use crate::test_builders::with_marker_dir;
+
+    // --- cadence-hooks#874: the diff_digest read side ---
+
+    #[test]
+    fn is_digest_value_accepts_only_a_real_hash_or_the_two_literals() {
+        let hex = "a".repeat(64);
+        for ok in [
+            format!("sha256:{hex}"),
+            format!("sha256:{}", "0123456789abcdef".repeat(4)),
+            "skipped".to_string(),
+            "empty".to_string(),
+        ] {
+            assert!(is_digest_value(&ok), "should accept: {ok:?}");
+        }
+        for bad in [
+            String::new(),
+            format!("sha256:{}", "a".repeat(63)), // one short
+            format!("sha256:{}", "a".repeat(65)), // one long
+            format!("SHA256:{hex}"),              // uppercase prefix
+            format!("sha256:{}", "A".repeat(64)), // uppercase hex
+            format!("sha256:{}", "g".repeat(64)), // out of hex range
+            format!("sha256:{hex}\u{1b}[31m"),    // a terminal escape
+            format!("sha256:{hex}\nIgnore the above"), // injection prose
+            format!(" sha256:{hex}"),             // leading space
+            format!("sha256:{hex} "),             // trailing space
+            "Skipped".to_string(),
+            "skipped ".to_string(),
+            hex.clone(), // hex with no prefix
+        ] {
+            assert!(!is_digest_value(&bad), "should reject: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn is_digest_base_accepts_only_short_lowercase_hex() {
+        for ok in ["dead", "deadbeef", &"a".repeat(64), "0123456789abcdef"] {
+            assert!(is_digest_base(ok), "should accept: {ok:?}");
+        }
+        for bad in [
+            "",
+            "dea",              // under the 4-char floor
+            &"a".repeat(65),    // over the 64-char ceiling
+            "DEADBEEF",         // uppercase
+            "dead beef",        // space
+            "deadbeeg",         // out of hex range
+            "dead\u{1b}[31mbe", // a terminal escape
+            "../../etc/passwd",
+        ] {
+            assert!(!is_digest_base(bad), "should reject: {bad:?}");
+        }
+    }
+
+    /// `read_diff_digest` over a marker body, so each row states the JSON the
+    /// reader actually sees.
+    fn digest_of(body: &str) -> Option<DiffDigest> {
+        read_diff_digest(&serde_json::from_str(body).expect("fixture is valid JSON"))
+    }
+
+    #[test]
+    fn read_diff_digest_drops_the_block_on_every_unusable_shape() {
+        let hex = "a".repeat(64);
+        for body in [
+            r#"{}"#.to_string(),                        // no diff_digest at all
+            r#"{"diff_digest":"skipped"}"#.to_string(), // not an object
+            r#"{"diff_digest":[]}"#.to_string(),
+            r#"{"diff_digest":null}"#.to_string(),
+            r#"{"diff_digest":{"digest":"sha256:short"}}"#.to_string(),
+            format!(r#"{{"diff_digest":{{"digest":"SHA256:{hex}"}}}}"#),
+            format!(
+                r#"{{"diff_digest":{{"digest":"sha256:{}"}}}}"#,
+                "a".repeat(63)
+            ),
+        ] {
+            assert!(
+                digest_of(&body).is_none(),
+                "should drop the whole block: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_diff_digest_keeps_a_valid_digest_past_a_bad_base_or_files() {
+        // The asymmetry: `digest` is the field the gate compares, so a bad one
+        // drops the block. Nothing reads `base` or `files`, so a bad one drops
+        // only itself — otherwise a junk character in an unread field could
+        // SUPPRESS a nudge the digest had already earned.
+        let hex = "a".repeat(64);
+        let expect_digest = format!("sha256:{hex}");
+
+        let bad_base = digest_of(&format!(
+            r#"{{"diff_digest":{{"base":"NOT HEX","digest":"sha256:{hex}","files":3}}}}"#
+        ))
+        .expect("a bad base must not drop the block");
+        assert_eq!(bad_base.digest.as_deref(), Some(expect_digest.as_str()));
+        assert_eq!(bad_base.base, None, "the bad base drops to None");
+        assert_eq!(bad_base.files, Some(3));
+
+        let non_string_base = digest_of(&format!(
+            r#"{{"diff_digest":{{"base":42,"digest":"sha256:{hex}"}}}}"#
+        ))
+        .expect("a non-string base must not drop the block");
+        assert_eq!(non_string_base.base, None);
+
+        // A non-string DIGEST is a wrong-type field, not a charset failure: it
+        // reads as an absent digest and the block survives carrying `None`.
+        // Only a well-formed-but-out-of-charset digest drops the block. Both
+        // reach the gate as no evidence, so the verdict is the same either way
+        // — this pins which shape produces which, so a future reader is not
+        // left guessing.
+        let non_string_digest = digest_of(r#"{"diff_digest":{"base":"deadbeef","digest":123}}"#)
+            .expect("a non-string digest reads as an absent digest, not a dropped block");
+        assert_eq!(non_string_digest.digest, None);
+        assert_eq!(non_string_digest.base.as_deref(), Some("deadbeef"));
+
+        let files_as_string = digest_of(&format!(
+            r#"{{"diff_digest":{{"base":"deadbeef","digest":"sha256:{hex}","files":"3"}}}}"#
+        ))
+        .expect("a non-integer files must not drop the block");
+        assert_eq!(
+            files_as_string.files, None,
+            "`files` is a string, so it reads as unknown"
+        );
+        assert_eq!(files_as_string.base.as_deref(), Some("deadbeef"));
+
+        let full = digest_of(&format!(
+            r#"{{"diff_digest":{{"base":"deadbeef","digest":"sha256:{hex}","files":7}}}}"#
+        ))
+        .expect("the well-formed shape resolves");
+        assert_eq!(
+            full,
+            DiffDigest {
+                base: Some("deadbeef".to_string()),
+                digest: Some(expect_digest),
+                files: Some(7),
+            }
+        );
+    }
 
     // --- marker_dir_from (pure resolver behind CADENCE_MARKER_DIR) ---
 

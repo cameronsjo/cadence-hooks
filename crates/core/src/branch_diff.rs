@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn working_tree_digest_is_stable_across_merging_an_advanced_origin_main_up() {
+    fn a_non_overlapping_merge_up_leaves_the_digest_unchanged() {
         // cadence-hooks#874: the pre-PR gate now COMPARES this digest against a
         // marker's recorded one, so the merge-up invariant stopped being
         // provenance trivia and became load-bearing. Merging an advanced
@@ -480,6 +480,11 @@ mod tests {
         // is computed against — but the branch's own change set is unchanged,
         // so the digest must not move. Were it to move, every branch that
         // merged main up after polishing would draw the stale-marker nudge.
+        //
+        // The invariant is CONDITIONAL on the merge not overlapping the
+        // branch's change set — the upstream commit here touches a different
+        // file. The overlapping case genuinely moves the digest and is pinned
+        // by `a_merge_up_that_overlaps_the_branch_change_set_does_move_the_digest`.
         let tmp = init_repo_with_origin_main(&[]);
         let dir = tmp.path();
         write_file(dir, "src/a.rs", "fn a() {}\n");
@@ -506,6 +511,44 @@ mod tests {
             "a merge-up must not move the digest"
         );
         assert_eq!(after.files, 1, "only the branch's own change set is hashed");
+    }
+
+    #[test]
+    fn a_merge_up_that_overlaps_the_branch_change_set_does_move_the_digest() {
+        // cadence-hooks#874 code review: the merge-up invariant above is
+        // CONDITIONAL. It holds only while the merged upstream commits touch no
+        // file the branch also changed. When they overlap, git's auto-merge
+        // rewrites that file in the working tree, so its content genuinely
+        // differs from what polish reviewed — and the digest moves.
+        //
+        // This is the boundary, pinned rather than hidden: the gate will nudge
+        // after such a merge. That is an accepted false positive on an advisory
+        // verdict, and it is not even clearly false — the shipping content of a
+        // reviewed file really did change.
+        let tmp = init_repo_with_origin_main(&[]);
+        let dir = tmp.path();
+        write_file(dir, "src/shared.rs", "fn branch_side() {}\n");
+        git_in(dir, &["add", "src/shared.rs"]);
+        git_in(dir, &["commit", "-q", "-m", "branch work"]);
+        let before = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
+
+        // Advance `origin/main` with a commit touching the SAME file, in a
+        // non-conflicting region so the auto-merge succeeds.
+        git_in(dir, &["checkout", "-q", "main"]);
+        write_file(dir, "src/shared.rs", "fn upstream_side() {}\n");
+        git_in(dir, &["add", "src/shared.rs"]);
+        git_in(dir, &["commit", "-q", "-m", "upstream work"]);
+        git_in(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(dir, &["checkout", "-q", "feat/x"]);
+        // Take the upstream side wholesale, so the merge lands without a
+        // conflict and the file's content demonstrably changes.
+        git_in(dir, &["merge", "-q", "--no-edit", "-X", "theirs", "main"]);
+
+        let after = working_tree_digest(dir.to_str().unwrap()).expect("digest resolves");
+        assert_ne!(
+            before.digest, after.digest,
+            "an OVERLAPPING merge-up rewrites a reviewed file, so the digest moves"
+        );
     }
 
     #[test]

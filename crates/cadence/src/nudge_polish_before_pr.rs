@@ -76,10 +76,14 @@
 //! advance from stale cover. **Nothing here compares SHAs, and nothing should.**
 //!
 //! The binding that replaced it is the **content digest** (cadence-hooks#874),
-//! which is invariant across exactly the moves that defeated the SHA: committing
+//! which is invariant across the moves that defeated the SHA: committing
 //! polish's own fixes leaves it unchanged, and merging an advanced `origin/main`
-//! up moves the base without moving the digest. A real new commit touching code
-//! moves it, which is the case worth reporting. The hold cadence-hooks#784 put
+//! up moves the base without moving the digest — **so long as the merged
+//! upstream commits touch no file the branch also changed.** An *overlapping*
+//! merge-up auto-merges a reviewed file, so its shipping content really did
+//! change and the digest moves with it; the nudge that follows is accepted, and
+//! arguably not even wrong. A real new commit touching code moves it too, which
+//! is the case worth reporting. The hold cadence-hooks#784 put
 //! on a read-side digest comparison was lifted on 2026-09-06 on #874's evidence.
 //!
 //! **Known and deliberate:** the digest measures the **working tree**, while
@@ -147,16 +151,18 @@ pub enum MarkerState {
     /// answer, so the gate asks; `false` means the content could not be read at
     /// all (a degraded marker dir, garbled JSON, an unreadable file), which
     /// stays on the presence-alone path because there is nothing to ask about.
-    /// `digest_moved` is the cadence-hooks#874 binding: `Some(true)` only when
-    /// the marker carries a well-formed `diff_digest` naming a real hash, a
-    /// live working-tree digest resolved, and the two differ. Every other
-    /// case — a legacy marker with no digest, a `skipped`/`empty` record, an
-    /// unresolvable live digest — is `None`, i.e. no evidence, stay silent.
+    ///
+    /// The cadence-hooks#874 digest comparison is deliberately **not** a field
+    /// here — it is a lazy predicate handed to [`decide`], like
+    /// `branch_touches_code`, because resolving it costs three git subprocesses
+    /// plus a content hash. As a field it would be paid while building this
+    /// value, i.e. on every marker that carries a digest, even when the
+    /// security-skipped or wrong-family arm wins first and the answer is
+    /// discarded.
     Present {
         security_ran: Option<bool>,
         security_model: Option<String>,
         roster_read: bool,
-        digest_moved: Option<bool>,
     },
 }
 
@@ -191,19 +197,6 @@ impl Check for NudgePolishBeforePr {
         } else {
             None
         };
-        // The live working-tree digest, resolved at most once and only when a
-        // recorded digest exists to compare it against (cadence-hooks#874).
-        // Like `touches_code` below, this is the expensive kind of work — two
-        // git subprocesses plus a content hash — so it is paid only on a ship
-        // anchor whose marker actually carries a comparable digest. Every
-        // legacy marker, every `skipped`/`empty` record, and every non-anchor
-        // command short-circuit before it runs.
-        let live_digest = || {
-            let dir = parse_work_dir(command, cwd?);
-            working_tree_digest(&dir)
-                .map(|d| d.digest)
-                .filter(|d| live_digest_is_comparable(d))
-        };
         let marker = match (present, &record) {
             (false, _) => MarkerState::Absent,
             (true, Some(record)) if record.is_expired() => MarkerState::Expired,
@@ -214,8 +207,6 @@ impl Check for NudgePolishBeforePr {
                 // an unreadable file all yield `None` here and stay on the
                 // presence-alone path (#775 item 6).
                 roster_read: record.is_some(),
-                digest_moved: recorded_digest(record.as_ref())
-                    .and_then(|recorded| Some(live_digest()? != recorded)),
             },
         };
         // Advisory annotations ride the otherwise-silent allow — they never
@@ -243,7 +234,20 @@ impl Check for NudgePolishBeforePr {
                 changed_files(&dir).is_some_and(|files| branch_touches_code(&files))
             })
         };
-        decide(command, marker, touches_code, &annotations)
+        // The cadence-hooks#874 digest comparison, lazy for the same reason
+        // (three git subprocesses plus a content hash — strictly more than
+        // `touches_code` costs). Consulted only by the digest arm, which sits
+        // below the security-skipped and wrong-family arms, so a marker that
+        // qualifies for one of those never pays for this.
+        let digest_moved = || {
+            let recorded = recorded_digest(record.as_ref())?;
+            let dir = parse_work_dir(command, cwd?);
+            let live = working_tree_digest(&dir)
+                .map(|d| d.digest)
+                .filter(|d| live_digest_is_comparable(d))?;
+            Some(live != recorded)
+        };
+        decide(command, marker, touches_code, digest_moved, &annotations)
     }
 }
 
@@ -349,6 +353,7 @@ fn decide(
     command: &str,
     marker: MarkerState,
     branch_touches_code: impl Fn() -> bool,
+    digest_moved: impl Fn() -> Option<bool>,
     annotations: &[String],
 ) -> CheckResult {
     if !is_polish_ship_anchor(command) {
@@ -377,10 +382,17 @@ fn decide(
         // disagree (#874): a polish ran on this branch, but not on what ships.
         // Never a SHA comparison — HEAD moves on every honest polish → commit
         // → ship path, and the digest does not.
-        MarkerState::Present {
-            digest_moved: Some(true),
-            ..
-        } => CheckResult::nudge(stale_marker_nudge_message()),
+        //
+        // Deliberately NOT guarded by `branch_touches_code`, unlike every arm
+        // above it. Those guards exist because a roster gap says nothing on a
+        // docs-only branch; this one is already code-scoped by construction —
+        // `working_tree_digest` filters the change set through polish's own
+        // code-path definition, so a docs-only branch digests to `empty` and
+        // the live-side predicate drops it before this arm is reached. Adding
+        // the guard would buy nothing and cost a second subprocess.
+        MarkerState::Present { .. } if digest_moved() == Some(true) => {
+            CheckResult::nudge(stale_marker_nudge_message())
+        }
         // The marker's content WAS read and names no roster at all (#775 item
         // 6) — a question the recorder can answer, unlike a marker whose
         // content could not be read, which falls through to the allow below.
@@ -559,19 +571,16 @@ mod tests {
         security_ran: None,
         security_model: None,
         roster_read: false,
-        digest_moved: None,
     };
     const PRESENT_SECURITY_RAN: MarkerState = MarkerState::Present {
         security_ran: Some(true),
         security_model: None,
         roster_read: true,
-        digest_moved: None,
     };
     const PRESENT_SECURITY_SKIPPED: MarkerState = MarkerState::Present {
         security_ran: Some(false),
         security_model: None,
         roster_read: true,
-        digest_moved: None,
     };
 
     #[test]
@@ -583,6 +592,7 @@ mod tests {
             "gh pr create --title x",
             PRESENT_SECURITY_SKIPPED,
             || true,
+            || None,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
@@ -609,6 +619,7 @@ mod tests {
             "gh pr create --title x",
             PRESENT_SECURITY_SKIPPED,
             || false,
+            || None,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Allow);
@@ -618,7 +629,14 @@ mod tests {
     #[test]
     fn decide_security_ran_allows_regardless_of_code() {
         assert_eq!(
-            decide("gh pr create --title x", PRESENT_SECURITY_RAN, || true, &[]).outcome,
+            decide(
+                "gh pr create --title x",
+                PRESENT_SECURITY_RAN,
+                || true,
+                || None,
+                &[]
+            )
+            .outcome,
             Outcome::Allow
         );
     }
@@ -631,7 +649,13 @@ mod tests {
         // what `PRESENT_UNKNOWN` now carries (`roster_read: false`). A roster
         // that was read and is simply absent draws the unknown-roster nudge —
         // `decide_read_roster_less_marker_nudges_to_record_the_roster`.
-        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, || true, &[]);
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_UNKNOWN,
+            || true,
+            || None,
+            &[],
+        );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
     }
@@ -641,7 +665,13 @@ mod tests {
         // A branch-scoped marker present → silent allow. #154 regression: this
         // holds with NO transcript involvement — a slash-command polish that
         // recorded a marker is honored.
-        let result = decide("gh pr create --title test", PRESENT_UNKNOWN, || false, &[]);
+        let result = decide(
+            "gh pr create --title test",
+            PRESENT_UNKNOWN,
+            || false,
+            || None,
+            &[],
+        );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(
             result.message.is_none(),
@@ -652,7 +682,13 @@ mod tests {
     #[test]
     fn decide_pr_create_without_marker_nudges() {
         // #146 RED (pure): no marker → nudge, never block. CP1 is fail-open.
-        let result = decide("gh pr create --title x", MarkerState::Absent, || false, &[]);
+        let result = decide(
+            "gh pr create --title x",
+            MarkerState::Absent,
+            || false,
+            || None,
+            &[],
+        );
         assert_eq!(result.outcome, Outcome::Nudge);
         let msg = result.message.unwrap_or_default();
         assert!(msg.contains("/polish"));
@@ -664,18 +700,25 @@ mod tests {
         // The matcher only scopes the process spawn; decide() still guards
         // against a non-anchor gh command slipping through.
         assert_eq!(
-            decide("gh pr list", MarkerState::Absent, || false, &[]).outcome,
+            decide("gh pr list", MarkerState::Absent, || false, || None, &[]).outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("git commit -m x", PRESENT_UNKNOWN, || false, &[]).outcome,
+            decide("git commit -m x", PRESENT_UNKNOWN, || false, || None, &[]).outcome,
             Outcome::Allow
         );
         // A merge that NAMES a PR is excluded — it is the orchestrator shape,
         // run from another cwd, where the branch would mis-resolve (#325). A
         // bare merge is a ship anchor and nudges; pinned just below.
         assert_eq!(
-            decide("gh pr merge 12", MarkerState::Absent, || false, &[]).outcome,
+            decide(
+                "gh pr merge 12",
+                MarkerState::Absent,
+                || false,
+                || None,
+                &[]
+            )
+            .outcome,
             Outcome::Allow
         );
         assert_eq!(
@@ -683,18 +726,33 @@ mod tests {
                 "gh --repo owner/r pr merge",
                 MarkerState::Absent,
                 || false,
+                || None,
                 &[]
             )
             .outcome,
             Outcome::Allow
         );
         assert_eq!(
-            decide("gh pr merge --squash", MarkerState::Absent, || false, &[]).outcome,
+            decide(
+                "gh pr merge --squash",
+                MarkerState::Absent,
+                || false,
+                || None,
+                &[]
+            )
+            .outcome,
             Outcome::Nudge
         );
         // ...and stays silent once the branch carries a marker.
         assert_eq!(
-            decide("gh pr merge --squash", PRESENT_UNKNOWN, || false, &[]).outcome,
+            decide(
+                "gh pr merge --squash",
+                PRESENT_UNKNOWN,
+                || false,
+                || None,
+                &[]
+            )
+            .outcome,
             Outcome::Allow
         );
     }
@@ -704,7 +762,14 @@ mod tests {
         // A `--draft` create is not the ship moment (#297) — an entry-posture
         // draft opens at zero diff, so it must allow even with no marker.
         assert_eq!(
-            decide("gh pr create --draft", MarkerState::Absent, || false, &[]).outcome,
+            decide(
+                "gh pr create --draft",
+                MarkerState::Absent,
+                || false,
+                || None,
+                &[]
+            )
+            .outcome,
             Outcome::Allow
         );
         assert_eq!(
@@ -712,6 +777,7 @@ mod tests {
                 "gh pr create -d --title x",
                 MarkerState::Absent,
                 || false,
+                || None,
                 &[]
             )
             .outcome,
@@ -723,10 +789,16 @@ mod tests {
     fn decide_pr_ready_routes_like_create() {
         // `gh pr ready` (leaves draft) is the ship anchor: no marker → nudge,
         // marker present → silent allow.
-        let nudge = decide("gh pr ready 12", MarkerState::Absent, || false, &[]);
+        let nudge = decide(
+            "gh pr ready 12",
+            MarkerState::Absent,
+            || false,
+            || None,
+            &[],
+        );
         assert_eq!(nudge.outcome, Outcome::Nudge);
         nudge_msg_has_loophole_clauses(&nudge.message.unwrap_or_default());
-        let allow = decide("gh pr ready 12", PRESENT_UNKNOWN, || false, &[]);
+        let allow = decide("gh pr ready 12", PRESENT_UNKNOWN, || false, || None, &[]);
         assert_eq!(allow.outcome, Outcome::Allow);
         assert!(allow.message.is_none());
     }
@@ -1025,7 +1097,6 @@ mod tests {
         security_ran: None,
         security_model: None,
         roster_read: true,
-        digest_moved: None,
     };
 
     #[test]
@@ -1038,6 +1109,7 @@ mod tests {
             "gh pr create --title x",
             PRESENT_ROSTER_READ_UNKNOWN,
             || true,
+            || None,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
@@ -1057,7 +1129,13 @@ mod tests {
         // The discrimination itself: a marker whose content could NOT be read
         // (degraded dir, garbled JSON, unreadable file) stays on the
         // presence-alone path — there is no roster question to ask.
-        let result = decide("gh pr create --title x", PRESENT_UNKNOWN, || true, &[]);
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_UNKNOWN,
+            || true,
+            || None,
+            &[],
+        );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
     }
@@ -1068,6 +1146,7 @@ mod tests {
             "gh pr create --title x",
             PRESENT_ROSTER_READ_UNKNOWN,
             || false,
+            || None,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Allow);
@@ -1102,7 +1181,6 @@ mod tests {
             security_ran: Some(true),
             security_model: Some(family.to_string()),
             roster_read: true,
-            digest_moved: None,
         }
     }
 
@@ -1115,6 +1193,7 @@ mod tests {
             "gh pr create --title x",
             present_security_ran_by("sonnet"),
             || true,
+            || None,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
@@ -1139,6 +1218,7 @@ mod tests {
             "gh pr create --title x",
             present_security_ran_by("opus"),
             || true,
+            || None,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Allow);
@@ -1158,6 +1238,7 @@ mod tests {
                 "gh pr create --title x",
                 present_security_ran_by(family),
                 || true,
+                || None,
                 &[],
             );
             assert_eq!(
@@ -1172,6 +1253,7 @@ mod tests {
                 "gh pr create --title x",
                 present_security_ran_by(family),
                 || true,
+                || None,
                 &[],
             );
             assert_eq!(
@@ -1193,7 +1275,13 @@ mod tests {
         // the estate is unattested, so nudging them all would be a rollout
         // nag, not a finding. Escalating unattested `ran` is a dated follow-up
         // issue, deliberately not this change.
-        let result = decide("gh pr create --title x", PRESENT_SECURITY_RAN, || true, &[]);
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_SECURITY_RAN,
+            || true,
+            || None,
+            &[],
+        );
         assert_eq!(result.outcome, Outcome::Allow);
         assert!(result.message.is_none());
     }
@@ -1206,6 +1294,7 @@ mod tests {
             "gh pr create --title x",
             present_security_ran_by("sonnet"),
             || false,
+            || None,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Allow);
@@ -1516,6 +1605,94 @@ mod tests {
     }
 
     #[test]
+    fn the_digest_predicate_is_never_consulted_when_an_earlier_arm_wins() {
+        // #874 code review: the digest comparison costs three git subprocesses
+        // plus a content hash, so it is a lazy predicate rather than a field on
+        // `MarkerState::Present`. As a field it was resolved while building
+        // that value — i.e. on every digest-carrying marker, including ones the
+        // security-skipped or wrong-family arm answers first and discards.
+        //
+        // Counting calls is the only way to see this: the verdict is identical
+        // either way, which is exactly why the eager version read as correct.
+        let calls = std::cell::Cell::new(0);
+        let counted = || {
+            calls.set(calls.get() + 1);
+            Some(true)
+        };
+
+        // The security-skipped arm sits above the digest arm and wins.
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_SECURITY_SKIPPED,
+            || true,
+            &counted,
+            &[],
+        );
+        assert!(
+            result.message.unwrap_or_default().contains("SECURITY arm"),
+            "precondition: the earlier arm must win"
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "an earlier verdict must not pay for a digest"
+        );
+
+        // The wrong-family arm likewise.
+        let result = decide(
+            "gh pr create --title x",
+            present_security_ran_by("sonnet"),
+            || true,
+            &counted,
+            &[],
+        );
+        assert!(result.message.unwrap_or_default().contains("sonnet"));
+        assert_eq!(calls.get(), 0);
+
+        // Positive control: when no earlier arm applies, the digest arm DOES
+        // consult it — otherwise the zero counts above would prove nothing.
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_SECURITY_RAN,
+            || true,
+            &counted,
+            &[],
+        );
+        assert_eq!(result.outcome, Outcome::Nudge);
+        assert!(
+            result
+                .message
+                .unwrap_or_default()
+                .contains("reviewed change set has moved")
+        );
+        assert_eq!(calls.get(), 1, "the digest arm must consult the predicate");
+    }
+
+    #[test]
+    fn the_digest_arm_needs_no_touches_code_guard() {
+        // #874 code review: every arm above the digest arm is guarded by
+        // `branch_touches_code`; this one is not, on purpose. The digest is
+        // already code-scoped — `working_tree_digest` filters the change set
+        // through polish's own code-path definition — so a docs-only branch
+        // digests to `empty`, the live-side predicate drops it, and the
+        // predicate returns None before this arm can fire. Pinned so nobody
+        // "fixes" the asymmetry by adding a guard that costs a subprocess and
+        // buys nothing.
+        let result = decide(
+            "gh pr create --title x",
+            PRESENT_SECURITY_RAN,
+            || false, // a docs-only branch, by the committed-diff classifier
+            || Some(true),
+            &[],
+        );
+        assert_eq!(
+            result.outcome,
+            Outcome::Nudge,
+            "the digest arm carries its own code scoping"
+        );
+    }
+
+    #[test]
     fn a_malformed_base_keeps_a_valid_digest() {
         // #874 security review: `base` and `digest` fail differently. Nothing
         // reads `base`, so dropping the whole block over a junk character in it
@@ -1557,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn hostile_digest_value_never_reaches_the_nudge_message() {
+    fn an_out_of_charset_digest_reads_as_absent_and_the_gate_allows() {
         // #874, mirroring `run_hostile_attested_family_never_reaches_the_nudge_
         // _message`: the nudge lands in the session's `additionalContext`, so a
         // hand-edited marker is a prompt-injection and terminal-escape channel.
@@ -1615,6 +1792,7 @@ mod tests {
             "gh pr create --title x",
             PRESENT_UNKNOWN,
             || false,
+            || None,
             &["the marker directory is not the hardened per-user one".to_string()],
         );
         assert_eq!(result.outcome, Outcome::Nudge);
@@ -1625,7 +1803,13 @@ mod tests {
             "an annotation must not present as the no-polish nudge: {msg}"
         );
         // Positive control: no annotations → the silent allow, unchanged.
-        let silent = decide("gh pr create --title x", PRESENT_UNKNOWN, || false, &[]);
+        let silent = decide(
+            "gh pr create --title x",
+            PRESENT_UNKNOWN,
+            || false,
+            || None,
+            &[],
+        );
         assert_eq!(silent.outcome, Outcome::Allow);
         assert!(silent.message.is_none());
     }
@@ -1638,6 +1822,7 @@ mod tests {
             "gh pr create --title x",
             MarkerState::Expired,
             || false,
+            || None,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Nudge);

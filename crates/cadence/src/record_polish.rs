@@ -16,6 +16,14 @@
 //! versa), and branch-scoped (a marker for branch A cannot satisfy a PR on
 //! branch B).
 //!
+//! **The worktree-agnostic claim now carries a caveat** (cadence-hooks#874).
+//! It still holds for *resolving* the marker — the key is unchanged. But the
+//! gate now compares the recorded `diff_digest` against a digest of the
+//! **live working tree**, and two checkouts of one branch have two working
+//! trees. So a marker recorded from a worktree satisfies the primary checkout
+//! only while their trees agree; a stray uncommitted edit in the other one
+//! moves the digest and draws the advisory nudge.
+//!
 //! Exit codes say whether a marker exists, because that is the only fact a
 //! caller can act on (cadence-hooks#801):
 //!
@@ -558,8 +566,10 @@ pub fn run_record(
     // reader-less because it is pre-polish by construction: polish never
     // commits, so HEAD moves on every honest polish → commit → ship path.
     // The digest does not move there. It is invariant across committing
-    // polish's own fixes and across merging an advanced `origin/main` up (the
-    // base moves, the digest does not), and it moves on a real new commit
+    // polish's own fixes, and across merging an advanced `origin/main` up
+    // **when the merged commits touch no file the branch also changed** (the
+    // base moves, the digest does not); an overlapping merge-up rewrites a
+    // reviewed file and does move it. It also moves on a real new commit
     // touching code — which is the case the gate reports.
     let digest = working_tree_digest(&work_dir);
     let content = marker_content(
