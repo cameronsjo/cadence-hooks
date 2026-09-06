@@ -1629,7 +1629,7 @@ mod tests {
             "gh pr create --title x",
             PRESENT_SECURITY_SKIPPED,
             || true,
-            &counted,
+            counted,
             &[],
         );
         assert!(
@@ -1647,7 +1647,7 @@ mod tests {
             "gh pr create --title x",
             present_security_ran_by("sonnet"),
             || true,
-            &counted,
+            counted,
             &[],
         );
         assert!(result.message.unwrap_or_default().contains("sonnet"));
@@ -1659,7 +1659,7 @@ mod tests {
             "gh pr create --title x",
             PRESENT_SECURITY_RAN,
             || true,
-            &counted,
+            counted,
             &[],
         );
         assert_eq!(result.outcome, Outcome::Nudge);

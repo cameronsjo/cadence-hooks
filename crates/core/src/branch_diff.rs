@@ -474,7 +474,7 @@ mod tests {
             tmp.path().to_str().unwrap(),
             MAX_DIGEST_FILES,
             MAX_DIGEST_BYTES,
-            &counted,
+            counted,
         )
         .expect("digest resolves");
         assert_eq!(empty.digest, "empty", "precondition: the early return");
@@ -491,7 +491,7 @@ mod tests {
             tmp.path().to_str().unwrap(),
             MAX_DIGEST_FILES,
             MAX_DIGEST_BYTES,
-            &counted,
+            counted,
         )
         .expect("digest resolves");
         assert!(hashed.digest.starts_with("sha256:"));
