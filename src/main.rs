@@ -458,6 +458,20 @@ enum MetricsCommands {
     LogSkill,
     /// Warn at SessionStart when metrics telemetry has gone stale (SessionStart)
     WarnStale,
+    /// Grade a session transcript deterministically and print the JSON (CLI action)
+    Grade {
+        /// Transcript JSONL to grade. Takes precedence over --session-id.
+        #[arg(long, value_name = "PATH")]
+        transcript: Option<String>,
+        /// Session UUID, resolved under the Claude config dir's projects/.
+        /// Defaults to $CLAUDE_CODE_SESSION_ID.
+        #[arg(long, value_name = "UUID")]
+        session_id: Option<String>,
+        /// Override path to the model price table (JSON). Falls back to the
+        /// embedded default; `CADENCE_METRICS_PRICES` env takes precedence.
+        #[arg(long, value_name = "PATH")]
+        prices: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -584,6 +598,10 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
             MetricsCommands::LogSkill => "log-skill",
             MetricsCommands::WarnStale => "warn-stale",
+            // A CLI action, not a hook: no hooks.json wiring, no stdin
+            // payload, not subject to CADENCE_DISABLE (same treatment as
+            // redact-scan / declare / status / dismiss-*).
+            MetricsCommands::Grade { .. } => return None,
         }),
         Commands::Session(s) => Some(match s {
             SessionCommands::Start => "start",
@@ -1358,6 +1376,16 @@ fn main() {
                 session,
                 canonical_hook,
             ),
+            MetricsCommands::Grade {
+                transcript,
+                session_id,
+                prices,
+            } => {
+                process::exit(
+                    cadence_hooks_metrics::session_grade::run_grade(transcript, session_id, prices)
+                        .into(),
+                );
+            }
         },
         Commands::Session(cmd) => match cmd {
             SessionCommands::Start => dispatch::run_logged_check(
@@ -1573,6 +1601,7 @@ mod tests {
             "status",
             "record-polish",
             "redact-scan",
+            "grade",
         ];
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();

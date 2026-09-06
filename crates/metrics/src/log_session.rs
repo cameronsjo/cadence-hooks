@@ -11,6 +11,7 @@
 use crate::common;
 use crate::compute_cost::compute_cost_by_model;
 use crate::prices::Prices;
+use crate::session_grade;
 use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
@@ -96,6 +97,11 @@ impl Logger for LogSession {
             .map(|contents| count_commits(&contents, session_id))
             .unwrap_or(0);
 
+        // Graded from the same transcript string already in memory, at the same
+        // price table cost is computed from — so `costUsd` and
+        // `grading.coldRestartUsdTotal` can never be quoted at different rates.
+        let grading = session_grade::grade_transcript(&transcript, &prices).to_json();
+
         let record = build_session_record(
             &ts,
             input,
@@ -107,6 +113,7 @@ impl Logger for LogSession {
             &prices,
             start_ts.as_deref(),
             commits,
+            grading,
         );
 
         let sessions_path = dir.join("sessions.jsonl");
@@ -166,6 +173,7 @@ fn build_session_record(
     prices: &Prices,
     start_ts: Option<&str>,
     commits: u64,
+    grading: Value,
 ) -> Value {
     let scan = &usage.scan;
     let (by_model, unpriced) = usage.priced_breakdown(prices);
@@ -194,6 +202,11 @@ fn build_session_record(
         "lastMessageId": scan.last_message_id,
         "agentId": input.agent_id,
         "parentSessionId": input.parent_session_id,
+        // Additive: no existing key changes meaning, so
+        // TOKEN_RECORD_SCHEMA_VERSION stays at 2 per the policy in `common`.
+        // Always an object, never null — grading is total over any transcript
+        // that reaches here, so a consumer never has to branch on absence.
+        "grading": grading,
     });
     record["costUsd"] = json!(cost);
     record
@@ -265,6 +278,7 @@ mod tests {
             &prices,
             None,
             2,
+            Value::Null,
         );
         assert_eq!(record["sessionId"], "s1");
         assert_eq!(record["transcriptPath"], "/tmp/t.jsonl");
@@ -315,6 +329,7 @@ mod tests {
             &prices,
             None,
             0,
+            Value::Null,
         );
         // Absent → null, not omitted.
         assert!(record["reason"].is_null());
@@ -361,6 +376,7 @@ mod tests {
             &prices,
             None,
             0,
+            Value::Null,
         );
         let unpriced = record["unpricedModels"].as_array().unwrap();
         assert_eq!(unpriced.len(), 1);
@@ -381,6 +397,7 @@ mod tests {
             &prices,
             Some("2026-07-02T00:10:00Z"),
             5,
+            Value::Null,
         );
         assert_eq!(record["startTs"], "2026-07-02T00:10:00Z");
         assert_eq!(record["endTs"], "2026-07-02T00:10:30Z");
@@ -461,6 +478,7 @@ mod tests {
             &Prices::embedded(),
             None,
             0,
+            Value::Null,
         );
         assert_eq!(record["costUsd"], 0.004_2);
         assert!(record.get("estimatedCostUsd").is_none());

@@ -238,10 +238,19 @@ pub struct Gap {
     /// Context of the nearest assistant turn at or before the start; `None`
     /// when no turn has run yet.
     pub context_tokens_at_gap: Option<u64>,
-    /// What resuming cost. `Some(0.0)` is a *measured* zero — the cache
-    /// survived, or the gap never exceeded the TTL. `None` is unmeasurable:
-    /// no next turn, or its model is absent from the price table.
+    /// What resuming cost, rounded to six places — the emitted figure.
+    /// `Some(0.0)` is a *measured* zero: the cache survived, or the gap never
+    /// exceeded the TTL. `None` is unmeasurable — no next turn, or its model is
+    /// absent from the price table.
     pub cold_restart_usd: Option<f64>,
+    /// The same quantity before rounding, kept only to total the session.
+    ///
+    /// Summing the *rounded* per-gap figures compounds up to half a
+    /// micro-dollar of error per gap; summing the exact ones and rounding once
+    /// does not. On a four-gap session that is the difference between
+    /// `12.936212` and `12.936211`, and the contract's own recorded value for
+    /// that session is the latter — see [`SessionGrade::cold_restart_usd_total`].
+    pub cold_restart_usd_exact: Option<f64>,
 }
 
 /// A graded session. Every field is a pure function of the transcript.
@@ -250,7 +259,18 @@ pub struct SessionGrade {
     pub wall_clock_ms: i64,
     /// Every idle span over [`GAP_MIN_MS`], ordered by start.
     pub gaps: Vec<Gap>,
-    /// Sum of the measurable `cold_restart_usd` values.
+    /// What every cold restart in this session cost, together.
+    ///
+    /// Summed from the **unrounded** per-gap values and rounded once, not
+    /// summed from the rounded ones. The contract's field table reads "sum of
+    /// non-null `coldRestartUsd`, rounded to 6 places", which taken literally
+    /// is the other reading — but the real session it records in section 8
+    /// totals `12.936211`, which only the sum-then-round produces (the
+    /// per-gap-rounded sum is `12.936212`). Its own fixture cannot tell the two
+    /// apart, since a single nonzero gap rounds identically either way, which
+    /// is how two independent implementations agreed and still left the
+    /// ambiguity in the prose. The recorded value wins; the prose is filed for
+    /// correction so the `sweep.py` backfill does not implement the other one.
     pub cold_restart_usd_total: f64,
     /// Wall clock minus all gap time.
     pub active_ms: i64,
@@ -354,7 +374,10 @@ pub fn grade_transcript_with(
 
     let gaps = find_gaps(&events, &turns, prices);
     let gap_total_ms: i64 = gaps.iter().map(|g| g.gap_ms).sum();
-    let cold_restart_usd_total = round_to(gaps.iter().filter_map(|g| g.cold_restart_usd).sum(), 6);
+    let cold_restart_usd_total = round_to(
+        gaps.iter().filter_map(|g| g.cold_restart_usd_exact).sum(),
+        6,
+    );
 
     let peak_context_tokens = turns.iter().map(|t| t.context).max().unwrap_or(0);
     let compactions = tally_compactions(&events);
@@ -483,6 +506,7 @@ fn find_gaps(events: &[Event], turns: &[&Turn], prices: &Prices) -> Vec<Gap> {
             }
             let start_ms = w[0].ts_ms;
             let end_ms = w[1].ts_ms;
+            let basis = cold_restart_basis(gap_ms, end_ms, turns, prices);
             Some(Gap {
                 start_ms,
                 end_ms,
@@ -492,25 +516,37 @@ fn find_gaps(events: &[Event], turns: &[&Turn], prices: &Prices) -> Vec<Gap> {
                     .filter(|t| t.ts_ms <= start_ms)
                     .next_back()
                     .map(|t| t.context),
-                cold_restart_usd: cold_restart_usd(gap_ms, end_ms, turns, prices),
+                cold_restart_usd: basis.map(|(t, r)| usd_per_mtok(t, r)),
+                cold_restart_usd_exact: basis.map(|(t, r)| t as f64 * r / 1_000_000.0),
             })
         })
         .collect()
 }
 
-/// What the first turn after the gap paid to rebuild its cache.
+/// What resuming after this gap is charged on: `(tokens, rate spread)`.
 ///
-/// `Some(0.0)` and `None` are different answers and neither substitutes for the
+/// Returns the *basis* rather than a dollar figure because the two consumers
+/// need different arithmetic over it — the emitted per-gap value rounds, the
+/// session total does not (see [`SessionGrade::cold_restart_usd_total`]) — and
+/// rounding first and un-rounding later is not possible.
+///
+/// `Some` and `None` are different answers and neither substitutes for the
 /// other: a gap under the TTL cost a measured nothing, and a gap over the TTL
 /// whose next turn reports zero cache creation *also* cost a measured nothing —
-/// the cache survived. `None` means the question could not be answered.
-fn cold_restart_usd(gap_ms: i64, end_ms: i64, turns: &[&Turn], prices: &Prices) -> Option<f64> {
+/// the cache survived. `None` means the question could not be answered at all:
+/// no turn followed, or its model is not in the table.
+fn cold_restart_basis(
+    gap_ms: i64,
+    end_ms: i64,
+    turns: &[&Turn],
+    prices: &Prices,
+) -> Option<(u64, f64)> {
     if gap_ms <= CACHE_TTL_MS {
-        return Some(0.0);
+        return Some((0, 0.0));
     }
     let next = turns.iter().find(|t| t.ts_ms >= end_ms)?;
     let price = prices.get(&next.model)?;
-    Some(usd_per_mtok(
+    Some((
         next.cache_creation,
         price.cache_write_1h() - price.cache_read_per_mtok,
     ))
@@ -941,6 +977,80 @@ mod tests {
         );
     }
 
+    /// A second exact half, at the opus spread, where the contract's own
+    /// recorded value is wrong.
+    ///
+    /// `93,161 x 9.5` is exactly `885,029.5`, so the half-away-from-zero
+    /// rounding of `0.8850295` is `0.885030`. The contract's section 9 records
+    /// `0.885029` for this gap and `6.324216` for that session's total; both
+    /// come from dividing before rounding, which loses the exact half — the
+    /// same trap section 5 documents and which section 8's session happened to
+    /// dodge because its quotient round-trips exactly. Recomputed in exact
+    /// decimal arithmetic against the live transcript: `0.885030` and
+    /// `6.324217`. Filed for correction; this test is the record.
+    #[test]
+    fn the_opus_spread_has_its_own_exact_half() {
+        assert_eq!(usd_per_mtok(93_161, 9.5), 0.885030);
+        assert_ne!(
+            usd_per_mtok(93_161, 9.5),
+            0.885029,
+            "the divide-first answer, which the contract records"
+        );
+    }
+
+    /// The session total sums the **unrounded** per-gap values and rounds once.
+    ///
+    /// This is the one place the contract's prose and its own recorded data
+    /// disagree. The field table says "sum of non-null `coldRestartUsd`,
+    /// rounded to 6 places" — and `coldRestartUsd` is itself defined as
+    /// rounded, so read literally the total is a sum of rounded values. But the
+    /// real four-gap session the contract records in section 8 totals
+    /// `12.936211`, and only sum-then-round produces that; summing the rounded
+    /// per-gap figures gives `12.936212`. Verified live against that
+    /// transcript: every other field agreed to the millisecond and the cent.
+    ///
+    /// The contract's fixture cannot arbitrate, because it has exactly one
+    /// nonzero gap and one value rounds the same either way. So this test
+    /// builds the case the fixture is missing — two gaps whose half-micro-dollar
+    /// remainders both round up — and pins the answer the recorded session gives.
+    #[test]
+    fn the_total_sums_unrounded_values_then_rounds_once() {
+        // Gap A restarts on fable-5-1 (spread 19.75) at 106,798 tokens
+        //   -> 2.1092605 exact, 2.109261 rounded.
+        // Gap B restarts on opus-5 (spread 9.5) at 767,197 tokens
+        //   -> 7.2883715 exact, 7.288372 rounded.
+        let t = concat!(
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T02:00:00Z","message":{"model":"claude-fable-5-1","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":106798}}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T02:00:01Z"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T05:00:00Z","message":{"model":"claude-opus-5","usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":767197}}}"#,
+        );
+
+        let grade = grade_transcript(t, &contract_prices());
+        assert_eq!(grade.gaps.len(), 2, "two gaps, both over the TTL");
+        assert_eq!(grade.gaps[0].cold_restart_usd, Some(2.109261));
+        assert_eq!(grade.gaps[1].cold_restart_usd, Some(7.288372));
+
+        let sum_of_rounded = 2.109261_f64 + 7.288372_f64;
+        assert_eq!(
+            round_to(sum_of_rounded, 6),
+            9.397633,
+            "the reading this test exists to rule out"
+        );
+        assert_eq!(
+            grade.cold_restart_usd_total, 9.397632,
+            "summing the exact values and rounding once gives one micro-dollar less"
+        );
+        assert_ne!(
+            grade.cold_restart_usd_total,
+            round_to(sum_of_rounded, 6),
+            "if these ever agree, this test has stopped distinguishing the two readings"
+        );
+    }
+
     /// Round on the numerator, not after a division that is then undone.
     ///
     /// This is the case that makes [`usd_per_mtok`]'s arithmetic falsifiable.
@@ -1069,5 +1179,247 @@ mod tests {
             json!(40.0),
             "the grading names the threshold it ran under"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript resolution
+// ---------------------------------------------------------------------------
+
+/// The Claude config root: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+pub fn claude_config_root() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(|h| std::path::Path::new(&h).join(".claude"))
+}
+
+/// Is this the canonical 8-4-4-4-12 hex UUID shape?
+///
+/// A shape gate, not a validity check. It runs *before* the value is joined
+/// into any path, so a session id can never carry `..`, a separator, or a glob
+/// metacharacter into the filesystem walk below.
+fn is_uuid_shaped(s: &str) -> bool {
+    let groups = [8, 4, 4, 4, 12];
+    let mut parts = s.split('-');
+    for want in groups {
+        let Some(part) = parts.next() else {
+            return false;
+        };
+        if part.len() != want || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    parts.next().is_none()
+}
+
+/// Find the transcript for `session_id` under `<root>/projects/*/<uuid>.jsonl`.
+///
+/// **The project-dir slug is never trusted.** It names the cwd at session
+/// birth, not the work — one graded session spanned four cwds and four
+/// branches and lives under the slug of a directory it left early. So every
+/// project dir is searched and the id is what identifies the file.
+///
+/// Subagent transcripts sit at `<project>/<session>/subagents/agent-*.jsonl`,
+/// strictly deeper than the one level this reads, so they are structurally
+/// unreachable here rather than filtered out by name.
+///
+/// Zero hits and several hits are both errors, and the message names which —
+/// silently taking the first of several would grade an arbitrary session and
+/// report it as the requested one.
+pub fn resolve_session_transcript(
+    session_id: &str,
+    root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    if !is_uuid_shaped(session_id) {
+        return Err(format!(
+            "session id is not a UUID: {session_id:?} (expected 8-4-4-4-12 hex)"
+        ));
+    }
+
+    let projects = root.join("projects");
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        return Err(format!(
+            "no project directory to search: {}",
+            projects.display()
+        ));
+    };
+
+    let mut hits: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path().join(format!("{session_id}.jsonl")))
+        .filter(|p| p.is_file())
+        .collect();
+    hits.sort();
+
+    match hits.len() {
+        0 => Err(format!(
+            "no transcript for session {session_id} under {}",
+            projects.display()
+        )),
+        1 => Ok(hits.remove(0)),
+        n => Err(format!(
+            "session {session_id} matches {n} transcripts under {} — pass --transcript to choose:\n  {}",
+            projects.display(),
+            hits.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        )),
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn seed(root: &std::path::Path, project: &str, name: &str) {
+        let dir = root.join("projects").join(project);
+        std::fs::create_dir_all(&dir).expect("create project dir");
+        std::fs::write(dir.join(name), "{}\n").expect("write transcript");
+    }
+
+    const ID: &str = "0e0e5f58-9ca8-4d51-bb3e-1d79a02636ae";
+
+    #[test]
+    fn a_non_uuid_session_id_is_refused_before_any_path_is_built() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in [
+            "../../etc/passwd",
+            "not-a-uuid",
+            "0e0e5f58-9ca8-4d51-bb3e-1d79a02636a", // one short
+            "0e0e5f58-9ca8-4d51-bb3e-1d79a02636aeZ", // one long
+            "0e0e5f58_9ca8_4d51_bb3e_1d79a02636ae", // wrong separator
+            "0e0e5f58-9ca8-4d51-bb3e-1d79a02636*e", // glob metacharacter
+            "",
+        ] {
+            let err = resolve_session_transcript(bad, dir.path())
+                .expect_err("a non-UUID must be refused");
+            assert!(err.contains("not a UUID"), "{bad:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn a_single_hit_resolves_whatever_the_project_slug_says() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed(
+            dir.path(),
+            "-Users-cameron-somewhere-else",
+            &format!("{ID}.jsonl"),
+        );
+        let got = resolve_session_transcript(ID, dir.path()).expect("must resolve");
+        assert!(got.ends_with(format!("{ID}.jsonl")));
+    }
+
+    #[test]
+    fn a_subagent_transcript_is_not_reachable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("projects/-p/session-dir/subagents");
+        std::fs::create_dir_all(&sub).expect("create subagent dir");
+        std::fs::write(sub.join(format!("{ID}.jsonl")), "{}\n").expect("write");
+        let err = resolve_session_transcript(ID, dir.path()).expect_err("must not resolve");
+        assert!(err.contains("no transcript"), "{err}");
+    }
+
+    #[test]
+    fn several_hits_are_an_error_naming_every_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed(dir.path(), "-project-a", &format!("{ID}.jsonl"));
+        seed(dir.path(), "-project-b", &format!("{ID}.jsonl"));
+        let err = resolve_session_transcript(ID, dir.path()).expect_err("ambiguous must fail");
+        assert!(err.contains("matches 2 transcripts"), "{err}");
+        assert!(
+            err.contains("-project-a"),
+            "names the first candidate: {err}"
+        );
+        assert!(
+            err.contains("-project-b"),
+            "names the second candidate: {err}"
+        );
+    }
+
+    #[test]
+    fn a_missing_projects_directory_is_a_named_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = resolve_session_transcript(ID, dir.path()).expect_err("must fail");
+        assert!(err.contains("no project directory"), "{err}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CLI action
+// ---------------------------------------------------------------------------
+
+/// `cadence-hooks metrics grade` — print one transcript's grading as JSON.
+///
+/// A CLI action, not a hook: it has no `hooks.json` wiring, reads no stdin
+/// payload, and is not subject to `CADENCE_DISABLE`. The thin I/O wrapper over
+/// [`grade_transcript`]; every decision it makes is which file to read.
+///
+/// Returns the process exit code: `0` on success, `1` with a reason on stderr
+/// when the transcript cannot be identified or read. Unlike a guard, this
+/// **fails closed** — printing an empty or partial grading would be read as a
+/// measurement, and a cost figure nobody can trace to a file is worse than no
+/// figure (ADR-0001 protects a user from a guard's own failure; there is no
+/// operation here to avoid blocking).
+pub fn run_grade(
+    transcript: Option<String>,
+    session_id: Option<String>,
+    prices_path: Option<String>,
+) -> u8 {
+    let path = match (transcript, session_id) {
+        (Some(p), _) => std::path::PathBuf::from(p),
+        (None, id) => {
+            let Some(id) = id
+                .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+                .filter(|s| !s.is_empty())
+            else {
+                eprintln!(
+                    "metrics grade: no transcript named. Pass --transcript <path> or \
+                     --session-id <uuid>, or run inside a session (CLAUDE_CODE_SESSION_ID)."
+                );
+                return 1;
+            };
+            let Some(root) = claude_config_root() else {
+                eprintln!(
+                    "metrics grade: cannot locate the Claude config directory \
+                     (set CLAUDE_CONFIG_DIR or HOME), so --session-id cannot be resolved."
+                );
+                return 1;
+            };
+            match resolve_session_transcript(&id, &root) {
+                Ok(p) => p,
+                Err(reason) => {
+                    eprintln!("metrics grade: {reason}");
+                    return 1;
+                }
+            }
+        }
+    };
+
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("metrics grade: cannot read {}: {e}", path.display());
+            return 1;
+        }
+    };
+
+    let prices = Prices::load(prices_path.as_deref());
+    let grading = grade_transcript(&contents, &prices).to_json();
+    match serde_json::to_string_pretty(&grading) {
+        Ok(s) => {
+            println!("{s}");
+            0
+        }
+        Err(e) => {
+            eprintln!("metrics grade: cannot serialize the grading: {e}");
+            1
+        }
     }
 }
