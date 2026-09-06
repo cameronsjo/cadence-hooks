@@ -14,11 +14,13 @@
 //! naive `.md == docs` classifier would re-open exactly the loophole the gate's
 //! SCOPE_CLAUSES exist to close.
 
+use crate::deadline;
 use crate::shell::{GitSpawn, git_command, run_git_bounded};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// The merge base with `origin/main` (falling back to `origin/master`) for the
 /// branch checked out at `dir`. The base refs are spelled fully qualified
@@ -98,16 +100,36 @@ pub const MAX_DIGEST_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// - a bound hit ([`MAX_DIGEST_FILES`] / [`MAX_DIGEST_BYTES`]) → `digest` is
 ///   the literal `"skipped"` — a real value the reader can see;
-/// - an unresolvable base or any subprocess failure → `None`, so the caller
-///   omits the field entirely. *Bounded out* and *no evidence* must not
-///   collapse into one another.
+/// - an unresolvable base, any subprocess failure, or a spent deadline budget
+///   mid-hash → `None`, so the caller omits the field entirely. *Bounded out*
+///   and *no evidence* must not collapse into one another.
 pub fn working_tree_digest(dir: &str) -> Option<WorkingTreeDigest> {
-    digest_bounded(dir, MAX_DIGEST_FILES, MAX_DIGEST_BYTES)
+    digest_bounded(dir, MAX_DIGEST_FILES, MAX_DIGEST_BYTES, hash_budget())
 }
 
-/// [`working_tree_digest`] with explicit bounds, so both bounds are testable
-/// without materializing a thousand files or 64 MiB.
-fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<WorkingTreeDigest> {
+/// How long the content-hash loop may run before abandoning the digest.
+///
+/// `Armed` already has the hook's elapsed time subtracted, so it is what
+/// remains from here; `Unarmed` (the CLI path) caps at the full budget;
+/// `Disabled` means no bound at all.
+fn hash_budget() -> Option<Duration> {
+    match deadline::state() {
+        deadline::BudgetState::Disabled => None,
+        deadline::BudgetState::Armed(remaining) | deadline::BudgetState::Unarmed(remaining) => {
+            Some(remaining)
+        }
+    }
+}
+
+/// [`working_tree_digest`] with explicit bounds, so all three bounds — files,
+/// bytes, and time — are testable without materializing a thousand files, 64
+/// MiB, or a real deadline.
+fn digest_bounded(
+    dir: &str,
+    max_files: usize,
+    max_bytes: u64,
+    hash_budget: Option<Duration>,
+) -> Option<WorkingTreeDigest> {
     let base = merge_base_with_origin(dir)?;
     // Resolve the repo top-level ONCE and run both change-set subprocesses
     // against it (cadence-hooks#775 C1): `git diff --name-only` yields
@@ -150,7 +172,24 @@ fn digest_bounded(dir: &str, max_files: usize, max_bytes: u64) -> Option<Working
     let root = Path::new(&root);
     let mut frames = Sha256::new();
     let mut remaining = max_bytes;
+    // The content-hash loop is the only unbounded work in this function — the
+    // two subprocesses above go through the deadline-aware spawn helpers, but
+    // reading and hashing up to MAX_DIGEST_FILES files consulted no clock at
+    // all. That was tolerable while this ran only on the `record-polish` CLI
+    // path; cadence-hooks#874 put it on the hook path, where an external
+    // hooks.json timeout would kill the process outright (the pre-#271 silent
+    // kill this module exists to prevent).
+    let hash_start = Instant::now();
     for path in &paths {
+        // Out of budget → `None`, the no-evidence shape. Deliberately NOT
+        // `"skipped"`: that is a real recorded value meaning "a declared bound
+        // was hit", and writing it here would attest a bound the operator can
+        // reason about when what actually happened is that the clock ran out.
+        // `None` omits the field, which every consumer already reads as silent.
+        if hash_budget.is_some_and(|budget| hash_start.elapsed() >= budget) {
+            deadline::note_hit();
+            return None;
+        }
         // The budget is spent BEFORE the read, not after it: `digest_entry`
         // returns `None` for a regular file whose metadata already exceeds what
         // is left, so no single file is ever pulled whole into memory to find
@@ -392,6 +431,47 @@ mod tests {
     }
 
     #[test]
+    fn a_spent_hash_budget_yields_no_evidence_not_a_skipped_record() {
+        // cadence-hooks#874 security review: the content-hash loop now runs on
+        // the HOOK path, where it previously ran only on the record-polish CLI
+        // path, and it consulted no clock at all. Without a budget check an
+        // external hooks.json timeout kills the process outright — the silent
+        // external kill the deadline module exists to prevent.
+        //
+        // A zero budget is spent before the first file, so the loop abandons
+        // immediately. The result must be `None` (no evidence — the caller
+        // omits the field and the gate stays silent), never a `"skipped"`
+        // record: `skipped` is a real recorded value asserting a DECLARED bound
+        // was hit, and writing it here would attest a bound the operator can
+        // reason about when the clock simply ran out.
+        let tmp = init_repo_with_origin_main(&[]);
+        let dir = tmp.path();
+        write_file(dir, "src/a.rs", "fn a() {}\n");
+
+        // Positive control: the same call with no budget resolves a real hash,
+        // so the `None` below is the budget's doing and not a broken fixture.
+        let unbounded = digest_bounded(
+            dir.to_str().unwrap(),
+            MAX_DIGEST_FILES,
+            MAX_DIGEST_BYTES,
+            None,
+        )
+        .expect("digest resolves with no time bound");
+        assert!(unbounded.digest.starts_with("sha256:"));
+
+        let spent = digest_bounded(
+            dir.to_str().unwrap(),
+            MAX_DIGEST_FILES,
+            MAX_DIGEST_BYTES,
+            Some(Duration::ZERO),
+        );
+        assert!(
+            spent.is_none(),
+            "a spent budget is no evidence, not a bounded-out record: {spent:?}"
+        );
+    }
+
+    #[test]
     fn working_tree_digest_is_stable_across_merging_an_advanced_origin_main_up() {
         // cadence-hooks#874: the pre-PR gate now COMPARES this digest against a
         // marker's recorded one, so the merge-up invariant stopped being
@@ -569,13 +649,13 @@ mod tests {
         write_file(dir, "src/a.rs", "aaaa\n");
         write_file(dir, "src/b.rs", "bbbb\n");
 
-        let over_files = digest_bounded(dir.to_str().unwrap(), 1, MAX_DIGEST_BYTES)
+        let over_files = digest_bounded(dir.to_str().unwrap(), 1, MAX_DIGEST_BYTES, None)
             .expect("a bounded-out digest still resolves");
         assert_eq!(over_files.digest, "skipped");
         assert_eq!(over_files.files, 2, "the file count still reports");
 
-        let over_bytes =
-            digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 1).expect("still resolves");
+        let over_bytes = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 1, None)
+            .expect("still resolves");
         assert_eq!(over_bytes.digest, "skipped");
     }
 
@@ -602,7 +682,7 @@ mod tests {
             return;
         }
 
-        let bounded = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 64)
+        let bounded = digest_bounded(dir.to_str().unwrap(), MAX_DIGEST_FILES, 64, None)
             .expect("a bounded-out digest still resolves");
         assert_eq!(bounded.digest, "skipped");
         assert_eq!(bounded.files, 1, "the file count still reports");

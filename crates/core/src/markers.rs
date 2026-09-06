@@ -444,10 +444,13 @@ pub fn read_polish_record(repo_root: &str, branch: &str) -> Option<PolishRecord>
 /// records when it declines to hash (`skipped` for a bound hit, `empty` for a
 /// change set with no code paths).
 ///
-/// Bounded on the READ side for the same reason [`is_arm_token`] is: the pre-PR
-/// gate interpolates a prefix of this value into the session's
-/// `additionalContext` (cadence-hooks#775 security review), and a marker is a
-/// plain file a hand edit can rewrite.
+/// Bounded on the READ side even though **no consumer renders this value
+/// today** — the pre-PR gate compares it and its nudge message echoes nothing
+/// from the marker. The bound is *both-sides parity* with [`is_arm_token`]: a
+/// marker is a plain file a hand edit can rewrite, and the moment a future
+/// renderer does interpolate a digest — a prefix in the nudge, a `doctor` row,
+/// a verdict line — it is already safe. Retrofitting a bound after the renderer
+/// exists is the sequence cadence-hooks#775's security review was filed for.
 fn is_digest_value(s: &str) -> bool {
     if s == "skipped" || s == "empty" {
         return true;
@@ -472,11 +475,15 @@ fn is_digest_base(s: &str) -> bool {
 /// Read the optional `diff_digest` block leniently (cadence-hooks#874).
 ///
 /// Every unexpected shape reads as *absent*: a non-object `diff_digest`, a
-/// non-string `base`/`digest`, a non-integer `files`. A `base` or `digest` that
-/// fails its charset bound drops the WHOLE block rather than only that field —
-/// a digest with no trustworthy base, or a base with no trustworthy digest, is
-/// not evidence, and half a block would let a hand edit steer the comparison.
-/// Dropping the block reads as unknown, which keeps the gate silent (ADR-0001).
+/// non-string `base`/`digest`, a non-integer `files`.
+///
+/// **The two fields fail differently, on purpose.** A malformed `digest` drops
+/// the whole block — it is the field the gate compares, so without a
+/// trustworthy one there is nothing to decide with. A malformed `base` drops
+/// only itself and keeps a valid digest: **nothing reads `base`**, so dropping
+/// the block over it would let one junk character in an unread field suppress a
+/// nudge the digest had already earned. Suppression is the direction that
+/// costs, since the gate is advisory and a spurious nudge is only noise.
 fn read_diff_digest(v: &serde_json::Value) -> Option<DiffDigest> {
     let entry = v.get("diff_digest")?.as_object()?;
     let string = |key: &str, ok: fn(&str) -> bool| -> Result<Option<String>, ()> {
@@ -486,7 +493,9 @@ fn read_diff_digest(v: &serde_json::Value) -> Option<DiffDigest> {
             Some(_) => Err(()),
         }
     };
-    let base = string("base", is_digest_base).ok()?;
+    // A malformed base drops to `None` (`.unwrap_or_default()`); a malformed
+    // digest drops the record (`.ok()?`).
+    let base = string("base", is_digest_base).unwrap_or_default();
     let digest = string("digest", is_digest_value).ok()?;
     Some(DiffDigest {
         base,
