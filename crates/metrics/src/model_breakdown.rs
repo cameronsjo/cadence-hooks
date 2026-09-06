@@ -23,6 +23,7 @@ pub fn by_model_json(by_model: &[(String, Tokens)], prices: &Prices) -> Vec<Valu
                 "tokens": {
                     "input": tokens.input,
                     "cacheCreate": tokens.cache_create,
+                    "cacheCreate1h": tokens.cache_create_1h,
                     "cacheRead": tokens.cache_read,
                     "output": tokens.output,
                 },
@@ -77,7 +78,7 @@ mod tests {
             Tokens {
                 input: 100,
                 cache_create: 50,
-                cache_create_1h: 0,
+                cache_create_1h: 20,
                 cache_read: 200,
                 output: 30,
             },
@@ -92,6 +93,7 @@ mod tests {
         assert_eq!(arr[0]["model"], "claude-opus-4-7");
         assert_eq!(arr[0]["tokens"]["input"], 100);
         assert_eq!(arr[0]["tokens"]["cacheCreate"], 50);
+        assert_eq!(arr[0]["tokens"]["cacheCreate1h"], 20);
         assert_eq!(arr[0]["tokens"]["cacheRead"], 200);
         assert_eq!(arr[0]["tokens"]["output"], 30);
         assert!(arr[0]["costUsd"].as_f64().unwrap() > 0.0);

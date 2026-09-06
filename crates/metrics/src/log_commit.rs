@@ -181,6 +181,7 @@ fn build_commit_record(
         "tokens": {
             "input": scan.tokens.input,
             "cacheCreate": scan.tokens.cache_create,
+            "cacheCreate1h": scan.tokens.cache_create_1h,
             "cacheRead": scan.tokens.cache_read,
             "output": scan.tokens.output,
             "reasoningOutput": usage.reasoning_output,
@@ -239,7 +240,7 @@ mod tests {
             tokens: Tokens {
                 input: 100,
                 cache_create: 50,
-                cache_create_1h: 0,
+                cache_create_1h: 20,
                 cache_read: 200,
                 output: 30,
             },
@@ -251,7 +252,7 @@ mod tests {
                 Tokens {
                     input: 100,
                     cache_create: 50,
-                    cache_create_1h: 0,
+                    cache_create_1h: 20,
                     cache_read: 200,
                     output: 30,
                 },
@@ -296,6 +297,7 @@ mod tests {
         assert_eq!(record["model"], "claude-opus-4-7");
         assert_eq!(record["tokens"]["input"], 100);
         assert_eq!(record["tokens"]["cacheCreate"], 50);
+        assert_eq!(record["tokens"]["cacheCreate1h"], 20);
         assert_eq!(record["tokens"]["cacheRead"], 200);
         assert_eq!(record["tokens"]["output"], 30);
         assert_eq!(record["costUsd"], 0.001234);
