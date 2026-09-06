@@ -32,9 +32,9 @@ check:
 	$(CARGO) check --workspace
 
 .PHONY: clippy
-## Run clippy lints
+## Run clippy lints (--all-targets matches CI; without it, test code is unlinted)
 clippy:
-	$(CARGO) clippy --workspace -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 .PHONY: fmt
 ## Format all code
