@@ -208,6 +208,30 @@ fn naming_no_transcript_at_all_says_how_to_name_one() {
     );
 }
 
+/// `CADENCE_BYPASS=1` must not silence a CLI action either.
+///
+/// Bypassed, `grade` exited 0 having printed nothing — and an operator piping
+/// it to `jq` reads absent output as "this session had no cold restarts"
+/// rather than "the command never ran". That is exactly the failure the
+/// fail-closed exit codes exist to prevent, arriving through the one env var
+/// whose documented purpose is keeping diagnostic commands working.
+#[test]
+fn cadence_bypass_does_not_silence_a_cli_action() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("t.jsonl");
+    std::fs::write(&path, TRANSCRIPT).expect("write");
+
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_BYPASS", "1");
+    cmd.args(["metrics", "grade", "--transcript"]).arg(&path);
+    let (code, stdout, stderr) = run(cmd);
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let g: serde_json::Value =
+        serde_json::from_str(&stdout).expect("a bypassed run still prints the grading");
+    assert_eq!(g["wallClockMs"], 9_960_000);
+}
+
 /// `grade` is a CLI action, not a hook — `CADENCE_DISABLE` must not reach it.
 #[test]
 fn cadence_disable_does_not_silence_a_cli_action() {

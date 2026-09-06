@@ -55,6 +55,12 @@ fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
             Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
             _
         ) | (Some("session"), Some("declare" | "status"))
+            // `metrics grade` is a CLI action, not a hook. Bypassed it would
+            // exit 0 having printed nothing, and an operator piping it to `jq`
+            // reads the absent output as "no cold restarts" rather than "the
+            // command never ran" — the exact failure its fail-closed exit
+            // codes exist to prevent.
+            | (Some("metrics"), Some("grade"))
     )
 }
 

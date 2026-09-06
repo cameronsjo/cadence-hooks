@@ -51,6 +51,24 @@ pub const CONTEXT_TIER_750K: u64 = 750_000;
 /// number.
 pub const DEFAULT_GRIND_TURNS_PER_PROMPT: f64 = 30.0;
 
+/// Wall clock above which `flags.longSession` is set.
+///
+/// Numerically equal to [`CACHE_TTL_MS`] and unrelated to it — one is "this
+/// session ran long", the other is "the prompt cache had expired". Named
+/// separately so a change to Anthropic's TTL cannot silently move a
+/// session-length flag, and so nobody folds two independent thresholds into
+/// one constant on the strength of them sharing a value today.
+pub const LONG_SESSION_MS: i64 = 60 * 60 * 1000;
+
+/// Decimal places every dollar figure is rounded to.
+pub const USD_PLACES: u32 = 6;
+
+/// Decimal places `turnsPerPrompt` is rounded to.
+const TURNS_PER_PROMPT_PLACES: u32 = 1;
+
+/// Tokens per unit of every rate in the price table.
+const TOKENS_PER_RATE_UNIT: f64 = 1_000_000.0;
+
 /// The model string Claude Code writes for a locally-synthesized assistant
 /// record. Such a record carries `usage` but is not a turn.
 const SYNTHETIC_MODEL: &str = "<synthetic>";
@@ -92,7 +110,7 @@ struct CompactMetadata {
     #[serde(default)]
     trigger: Option<String>,
     #[serde(default, rename = "preTokens")]
-    pre_tokens: u64,
+    pre_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -113,14 +131,22 @@ struct Message {
     content_is_string: Option<bool>,
 }
 
+/// Token counts, every field `Option` on purpose.
+///
+/// `#[serde(default)]` covers a *missing* key but not a present `null` — serde
+/// answers that with `invalid type: null, expected u64`, which fails the whole
+/// `Record` and drops the line. That costs far more than the field: the
+/// record's **timestamp** vanishes from the event stream too, so `wallClockMs`
+/// shrinks and a gap that record bounded is merged with its neighbour or lost
+/// outright. A null must cost one field, never one record.
 #[derive(Deserialize)]
 struct Usage {
     #[serde(default)]
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     #[serde(default)]
-    cache_read_input_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
     #[serde(default)]
-    cache_creation_input_tokens: u64,
+    cache_creation_input_tokens: Option<u64>,
 }
 
 /// Answer "was this a JSON string?" without binding the value.
@@ -238,19 +264,39 @@ pub struct Gap {
     /// Context of the nearest assistant turn at or before the start; `None`
     /// when no turn has run yet.
     pub context_tokens_at_gap: Option<u64>,
+    /// What resuming after this gap is charged on: `(tokens, rate spread)`.
+    ///
+    /// One field rather than a rounded figure and an exact one side by side.
+    /// Those two must always be `Some`/`None` together and always derive from
+    /// the same pair, and nothing would enforce either: an edit touching one
+    /// arm and not the other yields a gap whose emitted `coldRestartUsd` is
+    /// non-null while it contributes nothing to the session total — a silent
+    /// discrepancy no test shape would catch.
+    ///
+    /// `None` is unmeasurable: no turn followed the gap, or its model is
+    /// absent from the price table. `Some((0, _))` is a *measured* zero — the
+    /// gap never exceeded the TTL, or the cache survived it.
+    pub cold_restart_basis: Option<(u64, f64)>,
+}
+
+impl Gap {
     /// What resuming cost, rounded to six places — the emitted figure.
-    /// `Some(0.0)` is a *measured* zero: the cache survived, or the gap never
-    /// exceeded the TTL. `None` is unmeasurable — no next turn, or its model is
-    /// absent from the price table.
-    pub cold_restart_usd: Option<f64>,
-    /// The same quantity before rounding, kept only to total the session.
+    pub fn cold_restart_usd(&self) -> Option<f64> {
+        self.cold_restart_basis
+            .map(|(tokens, rate)| usd_per_mtok(tokens, rate))
+    }
+
+    /// The same quantity unrounded, for totalling the session.
     ///
     /// Summing the *rounded* per-gap figures compounds up to half a
     /// micro-dollar of error per gap; summing the exact ones and rounding once
     /// does not. On a four-gap session that is the difference between
     /// `12.936212` and `12.936211`, and the contract's own recorded value for
     /// that session is the latter — see [`SessionGrade::cold_restart_usd_total`].
-    pub cold_restart_usd_exact: Option<f64>,
+    pub fn cold_restart_usd_exact(&self) -> Option<f64> {
+        self.cold_restart_basis
+            .map(|(tokens, rate)| tokens as f64 * rate / TOKENS_PER_RATE_UNIT)
+    }
 }
 
 /// A graded session. Every field is a pure function of the transcript.
@@ -374,9 +420,18 @@ pub fn grade_transcript_with(
 
     let gaps = find_gaps(&events, &turns, prices);
     let gap_total_ms: i64 = gaps.iter().map(|g| g.gap_ms).sum();
+    // `+ 0.0` is load-bearing, not noise: Rust's `impl Sum for f64` seeds the
+    // fold at NEGATIVE zero, so an empty or fully-filtered sum yields `-0.0`,
+    // `round_to` preserves the sign, and serde_json writes the literal text
+    // `-0.0`. Most sessions have no gap at all, so without this the majority
+    // of rows would carry a negative dollar total — and `Value` equality uses
+    // IEEE `==`, under which `-0.0 == 0.0`, so no JSON-comparing test sees it.
     let cold_restart_usd_total = round_to(
-        gaps.iter().filter_map(|g| g.cold_restart_usd_exact).sum(),
-        6,
+        gaps.iter()
+            .filter_map(Gap::cold_restart_usd_exact)
+            .sum::<f64>()
+            + 0.0,
+        USD_PLACES,
     );
 
     let peak_context_tokens = turns.iter().map(|t| t.context).max().unwrap_or(0);
@@ -388,8 +443,12 @@ pub fn grade_transcript_with(
 
     let assistant_turns = turns.len() as u64;
     let user_prompts = prompt_times.len() as u64;
-    let turns_per_prompt =
-        (user_prompts > 0).then(|| round_to(assistant_turns as f64 / user_prompts as f64, 1));
+    let turns_per_prompt = (user_prompts > 0).then(|| {
+        round_to(
+            assistant_turns as f64 / user_prompts as f64,
+            TURNS_PER_PROMPT_PLACES,
+        )
+    });
 
     let gap_spans: Vec<(i64, i64)> = gaps.iter().map(|g| (g.start_ms, g.end_ms)).collect();
     let longest_turn_ms = longest_turn_ms(&prompt_times, last_ms, &gap_spans);
@@ -403,7 +462,7 @@ pub fn grade_transcript_with(
     };
 
     let flags = Flags {
-        long_session: wall_clock_ms > 60 * 60 * 1000,
+        long_session: wall_clock_ms > LONG_SESSION_MS,
         afk_gap: !gaps.is_empty(),
         cold_restart: gaps.iter().any(|g| g.gap_ms > CACHE_TTL_MS),
         context_500k: peak_context_tokens >= CONTEXT_TIER_500K,
@@ -457,12 +516,19 @@ fn to_event(r: Record) -> Option<Event> {
             if model == SYNTHETIC_MODEL {
                 return None;
             }
+            let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
             Some(Turn {
                 ts_ms,
-                context: usage.input_tokens
-                    + usage.cache_read_input_tokens
-                    + usage.cache_creation_input_tokens,
-                cache_creation: usage.cache_creation_input_tokens,
+                // Saturating: these three come straight from an untrusted
+                // file, and a plain `+` panics in debug and wraps in release.
+                // The release arm is the worse one — a wrapped sum reports a
+                // confident wrong `contextTier` rather than crashing.
+                context: usage
+                    .input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(usage.cache_read_input_tokens.unwrap_or(0))
+                    .saturating_add(cache_creation),
+                cache_creation,
                 model: model.to_string(),
             })
         })
@@ -478,7 +544,7 @@ fn to_event(r: Record) -> Option<Event> {
         let meta = r.compact_metadata.as_ref();
         Compaction {
             trigger: meta.and_then(|m| m.trigger.clone()),
-            pre_tokens: meta.map_or(0, |m| m.pre_tokens),
+            pre_tokens: meta.and_then(|m| m.pre_tokens).unwrap_or(0),
         }
     });
 
@@ -511,14 +577,15 @@ fn find_gaps(events: &[Event], turns: &[&Turn], prices: &Prices) -> Vec<Gap> {
                 start_ms,
                 end_ms,
                 gap_ms,
-                // Turns are sorted ascending, so the last one at or before the
-                // gap's start is the nearest preceding turn.
+                // `turns` derives from the sorted `events`, so it is sorted
+                // too — binary search rather than a scan per gap, which is
+                // quadratic on exactly the long AFK-heavy sessions grading
+                // exists to measure.
                 context_tokens_at_gap: turns
-                    .iter()
-                    .rfind(|t| t.ts_ms <= start_ms)
-                    .map(|t| t.context),
-                cold_restart_usd: basis.map(|(t, r)| usd_per_mtok(t, r)),
-                cold_restart_usd_exact: basis.map(|(t, r)| t as f64 * r / 1_000_000.0),
+                    .partition_point(|t| t.ts_ms <= start_ms)
+                    .checked_sub(1)
+                    .map(|i| turns[i].context),
+                cold_restart_basis: basis,
             })
         })
         .collect()
@@ -545,7 +612,8 @@ fn cold_restart_basis(
     if gap_ms <= CACHE_TTL_MS {
         return Some((0, 0.0));
     }
-    let next = turns.iter().find(|t| t.ts_ms >= end_ms)?;
+    // Sorted, as above — the first turn at or after the gap's end.
+    let next = turns.get(turns.partition_point(|t| t.ts_ms < end_ms))?;
     let price = prices.get(&next.model)?;
     Some((
         next.cache_creation,
@@ -631,6 +699,11 @@ fn longest_turn_ms(prompt_times: &[i64], last_ms: i64, gaps: &[(i64, i64)]) -> i
 /// unequal strings: Python's `isoformat` emits six digits, or none at all when
 /// the microseconds are zero.
 fn iso_millis(ms: i64) -> String {
+    // The fallback is unreachable from a graded transcript: every `ms` here
+    // came from a `jiff::Timestamp` this module already parsed, so it is in
+    // range by construction. It exists because the alternative is a panic in
+    // a fire-and-forget SessionEnd logger, and because a 1970 timestamp
+    // beside 2026 ones is a *visible* wrong answer rather than a silent one.
     jiff::Timestamp::from_millisecond(ms)
         .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
         .strftime("%Y-%m-%dT%H:%M:%S.%3fZ")
@@ -683,7 +756,7 @@ impl Gap {
             "endTs": iso_millis(self.end_ms),
             "gapMs": self.gap_ms,
             "contextTokensAtGap": self.context_tokens_at_gap,
-            "coldRestartUsd": self.cold_restart_usd,
+            "coldRestartUsd": self.cold_restart_usd(),
         })
     }
 }
@@ -860,7 +933,7 @@ mod tests {
         assert_eq!(grade.gaps.len(), 1);
         assert_eq!(grade.gaps[0].gap_ms, 2_760_000, "46 minutes");
         assert_eq!(
-            grade.gaps[0].cold_restart_usd,
+            grade.gaps[0].cold_restart_usd(),
             Some(0.0),
             "under the TTL is a measured zero, never null, however large the write"
         );
@@ -894,7 +967,7 @@ mod tests {
         );
         let grade = grade_transcript(t, &contract_prices());
         assert_eq!(grade.gaps.len(), 1);
-        assert_eq!(grade.gaps[0].cold_restart_usd, None);
+        assert_eq!(grade.gaps[0].cold_restart_usd(), None);
         assert_eq!(
             grade.cold_restart_usd_total, 0.0,
             "an unmeasurable gap contributes nothing to the total"
@@ -1032,8 +1105,8 @@ mod tests {
 
         let grade = grade_transcript(t, &contract_prices());
         assert_eq!(grade.gaps.len(), 2, "two gaps, both over the TTL");
-        assert_eq!(grade.gaps[0].cold_restart_usd, Some(2.109261));
-        assert_eq!(grade.gaps[1].cold_restart_usd, Some(7.288372));
+        assert_eq!(grade.gaps[0].cold_restart_usd(), Some(2.109261));
+        assert_eq!(grade.gaps[1].cold_restart_usd(), Some(7.288372));
 
         let sum_of_rounded = 2.109261_f64 + 7.288372_f64;
         assert_eq!(
@@ -1111,6 +1184,91 @@ mod tests {
         assert_eq!(grade.compactions.auto, 0);
         assert_eq!(grade.compactions.max_pre_tokens, 99);
         assert!(!grade.flags.auto_compacted);
+    }
+
+    /// A session with nothing to charge reports a POSITIVE zero.
+    ///
+    /// Rust's `impl Sum for f64` seeds the fold at `-0.0`, so an empty or
+    /// fully-filtered sum yields negative zero, `round_to` preserves the sign,
+    /// and `serde_json` writes the literal text `-0.0`. Most sessions have no
+    /// gap at all, so this would have put a negative dollar total on the
+    /// majority of rows. No JSON-comparing test can catch it: `Value` equality
+    /// is IEEE `==`, under which `-0.0 == 0.0`. Assert on the sign bit.
+    #[test]
+    fn a_session_with_no_cold_restart_totals_positive_zero() {
+        let no_gap = concat!(
+            r#"{"type":"user","timestamp":"2020-01-01T00:00:00Z","message":{"content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T00:00:10Z","message":{"model":"claude-opus-5","usage":{"input_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+        );
+        let total = grade_transcript(no_gap, &contract_prices()).cold_restart_usd_total;
+        assert_eq!(total, 0.0);
+        assert!(
+            !total.is_sign_negative(),
+            "a total of -0.0 serializes as the literal text `-0.0`"
+        );
+
+        // Same for a session whose only gaps are unmeasurable.
+        let unpriced = concat!(
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T02:00:00Z","message":{"model":"nobody-priced-this","usage":{"input_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":500}}}"#,
+        );
+        let total = grade_transcript(unpriced, &contract_prices()).cold_restart_usd_total;
+        assert!(
+            !total.is_sign_negative(),
+            "filtered-out gaps must not flip the sign"
+        );
+    }
+
+    /// A `null` in a numeric field costs that field, never the whole record.
+    ///
+    /// `#[serde(default)]` covers a *missing* key but not a present `null`, so
+    /// non-`Option` `u64`s would fail the `Record` and drop the line — taking
+    /// its **timestamp** with it, which shrinks `wallClockMs` and merges or
+    /// loses whatever gap that record bounded.
+    #[test]
+    fn a_null_numeric_field_costs_the_field_not_the_record() {
+        let t = concat!(
+            r#"{"type":"system","subtype":"informational","timestamp":"2020-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"compact_boundary","timestamp":"2020-01-01T03:00:00Z","compactMetadata":{"trigger":"auto","preTokens":null}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2020-01-01T03:00:01Z","message":{"model":"claude-opus-5","usage":{"input_tokens":null,"cache_read_input_tokens":7,"cache_creation_input_tokens":null}}}"#,
+        );
+        let grade = grade_transcript(t, &contract_prices());
+        assert_eq!(
+            grade.wall_clock_ms, 10_801_000,
+            "3h00m01s — the null-carrying record kept its timestamp"
+        );
+        assert_eq!(grade.gaps.len(), 1, "the gap it bounded still exists");
+        assert_eq!(
+            grade.compactions.auto, 1,
+            "and it still counted as a compaction"
+        );
+        assert_eq!(
+            grade.compactions.max_pre_tokens, 0,
+            "only the null field is lost"
+        );
+        assert_eq!(grade.assistant_turns, 1);
+        assert_eq!(grade.peak_context_tokens, 7, "the non-null count survives");
+    }
+
+    /// Token counts come from an untrusted file; a plain `+` panics in debug
+    /// and wraps in release, and the wrap is worse — it reports a confident
+    /// wrong `contextTier` instead of crashing.
+    #[test]
+    fn absurd_token_counts_saturate_rather_than_wrap() {
+        let t = format!(
+            r#"{{"type":"assistant","timestamp":"2020-01-01T00:00:00Z","message":{{"model":"claude-opus-5","usage":{{"input_tokens":{max},"cache_read_input_tokens":{max},"cache_creation_input_tokens":1}}}}}}"#,
+            max = u64::MAX
+        );
+        let grade = grade_transcript(&t, &contract_prices());
+        assert_eq!(grade.peak_context_tokens, u64::MAX);
+        assert_eq!(
+            grade.context_tier, "over750k",
+            "saturated, not wrapped to a small number"
+        );
     }
 
     /// An empty transcript grades to zeroes rather than panicking.
@@ -1503,34 +1661,60 @@ mod fixture_gate {
         );
     }
 
-    /// Collect every leaf path, including `false`- and `null`-valued ones.
+    /// A path found in a record, and whether it named a value or an empty
+    /// container.
     ///
-    /// A `paths(scalars)`-style filter cannot see those — the select drops
-    /// them — and `isSidechain: false` sits on most records here. A gate blind
-    /// to a third of its input is not a gate.
-    fn leaves(value: &Value, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    /// The two obey different rules, which is why they stay apart. A **leaf**
+    /// must be one of the fifteen allowed paths exactly. An **empty
+    /// container** need only be a *proper prefix* of one: the committed
+    /// fixture carries `"message":{}` on a user record with no content, so
+    /// requiring it to be an allowed path outright would fail the very file
+    /// this gate exists to bless — while ignoring empty containers entirely
+    /// lets `{"message":{"secretBag":{}}}` ride through invisibly, since it
+    /// has no leaf under it at all. Neither single rule covers both.
+    enum Found {
+        Leaf(Vec<String>),
+        EmptyContainer(Vec<String>),
+    }
+
+    /// Collect every path: `false`- and `null`-valued leaves included, and
+    /// empty containers as their own kind.
+    ///
+    /// A `paths(scalars)`-style filter cannot see a `false` or `null` — the
+    /// select drops it — and `isSidechain: false` sits on most records here. A
+    /// gate blind to a third of its input is not a gate.
+    fn walk(value: &Value, prefix: &mut Vec<String>, out: &mut Vec<Found>) {
         match value {
+            Value::Object(map) if map.is_empty() => {
+                out.push(Found::EmptyContainer(prefix.clone()));
+            }
+            Value::Array(items) if items.is_empty() => {
+                out.push(Found::EmptyContainer(prefix.clone()));
+            }
             Value::Object(map) => {
                 for (k, v) in map {
                     prefix.push(k.clone());
-                    leaves(v, prefix, out);
+                    walk(v, prefix, out);
                     prefix.pop();
                 }
             }
             Value::Array(items) => {
-                // An array under an allowlisted key is still a container the
-                // path check must see; index it so the leaf carries a path.
                 for (i, v) in items.iter().enumerate() {
                     prefix.push(format!("[{i}]"));
-                    leaves(v, prefix, out);
+                    walk(v, prefix, out);
                     prefix.pop();
                 }
-                if items.is_empty() {
-                    out.push(prefix.clone());
-                }
             }
-            _ => out.push(prefix.clone()),
+            _ => out.push(Found::Leaf(prefix.clone())),
         }
+    }
+
+    /// Is `path` a *proper* prefix of some allowed path — a legitimate
+    /// intermediate container rather than a key of its own?
+    fn is_container_prefix(path: &[String], allowed: &[Vec<String>]) -> bool {
+        allowed
+            .iter()
+            .any(|a| a.len() > path.len() && a.starts_with(path))
     }
 
     #[test]
@@ -1550,14 +1734,23 @@ mod fixture_gate {
             );
 
             let mut found = Vec::new();
-            leaves(&record, &mut Vec::new(), &mut found);
-            for path in found {
-                assert!(
-                    allowed.contains(&path),
-                    "line {}: path {:?} is not one of the fifteen the contract permits",
-                    n + 1,
-                    path
-                );
+            walk(&record, &mut Vec::new(), &mut found);
+            for item in found {
+                match item {
+                    Found::Leaf(path) => assert!(
+                        allowed.contains(&path),
+                        "line {}: leaf {path:?} is not one of the fifteen paths \
+                         the contract permits",
+                        n + 1
+                    ),
+                    Found::EmptyContainer(path) => assert!(
+                        is_container_prefix(&path, &allowed),
+                        "line {}: empty container {path:?} prefixes no permitted \
+                         path — an unlisted key with nothing under it is still \
+                         an unlisted key",
+                        n + 1
+                    ),
+                }
             }
         }
     }
@@ -1570,35 +1763,57 @@ mod fixture_gate {
             .map(|p| p.iter().map(|s| (*s).to_string()).collect())
             .collect();
 
+        let scan = |json: &str| {
+            let v: Value = serde_json::from_str(json).expect("parses");
+            let mut found = Vec::new();
+            walk(&v, &mut Vec::new(), &mut found);
+            found
+        };
+        let passes = |f: &Found| match f {
+            Found::Leaf(p) => allowed.contains(p),
+            Found::EmptyContainer(p) => is_container_prefix(p, &allowed),
+        };
+
         // A dotted key impersonating a nested path: byte-identical to an
         // allowlisted path once joined, and a different path as an array.
-        let smuggled: Value =
-            serde_json::from_str(r#"{"message":{"usage.input_tokens":"leaked prose"}}"#)
-                .expect("parses");
-        let mut found = Vec::new();
-        leaves(&smuggled, &mut Vec::new(), &mut found);
-        assert_eq!(found, vec![vec!["message", "usage.input_tokens"]]);
+        let found = scan(r#"{"message":{"usage.input_tokens":"leaked prose"}}"#);
         assert!(
-            !allowed.contains(&found[0]),
-            "a dotted key must not pass as a nested path"
+            matches!(&found[..], [Found::Leaf(p)] if p == &["message", "usage.input_tokens"]),
+            "a dotted key must read as one segment, not a nested path"
+        );
+        assert!(!passes(&found[0]), "a dotted key must not pass");
+
+        // `false` and `null` leaves must be visible, not silently dropped.
+        let found = scan(r#"{"secretFlag":false,"nested":{"x":null}}"#);
+        assert_eq!(found.len(), 2, "false and null leaves must both be seen");
+        assert!(found.iter().all(|f| !passes(f)), "both must be rejected");
+
+        // An empty container at a key that prefixes nothing must fail — it
+        // has no leaf under it, so a leaf-only scan could not see it at all.
+        let found = scan(r#"{"message":{"usage":{"iterations":[]}}}"#);
+        assert!(
+            matches!(&found[..], [Found::EmptyContainer(p)]
+                if p == &["message", "usage", "iterations"]),
+            "an empty array surfaces as its own container path"
+        );
+        assert!(!passes(&found[0]), "iterations prefixes nothing permitted");
+
+        let found = scan(r#"{"message":{"secretBag":{}}}"#);
+        assert!(
+            !passes(&found[0]),
+            "an empty object at an unlisted key must fail — an unlisted key \
+             with nothing under it is still an unlisted key"
         );
 
-        // A false-valued leaf must be visible, not silently dropped.
-        let falsey: Value =
-            serde_json::from_str(r#"{"secretFlag":false,"nested":{"x":null}}"#).expect("parses");
-        let mut found = Vec::new();
-        leaves(&falsey, &mut Vec::new(), &mut found);
-        assert_eq!(found.len(), 2, "false and null leaves must both be seen");
-        for path in &found {
-            assert!(!allowed.contains(path), "{path:?} must be rejected");
-        }
-
-        // An empty container has no scalar leaf; it must still be seen.
-        let empty: Value =
-            serde_json::from_str(r#"{"message":{"usage":{"iterations":[]}}}"#).expect("parses");
-        let mut found = Vec::new();
-        leaves(&empty, &mut Vec::new(), &mut found);
-        assert_eq!(found, vec![vec!["message", "usage", "iterations"]]);
-        assert!(!allowed.contains(&found[0]));
+        // But an empty container that IS a proper prefix of a permitted path
+        // is legitimate: the committed fixture carries `"message":{}` on a
+        // user record with no content, and rejecting it would fail the very
+        // file this gate exists to bless.
+        let found = scan(r#"{"message":{}}"#);
+        assert!(
+            matches!(&found[..], [Found::EmptyContainer(p)] if p == &["message"]),
+            "an empty object surfaces as a container path"
+        );
+        assert!(passes(&found[0]), "`message` prefixes `message.model`");
     }
 }
