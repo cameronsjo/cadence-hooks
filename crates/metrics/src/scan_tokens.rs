@@ -58,7 +58,13 @@ struct Usage {
     #[serde(default)]
     cache_creation_input_tokens: u64,
     /// Per-TTL breakdown of the scalar above. Absent on older transcripts.
-    #[serde(default)]
+    ///
+    /// Read leniently: an unexpected shape here degrades to `None` rather than
+    /// failing the whole line. A strict field would be a silent data-loss path
+    /// — `scan_tokens` skips an unparseable line entirely, so one unfamiliar
+    /// `cache_creation` shape would drop that message's *scalar* token counts
+    /// too, and dropping the marker message would skip the whole record.
+    #[serde(default, deserialize_with = "lenient_cache_creation")]
     cache_creation: Option<CacheCreation>,
     #[serde(default)]
     cache_read_input_tokens: u64,
@@ -72,10 +78,24 @@ struct Usage {
 /// rate. The 5-minute slice is derived as `cache_create - cache_create_1h`, so
 /// a TTL bucket this struct does not name still lands in the total and simply
 /// bills at the 5-minute rate rather than vanishing.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct CacheCreation {
     #[serde(default)]
     ephemeral_1h_input_tokens: u64,
+}
+
+/// Deserialize `cache_creation` without letting its shape veto the whole line.
+///
+/// Never fails: an unexpected shape yields `None`, so the message's
+/// authoritative `cache_creation_input_tokens` scalar still lands in the
+/// ledger and only the 1-hour split is lost. The strict form would discard the
+/// message's tokens outright — the failure this parser exists to avoid.
+fn lenient_cache_creation<'de, D>(deserializer: D) -> Result<Option<CacheCreation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 /// Sum token usage for assistant messages after `from` (exclusive).
@@ -327,6 +347,47 @@ mod tests {
             "the unnamed 1d bucket must stay in the total"
         );
         assert_eq!(r.tokens.cache_create_1h, 100);
+    }
+
+    #[test]
+    fn unexpected_cache_creation_shape_keeps_the_message_counted() {
+        // A strict field would fail the whole line here, dropping the
+        // authoritative scalar along with the 1h split — silent data loss in a
+        // cost ledger. Only the split may be lost.
+        for shape in [
+            r#""not-an-object""#,
+            "42",
+            "[1,2,3]",
+            r#"{"ephemeral_1h_input_tokens":"seventeen"}"#,
+            r#"{"ephemeral_1h_input_tokens":-5}"#,
+            r#"{"ephemeral_1h_input_tokens":1.5}"#,
+            "null",
+        ] {
+            let transcript = format!(
+                r#"{{"message":{{"id":"m1","role":"assistant","model":"claude-opus-5","usage":{{"input_tokens":9,"cache_creation_input_tokens":1000,"cache_creation":{shape},"output_tokens":2}}}}}}"#
+            );
+            let r = scan_tokens(&transcript, None)
+                .unwrap_or_else(|| panic!("message must survive cache_creation={shape}"));
+            assert_eq!(r.tokens.input, 9, "input survives {shape}");
+            assert_eq!(r.tokens.cache_create, 1000, "scalar survives {shape}");
+            assert_eq!(r.tokens.cache_create_1h, 0, "split degrades on {shape}");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_marker_message_would_skip_the_whole_record() {
+        // The control proving the test above measures something: scan_tokens
+        // drops a line it cannot parse, and dropping the marker returns None —
+        // which is why cache_creation must never be able to fail a line.
+        let transcript = [
+            r#"{"message":{"id":"m1","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            "{ not json at all",
+        ]
+        .join("\n");
+        assert!(
+            scan_tokens(&transcript, Some("nonexistent-marker")).is_none(),
+            "a dropped line takes its message out of the scan entirely"
+        );
     }
 
     #[test]

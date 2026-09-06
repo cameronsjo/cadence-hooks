@@ -30,17 +30,22 @@ pub struct ModelPrice {
 }
 
 impl ModelPrice {
-    /// The 1-hour cache-write rate, falling back to `input * 2.0` — Anthropic's
-    /// published multiplier — when the table omits it.
+    /// The 1-hour cache-write rate, falling back to
+    /// [`CACHE_WRITE_1H_INPUT_MULTIPLIER`] times base input when the table
+    /// omits it.
     ///
     /// The fallback *invents* a rate: it is right for every model priced on the
-    /// standard multiplier and wrong for any model that is not. It exists so an
-    /// override file written against the older four-field schema keeps working
-    /// rather than silently pricing 1-hour writes at zero. The embedded table
-    /// always carries the field explicitly.
+    /// standard multiplier and wrong for any model that is not — and this table
+    /// already contains such a model, since `claude-fable-5-1`'s cache *read*
+    /// is 0.025x rather than the usual 0.1x. It exists so an override file
+    /// written against the older four-field schema keeps working rather than
+    /// silently pricing 1-hour writes at zero, which is the worse of the two
+    /// failures: a guessed rate is wrong by a bounded factor, a zero is wrong
+    /// by the whole amount. The embedded table always states the rate, and
+    /// `every_embedded_model_declares_a_1h_cache_write_rate` keeps it that way.
     pub fn cache_write_1h(&self) -> f64 {
         self.cache_write_1h_per_mtok
-            .unwrap_or(self.input_per_mtok * 2.0)
+            .unwrap_or(self.input_per_mtok * CACHE_WRITE_1H_INPUT_MULTIPLIER)
     }
 }
 
@@ -52,6 +57,11 @@ pub struct Prices {
 
 /// The default table, compiled into the binary.
 const EMBEDDED: &str = include_str!("../prices.json");
+
+/// Anthropic's published multiplier over base input for a 1-hour-TTL cache
+/// write (a 5-minute write is 1.25x). Used only as a fallback for an override
+/// file that omits the rate — the embedded table states every rate outright.
+const CACHE_WRITE_1H_INPUT_MULTIPLIER: f64 = 2.0;
 
 impl Prices {
     /// Parse the embedded default table. Panics only if the embedded JSON is

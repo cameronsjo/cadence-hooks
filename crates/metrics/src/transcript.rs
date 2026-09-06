@@ -7,7 +7,7 @@
 use crate::model_breakdown::{by_model_json, unpriced_models};
 use crate::prices::Prices;
 use crate::scan_tokens::{ScanResult, scan_tokens};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// A successful usage scan.
 ///
@@ -25,6 +25,21 @@ pub struct UsageScan {
 }
 
 impl UsageScan {
+    /// The `tokens` object for a `commits.jsonl` or `sessions.jsonl` record:
+    /// the per-model token fields shared with each `byModel[]` bucket, plus the
+    /// two whole-record counts only a top-level row carries.
+    ///
+    /// Same reason as [`Self::priced_breakdown`] below — the two loggers held
+    /// verbatim copies, and a new token field (`cacheCreate1h`) had to be
+    /// hand-added to each. One home means the next one is one edit.
+    #[must_use]
+    pub fn tokens_json(&self) -> Value {
+        let mut fields = crate::model_breakdown::token_fields(&self.scan.tokens);
+        fields.insert("reasoningOutput".into(), json!(self.reasoning_output));
+        fields.insert("total".into(), json!(self.total_tokens));
+        Value::Object(fields)
+    }
+
     /// The `(byModel, unpricedModels)` pair for a token record.
     ///
     /// Per-model costs, with only the models actually missing a price listed as
