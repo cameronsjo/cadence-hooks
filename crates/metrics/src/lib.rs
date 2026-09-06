@@ -47,6 +47,8 @@ pub mod model_breakdown;
 pub mod prices;
 /// Sum transcript token usage over a range.
 pub mod scan_tokens;
+/// Deterministic session grading: gaps, cold-restart dollars, peak context.
+pub mod session_grade;
 /// Snapshot HEAD before a `git commit`.
 pub mod snapshot;
 /// Versioned Claude transcript usage scanner.
