@@ -14,8 +14,15 @@ pub fn compute_cost(tokens: &Tokens, model: &str, prices: &Prices) -> f64 {
         return 0.0;
     };
 
+    // A 1-hour cache write bills at 2x input, a 5-minute one at 1.25x — a 60%
+    // difference. `saturating_sub` is load-bearing: a malformed record whose
+    // 1h bucket exceeds the scalar must not underflow the u64 into a
+    // multi-quintillion-dollar cost line.
+    let cache_create_5m = tokens.cache_create.saturating_sub(tokens.cache_create_1h);
+
     let raw = tokens.input as f64 * p.input_per_mtok / 1_000_000.0
-        + tokens.cache_create as f64 * p.cache_write_per_mtok / 1_000_000.0
+        + cache_create_5m as f64 * p.cache_write_per_mtok / 1_000_000.0
+        + tokens.cache_create_1h as f64 * p.cache_write_1h() / 1_000_000.0
         + tokens.cache_read as f64 * p.cache_read_per_mtok / 1_000_000.0
         + tokens.output as f64 * p.output_per_mtok / 1_000_000.0;
 
@@ -45,6 +52,7 @@ mod tests {
         Tokens {
             input: 1_000_000,
             cache_create: 0,
+            cache_create_1h: 0,
             cache_read: 0,
             output: 0,
         }
@@ -68,6 +76,7 @@ mod tests {
         let tokens = Tokens {
             input: 1_000_000,
             cache_create: 1_000_000,
+            cache_create_1h: 0,
             cache_read: 1_000_000,
             output: 1_000_000,
         };
@@ -99,6 +108,87 @@ mod tests {
         assert_eq!(cost, 0.0);
     }
 
+    // --- 1-hour cache-write pricing (cadence-ecosystem#522) ---
+
+    #[test]
+    fn one_million_one_hour_cache_writes_bill_at_the_1h_rate() {
+        // opus-5: 1h write is $10/MTok, not the $6.25 5-minute rate. Pricing
+        // every write at 5m understated the corpus by 37.5%.
+        let tokens = Tokens {
+            cache_create: 1_000_000,
+            cache_create_1h: 1_000_000,
+            ..Default::default()
+        };
+        let cost = compute_cost(&tokens, "claude-opus-5", &Prices::embedded());
+        assert_eq!(cost, 10.0);
+    }
+
+    #[test]
+    fn legacy_scalar_only_writes_still_bill_at_the_5m_rate() {
+        // A transcript with no cache_creation sub-bucket must price exactly as
+        // it did before this change.
+        let tokens = Tokens {
+            cache_create: 1_000_000,
+            cache_create_1h: 0,
+            ..Default::default()
+        };
+        let cost = compute_cost(&tokens, "claude-opus-5", &Prices::embedded());
+        assert_eq!(cost, 6.25);
+    }
+
+    #[test]
+    fn mixed_ttl_writes_bill_each_slice_at_its_own_rate() {
+        let tokens = Tokens {
+            cache_create: 1_000_000,
+            cache_create_1h: 400_000,
+            ..Default::default()
+        };
+        // 600k at $6.25/MTok + 400k at $10/MTok = 3.75 + 4.00
+        let cost = compute_cost(&tokens, "claude-opus-5", &Prices::embedded());
+        assert_eq!(cost, 7.75);
+    }
+
+    #[test]
+    fn one_hour_bucket_exceeding_the_scalar_stays_finite() {
+        // A malformed record must not underflow the u64 subtraction into a
+        // multi-quintillion-dollar cost line.
+        let tokens = Tokens {
+            cache_create: 100,
+            cache_create_1h: 1_000_000,
+            ..Default::default()
+        };
+        let cost = compute_cost(&tokens, "claude-opus-5", &Prices::embedded());
+        assert!(cost.is_finite(), "cost must be finite");
+        assert_eq!(cost, 10.0, "1M at the 1h rate; the 5m slice saturates to 0");
+    }
+
+    #[test]
+    fn absent_1h_rate_falls_back_to_twice_input() {
+        use crate::prices::ModelPrice;
+        use std::collections::HashMap;
+
+        // An operator override written against the four-field schema: 1h
+        // writes bill at input * 2.0 rather than silently at zero.
+        let prices = Prices {
+            models: HashMap::from([(
+                "legacy-model".to_string(),
+                ModelPrice {
+                    input_per_mtok: 3.0,
+                    output_per_mtok: 0.0,
+                    cache_write_per_mtok: 3.75,
+                    cache_write_1h_per_mtok: None,
+                    cache_read_per_mtok: 0.0,
+                },
+            )]),
+        };
+        let tokens = Tokens {
+            cache_create: 1_000_000,
+            cache_create_1h: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(compute_cost(&tokens, "legacy-model", &prices), 6.0);
+    }
+
     // --- bucket-aware cost tests ---
 
     /// Two-model buckets: total cost equals sum of per-model costs.
@@ -110,6 +200,7 @@ mod tests {
                 Tokens {
                     input: 1_000_000,
                     cache_create: 0,
+                    cache_create_1h: 0,
                     cache_read: 0,
                     output: 0,
                 },
@@ -119,6 +210,7 @@ mod tests {
                 Tokens {
                     input: 1_000_000,
                     cache_create: 0,
+                    cache_create_1h: 0,
                     cache_read: 0,
                     output: 0,
                 },
@@ -143,6 +235,7 @@ mod tests {
                 Tokens {
                     input: 1_000_000,
                     cache_create: 0,
+                    cache_create_1h: 0,
                     cache_read: 0,
                     output: 0,
                 },
@@ -152,6 +245,7 @@ mod tests {
                 Tokens {
                     input: 1_000_000,
                     cache_create: 0,
+                    cache_create_1h: 0,
                     cache_read: 0,
                     output: 0,
                 },
@@ -181,6 +275,7 @@ mod tests {
             input_per_mtok: 1.5,
             output_per_mtok: 0.0,
             cache_write_per_mtok: 0.0,
+            cache_write_1h_per_mtok: Some(0.0),
             cache_read_per_mtok: 0.0,
         };
         let prices = Prices {
@@ -216,6 +311,7 @@ mod tests {
         let tokens = Tokens {
             input: 500_000,
             cache_create: 100_000,
+            cache_create_1h: 0,
             cache_read: 200_000,
             output: 50_000,
         };

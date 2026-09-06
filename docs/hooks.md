@@ -132,16 +132,23 @@ exit 0. They never block a tool call (see
 | `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` |
 | `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` |
 
-`log-commit` reads its price table from the embedded default, overridable with
-`--prices <path>` (or `CADENCE_METRICS_PRICES`). Set `CADENCE_METRICS_DEBUG=1`
-to add a `_keys` array of raw payload keys to subagent records — useful for
-spotting schema additions across Claude Code releases.
+`log-commit` and `log-session` both read the price table from the embedded
+default, overridable with `--prices <path>` (or `CADENCE_METRICS_PRICES`). Set
+`CADENCE_METRICS_DEBUG=1` to add a `_keys` array of raw payload keys to
+subagent records — useful for spotting schema additions across Claude Code
+releases.
 
 Cost is computed **per model**: when a commit range spans multiple models
 (opus → sonnet handoffs, fast-mode toggles), each model's tokens are priced at
 its own rates and summed. Records carry the breakdown in a `byModel` array
 (`[{model, tokens, costUsd}]`); rows written before this field existed are
 single-model by definition.
+
+Cache writes are priced **per TTL**: a 1-hour write costs 2x base input against
+1.25x for the 5-minute default, so records carry `cacheCreate1h` alongside
+`cacheCreate` and each slice is billed at its own rate. `cacheCreate` stays the
+grand total of all cache writes, so a TTL bucket the scanner does not name is
+still counted — it simply bills at the 5-minute rate.
 
 ## session (cadence-canon)
 

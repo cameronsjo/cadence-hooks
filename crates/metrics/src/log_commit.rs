@@ -178,14 +178,7 @@ fn build_commit_record(
         "branch": branch,
         "repo": repo,
         "model": scan.model,
-        "tokens": {
-            "input": scan.tokens.input,
-            "cacheCreate": scan.tokens.cache_create,
-            "cacheRead": scan.tokens.cache_read,
-            "output": scan.tokens.output,
-            "reasoningOutput": usage.reasoning_output,
-            "total": usage.total_tokens,
-        },
+        "tokens": usage.tokens_json(),
         "byModel": by_model,
         "unpricedModels": unpriced,
         "messagesScanned": scan.messages_scanned,
@@ -239,6 +232,7 @@ mod tests {
             tokens: Tokens {
                 input: 100,
                 cache_create: 50,
+                cache_create_1h: 20,
                 cache_read: 200,
                 output: 30,
             },
@@ -250,6 +244,7 @@ mod tests {
                 Tokens {
                     input: 100,
                     cache_create: 50,
+                    cache_create_1h: 20,
                     cache_read: 200,
                     output: 30,
                 },
@@ -294,6 +289,7 @@ mod tests {
         assert_eq!(record["model"], "claude-opus-4-7");
         assert_eq!(record["tokens"]["input"], 100);
         assert_eq!(record["tokens"]["cacheCreate"], 50);
+        assert_eq!(record["tokens"]["cacheCreate1h"], 20);
         assert_eq!(record["tokens"]["cacheRead"], 200);
         assert_eq!(record["tokens"]["output"], 30);
         assert_eq!(record["costUsd"], 0.001234);
@@ -341,6 +337,7 @@ mod tests {
             tokens: Tokens {
                 input: 300,
                 cache_create: 0,
+                cache_create_1h: 0,
                 cache_read: 0,
                 output: 30,
             },
@@ -353,6 +350,7 @@ mod tests {
                     Tokens {
                         input: 200,
                         cache_create: 0,
+                        cache_create_1h: 0,
                         cache_read: 0,
                         output: 20,
                     },
@@ -362,6 +360,7 @@ mod tests {
                     Tokens {
                         input: 100,
                         cache_create: 0,
+                        cache_create_1h: 0,
                         cache_read: 0,
                         output: 10,
                     },

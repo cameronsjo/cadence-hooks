@@ -8,7 +8,25 @@
 use crate::compute_cost::compute_cost;
 use crate::prices::Prices;
 use crate::scan_tokens::Tokens;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+
+/// The token counts shared by every cost-bearing row shape — the `tokens`
+/// object in `commits.jsonl` and `sessions.jsonl`, and each `byModel[]`
+/// bucket. The loggers add `reasoningOutput` and `total` on top; the bucket
+/// shape is exactly this.
+///
+/// One home so a new token field is one edit rather than three: before this
+/// existed, `cacheCreate1h` had to be hand-added at each site, which is the
+/// drift this module was extracted to prevent.
+pub fn token_fields(tokens: &Tokens) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("input".into(), json!(tokens.input));
+    fields.insert("cacheCreate".into(), json!(tokens.cache_create));
+    fields.insert("cacheCreate1h".into(), json!(tokens.cache_create_1h));
+    fields.insert("cacheRead".into(), json!(tokens.cache_read));
+    fields.insert("output".into(), json!(tokens.output));
+    fields
+}
 
 /// Per-model token + cost breakdown for the `byModel` field. Each bucket is
 /// billed at its own model's rates; buckets whose model is absent from the
@@ -20,12 +38,7 @@ pub fn by_model_json(by_model: &[(String, Tokens)], prices: &Prices) -> Vec<Valu
             let bucket_cost = compute_cost(tokens, model, prices);
             json!({
                 "model": model,
-                "tokens": {
-                    "input": tokens.input,
-                    "cacheCreate": tokens.cache_create,
-                    "cacheRead": tokens.cache_read,
-                    "output": tokens.output,
-                },
+                "tokens": token_fields(tokens),
                 "costUsd": bucket_cost,
             })
         })
@@ -35,6 +48,11 @@ pub fn by_model_json(by_model: &[(String, Tokens)], prices: &Prices) -> Vec<Valu
 /// Per-model usage buckets with no `costUsd`, for a harness whose public API
 /// pricing is not subscription cost. Retained after the Codex adapters were
 /// retired (#1040): it is the shape historical unpriced rows were written in.
+///
+/// Deliberately does **not** call [`token_fields`], and deliberately lacks
+/// `cacheCreate1h`. This shape is frozen at what was actually written, so it
+/// must not track the live one — it has no call sites, so a field added here
+/// could never emit, and adding one would misdescribe rows already on disk.
 pub fn by_model_unpriced_json(by_model: &[(String, Tokens)]) -> Vec<Value> {
     by_model
         .iter()
@@ -77,6 +95,7 @@ mod tests {
             Tokens {
                 input: 100,
                 cache_create: 50,
+                cache_create_1h: 20,
                 cache_read: 200,
                 output: 30,
             },
@@ -91,6 +110,7 @@ mod tests {
         assert_eq!(arr[0]["model"], "claude-opus-4-7");
         assert_eq!(arr[0]["tokens"]["input"], 100);
         assert_eq!(arr[0]["tokens"]["cacheCreate"], 50);
+        assert_eq!(arr[0]["tokens"]["cacheCreate1h"], 20);
         assert_eq!(arr[0]["tokens"]["cacheRead"], 200);
         assert_eq!(arr[0]["tokens"]["output"], 30);
         assert!(arr[0]["costUsd"].as_f64().unwrap() > 0.0);

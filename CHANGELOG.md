@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Cache writes were priced at the 5-minute rate regardless of TTL, understating them by 37.5%; and the three models actually in use cost $0** (cadence-ecosystem#522). Anthropic charges 1.25x base input for a 5-minute cache write and **2x** for a 1-hour one, and every cache write in the sampled corpus lands in the 1-hour bucket — 70 of 70 usage records in a live transcript carried `cache_creation.ephemeral_1h_input_tokens` with the 5-minute slice at zero. Separately `crates/metrics/prices.json` had no row for `claude-opus-5`, `claude-fable-5-1`, or `claude-sonnet-5`, the only Claude model ids appearing across 25 recent transcripts, so those sessions computed to $0 and landed in `unpricedModels`. **Every previously published cost figure moves as a result, including ADR-0022's corpus totals** — this changes the numbers, it does not merely change future ones.
+  - **Rates read, not derived** (`https://platform.claude.com/docs/en/about-claude/pricing.md`, read 2026-09-06). The multipliers over base input are 1.25x for a 5-minute write, 2x for a 1-hour write, and 0.1x for a read — **except `claude-fable-5-1` and `claude-mythos-5-1`, whose cache read is 0.025x**. Deriving fable-5.1's read from the usual 0.1x gives $1.00 against a real $0.25, wrong by 4x while looking right; a regression test pins it against exactly that derivation.
+  - **The authoritative scalar stays authoritative.** `cache_creation_input_tokens` is still summed unconditionally into `cacheCreate`, and the 1-hour sub-bucket is read *alongside* it. The 5-minute slice is derived by saturating subtraction, so a TTL bucket the parser does not name (a future `ephemeral_1d`) bills at the 5-minute rate rather than dropping out of the ledger and the cost — and a malformed record whose 1-hour bucket exceeds the total cannot underflow into an absurd cost line.
+  - **`cacheCreate1h` is emitted** beside `cacheCreate` in the `commits`, `sessions`, and `byModel` row shapes. Additive, so `TOKEN_RECORD_SCHEMA_VERSION` stays at `2` and no existing emitted value changes meaning.
+  - **`cacheWrite1hPerMTok` is optional in the price schema.** `Prices::load` fails open to the embedded table on any parse error, so a required field would have silently discarded an operator override written against the older four-field schema. Absent, the rate falls back to `input * 2.0`; the embedded table always states it.
+  - **Inert until a release.** `prices.json` is `include_str!`'d into the binary, so the understatement persists in the installed `0.94.0` until a version bump ships and `brew upgrade` lands it.
+
 ## [0.94.0] - 2026-09-05
 
 ### Fixed
