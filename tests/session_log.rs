@@ -284,3 +284,70 @@ fn unwritable_metrics_dir_fails_open() {
     let output = run_with_stdin(cmd, &payload);
     assert_eq!(output.status.code(), Some(0), "fail-open: still exits 0");
 }
+
+// ── The grading key (cadence-ecosystem#524) ──────────────────────────────
+
+/// A transcript with two real gaps: one under the cache TTL and one over it.
+///
+/// The timestamps are what make this a grading fixture rather than a token
+/// one — `write_transcript` above carries none, so it grades to all zeroes and
+/// could not tell a working grader from a stubbed one.
+fn write_timestamped_transcript(path: &std::path::Path) {
+    let transcript = [
+        r#"{"type":"user","timestamp":"2020-01-01T00:00:00Z","message":{"role":"user","content":"hi"}}"#,
+        // 46 minutes: a gap, but under the 1h TTL, so a measured zero.
+        r#"{"type":"assistant","timestamp":"2020-01-01T00:46:00Z","message":{"id":"m1","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":1000,"cache_creation_input_tokens":500000,"cache_read_input_tokens":0,"output_tokens":100}}}"#,
+        // 2 hours: over the TTL, restarting on a priced model.
+        r#"{"type":"assistant","timestamp":"2020-01-01T02:46:00Z","message":{"id":"m2","role":"assistant","model":"claude-opus-5","usage":{"input_tokens":2000,"cache_creation_input_tokens":1000000,"cache_read_input_tokens":0,"output_tokens":200}}}"#,
+    ]
+    .join("\n");
+    std::fs::write(path, transcript).expect("write transcript");
+}
+
+#[test]
+fn session_end_row_carries_a_grading() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transcript = dir.path().join("transcript.jsonl");
+    write_timestamped_transcript(&transcript);
+
+    let mut cmd = cadence_hooks();
+    cmd.env("CADENCE_METRICS_DIR", dir.path());
+    cmd.args(["metrics", "log-session"]);
+    let payload = session_payload("sess-grade", "SessionEnd", &transcript, Some("clear"));
+    let output = run_with_stdin(cmd, &payload);
+    assert_eq!(output.status.code(), Some(0), "loggers always exit 0");
+
+    let contents = std::fs::read_to_string(dir.path().join("sessions.jsonl"))
+        .expect("sessions.jsonl must exist after SessionEnd");
+    let row: serde_json::Value =
+        serde_json::from_str(contents.lines().next().expect("one row")).expect("row parses");
+
+    // Additive — the version does not move for a new key.
+    assert_eq!(row["schemaVersion"], 2, "additive fields do not bump");
+
+    let g = &row["grading"];
+    assert!(
+        g.is_object(),
+        "grading is always an object, never null: {row}"
+    );
+    assert_eq!(g["wallClockMs"], 9_960_000, "00:00:00 -> 02:46:00");
+    assert_eq!(g["gaps"].as_array().expect("gaps array").len(), 2);
+    assert_eq!(
+        g["gaps"][0]["coldRestartUsd"], 0.0,
+        "46 minutes is under the TTL — a measured zero, not a null"
+    );
+    // 1,000,000 tokens x (10.00 - 0.50) / 1e6 = 9.50, at the embedded rates.
+    assert_eq!(g["gaps"][1]["coldRestartUsd"], 9.5);
+    assert_eq!(g["coldRestartUsdTotal"], 9.5);
+    assert_eq!(g["assistantTurns"], 2);
+    assert_eq!(g["userPrompts"], 1);
+    assert_eq!(g["flags"]["afkGap"], true);
+    assert_eq!(g["flags"]["coldRestart"], true);
+    assert_eq!(g["config"]["grindTurnsPerPrompt"], 30.0);
+
+    // The invariant that outranks every field above.
+    assert!(
+        !contents.contains("\"hi\""),
+        "no prompt text may reach a metrics record: {contents}"
+    );
+}

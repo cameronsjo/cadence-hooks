@@ -1,0 +1,14 @@
+# The session-grading fixtures are digest-pinned artifacts, not source text.
+#
+# `include_str!` reads them from the WORKING TREE at build time, so any
+# checkout-time line-ending conversion changes the bytes the digest sees. A
+# Windows runner with the default `core.autocrlf=true` rewrote all 27 lines of
+# `contract-cases.jsonl` to CRLF, and the byte-identity assertion — whose whole
+# job is proving this file is the copy that was reviewed and leak-gated in
+# `cameronsjo/cadence-ecosystem` — failed with a message blaming drift.
+#
+# `-text` disables every conversion in both directions, so the working-tree
+# bytes equal the blob bytes on every platform. Deliberately scoped to these
+# two files rather than set repo-wide: a blanket policy would rewrite every
+# source file on a Windows checkout to no purpose.
+crates/metrics/testdata/grading/* -text
