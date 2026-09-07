@@ -32,8 +32,8 @@
 //! push through unscanned.
 
 use crate::shell::{
-    COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, child_scripts, command_word, executable_tokens,
-    git_output_detailed, is_assignment_word, is_redirect_token, names_transparent_prefix,
+    COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts, command_word,
+    executable_tokens, git_output_detailed, is_assignment_word, is_redirect_token,
     peel_command_runners, resolve_cd_target, split_segments_with_ops, strip_group_wrappers,
     unescape_word,
 };
@@ -232,7 +232,7 @@ fn collect_push_invocations(
                 invocation.unresolved |= implicit_push_config_unresolvable(&invocation.work_dir);
             }
             out.push(invocation);
-        } else if hides_a_push_behind_a_prefix(argv, &tokens) {
+        } else if hides_a_push_behind_a_prefix(argv, &tokens, &effective_dir) {
             out.push(PushInvocation {
                 work_dir: effective_dir.clone(),
                 refspecs: Vec::new(),
@@ -265,27 +265,66 @@ fn collect_push_invocations(
 ///
 /// `builtin -p git push` is over-refused — it fails in all three shells, so
 /// nothing is published — and that is the safe side of this trade.
-fn hides_a_push_behind_a_prefix(argv: &[String], tokens: &[String]) -> bool {
+fn hides_a_push_behind_a_prefix(argv: &[String], tokens: &[String], effective_dir: &str) -> bool {
     let leads_with_a_prefix = argv.first().is_some_and(|first| {
+        // **`command_word`, not `names_transparent_prefix` — the membership test
+        // has to BASENAME here.** Every sibling asking this question already
+        // does: `guard_rm`'s fallback and `peel_command_runners`' runner test
+        // both go through `command_word`. The shared primitive unescapes and
+        // folds and stops there, so `/usr/bin/nohup -- git push origin main` and
+        // `/usr/bin/time -p git push` — real binaries, ordinary spellings,
+        // running under bash, zsh and sh (measured) — answered false and the
+        // segment vanished. `env` and `nice` were saved only because they are
+        // also `COMMAND_RUNNERS`, whose peel basenames.
+        //
+        // Fixed locally rather than in `names_transparent_prefix`: widening the
+        // primitive reaches `skip_transparent_prefixes` and `enforce_worktree`'s
+        // env walk, the whole-guard blast radius this branch has deferred twice.
+        // The gap is recorded in the plan's documented-miss paragraph and filed
+        // (cadence-hooks#237 security review, F22).
         let word = command_word(first);
         // `eval` joins the prefix set for the same reason `guard_rm` admits it:
         // it is in neither `TRANSPARENT` nor `COMMAND_RUNNERS`, so nothing else
         // in this walk will ever get past it.
-        names_transparent_prefix(first) || word == "eval"
+        TRANSPARENT.contains(&word.as_ref()) || word == "eval"
     });
-    leads_with_a_prefix && names_a_push(tokens)
+    leads_with_a_prefix && names_a_push(tokens, effective_dir)
 }
 
-/// Does this token stream name `git` followed by `push`, at any position?
+/// Does this token stream run `git push`, at any position?
 ///
-/// Deliberately coarse — it runs only after the structured read has already
-/// declined the segment, so its job is to decide between *refuse* and *say
-/// nothing*, never to describe the push. Both words are read the way the shell
-/// hands them over, since `\git pu\sh` really does push.
-fn names_a_push(tokens: &[String]) -> bool {
-    tokens
-        .windows(2)
-        .any(|pair| command_word(&pair[0]) == "git" && unescape_word(&pair[1]).as_ref() == "push")
+/// Runs only after the structured read has already declined the segment, so its
+/// job is to decide between *refuse* and *say nothing*, never to describe the
+/// push.
+///
+/// **It reads the globals rather than scanning adjacent pairs.** A `windows(2)`
+/// scan required `git` and `push` to touch, and git accepts globals before its
+/// subcommand — so `command -p git -C /other push origin main` slipped straight
+/// back into the silent allow this fallback exists to close, and `-C /other`
+/// does not merely hide that push, it sends it to another repository. Reusing
+/// [`git_globals`] — the walk [`push_invocation_of`] already trusts — inherits
+/// `VALUE_GLOBALS` for free, so the list cannot drift into a second spelling,
+/// and it costs nothing in coarseness: the verb is still basenamed and the
+/// subcommand still unescaped, so `\git pu\sh` still matches.
+///
+/// It does **not** stop the fallback firing on the phrase in argument position.
+/// `command -p grep git push file` still refuses, because `git push` really is
+/// adjacent there and reading those two words as a push is correct in
+/// isolation. Telling them apart needs to know that `grep`, not `git`, is what
+/// the prefix runs — the per-prefix flag grammar this fallback exists precisely
+/// to avoid parsing. It is an over-refusal on a contrived command, pinned by a
+/// test so it cannot drift unnoticed (cadence-hooks#237 security review, F23;
+/// N26 stays open).
+fn names_a_push(tokens: &[String], effective_dir: &str) -> bool {
+    tokens.iter().enumerate().any(|(index, word)| {
+        command_word(word) == "git"
+            && tokens.get(index + 1..).is_some_and(|after_verb| {
+                git_globals(after_verb, effective_dir)
+                    .rest
+                    .first()
+                    .is_some_and(|subcommand| unescape_word(subcommand).as_ref() == "push")
+            })
+    })
 }
 
 /// Env-variable assignments that redirect a push somewhere this walk cannot
@@ -921,7 +960,22 @@ fn push_invocation_of(argv: &[String], effective_dir: &str) -> Option<PushInvoca
         return None;
     }
 
-    let scan = scan_push_words(words);
+    // **Redirections are not operands, and reading them as refspecs was this
+    // module's first FALSE-REFUSAL class.** `strip_redirections` already existed
+    // and was called at exactly one site, the directory-verb operand read, while
+    // `scan_push_words` was handed the words with the redirect tokens still in
+    // them. So `git push origin main > /dev/null` collected `main`, `>` and
+    // `/dev/null` as refspecs; `is_safe_ref` rejects `>`, the range comes back
+    // `Unresolved`, and a caller refuses a push that is entirely routine — the
+    // spelling scripts use. `git push > log origin main` was worse: `>` was read
+    // as the REPOSITORY, so `log` and `origin` both became refspecs.
+    //
+    // The direction was safe (every phantom is an extra scan or a refusal, never
+    // a lost refspec — a redirect only shifts positionals right), but this
+    // module's own doctrine puts a false block on the expensive side
+    // (cadence-hooks#237 security review, F24).
+    let operands: Vec<String> = strip_redirections(words).into_iter().cloned().collect();
+    let scan = scan_push_words(&operands);
     let mut refspecs: Vec<Refspec> = scan
         .refspecs
         .iter()
@@ -1788,6 +1842,104 @@ mod tests {
         // cannot invent an invocation out of any transparent prefix at all.
         assert!(push_invocations("command -p git status", "/repo").is_empty());
         assert!(push_invocations("exec -a name ls", "/repo").is_empty());
+    }
+
+    #[test]
+    fn a_path_spelled_transparent_prefix_still_refuses() {
+        // The fallback asked `names_transparent_prefix`, which unescapes and
+        // folds but does NOT basename — while every sibling asking the same
+        // question basenames (`guard_rm` and `peel_command_runners` both go
+        // through `command_word`). `nohup` and `time` are real binaries in
+        // /usr/bin, so this is not a theoretical spelling: each row below runs
+        // under bash, zsh and sh (measured) and yielded nothing at all.
+        for command in [
+            "/usr/bin/nohup -- git push origin main",
+            "/usr/bin/time -p git push origin main",
+            "/usr/bin/nohup git push origin main",
+            "/usr/bin/time git push origin main",
+            "./nohup -- git push origin main",
+            "command.exe -p git push origin main",
+        ] {
+            assert!(
+                only(command, "/repo").unresolved,
+                "{command:?} must refuse, not vanish"
+            );
+        }
+        // Controls: `env`/`nice` already survived a path because they are also
+        // command runners, whose peel basenames. They must keep resolving fully.
+        for command in [
+            "/usr/bin/env -i git push origin main",
+            "/usr/bin/nice -n 5 git push origin main",
+        ] {
+            assert_eq!(sources(command, "/repo"), ["main"], "{command:?}");
+        }
+        // Control: the bare spelling, unchanged.
+        assert!(only("nohup -- git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_git_global_between_the_verb_and_push_still_refuses() {
+        // The fallback was an ADJACENT-pair scan, so any global between `git`
+        // and `push` restored the silent allow — and `-C /other` does not merely
+        // hide the push, it redirects it to another repository. Every row is an
+        // ordinary spelling with no escape anywhere.
+        for command in [
+            "command -p git -C /other push origin main",
+            "exec -a x git -C /other push origin main",
+            "time -p git -C /other push origin main",
+            "nohup -- git -c a=b push origin main",
+            "command -p git --git-dir=/x push origin main",
+            "command -p git -c foo=bar push origin main",
+            "eval git -C /other push origin main",
+        ] {
+            assert!(
+                only(command, "/repo").unresolved,
+                "{command:?} must refuse, not vanish"
+            );
+        }
+        // Controls: the shapes that already worked must keep working.
+        for command in [
+            "command -p git push origin main",
+            "command -p git pu\\sh origin main",
+            "command -p \\git push origin main",
+            "command -p /usr/bin/git push origin main",
+        ] {
+            assert!(only(command, "/repo").unresolved, "{command:?}");
+        }
+        // N26 is NOT closed by this fix, and the round's premise that it would be
+        // does not hold. `command -p grep git push file` still refuses, because
+        // `git push` really is adjacent in argument position: the structured read
+        // finds `git` at index 3 and `git_globals` hands back `push` as its
+        // subcommand, which is the correct reading of those two words in
+        // isolation. Distinguishing them would require knowing that `grep` — not
+        // `git` — is what the prefix runs, and that is exactly the per-prefix
+        // flag grammar F16 declined to parse. Kept as a pinned over-refusal
+        // rather than silently drifting.
+        assert!(only("command -p grep git push file", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_redirection_is_not_a_refspec() {
+        // `strip_redirections` existed and was called at exactly one site — the
+        // directory-verb operand read — while `scan_push_words` was handed the
+        // words with the redirect tokens still in them. The first FALSE-REFUSAL
+        // class this module has carried, on the most ordinary spelling there is:
+        // `>` reaches `is_safe_ref`, which rejects it, and the range comes back
+        // Unresolved for a push that is entirely routine.
+        for command in [
+            "git push origin main > /dev/null",
+            "git push origin main >/dev/null",
+            "git push origin main 2>&1",
+            "git push origin main >log 2>&1",
+            "git push origin main > out.txt",
+            "git push origin main 2>/dev/null | tee log",
+        ] {
+            assert_eq!(sources(command, "/repo"), ["main"], "{command:?}");
+        }
+        // A redirect BEFORE the operands must not be read as the repository.
+        assert_eq!(sources("git push > log origin main", "/repo"), ["main"]);
+        // Control.
+        assert_eq!(sources("git push origin main", "/repo"), ["main"]);
     }
 
     #[test]

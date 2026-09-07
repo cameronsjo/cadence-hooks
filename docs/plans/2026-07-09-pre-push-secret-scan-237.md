@@ -117,13 +117,26 @@ consolidation, not churn, and directionally aligned with #268.
    and reported against the session's own checkout with `unresolved: false`), and round 11
    closed it by making an `eval` in command position refuse the directory. Closing the wrong
    answer does not close the miss, and #886 stays open for the miss.
-   Still open after round 11, and none of them a wrong answer — each fails toward seeing less,
-   which a caller reads as a refusal only where an invocation is emitted at all: `sudo -u me rm …`
-   reaches no delete verb in `guard_rm` (inherited, unrelated to this branch — `-u`'s value
-   ends the runner peel; reported for its own issue, not fixed here); the heredoc, dashed
-   `git-push`, alias and `MAX_WRAPPER_DEPTH` rows above; and any prefix outside both
-   `TRANSPARENT` and `COMMAND_RUNNERS` other than `eval`, which the round-11 fallback does not
-   cover.
+   **The `eval` refusal is scope-wide, and that is deliberate**: `eval "$(ssh-agent -s)"` at the
+   top of a script — the form actually met in the wild, far more than `eval echo hi` — makes
+   every later push in that script report `unresolved`, so a caller refuses them. The trade was
+   taken knowingly; a refusal a reader can explain beats a stale directory reported as fact.
+   **Still open after round 12** — measured rows, not a description. None is a wrong answer;
+   each fails toward seeing less, which a caller reads as a refusal only where an invocation is
+   emitted at all. `/usr/bin/nohup -- git push origin main` and every other path-spelled
+   `TRANSPARENT` prefix reach `skip_transparent_prefixes` and `enforce_worktree`'s env walk
+   unbasenamed — round 12 fixed the push fallback locally, but the shared
+   `shell::names_transparent_prefix` still does not basename, which also leaves
+   `guard_sops_decrypt` allowing `/usr/bin/nohup -- sops -d secrets.yaml`; that primitive is
+   filed separately. `env -S "git push origin main"` is unseen (`env` **is** a `COMMAND_RUNNERS`
+   member, so the earlier "outside both tables" wording never reached it; runs under bash, zsh
+   and sh). `find . -exec git push \;` is unseen — `find` is not a prefix at all, and `guard_rm`
+   has a dedicated `find` branch for exactly this shape that the push walk has no equivalent of.
+   `coproc git push origin main` is unseen, bash-only. `command -p grep git push file`
+   **over-refuses** and is the one row in the other direction. Plus the heredoc, dashed
+   `git-push`, alias and `MAX_WRAPPER_DEPTH` rows above, and `sudo rm -rf …` reaching no delete
+   verb in `guard_rm` in every spelling including bare `sudo` — inherited, filed as its own
+   issue, not this branch's to fix.
 
 2. **Range — from the refspec, not HEAD, correct ordering.** For each pushed source ref,
    outbound set = **`git rev-list <src-ref> --not --remotes`** — positive ref **before**
@@ -219,12 +232,15 @@ correction.
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
   error-distinguishing `shell::git_output_detailed`, with 77 core unit tests
   (75 in `push.rs`, 2 pinning `shell::unescape_word` directly).
-  Built on `feat/237-pre-push-secret-scan`, hardened over eleven adversarial
+  Built on `feat/237-pre-push-secret-scan`, hardened over twelve adversarial
   review rounds. Round 11 closed the escape-walk gaps in `skip_runner_flags`,
   `shell_c_argument_tokens`, `export`'s operands and `cd -`; added a refusal
   for a segment the peel cannot get past (`command -p git push`, which needs no
   escape at all); made `eval` refuse the directory; and moved
   `enforce_worktree`'s drifted prefix predicate onto core's single definition.
+  Round 12 hardened that new fallback — it now basenames the prefix and reads
+  git's globals instead of scanning adjacent word pairs — and fixed the branch's
+  first false refusal, where a shell redirection was collected as a refspec.
   The open rows are listed in the documented-misses paragraph above — read that,
   not this line, for what is still unseen.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
