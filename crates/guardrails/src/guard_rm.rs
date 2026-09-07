@@ -99,37 +99,30 @@ use std::path::Path;
 /// path class), so a shared const would couple them without real reuse.
 const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 
-/// The command word `token` names, stripped to what the shell will actually
-/// run: `basename` so `/bin/rm` matches, a leading `\` removed so the
-/// alias-bypass form `\rm` is still seen as `rm`, and ASCII case folded so `RM`
-/// is too.
+/// `token` names one of the [`DELETE_VERBS`], read through the shared
+/// [`cadence_hooks_core::shell::command_word`]: `basename` so `/bin/rm`
+/// matches, the shell's own quote removal so `\rm` and `r\m` are seen as `rm`,
+/// and ASCII case folding so `RM` is too.
 ///
-/// The fold is cadence-hooks#488, and it tracks the shared
-/// [`cadence_hooks_core::shell::command_word`] deliberately — the same reason
-/// for the same measured hole. On a case-insensitive volume the shell resolves
-/// `RM` to the `rm` binary and deletes; this guard collected no target and
-/// returned a silent Allow. Every consumer of this function is a DETECTOR — the
-/// delete-verb set, the `find` arm, the shell-wrapper arm, and the
-/// transparent-prefix `Unresolvable` gate — so folding can only ADD an ask or a
-/// block, never subtract one. The old mitigation note (a settings
-/// `allow Bash(rm:*)` rule keys on the leading word, so the guard defers rather
-/// than auto-approving) applied to the *lowercase* spelling only; it never
-/// covered `RM`, which is why the miss was real rather than merely theoretical.
+/// **This used to run a LOCAL `command_word` that trimmed only leading
+/// backslashes, and the divergence was a live miss** (cadence-hooks#237 security
+/// review, F8). `r\m -rf <path>` really runs `rm` — measured under bash, zsh and
+/// sh — but resolved to `r\m` and passed the guard untouched. Converging also
+/// *drops* one block: the local trim repeated, so it called `\\rm` a deletion,
+/// where the shell removes one backslash and finds no command named `\rm`. That
+/// was a false block on a command nobody runs, and losing it is the correct
+/// direction. Two guard tests pin both halves.
 ///
-/// `token` names one of the [`DELETE_VERBS`].
-///
-/// **This used to run a local `command_word` that trimmed leading backslashes
-/// repeatedly, and the divergence was a live miss** (cadence-hooks#237 security
-/// review, F8). The local copy handled only a LEADING backslash, so `r\m -rf
-/// <path>` — which really runs `rm`, measured under bash, zsh and sh — resolved
-/// to `r\m` and passed the guard untouched. The shared
-/// [`cadence_hooks_core::shell::command_word`] now applies the shell's own quote
-/// removal to the whole word and catches it.
-///
-/// Converging also *drops* one block: the local repeating trim called `\\rm` a
-/// deletion, where the shell removes one backslash and then finds no command
-/// named `\rm`. That was a false block on a command nobody runs, and losing it
-/// is the correct direction. Two guard tests pin both halves.
+/// The case fold is cadence-hooks#488, the same measured hole for the same
+/// reason: on a case-insensitive volume the shell resolves `RM` to the `rm`
+/// binary and deletes, while this guard collected no target and returned a
+/// silent Allow. Every consumer here is a DETECTOR — the delete-verb set, the
+/// `find` arm, the shell-wrapper arm, and the transparent-prefix `Unresolvable`
+/// gate — so normalizing can only ADD an ask or a block, never subtract one. The
+/// old mitigation note (a settings `allow Bash(rm:*)` rule keys on the leading
+/// word, so the guard defers rather than auto-approving) applied to the
+/// *lowercase* spelling only; it never covered `RM`, which is why that miss was
+/// real rather than merely theoretical.
 fn is_delete_verb(token: &str) -> bool {
     DELETE_VERBS.contains(&command_word(token).as_ref())
 }

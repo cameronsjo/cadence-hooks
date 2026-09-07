@@ -289,14 +289,16 @@ pub fn basename(token: &str) -> &str {
 /// (cadence-hooks#488). Borrows unless the fold changes something, so the
 /// common already-lowercase verb costs no allocation.
 ///
-/// **The one place the verb fold is spelled**, shared by
-/// [`command_word`] and by the two guards that keep a deliberately divergent
-/// local command word (`guard_rm`, which repeats the backslash strip;
-/// `warn_going_public`, which is basename-only). Those divergences are about
-/// the *path/escape* handling and are documented where they live — the fold is
-/// not one of them, and three hand-rolled copies of it would be four
-/// normalizations of "which verb is this?" all over again, which is exactly
-/// what #450 consolidated away.
+/// **The one place the verb fold is spelled**, shared by [`command_word`] and
+/// by the one guard that still keeps a deliberately divergent local command
+/// word (`warn_going_public`, which is basename-only). `guard_rm` used to be
+/// the second, repeating the backslash strip; its shadow was a measured miss
+/// (`r\m` passed the guard) and is gone — it uses [`command_word`] now
+/// (cadence-hooks#237 security review, F8). That divergence is about the
+/// *path/escape* handling and is documented where it lives — the fold is not
+/// one of them, and hand-rolled copies of it would be more normalizations of
+/// "which verb is this?" all over again, which is exactly what #450
+/// consolidated away.
 ///
 /// ASCII, never [`str::to_lowercase`]: every verb a guard gates on is ASCII,
 /// while Unicode folding maps the dotted-I family and assorted homoglyphs onto

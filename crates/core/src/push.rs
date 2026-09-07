@@ -399,14 +399,26 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
 
     let mut start = 0;
     let mut command_prefixed = false;
+    // **The peel reads the UNESCAPED word, and separately remembers that an
+    // escape was there.** Comparing the raw token instead made a whole segment
+    // invisible: `\builtin cd /other` broke the loop on `\builtin`, that word
+    // became the candidate, it unescaped to `builtin` — not a directory verb —
+    // and this returned `None`, which means "not a directory verb at all". The
+    // caller then kept a STALE directory with `unresolved: false`, which is
+    // strictly worse than the over-refusal below. Every row measured moves the
+    // shell (cadence-hooks#237 security review, F9).
+    let mut prefix_escaped = false;
     while start < tokens.len() {
-        let word = tokens[start].as_str();
-        if is_assignment_word(word) {
+        let raw = tokens[start].as_str();
+        let word = unescape_word(raw);
+        if is_assignment_word(word.as_ref()) {
+            prefix_escaped |= raw.contains('\\');
             start += 1;
             continue;
         }
-        if matches!(word, "command" | "builtin") {
-            command_prefixed |= word == "command";
+        if matches!(word.as_ref(), "command" | "builtin") {
+            command_prefixed |= word.as_ref() == "command";
+            prefix_escaped |= raw.contains('\\');
             start += 1;
             // The prefix's own flags (`-p`, `-v`, `-V`) sit before the verb.
             while start < tokens.len() && tokens[start].starts_with('-') && tokens[start] != "-" {
@@ -429,7 +441,9 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
     if !names_directory_verb(candidate) {
         return None;
     }
-    Some(if command_prefixed {
+    // `Knowable` only when the WHOLE chain is backslash-free: an escape in the
+    // prefix carries the same quoting ambiguity as one in the verb.
+    Some(if command_prefixed || prefix_escaped {
         DirectoryVerb::Unknowable
     } else {
         DirectoryVerb::Knowable(rest)
@@ -484,7 +498,7 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
 /// `$` is tested anywhere in the token, not just at the front — `cd "$HOME/x"`
 /// and `cd /a/$B` are equally unknowable.
 ///
-/// `tokens` begins at the verb ([`directory_verb_tokens`] did the peel).
+/// `tokens` begins at the verb ([`directory_verb`] did the peel).
 fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<String> {
     let verb = tokens.first()?.as_str();
     if verb == "popd" {
@@ -1329,6 +1343,30 @@ mod tests {
             "c\\d /other && git push origin main",
             "\\cd /other && git push origin main",
             "cd\\ /other && git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert!(invocation.unresolved, "should refuse: {command}");
+        }
+    }
+
+    #[test]
+    fn a_backslash_bearing_prefix_refuses() {
+        // The escape can sit in the PREFIX rather than the verb, and every one
+        // of these moves the shell (measured under bash, zsh and sh; the
+        // `\command` rows move under bash and sh only). Comparing the raw
+        // prefix token made the whole segment invisible instead: the loop broke
+        // on it, the prefix became the candidate, and `directory_verb` returned
+        // None — so the walk kept a stale directory with `unresolved: false`,
+        // which is worse than the over-refusal it replaced.
+        for command in [
+            "\\builtin cd /other && git push origin main",
+            "buil\\tin cd /other && git push origin main",
+            "b\\uiltin cd /other && git push origin main",
+            "\\command cd /other && git push origin main",
+            "comm\\and cd /other && git push origin main",
+            "\\command -p cd /other && git push origin main",
+            "\\builtin \\cd /other && git push origin main",
+            "\\builtin popd && git push origin main",
         ] {
             let invocation = only(command, "/repo");
             assert!(invocation.unresolved, "should refuse: {command}");

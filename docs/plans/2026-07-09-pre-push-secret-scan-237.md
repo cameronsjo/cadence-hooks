@@ -102,7 +102,12 @@ consolidation, not churn, and directionally aligned with #268.
    `split_segments_with_ops` strips heredoc bodies as data; `eval 'git push origin main'`
    is unseen (tracked as **cameronsjo/cadence-hooks#886**), because `eval` is not in
    `COMMAND_RUNNERS` and its argument is never treated as a child script; and the walk stops
-   at `MAX_WRAPPER_DEPTH` (3) levels of nesting. The `eval` fix belongs in
+   at `MAX_WRAPPER_DEPTH` (3) levels of nesting. Known **false block**, not a miss:
+   `shell::unescape_word` drops a trailing lone backslash as a line continuation, so
+   `rm\ -rf x` — one word `rm -rf x` the shell never runs — resolves to `rm` and reaches
+   the delete guard. Left unfixed here deliberately: the fix is in `core::shell` and its
+   blast radius is every guard, which is the wrong thing to ride in on this branch.
+   The `eval` fix belongs in
    `core::shell::child_scripts`, so every sibling guard gains it at once — closing it in the
    push walk alone would make push detection the only gate that sees through `eval`, and
    that divergence is the shape these misses come from.
