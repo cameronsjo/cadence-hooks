@@ -220,8 +220,7 @@ Composable with Option 2.
 
 ### (c) Recommendation
 
-> **Superseded 2026-08-09 by the Q1 ruling** (see "Rulings on the seven open
-> questions"): no split — the env-prefix form keeps nudging, same as the flag
+> **Superseded 2026-08-09 by the Q1 ruling** (see "Still open" at the end): no split — the env-prefix form keeps nudging, same as the flag
 > form, so Option 2 is declined. What survives of this section for the build:
 > the `merge` over-suppression is its own issue (now cameronsjo/cadence-hooks#881),
 > and Q4 rules the numbered-`ready` case a documented miss. The original
