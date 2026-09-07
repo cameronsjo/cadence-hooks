@@ -33,8 +33,8 @@
 
 use crate::shell::{
     GitOutput, MAX_WRAPPER_DEPTH, child_scripts, command_word, executable_tokens,
-    git_output_detailed, peel_command_runners, resolve_cd_target, split_segments_with_ops,
-    strip_group_wrappers,
+    git_output_detailed, is_assignment_word, peel_command_runners, resolve_cd_target,
+    split_segments_with_ops, strip_group_wrappers,
 };
 
 /// One refspec a `git push` names, with the local side a range resolver needs.
@@ -75,13 +75,36 @@ pub struct PushInvocation {
     /// `--all` or `--mirror` — the push is not confined to the named refspecs,
     /// so a caller must widen its range to every local branch (or refuse).
     pub all_or_mirror: bool,
+    /// `--tags` — every ref under `refs/tags` is pushed. **A caller must treat
+    /// this exactly like [`PushInvocation::all_or_mirror`] for range purposes.**
+    ///
+    /// Deliberately a separate field rather than folded into `all_or_mirror`: a
+    /// caller that reads `all_or_mirror` as "widen to every local branch" still
+    /// misses a tag pointing at a commit no branch reaches, which is the whole
+    /// hazard. Measured — `git push --tags origin` publishes a tagged
+    /// off-branch commit while `rev-list HEAD --not --remotes` is empty, and
+    /// empty is the one shape a caller may read as allow.
+    ///
+    /// `--follow-tags` is NOT this flag: it pushes only tags reachable from the
+    /// commits being pushed, which the refspec range already covers.
+    pub tags: bool,
     /// `--dry-run`/`-n`: git contacts the remote but publishes nothing, so a
     /// content guard may allow. Matched exactly — see the module docs.
     pub dry_run: bool,
     /// This walk saw something it cannot model well enough to scan a COMPLETE
-    /// range: a `--git-dir`/`--work-tree` redirect or the equivalent env
-    /// prefix. A caller must refuse rather than scan a subset — the plan's
-    /// "never silently scan a subset and exit 0".
+    /// range, so a caller must refuse rather than scan a subset — the plan's
+    /// "never silently scan a subset and exit 0". Three causes:
+    ///
+    /// - a `--git-dir`/`--work-tree` flag, or the `GIT_DIR=`/`GIT_WORK_TREE=`
+    ///   env equivalent, redirecting the push at a repository this walk would
+    ///   have to model git's setup rules to name correctly;
+    /// - `push.default=matching`, which publishes every same-named local
+    ///   branch rather than the current one;
+    /// - any configured `remote.<name>.push` refspec, which replaces the
+    ///   `push.default` computation outright.
+    ///
+    /// The last two are read only when the refspecs are implicit — a named
+    /// refspec replaces that computation anyway.
     pub unresolved: bool,
 }
 
@@ -97,27 +120,58 @@ pub struct PushInvocation {
 /// push, and a scanner that only looked at top-level segments would miss it.
 pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
     let mut out = Vec::new();
-    collect_push_invocations(command, cwd, 0, &mut out);
+    collect_push_invocations(command, cwd, 0, false, &mut out);
     out
 }
 
 /// Recursive worker for [`push_invocations`], mirroring
 /// `enforce_worktree::collect_targets`: one `effective_dir` per script scope,
 /// children recursed on the directory in effect where they appear.
-fn collect_push_invocations(script: &str, cwd: &str, depth: usize, out: &mut Vec<PushInvocation>) {
+///
+/// `inherited_redirect` is the env half of that mirror, and it is the reason
+/// this parameter exists rather than a local: a `GIT_DIR=`/`GIT_WORK_TREE=`
+/// prefix on a WRAPPER segment is exported into the shell it spawns, so the
+/// push inside `GIT_WORK_TREE=/x sh -c 'git push origin main'` really does run
+/// redirected. Computing the flag on the wrapper and dropping it at the
+/// recursion boundary handed the caller a resolvable-looking `work_dir` with
+/// `unresolved: false` — the #228/#378 miss `collect_targets` threads
+/// `inherited_env` to close, reopened here until this parameter landed.
+fn collect_push_invocations(
+    script: &str,
+    cwd: &str,
+    depth: usize,
+    inherited_redirect: bool,
+    out: &mut Vec<PushInvocation>,
+) {
     let mut effective_dir = cwd.to_string();
+    // A redirect set by an EARLIER segment of this same scope, which outlives
+    // the segment that set it — unlike a command prefix, which does not.
+    let mut scope_redirect = inherited_redirect;
 
     for (segment, _next_op) in split_segments_with_ops(script) {
         let segment = strip_group_wrappers(&segment);
         let tokens = executable_tokens(segment);
         let argv = peel_command_runners(&tokens);
 
+        // The prefix words `peel_command_runners` removed. A `GIT_DIR=`
+        // assignment lives there, and it redirects the push exactly as the flag
+        // does — checked on the prefix only, so a refspec or message that
+        // happens to contain the text cannot mark an invocation unresolved.
+        let prefix = &tokens[..tokens.len().saturating_sub(argv.len())];
+        let prefix_redirect = prefix.iter().map(String::as_str).any(names_git_redirect);
+
+        if segment_persists_git_redirect(argv, &tokens) {
+            scope_redirect = true;
+        }
+        let segment_redirect = scope_redirect || prefix_redirect;
+
         // Children run with the directory in effect HERE — a substitution is
         // evaluated before its own segment runs — and in their OWN scope, so
-        // their `cd`s die with the subshell.
+        // their `cd`s die with the subshell. The env redirect is the opposite:
+        // it crosses into the child, so it is passed down.
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, segment) {
-                collect_push_invocations(&child, &effective_dir, depth + 1, out);
+                collect_push_invocations(&child, &effective_dir, depth + 1, segment_redirect, out);
             }
         }
 
@@ -126,20 +180,83 @@ fn collect_push_invocations(script: &str, cwd: &str, depth: usize, out: &mut Vec
             continue;
         }
 
-        // The prefix words `peel_command_runners` removed. A `GIT_DIR=`
-        // assignment lives there, and it redirects the push exactly as the flag
-        // does — checked on the prefix only, so a refspec or message that
-        // happens to contain the text cannot mark an invocation unresolved.
-        let prefix = &tokens[..tokens.len().saturating_sub(argv.len())];
-        let env_redirect = prefix
-            .iter()
-            .any(|t| t.starts_with("GIT_DIR=") || t.starts_with("GIT_WORK_TREE="));
-
         if let Some(mut invocation) = push_invocation_of(argv, &effective_dir) {
-            invocation.unresolved |= env_redirect;
+            invocation.unresolved |= segment_redirect;
+            // Only an implicit refspec stands on the `push.default`
+            // computation; a named one replaces it, so the config question does
+            // not arise and no git call is made.
+            if invocation.refspecs.iter().all(|refspec| refspec.implicit) {
+                invocation.unresolved |= implicit_push_config_unresolvable(&invocation.work_dir);
+            }
             out.push(invocation);
         }
     }
+}
+
+/// Is this word a `GIT_DIR=`/`GIT_WORK_TREE=` assignment — the env spelling of
+/// the `--git-dir`/`--work-tree` redirect?
+fn names_git_redirect(word: &str) -> bool {
+    word.starts_with("GIT_DIR=") || word.starts_with("GIT_WORK_TREE=")
+}
+
+/// Does this segment set a git redirect that OUTLIVES it?
+///
+/// Two shapes do, and they are the ones a command prefix is not: an explicit
+/// `export`/`declare`/`typeset`, and an assignment segment with no command word
+/// at all (`GIT_DIR=/x;`). Both leave the variable set for every later segment
+/// in the scope.
+///
+/// A prefix (`GIT_DIR=/x git status`) is deliberately excluded — the shell sets
+/// it for that one command — so it marks its own segment and never leaks
+/// forward.
+///
+/// "No command word" is spelled as *every token is an assignment word*, not as
+/// an empty `argv`: [`crate::shell::skip_transparent_prefixes`] stops before the
+/// LAST token (`start + 1 < len`), so an assignment-only segment still comes
+/// back as a one-token `argv` and an emptiness test never fires — measured, it
+/// silently dropped `GIT_DIR=/x; git push`.
+fn segment_persists_git_redirect(argv: &[String], tokens: &[String]) -> bool {
+    let exported = argv.first().is_some_and(|word| {
+        matches!(
+            command_word(word).as_ref(),
+            "export" | "declare" | "typeset"
+        )
+    }) && argv
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .any(names_git_redirect);
+
+    let assignment_only = !tokens.is_empty() && tokens.iter().all(|t| is_assignment_word(t));
+
+    exported || (assignment_only && tokens.iter().map(String::as_str).any(names_git_redirect))
+}
+
+/// Does this repository's configuration replace the "publish the current
+/// branch" computation the implicit `HEAD` refspec stands for?
+///
+/// Two settings do. `push.default=matching` publishes every local branch with a
+/// same-named remote branch, HEAD or not — measured: on `main` with a divergent
+/// `side`, a bare `git push origin` pushes `side`. Any `remote.<name>.push`
+/// refspec replaces the computation outright.
+///
+/// **git reports "unset" and "unreadable" identically** — both exit non-zero,
+/// so both arrive as [`GitOutput::Failed`] and read here as *not configured*,
+/// which keeps the `HEAD` refspec. That is right for the unset case, which is
+/// the overwhelmingly common one and means the default (`simple`). It is a
+/// resolved-looking answer for the unreadable case, but a directory where git
+/// cannot read config is one where [`outbound_commits`] also fails, and that
+/// fails closed — so the composed posture still refuses.
+fn implicit_push_config_unresolvable(work_dir: &str) -> bool {
+    let push_default_matches_every_branch = matches!(
+        git_output_detailed(work_dir, &["config", "--get", "push.default"]),
+        GitOutput::Ok(value) if value.trim() == "matching"
+    );
+    let remote_push_refspec_configured = matches!(
+        git_output_detailed(work_dir, &["config", "--get-regexp", r"^remote\..*\.push$"]),
+        GitOutput::Ok(value) if !value.trim().is_empty()
+    );
+    push_default_matches_every_branch || remote_push_refspec_configured
 }
 
 /// Apply a `cd` segment to the tracked directory, or leave it alone when the
@@ -285,6 +402,7 @@ fn push_invocation_of(argv: &[String], effective_dir: &str) -> Option<PushInvoca
         work_dir,
         refspecs,
         all_or_mirror: scan.all_or_mirror,
+        tags: scan.tags,
         dry_run: scan.dry_run,
         unresolved: foreign_redirect,
     })
@@ -296,6 +414,7 @@ struct PushWordScan {
     /// repository argument, every later one is a refspec.
     refspecs: Vec<String>,
     all_or_mirror: bool,
+    tags: bool,
     dry_run: bool,
     delete_flag: bool,
 }
@@ -310,6 +429,7 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
     let mut scan = PushWordScan {
         refspecs: Vec::new(),
         all_or_mirror: false,
+        tags: false,
         dry_run: false,
         delete_flag: false,
     };
@@ -337,6 +457,12 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
             // reject costs nothing.
             if abbreviates("all", name) || abbreviates("mirror", name) {
                 scan.all_or_mirror = true;
+            }
+            // `--tags` widens the same way and is tracked separately — see the
+            // field's docs. `--follow-tags` fails this test (`"tags"` does not
+            // start with `"follow-tags"`) and is correctly non-widening.
+            if abbreviates("tags", name) {
+                scan.tags = true;
             }
             // Exact, both of them, and for opposite reasons. `dry-run` licenses
             // an allow, so a loose match is a bypass. `delete` skips a refspec,
@@ -414,6 +540,13 @@ fn parse_refspec(raw: &str, delete_flag: bool) -> Refspec {
 }
 
 /// The commits a push of `source_ref` would put on a remote that lacks them.
+///
+/// **Task A owes two things this type cannot enforce.** A push that reaches
+/// [`OutboundRange::Unavailable`] must block or nudge loudly, never allow —
+/// history size alone can drive a first push into the deadline, so the
+/// fail-open arm is reachable without an adversary. And the commit cap must be
+/// applied *before* buffering: this call holds the whole `rev-list` stdout,
+/// which on a first push is the entire history, with no size bound of its own.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OutboundRange {
     /// The commit shas, newest first. **Empty is a real answer** — genuinely
@@ -716,6 +849,51 @@ mod tests {
     }
 
     #[test]
+    fn env_redirect_on_a_wrapper_segment_reaches_the_child_push() {
+        // The prefix assignment is exported into the child shell, so the push
+        // inside it really does run redirected. Computing the flag on the
+        // wrapper segment and dropping it at the recursion boundary is the
+        // #228/#378 miss reopened in a new module.
+        assert!(only("GIT_WORK_TREE=/x sh -c 'git push origin main'", "/repo").unresolved);
+        assert!(only("GIT_DIR=/x/.git sh -c 'git push origin main'", "/repo").unresolved);
+    }
+
+    #[test]
+    fn an_exported_git_dir_in_an_earlier_segment_marks_a_later_push_unresolved() {
+        assert!(only("export GIT_DIR=/x/.git && git push origin main", "/repo").unresolved);
+        assert!(only("export GIT_WORK_TREE=/x; git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_bare_git_dir_assignment_segment_marks_a_later_push_unresolved() {
+        // An assignment with no command word persists in the shell, unlike a
+        // command prefix, which applies to that one command only.
+        assert!(only("GIT_DIR=/x/.git; git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn an_assignment_used_as_a_command_prefix_does_not_leak_to_a_later_push() {
+        // `GIT_DIR=/x git status` sets the variable for `git status` alone, so
+        // the push after it is NOT redirected and must stay resolvable.
+        let found = push_invocations("GIT_DIR=/x/.git git status; git push origin main", "/repo");
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].unresolved);
+    }
+
+    #[test]
+    fn tags_flag_widens_the_ref_set_and_follow_tags_does_not() {
+        // `--tags` publishes every ref under refs/tags, and a tag can point at
+        // a commit no branch reaches — so HEAD's range is not the answer.
+        let tagged = only("git push --tags origin", "/repo");
+        assert!(tagged.tags);
+        assert!(!tagged.all_or_mirror);
+        // `--follow-tags` only pushes tags reachable from the pushed commits.
+        let followed = only("git push --follow-tags origin main", "/repo");
+        assert!(!followed.tags);
+        assert!(!only("git push origin main", "/repo").tags);
+    }
+
+    #[test]
     fn two_pushes_in_one_chain_are_both_reported() {
         let found = push_invocations(
             "git push origin main; git -C /other push origin topic",
@@ -738,6 +916,59 @@ mod tests {
         assert!(!is_safe_ref("main;rm"));
         assert!(!is_safe_ref(""));
         assert!(!is_safe_ref("topic.lock"));
+    }
+
+    #[test]
+    fn push_default_matching_marks_an_implicit_refspec_unresolved() {
+        // `push.default=matching` publishes every same-named local branch, HEAD
+        // or not, so the implicit HEAD refspec is not what git would push.
+        let scratch = Scratch::new(&scratch_root(), "push-default-matching");
+        let repo = scratch.path();
+        init_repo(repo);
+        git_in(repo, &["config", "push.default", "matching"]);
+
+        let invocation = only("git push origin", &repo.to_string_lossy());
+        assert!(invocation.refspecs[0].implicit);
+        assert!(invocation.unresolved);
+    }
+
+    #[test]
+    fn push_default_simple_leaves_an_implicit_refspec_resolved() {
+        let scratch = Scratch::new(&scratch_root(), "push-default-simple");
+        let repo = scratch.path();
+        init_repo(repo);
+        git_in(repo, &["config", "push.default", "simple"]);
+
+        let invocation = only("git push origin", &repo.to_string_lossy());
+        assert!(invocation.refspecs[0].implicit);
+        assert!(!invocation.unresolved);
+    }
+
+    #[test]
+    fn a_configured_remote_push_refspec_marks_an_implicit_refspec_unresolved() {
+        let scratch = Scratch::new(&scratch_root(), "remote-push-refspec");
+        let repo = scratch.path();
+        init_repo(repo);
+        git_in(
+            repo,
+            &["config", "remote.origin.push", "refs/heads/*:refs/heads/*"],
+        );
+
+        assert!(only("git push origin", &repo.to_string_lossy()).unresolved);
+    }
+
+    #[test]
+    fn an_explicit_refspec_is_unaffected_by_push_default_matching() {
+        // Named refspecs replace the push.default computation entirely, so the
+        // config question never arises and no git call is made.
+        let scratch = Scratch::new(&scratch_root(), "explicit-beats-matching");
+        let repo = scratch.path();
+        init_repo(repo);
+        git_in(repo, &["config", "push.default", "matching"]);
+
+        let invocation = only("git push origin main", &repo.to_string_lossy());
+        assert!(!invocation.refspecs[0].implicit);
+        assert!(!invocation.unresolved);
     }
 
     #[test]

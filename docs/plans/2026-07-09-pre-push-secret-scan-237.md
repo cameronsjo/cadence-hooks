@@ -97,6 +97,10 @@ consolidation, not churn, and directionally aligned with #268.
    (`--delete`, leading-`:` `:dead`) — never skip the whole command, so
    `git push origin :dead newbranch` still scans `newbranch`. Documented misses (state them,
    don't imply): dashed `git-push`, user aliases (`git pu`) — same limit as sibling guards.
+   Also inherited from `core::shell` and shared by every sibling guard: a push inside a
+   heredoc-fed shell body (`bash <<EOF … git push … EOF`) is unseen, because
+   `split_segments_with_ops` strips heredoc bodies as data; and the walk stops at
+   `MAX_WRAPPER_DEPTH` (3) levels of nesting.
 
 2. **Range — from the refspec, not HEAD, correct ordering.** For each pushed source ref,
    outbound set = **`git rev-list <src-ref> --not --remotes`** — positive ref **before**
@@ -184,7 +188,7 @@ Third independent plan in the Step-0 queue.
 ## Progress
 
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
-  error-distinguishing `shell::git_output_detailed`, with 30 core unit tests.
+  error-distinguishing `shell::git_output_detailed`, with 41 core unit tests.
   Built on `feat/237-pre-push-secret-scan`.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
 - [ ] **Task B** — mandatory adversarial security review of the guard.
@@ -207,6 +211,14 @@ New `crates/cadence/src/prevent_secret_push.rs` + `impl Check for PreventSecretP
 consuming Task 0 + `scan_secret_values`. Range via corrected per-refspec `rev-list`;
 absolute-resolved exemption + `is_safe_template`; overflow scan-N-then-block; ack override;
 git-error → loud, not allow. Four-place wiring (template `guard_op_vault_scan.rs`):
+
+**Two obligations Task 0 hands to Task A explicitly.** An `OutboundRange::Unavailable` on a
+detected push MUST block or nudge loudly, never allow — history size alone can drive a first
+push into the deadline, so that arm is reachable without an adversary. And the commit cap
+MUST be applied **before** buffering: `outbound_commits` holds the whole `rev-list` stdout,
+which on a first push is the entire history, with no size bound of its own. Task A must also
+treat `PushInvocation::tags` exactly like `all_or_mirror` for range purposes — a tag can
+point at a commit no branch reaches, so widening to "every local branch" still misses it.
 
 - module export;
 - `CadenceCommands::PreventSecretPush` + `hook_name()` arm + dispatch arm (`src/main.rs`);
