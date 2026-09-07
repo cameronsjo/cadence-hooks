@@ -195,13 +195,14 @@ pub fn tokenize(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// One token, plus whether any of it was quoted.
+/// One token, plus where its quoting starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkedToken {
     /// The token exactly as [`tokenize`] produces it — quotes removed.
     pub text: String,
-    /// Any character in this token came from inside `'…'`, `"…"`, `$'…'`, or an
-    /// escaped quote outside quoting.
+    /// How many bytes of `text` were emitted **before** this token's first
+    /// quoting construct — `'…'`, `"…"`, `$'…'`, or an escaped quote outside
+    /// quoting. A token with no quoting anywhere reports its full length.
     ///
     /// **This is the only thing quote removal destroys that a redirect decision
     /// needs.** `is_redirect_token` judges a token's text, and `'>leak'` and
@@ -209,12 +210,23 @@ pub struct MarkedToken {
     /// discards a legal, quoted refspec as if it were a redirection
     /// (`git check-ref-format refs/heads/'>b'` answers OK).
     ///
-    /// Marking the WHOLE token rather than the redirect-shaped prefix is
-    /// deliberate and monotonically safe: a mark can only stop a strip, so it
-    /// can only leave more operands in view. `>'log'` — a real redirect whose
-    /// target is quoted — is therefore over-refused rather than resolved, which
-    /// is the direction this module trades toward.
-    pub quoted: bool,
+    /// **An OFFSET, not a boolean, because the operator and its target are one
+    /// token and only the operator decides.** A whole-token mark refused to
+    /// strip `>"$LOG"`, `2>"/dev/null"` and `>>"$LOG"` — the spellings scripts
+    /// are actually written in — turning every one into a phantom refspec and a
+    /// false block. The operator there is unquoted; only the target is. Reading
+    /// the offset lets a consumer ask the real question: was the redirect
+    /// *operator prefix* entirely unquoted?
+    ///
+    /// The offset advances only while no quote has been seen, so a quote that
+    /// emits nothing still marks the position after it: `''>log` reports `0`,
+    /// like `'>log'` and unlike `>log`. That matters because bash treats the
+    /// empty quote as starting a word.
+    ///
+    /// Safety direction is unchanged from the boolean: a smaller offset can only
+    /// stop a strip, never cause one, so it can only leave more operands in
+    /// view.
+    pub unquoted_prefix_len: usize,
 }
 
 /// [`tokenize`], additionally reporting which tokens carried quoting.
@@ -226,7 +238,9 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
     let mut tokens: Vec<MarkedToken> = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
-    let mut token_quoted = false;
+    // `None` until this token's first quoting construct; then the byte length
+    // `current` had reached at that moment.
+    let mut unquoted_prefix: Option<usize> = None;
     let mut quote: Option<Quote> = None;
     let mut chars = command.chars().peekable();
 
@@ -272,9 +286,9 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                 // An escaped quote outside quoting is a literal character; it
                 // opens no string.
                 '\\' if matches!(chars.peek(), Some('"' | '\'')) => {
-                    current.push(chars.next().expect("peeked"));
                     in_token = true;
-                    token_quoted = true;
+                    unquoted_prefix.get_or_insert(current.len());
+                    current.push(chars.next().expect("peeked"));
                 }
                 // `$'` opens ANSI-C quoting; the `$` is part of the syntax, not
                 // the word, so it is consumed like the quote itself. A `$`
@@ -283,26 +297,27 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
                     chars.next();
                     quote = Some(Quote::AnsiC);
                     in_token = true;
-                    token_quoted = true;
+                    unquoted_prefix.get_or_insert(current.len());
                 }
                 '\'' => {
                     quote = Some(Quote::Single);
                     in_token = true;
-                    token_quoted = true;
+                    unquoted_prefix.get_or_insert(current.len());
                 }
                 '"' => {
                     quote = Some(Quote::Double);
                     in_token = true;
-                    token_quoted = true;
+                    unquoted_prefix.get_or_insert(current.len());
                 }
                 c if c.is_whitespace() => {
                     if in_token {
+                        let text = std::mem::take(&mut current);
+                        let unquoted_prefix_len = unquoted_prefix.take().unwrap_or(text.len());
                         tokens.push(MarkedToken {
-                            text: std::mem::take(&mut current),
-                            quoted: token_quoted,
+                            text,
+                            unquoted_prefix_len,
                         });
                         in_token = false;
-                        token_quoted = false;
                     }
                 }
                 _ => {
@@ -313,9 +328,10 @@ pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
         }
     }
     if in_token {
+        let unquoted_prefix_len = unquoted_prefix.unwrap_or(current.len());
         tokens.push(MarkedToken {
             text: current,
-            quoted: token_quoted,
+            unquoted_prefix_len,
         });
     }
     tokens
@@ -724,19 +740,30 @@ pub fn executable_tokens(segment: &str) -> Vec<String> {
 /// header, a `case` arm) or rewrites the head token's leading `(`/`{`. The last
 /// N marked tokens are therefore the N executable ones.
 ///
-/// **Any misalignment fails closed.** If the two lists cannot be lined up, every
-/// flag reads `true` — "treat all of it as quoted" — which can only stop a
-/// redirect strip, leaving more operands in view rather than fewer. A wrong
-/// answer here would be a dropped operand, and that is the one outcome this is
-/// not allowed to produce.
-pub fn executable_tokens_marked(segment: &str) -> (Vec<String>, Vec<bool>) {
+/// **The misalignment arm is a belt on an invariant, not a live safeguard.**
+/// `marked.len() >= tokens.len()` always holds: both start from the same
+/// `tokenize(strip_group_wrappers(segment))`, and every step after it either
+/// drops a prefix of the slice or rewrites the head token in place — the
+/// pipeline is **prefix-drop only**, and nothing in it lengthens. So the `None`
+/// arm is unreachable today and no test can exercise it. It is kept because
+/// that invariant lives in four helpers (`strip_leading_keywords`,
+/// `strip_group_tokens`, `strip_function_header`, `strip_case_arm`) plus the
+/// head rewrite, and an edit to any of them is what would break it. When it
+/// does fire, every prefix length reads `0` — "quoted from the first byte" —
+/// which can only stop a redirect strip, leaving more operands in view rather
+/// than fewer. A dropped operand is the one outcome this is not allowed to
+/// produce.
+pub fn executable_tokens_marked(segment: &str) -> (Vec<String>, Vec<usize>) {
     let tokens = executable_tokens(segment);
     let marked = tokenize_marked(strip_group_wrappers(segment));
-    let quoted = match marked.len().checked_sub(tokens.len()) {
-        Some(offset) => marked[offset..].iter().map(|token| token.quoted).collect(),
-        None => vec![true; tokens.len()],
+    let unquoted_prefix_lens = match marked.len().checked_sub(tokens.len()) {
+        Some(offset) => marked[offset..]
+            .iter()
+            .map(|token| token.unquoted_prefix_len)
+            .collect(),
+        None => vec![0; tokens.len()],
     };
-    (tokens, quoted)
+    (tokens, unquoted_prefix_lens)
 }
 
 /// A group opener (or an empty parameter list) standing as its own token, left
@@ -4339,22 +4366,33 @@ mod tests {
         // The one fact quote removal destroys. `'>leak'` and `>leak` come out
         // byte-identical, so nothing downstream can tell a redirection from an
         // operand the shell quoted without this flag.
-        for (command, want_text, want_quoted) in [
-            ("git push origin '>leak'", ">leak", true),
-            ("git push origin \">leak\"", ">leak", true),
-            ("git push origin $'>leak'", ">leak", true),
-            ("git push origin >leak", ">leak", false),
-            ("git push origin main", "main", false),
+        // The offset is where quoting STARTS, in bytes of the produced text.
+        for (command, want_text, want_len) in [
+            ("git push origin '>leak'", ">leak", 0),
+            ("git push origin \">leak\"", ">leak", 0),
+            ("git push origin $'>leak'", ">leak", 0),
+            ("git push origin >leak", ">leak", 5),
+            ("git push origin main", "main", 4),
+            // The operator is unquoted and only the target is quoted — the
+            // distinction a boolean could not carry.
+            ("git push origin >\"$LOG\"", ">$LOG", 1),
+            ("git push origin 2>\"/dev/null\"", "2>/dev/null", 2),
+            ("git push origin >>\"$LOG\"", ">>$LOG", 2),
+            // Mid-operator quoting, and a quote that emits nothing at all.
+            ("git push origin 2'>'x", "2>x", 1),
+            ("git push origin '2'>x", "2>x", 0),
+            ("git push origin ''>log", ">log", 0),
+            ("git push origin '>'log", ">log", 0),
         ] {
             let marked = tokenize_marked(command);
             let last = marked.last().expect("a token");
             assert_eq!(last.text, want_text, "{command:?}");
-            assert_eq!(last.quoted, want_quoted, "{command:?}");
+            assert_eq!(last.unquoted_prefix_len, want_len, "{command:?}");
         }
         // The mark does not leak across a token boundary.
         let marked = tokenize_marked("'a' b");
-        assert!(marked[0].quoted);
-        assert!(!marked[1].quoted);
+        assert_eq!(marked[0].unquoted_prefix_len, 0);
+        assert_eq!(marked[1].unquoted_prefix_len, 1);
     }
 
     #[test]
@@ -4382,18 +4420,19 @@ mod tests {
         // The flags are aligned from the TAIL because the compound-head pipeline
         // only drops from the front. A misalignment would silently mark the
         // wrong token, so the lengths and the values are both pinned.
-        for (segment, want_last_quoted) in [
-            ("git push origin '>leak'", true),
-            ("git push origin >leak", false),
-            ("{ git push origin '>leak'", true),
-            ("do git push origin '>leak'", true),
-            ("if true; then git push origin '>leak'", true),
+        for (segment, want_last_len) in [
+            ("git push origin '>leak'", 0),
+            ("git push origin >leak", 5),
+            ("{ git push origin '>leak'", 0),
+            ("do git push origin '>leak'", 0),
+            ("if true; then git push origin '>leak'", 0),
+            ("{ git push origin >\"$LOG\"", 1),
         ] {
-            let (tokens, quoted) = executable_tokens_marked(segment);
-            assert_eq!(tokens.len(), quoted.len(), "{segment:?}");
+            let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
+            assert_eq!(tokens.len(), unquoted_prefix_lens.len(), "{segment:?}");
             assert_eq!(
-                *quoted.last().expect("a flag"),
-                want_last_quoted,
+                *unquoted_prefix_lens.last().expect("a mark"),
+                want_last_len,
                 "{segment:?} tokens={tokens:?}"
             );
             assert_eq!(tokens, executable_tokens(segment), "{segment:?}");

@@ -121,12 +121,14 @@ consolidation, not churn, and directionally aligned with #268.
    top of a script — the form actually met in the wild, far more than `eval echo hi` — makes
    every later push in that script report `unresolved`, so a caller refuses them. The trade was
    taken knowingly; a refusal a reader can explain beats a stale directory reported as fact.
-   **Still open after round 13** — measured rows, not a description. Every one fails toward
-   seeing less or toward refusing; none reports a *wrong* answer, and the two that once did are
-   closed (a quoted redirect-shaped refspec silently dropped, and a redirect standing before the
-   subcommand hiding the push entirely — both round 13). A row that fails toward seeing less is
-   a refusal to the caller only where an invocation is emitted at all; where nothing is emitted
-   it is a silent miss, which is what the rows below are. `/usr/bin/nohup -- git push origin main` and every other path-spelled
+   **Still open after round 14** — measured rows, not a description. Every one fails toward
+   seeing less or toward refusing; none reports a *wrong* answer. Four rows that once did are
+   closed: a quoted redirect-shaped refspec silently dropped and a redirect standing before the
+   subcommand hiding the push (round 13), and both faces of the unbalanced-closer trim — a
+   refspec and a work dir each reported as fact after `strip_group_wrappers` ate a trailing `}`
+   (round 14). A row that fails toward seeing less is a refusal to the caller only where an
+   invocation is emitted at all; where nothing is emitted it is a silent miss, which is what the
+   rows below are. `/usr/bin/nohup -- git push origin main` and every other path-spelled
    `TRANSPARENT` prefix reach `skip_transparent_prefixes` and `enforce_worktree`'s env walk
    unbasenamed — round 12 fixed the push fallback locally, but the shared
    `shell::names_transparent_prefix` still does not basename, which also leaves
@@ -252,7 +254,10 @@ correction.
   Round 13 made the redirect strip quote-aware (a new `shell::tokenize_marked`
   carries the one fact quote removal destroys) and moved it ahead of the verb,
   globals and subcommand reads, so a redirect standing anywhere in a simple
-  command no longer hides the push.
+  command no longer hides the push. Round 14 corrected that mark from a
+  whole-token flag to an offset — only the redirect OPERATOR decides, so
+  `>"$LOG"` strips again — and made an unbalanced trailing `}`/`)` refuse
+  rather than report a trimmed word as fact.
   The open rows are listed in the documented-misses paragraph above — read that,
   not this line, for what is still unseen.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
