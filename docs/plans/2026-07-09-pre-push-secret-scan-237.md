@@ -104,8 +104,9 @@ consolidation, not churn, and directionally aligned with #268.
    `COMMAND_RUNNERS` and its argument is never treated as a child script; and the walk stops
    at `MAX_WRAPPER_DEPTH` (3) levels of nesting. Known **false block**, not a miss:
    `shell::unescape_word` drops a trailing lone backslash as a line continuation, so
-   `rm\ -rf x` — one word `rm -rf x` the shell never runs — resolves to `rm` and reaches
-   the delete guard. Left unfixed here deliberately: the fix is in `core::shell` and its
+   `rm\ -rf x` — one command word `rm -rf`, with `x` as its argument, which no shell can
+   run (`bash: rm -rf: command not found`, rc 127, same under zsh and sh) — resolves to
+   `rm` and reaches the delete guard. Left unfixed here deliberately: the fix is in `core::shell` and its
    blast radius is every guard, which is the wrong thing to ride in on this branch.
    The `eval` fix belongs in
    `core::shell::child_scripts`, so every sibling guard gains it at once — closing it in the

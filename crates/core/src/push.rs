@@ -416,11 +416,30 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
             start += 1;
             continue;
         }
-        if matches!(word.as_ref(), "command" | "builtin") {
-            command_prefixed |= word.as_ref() == "command";
+        // `builtin` takes NO options in bash, zsh or sh — measured, a flag word
+        // makes it fail and the shell stays put, so `builtin -p cd /other`
+        // never moves. Sharing `command`'s flag-skip loop swallowed the flag,
+        // found `cd`, and reported the move: a wrong repository with
+        // `unresolved: false`, and no `command_prefixed` to save it. `builtin
+        // -- cd` splits three ways on top of that — bash and sh move, zsh does
+        // not. Refusing on ANY flag is the same trade
+        // [`resolve_directory_verb`] already makes for `pushd`: the flags that
+        // change the verb outnumber the ones that do not, and enumerating them
+        // is the wrong side of that problem.
+        if word.as_ref() == "builtin" {
             prefix_escaped |= raw.contains('\\');
             start += 1;
-            // The prefix's own flags (`-p`, `-v`, `-V`) sit before the verb.
+            if tokens.get(start).is_some_and(|next| next.starts_with('-')) {
+                return Some(DirectoryVerb::Unknowable);
+            }
+            continue;
+        }
+        if word.as_ref() == "command" {
+            command_prefixed = true;
+            prefix_escaped |= raw.contains('\\');
+            start += 1;
+            // `command`'s own flags (`-p`, `-v`, `-V`) are real and enumerable,
+            // and its verb refuses through `command_prefixed` regardless.
             while start < tokens.len() && tokens[start].starts_with('-') && tokens[start] != "-" {
                 start += 1;
             }
@@ -622,8 +641,20 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> GitGlobals<'a> {
     let mut idx = 0;
 
     while idx < argv.len() {
-        let token = argv[idx].as_str();
-        if !token.starts_with('-') {
+        // **Normalized once, then compared everywhere below.** git sees the word
+        // after the shell removes the escapes — measured, `git --git-\dir=/x`
+        // reports `not a git repository: '/x'` — but this walk compared the raw
+        // token, so an escaped global went unread in two directions at once: a
+        // `--git-\dir=` redirect left `unresolved: false` on a push that went
+        // elsewhere, and `git -\C /other push` never even reached the
+        // subcommand, so the push was absent from the results entirely.
+        //
+        // Unlike [`directory_verb`], unescaping here needs no ambiguity flag:
+        // every arm below only widens what is SEEN, and none of them sets a
+        // directory the shell might not have entered — `-C`'s value is still
+        // resolved from the raw operand, which fails closed.
+        let word = unescape_word(argv[idx].as_str());
+        if !word.starts_with('-') {
             break;
         }
 
@@ -634,9 +665,11 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> GitGlobals<'a> {
         // happens to spell a global: in `git -c -C push origin main` the `-C` is
         // `-c`'s value, but a look-back walk then reads `push` as `-C`'s value,
         // never reaches the subcommand, and the push goes unseen.
-        if VALUE_GLOBALS.contains(&token) {
-            match token {
+        if VALUE_GLOBALS.contains(&word.as_ref()) {
+            match word.as_ref() {
                 // `-C` accumulates: resolve this hop against the previous one.
+                // The VALUE stays raw — resolving it unescaped could invent a
+                // directory, and an unresolvable one fails closed downstream.
                 "-C" => {
                     if let Some(value) = argv.get(idx + 1) {
                         let base = redirect.as_deref().unwrap_or(effective_dir);
@@ -657,10 +690,10 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> GitGlobals<'a> {
             continue;
         }
 
-        if token.starts_with("--work-tree=") || token.starts_with("--git-dir=") {
+        if word.starts_with("--work-tree=") || word.starts_with("--git-dir=") {
             foreign_redirect = true;
         }
-        if let Some(setting) = token.strip_prefix("--config-env=")
+        if let Some(setting) = word.strip_prefix("--config-env=")
             && sets_push_ref_computation(setting)
         {
             push_config_override = true;
@@ -689,8 +722,17 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> GitGlobals<'a> {
 /// Section and variable names are case-insensitive to git, so the comparison is
 /// too. `remote.<name>.pushurl` deliberately does NOT match — it changes where
 /// the push goes, not which refs it carries.
+///
+/// The setting is unescaped first, for the same reason the flag word is: git
+/// reads it after the shell removes the escapes, so `-c push.\default=matching`
+/// really does set `push.default` (measured — `config --get push.default`
+/// answers `matching`) while a raw compare read some other key and left the
+/// invocation resolvable.
 fn sets_push_ref_computation(setting: &str) -> bool {
-    let key = setting.split_once('=').map_or(setting, |(key, _)| key);
+    let setting = unescape_word(setting);
+    let key = setting
+        .split_once('=')
+        .map_or(setting.as_ref(), |(key, _)| key);
     let key = key.to_ascii_lowercase();
     key == "push.default"
         || (key.starts_with("remote.")
@@ -1371,6 +1413,84 @@ mod tests {
             let invocation = only(command, "/repo");
             assert!(invocation.unresolved, "should refuse: {command}");
         }
+    }
+
+    #[test]
+    fn a_flagged_builtin_refuses() {
+        // `builtin` takes NO options in bash, zsh or sh — measured, a flag word
+        // makes it fail and the shell stays put. The peel shared one flag-skip
+        // loop with `command`, so it skipped the flag, found `cd`, and reported
+        // the move: a wrong repository with `unresolved: false`. Same trade
+        // `resolve_directory_verb` already makes for `pushd` — refuse on ANY
+        // flag rather than on a list of them.
+        //
+        // `builtin -- cd` is the second, independent half: bash and sh move,
+        // zsh does not, and the Bash tool on this estate is zsh.
+        for command in [
+            "builtin -p cd /other ; git push origin main",
+            "builtin -x cd /other ; git push origin main",
+            "builtin --nope cd /other ; git push origin main",
+            "builtin -p -q -z cd /other ; git push origin main",
+            "builtin -p pushd /other ; git push origin main",
+            "builtin -- cd /other ; git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert!(invocation.unresolved, "should refuse: {command}");
+        }
+        // Controls: an unflagged `builtin` still moves, and a flagged `command`
+        // still refuses through its own arm.
+        let moved = only("builtin cd /other && git push origin main", "/repo");
+        assert_eq!(moved.work_dir, "/other");
+        assert!(!moved.unresolved);
+        assert!(only("command -v cd /other ; git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn an_escaped_git_global_is_read_like_its_unescaped_control() {
+        // The shell removes the escape before git sees the word — measured,
+        // `git --git-\dir=/nonexistent rev-parse` reports
+        // `not a git repository: '/nonexistent'`. `git_globals` compared the raw
+        // token, so a redirect went unflagged and an escaped `-C` was not even
+        // seen as a push.
+        //
+        // Redirect flags: unresolved, exactly like the unescaped control.
+        for command in [
+            "git --git-dir=/x push origin main",
+            "git --git-\\dir=/x push origin main",
+            "git --work-tree=/x push origin main",
+            "git --work-\\tree=/x push origin main",
+        ] {
+            assert!(
+                only(command, "/repo").unresolved,
+                "should refuse: {command}"
+            );
+        }
+        // `-C` in either escaped spelling is still a push, and still redirects.
+        for command in [
+            "git -\\C /other push origin main",
+            "git \\-C /other push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert_eq!(invocation.work_dir, "/other", "for {command}");
+            assert_eq!(
+                invocation.refspecs[0].source.as_deref(),
+                Some("main"),
+                "for {command}"
+            );
+        }
+        // A config override reaches `push.default` through either escape.
+        for command in [
+            "git -c push.\\default=matching push origin",
+            "git -\\c push.default=matching push origin",
+            "git --config-\\env=push.default=P push origin",
+        ] {
+            assert!(
+                only(command, "/repo").unresolved,
+                "should refuse: {command}"
+            );
+        }
+        // Control: an escaped global that names no redirect stays resolvable.
+        assert!(!only("git -\\c color.ui=never push origin", "/repo").unresolved);
     }
 
     #[test]
