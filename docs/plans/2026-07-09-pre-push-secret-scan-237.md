@@ -205,9 +205,12 @@ The headings are left as written — they are frozen contract text — so read t
 correction.
 
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
-  error-distinguishing `shell::git_output_detailed`, with 64 core unit tests
-  (62 in `push.rs`, 2 pinning `shell::unescape_word` directly).
-  Built on `feat/237-pre-push-secret-scan`.
+  error-distinguishing `shell::git_output_detailed`, with 71 core unit tests
+  (69 in `push.rs`, 2 pinning `shell::unescape_word` directly).
+  Built on `feat/237-pre-push-secret-scan`, hardened over ten adversarial
+  review rounds. Round 10 closed the last escape-walk gaps: push options,
+  `command`/`builtin` flags, env-redirect operands after a runner, and the
+  shared `shell::skip_transparent_prefixes`, which every guard consumes.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
 - [ ] **Task B** — mandatory adversarial security review of the guard.
 - [ ] **Task C** — plugin `hooks.json` companion (release-gated).

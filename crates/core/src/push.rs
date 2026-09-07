@@ -32,7 +32,7 @@
 //! push through unscanned.
 
 use crate::shell::{
-    GitOutput, MAX_WRAPPER_DEPTH, child_scripts, command_word, executable_tokens,
+    COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, child_scripts, command_word, executable_tokens,
     git_output_detailed, is_assignment_word, is_redirect_token, peel_command_runners,
     resolve_cd_target, split_segments_with_ops, strip_group_wrappers, unescape_word,
 };
@@ -164,14 +164,17 @@ fn collect_push_invocations(
     for (segment, _next_op) in split_segments_with_ops(script) {
         let segment = strip_group_wrappers(&segment);
         let tokens = executable_tokens(segment);
-        let argv = peel_command_runners(&tokens);
+        let argv = skip_runner_assignments(&tokens, peel_command_runners(&tokens));
 
-        // The prefix words `peel_command_runners` removed. A `GIT_DIR=`
-        // assignment lives there, and it redirects the push exactly as the flag
-        // does — checked on the prefix only, so a refspec or message that
-        // happens to contain the text cannot mark an invocation unresolved.
+        // The prefix words the peel removed. A `GIT_DIR=` assignment lives
+        // there, and it redirects the push exactly as the flag does — checked
+        // on the prefix only, so a refspec or message that happens to contain
+        // the text cannot mark an invocation unresolved. Both spellings are
+        // tested because an `env` OPERAND reaches `env` already unescaped.
         let prefix = &tokens[..tokens.len().saturating_sub(argv.len())];
-        let prefix_redirect = prefix.iter().map(String::as_str).any(names_git_redirect);
+        let prefix_redirect = prefix.iter().any(|word| {
+            names_git_redirect(word) || names_git_redirect(unescape_word(word).as_ref())
+        });
 
         if segment_persists_git_redirect(argv, &tokens) {
             scope_unresolved = true;
@@ -251,6 +254,41 @@ fn collect_push_invocations(
 /// refuses the rest, unknown spellings included; over-refusing costs a caller an
 /// explainable refusal.
 const GIT_REDIRECT_ENV_PREFIXES: &[&str] = &["GIT_DIR=", "GIT_WORK_TREE=", "GIT_CONFIG"];
+
+/// Skip assignment operands that a RUNNER hands to the program it execs, which
+/// the shell has already unescaped.
+///
+/// **Two positions, opposite answers, same word.** `GIT_\DIR=/x git push` is an
+/// assignment to no shell — a quoted character in the name disqualifies it, and
+/// measured, all three answer `GIT_DIR=/nope: No such file or directory` — so
+/// `is_assignment_word`'s raw test correctly refuses it and the walk correctly
+/// sees no push. But as an operand of `env`, the shell strips the backslash
+/// *before* `env` sees it, so `env GIT_\DIR=/x git push` really does set
+/// `GIT_DIR` (measured: `env GIT_\DIR=/nope git rev-parse --git-dir` reports
+/// `not a git repository: '/nope'` under bash, zsh and sh) — and the walk saw
+/// no push at all for a command publishing from `/x`.
+///
+/// So the escape removal belongs HERE, at the runner-operand position, and not
+/// inside `is_assignment_word`, where it would wrongly admit the bare-prefix
+/// spelling. Gated on a runner actually having been peeled, for the same
+/// reason.
+fn skip_runner_assignments<'a>(tokens: &'a [String], argv: &'a [String]) -> &'a [String] {
+    let peeled_a_runner = argv.len() < tokens.len()
+        && tokens
+            .first()
+            .is_some_and(|word| COMMAND_RUNNERS.contains(&command_word(word).as_ref()));
+    if !peeled_a_runner {
+        return argv;
+    }
+    let mut start = 0;
+    while argv
+        .get(start)
+        .is_some_and(|word| is_assignment_word(unescape_word(word).as_ref()))
+    {
+        start += 1;
+    }
+    argv.get(start..).unwrap_or(argv)
+}
 
 /// Is this word an assignment from [`GIT_REDIRECT_ENV_PREFIXES`]?
 fn names_git_redirect(word: &str) -> bool {
@@ -426,10 +464,22 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
         // [`resolve_directory_verb`] already makes for `pushd`: the flags that
         // change the verb outnumber the ones that do not, and enumerating them
         // is the wrong side of that problem.
+        // **Both flag tests read the UNESCAPED word.** They were the last two
+        // raw comparisons in this function, and a raw token starting with `\`
+        // failed each of them: the loop broke on it, the flag became the
+        // candidate, it was not a directory verb, and the walk returned `None`
+        // — a stale directory with `unresolved: false`, the F9 mechanism one
+        // token to the right. `builtin \-- cd /other` and `command \-p cd
+        // /other` both move bash and sh (zsh stays), the exact three-way split
+        // these arms exist to refuse. `prefix_escaped` below is a second,
+        // independent route to the same answer.
         if word.as_ref() == "builtin" {
             prefix_escaped |= raw.contains('\\');
             start += 1;
-            if tokens.get(start).is_some_and(|next| next.starts_with('-')) {
+            if tokens
+                .get(start)
+                .is_some_and(|next| unescape_word(next).starts_with('-'))
+            {
                 return Some(DirectoryVerb::Unknowable);
             }
             continue;
@@ -440,7 +490,12 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
             start += 1;
             // `command`'s own flags (`-p`, `-v`, `-V`) are real and enumerable,
             // and its verb refuses through `command_prefixed` regardless.
-            while start < tokens.len() && tokens[start].starts_with('-') && tokens[start] != "-" {
+            while start < tokens.len() {
+                let flag = unescape_word(&tokens[start]);
+                if !flag.starts_with('-') || flag.as_ref() == "-" {
+                    break;
+                }
+                prefix_escaped |= tokens[start].contains('\\');
                 start += 1;
             }
             continue;
@@ -457,6 +512,12 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
         return names_directory_verb(unescape_word(candidate).as_ref())
             .then_some(DirectoryVerb::Unknowable);
     }
+    // A `prefix_escaped` refusal for a NON-verb candidate was tried here and
+    // withdrawn: it swallowed `\command git push origin main`, whose candidate
+    // is `git`, turning a real push into a directory-verb refusal and dropping
+    // it from the results. The unescaped flag tests above already close every
+    // escaped-flag row on their own, and `prefix_escaped` still refuses on the
+    // directory-verb path below, which is where it belongs.
     if !names_directory_verb(candidate) {
         return None;
     }
@@ -826,7 +887,17 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
     let mut index = 0;
 
     while index < words.len() {
-        let word = words[index].as_str();
+        let raw = words[index].as_str();
+        // **Options are read unescaped; the positional stays raw.** Argv proof,
+        // all three shells: `printf "[%s]" --t\ags --mirr\or -\-all` yields
+        // `[--tags][--mirror][--all]`. Comparing the raw word turned
+        // `--a\ll` into an unrecognised option — the repository swallowed the
+        // next word, no refspec was collected, and the implicit `HEAD` shipped
+        // with `unresolved: false` while git published every branch. A
+        // positional keeps its escape because a refspec goes to
+        // [`is_safe_ref`], which correctly refuses a backslash.
+        let word = unescape_word(raw);
+        let word = word.as_ref();
 
         if !options_ended && word == "--" {
             options_ended = true;
@@ -855,7 +926,12 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
             // Exact, both of them, and for opposite reasons. `dry-run` licenses
             // an allow, so a loose match is a bypass. `delete` skips a refspec,
             // so a loose match is a miss. Under-matching either only over-blocks.
-            if name == "dry-run" {
+            //
+            // `dry-run` is additionally the ONE arm read on the RAW word: every
+            // other test here fires more often once unescaped, which widens what
+            // is scanned, while this one would license an allow. Under-matching
+            // `--dry-\run` costs a false block on a harmless command.
+            if raw.strip_prefix("--").and_then(|r| r.split('=').next()) == Some("dry-run") {
                 scan.dry_run = true;
             }
             if name == "delete" {
@@ -877,7 +953,16 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
                 Some(position) => &cluster[..=position],
                 None => cluster,
             };
-            if flags.contains('n') {
+            // Short `-n` reads the RAW cluster, for the same reason the long
+            // `--dry-run` does: it is the only allow-licensing arm.
+            let raw_flags = raw
+                .strip_prefix('-')
+                .map(|c| match c.find('o') {
+                    Some(position) => &c[..=position],
+                    None => c,
+                })
+                .unwrap_or("");
+            if raw_flags.contains('n') {
                 scan.dry_run = true;
             }
             if flags.contains('d') {
@@ -890,9 +975,11 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
         }
 
         positionals += 1;
-        // The first positional is the repository; the rest are refspecs.
+        // The first positional is the repository; the rest are refspecs. The
+        // RAW word is kept — [`is_safe_ref`] refuses a backslash, so an escaped
+        // refspec reaches the caller as unresolvable rather than as a guess.
         if positionals > 1 {
-            scan.refspecs.push(word.to_string());
+            scan.refspecs.push(raw.to_string());
         }
         index += 1;
     }
@@ -1443,6 +1530,104 @@ mod tests {
         assert_eq!(moved.work_dir, "/other");
         assert!(!moved.unresolved);
         assert!(only("command -v cd /other ; git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn an_escaped_push_option_is_read_like_its_unescaped_control() {
+        // Argv proof, all three shells:
+        // `printf "[%s]" --t\ags --mirr\or -\-all` yields
+        // `[--tags][--mirror][--all]`. The walk compared the raw word, so an
+        // escaped `--all` read as an unrecognised option: `origin` became the
+        // repository, no refspec was collected, and the implicit HEAD shipped
+        // with `unresolved: false` while git published every branch.
+        for command in [
+            "git push --all origin",
+            "git push --a\\ll origin",
+            "git push -\\-all origin",
+            "git push --al\\l origin",
+            "git push --mirr\\or origin",
+            "git push origin --a\\ll",
+        ] {
+            assert!(only(command, "/repo").all_or_mirror, "for {command}");
+        }
+        for command in [
+            "git push --tags origin",
+            "git push --t\\ags origin",
+            "git push --ta\\gs origin main",
+        ] {
+            assert!(only(command, "/repo").tags, "for {command}");
+        }
+        // `--delete` widens the same way: an escaped spelling still deletes.
+        assert!(only("git push --dele\\te origin topic", "/repo").refspecs[0].is_delete);
+        // `dry_run` is the ONE arm where firing more often licenses an allow,
+        // so it stays matched on the raw word and under-matches an escape.
+        assert!(!only("git push --dry-\\run origin main", "/repo").dry_run);
+        assert!(only("git push --dry-run origin main", "/repo").dry_run);
+    }
+
+    #[test]
+    fn an_escaped_prefix_flag_refuses() {
+        // `builtin \-- cd /other` and `command \-p cd /other` move bash and sh
+        // (zsh stays) — the same three-way split F5 and F11 refuse. Both flag
+        // tests read the raw token, so the escaped word failed them, became the
+        // candidate, was not a directory verb, and the walk returned `None`:
+        // a STALE directory with `unresolved: false`, the F9 mechanism one
+        // token to the right.
+        //
+        // The last three rows are over-refusals — the shell stays put for
+        // those — and that is the safe side, since the token cannot say whether
+        // it was quoted.
+        for command in [
+            "builtin \\-- cd /other ; git push origin main",
+            "command \\-p cd /other ; git push origin main",
+            "builtin -- cd /other ; git push origin main",
+            "command -p cd /other ; git push origin main",
+            "builtin \\-p cd /other ; git push origin main",
+            "command \\-v cd /other ; git push origin main",
+            "builtin \\--nope cd /other ; git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert!(invocation.unresolved, "should refuse: {command}");
+            assert_eq!(invocation.work_dir, "/repo", "no stale move: {command}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_transparent_prefix_still_sees_the_push() {
+        // `exec`, `command`, `builtin`, `time` and `nohup` are TRANSPARENT-only
+        // — unlike `env`/`nice`, they have no second path through
+        // `peel_command_runners` — so an escaped spelling made the whole
+        // segment invisible and the push was absent from the results entirely.
+        // Every row runs its argument in bash, zsh and sh.
+        for command in [
+            "exec git push origin main",
+            "\\exec git push origin main",
+            "\\command git push origin main",
+            "\\builtin git push origin main",
+            "\\time git push origin main",
+            "ti\\me git push origin main",
+            "\\nohup git push origin main",
+            "time git push origin main",
+            "nohup git push origin main",
+        ] {
+            assert_eq!(sources(command, "/repo"), ["main"], "for {command}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_env_operand_redirect_is_seen() {
+        // Two positions, opposite answers, same word. As an `env` OPERAND the
+        // shell strips the backslash before `env` sees it, so `env GIT_\DIR=/x`
+        // really sets GIT_DIR — measured, `env GIT_\DIR=/nope git rev-parse
+        // --git-dir` reports `not a git repository: '/nope'` in all three
+        // shells. As a bare shell PREFIX no shell honours it at all.
+        assert!(only("env GIT_DIR=/x git push origin main", "/repo").unresolved);
+        assert!(only("env GIT_\\DIR=/x git push origin main", "/repo").unresolved);
+        assert!(only("env -i GIT_DIR=/x git push origin main", "/repo").unresolved);
+        // Controls: the bare prefix spelling is honoured by no shell, so seeing
+        // no push is the RIGHT answer and must stay that way.
+        assert!(push_invocations("GIT_\\DIR=/x git push origin main", "/repo").is_empty());
+        assert!(push_invocations("GIT_CONFIG_\\COUNT=1 git push origin main", "/repo").is_empty());
     }
 
     #[test]

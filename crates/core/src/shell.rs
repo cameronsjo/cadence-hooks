@@ -795,7 +795,21 @@ pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
         // to the gates downstream, so this can add blocks and never subtract.
         // The flag refusal below is unchanged, so a prefix's own options are
         // still never parsed.
-        if (TRANSPARENT.contains(&fold_verb(tok).as_ref()) && !tokens[start + 1].starts_with('-'))
+        // The membership test reads the word the SHELL runs — unescaped, then
+        // folded. `fold_verb` alone only lowercases, so every backslash
+        // spelling of a `TRANSPARENT` verb failed it: `\exec git push`,
+        // `\command git push`, `ti\me git push` and `\nohup git push` all run
+        // in bash, zsh and sh, and all four broke the loop, left the prefix as
+        // the command word, and went unseen by every gate downstream. `env` and
+        // `nice` escaped that only because they are ALSO in `COMMAND_RUNNERS`,
+        // whose peel resolves through `command_word`, which does unescape.
+        //
+        // The #488 direction argument above covers this verbatim: skipping more
+        // prefixes only exposes more verbs to the gates, so it can add blocks
+        // and never subtract. The flag refusal beside it is unchanged, so a
+        // prefix's own options are still never parsed.
+        if (TRANSPARENT.contains(&fold_verb(unescape_word(tok).as_ref()).as_ref())
+            && !tokens[start + 1].starts_with('-'))
             || is_assignment_word(tok)
         {
             start += 1;
