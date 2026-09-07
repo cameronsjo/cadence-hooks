@@ -1121,10 +1121,13 @@ fn peel_env<'a>(tokens: &'a [&'a str]) -> Option<EnvPeel<'a>> {
 ///   compose that strip with [`executable_tokens`].
 /// - A WRAPPER'S OWN FLAG stops the peel one token short: `command -p cd /x`,
 ///   `time -p cd /x`. The loop skips a `CD_WRAPPERS` word, not a flag behind it.
-/// - A MID-WORD backslash is not folded. `command_word` strips one LEADING
-///   backslash, while bash removes every unquoted one, so `c\d /x` is a `cd`
-///   the resolver reads as `c\d`. The quote path is sound — `'cd'`, `"cd"`,
-///   `c""d`, `\cd` all resolve.
+/// - **RESOLVED (cadence-hooks#237 security review, F6).** A mid-word backslash
+///   used to go unfolded: `command_word` stripped one LEADING backslash while
+///   bash removes every unquoted one, so `c\d /x` was a `cd` the resolver read
+///   as `c\d`. `command_word` now applies the shell's whole quote removal
+///   ([`cadence_hooks_core::shell::unescape_word`]), so `c\d` and `g\it`
+///   resolve — while `\\git` stays a literal `\git`, which is what the shell
+///   does. The quote path was already sound: `'cd'`, `"cd"`, `c""d`, `\cd`.
 /// - A `cd` behind a substitution (`$(echo cd) /x`) or a variable (`$CD /x`).
 /// - A `cd` inside a SOURCED script (`source s.sh`, `. s.sh`), which really does
 ///   move the parent shell but lives in a file no string scan can see.

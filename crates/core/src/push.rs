@@ -206,7 +206,7 @@ fn collect_push_invocations(
                 }
                 continue;
             }
-            Some(DirectoryVerb::ShellDependent) => {
+            Some(DirectoryVerb::Unknowable) => {
                 scope_unresolved = true;
                 continue;
             }
@@ -367,23 +367,46 @@ fn implicit_push_config_unresolvable(work_dir: &str) -> bool {
 enum DirectoryVerb<'a> {
     /// A verb whose effect every shell agrees on. The slice starts at the verb.
     Knowable(&'a [String]),
-    /// A `command`-prefixed verb: bash and sh move, zsh does not, and this walk
-    /// cannot know which shell runs the command.
-    ShellDependent,
+    /// A verb this walk cannot resolve to a directory, for either of the two
+    /// reasons named on [`directory_verb`]. The scope is marked unresolved.
+    Unknowable,
 }
 
 /// Classify a segment as a directory verb, or `None` when it is not one.
+///
+/// Two shapes are [`DirectoryVerb::Unknowable`] rather than a move:
+///
+/// 1. **A `command` prefix.** bash and sh move, zsh does not (measured), and
+///    nothing here knows which shell runs the command.
+/// 2. **Any backslash in the verb word.** [`crate::shell::tokenize`] throws
+///    quoting away, so `'c\d' /x` and `c\d /x` arrive as the SAME token — and
+///    the shells split on exactly that: measured, `\cd /usr` moves under bash,
+///    zsh and sh while `'\cd' /usr` moves under none of them, because the quotes
+///    make it a literal command name. `cd\ /other` is a third reading: the
+///    escaped space makes it one word the shell never runs, where the tokenizer
+///    sees two.
+///
+/// **Point 2 is the opposite call from the push verb, deliberately.** There,
+/// unescaping only widens what is seen, and seeing more is the safe direction
+/// for a detector. Here a wrong move is a wrong repository, so a token that
+/// merely *could* unescape to a directory verb refuses. That over-refuses the
+/// unquoted `\cd`, which really does move — an explainable refusal, traded
+/// against a silently wrong answer.
 fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
+    fn names_directory_verb(word: &str) -> bool {
+        matches!(word, "cd" | "pushd" | "popd")
+    }
+
     let mut start = 0;
     let mut command_prefixed = false;
     while start < tokens.len() {
-        let word = unescape_word(tokens[start].as_str());
-        if is_assignment_word(word.as_ref()) {
+        let word = tokens[start].as_str();
+        if is_assignment_word(word) {
             start += 1;
             continue;
         }
-        if matches!(word.as_ref(), "command" | "builtin") {
-            command_prefixed |= word.as_ref() == "command";
+        if matches!(word, "command" | "builtin") {
+            command_prefixed |= word == "command";
             start += 1;
             // The prefix's own flags (`-p`, `-v`, `-V`) sit before the verb.
             while start < tokens.len() && tokens[start].starts_with('-') && tokens[start] != "-" {
@@ -394,14 +417,20 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
         break;
     }
     let rest = tokens.get(start..)?;
-    if !matches!(
-        unescape_word(rest.first()?).as_ref(),
-        "cd" | "pushd" | "popd"
-    ) {
+    let candidate = rest.first()?;
+
+    if candidate.contains('\\') {
+        // It could be a directory verb once the shell removes the escapes, and
+        // the token cannot say whether it was quoted. Refuse if it might be
+        // one; ignore it if it could not be.
+        return names_directory_verb(unescape_word(candidate).as_ref())
+            .then_some(DirectoryVerb::Unknowable);
+    }
+    if !names_directory_verb(candidate) {
         return None;
     }
     Some(if command_prefixed {
-        DirectoryVerb::ShellDependent
+        DirectoryVerb::Unknowable
     } else {
         DirectoryVerb::Knowable(rest)
     })
@@ -457,7 +486,7 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
 ///
 /// `tokens` begins at the verb ([`directory_verb_tokens`] did the peel).
 fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<String> {
-    let verb = unescape_word(tokens.first()?);
+    let verb = tokens.first()?.as_str();
     if verb == "popd" {
         return None;
     }
@@ -1245,15 +1274,6 @@ mod tests {
     }
 
     #[test]
-    fn a_backslash_escaped_cd_moves_the_work_dir() {
-        // Measured: `bash -c 'cd /tmp; \cd /usr && pwd'` prints `/usr`. The
-        // backslash suppresses alias lookup and still runs the builtin.
-        let invocation = only("\\cd /other && git push origin main", "/repo");
-        assert_eq!(invocation.work_dir, "/other");
-        assert!(!invocation.unresolved);
-    }
-
-    #[test]
     fn builtin_prefixed_cd_moves_the_work_dir() {
         // `builtin cd /usr` prints `/usr` under bash, zsh and sh alike — every
         // shell agrees, so the move is knowable.
@@ -1293,16 +1313,34 @@ mod tests {
     }
 
     #[test]
-    fn an_inner_backslash_in_the_cd_verb_moves_the_work_dir() {
-        // `c\d /usr` lands in `/usr` under bash and zsh.
+    fn a_backslash_bearing_directory_verb_refuses() {
+        // `tokenize` throws quoting away, so `'c\d' /x` and `c\d /x` arrive as
+        // the SAME token — and the shells disagree about them: measured, `\cd
+        // /usr` moves under bash, zsh and sh while `'\cd' /usr` moves under
+        // none of them (the quotes make it a literal command name). `cd\ /other`
+        // is a third case: the escaped space makes it ONE word the shell never
+        // runs, where the tokenizer sees two.
+        //
+        // For push detection, unescaping is safe — it only widens what is seen.
+        // For a directory verb it is not: a wrong move is a wrong repository. So
+        // a candidate that merely COULD unescape to a directory verb refuses.
         for command in [
+            "'c\\d' /other && git push origin main",
             "c\\d /other && git push origin main",
-            "\\c\\d /other && git push origin main",
+            "\\cd /other && git push origin main",
+            "cd\\ /other && git push origin main",
         ] {
             let invocation = only(command, "/repo");
-            assert_eq!(invocation.work_dir, "/other", "for {command}");
-            assert!(!invocation.unresolved, "for {command}");
+            assert!(invocation.unresolved, "should refuse: {command}");
         }
+    }
+
+    #[test]
+    fn a_backslash_bearing_word_that_is_not_a_directory_verb_is_ignored() {
+        // The refusal is scoped to tokens that could BE a directory verb.
+        let invocation = only("ec\\ho hi && git push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/repo");
+        assert!(!invocation.unresolved);
     }
 
     #[test]

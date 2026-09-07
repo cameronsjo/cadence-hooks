@@ -434,11 +434,19 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 /// The unescape runs AFTER the path split, so a Windows path keeps its
 /// separators: `C:\Program Files\Git\cmd\git.exe` still resolves to `git`.
 ///
-/// Direction check, because this widens a shared seam: an unescape can only make
-/// MORE tokens resolve to a gated verb, and every caller here is a detector. The
-/// cost is a false block on a command word whose real filename contains a
-/// literal backslash and whose de-escaped form spells a gated verb; the cost of
-/// not doing it is measured, and it is a miss.
+/// Direction check, because this widens a shared seam. An unescape can only make
+/// MORE tokens resolve to a gated verb, which is the safe direction for the
+/// callers here — they are all detectors, where seeing more of what the shell
+/// runs is the point, and the cost is a false block on a command word whose real
+/// filename contains a literal backslash and whose de-escaped form spells a
+/// gated verb.
+///
+/// **That direction does not generalize, and one caller takes the opposite
+/// one.** [`crate::push::directory_verb`] refuses a backslash-bearing word
+/// instead of unescaping it, because a directory verb decides *where* a later
+/// command runs rather than *whether* one is inspected: seeing more there means
+/// moving a tracked directory, and a wrong move is a wrong repository. Ask which
+/// of the two a new caller is before reusing this.
 ///
 /// Deliberate misses, shared by every caller: a command word behind a
 /// substitution (`$(which git)`) or a variable.

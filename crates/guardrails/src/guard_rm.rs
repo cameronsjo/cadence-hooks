@@ -85,9 +85,8 @@
 
 use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, fold_verb, looks_absolute,
-    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers,
-    tokenize,
+    MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts, command_word, looks_absolute, resolve_cd_target,
+    skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome, normalize_path};
 use std::borrow::Cow;
@@ -117,23 +116,20 @@ const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 /// than auto-approving) applied to the *lowercase* spelling only; it never
 /// covered `RM`, which is why the miss was real rather than merely theoretical.
 ///
-/// **Deliberately NOT the shared [`cadence_hooks_core::shell::command_word`],
-/// which the enforce-worktree verb gates moved onto (#450 review).** The two
-/// differ on one input: the shared one strips exactly ONE backslash, so `\\rm`
-/// normalizes to `\rm` and is not a delete verb — which is what the shell does,
-/// since it removes one backslash and then finds no command named `\rm`. The
-/// repeating strip here calls `\\rm` a deletion and blocks it. Converging would
-/// therefore *loosen* a block-capable guard on a spelling nobody has measured
-/// in the wild, so it is left alone and tracked separately rather than ridden
-/// in on a PR about three other issues. The two are consistent in the direction
-/// that matters: every spelling the shell really runs as `rm` is caught by both.
-fn command_word(token: &str) -> Cow<'_, str> {
-    fold_verb(basename(token).trim_start_matches('\\'))
-}
-
-/// `token` names one of the [`DELETE_VERBS`]. Shared by every site that has to
-/// recognize a delete verb, so the `\`-strip above lives in exactly one place —
-/// forgetting it at a new call site would silently re-open the alias bypass.
+/// `token` names one of the [`DELETE_VERBS`].
+///
+/// **This used to run a local `command_word` that trimmed leading backslashes
+/// repeatedly, and the divergence was a live miss** (cadence-hooks#237 security
+/// review, F8). The local copy handled only a LEADING backslash, so `r\m -rf
+/// <path>` — which really runs `rm`, measured under bash, zsh and sh — resolved
+/// to `r\m` and passed the guard untouched. The shared
+/// [`cadence_hooks_core::shell::command_word`] now applies the shell's own quote
+/// removal to the whole word and catches it.
+///
+/// Converging also *drops* one block: the local repeating trim called `\\rm` a
+/// deletion, where the shell removes one backslash and then finds no command
+/// named `\rm`. That was a false block on a command nobody runs, and losing it
+/// is the correct direction. Two guard tests pin both halves.
 fn is_delete_verb(token: &str) -> bool {
     DELETE_VERBS.contains(&command_word(token).as_ref())
 }
@@ -2529,6 +2525,30 @@ mod tests {
     fn root_glob_still_blocks_under_file_glob_path() {
         // `/*` reduces to the root — the bare-glob path, never softened.
         assert_eq!(judge("rm -rf /*", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn an_inner_backslash_in_the_delete_verb_still_blocks() {
+        // `r\m -rf <protected>` really runs rm — measured under bash, zsh and
+        // sh. A local `command_word` that trimmed only LEADING backslashes
+        // resolved it to `r\m` and let it through (cadence-hooks#237 security
+        // review, F8); the shared one applies the shell's whole quote removal.
+        for command in [
+            "r\\m -rf ~/Documents",
+            "\\r\\m -rf ~/Documents",
+            "r\\m -rf /",
+        ] {
+            assert_eq!(judge(command, "/home"), Outcome::Block, "for {command}");
+        }
+    }
+
+    #[test]
+    fn a_doubled_backslash_delete_verb_is_not_a_false_block() {
+        // `\\rm` is an ESCAPED backslash then `rm` — the word is a literal
+        // `\rm`, a command name no shell finds (measured: `bash: \rm: command
+        // not found`). The old local trim collapsed it and blocked; converging
+        // on the shared word correctly stops judging a command nobody runs.
+        assert_ne!(judge("\\\\rm -rf ~/Documents", "/home"), Outcome::Block);
     }
 
     // --- #344: a secret-shaped file sweep nudges instead of allowing silently ---
