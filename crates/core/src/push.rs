@@ -33,8 +33,8 @@
 
 use crate::shell::{
     GitOutput, MAX_WRAPPER_DEPTH, child_scripts, command_word, executable_tokens,
-    git_output_detailed, is_assignment_word, peel_command_runners, resolve_cd_target,
-    split_segments_with_ops, strip_group_wrappers,
+    git_output_detailed, is_assignment_word, is_redirect_token, peel_command_runners,
+    resolve_cd_target, split_segments_with_ops, strip_group_wrappers, unescape_word,
 };
 
 /// One refspec a `git push` names, with the local side a range resolver needs.
@@ -195,14 +195,22 @@ fn collect_push_invocations(
             }
         }
 
-        if let Some(verb_tokens) = directory_verb_tokens(&tokens) {
-            match resolve_directory_verb(verb_tokens, &effective_dir) {
-                Some(moved) => effective_dir = moved,
-                // The target could not be read. Keeping the pre-`cd` directory
-                // and saying nothing is the trap — see [`resolve_directory_verb`].
-                None => scope_unresolved = true,
+        match directory_verb(&tokens) {
+            Some(DirectoryVerb::Knowable(verb_tokens)) => {
+                match resolve_directory_verb(verb_tokens, &effective_dir) {
+                    Some(moved) => effective_dir = moved,
+                    // The target could not be read. Keeping the pre-`cd`
+                    // directory and saying nothing is the trap — see
+                    // [`resolve_directory_verb`].
+                    None => scope_unresolved = true,
+                }
+                continue;
             }
-            continue;
+            Some(DirectoryVerb::ShellDependent) => {
+                scope_unresolved = true;
+                continue;
+            }
+            None => {}
         }
 
         if let Some(mut invocation) = push_invocation_of(argv, &effective_dir) {
@@ -322,12 +330,28 @@ fn implicit_push_config_unresolvable(work_dir: &str) -> bool {
 /// **The peel here is deliberately NARROWER than [`peel_command_runners`], which
 /// the push side uses.** That asymmetry is the point, not an oversight: a
 /// directory verb only moves THIS shell when it runs as a builtin of it.
-/// Measured against bash — `command cd /usr`, `builtin cd /usr`, `command -p cd
-/// /usr` and `\cd /usr` all print `/usr`, while `env cd /usr` and `nice cd /usr`
-/// print the ORIGINAL directory, because those exec a child that exits. Reusing
-/// the push side's peel would therefore move the tracked directory for commands
-/// bash leaves put — inventing exactly the wrong-repository answer this arm was
-/// rewritten to stop producing.
+/// Measured, `pwd` after each:
+///
+/// | spelling | bash | zsh | sh | this walk |
+/// |---|---|---|---|---|
+/// | `cd /b` | moves | moves | moves | moves |
+/// | `builtin cd /b` | moves | moves | moves | moves |
+/// | `\cd /b`, `c\d /b` | moves | moves | moves | moves |
+/// | `command cd /b` | moves | **does not** | moves | **refuses** |
+/// | `command -p cd /b` | moves | **does not** | moves | **refuses** |
+/// | `command command cd /b` | moves | **does not** | moves | **refuses** |
+/// | `env cd /b`, `nice cd /b` | does not | does not | does not | ignores |
+///
+/// Three groups, three answers. `builtin` is unanimous, so the move is
+/// knowable. `env`/`nice` exec a child that exits, so nothing moves anywhere and
+/// ignoring them is correct — which is why reusing the push side's peel, which
+/// strips both, would move the tracked directory for commands no shell moved.
+/// **`command` is the one this walk cannot answer**: zsh forces external lookup
+/// and the external `cd` execs a child, so bash and zsh genuinely disagree, and
+/// the Bash tool on this estate is zsh. Picking either answer states a directory
+/// with `unresolved: false` that the other shell never entered, so a
+/// `command`-prefixed directory verb refuses instead (cadence-hooks#237 security
+/// review, F5).
 ///
 /// **The verb is matched EXACTLY, not through [`command_word`].** That helper
 /// case-folds and strips a path and a `.exe`, which is right for `git` — an
@@ -339,21 +363,29 @@ fn implicit_push_config_unresolvable(work_dir: &str) -> bool {
 /// opposite direction. Only a leading backslash is stripped, because `\cd` is
 /// alias suppression and really does run the builtin.
 ///
-/// Returns the slice starting at the verb, so the caller's target walk sees the
-/// same words bash would.
-fn directory_verb_tokens(tokens: &[String]) -> Option<&[String]> {
+/// What a directory verb this walk found means for the tracked directory.
+enum DirectoryVerb<'a> {
+    /// A verb whose effect every shell agrees on. The slice starts at the verb.
+    Knowable(&'a [String]),
+    /// A `command`-prefixed verb: bash and sh move, zsh does not, and this walk
+    /// cannot know which shell runs the command.
+    ShellDependent,
+}
+
+/// Classify a segment as a directory verb, or `None` when it is not one.
+fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
     let mut start = 0;
+    let mut command_prefixed = false;
     while start < tokens.len() {
-        let word = tokens[start].as_str();
-        if is_assignment_word(word) {
+        let word = unescape_word(tokens[start].as_str());
+        if is_assignment_word(word.as_ref()) {
             start += 1;
             continue;
         }
-        if matches!(strip_alias_escape(word), "command" | "builtin") {
+        if matches!(word.as_ref(), "command" | "builtin") {
+            command_prefixed |= word.as_ref() == "command";
             start += 1;
-            // `command`'s own flags (`-p`, `-v`, `-V`) sit before the verb.
-            // `command -v cd` only PRINTS, but it also carries no path, so it
-            // resolves to `None` and over-refuses rather than moving anywhere.
+            // The prefix's own flags (`-p`, `-v`, `-V`) sit before the verb.
             while start < tokens.len() && tokens[start].starts_with('-') && tokens[start] != "-" {
                 start += 1;
             }
@@ -362,14 +394,27 @@ fn directory_verb_tokens(tokens: &[String]) -> Option<&[String]> {
         break;
     }
     let rest = tokens.get(start..)?;
-    matches!(strip_alias_escape(rest.first()?), "cd" | "pushd" | "popd").then_some(rest)
+    if !matches!(
+        unescape_word(rest.first()?).as_ref(),
+        "cd" | "pushd" | "popd"
+    ) {
+        return None;
+    }
+    Some(if command_prefixed {
+        DirectoryVerb::ShellDependent
+    } else {
+        DirectoryVerb::Knowable(rest)
+    })
 }
 
-/// A word with its alias-suppressing leading backslash removed, and nothing
-/// else changed — the only normalization a shell builtin admits.
-fn strip_alias_escape(word: &str) -> &str {
-    word.strip_prefix('\\').unwrap_or(word)
-}
+// [`unescape_word`] is core's shared quote removal — an escape walk, so `c\d`
+// becomes `cd` while `\\cd` becomes a literal `\cd` the shell cannot find.
+//
+// It is used here INSTEAD of [`command_word`], which also case-folds and strips
+// a path: both are right for an executable found on `PATH` and wrong for a
+// builtin. Measured, `CD /usr` and `/usr/bin/cd /usr` leave bash in the ORIGINAL
+// directory, so folding either into `cd` would move the tracked directory for a
+// command the shell never honoured.
 
 /// Where a directory verb leaves the shell, or `None` when this walk cannot
 /// tell.
@@ -412,7 +457,7 @@ fn strip_alias_escape(word: &str) -> &str {
 ///
 /// `tokens` begins at the verb ([`directory_verb_tokens`] did the peel).
 fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<String> {
-    let verb = strip_alias_escape(tokens.first()?);
+    let verb = unescape_word(tokens.first()?);
     if verb == "popd" {
         return None;
     }
@@ -427,13 +472,16 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
         }
         idx += 1;
     }
-    let operands = tokens.len() - idx;
-    if operands != 1 {
+    // A redirection is not an operand. `pushd <dir> >/dev/null` is how the
+    // idiom is normally written, and counting the redirect words made that
+    // ordinary, non-adversarial command refuse.
+    let operands: Vec<&String> = strip_redirections(&tokens[idx..]);
+    if operands.len() != 1 {
         return None;
     }
-    match tokens.get(idx) {
+    match operands.first() {
         Some(target)
-            if target != "-"
+            if *target != "-"
                 && !target.contains('$')
                 && !target.contains('`')
                 && !(stack_verb && target.starts_with('+')) =>
@@ -442,6 +490,32 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
         }
         _ => None,
     }
+}
+
+/// The words that are real operands, with redirections removed.
+///
+/// A redirect arrives as one token when its target is glued on (`>/dev/null`,
+/// `2>&1`) and as two when the operator stands alone (`> log`), so the standalone
+/// form consumes the word after it. [`is_redirect_token`] is core's own test for
+/// the operator, shared rather than re-spelled.
+fn strip_redirections(words: &[String]) -> Vec<&String> {
+    let mut operands = Vec::new();
+    let mut idx = 0;
+    while let Some(word) = words.get(idx) {
+        if is_redirect_token(word) {
+            // Standalone operator: the next word is its target, not an operand.
+            let operator_only = word
+                .trim_start_matches('&')
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start_matches(['>', '<'])
+                .is_empty();
+            idx += if operator_only { 2 } else { 1 };
+            continue;
+        }
+        operands.push(word);
+        idx += 1;
+    }
+    operands
 }
 
 /// git's global options that take a SEPARATE value word.
@@ -593,7 +667,11 @@ fn push_invocation_of(argv: &[String], effective_dir: &str) -> Option<PushInvoca
     }
     let globals = git_globals(&argv[1..], effective_dir);
     let (subcommand, words) = globals.rest.split_first()?;
-    if subcommand != "push" {
+    // `push` stays case-SENSITIVE — a git subcommand is — but it takes the same
+    // backslash removal the verb does: `git pu\sh origin main` really pushes
+    // (measured), and a literal compare read it as some other subcommand and
+    // dropped the segment.
+    if unescape_word(subcommand) != "push" {
         return None;
     }
 
@@ -1176,13 +1254,75 @@ mod tests {
     }
 
     #[test]
-    fn command_and_builtin_prefixed_cd_move_the_work_dir() {
-        // Measured: `command cd /usr`, `builtin cd /usr` and `command -p cd
-        // /usr` all print `/usr` — each runs the builtin in THIS shell.
+    fn builtin_prefixed_cd_moves_the_work_dir() {
+        // `builtin cd /usr` prints `/usr` under bash, zsh and sh alike — every
+        // shell agrees, so the move is knowable.
+        let invocation = only("builtin cd /other && git push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/other");
+        assert!(!invocation.unresolved);
+    }
+
+    #[test]
+    fn command_prefixed_cd_is_shell_dependent_and_refuses() {
+        // Measured: `command cd /usr` prints `/usr` under bash and sh but
+        // `/tmp` under zsh, which forces external lookup — and the Bash tool on
+        // this estate is zsh. The walk cannot know which shell runs, and an
+        // earlier cut picked bash's answer and stated it with `unresolved:
+        // false`.
         for command in [
             "command cd /other && git push origin main",
-            "builtin cd /other && git push origin main",
             "command -p cd /other && git push origin main",
+            "command command cd /other && git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert!(invocation.unresolved, "for {command}");
+        }
+    }
+
+    #[test]
+    fn an_inner_backslash_in_the_verb_still_resolves_the_push() {
+        // Measured: `g\it --version` prints `git version 2.55.0` under bash and
+        // zsh. `command_word` stripped only a LEADING backslash after a
+        // basename that splits on `\`, so `g\it` resolved to `it`, the segment
+        // was dropped, and an empty invocation list is the strongest allow
+        // shape there is.
+        assert_eq!(sources("g\\it push origin main", "/repo"), ["main"]);
+        assert_eq!(sources("gi\\t push origin main", "/repo"), ["main"]);
+        // The subcommand takes the same escape (`git pu\sh` runs a push).
+        assert_eq!(sources("git pu\\sh origin main", "/repo"), ["main"]);
+    }
+
+    #[test]
+    fn an_inner_backslash_in_the_cd_verb_moves_the_work_dir() {
+        // `c\d /usr` lands in `/usr` under bash and zsh.
+        for command in [
+            "c\\d /other && git push origin main",
+            "\\c\\d /other && git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert_eq!(invocation.work_dir, "/other", "for {command}");
+            assert!(!invocation.unresolved, "for {command}");
+        }
+    }
+
+    #[test]
+    fn a_backslash_in_an_operand_is_left_alone() {
+        // Only the VERB is unescaped. An operand keeps its backslash, so a
+        // refspec carrying one fails `is_safe_ref` and refuses — the safe
+        // direction, and the honest statement of what this walk models.
+        let invocation = only("git push origin ma\\in", "/repo");
+        assert_eq!(invocation.refspecs[0].source.as_deref(), Some("ma\\in"));
+        assert!(!is_safe_ref("ma\\in"));
+    }
+
+    #[test]
+    fn redirections_are_not_counted_as_operands() {
+        // `pushd <dir> >/dev/null` is how the idiom is normally written, and
+        // the operand count was reading the redirect as a second operand.
+        for command in [
+            "pushd /other >/dev/null && git push origin main",
+            "cd /other 2>/dev/null && git push origin main",
+            "cd /other > log 2>&1 && git push origin main",
         ] {
             let invocation = only(command, "/repo");
             assert_eq!(invocation.work_dir, "/other", "for {command}");

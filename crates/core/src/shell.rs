@@ -415,9 +415,33 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 /// programs that receive them, and path operands are case-sensitive in content
 /// even on a case-insensitive volume.
 ///
+/// **The whole word goes through [`unescape_word`], not just a leading-backslash
+/// strip.** The old strip left the escape usable one character in: `g\it push
+/// origin main` runs git under bash, zsh and sh alike, and `basename` splits on
+/// `\` for the Windows branch, so `g\it` resolved to `it` and `gi\t` to `t`.
+/// Neither folded to `git`, so the segment was dropped and every guard that
+/// gates on a verb — push-remote, `guard_rm`, `enforce_worktree` — saw nothing
+/// at all. An empty result is the strongest allow shape there is
+/// (cadence-hooks#237 security review, F6).
+///
+/// **`\\git` still does NOT resolve to `git`, and that is load-bearing.** The
+/// first backslash escapes the second, so the word is a literal `\git` — a
+/// command name no shell finds (measured: `bash: \git: command not found`).
+/// A blunt "remove every backslash" collapses it to `git` and judges a command
+/// that never runs; four sibling guard tests pin exactly that case, and they
+/// caught the blunt version.
+///
+/// The unescape runs AFTER the path split, so a Windows path keeps its
+/// separators: `C:\Program Files\Git\cmd\git.exe` still resolves to `git`.
+///
+/// Direction check, because this widens a shared seam: an unescape can only make
+/// MORE tokens resolve to a gated verb, and every caller here is a detector. The
+/// cost is a false block on a command word whose real filename contains a
+/// literal backslash and whose de-escaped form spells a gated verb; the cost of
+/// not doing it is measured, and it is a miss.
+///
 /// Deliberate misses, shared by every caller: a command word behind a
-/// substitution (`$(which git)`) or a variable, and a mid-path escape
-/// (`/usr/bin/\git`).
+/// substitution (`$(which git)`) or a variable.
 pub fn command_word(token: &str) -> Cow<'_, str> {
     let has_drive_prefix = {
         let mut chars = token.chars();
@@ -428,12 +452,53 @@ pub fn command_word(token: &str) -> Cow<'_, str> {
     } else {
         basename(token)
     };
-    let segment = segment.strip_prefix('\\').unwrap_or(segment);
-    let segment = match segment.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => stem,
-        _ => segment,
-    };
-    fold_verb(segment)
+    match unescape_word(segment) {
+        Cow::Owned(unescaped) => {
+            let stem = match unescaped.rsplit_once('.') {
+                Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => {
+                    stem.to_string()
+                }
+                _ => unescaped,
+            };
+            Cow::Owned(fold_verb(&stem).into_owned())
+        }
+        Cow::Borrowed(segment) => {
+            let segment = match segment.rsplit_once('.') {
+                Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => stem,
+                _ => segment,
+            };
+            fold_verb(segment)
+        }
+    }
+}
+
+/// Apply the shell's quote removal to one unquoted word: each backslash is
+/// dropped and the character after it is taken literally.
+///
+/// This is an escape WALK, not a strip, and the difference is the whole point.
+/// `g\it` and `gi\t` both become `git` — the shell runs git for each (measured
+/// under bash, zsh and sh). `\\git` becomes `\git`, because the first backslash
+/// escapes the second: a literal-backslash command name the shell cannot find.
+/// A strip would collapse both to `git` and judge a command that never runs.
+///
+/// A trailing lone backslash is a line continuation and is dropped. Borrows when
+/// the word carries no backslash, so the common case costs no allocation.
+pub fn unescape_word(word: &str) -> Cow<'_, str> {
+    if !word.contains('\\') {
+        return Cow::Borrowed(word);
+    }
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// True when `p` is absolute — POSIX (`/foo`) or a Windows drive-absolute path
@@ -1005,7 +1070,7 @@ pub fn carries_undo_flag(operands: &[String]) -> bool {
 /// `>`, `>>`, `<`, `2>`, `2>&1`, `&>`, and the attached-target forms (`>log`,
 /// `2>/dev/null`). Leading `&` and file-descriptor digits are stripped before
 /// the test, which is what distinguishes these from an ordinary operand.
-fn is_redirect_token(token: &str) -> bool {
+pub(crate) fn is_redirect_token(token: &str) -> bool {
     let rest = token.strip_prefix('&').unwrap_or(token);
     let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     rest.starts_with('>') || rest.starts_with('<')
