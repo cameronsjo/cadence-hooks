@@ -130,7 +130,7 @@ fn collect_push_invocations(script: &str, cwd: &str, depth: usize, out: &mut Vec
         // assignment lives there, and it redirects the push exactly as the flag
         // does — checked on the prefix only, so a refspec or message that
         // happens to contain the text cannot mark an invocation unresolved.
-        let prefix = &tokens[..tokens.len() - argv.len()];
+        let prefix = &tokens[..tokens.len().saturating_sub(argv.len())];
         let env_redirect = prefix
             .iter()
             .any(|t| t.starts_with("GIT_DIR=") || t.starts_with("GIT_WORK_TREE="));
@@ -203,29 +203,41 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> (String, bool, &'
 
     while idx < argv.len() {
         let token = argv[idx].as_str();
-        let previous = idx.checked_sub(1).map(|p| argv[p].as_str());
-        let is_value_of_global = previous.is_some_and(|p| VALUE_GLOBALS.contains(&p));
-
-        if !token.starts_with('-') && !is_value_of_global {
+        if !token.starts_with('-') {
             break;
         }
 
-        if is_value_of_global {
-            // A token that is the VALUE of the preceding global is never re-read
-            // as a flag: `git -c --git-dir=/x push` passes that string to `-c`.
-            match previous {
-                Some("-C") => {
-                    let base = redirect.as_deref().unwrap_or(effective_dir);
-                    redirect = Some(resolve_cd_target(token, base));
+        // A value word is consumed WITH its flag, in one step, so it is never
+        // re-read as a flag on the next pass. Deciding that by looking BACK at
+        // the previous token instead — the shape
+        // `enforce_worktree::commit_targets_of` uses — misreads a value that
+        // happens to spell a global: in `git -c -C push origin main` the `-C` is
+        // `-c`'s value, but a look-back walk then reads `push` as `-C`'s value,
+        // never reaches the subcommand, and the push goes unseen.
+        if VALUE_GLOBALS.contains(&token) {
+            match token {
+                // `-C` accumulates: resolve this hop against the previous one.
+                "-C" => {
+                    if let Some(value) = argv.get(idx + 1) {
+                        let base = redirect.as_deref().unwrap_or(effective_dir);
+                        redirect = Some(resolve_cd_target(value, base));
+                    }
                 }
-                Some("--work-tree" | "--git-dir") => foreign_redirect = true,
+                "--work-tree" | "--git-dir" => foreign_redirect = true,
                 _ => {}
             }
-        } else if token.starts_with("--work-tree=") || token.starts_with("--git-dir=") {
+            idx += 2;
+            continue;
+        }
+
+        if token.starts_with("--work-tree=") || token.starts_with("--git-dir=") {
             foreign_redirect = true;
         }
         idx += 1;
     }
+    // A trailing value-taking global with no value (`git -C`) leaves `idx` past
+    // the end; git errors on that command, and an empty slice reports no push.
+    let idx = idx.min(argv.len());
 
     (
         redirect.unwrap_or_else(|| effective_dir.to_string()),
@@ -679,6 +691,22 @@ mod tests {
         assert!(only("git --work-tree /x push origin main", "/repo").unresolved);
         // A `-c` VALUE that looks like a redirect is not one.
         assert!(!only("git -c --git-dir=/x push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_global_value_spelling_another_global_does_not_swallow_the_subcommand() {
+        // `-C` here is `-c`'s value. A walk that decides "is this a value?" by
+        // looking BACK one token then reads `push` as `-C`'s value, never
+        // reaches the subcommand, and reports no push at all.
+        let invocation = only("git -c -C push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/repo");
+        assert_eq!(invocation.refspecs[0].source.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_trailing_valueless_global_reports_no_push() {
+        // `git -C` is an error git never runs; the walk must not panic on it.
+        assert!(push_invocations("git -C", "/repo").is_empty());
     }
 
     #[test]
