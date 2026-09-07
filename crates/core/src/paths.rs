@@ -198,7 +198,11 @@ pub fn resolve_git_common_dir(repo_root: &Path) -> Option<PathBuf> {
 /// `pub(crate)` so [`crate::gitstate`] can resolve a linked worktree's admin
 /// dir (which holds that worktree's own `HEAD`) without re-deriving the parse.
 pub(crate) fn read_gitdir_file(dot_git_file: &Path, repo_root: &Path) -> Option<PathBuf> {
-    let contents = std::fs::read_to_string(dot_git_file).ok()?;
+    // Repo-controlled data, same untrusted-input class as `.claude/*.json` —
+    // bounded so a crafted or pathological `.git` file can't OOM a hook that
+    // now runs on every metrics write (`repo_basename`'s `GitState::resolve`
+    // path), not just the occasional guard invocation.
+    let contents = read_capped(dot_git_file, MAX_UNTRUSTED_CONFIG_BYTES)?;
     let target = contents
         .lines()
         .find_map(|l| l.trim().strip_prefix("gitdir:"))
@@ -209,8 +213,10 @@ pub(crate) fn read_gitdir_file(dot_git_file: &Path, repo_root: &Path) -> Option<
 /// Read `<gitdir>/commondir` to reach the shared `.git`; absent or empty →
 /// `gitdir` itself is the common dir (a submodule has no separate common dir).
 fn resolve_commondir(gitdir: &Path) -> PathBuf {
-    match std::fs::read_to_string(gitdir.join("commondir")) {
-        Ok(raw) => {
+    // Same bounded-read discipline as `read_gitdir_file` above — repo-controlled,
+    // on the same hot path.
+    match read_capped(&gitdir.join("commondir"), MAX_UNTRUSTED_CONFIG_BYTES) {
+        Some(raw) => {
             let rel = raw.trim();
             if rel.is_empty() {
                 gitdir.to_path_buf()
@@ -218,7 +224,7 @@ fn resolve_commondir(gitdir: &Path) -> PathBuf {
                 join_maybe_relative(rel, gitdir)
             }
         }
-        Err(_) => gitdir.to_path_buf(),
+        None => gitdir.to_path_buf(),
     }
 }
 

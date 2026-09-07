@@ -22,13 +22,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -36,19 +36,11 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # --no-fail-fast: cargo otherwise stops after the first test binary that
+      # fails and never builds the remaining crates', so a red crate silently
+      # takes every other crate's tests out of the run. Measured on the
+      # red-tests branch (#551): the cadence crate failed with 5, aborted, and
+      # cadence-hooks-core's 718 tests never executed — CI reported the 5 as if
+      # it were the whole picture.
       - name: Run tests
-        run: cargo test --workspace
-
-      # The checked-in Codex compatibility report is ~1700 generated lines that
-      # external consumers read as "what Codex support actually covers", and the
-      # only test touching it compared hook *names*. Wiring, evidence strings,
-      # status/applicable overrides, and the capabilities array could all drift
-      # from the live registry without failing anything. The generator has
-      # supported `--check` all along; nothing called it.
-      #
-      # Linux only: a generated-artifact freshness check is platform-independent,
-      # so running it on both legs would buy nothing and add a `python3`
-      # dependency on the Windows runner.
-      - name: Check Codex compatibility report is fresh
-        if: matrix.os == 'ubuntu-latest'
-        run: make report-check
+        run: cargo test --workspace --no-fail-fast

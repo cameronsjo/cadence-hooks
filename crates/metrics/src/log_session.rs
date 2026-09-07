@@ -11,6 +11,7 @@
 use crate::common;
 use crate::compute_cost::compute_cost_by_model;
 use crate::prices::Prices;
+use crate::session_grade;
 use crate::transcript::{TranscriptScan, UsageScan, scan_transcript};
 use cadence_hooks_core::{Logger, MetricsInput};
 use serde_json::{Value, json};
@@ -62,7 +63,7 @@ impl Logger for LogSession {
         let Ok(transcript) = std::fs::read_to_string(transcript_path) else {
             return;
         };
-        let usage = match scan_transcript(&transcript, None, common::harness()) {
+        let usage = match scan_transcript(&transcript, None) {
             TranscriptScan::Usage(usage) => usage,
             TranscriptScan::Diagnostic(diagnostic) => {
                 common::append_transcript_diagnostic(
@@ -77,8 +78,11 @@ impl Logger for LogSession {
         };
 
         let prices = Prices::load(self.prices_path.as_deref());
-        let cost = (usage.harness == "claude")
-            .then(|| compute_cost_by_model(&usage.scan.by_model, &prices));
+        // Unconditional since the unpriced harness was retired (#1040). It was
+        // `(usage.harness == "claude").then(...)`, which is now a tautology —
+        // left in place it would read as live logic while its `unwrap_or(0.0)`
+        // fallback silently rendered "unpriced" as "$0.00" in any aggregation.
+        let cost = compute_cost_by_model(&usage.scan.by_model, &prices);
 
         let branch = common::branch(input.cwd.as_deref());
         let repo = common::repo_basename(input.cwd.as_deref());
@@ -93,6 +97,11 @@ impl Logger for LogSession {
             .map(|contents| count_commits(&contents, session_id))
             .unwrap_or(0);
 
+        // Graded from the same transcript string already in memory, at the same
+        // price table cost is computed from — so `costUsd` and
+        // `grading.coldRestartUsdTotal` can never be quoted at different rates.
+        let grading = session_grade::grade_transcript(&transcript, &prices).to_json();
+
         let record = build_session_record(
             &ts,
             input,
@@ -104,6 +113,7 @@ impl Logger for LogSession {
             &prices,
             start_ts.as_deref(),
             commits,
+            grading,
         );
 
         let sessions_path = dir.join("sessions.jsonl");
@@ -113,10 +123,19 @@ impl Logger for LogSession {
             .append(true)
             .open(&sessions_path)
         {
-            // Build the whole line (record + newline) and write it in a single
-            // `write_all`, so concurrent appends from other sessions can't
-            // interleave a record with its trailing newline. `record` is compact
-            // JSON, so this is one line with no embedded newlines.
+            // Build the whole line (record + newline) and hand it to one
+            // `write_all`, so a concurrent append from another session is
+            // unlikely to interleave. `record` is compact JSON, so this is one
+            // line with no embedded newlines.
+            //
+            // `write_all` is a LOOP, not one syscall: it retries until the
+            // buffer drains, and each retry is a separate append-offset write.
+            // A short write therefore still admits interleaving. That was
+            // effectively unreachable while every field was bounded; the
+            // `grading` key makes record size input-dependent for the first
+            // time (~110 bytes per idle gap, uncapped), so the guarantee is
+            // now "regular-file writes do not return short except on signal or
+            // a space limit" rather than anything this code enforces.
             let mut line = record.to_string();
             line.push('\n');
             let _ = file.write_all(line.as_bytes());
@@ -159,10 +178,11 @@ fn build_session_record(
     branch: &str,
     repo: &str,
     usage: &UsageScan,
-    cost: Option<f64>,
+    cost: f64,
     prices: &Prices,
     start_ts: Option<&str>,
     commits: u64,
+    grading: Value,
 ) -> Value {
     let scan = &usage.scan;
     let (by_model, unpriced) = usage.priced_breakdown(prices);
@@ -184,28 +204,20 @@ fn build_session_record(
         "durationMs": duration_ms,
         "commits": commits,
         "model": scan.model,
-        "tokens": {
-            "input": scan.tokens.input,
-            "cacheCreate": scan.tokens.cache_create,
-            "cacheRead": scan.tokens.cache_read,
-            "output": scan.tokens.output,
-            "reasoningOutput": usage.reasoning_output,
-            "total": usage.total_tokens,
-        },
+        "tokens": usage.tokens_json(),
         "byModel": by_model,
         "unpricedModels": unpriced,
         "messagesScanned": scan.messages_scanned,
         "lastMessageId": scan.last_message_id,
         "agentId": input.agent_id,
         "parentSessionId": input.parent_session_id,
+        // Additive: no existing key changes meaning, so
+        // TOKEN_RECORD_SCHEMA_VERSION stays at 2 per the policy in `common`.
+        // Always an object, never null — grading is total over any transcript
+        // that reaches here, so a consumer never has to branch on absence.
+        "grading": grading,
     });
-    if usage.is_unpriced_harness() {
-        record["estimatedCostUsd"] = Value::Null;
-        record["pricingSource"] = Value::Null;
-        record["pricingVerifiedAt"] = Value::Null;
-    } else {
-        record["costUsd"] = json!(cost.unwrap_or(0.0));
-    }
+    record["costUsd"] = json!(cost);
     record
 }
 
@@ -224,6 +236,7 @@ mod tests {
             tokens: Tokens {
                 input: 100,
                 cache_create: 50,
+                cache_create_1h: 20,
                 cache_read: 200,
                 output: 30,
             },
@@ -235,6 +248,7 @@ mod tests {
                 Tokens {
                     input: 100,
                     cache_create: 50,
+                    cache_create_1h: 20,
                     cache_read: 200,
                     output: 30,
                 },
@@ -269,10 +283,11 @@ mod tests {
             "feat/x",
             "myrepo",
             &sample_usage(),
-            Some(0.001234),
+            0.001234,
             &prices,
             None,
             2,
+            Value::Null,
         );
         assert_eq!(record["sessionId"], "s1");
         assert_eq!(record["transcriptPath"], "/tmp/t.jsonl");
@@ -284,6 +299,7 @@ mod tests {
         assert_eq!(record["model"], "claude-opus-4-7");
         assert_eq!(record["tokens"]["input"], 100);
         assert_eq!(record["tokens"]["cacheCreate"], 50);
+        assert_eq!(record["tokens"]["cacheCreate1h"], 20);
         assert_eq!(record["tokens"]["cacheRead"], 200);
         assert_eq!(record["tokens"]["output"], 30);
         assert_eq!(record["costUsd"], 0.001234);
@@ -318,10 +334,11 @@ mod tests {
             "",
             "myrepo",
             &sample_usage(),
-            Some(0.0),
+            0.0,
             &prices,
             None,
             0,
+            Value::Null,
         );
         // Absent → null, not omitted.
         assert!(record["reason"].is_null());
@@ -364,10 +381,11 @@ mod tests {
             "main",
             "r",
             &UsageScan::claude(scan),
-            Some(0.0),
+            0.0,
             &prices,
             None,
             0,
+            Value::Null,
         );
         let unpriced = record["unpricedModels"].as_array().unwrap();
         assert_eq!(unpriced.len(), 1);
@@ -384,10 +402,11 @@ mod tests {
             "main",
             "r",
             &sample_usage(),
-            Some(0.0),
+            0.0,
             &prices,
             Some("2026-07-02T00:10:00Z"),
             5,
+            Value::Null,
         );
         assert_eq!(record["startTs"], "2026-07-02T00:10:00Z");
         assert_eq!(record["endTs"], "2026-07-02T00:10:30Z");
@@ -450,11 +469,13 @@ mod tests {
         assert_eq!(whole.tokens.output, 60);
     }
 
+    /// Every session record carries a real `costUsd`.
+    ///
+    /// Inherited from `codex_session_cost_is_an_unverified_nullable_estimate`;
+    /// see the sibling in `log_commit` for why the assertions inverted.
     #[test]
-    fn codex_session_cost_is_an_unverified_nullable_estimate() {
-        let mut usage = sample_usage();
-        usage.harness = "codex";
-        usage.source_format = "codex-rollout-v1";
+    fn session_record_carries_a_real_cost() {
+        let usage = sample_usage();
         let record = build_session_record(
             "ts",
             &sample_input(),
@@ -462,14 +483,15 @@ mod tests {
             "main",
             "r",
             &usage,
-            None,
+            0.004_2,
             &Prices::embedded(),
             None,
             0,
+            Value::Null,
         );
-        assert!(record.get("costUsd").is_none());
-        assert!(record["estimatedCostUsd"].is_null());
-        assert!(record["pricingSource"].is_null());
-        assert!(record["pricingVerifiedAt"].is_null());
+        assert_eq!(record["costUsd"], 0.004_2);
+        assert!(record.get("estimatedCostUsd").is_none());
+        assert!(record.get("pricingSource").is_none());
+        assert!(record.get("pricingVerifiedAt").is_none());
     }
 }

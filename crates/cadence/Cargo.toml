@@ -12,6 +12,7 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+toml.workspace = true
 
 [dev-dependencies]
 cadence-hooks-core = { workspace = true, features = ["test-builders"] }

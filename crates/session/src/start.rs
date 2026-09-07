@@ -22,6 +22,17 @@
 //! only composes the line it returns. Unlike the other three it is resolved
 //! *before* the registry guards, since guard health belongs to the machine
 //! rather than to a repo — a cwd with no git repository still hears it.
+//!
+//! A fifth part answers "is this checkout behind `origin`?" — nothing else on
+//! this surface counts commits, and nothing brings a primary checkout back up
+//! to date on its own. **No network call**: a fetch here would share the
+//! deadline budget with the guards ahead of it and, on a timeout, would mark
+//! [`cadence_hooks_core::deadline::note_hit`] — the same signal the fail-open
+//! part above discloses as "guards may not be enforcing", so a slow network
+//! would make a session announce a guard-health problem it does not have. The
+//! count comes from cached `refs/remotes/origin/<default>` instead; the outro
+//! skill's sync step is what keeps that cache fresh, and the rendered line
+//! names its own age so a stale cache reads as stale, not as current.
 
 use crate::identity::{self, SessionRecord};
 use crate::registry::{self, Peer};
@@ -46,28 +57,89 @@ impl Check for Start {
         // it behind the registry guards would silence it in exactly the cwd
         // that has no git repo to coordinate in.
         let failopen = cadence_hooks_metrics::failopen_disclose::disclosure_line();
+        // Machine-level like `failopen`, and joined into its slot so
+        // `run_start`'s testable signature stays stable: an always-on rules
+        // file that was never installed is behaviorally identical to a loaded
+        // one the model ignored — with the opposite fix (cadence#942). Once
+        // per calendar day via the same daily gate `platform-drift` uses.
+        let machine = join_machine_lines(rules_absence_line(), failopen);
         let Some(cwd) = input.cwd.as_deref() else {
-            return finish(None, None, None, failopen);
+            return finish(None, None, None, machine, None);
         };
         let Some(dir) = registry::sessions_dir(cwd) else {
-            // Not a git repository — no registry, nothing to coordinate.
-            return finish(None, None, None, failopen);
+            // Not a git repository — no registry, nothing to coordinate. A
+            // non-repo cwd also has no checkout to measure staleness for.
+            return finish(None, None, None, machine, None);
         };
         if let Some(root) = registry::repo_root(cwd) {
             registry::ensure_git_excluded(&root);
         }
         let branch = git_command(cwd, &["branch", "--show-current"]);
         let stale_secs = registry::stale_minutes() * 60;
-        run_start(input, &dir, branch, stale_secs, failopen)
+        run_start(
+            input,
+            &dir,
+            Some(registry::global_sessions_dir().as_path()),
+            branch,
+            stale_secs,
+            machine,
+        )
     }
 }
 
-/// Testable core: registry path, branch, and the fail-open disclosure are
-/// injected so tests can target a tempdir without a git repository — and
-/// without reading the machine's real telemetry.
+/// Join the machine-level disclosure lines (rules absence, guard fail-open)
+/// into the single machine slot [`finish`] renders last.
+fn join_machine_lines(rules: Option<String>, failopen: Option<String>) -> Option<String> {
+    match (rules, failopen) {
+        (Some(r), Some(f)) => Some(format!("{r}\n\n{f}")),
+        (Some(r), None) => Some(r),
+        (None, f) => f,
+    }
+}
+
+/// One line, once per calendar day, when the always-on cadence rules file was
+/// never installed on this machine — the silent-absence gap cadence#942
+/// reported: every other always-on surface announces itself at SessionStart,
+/// and without this line "never installed" is indistinguishable from
+/// "installed and ignored". Fail-open: a present file, an unclaimable daily
+/// marker, or any resolution failure is silence.
+fn rules_absence_line() -> Option<String> {
+    rules_absence_line_from(&cadence_hooks_core::paths::claude_config_dir())
+}
+
+/// Testable core of [`rules_absence_line`]: the config dir is injected so
+/// tests target a tempdir instead of the machine's real one. The daily-gate
+/// side (`claim_today`) still reads `CADENCE_MARKER_DIR` — sandbox it with
+/// `test_builders::with_marker_dir` (the #302 discipline) so a test run never
+/// consumes the machine's real once-per-day claim.
+fn rules_absence_line_from(config_dir: &Path) -> Option<String> {
+    let path = config_dir
+        .join("rules")
+        .join("cadence")
+        .join("cadence-rules.md");
+    if path.is_file() {
+        return None;
+    }
+    if !cadence_hooks_core::markers::claim_today("rules-absence", "cadence-rules.md") {
+        return None;
+    }
+    Some(
+        "cadence-rules.md is NOT installed (rules/cadence/ under the Claude config dir) — \
+         sessions on this machine run with none of the cadence doctrine (principles, plan \
+         execution, verification). Install it: the cadence-groundwork initializing-cadence \
+         skill (cadence#942)."
+            .to_string(),
+    )
+}
+
+/// Testable core: registry path, branch, and the machine-level disclosure —
+/// the pre-joined rules-absence + fail-open string from [`join_machine_lines`]
+/// — are injected so tests can target a tempdir without a git repository, and
+/// without reading the machine's real telemetry or rules install.
 pub fn run_start(
     input: &HookInput,
     dir: &std::path::Path,
+    global_dir: Option<&std::path::Path>,
     branch: Option<String>,
     stale_secs: u64,
     failopen: Option<String>,
@@ -84,12 +156,16 @@ pub fn run_start(
     // must surface even when the session id is missing/unsafe or the
     // registry write below fails.
     let plan_disclosure = input.cwd.as_deref().and_then(plan_disclosure_line);
+    // Independent of session registration, same reasoning as `posture` and
+    // `plan_disclosure`: checkout staleness is repo state, cached-refs-only,
+    // so it must surface regardless of session id or registry-write outcome.
+    let staleness = input.cwd.as_deref().and_then(checkout_staleness_line);
 
     let Some(sid) = input
         .session_id()
         .filter(|s| identity::is_safe_session_id(s))
     else {
-        return finish(posture, None, plan_disclosure, failopen);
+        return finish(posture, None, plan_disclosure, failopen, staleness);
     };
 
     // Register (or re-register on resume — preserves any declared
@@ -134,9 +210,45 @@ pub fn run_start(
             ..Default::default()
         },
     };
+    // Stamp the repo on every write, not just on first registration: a record
+    // created before this field existed carries none, and a session that only
+    // ever heartbeats would keep it empty forever. In the cross-checkout mirror
+    // an empty repo makes the refusal unactionable — it can name the session but
+    // not where to go release it.
+    let mut record = record;
+    // Unconditionally, not only when absent: `dir` is authoritative about where
+    // this session is registering RIGHT NOW, so a record carried across a
+    // worktree move would otherwise keep naming the old checkout and send a
+    // reader of the prune refusal to the wrong place. Falls back to the
+    // existing value when the shape does not resolve, so a good repo is never
+    // replaced by nothing.
+    record.repo = registry::repo_root_of_registry(dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .or(record.repo);
     if registry::write_record(dir, &record).is_err() {
         // Fail open: a read-only filesystem must not break session start.
-        return finish(posture, None, plan_disclosure, failopen);
+        return finish(posture, None, plan_disclosure, failopen, staleness);
+    }
+
+    // Mirror into the cross-checkout registry, for readers reasoning about a
+    // resource shared by every session on the machine rather than about this
+    // repo — the plugin cache prune gate is the first (cadence-hooks#634).
+    //
+    // Best-effort BY CONSTRUCTION: the result is discarded, and this sits after
+    // the local write so a failure here can never turn a successful local
+    // registration into a failed session start. Worst case the mirror stays
+    // empty and the cross-checkout reader is exactly as blind as it was before
+    // this existed (ADR-0001).
+    if let Some(global) = global_dir {
+        let _ = registry::write_record(global, &record);
+        // The shared registry is swept on the DEFAULT threshold, never this
+        // session's `CADENCE_SESSION_STALE_MINUTES`. A per-session override is
+        // a statement about one repo's own lanes; applying it to a directory
+        // holding other checkouts' records lets one session with a short
+        // threshold reap a peer that is alive but quiet — and a reaped mirror
+        // record is exactly what makes the prune gate proceed against a live
+        // session. A shared directory cannot take a per-session threshold.
+        registry::sweep_stale(global, registry::default_stale_secs(), sid, "start");
     }
 
     // Housekeeping: presumed-dead peers leave the room before roll call. Our
@@ -146,7 +258,13 @@ pub fn run_start(
     // Disclose live peers, if any.
     let peers = registry::live_peers(dir, sid, stale_secs);
     let peer_disclosure = (!peers.is_empty()).then(|| render_disclosure(&record, &peers));
-    finish(posture, peer_disclosure, plan_disclosure, failopen)
+    finish(
+        posture,
+        peer_disclosure,
+        plan_disclosure,
+        failopen,
+        staleness,
+    )
 }
 
 /// The worktree-posture line for `cwd`, or `None` when `enforce-worktree`
@@ -171,7 +289,66 @@ fn worktree_posture_line(cwd: &str) -> Option<String> {
 /// repo root the same way [`crate::persist_plan`] does.
 fn plan_disclosure_line(cwd: &str) -> Option<String> {
     let root = registry::repo_root(cwd)?;
-    crate::plan_scan::scan_in_flight_plans(&root)
+    let scan = crate::plan_scan::scan_in_flight_plans(&root);
+    let uncommitted = uncommitted_plans_line(&root);
+    match (scan, uncommitted) {
+        (Some(scan), Some(unc)) => Some(format!("{scan}\n{unc}")),
+        (Some(scan), None) => Some(scan),
+        (None, Some(unc)) => Some(unc),
+        (None, None) => None,
+    }
+}
+
+/// One line naming in-flight plan docs that are untracked or dirty in the
+/// working tree — the persist-plan nudge's "commit it" half can be wasted
+/// (plan mode blocks the commit; a session ends first), and an uncommitted
+/// plan is invisible to every other checkout (the living-plan-guards plan's
+/// Task 3 guard 1). One `git status` spawn, once per session start, only when
+/// an in-flight plan exists; any spawn failure or clean status is silence.
+/// File names are repo-authored text — sanitized before rendering.
+fn uncommitted_plans_line(repo_root: &Path) -> Option<String> {
+    let plans = crate::plan_scan::in_flight_plans(repo_root);
+    if plans.is_empty() {
+        return None;
+    }
+    let status = cadence_hooks_core::shell::git_command(
+        &repo_root.to_string_lossy(),
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "docs/plans",
+        ],
+    )?;
+    let dirty: Vec<&str> = status
+        .lines()
+        .filter_map(|line| line.get(3..))
+        .map(str::trim)
+        .collect();
+    let mut hits: Vec<String> = plans
+        .iter()
+        .filter(|plan| dirty.iter().any(|d| *d == plan.rel_path))
+        .map(|plan| identity::sanitize_field(&plan.rel_path, identity::MAX_FIELD_DISPLAY))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    // Cap the rendered list (the sibling plan-scan renderer's discipline) so
+    // repo-controlled filenames can't inflate the SessionStart context.
+    const MAX_NAMED: usize = 5;
+    let overflow = hits.len().saturating_sub(MAX_NAMED);
+    hits.truncate(MAX_NAMED);
+    let tail = if overflow > 0 {
+        format!(" …and {overflow} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Uncommitted living plan(s): {}{tail} — commit them (explicit-path git add); an \
+         uncommitted plan is invisible to every other session and checkout.",
+        hits.join(", ")
+    ))
 }
 
 /// Compose the final result from the optional posture line, peer disclosure,
@@ -186,15 +363,129 @@ fn finish(
     peer_disclosure: Option<String>,
     plan_disclosure: Option<String>,
     failopen: Option<String>,
+    staleness: Option<String>,
 ) -> CheckResult {
-    let parts: Vec<String> = [posture, peer_disclosure, plan_disclosure, failopen]
-        .into_iter()
-        .flatten()
-        .collect();
+    let parts: Vec<String> = [
+        posture,
+        peer_disclosure,
+        plan_disclosure,
+        failopen,
+        staleness,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if parts.is_empty() {
         CheckResult::allow()
     } else {
         CheckResult::nudge(parts.join("\n\n"))
+    }
+}
+
+/// The checkout-staleness line for `cwd`'s repo, or `None` when there is no
+/// resolvable default branch ([`GitState::default_branch`] — no `origin`
+/// remote, or an unreadable `origin/HEAD` symref), the local default branch
+/// is already current, or any git read fails. Cached refs only — see the
+/// module docs for why this never fetches.
+fn checkout_staleness_line(cwd: &str) -> Option<String> {
+    let state = cadence_hooks_core::gitstate::GitState::resolve(Path::new(cwd))?;
+    let default = state.default_branch?;
+    let common_dir = state.git_common_dir;
+
+    let range = format!("refs/heads/{default}..refs/remotes/origin/{default}");
+    // `run_git_bounded` directly, not `git_command`/`git_command_detailed`:
+    // the latter's `GitQuery::Value` maps empty stdout to `Failed`, and while
+    // `rev-list --count` never emits empty stdout on success, spawning
+    // `run_git_bounded` ourselves keeps that class of trap out of this read
+    // entirely rather than relying on the argument staying true.
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(&common_dir)
+        .args(["rev-list", "--count", &range]);
+    let behind: u64 = match cadence_hooks_core::shell::run_git_bounded(&mut cmd) {
+        cadence_hooks_core::shell::GitSpawn::Completed(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .ok()?
+        }
+        _ => return None,
+    };
+    if behind == 0 {
+        return None;
+    }
+
+    let age = std::fs::metadata(common_dir.join("FETCH_HEAD"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .map(|elapsed| identity::relative_age(elapsed.as_secs()));
+
+    // `default` is the REMOTE's advertised `origin/HEAD` target — repo state
+    // a peer's registry file already gets this same treatment for (see
+    // `render_disclosure`'s `sanitize_field` calls below: "a crafted file
+    // must not be able to inject instruction blocks into the context Claude
+    // reads"). git's own ref-name rules permit unbounded length and several
+    // Unicode whitespace/line-separator categories `sanitize_field` doesn't
+    // strip (it only scrubs `char::is_control()`/Cc), but the length cap and
+    // control-char scrub still matter here and keep this part consistent
+    // with the rest of this surface. The RAW `default` is used above to
+    // build the actual git range — only the rendered copy is sanitized.
+    let display_default = identity::sanitize_field(&default, identity::MAX_FIELD_DISPLAY);
+
+    Some(match age {
+        Some(age) => {
+            format!(
+                "Checkout: {behind} commits behind origin/{display_default} (refs fetched {age})"
+            )
+        }
+        None => format!("Checkout: {behind} commits behind origin/{display_default}"),
+    })
+}
+
+#[cfg(test)]
+mod machine_lines_tests {
+    use super::{join_machine_lines, rules_absence_line_from};
+    use cadence_hooks_core::test_builders::with_marker_dir;
+    use tempfile::TempDir;
+
+    #[test]
+    fn join_machine_lines_covers_all_four_shapes() {
+        assert_eq!(join_machine_lines(None, None), None);
+        assert_eq!(join_machine_lines(Some("r".into()), None), Some("r".into()));
+        assert_eq!(join_machine_lines(None, Some("f".into())), Some("f".into()));
+        assert_eq!(
+            join_machine_lines(Some("r".into()), Some("f".into())),
+            Some("r\n\nf".into())
+        );
+    }
+
+    #[test]
+    fn rules_absence_fires_once_when_missing_and_never_when_installed() {
+        // Sandboxed on BOTH globals the probe reads: the config dir is
+        // injected, and the daily marker lands in a tempdir via
+        // `with_marker_dir` — never the machine's real once-per-day claim
+        // (the #302 discipline; review of this change).
+        let config = TempDir::new().unwrap();
+        let markers = TempDir::new().unwrap();
+        with_marker_dir(markers.path(), || {
+            let line = rules_absence_line_from(config.path())
+                .expect("missing rules file must draw the line");
+            assert!(line.contains("cadence-rules.md is NOT installed"));
+            assert!(line.contains("initializing-cadence"));
+            // Same calendar day: the daily gate holds.
+            assert_eq!(rules_absence_line_from(config.path()), None);
+        });
+
+        // Installed file: silence, and no marker is even claimed.
+        let installed = TempDir::new().unwrap();
+        let rules_dir = installed.path().join("rules").join("cadence");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("cadence-rules.md"), "# rules\n").unwrap();
+        let fresh_markers = TempDir::new().unwrap();
+        with_marker_dir(fresh_markers.path(), || {
+            assert_eq!(rules_absence_line_from(installed.path()), None);
+        });
     }
 }
 
@@ -295,7 +586,7 @@ mod tests {
             cwd: Some("/tmp".into()),
             ..Default::default()
         };
-        let r = run_start(&input, tmp.path(), None, 600, None);
+        let r = run_start(&input, tmp.path(), None, None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -303,7 +594,7 @@ mod tests {
     fn unsafe_session_id_allows() {
         let tmp = TempDir::new().unwrap();
         let input = make_session_with_cwd("../escape", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), None, 600, None);
+        let r = run_start(&input, tmp.path(), None, None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
         assert!(
             std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
@@ -317,7 +608,7 @@ mod tests {
     fn empty_room_registers_silently() {
         let tmp = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        let r = run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         assert_eq!(r.outcome, Outcome::Allow, "no peers → no disclosure");
         let own = registry::read_own(tmp.path(), "solo-session").unwrap();
         assert_eq!(own.branch.as_deref(), Some("main"));
@@ -329,7 +620,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // First registration + declaration.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         let mut rec = registry::read_own(tmp.path(), "self-session").unwrap();
         rec.intent = Some("cadence-hooks#54".into());
         rec.touching = vec!["crates/session/".into()];
@@ -337,7 +628,7 @@ mod tests {
 
         // Re-register (e.g. after /clear) on a new branch.
         let input = make_session_with_cwd("self-session", "clear", "/tmp");
-        run_start(&input, tmp.path(), Some("feat/x".into()), 600, None);
+        run_start(&input, tmp.path(), None, Some("feat/x".into()), 600, None);
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
         assert_eq!(back.intent.as_deref(), Some("cadence-hooks#54"));
@@ -360,7 +651,7 @@ mod tests {
 
         // First registration + declaration.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         let mut rec = registry::read_own(tmp.path(), "self-session").unwrap();
         rec.intent = Some("cadence-hooks#69".into());
         rec.touching = vec!["crates/session/".into()];
@@ -370,7 +661,7 @@ mod tests {
         // the OLD sweep-first ordering would have deleted it before read_own.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let input = make_session_with_cwd("self-session", "clear", "/tmp");
-        run_start(&input, tmp.path(), Some("main".into()), 0, None);
+        run_start(&input, tmp.path(), None, Some("main".into()), 0, None);
 
         let back = registry::read_own(tmp.path(), "self-session").unwrap();
         assert_eq!(
@@ -391,6 +682,7 @@ mod tests {
         run_start(
             &peer_input,
             tmp.path(),
+            None,
             Some("feat/issue-52".into()),
             600,
             None,
@@ -398,7 +690,7 @@ mod tests {
 
         // We arrive.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        let r = run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(msg.contains("feat/issue-52"), "peer branch named: {msg}");
@@ -416,7 +708,7 @@ mod tests {
     fn stale_peer_does_not_trigger_disclosure() {
         let tmp = TempDir::new().unwrap();
         let peer_input = make_session_with_cwd("peer-session", "startup", "/tmp");
-        run_start(&peer_input, tmp.path(), None, 600, None);
+        run_start(&peer_input, tmp.path(), None, None, 600, None);
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
         // stale_secs = 0: any measurable age (whole seconds) counts as stale.
@@ -425,7 +717,7 @@ mod tests {
         // process-global CADENCE_METRICS_DIR.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
         let r = registry::test_metrics_env::with_scratch_metrics_dir(|| {
-            run_start(&input, tmp.path(), None, 0, None)
+            run_start(&input, tmp.path(), None, None, 0, None)
         });
         assert_eq!(r.outcome, Outcome::Allow, "stale peers are ignored");
         assert!(
@@ -439,8 +731,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Same session re-starting (e.g. compact) must not see itself as a peer.
         let input = make_session_with_cwd("self-session", "startup", "/tmp");
-        run_start(&input, tmp.path(), None, 600, None);
-        let r = run_start(&input, tmp.path(), None, 600, None);
+        run_start(&input, tmp.path(), None, None, 600, None);
+        let r = run_start(&input, tmp.path(), None, None, 600, None);
         assert_eq!(r.outcome, Outcome::Allow);
     }
 
@@ -460,6 +752,7 @@ mod tests {
         let r = run_start(
             &input,
             tmp.path(),
+            None,
             Some("main".into()),
             600,
             Some("guards are NOT enforcing".into()),
@@ -476,7 +769,7 @@ mod tests {
     fn no_failopen_line_leaves_the_start_silent() {
         let tmp = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-session", "startup", "/tmp");
-        let r = run_start(&input, tmp.path(), Some("main".into()), 600, None);
+        let r = run_start(&input, tmp.path(), None, Some("main".into()), 600, None);
         assert_eq!(r.outcome, Outcome::Allow, "healthy telemetry adds nothing");
     }
 
@@ -489,18 +782,26 @@ mod tests {
         // `Start::run`, not `run_start`, because the ordering being pinned
         // lives in the guards themselves.
         let metrics = TempDir::new().unwrap();
+        // `Start::run` also probes the rules-absence line, whose daily claim
+        // must land in a sandbox — on a machine without the rules file this
+        // test would otherwise consume the real once-per-day claim (#302
+        // discipline; review of this change). Nested inside the metrics lock:
+        // different globals, different mutexes, no deadlock.
+        let marker_sandbox = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo-session", "startup", "/tmp");
         let r = registry::test_metrics_env::with_metrics_dir(metrics.path(), || {
-            for _ in 0..3 {
-                cadence_hooks_metrics::log_failopen(
-                    "deadline",
-                    Some("guardrails"),
-                    Some("guard-rm"),
-                    "1.0.0",
-                    None,
-                );
-            }
-            Start.run(&input)
+            cadence_hooks_core::test_builders::with_marker_dir(marker_sandbox.path(), || {
+                for _ in 0..3 {
+                    cadence_hooks_metrics::log_failopen(
+                        "deadline",
+                        Some("guardrails"),
+                        Some("guard-rm"),
+                        "1.0.0",
+                        None,
+                    );
+                }
+                Start.run(&input)
+            })
         });
         assert_eq!(
             r.outcome,
@@ -520,6 +821,7 @@ mod tests {
         run_start(
             &peer_input,
             tmp.path(),
+            None,
             Some("feat/issue-52".into()),
             600,
             None,
@@ -529,6 +831,7 @@ mod tests {
         let r = run_start(
             &input,
             tmp.path(),
+            None,
             Some("main".into()),
             600,
             Some("FAILOPEN-MARKER".into()),
@@ -566,7 +869,14 @@ mod tests {
         let registry_dir = TempDir::new().unwrap();
         let input = make_session_with_cwd("solo", "startup", &scratch.path().to_string_lossy());
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
+            run_start(
+                &input,
+                registry_dir.path(),
+                None,
+                Some("main".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -576,6 +886,39 @@ mod tests {
         );
         assert!(msg.contains("2026-07-25-x"), "slug named: {msg}");
         assert!(msg.contains("ship it"), "next: text named: {msg}");
+        // The plan file above is untracked — the uncommitted-plan guard line
+        // rides the same disclosure (living-plan-guards Task 3 guard 1).
+        assert!(
+            msg.contains("Uncommitted living plan(s): docs/plans/2026-07-25-x.md"),
+            "uncommitted line present: {msg}"
+        );
+    }
+
+    #[test]
+    fn uncommitted_plan_line_goes_silent_once_the_plan_is_committed() {
+        let scratch = scratch("plan-uncommitted");
+        init_repo(scratch.path());
+        let plans_dir = scratch.path().join("docs").join("plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(
+            plans_dir.join("2026-07-25-x.md"),
+            "---\nstatus: in-flight\nnext: \"ship it\"\n---\n\nbody\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(scratch.path())
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "plan lands"]);
+
+        let line = uncommitted_plans_line(scratch.path());
+        assert_eq!(line, None, "committed plan must not draw the line");
     }
 
     #[test]
@@ -599,12 +942,173 @@ mod tests {
         // posture_line_* tests below, which fail locally for the identical
         // environment reason and pass in CI).
         let r = with_worktree_env(Some("true"), None, || {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
+            run_start(
+                &input,
+                registry_dir.path(),
+                None,
+                Some("main".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(
             r.outcome,
             Outcome::Allow,
             "no docs/plans/ dir at all → silence"
+        );
+    }
+
+    // --- checkout staleness line (Part B, checkout-freshness plan) ---
+    //
+    // `checkout_staleness_line` reads only cached refs — no fetch — so these
+    // fixtures fabricate the "already fetched" state directly: a bare remote,
+    // an `origin` pointed at it, and (for the behind case) a second commit
+    // pushed to the bare remote and pulled down with a real `git fetch`,
+    // which also gives a genuine, fresh `FETCH_HEAD` for the age half of the
+    // line.
+
+    /// A primary checkout on `main` with a real `origin` remote (a bare repo)
+    /// and `origin/HEAD` set, freshly fetched. Returns the primary and bare
+    /// paths.
+    fn repo_with_origin(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let primary = dir.join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        init_repo(&primary);
+        let bare = dir.join("origin.git");
+        git_in(dir, &["clone", "-q", "--bare", "primary", "origin.git"]);
+        git_in(
+            &primary,
+            &["remote", "add", "origin", &bare.to_string_lossy()],
+        );
+        git_in(&primary, &["fetch", "-q", "origin"]);
+        git_in(&primary, &["remote", "set-head", "origin", "-a"]);
+        (primary, bare)
+    }
+
+    #[test]
+    fn checkout_staleness_line_renders_when_behind() {
+        let scratch = scratch("staleness-behind");
+        let (primary, bare) = repo_with_origin(scratch.path());
+
+        // Advance the bare remote via a throwaway clone, then pull the new
+        // ref down into `primary`'s remote-tracking branch WITHOUT merging —
+        // exactly the "behind" state this line reports on.
+        let pusher = scratch.path().join("pusher");
+        git_in(
+            scratch.path(),
+            &["clone", "-q", &bare.to_string_lossy(), "pusher"],
+        );
+        git_in(&pusher, &["config", "user.email", "t@t"]);
+        git_in(&pusher, &["config", "user.name", "t"]);
+        std::fs::write(pusher.join("g.txt"), "y").unwrap();
+        git_in(&pusher, &["add", "g.txt"]);
+        git_in(&pusher, &["commit", "-q", "-m", "second"]);
+        git_in(&pusher, &["push", "-q", "origin", "main"]);
+        git_in(&primary, &["fetch", "-q", "origin"]);
+
+        let line = checkout_staleness_line(&primary.to_string_lossy())
+            .expect("one commit behind must render");
+        assert!(
+            line.contains("1 commits behind origin/main"),
+            "count and branch named: {line}"
+        );
+        assert!(
+            line.contains("refs fetched"),
+            "age qualifier present: {line}"
+        );
+    }
+
+    #[test]
+    fn checkout_staleness_line_silent_when_current() {
+        let scratch = scratch("staleness-current");
+        let (primary, _bare) = repo_with_origin(scratch.path());
+        assert_eq!(
+            checkout_staleness_line(&primary.to_string_lossy()),
+            None,
+            "freshly fetched and up to date → silence"
+        );
+    }
+
+    #[test]
+    fn checkout_staleness_line_silent_with_no_default_branch() {
+        // No `origin` remote at all → `GitState::default_branch` is `None` →
+        // silent by contract (the plan's stated scope).
+        let scratch = scratch("staleness-no-origin");
+        init_repo(scratch.path());
+        assert_eq!(
+            checkout_staleness_line(&scratch.path().to_string_lossy()),
+            None
+        );
+    }
+
+    #[test]
+    fn display_default_sanitizes_and_caps_a_crafted_branch_name() {
+        // `checkout_staleness_line`'s render step passes `default` (the
+        // remote's advertised `origin/HEAD` target — a crafted-remote PoC
+        // an independent Opus security review confirmed reachable via a
+        // real `git clone`) through `sanitize_field` before it reaches the
+        // formatted line, exactly like `render_disclosure` already does for
+        // peer-supplied branch/intent fields. `sanitize_field` itself is
+        // covered by its own tests (`display.rs`); this pins that the new
+        // part actually calls it with the same cap the rest of this surface
+        // uses, rather than re-deriving `sanitize_field`'s own behavior
+        // (attempts to reproduce the crafted-name scenario end-to-end
+        // through real git ref resolution hit unrelated git-internal
+        // revision-parsing limits on very long two-sided ranges — a test
+        // environment artifact, not a property of this code).
+        let crafted = format!("main\u{7}{}", "a".repeat(200));
+        let sanitized = identity::sanitize_field(&crafted, identity::MAX_FIELD_DISPLAY);
+        assert!(
+            !sanitized.contains('\u{7}'),
+            "control char must not survive: {sanitized}"
+        );
+        assert!(
+            sanitized.len() < crafted.len(),
+            "must be capped, not rendered whole: {sanitized}"
+        );
+        assert!(
+            sanitized.contains('…'),
+            "cap must show the truncation marker: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn checkout_staleness_line_fails_open_on_git_error() {
+        // `origin/HEAD` is set (so `default_branch` resolves), but no fetch
+        // ever ran, so `refs/remotes/origin/main` does not exist — `git
+        // rev-list --count <range>` fails ("unknown revision"), and the line
+        // must fail open silently rather than panic or propagate the error.
+        let scratch = scratch("staleness-git-error");
+        let primary = scratch.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        init_repo(&primary);
+        let bare = scratch.path().join("origin.git");
+        git_in(
+            scratch.path(),
+            &["clone", "-q", "--bare", "primary", "origin.git"],
+        );
+        git_in(
+            &primary,
+            &["remote", "add", "origin", &bare.to_string_lossy()],
+        );
+        // Set the symref by hand instead of fetching, so `default_branch`
+        // resolves while `refs/remotes/origin/main` stays absent.
+        let common = primary.join(".git");
+        std::fs::create_dir_all(common.join("refs").join("remotes").join("origin")).unwrap();
+        std::fs::write(
+            common
+                .join("refs")
+                .join("remotes")
+                .join("origin")
+                .join("HEAD"),
+            "ref: refs/remotes/origin/main\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            checkout_staleness_line(&primary.to_string_lossy()),
+            None,
+            "unresolvable range fails open, not panics"
         );
     }
 
@@ -908,7 +1412,14 @@ mod tests {
         let registry_dir = tempfile::TempDir::new().unwrap();
         let input = make_session_with_cwd("solo", "startup", &scratch.path().to_string_lossy());
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
+            run_start(
+                &input,
+                registry_dir.path(),
+                None,
+                Some("main".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge, "posture alone still nudges");
         let msg = r.message.unwrap();
@@ -930,6 +1441,7 @@ mod tests {
         run_start(
             &peer_input,
             registry_dir.path(),
+            None,
             Some("feat/x".into()),
             600,
             None,
@@ -937,7 +1449,14 @@ mod tests {
 
         let input = make_session_with_cwd("self-session", "startup", &cwd);
         let r = with_clean_worktree_env(|| {
-            run_start(&input, registry_dir.path(), Some("main".into()), 600, None)
+            run_start(
+                &input,
+                registry_dir.path(),
+                None,
+                Some("main".into()),
+                600,
+                None,
+            )
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
@@ -964,6 +1483,7 @@ mod tests {
             run_start(
                 &input,
                 registry_dir.path(),
+                None,
                 Some("feat/y".into()),
                 600,
                 None,

@@ -248,22 +248,19 @@ fn payload_preview(payload: &str, user_supplied: bool, show_payload: bool) -> St
 /// checks exercise real repo/git-state detection — is correct for the
 /// overwhelming majority of hooks, which only ever READ state. It is actively
 /// dangerous for a hook with a genuine filesystem WRITE side effect: injecting
-/// a real repo path let a bare `cadence-hooks try session persist-plan` (or
-/// `persist-plan-approval`) actually create a plan doc in whatever repo the
+/// a real repo path let a bare `cadence-hooks try session persist-plan-approval`
+/// (or the since-removed `persist-plan`) actually create a plan doc in whatever repo the
 /// user happened to be standing in when they ran `try` — reachable endpoints
 /// included `~/.claude/rules/`. Verified end to end (cameronsjo/cadence-hooks#396
 /// review): a real plan doc landed in a real repo during review, then had to
 /// be manually removed.
 ///
 /// Every entry here MUST carry its own `cwd` in its `registry::sample_for`
-/// override (see `session persist-plan`/`persist-plan-approval`'s overrides),
+/// override (see `session persist-plan-approval`'s override),
 /// pointed at a path that cannot resolve as a git repo — never left absent,
 /// since an absent `cwd` degrades most Checks to a no-op fail-open, not a
 /// demonstration of the hook's real behavior.
-const CWD_OVERRIDE_REFUSED: &[(&str, &str)] = &[
-    ("session", "persist-plan"),
-    ("session", "persist-plan-approval"),
-];
+const CWD_OVERRIDE_REFUSED: &[(&str, &str)] = &[("session", "persist-plan-approval")];
 
 /// The sample payload for a hook, with the real working directory injected
 /// so hooks that resolve git state see the repo `try` was run from — EXCEPT

@@ -15,13 +15,14 @@ For how hooks communicate with Claude Code (stdin/stdout/exit codes), see
 |------|-------|--------------|
 | `terminology` | PreToolUse (Write, Edit) | Block inclusive terminology violations |
 | `orphaned-todos` | PreToolUse (Write, Edit) | Require `MARKER(#issue):` format for TODO/FIXME/HACK |
-| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading .env, credentials, private keys |
-| `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting .env and credential files |
+| `prevent-secret-leaks` | PreToolUse (Read, Grep, Bash) | Block reading the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path), credentials, private keys (exempt: a **bare** `forgectl env keys\|set\|get\|check\|redact` naming its `--file` target — not a path-qualified or wrapped spelling, not another operand, not a redirection whose target is itself a secret file) |
+| `prevent-secret-writes` | PreToolUse (Write, Edit, Bash) | Block writing/deleting the dotenv family (`.env`, `.env.*`, minus templates; `<name>.env` too wherever the token is known to be a path) and credential files |
 | `memory-guard` | PreToolUse (Write, Edit) | Enforce MEMORY.md line limits |
 | `git-safety` | PreToolUse (Bash) | Block force-push to main, reset --hard, etc. |
 | `line-endings` | PreToolUse (Write) | Validate shell script line endings (LF, not CRLF) |
 | `env-vars` | PreToolUse (Write, Edit) | Warn on generic env var names (DEBUG, PORT) |
 | `warn-docs-update` | PreToolUse (Bash) | Nudge to review docs when creating a PR (`gh pr create`) |
+| `warn-changelog-entry` | PreToolUse (Bash) | Nudge to add a CHANGELOG.md entry when shipping code changes |
 | `warn-overshare` | PreToolUse (Bash, Write, Edit) | Nudge to audit about-to-ship content for personal-context overshare |
 | `nudge-polish-before-pr` | PreToolUse (Bash) | Nudge to run `/polish` (cadence-forge:polish) before `gh pr create` |
 | `markdown-lint` | PreToolUse (Write) | Run markdownlint on markdown files |
@@ -51,12 +52,12 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-issue-tracker` | PreToolUse (Bash) | Nudge when `gh issue create` targets an owned repo that is not a known ecosystem tracker |
 | `verify-pr-autoclose` | PostToolUse (Bash) | Verify issue auto-close refs after PR create; close stragglers after merge |
 | `guard-op-vault-scan` | PreToolUse (Bash) | Block 1Password vault enumeration (`op item list`); single-item reads stay allowed |
+| `guard-sops-decrypt` | PreToolUse (Bash) | Block a `sops` decrypt whose plaintext is not consumed by an allowed tool (key-name lister, `curl --config -`); `sops edit`/`set`/`-e` are untouched. Escape: `CADENCE_ALLOW_SOPS_DECRYPT=1` |
 | `warn-curl-alias` | PreToolUse (Bash) | Warn when bare `curl` (aliased to curlie) is used with custom headers |
 | `warn-gh-merge-preflight` | PreToolUse (Bash) | Pre-flight checklist before `gh pr merge` (isDraft, worktree, mergedAt verification) |
-| `warn-coderabbit-retrigger` | PreToolUse (Bash) | Warn that `@coderabbitai review` comments are no-ops on already-reviewed content |
+| `warn-unreviewed-ready-flip` | PreToolUse (Bash) | Warn on `gh pr ready`/`gh pr merge` when the PR head has no reviewed signal (non-author human APPROVED, or a clean `cadence-review` marker) |
 | `warn-alias-parsing` | PreToolUse (Bash) | Warn when piping aliased-tool output (cat/find/ls/du/df/top) into parsers |
 | `guard-browser-device` | PreToolUse (Claude-in-Chrome MCP) | Block the first claude-in-chrome action per session until the target device is confirmed |
-| `inject-gh-context` | SessionStart (startup, resume, compact) | Inject the gh-write allowlist + `-R owner/repo` rule into context |
 | `inject-gh-write-context` | PreToolUse (Bash) | Re-inject the same allowlist + `-R owner/repo` rule just before a `gh` write that names no target |
 
 `guard-browser-device` is a deliberate block (not a nudge): a nudge is exit 0,
@@ -131,16 +132,37 @@ exit 0. They never block a tool call (see
 | `log-polish-nudge` | PostToolUse (Bash, `gh pr create`) | Record every nudged PR and whether `/polish` ran earlier this session, append to `polish_nudges.jsonl` |
 | `log-ask-user-question` | PreToolUse (`AskUserQuestion`) | Record each call's stance (recommended / declared-no-rec / silent) and shape (multiSelect, question/option counts), append to `askuserquestion.jsonl` |
 
-`log-commit` reads its price table from the embedded default, overridable with
-`--prices <path>` (or `CADENCE_METRICS_PRICES`). Set `CADENCE_METRICS_DEBUG=1`
-to add a `_keys` array of raw payload keys to subagent records — useful for
-spotting schema additions across Claude Code releases.
+`metrics grade` is a **CLI action, not a hook** — it has no `hooks.json` wiring,
+reads no stdin payload, and is not subject to `CADENCE_DISABLE`. It grades one
+transcript deterministically and prints the JSON:
+
+```bash
+cadence-hooks metrics grade --transcript path/to/transcript.jsonl
+cadence-hooks metrics grade --session-id <uuid>   # searches every projects/* dir
+cadence-hooks metrics grade                        # defaults to $CLAUDE_CODE_SESSION_ID
+```
+
+The same grading is written to every `sessions.jsonl` row under a `grading` key.
+Unlike a guard, `grade` fails closed: a transcript it cannot identify or read
+exits 1 with the reason on stderr rather than printing a partial grading.
+
+`log-commit` and `log-session` both read the price table from the embedded
+default, overridable with `--prices <path>` (or `CADENCE_METRICS_PRICES`). Set
+`CADENCE_METRICS_DEBUG=1` to add a `_keys` array of raw payload keys to
+subagent records — useful for spotting schema additions across Claude Code
+releases.
 
 Cost is computed **per model**: when a commit range spans multiple models
 (opus → sonnet handoffs, fast-mode toggles), each model's tokens are priced at
 its own rates and summed. Records carry the breakdown in a `byModel` array
 (`[{model, tokens, costUsd}]`); rows written before this field existed are
 single-model by definition.
+
+Cache writes are priced **per TTL**: a 1-hour write costs 2x base input against
+1.25x for the 5-minute default, so records carry `cacheCreate1h` alongside
+`cacheCreate` and each slice is billed at its own rate. `cacheCreate` stays the
+grand total of all cache writes, so a TTL bucket the scanner does not name is
+still counted — it simply bills at the 5-minute rate.
 
 ## session (cadence-canon)
 
@@ -161,6 +183,22 @@ give sessions *identity* within a repo via a registry at `<repo>/.claude/session
 Liveness is mtime-based: a session that crashes or closes simply stops heartbeating
 and is presumed dead after 10 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
 deregistration ceremony. Stale entries are swept on the next `session start`.
+
+### Living-plan guards
+
+Three more `session` hooks serve the living-plan lifecycle (ADR-0038) rather than
+multi-session identity. They are wired by the **cadence** plugin, not cadence-canon,
+and all three bind to the plan doc for the current branch.
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `nudge-plan-tick` | PostToolUse (Bash, `git commit`) | Nudge once per session when a successful commit left the branch's in-flight plan untouched |
+| `warn-plan-ready-flip` | PreToolUse (Bash, `gh pr ready`/`merge`) | Warn when the branch's plan still reads `status: in-flight` or carries unticked boxes at the PR-ready flip |
+| `lint-plan-shape` | PreToolUse (ExitPlanMode) | Block when the plan carries no settled `Panel:` line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every judged outcome carries the presentation reminders (subagents stopped, operator asked to see the plan) |
+
+`nudge-plan-tick` and `warn-plan-ready-flip` only ever warn. `lint-plan-shape` is the
+one plan guard that blocks, and only on the `Panel:` line; subagent-originated calls
+(`agent_id` present) and every internal failure allow (ADR-0001).
 
 ### CLI actions (not hooks)
 

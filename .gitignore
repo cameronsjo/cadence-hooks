@@ -6,3 +6,4 @@
 .review-loop.local.md
 .claude/intros/
 .claude/agent-memory/
+.claude/worktrees/

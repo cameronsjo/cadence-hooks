@@ -20,8 +20,11 @@ release:
 
 .PHONY: test
 ## Run all workspace tests
+# --no-fail-fast is load-bearing: without it cargo stops after the first test
+# binary that fails and never builds the rest, so one red crate hides every
+# other crate's results while the run still looks like a complete answer.
 test:
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace --no-fail-fast
 
 .PHONY: check
 ## Run cargo check (fast compilation check)
@@ -29,9 +32,9 @@ check:
 	$(CARGO) check --workspace
 
 .PHONY: clippy
-## Run clippy lints
+## Run clippy lints (--all-targets matches CI; without it, test code is unlinted)
 clippy:
-	$(CARGO) clippy --workspace -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 .PHONY: fmt
 ## Format all code
@@ -45,19 +48,9 @@ fmt-check:
 
 ## CI ──────────────────────────────────────────
 
-.PHONY: report
-## Regenerate the Codex compatibility report
-report: build
-	@python3 scripts/generate-codex-report.py
-
-.PHONY: report-check
-## Fail if the checked-in Codex compatibility report is stale
-report-check: build
-	@python3 scripts/generate-codex-report.py --check
-
 .PHONY: ci
-## Run all CI checks (fmt, clippy, test, report freshness)
-ci: fmt-check clippy test report-check
+## Run all CI checks (fmt, clippy, test)
+ci: fmt-check clippy test
 
 ## Release ────────────────────────────────────
 

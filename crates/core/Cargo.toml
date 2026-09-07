@@ -15,6 +15,7 @@ serde_ignored.workspace = true
 regex.workspace = true
 brush-parser.workspace = true
 jiff.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

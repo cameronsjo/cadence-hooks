@@ -16,9 +16,13 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use sha2::{Digest, Sha256};
+
 use crate::registry;
+use cadence_hooks_core::capability::on_path;
 // The session crate's `registry` (peer-session liveness) — aliased because the
 // bare name is already taken by the binary's hook-catalog `registry` above.
+use cadence_hooks_session::identity as session_identity;
 use cadence_hooks_session::registry as session_registry;
 
 /// Severity of a finding: errors block (shell bugs), warnings advise (version skew).
@@ -47,6 +51,11 @@ struct Finding {
 /// prose around an already-`display_safe_bounded`-clamped 200-char error
 /// string from `log_failopen` (`MAX_ERROR_CHARS`), so 500 leaves real
 /// content intact while still bounding a pathological one.
+/// Cap on how many live peers the prune refusal NAMES. The count it reports is
+/// the true total; this only bounds the rendered list, so a directory seeded
+/// with records cannot flood an operator's terminal.
+const MAX_NAMED_PEERS: usize = 10;
+
 const MAX_FINDING_FIELD_CHARS: usize = 500;
 
 impl Finding {
@@ -252,24 +261,93 @@ fn upgrade_hint_short(channel: InstallChannel) -> &'static str {
     }
 }
 
-/// Build the one-line quiet SessionStart warning summary. Names an actor
-/// (Claude) and an action (run doctor, triage, surface to the user) instead of
-/// the old passive "run for details". The version-skew upgrade hint is appended
-/// only when a skew warning is present — stale-telemetry-only warnings carry no
-/// upgrade to suggest.
-fn quiet_warning_summary(
+/// Build the once-daily enveloped SessionStart warning nag. Wrapped in a
+/// `<cadence-system-message>` envelope and phrased as a `MUST` directive
+/// addressed to the hosting session (never the human directly) — the
+/// envelope tags are what let a downstream reader (or the session itself)
+/// recognize this as machine-directed instruction text rather than a plain
+/// status line. The version-skew upgrade hint is appended to the count line
+/// only when a skew warning is present — stale-telemetry-only warnings carry
+/// no upgrade to suggest.
+///
+/// Pure and print-free by design: the call site owns the once-daily gate
+/// (`cadence_hooks_core::markers::claim_today`, keyed on
+/// [`warning_set_token`]) and the actual `println!`, so this shape is
+/// unit-testable without touching the marker filesystem.
+///
+/// **Invariant: no untrusted text.** Everything interpolated here is
+/// binary-controlled (the compile-time version, a count, the static upgrade
+/// hints). The envelope is trust-elevated instruction text addressed to the
+/// hosting session, so interpolating a plugin-controlled `diagnosis` into it
+/// would hand plugin metadata a prompt-injection channel — keep specifics in
+/// the full `doctor` output, never in the envelope.
+///
+/// **Known degraded mode:** the gate is content-keyed, not date-keyed, and it
+/// is skipped entirely (every call fires) whenever
+/// `cadence_hooks_core::markers::marker_dir_is_private` is false — a
+/// non-private marker dir (e.g. a world-writable fallback base) means the nag
+/// simply repeats every session rather than risk a co-tenant muting it. A
+/// `$TMPDIR` reboot that clears the marker dir re-arms the gate the same way:
+/// the next session after a reboot sees "first sighting" again even for an
+/// unchanged warning set.
+fn quiet_warning_envelope(
     version: &str,
     n_warn: usize,
     has_skew: bool,
     channel: InstallChannel,
 ) -> String {
-    let mut summary = format!(
-        "cadence-hooks {version}: {n_warn} plugin warning(s). Claude: run 'cadence-hooks doctor', triage, and surface anything actionable to the user in one line."
-    );
+    let mut count_line = format!("cadence-hooks {version}: {n_warn} plugin warning(s).");
     if has_skew {
-        summary.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
+        count_line.push_str(&format!(" Version skew: {}.", upgrade_hint_short(channel)));
     }
-    summary
+    format!(
+        "<cadence-system-message>\n\
+         This appears only on the first session of the day. You MUST run 'cadence-hooks doctor',\n\
+         triage, and surface anything actionable to the user in one line before session work ends.\n\
+         {count_line}\n\
+         </cadence-system-message>"
+    )
+}
+
+/// Deterministic content token for a warning set: a SHA-256 digest over the
+/// running binary's version plus every warning's `diagnosis`, sorted before
+/// hashing so the token is order-insensitive — the scan order of `findings`
+/// is not part of the identity of "today's warning set". Feeds
+/// `cadence_hooks_core::markers::claim_today`'s once-daily gate: the same
+/// warning set (same version, same diagnoses) always claims the same slot,
+/// while a genuinely different set — a new diagnosis, a dropped one, or a
+/// version bump — mints a new token so the gate re-fires the same day instead
+/// of waiting until tomorrow (mirrors `warn-stale`'s `verdict_token`
+/// precedent, per `claim_today`'s own doc comment).
+///
+/// **MUST** stay stable across the many separate `cadence-hooks` processes one
+/// SessionStart's worth of hooks spans — `std::collections::hash_map::
+/// DefaultHasher`/`RandomState` are process-randomized per `HashMap`
+/// construction and are unusable here for exactly that reason (this is a
+/// distinct concern from `crate::gitstate`'s or `markers::hash_of`'s
+/// same-process marker-name hashing, which never needs cross-process
+/// stability).
+fn warning_set_token(version: &str, diagnoses: &[&str]) -> String {
+    // Bag, not set: duplicates are kept deliberately — a warning set gaining or
+    // losing a duplicate diagnosis is a genuine change and should re-fire.
+    let mut sorted: Vec<&str> = diagnoses.to_vec();
+    sorted.sort_unstable();
+    let mut hasher = Sha256::new();
+    // Length-prefix every field instead of joining on a separator: diagnoses
+    // interpolate plugin-controlled text, so any in-band delimiter could be
+    // embedded to mint a colliding token and mute the day's nag for a
+    // different warning set.
+    hasher.update((version.len() as u64).to_le_bytes());
+    hasher.update(version.as_bytes());
+    for d in &sorted {
+        hasher.update((d.len() as u64).to_le_bytes());
+        hasher.update(d.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Judge an invocation against the registry.
@@ -982,52 +1060,10 @@ fn referenced_clis(command: &str) -> std::collections::BTreeSet<String> {
     out
 }
 
-/// True when `name` resolves on the current `PATH`.
-///
-/// A plain PATH walk rather than shelling to `which`/`command -v`: this check
-/// exists precisely because a CLI may be absent, and asking a subprocess to
-/// answer that question adds a second dependency to the dependency check.
-fn on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| is_executable_at(&dir.join(name)))
-}
-
-/// True when `candidate` is something the shell could actually exec.
-///
-/// On unix that means the executable bit, not merely `is_file()`: a stray
-/// `chmod 644` placeholder earlier on PATH would otherwise read as present
-/// while the shell fails to run it — the check would report health where there
-/// is none.
-#[cfg(unix)]
-fn is_executable_at(candidate: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(candidate)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-/// True when `candidate`, or `candidate` plus any `PATHEXT` suffix, is a file.
-///
-/// Windows resolves an extensionless name through `PATHEXT`, and the default
-/// list is not just `.exe`. Node's global installs ship `.cmd` shims —
-/// `prettier.cmd`, `eslint.cmd`, `markdownlint-cli2.cmd` — so hardcoding `.exe`
-/// would report a large share of the CLIs hooks actually shell to as missing.
-/// No executable-bit concept applies here; presence is the whole test.
-#[cfg(windows)]
-fn is_executable_at(candidate: &Path) -> bool {
-    if candidate.is_file() {
-        return true;
-    }
-    let pathext = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC".to_string());
-    pathext.split(';').filter(|e| !e.is_empty()).any(|ext| {
-        let mut with_ext = candidate.as_os_str().to_os_string();
-        with_ext.push(ext);
-        Path::new(&with_ext).is_file()
-    })
-}
+// `on_path` and `is_executable_at` moved to `cadence_hooks_core::capability`
+// (imported at the top of this file) when the secret guards grew a second need
+// for the same PATH walk. One copy, so the two consumers cannot drift on what
+// "installed" means.
 
 /// Warn once per CLI that an installed hook shells to but PATH cannot resolve.
 ///
@@ -1857,7 +1893,24 @@ fn orphan_findings(
             diagnosis: format!(
                 "{orphan_count} orphaned version dir(s) (~{mib:.1} MiB) left in cache"
             ),
-            remediation: "safe to prune — not the active pinned version".to_string(),
+            // Name the command that actually does this. The previous text sent
+            // readers to `cadence:tend`, which has no plugin-cache handling at
+            // all — so the one warning that also carries the safety
+            // precondition pointed away from both the tool and the gate
+            // (cameronsjo/cadence-hooks#803).
+            //
+            // Liveness IS enforced: `prune_liveness_gate` refuses `--apply`
+            // while any non-stale peer is registered, names them, and offers
+            // `CADENCE_DOCTOR_PRUNE_FORCE=1`. What it cannot see is the other
+            // half of this line's own precondition — the registry is
+            // repo-scoped, so sessions in OTHER checkouts sharing the same
+            // global cache are invisible to it (cameronsjo/cadence-hooks#804).
+            // That residue is why the text still asks the operator to look
+            // across checkouts rather than trusting the refusal alone.
+            remediation: "`cadence-hooks doctor --prune` previews; `--prune --apply` removes. \
+                 Apply refuses while this repo has live sessions — but the registry is \
+                 repo-scoped, so check other checkouts yourself"
+                .to_string(),
         });
     }
 
@@ -2009,28 +2062,97 @@ enum PruneGate {
 /// testable without a live registry.
 ///
 /// `force` overrides everything (the `CADENCE_DOCTOR_PRUNE_FORCE` escape hatch).
-/// A `None` sessions dir means there is nothing to protect (not inside a repo),
-/// so it proceeds. Otherwise it blocks when any non-stale peer is registered,
-/// naming them. `own_session_id` is `""` so the invoking session itself counts
+/// It blocks when any non-stale peer is registered in EITHER registry, naming
+/// them. `own_session_id` is `""` so the invoking session itself counts
 /// as a live peer — a prune must not delete dirs the caller is pinned to —
 /// matching how `run_status` enumerates peers.
 ///
-/// Limitation: the session registry is repo-scoped (`<repo>/.claude/sessions`),
-/// so sessions running in other checkouts against the same global plugin cache
-/// are invisible here — the gate is under-protective across repos, never
-/// over-destructive.
-fn prune_liveness_gate(sessions_dir: Option<&Path>, stale_secs: u64, force: bool) -> PruneGate {
+/// Reads TWO registries and unions them (cadence-hooks#634). The per-checkout
+/// one answers "who else is in this repo"; the cross-checkout mirror
+/// (`session_registry::global_sessions_dir`) answers the question this gate
+/// actually has, which is "who else on this machine is reading the plugin
+/// cache" — a resource no single checkout owns. Gating on the local registry
+/// alone was under-protective by construction: the sessions most likely to be
+/// pinned to a retired version dir are the long-running ones, and there is no
+/// reason those sit in the repo you happen to be pruning from.
+///
+/// A `None` local dir no longer short-circuits. Not being inside a git
+/// repository says nothing about whether other sessions are live, and treating
+/// it as "nothing to protect" is exactly the reasoning that made this
+/// repo-scoped in the first place — the mirror is still consulted.
+///
+/// Deduplicated by session id, because a session registers in BOTH and would
+/// otherwise be named twice in a refusal that counts what it names.
+/// `global_dir` is a PARAMETER, not resolved in here, and that is load-bearing
+/// for the tests rather than a style preference. Resolving it internally would
+/// make every case read the machine's real cross-checkout registry — a
+/// directory that is empty today only because nothing has written it yet, so
+/// `prune_liveness_gate_empty_dir_proceeds` and its siblings would pass now and
+/// go red on a real machine the moment sessions start mirroring, with CI still
+/// green. Injecting it keeps each case hermetic and lets the union itself be
+/// asserted.
+fn prune_liveness_gate(
+    sessions_dir: Option<&Path>,
+    global_dir: Option<&Path>,
+    stale_secs: u64,
+    force: bool,
+) -> PruneGate {
     if force {
         return PruneGate::Proceed;
     }
-    let Some(dir) = sessions_dir else {
-        return PruneGate::Proceed;
-    };
-    let live = session_registry::live_peers(dir, "", stale_secs);
-    if live.is_empty() {
+
+    // Collect by session id, PREFERRING the record that carries a repo.
+    //
+    // First-wins would take whichever registry we happened to read first — the
+    // local one — and during rollout that is exactly the record written by a
+    // pre-`repo` binary, while the mirrored one has the field. The refusal
+    // would then drop the only part a reader can act on. Which registry a
+    // record came from is not the question; whether it can be acted on is.
+    let mut by_session: std::collections::BTreeMap<String, (String, Option<String>)> =
+        std::collections::BTreeMap::new();
+
+    for dir in sessions_dir.into_iter().chain(global_dir) {
+        for peer in session_registry::live_peers(dir, "", stale_secs) {
+            let entry = by_session
+                .entry(peer.record.session_id.clone())
+                .or_insert_with(|| (peer.record.name.clone(), None));
+            if entry.1.is_none() && peer.record.repo.is_some() {
+                entry.1 = peer.record.repo.clone();
+                entry.0 = peer.record.name.clone();
+            }
+        }
+    }
+
+    // SANITIZE both fields. They come from JSON files this process did not
+    // write — in a shared directory, from other sessions entirely — and land on
+    // an interactive terminal in the refusal for a DESTRUCTIVE command. A `\r`
+    // plus crafted text can rewrite the rendered line, e.g. appending "0 live
+    // sessions — safe to force", which talks the operator into
+    // CADENCE_DOCTOR_PRUNE_FORCE=1 and a remove_dir_all. Every other consumer
+    // of these fields already sanitizes; this call site was the lone exception.
+    //
+    // The list is capped so a seeded directory cannot flood the terminal; the
+    // count reported alongside it is the true total.
+    let total = by_session.len();
+    let mut names: Vec<String> = by_session
+        .into_values()
+        .take(MAX_NAMED_PEERS)
+        .map(|(name, repo)| {
+            let name = session_identity::sanitize_field(&name, 40);
+            match repo {
+                Some(repo) => format!("{name} ({})", session_identity::sanitize_field(&repo, 120)),
+                None => name,
+            }
+        })
+        .collect();
+    if total > names.len() {
+        names.push(format!("and {} more", total - names.len()));
+    }
+
+    if names.is_empty() {
         return PruneGate::Proceed;
     }
-    PruneGate::Blocked(live.into_iter().map(|p| p.record.name).collect())
+    PruneGate::Blocked(names)
 }
 
 /// `doctor --prune` entry point: list (or, with `apply`, remove) orphaned
@@ -2118,12 +2240,17 @@ fn run_prune(root_override: Option<&Path>, quiet: bool, apply: bool) -> u8 {
         let sessions_dir = std::env::current_dir()
             .ok()
             .and_then(|cwd| session_registry::sessions_dir(&cwd.to_string_lossy()));
-        if let PruneGate::Blocked(names) =
-            prune_liveness_gate(sessions_dir.as_deref(), stale_secs, force)
-        {
+        let global_dir = session_registry::global_sessions_dir();
+        if let PruneGate::Blocked(names) = prune_liveness_gate(
+            sessions_dir.as_deref(),
+            Some(global_dir.as_path()),
+            stale_secs,
+            force,
+        ) {
             eprintln!(
                 "cadence-hooks doctor --prune --apply: refusing to prune — {} live session(s) may be pinned to these version dirs: {}. \
-                 Run /reload-plugins in any live session first to release the retired dirs, then re-run. \
+                 The gate blocks while any session is REGISTERED, including this one, so /reload-plugins does not clear it: \
+                 end those sessions, or wait out the staleness window, then re-run. \
                  Or re-run with CADENCE_DOCTOR_PRUNE_FORCE=1 to prune anyway.",
                 names.len(),
                 names.join(", ")
@@ -2304,6 +2431,64 @@ fn cadence_config_parse_finding(root: &Path) -> Option<Finding> {
     })
 }
 
+/// Guardrails identity health from the USER settings.json: is
+/// `CADENCE_ALLOWED_OWNERS` set, and are the retired `GIT_GUARDRAILS_ALLOWED_*`
+/// keys still lying around (cameronsjo/cadence-hooks#275)?
+///
+/// Advisory only — a `Warning`, never an `Error`. An unset allowlist is a
+/// legitimate state on a machine that has not run `configure guardrails` yet;
+/// what makes it worth surfacing is that the failure it produces is a *block*
+/// on every push and gh write, which reads as a guard bug rather than as
+/// missing configuration.
+///
+/// Fails open on an unreadable or malformed settings file: this is a config
+/// health check, not a JSON validator, and a false finding about a file the
+/// binary could not read would be worse than silence (ADR-0001).
+fn guardrails_identity_finding(settings_path: &Path) -> Option<Finding> {
+    let content = cadence_hooks_core::paths::read_untrusted_config(settings_path)?;
+    let root = match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => return None,
+    };
+    let current = crate::configure_guardrails::current_from(&root);
+
+    let diagnosis = match (current.owners.is_empty(), current.has_legacy()) {
+        (false, false) => return None,
+        (false, true) => format!(
+            "`{}` is set, but the retired `{}`/`{}` keys are still present in the \
+             env block and are no longer read — they mislead the next person who \
+             edits this file",
+            crate::configure_guardrails::OWNERS_KEY,
+            crate::configure_guardrails::LEGACY_OWNERS_KEY,
+            crate::configure_guardrails::LEGACY_REPOS_KEY,
+        ),
+        (true, true) => format!(
+            "only the retired `{}` key is set — this binary reads `{}`, so every \
+             `git push` and `gh` write is blocked",
+            crate::configure_guardrails::LEGACY_OWNERS_KEY,
+            crate::configure_guardrails::OWNERS_KEY,
+        ),
+        (true, false) => format!(
+            "`{}` is unset or empty — the push and gh-write guards block every \
+             operation until it names at least one GitHub owner",
+            crate::configure_guardrails::OWNERS_KEY,
+        ),
+    };
+
+    Some(Finding {
+        severity: Severity::Warning,
+        plugin: "cadence-guardrails".to_string(),
+        file: settings_path.to_path_buf(),
+        line: None,
+        snippet: crate::configure_guardrails::OWNERS_KEY.to_string(),
+        diagnosis,
+        remediation: "run `cadence-hooks configure guardrails` from a terminal \
+                      (it is refused under Claude Code — it edits the push allowlist), \
+                      then restart Claude Code"
+            .to_string(),
+    })
+}
+
 /// Entry point for the `doctor` subcommand. Returns the process exit code.
 ///
 /// Exit codes:
@@ -2451,6 +2636,15 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             cadence_hooks_core::paths::claude_config_dir(),
         ));
         findings.extend(cloud_sync_findings(&sync_candidates));
+        // Guardrails identity, from the USER settings.json — the same file
+        // `configure guardrails` writes. Live-machine read, so it is gated with
+        // the rest of this block; under `--root` there is no user config to
+        // inspect.
+        if let Some(finding) =
+            guardrails_identity_finding(&crate::configure_guardrails::user_settings_path())
+        {
+            findings.push(finding);
+        }
         if !quiet {
             print_sweep_summary(&metrics_dir, window, now);
             print_platform_drift_status();
@@ -2521,7 +2715,8 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
             );
             return 2;
         }
-        // Warnings only in quiet mode: one summary line to stdout, exit 0.
+        // Warnings only in quiet mode: an enveloped nag to stdout, gated to at
+        // most once per calendar day per distinct warning set (#632).
         // Warnings are now version skew (missing subcommands) and/or stale
         // telemetry, so the summary stays generic and defers the specifics to a
         // full `cadence-hooks doctor` run.
@@ -2529,10 +2724,14 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
         let has_skew = warnings
             .iter()
             .any(|w| w.diagnosis.contains("not present in this binary"));
-        println!(
-            "{}",
-            quiet_warning_summary(version, warnings.len(), has_skew, channel)
-        );
+        let diagnoses: Vec<&str> = warnings.iter().map(|w| w.diagnosis.as_str()).collect();
+        let token = warning_set_token(version, &diagnoses);
+        if cadence_hooks_core::markers::claim_today("doctor-warnings", &token) {
+            println!(
+                "{}",
+                quiet_warning_envelope(version, warnings.len(), has_skew, channel)
+            );
+        }
         return 0;
     }
 
@@ -2563,6 +2762,7 @@ pub fn run(root_override: Option<&Path>, quiet: bool, prune: bool, apply: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cadence_hooks_core::capability::is_executable_at;
     use std::fs;
 
     // ── Finding::render sanitization (#440) ─────────────────────────────────
@@ -3847,6 +4047,49 @@ mod tests {
         );
     }
 
+    /// The remediation must name the command that actually prunes.
+    ///
+    /// It previously named a skill with no plugin-cache handling of any kind
+    /// (cadence-hooks#803), and nothing in the suite could observe that — a
+    /// remediation pointing at the wrong tool is invisible in both directions,
+    /// so it could rot again with no red anywhere. This is the assertion that
+    /// makes the recurrence detectable.
+    #[test]
+    fn orphan_finding_remediation_names_the_prune_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("mp/plugin");
+        for sha in ["sha1", "sha2"] {
+            let dir = plugin_dir.join(sha);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("marker"), "x").unwrap();
+        }
+        let pinned = vec![("plugin@mp".to_string(), plugin_dir.join("sha2"))];
+
+        let findings = orphan_findings(
+            &pinned,
+            false,
+            tmp.path(),
+            &tmp.path().join("known_marketplaces.json"),
+        );
+        let orphan_finding = findings
+            .iter()
+            .find(|f| f.diagnosis.contains("orphaned"))
+            .expect("should report orphans");
+
+        assert!(
+            orphan_finding
+                .remediation
+                .contains("cadence-hooks doctor --prune"),
+            "remediation must name the command that does the work, got: {}",
+            orphan_finding.remediation
+        );
+        assert!(
+            orphan_finding.remediation.contains("--apply"),
+            "remediation must distinguish the dry run from the removal, got: {}",
+            orphan_finding.remediation
+        );
+    }
+
     #[test]
     fn orphan_findings_missing_pinned_dir_is_warning() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3953,8 +4196,8 @@ mod tests {
     #[test]
     fn orphan_findings_excludes_active_pins_sharing_parent() {
         // Two active pins (sha-A/sha-B) sharing a parent must NEVER be
-        // reported as "safe to prune" — only the genuine orphan (sha-C)
-        // should generate a finding, and exactly one (not one per label).
+        // flagged for pruning — only the genuine orphan (sha-C) should
+        // generate a finding, and exactly one (not one per label).
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("cache/mp/p");
         for sha in ["sha-A", "sha-B", "sha-C"] {
@@ -4605,33 +4848,91 @@ mod tests {
         assert!(!h.contains("brew"), "{h}");
     }
 
-    // ── quiet_warning_summary (#306) ────────────────────────────────────────
+    // ── quiet_warning_envelope (#306, #632) ─────────────────────────────────
 
     #[test]
-    fn quiet_summary_names_actor_and_action() {
-        let s = quiet_warning_summary("0.60.0", 2, false, InstallChannel::Unknown);
-        assert!(s.contains("Claude:"), "must name the actor: {s}");
+    fn quiet_envelope_carries_tags_must_sentence_and_count_line() {
+        let s = quiet_warning_envelope("0.60.0", 2, false, InstallChannel::Unknown);
         assert!(
-            s.contains("run 'cadence-hooks doctor'"),
-            "must name the action: {s}"
+            s.starts_with("<cadence-system-message>\n"),
+            "must open with the envelope tag: {s}"
+        );
+        assert!(
+            s.trim_end().ends_with("</cadence-system-message>"),
+            "must close with the envelope tag: {s}"
+        );
+        assert!(
+            s.contains("You MUST run 'cadence-hooks doctor'"),
+            "must carry the MUST directive: {s}"
+        );
+        assert!(
+            s.contains("cadence-hooks 0.60.0: 2 plugin warning(s)."),
+            "must carry the version/count line: {s}"
         );
     }
 
     #[test]
-    fn quiet_summary_no_skew_omits_upgrade_hint() {
-        let s = quiet_warning_summary("0.60.0", 1, false, InstallChannel::Homebrew);
+    fn quiet_envelope_no_skew_omits_upgrade_hint() {
+        let s = quiet_warning_envelope("0.60.0", 1, false, InstallChannel::Homebrew);
         assert!(!s.contains("brew upgrade"), "no upgrade hint expected: {s}");
         assert!(!s.contains("Version skew"), "no skew clause expected: {s}");
     }
 
     #[test]
-    fn quiet_summary_skew_includes_upgrade_hint() {
-        let s = quiet_warning_summary("0.60.0", 1, true, InstallChannel::Homebrew);
+    fn quiet_envelope_skew_includes_upgrade_hint() {
+        let s = quiet_warning_envelope("0.60.0", 1, true, InstallChannel::Homebrew);
         assert!(s.contains("Version skew"), "skew clause expected: {s}");
         assert!(
             s.contains("brew upgrade cadence-hooks"),
             "Homebrew skew hint expected: {s}"
         );
+    }
+
+    // ── warning_set_token (#632) ─────────────────────────────────────────────
+
+    #[test]
+    fn warning_set_token_is_order_insensitive() {
+        let a = warning_set_token("0.60.0", &["diag-a", "diag-b"]);
+        let b = warning_set_token("0.60.0", &["diag-b", "diag-a"]);
+        assert_eq!(
+            a, b,
+            "sort order of the input slice must not change the token"
+        );
+    }
+
+    #[test]
+    fn warning_set_token_changes_when_a_diagnosis_changes() {
+        let a = warning_set_token("0.60.0", &["diag-a", "diag-b"]);
+        let b = warning_set_token("0.60.0", &["diag-a", "diag-c"]);
+        assert_ne!(a, b, "a changed diagnosis must mint a different token");
+    }
+
+    #[test]
+    fn warning_set_token_changes_when_version_changes() {
+        let a = warning_set_token("0.60.0", &["diag-a"]);
+        let b = warning_set_token("0.61.0", &["diag-a"]);
+        assert_ne!(a, b, "a version bump must mint a different token");
+    }
+
+    // ── doctor-warnings daily gate (#632) ────────────────────────────────────
+
+    #[test]
+    fn doctor_warnings_gate_suppresses_second_call_with_same_token() {
+        // Mirrors the marker-family's own `with_marker_dir` pattern
+        // (crates/core/src/markers.rs) so the stamp lands in a fresh private
+        // tempdir rather than the real per-user marker directory.
+        let marker_tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(marker_tmp.path(), || {
+            let token = warning_set_token("0.60.0", &["diag-a"]);
+            assert!(
+                cadence_hooks_core::markers::claim_today("doctor-warnings", &token),
+                "first sighting today must fire"
+            );
+            assert!(
+                !cadence_hooks_core::markers::claim_today("doctor-warnings", &token),
+                "the same token must be silent for the rest of the day"
+            );
+        });
     }
 
     // ── integration tests via run(Some(tmpdir), ...) ─────────────────────────
@@ -5011,7 +5312,7 @@ mod tests {
         let tmp = seed_session("forge-anvil", "peer-session");
         let dir = tmp.path().join(".claude").join("sessions");
         assert!(matches!(
-            prune_liveness_gate(Some(&dir), 600, true),
+            prune_liveness_gate(Some(&dir), None, 600, true),
             PruneGate::Proceed
         ));
     }
@@ -5019,7 +5320,7 @@ mod tests {
     #[test]
     fn prune_liveness_gate_none_dir_proceeds() {
         assert!(matches!(
-            prune_liveness_gate(None, 600, false),
+            prune_liveness_gate(None, None, 600, false),
             PruneGate::Proceed
         ));
     }
@@ -5028,7 +5329,7 @@ mod tests {
     fn prune_liveness_gate_empty_dir_proceeds() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(matches!(
-            prune_liveness_gate(Some(tmp.path()), 600, false),
+            prune_liveness_gate(Some(tmp.path()), None, 600, false),
             PruneGate::Proceed
         ));
     }
@@ -5038,11 +5339,201 @@ mod tests {
         let tmp = seed_session("forge-anvil", "peer-session");
         let dir = tmp.path().join(".claude").join("sessions");
         // Large stale window so the just-written record counts as live.
-        match prune_liveness_gate(Some(&dir), 600, false) {
+        match prune_liveness_gate(Some(&dir), None, 600, false) {
             PruneGate::Blocked(names) => {
                 assert!(
                     names.contains(&"forge-anvil".to_string()),
                     "block must name the live session: {names:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a live session must block the prune"),
+        }
+    }
+
+    /// The cadence-hooks#634 case: a session live in ANOTHER checkout.
+    ///
+    /// This is the whole point of the mirror. The local registry is empty — the
+    /// operator is pruning from a repo with no peers — while a session is live
+    /// somewhere else on the machine, pinned to version dirs the prune would
+    /// delete out from under it. The old gate proceeded here.
+    ///
+    /// It also asserts the refusal names the REPO, because "a session called
+    /// forge-anvil is live" is not actionable when the reader cannot tell which
+    /// of a dozen checkouts to go release it in.
+    #[test]
+    fn prune_liveness_gate_blocks_on_a_peer_in_another_checkout() {
+        let local = tempfile::tempdir().unwrap();
+        let local_dir = local.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&local_dir).unwrap();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "distant-anvil".into(),
+            session_id: "other-checkout-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            repo: Some("/Users/x/Projects/other-repo".into()),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        // Control: without the mirror this is the old, under-protective answer.
+        assert!(
+            matches!(
+                prune_liveness_gate(Some(&local_dir), None, 600, false),
+                PruneGate::Proceed
+            ),
+            "local registry alone sees nothing — this is the defect"
+        );
+
+        match prune_liveness_gate(Some(&local_dir), Some(&global_dir), 600, false) {
+            PruneGate::Blocked(names) => {
+                assert_eq!(names.len(), 1, "one live peer: {names:?}");
+                assert!(
+                    names[0].contains("distant-anvil"),
+                    "must name the session: {names:?}"
+                );
+                assert!(
+                    names[0].contains("/Users/x/Projects/other-repo"),
+                    "must name the repo, or the reader cannot act on it: {names:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a peer in another checkout must block the prune"),
+        }
+    }
+
+    /// A session registers in BOTH registries, so the naive union counts it
+    /// twice — and the refusal reports a count of what it names, so a duplicate
+    /// inflates "2 live session(s)" for one session. Dedupe is by session id,
+    /// not by name, because names are generated from the id and two records for
+    /// one session are the same session however they are spelled.
+    #[test]
+    fn prune_liveness_gate_counts_a_session_once_across_both_registries() {
+        let tmp = seed_session("forge-anvil", "peer-session");
+        let local_dir = tmp.path().join(".claude").join("sessions");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "forge-anvil".into(),
+            session_id: "peer-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            // Only the MIRROR record carries a repo here, deliberately: a local
+            // record written by a pre-`repo` binary paired with a mirrored one
+            // that has it is the real state during rollout. Asserting only the
+            // count would pass while silently dropping the actionable field.
+            repo: Some("/Users/x/Projects/some-repo".into()),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        match prune_liveness_gate(Some(&local_dir), Some(&global_dir), 600, false) {
+            PruneGate::Blocked(names) => {
+                assert_eq!(
+                    names.len(),
+                    1,
+                    "one session mirrored into both registries is still one session: {names:?}"
+                );
+                assert!(
+                    names[0].contains("/Users/x/Projects/some-repo"),
+                    "dedupe must keep the record that can be acted on: {names:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a live session must block the prune"),
+        }
+    }
+
+    /// A cwd outside any git repository used to short-circuit to Proceed, on
+    /// the reasoning that there was "nothing to protect". That reasoning is the
+    /// repo-scoped assumption itself: not being in a repo says nothing about
+    /// whether other sessions on the machine are live, and the cache they share
+    /// is not owned by any checkout.
+    #[test]
+    fn prune_liveness_gate_consults_the_mirror_with_no_local_registry() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "distant-anvil".into(),
+            session_id: "some-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        assert!(
+            matches!(
+                prune_liveness_gate(None, Some(&global_dir), 600, false),
+                PruneGate::Blocked(_)
+            ),
+            "no local registry must not mean no live sessions"
+        );
+    }
+
+    /// The escape hatch has to work against the NEW arm too, or an operator
+    /// facing a cross-checkout block has no way through at all.
+    #[test]
+    fn prune_liveness_gate_force_overrides_a_global_peer() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            name: "distant-anvil".into(),
+            session_id: "blocking-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        assert!(
+            matches!(
+                prune_liveness_gate(None, Some(&global_dir), 600, false),
+                PruneGate::Blocked(_)
+            ),
+            "control: without force this blocks"
+        );
+        assert!(
+            matches!(
+                prune_liveness_gate(None, Some(&global_dir), 600, true),
+                PruneGate::Proceed
+            ),
+            "force must override the cross-checkout arm too"
+        );
+    }
+
+    /// Record fields come from JSON this process did not write and land on an
+    /// interactive terminal in a DESTRUCTIVE command's refusal. A control
+    /// character there can rewrite the rendered line.
+    #[test]
+    fn prune_refusal_sanitizes_record_fields() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let global_dir = elsewhere.path().join("live-sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            // Hostile content goes in `repo`, not `name`: the record FILENAME
+            // derives from the name, and Windows rejects control characters in
+            // filenames, so a hostile name makes the fixture unwritable there
+            // rather than testing the renderer. The name exercises the length
+            // cap instead — the other half of the same sanitize call.
+            name: "x".repeat(200),
+            session_id: "hostile-session".into(),
+            started: cadence_hooks_session::identity::utc_timestamp(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            repo: Some("/repo\r\u{1b}[2K0 live sessions — safe to force".into()),
+            ..Default::default()
+        };
+        session_registry::write_record(&global_dir, &rec).unwrap();
+
+        match prune_liveness_gate(None, Some(&global_dir), 600, false) {
+            PruneGate::Blocked(names) => {
+                let rendered = names.join(" ");
+                assert!(
+                    !rendered.contains('\r') && !rendered.contains('\u{1b}'),
+                    "control characters must never reach the terminal: {rendered:?}"
+                );
+                assert!(
+                    rendered.len() < 200,
+                    "an overlong name must be capped, not rendered whole: {rendered:?}"
                 );
             }
             PruneGate::Proceed => panic!("a live session must block the prune"),
@@ -5056,9 +5547,91 @@ mod tests {
         // stale_secs = 0: any measurable mtime age makes the peer stale.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(matches!(
-            prune_liveness_gate(Some(&dir), 0, false),
+            prune_liveness_gate(Some(&dir), None, 0, false),
             PruneGate::Proceed
         ));
+    }
+
+    // ── guardrails_identity_finding (#275) ───────────────────────────────────
+
+    /// Write a user-level settings.json body and return its path.
+    fn seed_user_settings(body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn guardrails_identity_configured_machine_is_clean() {
+        let (_dir, path) = seed_user_settings(r#"{"env":{"CADENCE_ALLOWED_OWNERS":"cameronsjo"}}"#);
+
+        assert!(guardrails_identity_finding(&path).is_none());
+    }
+
+    #[test]
+    fn guardrails_identity_unset_owners_warns_about_blocked_pushes() {
+        let (_dir, path) = seed_user_settings(r#"{"env":{"SOMETHING_ELSE":"x"}}"#);
+
+        let finding = guardrails_identity_finding(&path).expect("unset owners warns");
+
+        assert_eq!(finding.severity, Severity::Warning);
+        assert!(
+            finding.diagnosis.contains("unset or empty"),
+            "{}",
+            finding.diagnosis
+        );
+        assert!(
+            finding.remediation.contains("configure guardrails"),
+            "names the fix: {}",
+            finding.remediation
+        );
+    }
+
+    #[test]
+    fn guardrails_identity_legacy_only_says_every_push_is_blocked() {
+        let (_dir, path) =
+            seed_user_settings(r#"{"env":{"GIT_GUARDRAILS_ALLOWED_OWNERS":"cameronsjo"}}"#);
+
+        let finding = guardrails_identity_finding(&path).expect("legacy-only warns");
+
+        assert!(
+            finding.diagnosis.contains("is blocked"),
+            "{}",
+            finding.diagnosis
+        );
+        assert!(
+            finding.diagnosis.contains("GIT_GUARDRAILS_ALLOWED_OWNERS"),
+            "names the legacy key: {}",
+            finding.diagnosis
+        );
+    }
+
+    #[test]
+    fn guardrails_identity_lingering_legacy_alongside_current_warns() {
+        let (_dir, path) = seed_user_settings(
+            r#"{"env":{
+                 "CADENCE_ALLOWED_OWNERS":"cameronsjo",
+                 "GIT_GUARDRAILS_ALLOWED_OWNERS":"cameronsjo"
+               }}"#,
+        );
+
+        let finding = guardrails_identity_finding(&path).expect("lingering legacy warns");
+
+        assert!(
+            finding.diagnosis.contains("no longer read"),
+            "{}",
+            finding.diagnosis
+        );
+    }
+
+    #[test]
+    fn guardrails_identity_fails_open_on_missing_or_malformed_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(guardrails_identity_finding(&dir.path().join("absent.json")).is_none());
+
+        let (_dir, path) = seed_user_settings("{ not json");
+        assert!(guardrails_identity_finding(&path).is_none());
     }
 
     // ── legacy_config_findings / cadence_config_parse_finding (#153) ─────────

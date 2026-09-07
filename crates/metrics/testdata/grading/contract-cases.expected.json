@@ -1,0 +1,68 @@
+{
+  "wallClockMs": 21300000,
+  "gaps": [
+    {
+      "startTs": "2020-01-01T00:00:00.000Z",
+      "endTs": "2020-01-01T00:45:00.001Z",
+      "gapMs": 2700001,
+      "contextTokensAtGap": null,
+      "coldRestartUsd": 0.0
+    },
+    {
+      "startTs": "2020-01-01T01:30:00.700Z",
+      "endTs": "2020-01-01T02:30:00.701Z",
+      "gapMs": 3600001,
+      "contextTokensAtGap": 150010,
+      "coldRestartUsd": 2.109261
+    },
+    {
+      "startTs": "2020-01-01T02:40:00.000Z",
+      "endTs": "2020-01-01T03:46:40.000Z",
+      "gapMs": 4000000,
+      "contextTokensAtGap": 520020,
+      "coldRestartUsd": 0.0
+    },
+    {
+      "startTs": "2020-01-01T03:48:20.000Z",
+      "endTs": "2020-01-01T04:50:00.000Z",
+      "gapMs": 3700000,
+      "contextTokensAtGap": 300002,
+      "coldRestartUsd": null
+    },
+    {
+      "startTs": "2020-01-01T04:51:40.000Z",
+      "endTs": "2020-01-01T05:55:00.000Z",
+      "gapMs": 3800000,
+      "contextTokensAtGap": 11000,
+      "coldRestartUsd": null
+    }
+  ],
+  "coldRestartUsdTotal": 2.109261,
+  "activeMs": 3499998,
+  "peakContextTokens": 520020,
+  "contextTier": "over500k",
+  "compactions": {
+    "manual": 1,
+    "auto": 1,
+    "other": 1,
+    "maxPreTokens": 310000
+  },
+  "modelRefusalFallbacks": 1,
+  "longestTurnMs": 2799998,
+  "assistantTurns": 5,
+  "userPrompts": 3,
+  "turnsPerPrompt": 1.7,
+  "flags": {
+    "longSession": true,
+    "afkGap": true,
+    "coldRestart": true,
+    "context500k": true,
+    "context750k": false,
+    "autoCompacted": true,
+    "modelFallback": true,
+    "grind": false
+  },
+  "config": {
+    "grindTurnsPerPrompt": 30
+  }
+}

@@ -107,9 +107,11 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
     // Hoisted above the stdin parse so both the parse-failure arm and the
     // decided-result arm below can record against the same canonical name.
     let hook_name = hook.unwrap_or_else(|| check.name());
-    let input = match HookInput::from_stdin() {
+    let input = match HookInput::from_stdin_detailed() {
         Ok(input) => input,
         Err(e) => {
+            let unenumerable_patch = e.patch_targets_unenumerable;
+            let e = e.message;
             eprintln!("cadence-hooks: {e}");
             // `e` is this binary's own message ("Failed to parse hook JSON:
             // <serde error>") — a line/column locator, never an echo of the
@@ -121,11 +123,22 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                 env!("CARGO_PKG_VERSION"),
                 Some(&e),
             );
-            if codex_fail_closed(hook_name) {
+            // Fail CLOSED only for an `apply_patch` body whose targets could not
+            // be enumerated, on a security-critical hook — the same pair of
+            // conditions the pre-#1040 code fired on. That path LOOKED
+            // harness-gated and was not: `tool_name: "apply_patch"` armed the
+            // harness sniff on the raw value before the patch rewrite errored,
+            // so it blocked with no env var set. Ordinary malformed JSON still
+            // fails open (ADR-0001), exactly as before.
+            //
+            // Verified against a binary built from the pre-change `main`:
+            //   conflicting apply_patch bodies, no env -> exit 2
+            //   plain unparseable JSON, no env         -> exit 0
+            if unenumerable_patch && crate::registry::is_security_critical(hook_name) {
                 eprintln!(
-                    "cadence-hooks: security-critical hook input could not be parsed; \
-                     blocking because the guard cannot prove the operation safe. \
-                     Fix the hook payload/schema or run the reviewed operation yourself."
+                    "cadence-hooks: blocked because security-critical patch targets \
+                     could not be enumerated. Review the patch and retry with a \
+                     parseable operation, or apply it yourself."
                 );
                 process::exit(2);
             }
@@ -142,15 +155,36 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
                 env!("CARGO_PKG_VERSION"),
                 Some(&error),
             );
-            if codex_fail_closed(hook_name) {
+            // The diagnostic names why normalization gave up without ever
+            // echoing the patch body — `error` is this binary's own message and
+            // every `patch::parse` error is a static string.
+            eprintln!("cadence-hooks: {error}");
+            // Fail CLOSED on a security-critical hook, unconditionally.
+            //
+            // This arm used to be gated on the Codex harness, but that gate was
+            // never really a gate: the only payload that reaches it carries
+            // `tool_name: "apply_patch"`, which armed the harness sniff by
+            // itself, so it fired with no env var set. Retiring the harness
+            // (#1040) therefore silently turned a live fail-closed path into a
+            // fail-open one — caught by an Opus review's old-vs-new differential,
+            // not by the suite.
+            //
+            // `patch.rs` and the guards that consume it were retained
+            // deliberately, so the route keeps its partner. The asymmetry the
+            // original design warned about — normalization unconditional,
+            // hardening conditional — is the exact shape being avoided here.
+            //
+            // Not an ADR-0001 violation: that rule protects the user from a
+            // guard's OWN failure. This is the input being unparseable, so the
+            // guard cannot prove the operation safe and says so.
+            if crate::registry::is_security_critical(hook_name) {
                 eprintln!(
-                    "cadence-hooks: {error}; blocked because security-critical patch \
-                     targets could not be enumerated. Review the patch and retry with \
-                     a parseable operation or apply it yourself."
+                    "cadence-hooks: blocked because security-critical patch targets \
+                     could not be enumerated. Review the patch and retry with a \
+                     parseable operation, or apply it yourself."
                 );
                 process::exit(2);
             }
-            eprintln!("cadence-hooks: {error}");
             process::exit(0);
         }
     };
@@ -246,9 +280,49 @@ pub fn run_logged_check(check: &dyn Check, event: HookEvent, hook: Option<&str>)
             // (Allow/Nudge let the tool proceed, so those still do).
             let enforced = matches!(result.outcome, Outcome::Block | Outcome::Ask);
             emit_telemetry_tail(enforced);
+            // Sits AFTER the telemetry tail on purpose: a suppressed duplicate
+            // is still a decision this hook made, so it stays counted in
+            // `denials.jsonl` and `hooks.jsonl`. Only the operator-facing
+            // emission is dropped.
+            if !claim_emission(&result, &input, event, hook_name) {
+                process::exit(Outcome::Nudge.code());
+            }
             emit_and_exit(&result, event);
         }
     }
+}
+
+/// Should this decision's advisory context actually reach the operator?
+///
+/// One `hooks.json` can register the same command several times under one
+/// matcher with overlapping `if:` globs, so a single tool call spawns N
+/// identical hook processes that each print the same advisory
+/// (claude-configurations#472). Every one of them sees the same payload, so
+/// they claim the same key and only the first emits.
+///
+/// **Only `Nudge` is gated, and only with a non-empty message.** A `Block` or
+/// `Ask` stops the operation, so suppressing its message would leave the
+/// operator staring at a halted tool call with no reason given — an advisory
+/// heard twice is noise, an enforcement heard zero times is a broken guard.
+/// `Allow` has nothing to say. The message is part of the key, so two hooks
+/// with genuinely different things to report both still speak.
+///
+/// **And only for a hook in `markers::DEDUPE_ELIGIBLE_HOOKS`** — the handful of
+/// commands actually registered more than once in a single matcher block. Every
+/// other hook reaches the operator unconditionally, whatever the key says.
+fn claim_emission(
+    result: &CheckResult,
+    input: &HookInput,
+    event: HookEvent,
+    hook_name: &str,
+) -> bool {
+    if result.outcome != Outcome::Nudge {
+        return true;
+    }
+    let Some(message) = result.message.as_deref().filter(|m| !m.is_empty()) else {
+        return true;
+    };
+    cadence_hooks_core::markers::claim_tool_event_nudge(input, event, hook_name, message)
 }
 
 /// One invocation's decision, plus the two things the audit writes need that the
@@ -328,10 +402,6 @@ fn aggregate_results(mut results: Vec<CheckResult>) -> Option<Aggregated> {
         outcomes,
         bypasses,
     })
-}
-
-fn codex_fail_closed(hook_name: &str) -> bool {
-    cadence_hooks_core::is_codex_harness() && crate::registry::is_security_critical(hook_name)
 }
 
 /// Run a fire-and-forget logger from stdin, record its wall-clock time to
@@ -566,5 +636,132 @@ mod tests {
             ["dismiss-guard-rm", "CADENCE_ALLOW_MAIN"],
             "three rides of one dismissal are one event; a second mechanism is another"
         );
+    }
+
+    // --- claim_emission (the per-tool-event advisory dedupe gate, #472) ---
+
+    /// The payload every process of one fan-out sees: same session, same
+    /// command, same everything.
+    fn fanout_input(command: &str) -> HookInput {
+        HookInput {
+            session_id: Some("sid-472".into()),
+            ..cadence_hooks_core::test_builders::make_bash(command)
+        }
+    }
+
+    #[test]
+    fn dedupe_suppresses_a_repeat_nudge() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("git push");
+            let nudge = CheckResult::nudge("mind the overshare");
+
+            assert!(
+                claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-overshare"),
+                "the first process of the fan-out must emit"
+            );
+            assert!(
+                !claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-overshare"),
+                "a second identical registration must stay silent"
+            );
+            assert!(
+                claim_emission(
+                    &CheckResult::nudge("a different advisory"),
+                    &input,
+                    HookEvent::PreToolUse,
+                    "warn-overshare"
+                ),
+                "a genuinely different message is different information and must reach the operator"
+            );
+        });
+    }
+
+    #[test]
+    fn dedupe_never_suppresses_a_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("git push --force origin main");
+            let block = CheckResult::block("blocked");
+            let ask = CheckResult {
+                outcome: Outcome::Ask,
+                message: Some("confirm?".to_string()),
+                block_metadata: None,
+                bypass: None,
+            };
+
+            for _ in 0..3 {
+                assert!(
+                    claim_emission(&block, &input, HookEvent::PreToolUse, "git-safety"),
+                    "an enforcement message must never be deduped away"
+                );
+                assert!(
+                    claim_emission(&ask, &input, HookEvent::PreToolUse, "git-safety"),
+                    "an Ask gates the operator and must always carry its reason"
+                );
+            }
+        });
+    }
+
+    /// The #472 regression fixture: one multi-command Bash call, registered
+    /// under overlapping `if:` globs that each match a different segment
+    /// (`git commit`, `git push`, `gh pr create`), spawns three processes with
+    /// identical payloads — and must produce exactly ONE emission. The fixture
+    /// hook is `warn-overshare` — a hook still on `DEDUPE_ELIGIBLE_HOOKS` with
+    /// genuinely overlapping registrations (`nudge-polish-before-pr` left the
+    /// list when cadence#912 consolidated its wiring).
+    #[test]
+    fn dedupe_collapses_a_multi_command_fan_out_to_one_emission() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("git commit -m 'ship it' && git push && gh pr create --fill");
+            let nudge = CheckResult::nudge("possible overshare in the outgoing content");
+
+            let emissions = (0..3)
+                .filter(|_| claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-overshare"))
+                .count();
+
+            assert_eq!(
+                emissions, 1,
+                "three overlapping registrations of one tool event must nudge once"
+            );
+        });
+    }
+
+    /// The narrowing that makes the gate safe: a hook that is NOT a known
+    /// fan-out offender is never gated, so two same-event nudges from it both
+    /// reach the operator even when their payload fingerprints identically.
+    ///
+    /// Shaped after `warn-empty-answers` / `warn-recommended-option`, which fire
+    /// per *question* within one `AskUserQuestion` call — same session, same
+    /// tool payload, genuinely different things to say.
+    #[test]
+    fn non_allowlisted_hook_is_never_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        cadence_hooks_core::test_builders::with_marker_dir(tmp.path(), || {
+            let input = fanout_input("irrelevant — the payload is identical either way");
+            let nudge = CheckResult::nudge("that answer set looks empty");
+
+            for _ in 0..5 {
+                assert!(
+                    claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-empty-answers"),
+                    "a hook outside DEDUPE_ELIGIBLE_HOOKS must never be suppressed, \
+                     however identical the event looks"
+                );
+            }
+
+            // Positive control: the same identical repeat IS collapsed for an
+            // allowlisted hook, so the assertion above proves the allowlist and
+            // not a dead gate.
+            assert!(claim_emission(
+                &nudge,
+                &input,
+                HookEvent::PreToolUse,
+                "warn-overshare"
+            ));
+            assert!(
+                !claim_emission(&nudge, &input, HookEvent::PreToolUse, "warn-overshare"),
+                "the gate must still collapse a real fan-out"
+            );
+        });
     }
 }

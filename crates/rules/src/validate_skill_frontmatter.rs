@@ -76,10 +76,188 @@ enum FileType {
     Other,
 }
 
+/// Upper bound on a path we will scan. Past this we classify as `Other` rather
+/// than walk it: `file_path` is unbounded agent-supplied input, and the scan
+/// below pays a `stat` per candidate directory, so an absurd path is a way to
+/// stall the hook. Failing open here matches ADR-0001 — a guard that times out
+/// protects nobody either.
+const MAX_PATH_BYTES: usize = 4096;
+
+/// Split a path into segments, dropping what carries no meaning (`//` and
+/// `/./`) and folding `..`, so the classifier sees the directory the write
+/// actually lands in.
+///
+/// `normalize_path` upstream (`crates/core`) only maps `\` to `/`, strips NULs,
+/// and trims trailing slashes — it does none of this — so `/repo/.claude//commands/x.md`
+/// and `/repo/.claude/./commands/x.md` arrive verbatim. Comparing raw segments
+/// would see `""` or `"."` as the parent and miss a real command definition.
+///
+/// Returns the absolute ROOT PREFIX alongside the segments, because the two
+/// supported platforms spell it differently and the marker probe has to
+/// reconstruct a real path from them. On Unix the prefix is `/`; on Windows a
+/// path reaches us as `C:/Users/...` — `normalize_path` maps `\` to `/` but
+/// leaves the drive letter — so the prefix is `C:/` and rebuilding with a
+/// leading slash would produce `/C:/Users/...`, which stats nothing.
+///
+/// `None` means "do not classify": a relative path, or one past the size bound.
+/// Relative paths are refused because the marker probe below resolves against
+/// the hook process's cwd, so the same path would classify differently
+/// depending on where the process happens to stand.
+///
+/// The Windows case is easy to lose and expensive when lost: every test fixture
+/// in this file is a Unix-style string, which is a perfectly valid input on
+/// either platform, so a predicate that rejects `C:/...` disables the whole
+/// command arm on Windows with the suite fully green. `windows_drive_paths_still_classify`
+/// is the control for that.
+fn normalized_segments(path: &str) -> Option<(&str, Vec<&str>)> {
+    if path.len() > MAX_PATH_BYTES {
+        return None;
+    }
+    let (prefix, rest) = if let Some(rest) = path.strip_prefix('/') {
+        ("/", rest)
+    } else if path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && path.as_bytes().get(1) == Some(&b':')
+        && path.as_bytes().get(2) == Some(&b'/')
+    {
+        (&path[..3], &path[3..])
+    } else {
+        return None;
+    };
+
+    let mut segments: Vec<&str> = Vec::new();
+    for raw in rest.split('/') {
+        match raw {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+    Some((prefix, segments))
+}
+
+/// Is `segments` — the directory that holds a `commands/` or `skills/` tree —
+/// somewhere Claude Code actually loads definitions from?
+///
+/// Three shapes:
+///
+/// 1. A config directory: user (`~/.claude`) or project (`<repo>/.claude`) —
+///    and whatever `CLAUDE_CONFIG_DIR` names, per [`CONFIG_DIR_NAME`].
+/// 2. A plugin root, identified by its sibling `.claude-plugin/` marker. This
+///    covers the installed cache (`<cache>/<marketplace>/<plugin>/<sha>/`), the
+///    monorepo's `plugins/<plugin>/`, and a standalone plugin repo root alike —
+///    all 14 plugins in the cadence monorepo carry the marker, so nothing needs
+///    a `plugins/` path-segment rule to be recognised.
+/// 3. A repo that is itself a Claude workspace, identified by a sibling
+///    `.claude/` directory. This is the SYMLINK-FARM layout: `cmux` keeps its
+///    20 skills at `cmux/skills/<name>/` and links them in from
+///    `cmux/.claude/skills/<name>`, so the canonical path an agent edits — the
+///    link TARGET — has no `.claude` ancestor at all and rule 1 never sees it.
+///    Narrow by construction: the candidate root is the `skills/` or
+///    `commands/` parent, so `<repo>/docs/skills/…` asks about `<repo>/docs`,
+///    which is not a workspace, and stays documentation.
+///
+/// An earlier draft of this fix DID carry that extra rule — accept any
+/// `plugins/<name>/commands/` triple — as a fast path to skip the `stat`. It
+/// reintroduced the very bug being fixed one directory deeper:
+/// `<repo>/docs/plugins/<name>/commands/overview.md` is documentation ABOUT
+/// plugins and was hard-blocked by it. The marker covers every real instance,
+/// so the fast path bought one `stat` and cost a false block.
+///
+/// Comparisons are ASCII-case-insensitive because APFS and NTFS are: a write to
+/// `/repo/.Claude/commands/x.md` lands in the real `.claude` directory, and a
+/// case-sensitive compare would let it skip validation.
+///
+/// Fails OPEN: an absent or unreadable marker classifies as `Other`, so the
+/// guard's own I/O trouble can never block an edit (ADR-0001). The known cost is
+/// a missed nudge on a plugin being scaffolded whose `.claude-plugin/` does not
+/// exist yet — the cheaper failure, since a guardrail's real price is a false
+/// block on legitimate work, not a missed nudge.
+/// Is this path segment a Claude config directory?
+///
+/// Pure and parameterised over the config-dir name **so it can be tested**.
+/// [`CONFIG_DIR_NAME`] is a process-lifetime cache, and on a machine whose
+/// `CLAUDE_CONFIG_DIR` is unset it resolves to `.claude` — so a test written
+/// against the cache passes identically whether or not the relocated-dir rule
+/// exists, which is no test at all. Passing the name in is what lets a control
+/// go red.
+fn is_config_dir_segment(segment: &str, config_dir_name: &str) -> bool {
+    segment.eq_ignore_ascii_case(".claude") || segment.eq_ignore_ascii_case(config_dir_name)
+}
+
+fn is_definition_root(prefix: &str, segments: &[&str]) -> bool {
+    if segments
+        .last()
+        .is_some_and(|parent| is_config_dir_segment(parent, &CONFIG_DIR_NAME))
+    {
+        return true;
+    }
+    if segments.is_empty() {
+        return false;
+    }
+    let root = std::path::Path::new(prefix).join(segments.join("/"));
+    root.join(".claude-plugin").is_dir() || root.join(".claude").is_dir()
+}
+
+/// The basename of the ACTIVE config dir, which is `.claude` by default but is
+/// whatever `CLAUDE_CONFIG_DIR` names when a second subscription profile is in
+/// use (`claude-as` runs one; `~/.claude-alt` holds 26 live skills). Matching
+/// only the literal `.claude` silently stops validating every definition in
+/// that profile — the same six rules, no error, no signal.
+///
+/// The binary already resolves this correctly for every other purpose
+/// (`cadence_hooks_core::paths::claude_config_dir`); the classifier simply
+/// never asked. Cached because a hook is a short-lived process and the env does
+/// not move underneath it.
+static CONFIG_DIR_NAME: LazyLock<String> = LazyLock::new(|| {
+    cadence_hooks_core::paths::claude_config_dir()
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| ".claude".to_string())
+});
+
+/// Does this path pass through a `<kind>/` directory that a definition root
+/// actually owns — `commands` for slash commands, `skills` for skills?
+///
+/// Both arms were once a bare substring test (`contains("/commands/")`,
+/// `contains("/skills/")`), and both swept in ordinary project documentation:
+/// `<repo>/docs/commands/*.md` is a natural home for a CLI's per-command-group
+/// pages (forgectl keeps nine, none of which has or should have YAML
+/// frontmatter), and `<repo>/docs/skills/<x>/SKILL.md` is the same thing one
+/// noun over. Every edit to those files was hard-blocked for "missing
+/// frontmatter", with no way forward but adding meaningless frontmatter or
+/// bypassing the guard (cameronsjo/cadence-hooks#802 for commands,
+/// cameronsjo/cadence-hooks#806 for skills).
+///
+/// One predicate rather than two near-identical ones, deliberately: the whole
+/// lesson of #806 is that fixing one arm and leaving its twin is how the defect
+/// survives. A shared function cannot drift apart.
+fn is_definition_of(kind: &str, prefix: &str, segments: &[&str]) -> bool {
+    segments.iter().enumerate().any(|(i, segment)| {
+        segment.eq_ignore_ascii_case(kind) && is_definition_root(prefix, &segments[..i])
+    })
+}
+
 fn classify_path(path: &str) -> FileType {
-    if path.contains("/skills/") && path.ends_with("/SKILL.md") {
+    let Some((prefix, segments)) = normalized_segments(path) else {
+        return FileType::Other;
+    };
+    // The filename tests are ASCII-case-insensitive for the same reason the
+    // directory tests are: on APFS and NTFS a write to `Skill.md` lands in the
+    // loaded `SKILL.md`, so a case-sensitive compare here would let it skip
+    // validation while the case-folding rationale on `is_definition_root`
+    // claimed otherwise.
+    let is_skill_file = segments
+        .last()
+        .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
+    let is_markdown = segments
+        .last()
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".md"));
+
+    if is_skill_file && is_definition_of("skills", prefix, &segments) {
         FileType::Skill
-    } else if path.contains("/commands/") && path.ends_with(".md") {
+    } else if is_markdown && is_definition_of("commands", prefix, &segments) {
         FileType::Command
     } else {
         FileType::Other
@@ -117,8 +295,23 @@ fn extract_frontmatter(content: &str) -> Option<Vec<(String, String)>> {
 
 /// Extract directory name for a skill path (parent of SKILL.md).
 fn skill_dir_name(path: &str) -> Option<&str> {
-    let parent = path.strip_suffix("/SKILL.md")?;
-    parent.rsplit('/').next()
+    // Derive from the SAME normalised view `classify_path` uses, not from the
+    // raw string. The two were on different path models, and the gap was a
+    // false BLOCK: `/repo/.claude/skills/my-skill/./SKILL.md` classifies as a
+    // skill (that is what normalisation is for), but a raw
+    // `strip_suffix` + `rsplit` then reported the directory as "." and rejected
+    // a perfectly valid `name: my-skill` with "must match directory '.'".
+    // `//` gave the same result with an empty string.
+    //
+    // `normalize_path` upstream does not collapse those shapes, so they do
+    // reach production — `unnormalized_shapes_still_reach_the_command_arm` is
+    // the standing evidence. Deriving both from one view is what keeps the
+    // classifier and the name rule from disagreeing about the same path.
+    let (_prefix, segments) = normalized_segments(path)?;
+    if !segments.last()?.eq_ignore_ascii_case("SKILL.md") {
+        return None;
+    }
+    segments.get(segments.len().checked_sub(2)?).copied()
 }
 
 /// Strip a trailing inline YAML comment from a scalar value. Per YAML, `#`
@@ -258,6 +451,23 @@ impl Check for ValidateSkillFrontmatter {
 mod tests {
     use super::*;
 
+    /// Render an on-disk fixture path the way the check actually receives one.
+    ///
+    /// `classify_path` is fed by `HookInput::file_path()`, which runs
+    /// `normalize_path` first — and that maps `\` to `/`. A test that hands a
+    /// raw `PathBuf` straight to `classify_path` skips that step, so on Windows
+    /// it passes `C:\Users\…\Temp\…` into a function that splits on `/`, gets
+    /// one segment, and finds no `commands`. The assertion then fails for a
+    /// reason that has nothing to do with the behaviour under test.
+    ///
+    /// Deliberately NOT solved by making the production splitter accept `\` as
+    /// well: a backslash is a legal filename character on Unix, so a file named
+    /// `a\commands\b.md` would gain a phantom `commands` segment and could be
+    /// falsely blocked. The fixture is what is wrong here, not the splitter.
+    fn as_hook_path(p: &std::path::Path) -> String {
+        p.to_str().expect("utf-8 fixture path").replace('\\', "/")
+    }
+
     #[test]
     fn valid_skill_passes() {
         let content = "---\nname: my-skill\ndescription: A test skill\n---\n# Content";
@@ -294,33 +504,426 @@ mod tests {
         assert!(!NAME_PATTERN.is_match("cadence:At")); // uppercase suffix
     }
 
+    /// Both arms of the shared predicate stay live — a `.claude/` tree owns its
+    /// `skills/` and its `commands/` alike, and neither noun may quietly stop
+    /// being recognised while the other keeps working. Fixing one arm and
+    /// leaving its twin is the exact failure cadence-hooks#806 exists to close,
+    /// so the two assertions belong in one test rather than in two that can be
+    /// updated independently.
     #[test]
-    fn classify_skill_path() {
+    fn both_arms_recognise_a_claude_tree() {
         assert_eq!(
-            classify_path("/plugins/cadence/skills/my-skill/SKILL.md"),
+            classify_path("/repo/.claude/skills/my-skill/SKILL.md"),
             FileType::Skill
+        );
+        assert_eq!(
+            classify_path("/repo/.claude/commands/my-cmd.md"),
+            FileType::Command
         );
     }
 
     #[test]
-    fn classify_command_path() {
+    fn classify_dot_claude_command_path() {
         assert_eq!(
-            classify_path("/plugins/cadence/commands/my-cmd.md"),
+            classify_path("/Users/x/.claude/commands/my-cmd.md"),
             FileType::Command
+        );
+        assert_eq!(
+            classify_path("/repo/.claude/commands/nested/my-cmd.md"),
+            FileType::Command
+        );
+    }
+
+    /// The cameronsjo/cadence-hooks#802 regression, pinned.
+    ///
+    /// `docs/commands/` is ordinary project documentation — a natural home for
+    /// a CLI's per-command-group pages, and forgectl keeps nine of them with no
+    /// frontmatter by convention. The old bare `contains("/commands/")`
+    /// predicate classified every one as a command DEFINITION, so the check
+    /// hard-blocked each edit for "missing YAML frontmatter".
+    ///
+    /// This is the control for the fix: it fails on the old predicate and is
+    /// the reason the new one splits on path segments instead of substrings.
+    #[test]
+    fn docs_commands_dir_is_not_a_command_definition() {
+        for path in [
+            "/repo/docs/commands/projects-and-review.md",
+            "/repo/docs/commands/pr.md",
+            "/repo/documentation/commands/index.md",
+            "/srv/commands/readme.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Other,
+                "{path} is documentation, not a command definition"
+            );
+        }
+    }
+
+    /// A plugin root is identified by its sibling `.claude-plugin/` marker —
+    /// the installed-cache and standalone-plugin-repo layouts, neither of which
+    /// carries a `plugins/` path segment for the string fast paths to catch.
+    ///
+    /// The negative half is what keeps the marker load-bearing: the identical
+    /// tree WITHOUT `.claude-plugin/` must classify as `Other`, or this test
+    /// would pass for a reason that has nothing to do with the marker.
+    #[test]
+    fn plugin_root_marker_classifies_commands() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("some-plugin");
+        let commands = root.join("commands");
+        std::fs::create_dir_all(&commands).expect("fixture dirs");
+        let cmd_path = commands.join("my-cmd.md");
+        let cmd_str = as_hook_path(&cmd_path);
+        let cmd_str = cmd_str.as_str();
+
+        // No marker yet — indistinguishable from any other `commands` dir.
+        assert_eq!(
+            classify_path(cmd_str),
+            FileType::Other,
+            "without .claude-plugin/ this is not a plugin root"
+        );
+
+        std::fs::create_dir_all(root.join(".claude-plugin")).expect("marker dir");
+        assert_eq!(
+            classify_path(cmd_str),
+            FileType::Command,
+            "the .claude-plugin/ marker is what makes it a plugin root"
+        );
+    }
+
+    /// The installed-cache shape, which is the reason the marker rule exists —
+    /// and which carries a DECOY `plugins` segment at a non-matching offset
+    /// (`.../plugins/cache/<marketplace>/<plugin>/<sha>/commands/`).
+    ///
+    /// An earlier draft accepted any `plugins/<name>/commands/` triple as a fast
+    /// path. That rule could not reach this shape (the offsets do not line up)
+    /// while it DID reach `docs/plugins/<name>/commands/`, which is exactly
+    /// backwards. This test pins the real shape so a future "simplify the
+    /// predicate" edit cannot quietly reintroduce the substring form.
+    #[test]
+    fn installed_cache_shape_with_decoy_plugins_segment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp
+            .path()
+            .join("plugins")
+            .join("cache")
+            .join("workbench")
+            .join("cadence-forge")
+            .join("960c588950a6-7712fab0");
+        std::fs::create_dir_all(root.join("commands")).expect("fixture dirs");
+        std::fs::create_dir_all(root.join(".claude-plugin")).expect("marker dir");
+
+        let cmd = root.join("commands").join("polish.md");
+        assert_eq!(
+            classify_path(&as_hook_path(&cmd)),
+            FileType::Command,
+            "the installed cache layout is a real command definition location"
+        );
+    }
+
+    /// The cameronsjo/cadence-hooks#806 regression, pinned — the mirror of the
+    /// `docs/commands/` case below.
+    ///
+    /// `docs/skills/<x>/SKILL.md` is documentation about skills. The old
+    /// `contains("/skills/")` predicate classified every one as a skill
+    /// DEFINITION and hard-blocked each edit for missing frontmatter, by the
+    /// same mechanism and for the same reason as #802.
+    #[test]
+    fn docs_skills_dir_is_not_a_skill_definition() {
+        for path in [
+            "/repo/docs/skills/attune/SKILL.md",
+            "/repo/documentation/skills/my-skill/SKILL.md",
+            "/repo/docs/plugins/p/skills/x/SKILL.md",
+            "/srv/skills/whatever/SKILL.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Other,
+                "{path} is documentation, not a skill definition"
+            );
+        }
+    }
+
+    /// A plugin root's `skills/` is a definition location, identified by the
+    /// same `.claude-plugin/` marker the command arm uses — and the negative
+    /// half keeps the marker load-bearing rather than incidental.
+    #[test]
+    fn plugin_root_marker_classifies_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("some-plugin");
+        let skill = root.join("skills").join("my-skill");
+        std::fs::create_dir_all(&skill).expect("fixture dirs");
+        let skill_md = as_hook_path(&skill.join("SKILL.md"));
+
+        assert_eq!(
+            classify_path(&skill_md),
+            FileType::Other,
+            "without .claude-plugin/ this is not a plugin root"
+        );
+
+        std::fs::create_dir_all(root.join(".claude-plugin")).expect("marker dir");
+        assert_eq!(
+            classify_path(&skill_md),
+            FileType::Skill,
+            "the .claude-plugin/ marker is what makes it a plugin root"
+        );
+    }
+
+    /// The symlink-farm layout: a repo that is itself a Claude workspace keeps
+    /// its definitions at `<repo>/skills/<name>/` and links them in from
+    /// `<repo>/.claude/skills/<name>`. The path an agent actually edits is the
+    /// link TARGET, which has no `.claude` ancestor — so a `.claude`-only rule
+    /// stops validating all 20 of cmux's skills while the symlinked spelling
+    /// keeps working, which is exactly the kind of split nobody notices.
+    ///
+    /// The negative half is what keeps the rule narrow: the identical tree
+    /// WITHOUT the sibling `.claude/` is not a workspace, and `docs/skills/`
+    /// asks about `docs`, which never is.
+    #[test]
+    fn workspace_repo_owns_its_top_level_definitions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("cmux-like");
+        std::fs::create_dir_all(repo.join("skills").join("my-skill")).expect("fixture dirs");
+        std::fs::create_dir_all(repo.join("docs").join("skills").join("about"))
+            .expect("fixture dirs");
+        let target = as_hook_path(&repo.join("skills/my-skill/SKILL.md"));
+        let docs = as_hook_path(&repo.join("docs/skills/about/SKILL.md"));
+
+        assert_eq!(
+            classify_path(&target),
+            FileType::Other,
+            "without a sibling .claude/ this repo is not a workspace"
+        );
+
+        std::fs::create_dir_all(repo.join(".claude")).expect("workspace marker");
+        assert_eq!(
+            classify_path(&target),
+            FileType::Skill,
+            "the sibling .claude/ is what makes the repo a definition root"
+        );
+        assert_eq!(
+            classify_path(&docs),
+            FileType::Other,
+            "docs/skills asks about docs/, which is still not a workspace"
+        );
+    }
+
+    /// A relocated config dir (`CLAUDE_CONFIG_DIR`, as `claude-as` uses for a
+    /// second subscription profile) is still a config dir. Matching only the
+    /// literal `.claude` silently stops validating every definition in that
+    /// profile — 26 live skills under `~/.claude-alt` at the time of writing.
+    ///
+    /// The rule itself, proved against a name this machine does not use.
+    ///
+    /// The wiring test below cannot carry this: `CONFIG_DIR_NAME` caches for
+    /// the process, and where `CLAUDE_CONFIG_DIR` is unset it resolves to
+    /// `.claude` — so the literal arm already answers every case and deleting
+    /// the relocated arm changes nothing. Verified: mutating the rule away left
+    /// that test green. This one is parameterised, so it goes red.
+    #[test]
+    fn a_relocated_config_dir_is_still_a_config_dir() {
+        assert!(is_config_dir_segment(".claude-alt", ".claude-alt"));
+        assert!(
+            is_config_dir_segment(".CLAUDE-ALT", ".claude-alt"),
+            "case-folded like every other segment compare"
+        );
+        assert!(
+            is_config_dir_segment(".claude", ".claude-alt"),
+            "the default stays a config dir even when another is active"
+        );
+        assert!(
+            !is_config_dir_segment(".claude-alt", ".claude"),
+            "a lookalike is not a config dir just because it shares a prefix"
+        );
+        assert!(!is_config_dir_segment("docs", ".claude-alt"));
+    }
+
+    /// Asserted through the same accessor production reads, rather than by
+    /// setting the env var: `CONFIG_DIR_NAME` is a process-lifetime cache, so a
+    /// test that mutated the env would race every other test in the binary and
+    /// prove nothing repeatable. This pins the WIRING; the test above pins the
+    /// RULE.
+    #[test]
+    fn config_dir_name_tracks_the_resolved_config_dir() {
+        let resolved = cadence_hooks_core::paths::claude_config_dir();
+        let expected = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| ".claude".to_string());
+        assert_eq!(
+            *CONFIG_DIR_NAME, expected,
+            "the classifier must use the config dir the rest of the binary resolves"
+        );
+
+        let path = format!("/Users/x/{}/skills/my-skill/SKILL.md", *CONFIG_DIR_NAME);
+        assert_eq!(
+            classify_path(&path),
+            FileType::Skill,
+            "{path} is a real skill definition under the active config dir"
+        );
+    }
+
+    /// The skill arm inherits normalisation, case-folding, the Windows drive
+    /// branch, and the relative/oversize refusals from the shared predicate —
+    /// but inheritance is a claim until something pins it. Every other control
+    /// in this file exercises `commands` only, so drift would land here unseen.
+    #[test]
+    fn skill_arm_inherits_the_shared_path_handling() {
+        for path in [
+            "/repo/.claude//skills/my-skill/SKILL.md",
+            "/repo/.claude/./skills/my-skill/SKILL.md",
+            "/repo/.claude/x/../skills/my-skill/SKILL.md",
+            "/repo/.Claude/SKILLS/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/Skill.md",
+            "C:/repo/.claude/skills/my-skill/SKILL.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Skill,
+                "{path} resolves into a real skills tree"
+            );
+        }
+        assert_eq!(
+            classify_path("repo/.claude/skills/my-skill/SKILL.md"),
+            FileType::Other,
+            "a relative path has no stable meaning on either arm"
+        );
+        let huge = format!("/{}/skills/x/SKILL.md", "a".repeat(MAX_PATH_BYTES));
+        assert_eq!(classify_path(&huge), FileType::Other, "past the size bound");
+    }
+
+    /// Documentation ABOUT plugins is still documentation.
+    ///
+    /// This is the second half of cadence-hooks#802 and the reason the
+    /// `plugins/<name>/commands/` fast path was dropped rather than kept: that
+    /// rule reintroduced the identical false block one directory deeper, on a
+    /// path shape (`docs/plugins/…`) that is if anything more likely than the
+    /// original.
+    #[test]
+    fn docs_about_plugins_is_not_a_command_definition() {
+        for path in [
+            "/repo/docs/plugins/my-plugin/commands/overview.md",
+            "/repo/node_modules/foo/plugins/bar/commands/doc.md",
+            "/repo/plugins/some-plugin/commands/x.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Other,
+                "{path} has no .claude-plugin/ marker, so it is not a plugin root"
+            );
+        }
+    }
+
+    /// `normalize_path` upstream does not collapse `//`, resolve `.`/`..`, or
+    /// case-fold, so these reach the classifier verbatim — and every one of them
+    /// writes to a real `.claude/commands/` file on disk. Comparing raw segments
+    /// saw `""`, `"."`, or `".."` as the parent and let a genuine command
+    /// definition skip validation entirely.
+    #[test]
+    fn unnormalized_shapes_still_reach_the_command_arm() {
+        for path in [
+            "/repo/.claude//commands/x.md",
+            "/repo/.claude/./commands/x.md",
+            "/repo/.claude/sub/../commands/x.md",
+            "/repo/.Claude/commands/x.md",
+            "/repo/.claude/COMMANDS/x.md",
+        ] {
+            assert_eq!(
+                classify_path(path),
+                FileType::Command,
+                "{path} resolves into a real .claude/commands tree"
+            );
+        }
+    }
+
+    /// A relative path would make the marker probe resolve against whatever
+    /// directory the hook process is standing in, so the same path could
+    /// classify two ways in one session. Refuse rather than answer
+    /// inconsistently — and refuse an absurd path rather than walk it.
+    #[test]
+    fn relative_and_oversized_paths_are_not_classified() {
+        assert_eq!(
+            classify_path("repo/.claude/commands/x.md"),
+            FileType::Other,
+            "a relative path has no stable meaning here"
+        );
+        let huge = format!("/{}/commands/x.md", "a".repeat(MAX_PATH_BYTES));
+        assert_eq!(
+            classify_path(&huge),
+            FileType::Other,
+            "past the size bound we decline to scan"
         );
     }
 
     #[test]
     fn skill_dir_extraction() {
         assert_eq!(
-            skill_dir_name("/plugins/skills/my-skill/SKILL.md"),
+            skill_dir_name("/repo/.claude/skills/my-skill/SKILL.md"),
             Some("my-skill")
         );
     }
 
+    /// The classifier and the name rule must agree about the same path.
+    ///
+    /// `classify_path` normalises; `skill_dir_name` used to read the raw string.
+    /// So `/repo/.claude/skills/my-skill/./SKILL.md` classified as a skill and
+    /// then reported its directory as ".", rejecting a valid `name: my-skill`
+    /// with "must match directory '.'" — a FALSE BLOCK, the exact defect class
+    /// this whole change exists to remove. `//` gave an empty string.
+    #[test]
+    fn skill_dir_name_uses_the_normalised_view() {
+        for path in [
+            "/repo/.claude/skills/my-skill/./SKILL.md",
+            "/repo/.claude/skills/my-skill//SKILL.md",
+            "/repo/.claude/skills/sub/../my-skill/SKILL.md",
+            "C:/repo/.claude/skills/my-skill/SKILL.md",
+        ] {
+            assert_eq!(
+                skill_dir_name(path),
+                Some("my-skill"),
+                "{path} names the my-skill directory"
+            );
+            assert_eq!(
+                classify_path(path),
+                FileType::Skill,
+                "{path} must also classify as a skill, or the pair disagrees"
+            );
+        }
+        assert_eq!(skill_dir_name("/SKILL.md"), None, "no directory to name");
+    }
+
     #[test]
     fn skill_dir_name_none_for_non_skill() {
-        assert_eq!(skill_dir_name("/plugins/commands/my-cmd.md"), None);
+        assert_eq!(skill_dir_name("/repo/docs/commands/my-cmd.md"), None);
+    }
+
+    /// `normalize_path` maps `\` to `/` but leaves the drive letter, so a
+    /// Windows path arrives as `C:/Users/...` and does not start with `/`.
+    /// An absolute-path test written as `starts_with('/')` therefore declines
+    /// every real Windows path and disables the command arm entirely — with the
+    /// whole suite green, because every other fixture here is a Unix-style
+    /// string that is equally valid as a test input on either platform.
+    ///
+    /// The negative half is what stops this passing for the wrong reason: the
+    /// drive-letter branch must still discriminate, not classify everything.
+    #[test]
+    fn windows_drive_paths_still_classify() {
+        assert_eq!(
+            classify_path("C:/Users/x/.claude/commands/my-cmd.md"),
+            FileType::Command,
+            "a Windows path must not silently disable the command arm"
+        );
+        assert_eq!(
+            classify_path("C:/repo/docs/commands/pr.md"),
+            FileType::Other,
+            "the drive-letter branch must still tell docs from definitions"
+        );
+        assert_eq!(
+            classify_path("C:/repo/.claude/./commands/x.md"),
+            FileType::Command,
+            "normalisation applies on the drive-letter branch too"
+        );
     }
 
     #[test]
@@ -355,7 +958,7 @@ mod tests {
 
     #[test]
     fn run_skill_missing_frontmatter_blocks() {
-        let input = make_write_input("/plugins/skills/my-skill/SKILL.md", "# No frontmatter");
+        let input = make_write_input("/repo/.claude/skills/my-skill/SKILL.md", "# No frontmatter");
         let result = ValidateSkillFrontmatter.run(&input);
         assert_eq!(result.outcome, cadence_hooks_core::Outcome::Block);
     }
@@ -363,7 +966,7 @@ mod tests {
     #[test]
     fn run_skill_missing_name_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\ndescription: A test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -374,7 +977,7 @@ mod tests {
     #[test]
     fn run_skill_missing_description_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -390,7 +993,7 @@ mod tests {
     #[test]
     fn run_skill_invalid_name_format_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: My-Skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -401,7 +1004,7 @@ mod tests {
     #[test]
     fn run_skill_name_dir_mismatch_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: other-name\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -415,7 +1018,7 @@ mod tests {
         // suffix equals the directory — this is the form 0.19.0 through
         // 0.63.0 accepted, and the one that renders `/cadence:cadence:my-skill`.
         let input = make_write_input(
-            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: cadence:my-skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -428,7 +1031,7 @@ mod tests {
         // Still blocks, now for two reasons rather than one: the colon fails
         // the format check AND `cadence:wrong` is not the directory `my-skill`.
         let input = make_write_input(
-            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: cadence:wrong\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -440,7 +1043,7 @@ mod tests {
     fn run_skill_bare_name_matching_dir_passes() {
         // The correct form as of Claude Code 2.1.216.
         let input = make_write_input(
-            "/plugins/cadence/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -450,7 +1053,7 @@ mod tests {
     #[test]
     fn run_valid_skill_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -460,7 +1063,7 @@ mod tests {
     #[test]
     fn run_command_with_name_field_blocks() {
         let input = make_write_input(
-            "/plugins/commands/my-cmd.md",
+            "/repo/.claude/commands/my-cmd.md",
             "---\nname: my-cmd\ndescription: test\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -471,7 +1074,7 @@ mod tests {
     #[test]
     fn run_command_without_name_passes() {
         let input = make_write_input(
-            "/plugins/commands/my-cmd.md",
+            "/repo/.claude/commands/my-cmd.md",
             "---\ndescription: A command\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -481,7 +1084,7 @@ mod tests {
     #[test]
     fn run_unknown_field_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\nunknown-field: value\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -511,7 +1114,7 @@ mod tests {
         let input = HookInput {
             tool_name: Some("Write".into()),
             tool_input: Some(cadence_hooks_core::ToolInput {
-                file_path: Some("/plugins/skills/my-skill/SKILL.md".into()),
+                file_path: Some("/repo/.claude/skills/my-skill/SKILL.md".into()),
                 path: None,
                 command: None,
                 content: None,
@@ -569,7 +1172,7 @@ mod tests {
     #[test]
     fn run_multiple_errors_all_reported() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nunknown1: val\nunknown2: val\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -588,15 +1191,41 @@ mod tests {
     const VALID_SKILL: &str =
         "---\nname: my-skill\ndescription: A test skill\n---\n# My Skill\n\nBody text here.\n";
 
-    /// Write a valid SKILL.md into a temp dir shaped like a plugin skill tree.
-    /// Returns (tempdir guard, absolute SKILL.md path).
+    /// Write a valid SKILL.md into a temp dir shaped like a REAL plugin skill
+    /// tree — a plugin root carrying a `.claude-plugin/` marker, with the skill
+    /// beneath it. Returns (tempdir guard, absolute SKILL.md path).
+    ///
+    /// The marker is load-bearing, not decoration. This helper previously built
+    /// a bare `<tmp>/skills/my-skill/SKILL.md`, which under the pre-#806
+    /// substring predicate classified as a skill purely because the string
+    /// `/skills/` appeared. Once the predicate started requiring a definition
+    /// root, that shape became `Other` — so every caller expecting a BLOCK
+    /// failed, and, more quietly, every caller expecting an ALLOW kept passing
+    /// while exercising nothing at all. Only one test went red; several went
+    /// vacuous. Building the marker is what keeps this helper's whole cohort
+    /// meaningful, and it is also the on-disk plugin-skill coverage the fixture
+    /// migration would otherwise have dropped when the string fixtures moved to
+    /// project-skill paths.
     fn on_disk_skill(content: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join("skills/my-skill");
+        let plugin_root = dir.path().join("some-plugin");
+        std::fs::create_dir_all(plugin_root.join(".claude-plugin")).unwrap();
+        let skill_dir = plugin_root.join("skills/my-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let path = skill_dir.join("SKILL.md");
         std::fs::write(&path, content).unwrap();
-        (dir, path.to_str().unwrap().to_string())
+        let hook_path = as_hook_path(&path);
+        // Self-guarding, so every present and future caller carries its own
+        // proof rather than depending on one block-expecting neighbour to
+        // notice. A fixture that stops classifying as a skill makes ALLOW-
+        // expecting callers pass while exercising nothing — the failure mode
+        // this helper already had once.
+        assert_eq!(
+            classify_path(&hook_path),
+            FileType::Skill,
+            "fixture must classify as a skill or every caller is vacuous"
+        );
+        (dir, hook_path)
     }
 
     #[test]
@@ -636,7 +1265,7 @@ mod tests {
         // Fail open (ADR-0001): if the file can't be read, the edit can't be
         // simulated — allow rather than block on incomplete information.
         let input = make_edit(
-            "/nonexistent/plugins/skills/my-skill/SKILL.md",
+            "/nonexistent/.claude/skills/my-skill/SKILL.md",
             "old",
             "new",
         );
@@ -649,7 +1278,7 @@ mod tests {
         // Regression for #63 (bug 2): nested keys under `metadata:` are not
         // unknown top-level fields.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\nmetadata:\n  author: cameron\n  version: 1.0.0\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -659,7 +1288,7 @@ mod tests {
     #[test]
     fn valid_skill_with_optional_fields() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A skill\nmodel: opus\nallowed-tools: Read,Grep\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -672,7 +1301,7 @@ mod tests {
         // (scopes a skill to activate only when matching files are touched).
         // It must not be rejected as an unknown frontmatter field.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\npaths: src/**/*.rs\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -684,7 +1313,7 @@ mod tests {
     #[test]
     fn run_skill_with_background_true_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -694,7 +1323,7 @@ mod tests {
     #[test]
     fn run_skill_with_background_false_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: false\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -706,7 +1335,7 @@ mod tests {
         // The platform loosened boolean parsing (yes/no/on/off/1/0) in
         // 2.1.218; cadence house style stays strict true/false.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: yes\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -724,7 +1353,7 @@ mod tests {
         // One rule for all boolean fields — pre-existing booleans get the
         // same strictness as the new `background` field.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\nuser-invocable: yes\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -740,7 +1369,7 @@ mod tests {
     #[test]
     fn run_skill_disable_model_invocation_numeric_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ndisable-model-invocation: 1\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -756,7 +1385,7 @@ mod tests {
     #[test]
     fn run_skill_boolean_true_false_still_pass() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\nuser-invocable: false\ndisable-model-invocation: true\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -768,7 +1397,7 @@ mod tests {
         // A trailing YAML comment is not part of the value — `true  # why`
         // is the boolean true, not a malformed spelling.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: true  # opt out later\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -780,7 +1409,7 @@ mod tests {
         // Deliberate: `"true"` is a string spelling, not the house boolean.
         // Unquoted true/false is the one greppable form.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: A test skill\ncontext: fork\nbackground: \"true\"\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -806,7 +1435,7 @@ mod tests {
     #[test]
     fn command_valid_with_description_only() {
         let input = make_write_input(
-            "/plugins/commands/deploy.md",
+            "/repo/.claude/commands/deploy.md",
             "---\ndescription: Deploy the app\nallowed-tools: Bash\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -816,7 +1445,7 @@ mod tests {
     #[test]
     fn skill_dir_name_deeply_nested() {
         assert_eq!(
-            skill_dir_name("/a/b/c/d/skills/deep-skill/SKILL.md"),
+            skill_dir_name("/a/b/c/.claude/skills/deep-skill/SKILL.md"),
             Some("deep-skill")
         );
     }
@@ -840,7 +1469,7 @@ mod tests {
     #[test]
     fn run_skill_with_when_to_use_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\nwhen_to_use: Use when doing X\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -850,7 +1479,7 @@ mod tests {
     #[test]
     fn run_skill_with_arguments_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\narguments: issue branch\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -860,7 +1489,7 @@ mod tests {
     #[test]
     fn run_skill_with_disallowed_tools_passes() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\ndisallowed-tools: AskUserQuestion\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -872,7 +1501,7 @@ mod tests {
         for level in ["low", "medium", "high", "xhigh", "max"] {
             let content =
                 format!("---\nname: my-skill\ndescription: test\neffort: {level}\n---\n# Content");
-            let input = make_write_input("/plugins/skills/my-skill/SKILL.md", &content);
+            let input = make_write_input("/repo/.claude/skills/my-skill/SKILL.md", &content);
             let result = ValidateSkillFrontmatter.run(&input);
             assert_eq!(
                 result.outcome,
@@ -885,7 +1514,7 @@ mod tests {
     #[test]
     fn run_skill_with_invalid_effort_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\neffort: extreme\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -898,7 +1527,7 @@ mod tests {
         for shell in ["bash", "powershell"] {
             let content =
                 format!("---\nname: my-skill\ndescription: test\nshell: {shell}\n---\n# Content");
-            let input = make_write_input("/plugins/skills/my-skill/SKILL.md", &content);
+            let input = make_write_input("/repo/.claude/skills/my-skill/SKILL.md", &content);
             let result = ValidateSkillFrontmatter.run(&input);
             assert_eq!(
                 result.outcome,
@@ -911,7 +1540,7 @@ mod tests {
     #[test]
     fn run_skill_with_invalid_shell_blocks() {
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\nshell: zsh\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);
@@ -924,7 +1553,7 @@ mod tests {
         // The new fields don't loosen the allowlist — an unrelated unknown
         // key is still rejected.
         let input = make_write_input(
-            "/plugins/skills/my-skill/SKILL.md",
+            "/repo/.claude/skills/my-skill/SKILL.md",
             "---\nname: my-skill\ndescription: test\neffort: high\ntotally-made-up: value\n---\n# Content",
         );
         let result = ValidateSkillFrontmatter.run(&input);

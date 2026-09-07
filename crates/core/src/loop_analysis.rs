@@ -575,8 +575,14 @@ fn is_git_push_command(cmd: &SimpleCommand) -> bool {
     if name.value != "git" {
         return false;
     }
-    // Check first suffix word is "push"
-    suffix_words(cmd).first().is_some_and(|w| w == "push")
+    // The subcommand is the first word after git's GLOBAL options, not the
+    // first suffix word — `git -C . push` and `git --no-pager push` resolved
+    // their subcommand to `-C`/`--no-pager` and went undetected, so a looped
+    // push carrying a global reached no structural gate (cadence-hooks#554).
+    let words = suffix_words(cmd);
+    crate::shell::skip_git_global_options(&words)
+        .first()
+        .is_some_and(|w| w == "push")
 }
 
 /// Extract `-R` or `--repo` flag value from a `gh` command's arguments.
@@ -632,7 +638,11 @@ fn extract_repo_flag(cmd: &SimpleCommand) -> Option<String> {
 /// gate and its loop gate.
 fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
     let words = suffix_words(cmd);
-    let start = words.iter().position(|word| word == "push")? + 1;
+    // Skip git's globals before locating the subcommand, so a global's VALUE
+    // cannot be mistaken for the verb and the walk starts where the push
+    // grammar actually begins (cadence-hooks#554).
+    let argv = crate::shell::skip_git_global_options(&words);
+    let start = argv.iter().position(|word| word == "push")? + 1;
     // **Positional only — deliberately NOT `--repo`.** These structural gates
     // ask "did this command name a remote explicitly", and answering yes for a
     // `--repo`-only push turned a hard block into a silent allow: it promoted
@@ -642,7 +652,7 @@ fn extract_push_remote(cmd: &SimpleCommand) -> Option<String> {
     // the same transition. `--repo`'s value is still ownership-validated — by
     // `guard_push_remote`'s own destination arm, where the URL/name distinction
     // is actually made.
-    crate::shell::push_repository_argument(&words[start..]).positional
+    crate::shell::push_repository_argument(&argv[start..]).positional
 }
 
 /// Extract word values from a command's suffix.
@@ -1369,5 +1379,20 @@ mod tests {
             "git push origin main && git push origin v1.0 && git push upstream main",
         );
         assert!(matches!(result, ChainAnalysis::DifferentRemotes(_)));
+    }
+
+    #[test]
+    fn git_global_options_before_push_still_detected() {
+        // The subcommand sits after git's globals, so reading the first suffix
+        // word resolved it to `-c` and the chain gate saw no pushes at all —
+        // two pushes to different remotes reported SingleOrNone
+        // (cadence-hooks#554a).
+        let result = analyze_push_chain(
+            "git -c color.ui=false push origin main && git --no-pager push upstream main",
+        );
+        assert!(
+            matches!(result, ChainAnalysis::DifferentRemotes(_)),
+            "globals before `push` hid both pushes: {result:?}"
+        );
     }
 }

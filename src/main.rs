@@ -41,6 +41,29 @@ static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
 /// Return true when running inside Claude Code. Detected via `CLAUDECODE=1`,
 /// which Claude Code exports for every spawned shell. Empty/unset means no.
+/// True when the positional subcommand path names a CLI/diagnostic command
+/// that `CADENCE_BYPASS=1` must NOT short-circuit.
+///
+/// `first`/`second` are argv[1] and argv[2] — position, not any argv token,
+/// so a hook *argument* that happens to equal `list` or `try` cannot buy an
+/// exemption. The `_` on the first arm covers every sub-subcommand and flag of
+/// those commands, `configure guardrails` included.
+fn is_bypass_exempt(first: Option<&str>, second: Option<&str>) -> bool {
+    matches!(
+        (first, second),
+        (
+            Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
+            _
+        ) | (Some("session"), Some("declare" | "status"))
+            // `metrics grade` is a CLI action, not a hook. Bypassed it would
+            // exit 0 having printed nothing, and an operator piping it to `jq`
+            // reads the absent output as "no cold restarts" rather than "the
+            // command never ran" — the exact failure its fail-closed exit
+            // codes exist to prevent.
+            | (Some("metrics"), Some("grade"))
+    )
+}
+
 fn under_claude_code() -> bool {
     std::env::var("CLAUDECODE")
         .map(|v| !v.is_empty())
@@ -48,6 +71,7 @@ fn under_claude_code() -> bool {
 }
 
 mod configure;
+mod configure_guardrails;
 mod dispatch;
 mod doctor;
 mod hook_latency;
@@ -63,11 +87,19 @@ use registry::{HOOKS, HookEntry};
 const PROTECTED_GUARDS: &[&str] = &[
     "prevent-secret-leaks",
     "prevent-secret-writes",
+    // Carries the fail-closed identity tier. Protection is per-guard, so this
+    // also strips CADENCE_DISABLE from the same guard's *advisory* tiers —
+    // accepted deliberately (ruled 2026-08-03): the alternative was splitting
+    // one guard in two, and the remaining levers for a noisy nudge are the
+    // per-repo allowlist and originAudience, both config edits. Without this
+    // line, one environment variable silently disarms the leak protection.
+    "redact-external-content",
     "git-safety",
     "guard-push-remote",
     "guard-gh-dangerous",
     "guard-gh-write",
     "guard-op-vault-scan",
+    "guard-sops-decrypt",
     "guard-browser-device",
     "guard-dotfiles",
     "guard-read-model",
@@ -140,6 +172,10 @@ enum Commands {
         /// Print current configuration without interactive mode
         #[arg(long)]
         list: bool,
+
+        /// Configure a specific subject instead of the hook-disable wizard
+        #[command(subcommand)]
+        action: Option<ConfigureCommands>,
     },
 
     /// Scan installed plugin hooks.json files for shell-expansion bugs and subcommand skew
@@ -168,6 +204,30 @@ enum ManifestFormat {
 }
 
 #[derive(Subcommand)]
+enum ConfigureCommands {
+    /// Set the git-guardrails identity allowlist in the USER settings.json
+    Guardrails {
+        /// GitHub users/orgs you own (space-separated). Omit to keep the
+        /// current value, or to be prompted.
+        #[arg(long, num_args = 1.., value_name = "OWNER")]
+        owners: Vec<String>,
+
+        /// Other owners' repos you have write access to, as `owner/repo`.
+        /// Omitting this preserves whatever is already configured.
+        #[arg(long, num_args = 1.., value_name = "OWNER/REPO")]
+        repos: Vec<String>,
+
+        /// Write without prompting (scriptable). Identical values are a no-op.
+        #[arg(long)]
+        yes: bool,
+
+        /// Print the current allowlist and exit — read-only, no writes
+        #[arg(long)]
+        show: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum CadenceCommands {
     /// Block inclusive terminology violations
     Terminology,
@@ -187,6 +247,8 @@ enum CadenceCommands {
     EnvVars,
     /// Nudge to review docs when creating a PR
     WarnDocsUpdate,
+    /// Nudge to add a CHANGELOG.md entry when shipping code changes
+    WarnChangelogEntry,
     /// Nudge to audit about-to-ship content for personal-context overshare
     WarnOvershare,
     /// Nudge to run `/polish` (cadence-forge:polish) before creating a PR
@@ -204,7 +266,8 @@ enum CadenceCommands {
     },
     /// Scan text (stdin or --file) for redaction hits at a destination
     /// audience tier. CLI action — the single engine behind the redaction
-    /// skill's pre-post scan (exit 0 clean / 1 hits on stderr / 2 usage)
+    /// skill's pre-post scan; scans the identity tier and the four shaped
+    /// categories (exit 0 clean / 1 hits on stderr / 2 usage)
     RedactScan {
         /// Scan a file instead of stdin
         #[arg(long, value_name = "PATH")]
@@ -216,25 +279,58 @@ enum CadenceCommands {
         /// Scaffold the redaction section of .claude/cadence.json and exit
         #[arg(long)]
         init: bool,
+        /// Report whether the identity tier is armed, and exit. Consumed by the
+        /// cadence plugin's SessionStart: an absent or unreadable term source
+        /// is a silent disarm on the machine you are not looking at, so it has
+        /// to announce itself once per session. Exit 0 armed / 1 unarmed.
+        #[arg(long)]
+        status: bool,
     },
     /// Record that /polish ran on this branch (writes a branch-scoped marker). CLI action.
+    /// Exit: 0 recorded, 1 nothing recorded (detached HEAD, not a repo, write failed),
+    /// 2 usage error.
     RecordPolish {
         /// Repository to record against (default: the current directory's).
         /// Resolved to the repo's shared git dir, so any worktree of it works
         /// and the marker stays readable by the pre-PR gate
         #[arg(long, value_name = "PATH")]
         repo_root: Option<String>,
-        /// Branch to record against (default: the checked-out branch)
+        /// Branch to record against (default: the checked-out branch). A value
+        /// carrying control characters is a usage error (exit 2) — git refuses
+        /// such a ref itself, and the marker would key a branch nothing can read
         #[arg(long, value_name = "NAME")]
         branch: Option<String>,
-        /// What the pass covered — `full`, `code`, or `docs` (default: full)
+        /// What the pass covered — `full`, `code`, or `docs` (default: full).
+        /// Anything else is a usage error (exit 2), not a free-text value
         #[arg(long, value_name = "SCOPE")]
         scope: Option<String>,
         /// Per-arm outcome, repeatable — e.g. `--arm security=ran --arm
-        /// tests=skipped`. Recorded additively; a marker without a roster
-        /// reads as unknown, never as skipped (cadence-hooks#467)
+        /// tests=skipped`. Merged additively into any prior roster by
+        /// default, so an omitted arm keeps its previous state; a marker
+        /// without a roster reads as unknown, never as skipped
+        /// (cadence-hooks#467)
         #[arg(long = "arm", value_name = "NAME=STATE", action = clap::ArgAction::Append)]
         arm: Vec<String>,
+        /// Model family that ran an arm, repeatable — e.g. `--arm-model
+        /// security=opus`. Recorded, not validated against a closed set: the
+        /// point is what actually ran. Accepted only alongside `--arm NAME=…`
+        /// in the same invocation, so the attestation always describes the run
+        /// stated beside it (cadence-hooks#775)
+        #[arg(long = "arm-model", value_name = "NAME=FAMILY", action = clap::ArgAction::Append)]
+        arm_model: Vec<String>,
+        /// Where an arm's report landed, repeatable — e.g. `--arm-report
+        /// security=/tmp/review.md`. Provenance only: the path is never opened
+        /// and its contents never read. Same binding rule as `--arm-model`
+        /// (cadence-hooks#775)
+        #[arg(long = "arm-report", value_name = "NAME=PATH", action = clap::ArgAction::Append)]
+        arm_report: Vec<String>,
+        /// Record exactly the stated roster instead of merging with the prior
+        /// marker — the clearing spelling. An omitted arm is then genuinely
+        /// absent, so the pre-PR gate reads it as unknown rather than
+        /// inheriting a stale `ran`. The marker carries `"fresh": true` so an
+        /// audit can tell a cleared roster from a legacy one (cadence-hooks#775)
+        #[arg(long)]
+        fresh: bool,
     },
 }
 
@@ -252,8 +348,6 @@ enum GuardrailsCommands {
     WarnMainBranch,
     /// Warn when dispatching a subagent from main while a sibling worktree exists
     WarnSubagentWorktree,
-    /// Nudge when the live subagent count is at or over the concurrency cap
-    WarnSubagentConcurrency,
     /// Warn when creating a branch from a non-main base
     WarnBranchBase,
     /// Remind to check datetime before scheduling cron jobs
@@ -280,18 +374,18 @@ enum GuardrailsCommands {
     VerifyPrAutoclose,
     /// Block uninvited 1Password vault enumeration (op item list)
     GuardOpVaultScan,
+    /// Block a sops decrypt whose plaintext is not consumed by an allowed tool
+    GuardSopsDecrypt,
     /// Warn when bare curl (aliased to curlie) is used with custom headers
     WarnCurlAlias,
     /// Pre-flight checklist nudge before gh pr merge (draft, worktree, verify)
     WarnGhMergePreflight,
-    /// Warn that CodeRabbit re-trigger comments are no-ops on reviewed content
-    WarnCoderabbitRetrigger,
+    /// Warn on gh pr ready/merge when the PR head has no reviewed signal
+    WarnUnreviewedReadyFlip,
     /// Warn when piping aliased-tool output (ls/find/cat/du/df/top) into parsers
     WarnAliasParsing,
     /// Block the first Claude-in-Chrome action per session until the device is confirmed
     GuardBrowserDevice,
-    /// Inject the gh-write allowlist + `-R` rule on SessionStart
-    InjectGhContext,
     /// Re-inject the gh-write allowlist + `-R` rule before an untargeted gh write
     InjectGhWriteContext,
     /// Snooze warn-main-branch for this repo for the given duration
@@ -370,6 +464,20 @@ enum MetricsCommands {
     LogSkill,
     /// Warn at SessionStart when metrics telemetry has gone stale (SessionStart)
     WarnStale,
+    /// Grade a session transcript deterministically and print the JSON (CLI action)
+    Grade {
+        /// Transcript JSONL to grade. Takes precedence over --session-id.
+        #[arg(long, value_name = "PATH")]
+        transcript: Option<String>,
+        /// Session UUID, resolved under the Claude config dir's projects/.
+        /// Defaults to $CLAUDE_CODE_SESSION_ID.
+        #[arg(long, value_name = "UUID")]
+        session_id: Option<String>,
+        /// Override path to the model price table (JSON). Falls back to the
+        /// embedded default; `CADENCE_METRICS_PRICES` env takes precedence.
+        #[arg(long, value_name = "PATH")]
+        prices: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -392,10 +500,14 @@ enum SessionCommands {
     BackstopRecord,
     /// Warn at session start when the last session in this repo left loose ends (SessionStart)
     BackstopWarn,
-    /// Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)
-    PersistPlan,
     /// Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)
     PersistPlanApproval,
+    /// Nudge once per session when commits keep skipping the branch's in-flight plan (PostToolUse:Bash)
+    NudgePlanTick,
+    /// Warn on gh pr ready/merge while the branch's plan is unreconciled (PreToolUse:Bash)
+    WarnPlanReadyFlip,
+    /// Block ExitPlanMode on a plan with no settled Panel: line; nudge on other missing stanzas (PreToolUse:ExitPlanMode)
+    LintPlanShape,
     /// Declare what this session is working on, so peers can assess collision risk
     Declare {
         /// What this session is working on (e.g. "cadence-hooks#54")
@@ -426,6 +538,7 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             CadenceCommands::LineEndings => "line-endings",
             CadenceCommands::EnvVars => "env-vars",
             CadenceCommands::WarnDocsUpdate => "warn-docs-update",
+            CadenceCommands::WarnChangelogEntry => "warn-changelog-entry",
             CadenceCommands::WarnOvershare => "warn-overshare",
             CadenceCommands::NudgePolishBeforePr => "nudge-polish-before-pr",
             CadenceCommands::MarkdownLint => "markdown-lint",
@@ -444,7 +557,6 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::GuardGitInit => "guard-git-init",
             GuardrailsCommands::WarnMainBranch => "warn-main-branch",
             GuardrailsCommands::WarnSubagentWorktree => "warn-subagent-worktree",
-            GuardrailsCommands::WarnSubagentConcurrency => "warn-subagent-concurrency",
             GuardrailsCommands::WarnBranchBase => "warn-branch-base",
             GuardrailsCommands::WarnCronDatetime => "warn-cron-datetime",
             GuardrailsCommands::NudgeUpgradeAfterPush => "nudge-upgrade-after-push",
@@ -458,12 +570,12 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             GuardrailsCommands::WarnGoingPublic => "warn-going-public",
             GuardrailsCommands::VerifyPrAutoclose => "verify-pr-autoclose",
             GuardrailsCommands::GuardOpVaultScan => "guard-op-vault-scan",
+            GuardrailsCommands::GuardSopsDecrypt => "guard-sops-decrypt",
             GuardrailsCommands::WarnCurlAlias => "warn-curl-alias",
             GuardrailsCommands::WarnGhMergePreflight => "warn-gh-merge-preflight",
-            GuardrailsCommands::WarnCoderabbitRetrigger => "warn-coderabbit-retrigger",
+            GuardrailsCommands::WarnUnreviewedReadyFlip => "warn-unreviewed-ready-flip",
             GuardrailsCommands::WarnAliasParsing => "warn-alias-parsing",
             GuardrailsCommands::GuardBrowserDevice => "guard-browser-device",
-            GuardrailsCommands::InjectGhContext => "inject-gh-context",
             GuardrailsCommands::InjectGhWriteContext => "inject-gh-write-context",
             GuardrailsCommands::EnforceWorktree => "enforce-worktree",
             // The dismiss-* subcommands are CLI actions, not hooks —
@@ -492,6 +604,10 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             MetricsCommands::LogAskUserQuestion => "log-ask-user-question",
             MetricsCommands::LogSkill => "log-skill",
             MetricsCommands::WarnStale => "warn-stale",
+            // A CLI action, not a hook: no hooks.json wiring, no stdin
+            // payload, not subject to CADENCE_DISABLE (same treatment as
+            // redact-scan / declare / status / dismiss-*).
+            MetricsCommands::Grade { .. } => return None,
         }),
         Commands::Session(s) => Some(match s {
             SessionCommands::Start => "start",
@@ -503,8 +619,10 @@ fn hook_name(cmd: &Commands) -> Option<&'static str> {
             SessionCommands::End => "end",
             SessionCommands::BackstopRecord => "backstop-record",
             SessionCommands::BackstopWarn => "backstop-warn",
-            SessionCommands::PersistPlan => "persist-plan",
             SessionCommands::PersistPlanApproval => "persist-plan-approval",
+            SessionCommands::NudgePlanTick => "nudge-plan-tick",
+            SessionCommands::WarnPlanReadyFlip => "warn-plan-ready-flip",
+            SessionCommands::LintPlanShape => "lint-plan-shape",
             // declare and status are CLI actions, not hooks — no hooks.json
             // wiring and not subject to CADENCE_DISABLE (same treatment as
             // dismiss-main-branch-warn).
@@ -629,13 +747,8 @@ fn main() {
     // CLI actions) — not any argv token, which would let a hook argument that
     // happens to equal "list"/"try"/etc. skip the bypass short-circuit.
     let mut positional = std::env::args().skip(1);
-    let bypass_exempt = matches!(
-        (positional.next().as_deref(), positional.next().as_deref()),
-        (
-            Some("list" | "manifest" | "configure" | "doctor" | "try" | "migrate-config"),
-            _
-        ) | (Some("session"), Some("declare" | "status"))
-    );
+    let bypass_exempt =
+        is_bypass_exempt(positional.next().as_deref(), positional.next().as_deref());
     if bypassed && !bypass_exempt {
         eprintln!("⚠️  cadence-hooks: all enforcement bypassed (CADENCE_BYPASS=1)");
         process::exit(0);
@@ -827,7 +940,6 @@ fn main() {
     let pre = HookEvent::PreToolUse;
     let post = HookEvent::PostToolUse;
     let session = HookEvent::SessionStart;
-    let user_prompt_submit = HookEvent::UserPromptSubmit;
 
     match cli.command {
         Commands::Try {
@@ -851,7 +963,46 @@ fn main() {
             print_hook_manifest(format);
             process::exit(0);
         }
-        Commands::Configure { list } => {
+        Commands::Configure {
+            action:
+                Some(ConfigureCommands::Guardrails {
+                    owners,
+                    repos,
+                    yes,
+                    show,
+                }),
+            ..
+        } => {
+            // Same refusal as the hook-disable wizard below: this writes the
+            // allowlist deciding which repos a push or gh write may target, so
+            // an incidental agent invocation would silently widen it.
+            //
+            // It is an ACCIDENT GUARD, not a capability boundary — worth saying
+            // plainly so the point is not re-derived at every review.
+            // `CLAUDECODE` is a plain env var an agent can clear in one Bash
+            // call (this estate's own docs instruct `CLAUDECODE= claude …`),
+            // and nothing guards the user settings file against the Write tool
+            // either. That matches this repo's stated threat model: accidents,
+            // not a hostile agent. `--show` is read-only and stays available.
+            if under_claude_code() && !show {
+                eprintln!(
+                    "cadence-hooks: `configure guardrails` is disabled under Claude Code.\n\
+                     \n\
+                     It writes CADENCE_ALLOWED_OWNERS — the allowlist deciding which repos\n\
+                     pushes and gh writes are permitted against — so it is not something an\n\
+                     agent should change on your behalf.\n\
+                     \n\
+                     Run it yourself from a terminal:\n\
+                     \n\
+                     \x20   cadence-hooks configure guardrails\n\
+                     \n\
+                     Or use `configure guardrails --show` to see the current values."
+                );
+                process::exit(1);
+            }
+            configure_guardrails::run(owners, repos, yes, show);
+        }
+        Commands::Configure { list, action: None } => {
             // Under Claude Code, refuse the interactive wizard — it edits settings.json
             // and would let the agent silently disable guardrails. `--list` is read-only
             // and stays available for visibility.
@@ -890,12 +1041,12 @@ fn main() {
                 canonical_hook,
             ),
             CadenceCommands::PreventSecretLeaks => dispatch::run_logged_check(
-                &cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard,
+                &cadence_hooks_cadence::prevent_secret_leaks::SecretLeaksGuard::default(),
                 pre,
                 canonical_hook,
             ),
             CadenceCommands::PreventSecretWrites => dispatch::run_logged_check(
-                &cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard,
+                &cadence_hooks_cadence::prevent_secret_writes::SecretWritesGuard::default(),
                 pre,
                 canonical_hook,
             ),
@@ -921,6 +1072,11 @@ fn main() {
             ),
             CadenceCommands::WarnDocsUpdate => dispatch::run_logged_check(
                 &cadence_hooks_cadence::warn_docs_update::WarnDocsUpdate,
+                pre,
+                canonical_hook,
+            ),
+            CadenceCommands::WarnChangelogEntry => dispatch::run_logged_check(
+                &cadence_hooks_cadence::warn_changelog_entry::WarnChangelogEntry,
                 pre,
                 canonical_hook,
             ),
@@ -956,14 +1112,35 @@ fn main() {
                 branch,
                 scope,
                 arm,
+                arm_model,
+                arm_report,
+                fresh,
             } => {
-                cadence_hooks_cadence::record_polish::run_record(repo_root, branch, scope, arm);
+                // Exit only on a nonzero code; the success path keeps falling
+                // through to main's own exit. `run_record` returns 0 when a
+                // marker was written, 1 when the environment prevented the
+                // record and nothing was written (not a repo, detached HEAD,
+                // write failed — cadence-hooks#801), and 2 on a usage error
+                // (`--scope`, `--branch` — cadence-hooks#775, #801). This is a
+                // CLI action, not a hook, so a nonzero exit gates no tool call.
+                let code = cadence_hooks_cadence::record_polish::run_record(
+                    repo_root, branch, scope, arm, arm_model, arm_report, fresh,
+                );
+                if code != 0 {
+                    process::exit(code.into());
+                }
             }
             CadenceCommands::RedactScan {
                 file,
                 audience,
                 init,
+                status,
             } => {
+                if status {
+                    process::exit(
+                        cadence_hooks_cadence::redact_external_content::run_status().into(),
+                    );
+                }
                 process::exit(
                     cadence_hooks_cadence::redact_external_content::run_scan(file, audience, init)
                         .into(),
@@ -998,11 +1175,6 @@ fn main() {
             ),
             GuardrailsCommands::WarnSubagentWorktree => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_subagent_worktree::WarnSubagentWorktree,
-                pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::WarnSubagentConcurrency => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_subagent_concurrency::WarnSubagentConcurrency,
                 pre,
                 canonical_hook,
             ),
@@ -1071,6 +1243,11 @@ fn main() {
                 pre,
                 canonical_hook,
             ),
+            GuardrailsCommands::GuardSopsDecrypt => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::guard_sops_decrypt::SopsDecryptGuard,
+                pre,
+                canonical_hook,
+            ),
             GuardrailsCommands::WarnCurlAlias => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::warn_curl_alias::WarnCurlAlias,
                 pre,
@@ -1081,8 +1258,8 @@ fn main() {
                 pre,
                 canonical_hook,
             ),
-            GuardrailsCommands::WarnCoderabbitRetrigger => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::warn_coderabbit_retrigger::WarnCoderabbitRetrigger,
+            GuardrailsCommands::WarnUnreviewedReadyFlip => dispatch::run_logged_check(
+                &cadence_hooks_guardrails::warn_unreviewed_ready_flip::WarnUnreviewedReadyFlip,
                 pre,
                 canonical_hook,
             ),
@@ -1094,11 +1271,6 @@ fn main() {
             GuardrailsCommands::GuardBrowserDevice => dispatch::run_logged_check(
                 &cadence_hooks_guardrails::guard_browser_device::GuardBrowserDevice,
                 pre,
-                canonical_hook,
-            ),
-            GuardrailsCommands::InjectGhContext => dispatch::run_logged_check(
-                &cadence_hooks_guardrails::inject_gh_context::InjectGhContext,
-                session,
                 canonical_hook,
             ),
             GuardrailsCommands::InjectGhWriteContext => dispatch::run_logged_check(
@@ -1210,6 +1382,16 @@ fn main() {
                 session,
                 canonical_hook,
             ),
+            MetricsCommands::Grade {
+                transcript,
+                session_id,
+                prices,
+            } => {
+                process::exit(
+                    cadence_hooks_metrics::session_grade::run_grade(transcript, session_id, prices)
+                        .into(),
+                );
+            }
         },
         Commands::Session(cmd) => match cmd {
             SessionCommands::Start => dispatch::run_logged_check(
@@ -1261,14 +1443,24 @@ fn main() {
                 session,
                 canonical_hook,
             ),
-            SessionCommands::PersistPlan => dispatch::run_logged_check(
-                &cadence_hooks_session::persist_plan::PersistPlan,
-                user_prompt_submit,
-                canonical_hook,
-            ),
             SessionCommands::PersistPlanApproval => dispatch::run_logged_check(
                 &cadence_hooks_session::persist_plan::PersistPlanApproval,
                 post,
+                canonical_hook,
+            ),
+            SessionCommands::NudgePlanTick => dispatch::run_logged_check(
+                &cadence_hooks_session::plan_guards::NudgePlanTick,
+                post,
+                canonical_hook,
+            ),
+            SessionCommands::WarnPlanReadyFlip => dispatch::run_logged_check(
+                &cadence_hooks_session::plan_guards::WarnPlanReadyFlip,
+                pre,
+                canonical_hook,
+            ),
+            SessionCommands::LintPlanShape => dispatch::run_logged_check(
+                &cadence_hooks_session::plan_guards::LintPlanShape,
+                pre,
                 canonical_hook,
             ),
             SessionCommands::Declare {
@@ -1314,6 +1506,82 @@ fn finish_dismiss(result: Result<cadence_hooks_guardrails::snooze_meta::DismissA
 mod tests {
     use super::*;
 
+    #[test]
+    fn configure_guardrails_is_exempt_from_the_maintenance_bypass() {
+        assert!(is_bypass_exempt(Some("configure"), Some("guardrails")));
+        assert!(is_bypass_exempt(Some("configure"), None));
+        assert!(is_bypass_exempt(Some("doctor"), None));
+        assert!(is_bypass_exempt(Some("session"), Some("status")));
+    }
+
+    #[test]
+    fn enforcement_hooks_are_not_exempt_from_the_maintenance_bypass() {
+        assert!(!is_bypass_exempt(
+            Some("guardrails"),
+            Some("guard-push-remote")
+        ));
+        // Position, not presence: an argument spelled like an exempt command
+        // must not buy an exemption.
+        assert!(!is_bypass_exempt(Some("cadence"), Some("configure")));
+    }
+
+    /// `configure guardrails` parses, and its flags land where the dispatch
+    /// arm reads them.
+    #[test]
+    fn configure_guardrails_flags_parse() {
+        let cli = Cli::command();
+        let matches = cli
+            .try_get_matches_from([
+                "cadence-hooks",
+                "configure",
+                "guardrails",
+                "--owners",
+                "cameronsjo",
+                "acme",
+                "--repos",
+                "other/tool",
+                "--yes",
+            ])
+            .expect("configure guardrails parses");
+        let parsed = Cli::from_arg_matches(&matches).expect("into Cli");
+
+        match parsed.command {
+            Commands::Configure {
+                action:
+                    Some(ConfigureCommands::Guardrails {
+                        owners,
+                        repos,
+                        yes,
+                        show,
+                    }),
+                ..
+            } => {
+                assert_eq!(owners, vec!["cameronsjo".to_string(), "acme".to_string()]);
+                assert_eq!(repos, vec!["other/tool".to_string()]);
+                assert!(yes);
+                assert!(!show);
+            }
+            _ => panic!("expected Configure/Guardrails"),
+        }
+    }
+
+    /// Bare `configure` keeps its existing shape — the hook-disable wizard.
+    #[test]
+    fn bare_configure_still_takes_list_and_no_action() {
+        let matches = Cli::command()
+            .try_get_matches_from(["cadence-hooks", "configure", "--list"])
+            .expect("configure --list parses");
+        let parsed = Cli::from_arg_matches(&matches).expect("into Cli");
+
+        match parsed.command {
+            Commands::Configure { list, action } => {
+                assert!(list);
+                assert!(action.is_none());
+            }
+            _ => panic!("expected Configure"),
+        }
+    }
+
     /// The registry must mirror clap's dispatch exactly — both directions.
     ///
     /// This is the mechanical enforcement of "single source of truth"
@@ -1339,6 +1607,7 @@ mod tests {
             "status",
             "record-polish",
             "redact-scan",
+            "grade",
         ];
 
         let mut clap_pairs: Vec<(String, String)> = Vec::new();

@@ -1,11 +1,13 @@
 //! `guardrails inject-gh-write-context` — PreToolUse hook.
 //!
-//! Just-in-time twin of [`inject_gh_context`](super::inject_gh_context), which
-//! primes the same allowlist + `-R owner/repo` rule at SessionStart. Session
-//! start is far from the write: by the time a `gh pr create` is composed, that
-//! context may be many turns — or a compaction — behind, and the write lands
+//! Re-states the gh-write allowlist + `-R owner/repo` rule (rendered by
+//! [`gh_context`](super::gh_context)) at the moment it applies. It began as the
+//! just-in-time twin of a SessionStart injector (`inject-gh-context`): session
+//! start is far from the write — by the time a `gh pr create` is composed that
+//! context may be many turns, or a compaction, behind, and the write lands
 //! without `-R`, silently targeting whatever cwd's git remote happens to be.
-//! This check re-states the rule at the moment it applies.
+//! cameronsjo/cadence#658 retired the SessionStart half; this is the one that
+//! stayed.
 //!
 //! Fires only on the shapes that need it: a segment that actually invokes `gh`,
 //! runs a write sub-command, and names no explicit target. Reads never fire
@@ -26,8 +28,8 @@
 use cadence_hooks_core::shell::command_segments;
 use cadence_hooks_core::{Check, CheckResult, HookInput};
 
+use crate::gh_context::render_from_env;
 use crate::guard_gh_write::{is_write_command, segment_invokes_gh, segment_lacks_explicit_target};
-use crate::inject_gh_context::render_from_env;
 
 /// Re-inject the gh allowlist + `-R` rule just before an untargeted gh write.
 pub struct InjectGhWriteContext;

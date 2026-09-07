@@ -1,0 +1,13 @@
+{
+  "session_id": "test",
+  "transcript_path": "/tmp/test.jsonl",
+  "cwd": "/tmp",
+  "permission_mode": "plan",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "ExitPlanMode",
+  "tool_use_id": "toolu_test",
+  "tool_input": {
+    "plan": "# Research: where does the cache live\n\n## Goal\n\nAnswer a question; no code change.\n\n## Alternatives declined\n\n- none proposed — research only\n\n## Panel\n\nPanel: none — research-only turn, no implementation plan\n\nFindings land in the reply.\n",
+    "planFilePath": "/nonexistent/plans/research.md"
+  }
+}

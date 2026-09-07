@@ -34,12 +34,16 @@ jobs:
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             use-cross: true
+          # Both macOS targets build on the M1 Max fleet's `ghr-cadence-hooks`
+          # account. `os` is an array here and a string elsewhere, which
+          # `runs-on: ${{ matrix.os }}` accepts — a label set and a single label
+          # are both valid runs-on values.
           - name: macos-x86_64
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64]
             target: x86_64-apple-darwin
             use-cross: false
           - name: macos-aarch64
-            os: macos-latest
+            os: [self-hosted, macOS, ARM64]
             target: aarch64-apple-darwin
             use-cross: false
           - name: windows-x86_64
@@ -47,7 +51,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             use-cross: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -98,7 +102,7 @@ jobs:
           "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: ${{ env.ARCHIVE }}
@@ -111,12 +115,12 @@ jobs:
     steps:
       # Checkout + toolchain are needed for the CycloneDX SBOM step below — the
       # release job otherwise only consumes the build job's artifacts.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 
@@ -139,7 +143,7 @@ jobs:
           echo "SBOM=${SBOM}" >> "${GITHUB_ENV}"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             cadence-hooks-*.tar.gz
@@ -148,7 +152,7 @@ jobs:
       # Attest the SBOM against the binaries it describes. Complements (does not
       # replace) the build-provenance attestation above.
       - name: Attest SBOM
-        uses: actions/attest-sbom@v2
+        uses: actions/attest-sbom@v4
         with:
           subject-path: |
             cadence-hooks-*.tar.gz
@@ -167,7 +171,7 @@ jobs:
         run: cosign sign-blob --yes --bundle checksums.txt.cosign.bundle checksums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
@@ -197,11 +201,15 @@ jobs:
 
       - name: Generate Forge Bellows token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.RELEASE_APP_ID }}
+          # client-id, not the deprecated app-id — see auto-tag.yml for why the
+          # numeric App ID in RELEASE_APP_ID stays valid under the new key, and
+          # why the rename requires v3.1.0+ (not v2, and not v3.0.0).
+          client-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           repositories: homebrew-tap
+          permission-contents: write
 
       - name: Update Homebrew tap
         env:

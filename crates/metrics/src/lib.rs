@@ -47,9 +47,11 @@ pub mod model_breakdown;
 pub mod prices;
 /// Sum transcript token usage over a range.
 pub mod scan_tokens;
+/// Deterministic session grading: gaps, cold-restart dollars, peak context.
+pub mod session_grade;
 /// Snapshot HEAD before a `git commit`.
 pub mod snapshot;
-/// Versioned Claude and Codex transcript usage scanners.
+/// Versioned Claude transcript usage scanner.
 pub mod transcript;
 /// Warn at SessionStart when metrics telemetry has gone stale.
 pub mod warn_stale;
@@ -57,7 +59,7 @@ pub mod warn_stale;
 /// The metrics root directory (`CADENCE_METRICS_DIR`, else
 /// `<config_dir>/metrics`) — the single source of truth every stream's
 /// writer resolves against. Re-exported so a JSONL append living outside
-/// this crate (e.g. `session persist-plan`'s `plan-links.jsonl`) reuses the
+/// this crate (e.g. `session persist-plan-approval`'s `plan-links.jsonl`) reuses the
 /// resolution instead of re-deriving it.
 pub use common::metrics_dir;
 

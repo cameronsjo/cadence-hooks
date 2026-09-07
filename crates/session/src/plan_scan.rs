@@ -24,8 +24,7 @@
 //! every plan doc is committed source, but a shared checkout can carry a
 //! contributor-authored file, so this scan treats the corpus as adversarial
 //! input, not just large input: candidates are capped to the newest
-//! [`PLAN_SCAN_MAX_FILES`] by mtime (mirroring
-//! `persist_plan::find_parent`'s newest-first bound), a symlinked or
+//! [`PLAN_SCAN_MAX_FILES`] by mtime (a newest-first bound), a symlinked or
 //! non-regular `.md` entry is skipped via `symlink_metadata` rather than
 //! opened, each file's read is capped to [`PLAN_SCAN_READ_CAP_BYTES`], and
 //! the rendered disclosure itself caps at [`PLAN_SCAN_MAX_EMITTED_LINES`]
@@ -43,6 +42,18 @@
 //! Fails open throughout (ADR-0001): an unreadable directory, an unreadable
 //! file, or a malformed frontmatter block is skipped, never surfaced as an
 //! error — a bug here must not break `session start`.
+//!
+//! **Second responsibility — the plan-shape detectors.** This module also
+//! hosts the ONE implementation of the plan template's mandatory-stanza
+//! checks ([`missing_stanzas`], built on [`panel_line_settled`],
+//! [`alternatives_stanza_present`], [`checkbox_present`], and the shared
+//! [`visible_lines`] fence/quote filter). Two gates consume it: the
+//! persist-time format-gate sentence in [`crate::persist_plan`] (after
+//! approval) and the call-time `session lint-plan-shape` block in
+//! [`crate::plan_guards`] (at `PreToolUse:ExitPlanMode`). They share one
+//! detector because two scanners drifted once already (the cadence-hooks#675
+//! polish) — a plan judged template-shaped at call time must be judged the
+//! same at persist time.
 
 use crate::identity;
 use std::fs;
@@ -58,8 +69,7 @@ use std::time::SystemTime;
 const PLAN_SCAN_READ_CAP_BYTES: u64 = 64 * 1024;
 
 /// Cap on how many `docs/plans/*.md` candidates are even considered, newest
-/// by mtime — mirrors `persist_plan::find_parent`'s `PARENT_SCAN_MAX_FILES`
-/// bound on sibling transcripts. Bounds the scan's total work independent of
+/// by mtime. Bounds the scan's total work independent of
 /// how large (or adversarially padded) the directory grows.
 const PLAN_SCAN_MAX_FILES: usize = 50;
 
@@ -88,15 +98,252 @@ struct PlanFacts {
     pr: Option<String>,
 }
 
+/// One in-flight (or blocked) plan doc, structured for the plan guards
+/// ([`crate::plan_guards`]) — the same bounded scan the disclosure renderer
+/// uses, exposed as data instead of prose. `rel_path` is forward-slash
+/// repo-relative (`docs/plans/<file>`), the shape `git log --name-only`
+/// prints, so guard-side comparisons are string-equal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct InFlightPlan {
+    pub(crate) path: PathBuf,
+    pub(crate) rel_path: String,
+    pub(crate) status: String,
+    pub(crate) branch: Option<String>,
+}
+
+/// The shared, fence-aware checkbox scan — the ONE body reader every checkbox
+/// consumer uses (the living-plan-guards plan's Task 3 shared-reader bullet;
+/// two independent scanners diverged on fence discipline in this feature's
+/// first cut, which is exactly the drift a single reader prevents). Lines
+/// inside fenced code blocks (``` / ~~~ toggles) never count — a plan that
+/// *documents* checklist syntax in a fenced example carries no real boxes
+/// there. Both tick spellings count as ticked (`[x]`/`[X]`).
+pub(crate) fn checkbox_counts(text: &str) -> (usize, usize) {
+    let mut in_fence = false;
+    let (mut unticked, mut ticked) = (0usize, 0usize);
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trimmed.starts_with("- [ ]") {
+            unticked += 1;
+        } else if trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
+            ticked += 1;
+        }
+    }
+    (unticked, ticked)
+}
+
+/// Every plan-shape detector in this module ([`alternatives_stanza_present`],
+/// [`panel_line_settled`]) and the `## Orchestrator` reader in
+/// [`crate::persist_plan`] skip the same two things before inspecting a
+/// line: fenced code (a naive ```` ``` ````/`~~~` toggle — no length
+/// matching, which errs toward skipping ambiguous lines) and block quotes
+/// (`>`). One shared filter so the discipline can't drift between detectors.
+pub(crate) fn visible_lines(body: &str) -> impl Iterator<Item = &str> {
+    let mut in_fence = false;
+    body.lines().filter(move |line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            return false;
+        }
+        !in_fence && !line.starts_with('>')
+    })
+}
+
+/// True when the plan body carries an `## Alternatives declined` heading at
+/// line start ([`visible_lines`]'s fence/quote-skip discipline). Case-exact:
+/// the template writes it one way.
+pub(crate) fn alternatives_stanza_present(body: &str) -> bool {
+    visible_lines(body).any(|line| line.starts_with("## Alternatives declined"))
+}
+
+/// True when the plan body carries at least one checkbox task outside fenced
+/// code — delegates to the shared fence-aware reader
+/// ([`checkbox_counts`]) so this detector and the plan
+/// guards can never diverge on what counts as a box.
+pub(crate) fn checkbox_present(body: &str) -> bool {
+    let (unticked, ticked) = checkbox_counts(body);
+    unticked + ticked > 0
+}
+
+/// True when the plan body carries a settled `Panel:` line — anchored at line
+/// start, in exactly one of the plan template's two settled forms:
+///
+/// - `Panel: <seats> ran — <counts…>` (a panel ran; both sides non-empty)
+/// - `Panel: none — <reason>` (the absence assertion; non-empty reason)
+///
+/// The separator tolerates what a human actually types: em dash (the
+/// template's canonical form), en dash, `--`, or a plain hyphen — a
+/// hand-written `Panel: none - reason` states the settled fact unambiguously,
+/// and hardcoding U+2014 would fire a false nudge on it (code review of this
+/// change).
+///
+/// Anything else — no `Panel:` line at all, a `Panel: pending…` placeholder,
+/// or a `## Panel review` heading with no settled line — is unsettled. The
+/// line-start anchor plus the required `Panel: ` prefix means a `## Panel`
+/// heading can never false-match.
+///
+/// **First match in document order decides** — the `Driver:` stamp's
+/// discipline (plan-pipeline-conventions §4/§5): the plan template's `## Panel`
+/// stanza precedes the task body, so the stanza's own line is judged, and a
+/// quoted `Panel: … ran — …` example later in the body can neither satisfy
+/// the gate (the accidental-forgery hole a whole-body `any()` scan would
+/// open) nor contradict the stanza. Lines inside fenced code blocks and
+/// block quotes are skipped before the first-match rule applies
+/// ([`visible_lines`]'s discipline) — a fenced or quoted example in a plan
+/// with no stanza at all must not mint a settled verdict (security review of
+/// this change; same class as the quoted-example hole above). The fence
+/// tracker is deliberately naive — it toggles without matching fence
+/// lengths — which errs toward skipping ambiguous lines: on a malformed
+/// document the failure mode is a spurious nudge (fail-loud), never a
+/// suppressed one. Detection only; the caller names this stanza (a static
+/// string, "a settled Panel: line") in the composed format-gate line, never
+/// any matched text.
+pub(crate) fn panel_line_settled(body: &str) -> bool {
+    let Some(rest) = visible_lines(body).find_map(|line| line.strip_prefix("Panel: ")) else {
+        return false;
+    };
+    // Dash tolerance: `--` must be tried before `-` or the second hyphen
+    // leaks into the text it precedes.
+    fn strip_dash(s: &str) -> Option<&str> {
+        let s = s.trim_start();
+        ["—", "–", "--", "-"].iter().find_map(|d| s.strip_prefix(d))
+    }
+    if let Some(after_none) = rest.strip_prefix("none") {
+        return strip_dash(after_none).is_some_and(|reason| !reason.trim().is_empty());
+    }
+    if let Some((seats, tail)) = rest.split_once(" ran ") {
+        return !seats.trim().is_empty()
+            && strip_dash(tail).is_some_and(|counts| !counts.trim().is_empty());
+    }
+    false
+}
+
+/// Static stanza names the plan-shape gates render — never matched plan
+/// text (cameronsjo/cadence-hooks#715). Both consumers (the persist-time
+/// format-gate sentence in [`crate::persist_plan`] and the call-time
+/// `session lint-plan-shape` guard in [`crate::plan_guards`]) name the same
+/// three stanzas through the same strings.
+pub(crate) const PANEL_STANZA: &str = "a settled Panel: line";
+pub(crate) const ALTERNATIVES_STANZA: &str = "an Alternatives-declined stanza";
+pub(crate) const CHECKBOX_STANZA: &str = "checkbox tasks";
+pub(crate) const GLOBAL_CONSTRAINTS_STANZA: &str = "a ## Global Constraints section";
+pub(crate) const ORCHESTRATOR_STANZA: &str = "an ## Orchestrator block with a Driver: line";
+pub(crate) const TASKS_STANZA: &str = "a ## Tasks section";
+
+/// The template's home, appended to every plan-shape gate message — one
+/// const so the persist-time and call-time gates can never drift onto
+/// different pointers (the pre-this-change texts said "see the plan
+/// template" with no location).
+pub(crate) const TEMPLATE_POINTER: &str =
+    "the plan template: `cadence:arrange` `references/plan-template.md`";
+
+/// A minimal plan satisfying every [`missing_stanzas`] detector — the shared
+/// template-conforming fixture for this module's and both gates' tests.
+#[cfg(test)]
+pub(crate) const TEMPLATE_SHAPED_PLAN: &str = "# T\n\n\
+    Panel: r ran — 1 finding, 1 folded in, 0 declined\n\n\
+    ## Alternatives declined\n\n- none\n\n\
+    ## Global Constraints\n\n- keep it small\n\n\
+    ## Orchestrator\n\n**Driver:** sonnet\n\n\
+    ## Tasks\n\n- [ ] task\n";
+
+/// The ONE plan-shape detector both gates consume: the plan template's
+/// mandatory stanzas `body` lacks, in template order (`Panel:` line,
+/// `## Alternatives declined`, checkbox tasks). Empty for a template-shaped
+/// plan. Two scanners drifted once already (the #675 polish), which is why
+/// persist-time and call-time share this single entry point rather than
+/// each composing the list inline.
+pub(crate) fn missing_stanzas(body: &str) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !panel_line_settled(body) {
+        missing.push(PANEL_STANZA);
+    }
+    if !alternatives_stanza_present(body) {
+        missing.push(ALTERNATIVES_STANZA);
+    }
+    if !section_heading_present(body, "## Global Constraints") {
+        missing.push(GLOBAL_CONSTRAINTS_STANZA);
+    }
+    // Deliberately STRICTER than [`recommended_tier`]: the legacy
+    // `recommended_model:` frontmatter field (its priority-3 fallback) does
+    // not satisfy this detector — the nudge teaches the template's
+    // `## Orchestrator` + `Driver:` form, the one the dispatcher greps
+    // (pipeline-doctrine deliverable 7, cameronsjo/cadence#1070).
+    if !orchestrator_driver_present(body) {
+        missing.push(ORCHESTRATOR_STANZA);
+    }
+    if !section_heading_present(body, "## Tasks") {
+        missing.push(TASKS_STANZA);
+    }
+    if !checkbox_present(body) {
+        missing.push(CHECKBOX_STANZA);
+    }
+    missing
+}
+
+/// Line-start exact match for a template section heading, over
+/// [`visible_lines`] so a fenced or quoted example never satisfies the
+/// detector. Trailing whitespace tolerated; a deeper heading
+/// (`### Global Constraints`) or prose mention does not match.
+fn section_heading_present(body: &str, heading: &str) -> bool {
+    visible_lines(body).any(|line| line.trim_end() == heading)
+}
+
+/// An `## Orchestrator` block carrying a parseable driver — the template's
+/// canonical `**Driver:** <family>` line, or the `<family>-drivable` prose
+/// token the tier parser also accepts. See the [`missing_stanzas`] comment
+/// for why the legacy frontmatter field is excluded here.
+fn orchestrator_driver_present(body: &str) -> bool {
+    orchestrator_block(body).is_some_and(|block| {
+        find_driver_line(&block)
+            .or_else(|| find_drivable_token(&block))
+            .is_some()
+    })
+}
+
+/// Every plan doc whose `status:` is `in-flight` or `blocked`, under the same
+/// candidate bounds as [`scan_in_flight_plans`]. Empty on a missing or
+/// unreadable directory (fail-open).
+pub(crate) fn in_flight_plans(repo_root: &Path) -> Vec<InFlightPlan> {
+    let plans_dir = repo_root.join("docs").join("plans");
+    let Some(paths) = list_markdown_files(&plans_dir) else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let content = read_capped(&path)?;
+            let facts = parse_frontmatter_facts(&content)?;
+            if !matches_in_flight_or_blocked(&facts.status) {
+                return None;
+            }
+            let file_name = path.file_name()?.to_str()?.to_string();
+            Some(InFlightPlan {
+                rel_path: format!("docs/plans/{file_name}"),
+                status: facts.status,
+                branch: facts.branch,
+                path,
+            })
+        })
+        .collect()
+}
+
 /// Scan `<repo_root>/docs/plans/*.md` and render a disclosure block for every
 /// plan whose `status:` is `in-flight` or `blocked`. `None` when the
 /// directory doesn't exist, is unreadable, or no plan matches — the "zero
 /// matching plans = silence" contract at `session start`.
 ///
-/// `pub(crate)`, not `pub`: this scanner has exactly one consumer,
-/// [`crate::start`], within this crate — unlike the `Check`/`Logger` types
-/// `main.rs` dispatches across the crate boundary, nothing outside
-/// `cadence-hooks-session` ever calls this directly.
+/// `pub(crate)`, not `pub`: this scanner's consumers all live in this crate
+/// ([`crate::start`], [`crate::plan_guards`]) — unlike the `Check`/`Logger`
+/// types `main.rs` dispatches across the crate boundary.
 pub(crate) fn scan_in_flight_plans(repo_root: &Path) -> Option<String> {
     let plans_dir = repo_root.join("docs").join("plans");
     let paths = list_markdown_files(&plans_dir)?;
@@ -336,9 +583,209 @@ fn render_block(lines: &[String]) -> String {
     }
     format!(
         "{header}\n{}\nThe plan file is an index — verify it against the branch log before \
-         trusting it.",
+         trusting it. Tick the plan as work lands — the commit that lands work is the commit \
+         that touches the plan (Plan Execution doctrine, carried here so it reaches every \
+         machine the hook reaches, rules installed or not).",
         body.join("\n")
     )
+}
+
+// ---------------------------------------------------------------------------
+// Driver tier (model-guard, cameronsjo/cadence-hooks — "stronger prose, not
+// teeth"): the hook can never know the LIVE model at pickup (probed
+// 2026-08-14: no `model` field on UserPromptSubmit, no structural `model` in
+// the transcript before the first assistant turn), but it CAN deterministically
+// parse the plan's own recorded intent — the `## Orchestrator` block's
+// `Driver:` line. Each party carries its half: this parser records the tier,
+// [`persist_and_nudge`] instructs Claude to compare it against the live
+// model, and Claude alone completes the comparison.
+// ---------------------------------------------------------------------------
+
+/// The plan's recorded Driver tier — a closed enum, deliberately. This is the
+/// injection wall: [`Tier::as_str`]'s canonical lowercase name is the ONLY
+/// text [`recommended_tier`]'s callers ever render (the plan-links row, the
+/// nudge directive) — never the matched source text, which is untrusted plan
+/// content (same discipline as the format-gate line's stanza names below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    Fable,
+    Opus,
+    Sonnet,
+    Haiku,
+}
+
+impl Tier {
+    /// The canonical lowercase family name — the sole text this enum ever
+    /// contributes to rendered output.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Tier::Fable => "fable",
+            Tier::Opus => "opus",
+            Tier::Sonnet => "sonnet",
+            Tier::Haiku => "haiku",
+        }
+    }
+}
+
+/// Every recognized family, in a fixed order used only for the earliest-match
+/// scan in [`find_drivable_token`] — priority BETWEEN anchors is decided by
+/// [`recommended_tier`], not by this array's order.
+const FAMILIES: [(&str, Tier); 4] = [
+    ("fable", Tier::Fable),
+    ("opus", Tier::Opus),
+    ("sonnet", Tier::Sonnet),
+    ("haiku", Tier::Haiku),
+];
+
+/// Drop every inline-code span (`` `...` ``) from `line`, non-nested. Used
+/// only by [`find_drivable_token`]'s unanchored substring search, so a
+/// paragraph merely discussing the syntax (`` `sonnet-drivable` ``) can never
+/// forge a real match. Pairing is positional (`split('`').step_by(2)` keeps
+/// even-indexed segments): with an EVEN backtick count each odd-indexed
+/// segment is a genuine code span, correctly dropped; with an ODD count the
+/// trailing segment — everything after the final, unpaired backtick — is
+/// also dropped as if it were code. Conservative for this module's one
+/// caller (an over-stripped candidate simply fails to match, never forges
+/// one), but not a general-purpose inline-code stripper: callers needing
+/// exact span semantics should not reuse this.
+fn strip_inline_code(line: &str) -> String {
+    line.split('`').step_by(2).collect::<Vec<_>>().join(" ")
+}
+
+/// Case-insensitive "does `s` begin with the whole family token `name`"
+/// check, returning the tier and the remainder past the token when it does.
+/// "Whole token" is the load-bearing word: the char immediately after the
+/// token must be absent, whitespace, or one of the tail-introducing marks
+/// tolerated elsewhere in this module (`*` \` `:` `,` `.` `(` and the dash
+/// family) — never an alphanumeric or `/`. This is what makes a multi-family
+/// value like `Opus/Fable` fail every family's boundary check and fall
+/// through to `None` (conservative, per the plan's pinned rule), while
+/// `sonnet — needs Opus fallback` still matches `sonnet` cleanly.
+fn match_family_prefix(s: &str) -> Option<(Tier, &str)> {
+    let lower = s.to_ascii_lowercase();
+    for (name, tier) in FAMILIES {
+        if let Some(after) = lower.strip_prefix(name) {
+            let real_after = &s[s.len() - after.len()..];
+            let boundary_ok = real_after
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '/'));
+            if boundary_ok {
+                return Some((tier, real_after));
+            }
+        }
+    }
+    None
+}
+
+/// Extract a `Tier` from a `Driver:`-style value, e.g. `**sonnet**`,
+/// `` `sonnet` ``, or `sonnet — needs Opus fallback`. Formatting (`**`,
+/// backticks) around the value is stripped before matching; anything after
+/// the whole token (an em/en-dash tail, a trailing colon or comma) is
+/// ignored by [`match_family_prefix`]'s boundary check.
+fn extract_family_value(rest: &str) -> Option<Tier> {
+    let trimmed = rest.trim().trim_matches(|c: char| c == '*' || c == '`');
+    match_family_prefix(trimmed.trim_start()).map(|(tier, _)| tier)
+}
+
+/// Is `line` exactly a level-2 `## Orchestrator` heading (surrounding
+/// whitespace and a trailing marker like `## Orchestrator ⏳` tolerated via
+/// [`str::trim`], but not a mere prefix)? A bare `starts_with("## Orchestrator")`
+/// would also open on `## OrchestratorNotes` or `## Orchestrator2` — this
+/// requires the heading TEXT to equal `"Orchestrator"` after the `## ` marker.
+fn is_orchestrator_heading(line: &str) -> bool {
+    line.trim_start().strip_prefix("## ").map(str::trim) == Some("Orchestrator")
+}
+
+/// The `## Orchestrator` block's lines — from just past the line-start
+/// heading through (but not including) the next line-start `## ` heading, or
+/// EOF. Headings inside fenced code or block quotes never open or close a
+/// block ([`visible_lines`]'s discipline). On more than one `## Orchestrator`
+/// heading, the FIRST wins.
+fn orchestrator_block(body: &str) -> Option<Vec<&str>> {
+    let mut lines = visible_lines(body).skip_while(|line| !is_orchestrator_heading(line));
+    lines.next()?; // the heading line itself, consumed but not part of the block
+    Some(lines.take_while(|line| !line.starts_with("## ")).collect())
+}
+
+/// Priority 1: a line-start `**Driver:**` or `Driver:` line inside the
+/// `## Orchestrator` block (`plan-template.md`'s canonical form). NOT
+/// inline-code-stripped: [`strip_inline_code`] is reserved for
+/// [`find_drivable_token`]'s unanchored substring search — applying it here
+/// would also erase a legitimately backtick-wrapped VALUE (`` **Driver:**
+/// `sonnet` ``, [`extract_family_value`]'s own documented syntax), and it is
+/// unneeded for decoy exclusion: a decoy anchor quoted in backticks (`` `**
+/// Driver:** Sonnet` `` or a mid-sentence `` `Driver: sonnet` `` mention)
+/// cannot satisfy the line-start `strip_prefix` below in the first place,
+/// since a leading backtick byte breaks the literal match.
+fn find_driver_line(block: &[&str]) -> Option<Tier> {
+    block.iter().find_map(|line| {
+        let rest = line
+            .strip_prefix("**Driver:**")
+            .or_else(|| line.strip_prefix("Driver:"))?;
+        extract_family_value(rest)
+    })
+}
+
+/// Priority 2: the prose token `<family>-drivable` (case-insensitive)
+/// anywhere in the `## Orchestrator` block, inline-code-stripped (unlike
+/// [`find_driver_line`] — this search is NOT line-start-anchored, so a
+/// backtick-quoted mention like `` `sonnet-drivable` `` needs the strip to
+/// stay excluded); the earliest match in document order wins (first matching
+/// line, leftmost token on that line). BOTH boundaries checked — left, so a
+/// compound like `non-sonnet-drivable` cannot false-match `sonnet-drivable`;
+/// right, so `opus-drivability` (a real word continuing past the token)
+/// cannot false-match `opus-drivable` — same "whole token" discipline as
+/// [`match_family_prefix`]'s boundary check. A decoy earlier on the line that
+/// fails either boundary check is not retried against a later, valid
+/// occurrence of the same family term on that line — conservative, matching
+/// this module's "ambiguous → skip" bias.
+fn find_drivable_token(block: &[&str]) -> Option<Tier> {
+    block.iter().find_map(|line| {
+        let stripped = strip_inline_code(line);
+        let lower = stripped.to_ascii_lowercase();
+        FAMILIES
+            .iter()
+            .filter_map(|(name, tier)| {
+                let needle = format!("{name}-drivable");
+                let idx = lower.find(&needle)?;
+                let left_ok = lower[..idx]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '-'));
+                let right_ok = lower[idx + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric());
+                (left_ok && right_ok).then_some((idx, *tier))
+            })
+            .min_by_key(|(idx, _)| *idx)
+            .map(|(_, tier)| tier)
+    })
+}
+
+/// Priority 3 (legacy fallback): a line-start `recommended_model:` line
+/// appearing before the first line-start `## ` heading. Scanning stops at
+/// the first such heading; nothing past it is a legacy header field. Not
+/// inline-code-stripped — same reasoning as [`find_driver_line`] (line-start
+/// anchored, so a decoy can't reach it, and stripping would eat a
+/// legitimately backtick-wrapped value).
+fn legacy_recommended_model(body: &str) -> Option<Tier> {
+    visible_lines(body)
+        .take_while(|line| !line.starts_with("## "))
+        .find_map(|line| extract_family_value(line.strip_prefix("recommended_model:")?))
+}
+
+/// Parse the plan's recommended Driver tier from its body, per the pinned
+/// priority order. `None` when nothing settles it — including a
+/// recognized-but-invalid capture — never a guess.
+pub(crate) fn recommended_tier(body: &str) -> Option<Tier> {
+    if let Some(block) = orchestrator_block(body)
+        && let Some(tier) = find_driver_line(&block).or_else(|| find_drivable_token(&block))
+    {
+        return Some(tier);
+    }
+    legacy_recommended_model(body)
 }
 
 #[cfg(test)]
@@ -561,7 +1008,10 @@ mod tests {
         assert_eq!(
             block,
             "1 in-flight plan in docs/plans/:\n- a\nThe plan file is an index — verify it \
-             against the branch log before trusting it."
+             against the branch log before trusting it. Tick the plan as work lands — the \
+             commit that lands work is the commit that touches the plan (Plan Execution \
+             doctrine, carried here so it reaches every machine the hook reaches, rules \
+             installed or not)."
         );
     }
 
@@ -750,7 +1200,10 @@ mod tests {
             block,
             "1 in-flight plan in docs/plans/:\n\
              - 2026-07-25-real-plan — next: \"ship the thing\" (branch: feat/x)\n\
-             The plan file is an index — verify it against the branch log before trusting it."
+             The plan file is an index — verify it against the branch log before trusting it. \
+             Tick the plan as work lands — the commit that lands work is the commit that \
+             touches the plan (Plan Execution doctrine, carried here so it reaches every \
+             machine the hook reaches, rules installed or not)."
         );
     }
 
@@ -793,5 +1246,151 @@ mod tests {
         let second_pos = block.find("2026-07-02-second").unwrap();
         assert!(first_pos < second_pos, "sorted by filename: {block}");
         assert!(block.contains("[blocked]"));
+    }
+
+    #[test]
+    fn format_gate_detectors_anchor_on_real_stanzas_only() {
+        // Alternatives stanza: line-start heading, fences and quotes skipped.
+        assert!(alternatives_stanza_present(
+            "# T\n\n## Alternatives declined\n\n- none proposed\n"
+        ));
+        assert!(!alternatives_stanza_present("# T\n\nno stanza here\n"));
+        assert!(!alternatives_stanza_present(
+            "# T\n\n```\n## Alternatives declined\n```\n"
+        ));
+        assert!(!alternatives_stanza_present(
+            "# T\n\n> ## Alternatives declined\n"
+        ));
+        // Checkboxes: ticked or unticked count; fenced examples don't.
+        assert!(checkbox_present("# T\n\n- [ ] build\n"));
+        assert!(checkbox_present("# T\n\n  - [x] done\n"));
+        assert!(!checkbox_present("# T\n\nprose only\n"));
+        assert!(!checkbox_present("# T\n\n```\n- [ ] fenced example\n```\n"));
+    }
+
+    #[test]
+    fn panel_line_settled_accepts_both_settled_forms_only() {
+        // Settled: the ran form and the absence assertion.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: plan-reviewer ×2 ran — 3 findings, 2 folded in, 1 declined\n\nbody"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none — raw-draft bypass per operator ask\n"
+        ));
+        // Unsettled: absent, pending-shaped, empty reason/counts, heading-only.
+        assert!(!panel_line_settled("# T\n\nno panel line at all\n"));
+        assert!(!panel_line_settled(
+            "# T\n\nPanel: pending — seats not yet run\n"
+        ));
+        assert!(!panel_line_settled("# T\n\nPanel: none — \n"));
+        assert!(!panel_line_settled("# T\n\nPanel:  ran — 3 findings\n"));
+        assert!(!panel_line_settled(
+            "# T\n\n## Panel review — findings declined\n\n- none declined\n"
+        ));
+        // Anchored at line start: an indented or mid-line mention never matches.
+        assert!(!panel_line_settled("# T\n\n  Panel: x ran — y\n"));
+        assert!(!panel_line_settled(
+            "# T\n\nsee Panel: x ran — y for details\n"
+        ));
+        // First match in document order decides (the Driver: stamp's
+        // discipline): a settled-looking quoted example AFTER an unsettled
+        // stanza line never satisfies the gate…
+        assert!(!panel_line_settled(
+            "# T\n\nPanel: pending — seats queued\n\nExample: write\nPanel: x ran — 1 finding\n"
+        ));
+        // …and a later unsettled mention never contradicts a settled stanza.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: reviewer ran — 2 findings, 2 folded in, 0 declined\n\n\
+             Quoted form:\nPanel: pending — never do this\n"
+        ));
+        // Dash tolerance: a hand-typed hyphen, double hyphen, or en dash
+        // states the settled fact as unambiguously as the template's em dash.
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none - raw-draft bypass\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: 2 reviewers ran - 3 findings, all folded in\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: none -- operator bypass\n"
+        ));
+        assert!(panel_line_settled(
+            "# T\n\nPanel: reviewer ran – 1 finding\n"
+        ));
+        // …but the dash is still required, and an empty ran-tail is unsettled.
+        assert!(!panel_line_settled("# T\n\nPanel: none reason given\n"));
+        assert!(!panel_line_settled("# T\n\nPanel: x ran — \n"));
+        assert!(!panel_line_settled("# T\n\nPanel: x ran 3 findings\n"));
+        // Fenced and block-quoted examples never mint a settled verdict for a
+        // plan with no stanza at all (security review of this change).
+        assert!(!panel_line_settled(
+            "# Add a Panel: stanza\n\n```markdown\nPanel: reviewer ran — 3 findings\n```\n\n\
+             Approach: …\n"
+        ));
+        assert!(!panel_line_settled(
+            "# T\n\n> Panel: reviewer ran — 3 findings\n\nbody\n"
+        ));
+        // A real stanza after a closed fence still settles.
+        assert!(panel_line_settled(
+            "# T\n\n```\nexample\n```\n\nPanel: reviewer ran — 1 finding, folded\n"
+        ));
+    }
+
+    #[test]
+    fn missing_stanzas_names_every_absent_stanza_in_template_order() {
+        assert_eq!(
+            missing_stanzas("# T\n\n## Context\n\nprose\n"),
+            vec![
+                PANEL_STANZA,
+                ALTERNATIVES_STANZA,
+                GLOBAL_CONSTRAINTS_STANZA,
+                ORCHESTRATOR_STANZA,
+                TASKS_STANZA,
+                CHECKBOX_STANZA
+            ]
+        );
+        assert_eq!(
+            missing_stanzas("# T\n\nPanel: none — no seat warranted\n\nprose\n"),
+            vec![
+                ALTERNATIVES_STANZA,
+                GLOBAL_CONSTRAINTS_STANZA,
+                ORCHESTRATOR_STANZA,
+                TASKS_STANZA,
+                CHECKBOX_STANZA
+            ]
+        );
+        assert!(missing_stanzas(TEMPLATE_SHAPED_PLAN).is_empty());
+    }
+
+    #[test]
+    fn missing_stanzas_new_detectors_ignore_fenced_examples() {
+        // Headings and a Driver line inside a fence are examples, not stanzas.
+        let body = "# T\n\nPanel: r ran — 1 finding, folded\n\n## Alternatives declined\n\n\
+                    - none\n\n```markdown\n## Global Constraints\n\n## Orchestrator\n\n\
+                    **Driver:** sonnet\n\n## Tasks\n```\n\n- [ ] task\n";
+        let missing = missing_stanzas(body);
+        assert!(missing.contains(&GLOBAL_CONSTRAINTS_STANZA), "{missing:?}");
+        assert!(missing.contains(&ORCHESTRATOR_STANZA), "{missing:?}");
+        assert!(missing.contains(&TASKS_STANZA), "{missing:?}");
+    }
+
+    #[test]
+    fn missing_stanzas_orchestrator_detector_rejects_legacy_field_only() {
+        // The legacy `recommended_model:` frontmatter field still parses a
+        // tier (priority 3) but does NOT satisfy the template detector — the
+        // nudge teaches the `## Orchestrator` + `Driver:` form (deliverable 7).
+        let body = "---\nrecommended_model: sonnet\n---\n\n# T\n\n\
+                    Panel: r ran — 1 finding, folded\n\n## Alternatives declined\n\n- none\n\n\
+                    ## Global Constraints\n\n- c\n\n## Tasks\n\n- [ ] task\n";
+        assert_eq!(recommended_tier(body), Some(Tier::Sonnet));
+        assert_eq!(missing_stanzas(body), vec![ORCHESTRATOR_STANZA]);
+    }
+
+    #[test]
+    fn missing_stanzas_deeper_heading_does_not_satisfy_section_detector() {
+        let body = "# T\n\nPanel: r ran — 1 finding, folded\n\n## Alternatives declined\n\n\
+                    - none\n\n### Global Constraints\n\n- c\n\n## Orchestrator\n\n\
+                    **Driver:** sonnet\n\n## Tasks\n\n- [ ] task\n";
+        assert_eq!(missing_stanzas(body), vec![GLOBAL_CONSTRAINTS_STANZA]);
     }
 }

@@ -40,6 +40,28 @@
 //! [`CLAUDE_SCRATCH_DIRS`] earn the class now; anything else under `.claude`
 //! falls through to the structural classes, so a directory nobody has vetted is
 //! ambiguous by default rather than silently disposable.
+//!
+//! **Case folding follows the verdict direction, not consistency.** A path
+//! compare folds ASCII case only when folding can move a path into a *stricter*
+//! class: `.claude` (#726), `.git` (#657), and the home-child prefix (#732) all
+//! feed BLOCK or ASK, so they fold. [`under_claude_scratch`],
+//! `worktree::path_under_temp_root`, and `guard_rm::is_transient_scratch` each
+//! grant a silent ALLOW, so all three stay byte-exact. The per-predicate
+//! reasoning lives on [`under_claude_dir`].
+//!
+//! **Non-goals of the #732 fold, recorded so a later pass does not re-derive
+//! them:**
+//!
+//! - `worktree::path_under_temp_root` stays byte-exact. It is the ALLOW side of
+//!   the same coin, and folding it would let `/TMP/repo` claim the temp
+//!   carve-out.
+//! - Symlink-aware (as opposed to lexical) resolution stays declined per #732.
+//!   This module is pure and lexical by contract; resolving links here would
+//!   add I/O to a predicate every guard calls, and the guards that need the
+//!   filesystem inject their own probes.
+//! - Folding is ASCII-only. A non-ASCII case variant (`/Users/JOSÉ` vs
+//!   `/Users/José`) is not folded, because deciding it correctly needs the
+//!   volume's collation rules this module cannot see.
 
 use crate::normalize_path;
 use crate::worktree::path_under_temp_root;
@@ -162,7 +184,7 @@ pub fn classify(
     // ancestor (a worktree under `.claude`, a repo in `/tmp`) resolves to its
     // allow-class before git-root can match. This ordering is load-bearing and
     // locked by `claude_scratch_wins_over_git_root_probe`.
-    if path_under_temp_root(Path::new(&norm), ctx.tmpdir) {
+    if path_under_temp_root(Path::new(&norm), ctx.tmpdir, Some(ctx.home)) {
         return PathClass::Temp;
     }
     if under_claude_scratch(&norm) {
@@ -206,9 +228,39 @@ pub fn classify(
 /// `.claude` appears as a path component AND is not the final one — the path
 /// lives *under* a `.claude` dir rather than being it. The coarse fact;
 /// [`under_claude_scratch`] is the narrow allowlist within it.
+///
+/// The component compare **folds case** (#726), and that is deliberately the
+/// opposite of [`under_claude_scratch`], which stays byte-exact. Case folding is
+/// decided per predicate by which direction it moves a verdict, never by
+/// consistency, so a sweep folding every path compare would be a regression.
+///
+/// **The predicates that fold, because they are protective** — folding can only
+/// move a path *into* a stricter class:
+///
+/// - This one feeds [`PathClass::ClaudeState`] — guard_rm maps it to ASK, while
+///   the fall-through (`Source`) rides the single-file softening to a silent
+///   ALLOW. On a case-insensitive volume (the APFS default)
+///   `~/.CLAUDE/projects/t.jsonl` and `~/.claude/projects/t.jsonl` are the same
+///   transcript, and before the fold the case variant took the silent ALLOW.
+/// - [`has_git_component`] feeds [`PathClass::GitRoot`] → BLOCK (#657).
+/// - [`is_first_level_home_child`] feeds [`PathClass::HomeChild`] → BLOCK, and
+///   guard_rm's own home-equality and vault compares fold for the same reason
+///   (#732). All three feed **BLOCK**, not ALLOW.
+///
+/// **The predicates that stay byte-exact, because they grant an ALLOW** —
+/// folding would widen a silent allow:
+///
+/// - [`under_claude_scratch`] feeds [`PathClass::ClaudeScratch`], and guard_rm's
+///   #576 rule reads it *negated*. Locked by
+///   `claude_scratch_carve_out_stays_byte_exact`.
+/// - `worktree::path_under_temp_root` feeds [`PathClass::Temp`], guard_rm's
+///   other silent ALLOW. `/TMP/x` is therefore not a temp root here.
+/// - `guard_rm::is_transient_scratch` (guard-local, so not linkable from here)
+///   demotes a home child to an ALLOW on a `.tmp`/`.swp`/`.swo` suffix, which
+///   is why `~/notes.TMP` still blocks.
 fn under_claude_dir(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    match segs.iter().position(|s| *s == ".claude") {
+    match segs.iter().position(|s| s.eq_ignore_ascii_case(".claude")) {
         Some(pos) => pos + 1 < segs.len(),
         None => false,
     }
@@ -242,7 +294,23 @@ pub const CLAUDE_SCRATCH_DIRS: &[&str] = &["worktrees", "intros"];
 /// (`.claude/worktrees`) is excluded — deleting it takes every worktree at once,
 /// which is not the single-disposable-item case. Mirrors the `.claude` dir's own
 /// exclusion one level down.
-fn under_claude_scratch(norm: &str) -> bool {
+///
+/// Public because [`classify`] tests `Temp` FIRST, so a scratch path that also
+/// lives under a temp root reports [`PathClass::Temp`] and the scratch fact is
+/// unreachable from the returned class. `guardrails::guard_rm` needs that fact
+/// to keep worktree cleanup allowed while blocking a plain repo under `/tmp`
+/// (cadence-hooks#576), and asking here is cheaper and safer than reordering a
+/// precedence three tests already lock.
+///
+/// **Both compares stay byte-exact on purpose (#726)** — do not "make this
+/// consistent" with [`under_claude_dir`], which folds case. This predicate
+/// grants an ALLOW at both of its call sites: `classify` returns
+/// [`PathClass::ClaudeScratch`] (guard_rm ALLOW), and guard_rm's #576 rule reads
+/// it *negated* to decline the git-repo BLOCK. Folding here would widen a silent
+/// ALLOW in both — the wrong safety direction — where folding `under_claude_dir`
+/// only ever tightens ALLOW into ASK. Locked by
+/// `claude_scratch_carve_out_stays_byte_exact`.
+pub fn under_claude_scratch(norm: &str) -> bool {
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
     let Some(pos) = segs.iter().position(|s| *s == ".claude") else {
         return false;
@@ -261,18 +329,65 @@ fn under_docs_plans(norm: &str) -> bool {
 }
 
 /// `norm` is a first-level entry directly under `home` (one component below).
+///
+/// The `home` compare folds ASCII case (#732), for the same reason
+/// [`under_claude_dir`] does: this feeds [`PathClass::HomeChild`], which
+/// guard-rm maps to BLOCK, so folding can only move a path from ALLOW/ASK to
+/// BLOCK. On a case-insensitive volume `/USERS/x/Documents` names exactly the
+/// same directory as `/Users/x/Documents`, and before the fold the case variant
+/// escaped the protection entirely.
 fn is_first_level_home_child(norm: &str, home: &str) -> bool {
     if home.is_empty() {
         return false;
     }
-    let prefix = format!("{home}/");
-    norm.strip_prefix(&prefix)
-        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+    if !is_under_dir_ignoring_ascii_case(norm, home) {
+        return false;
+    }
+    let rest = &norm[home.len() + 1..];
+    !rest.is_empty() && !rest.contains('/')
 }
 
-/// Any `/`-separated segment of `norm` is exactly `.git`.
+/// `path` lies strictly under `dir`: a `{dir}/` prefix, with the `dir` half
+/// compared ASCII-case-insensitively.
+///
+/// An **empty `dir` is never a parent** — it returns `false` rather than
+/// matching every absolute path. Both of today's callers already reject an
+/// empty home/vault before reaching here, so this guard is for the next one:
+/// the predicate is `pub`, and a caller that forgot the check would otherwise
+/// classify the entire filesystem as living under its empty root.
+///
+/// Case folding forces a byte comparison, which is what makes the slicing
+/// deliberate: [`str::get`] rather than `path[..dir.len()]`, because a home or
+/// vault carrying a non-ASCII character (`/Users/José`) can put `dir.len()` in
+/// the middle of a UTF-8 sequence for some `path`, and indexing there panics.
+/// `get` answers `None` for that split instead, which reads as "not under
+/// `dir`". This is a hazard the *new* code introduces and closes, not a bug
+/// being fixed: the byte-exact predicates this replaced used `strip_prefix` and
+/// `starts_with`, which are `&str`-safe and could never panic. It matters
+/// because a panicking guard blocks nothing, which is the one failure the
+/// fail-open contract (ADR-0001) does not cover.
+///
+/// ASCII-only folding is the limit, not an oversight: `é` and `É` still compare
+/// unequal, so a non-ASCII case variant keeps its unfolded verdict. Widening to
+/// Unicode case folding would need the volume's own collation rules, which this
+/// pure predicate cannot see.
+pub fn is_under_dir_ignoring_ascii_case(path: &str, dir: &str) -> bool {
+    !dir.is_empty()
+        && path
+            .get(..dir.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(dir))
+        && path.as_bytes().get(dir.len()) == Some(&b'/')
+}
+
+/// Any `/`-separated segment of `norm` is `.git`, compared case-insensitively.
+///
+/// Case-insensitive volumes (the APFS default) resolve `.GIT` to the real
+/// `.git`, so a case-sensitive match let `.GIT` walk past GitRoot protection.
+/// Folding only ever promotes a path *into* GitRoot, never out of it, so on a
+/// case-sensitive volume the worst outcome is protecting a directory that
+/// merely looks like a repo.
 fn has_git_component(norm: &str) -> bool {
-    norm.split('/').any(|seg| seg == ".git")
+    norm.split('/').any(|seg| seg.eq_ignore_ascii_case(".git"))
 }
 
 #[cfg(test)]
@@ -420,6 +535,64 @@ mod tests {
         );
     }
 
+    /// #726: a case-insensitive volume resolves `.CLAUDE` to the real `.claude`,
+    /// so the protective `ClaudeState` compare folds case — otherwise
+    /// `~/.CLAUDE/projects/t.jsonl` fell through to `Source` and rode guard_rm's
+    /// single-file softening to a silent ALLOW while the canonical spelling
+    /// asked. The negative controls prove the fold did not widen into substring
+    /// matching.
+    #[test]
+    fn claude_dir_case_variants_are_claude_state() {
+        assert_eq!(
+            class("/Users/x/.CLAUDE/projects/t.jsonl", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/Users/x/.Claude/projects/t.jsonl", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/srv/repo/.CLAUDE/agent-memory", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/Users/x/repo/.claudex/a", "/Users/x"),
+            PathClass::Source
+        );
+        assert_eq!(
+            class("/Users/x/repo/x.CLAUDE/a", "/Users/x"),
+            PathClass::Source
+        );
+    }
+
+    /// #726's asymmetry lock: the two `.claude` predicates fold in OPPOSITE
+    /// safety directions, so a later consistency sweep must break a test rather
+    /// than ship. `under_claude_dir` folds (protective: ALLOW → ASK);
+    /// `under_claude_scratch` stays byte-exact (folding would widen a silent
+    /// ALLOW). A case-variant scratch path therefore must NOT gain the carve-out
+    /// — it lands on the protective `ClaudeState` instead.
+    #[test]
+    fn claude_scratch_carve_out_stays_byte_exact() {
+        assert!(!under_claude_scratch("/srv/repo/.CLAUDE/worktrees/x"));
+        assert!(!under_claude_scratch("/srv/repo/.claude/WORKTREES/x"));
+        assert!(under_claude_scratch("/srv/repo/.claude/worktrees/x"));
+
+        // Through `classify`: the case variant falls to the protective class,
+        // never to the allow-granting one.
+        assert_eq!(
+            class("/srv/repo/.CLAUDE/worktrees/x", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/srv/repo/.claude/WORKTREES/x", "/Users/x"),
+            PathClass::ClaudeState
+        );
+        assert_eq!(
+            class("/srv/repo/.claude/worktrees/x", "/Users/x"),
+            PathClass::ClaudeScratch
+        );
+    }
+
     #[test]
     fn claude_lookalike_is_not_scratch() {
         assert_eq!(
@@ -511,12 +684,114 @@ mod tests {
         assert_eq!(class("/Users/x/Documents", ""), PathClass::Source);
     }
 
+    /// #732: a case-insensitive volume (the APFS default) resolves
+    /// `/USERS/x/Documents` to the very same directory as `/Users/x/Documents`,
+    /// so the protective home-child prefix folds ASCII case. Folding moves a
+    /// path only from `Source` (which rides guard_rm's single-file softening to
+    /// a silent ALLOW) into `HomeChild` (BLOCK).
+    #[test]
+    fn home_child_case_variants_are_home_child() {
+        assert_eq!(
+            class("/USERS/x/Documents", "/Users/x"),
+            PathClass::HomeChild
+        );
+        assert_eq!(class("/users/X/.zshrc", "/Users/x"), PathClass::HomeChild);
+        assert_eq!(
+            class("/Users/X/Documents", "/Users/x"),
+            PathClass::HomeChild
+        );
+    }
+
+    /// The negative controls: folding must not widen into a substring or
+    /// prefix match. A genuinely different home, a longer sibling directory,
+    /// and a deeper path all keep their unfolded verdicts.
+    #[test]
+    fn home_child_fold_does_not_widen() {
+        // A different user's home is not this home, however it is spelled.
+        assert_eq!(class("/USERS/y/Documents", "/Users/x"), PathClass::Source);
+        // `/Users/xx` must not be swallowed by a home at `/Users/x` — the
+        // separator byte is checked, not just the prefix.
+        assert_eq!(class("/USERS/xx/Documents", "/Users/x"), PathClass::Source);
+        // Still one level only: a deeper case-variant path is not a child.
+        assert_eq!(
+            class("/USERS/x/Documents/notes", "/Users/x"),
+            PathClass::Source
+        );
+        // Home itself, case-varied, is still not its own child.
+        assert_eq!(class("/USERS/x", "/Users/x"), PathClass::Source);
+    }
+
+    /// The panic rail on the folded prefix test. Case folding forces a byte
+    /// comparison, so the new predicate slices — and a non-ASCII home puts
+    /// `home.len()` in the middle of a UTF-8 sequence for some paths, where
+    /// `norm[..home.len()]` would panic. (The byte-exact predicate this
+    /// replaced used `strip_prefix` and could not: this guards a hazard the
+    /// fold introduces, not a bug it inherited.) A panicking guard blocks
+    /// nothing, so `is_under_dir_ignoring_ascii_case` slices with `get` and
+    /// these answer a verdict instead.
+    #[test]
+    fn non_ascii_home_does_not_panic() {
+        // `home.len()` (10) lands on the first byte of `é` in this path.
+        assert_eq!(class("/Users/José/a", "/Users/Jos"), PathClass::Source);
+        // The genuine child of a non-ASCII home still classifies.
+        assert_eq!(
+            class("/Users/José/Documents", "/Users/José"),
+            PathClass::HomeChild
+        );
+        // ASCII-only folding is the documented limit: `É` is not folded to `é`.
+        assert_eq!(
+            class("/Users/JOSÉ/Documents", "/Users/José"),
+            PathClass::Source
+        );
+    }
+
+    /// An empty `dir` is never a parent. Both of today's callers reject an
+    /// empty home/vault first, so this asserts the `pub` helper's own contract
+    /// for the next caller — without the guard, the separator test alone would
+    /// call every absolute path a child of the empty root.
+    #[test]
+    fn empty_dir_is_never_a_parent() {
+        assert!(!is_under_dir_ignoring_ascii_case("/Users/x/Documents", ""));
+        assert!(!is_under_dir_ignoring_ascii_case("/", ""));
+        assert!(!is_under_dir_ignoring_ascii_case("", ""));
+        // …while a real parent still matches, folded.
+        assert!(is_under_dir_ignoring_ascii_case(
+            "/USERS/x/Documents",
+            "/Users/x"
+        ));
+    }
+
+    /// #732's invariant lock, the counterpart to
+    /// `claude_scratch_carve_out_stays_byte_exact`: the ALLOW-granting temp
+    /// predicate must NOT fold, or `/TMP/repo` claims the silent temp carve-out.
+    /// A consistency sweep folding every path compare breaks this rather than
+    /// shipping.
+    #[test]
+    fn temp_root_carve_out_stays_byte_exact() {
+        assert_eq!(class("/TMP/scratch", "/Users/x"), PathClass::Source);
+        assert_eq!(class("/Private/TMP/y", "/Users/x"), PathClass::Source);
+        // The canonical spelling keeps its carve-out.
+        assert_eq!(class("/tmp/scratch", "/Users/x"), PathClass::Temp);
+    }
+
     // --- GitRoot ---
 
     #[test]
     fn dot_git_component_is_git_root() {
         assert_eq!(class("/a/repo/.git", "/Users/x"), PathClass::GitRoot);
         assert_eq!(class("/a/repo/.git/hooks", "/Users/x"), PathClass::GitRoot);
+    }
+
+    /// #657: a case-insensitive volume resolves `.GIT` to the real `.git`, so
+    /// the segment match folds case. The negative controls prove the fold did
+    /// not widen into substring matching.
+    #[test]
+    fn dot_git_component_case_variants_are_git_root() {
+        assert_eq!(class("/a/repo/.GIT", "/Users/x"), PathClass::GitRoot);
+        assert_eq!(class("/a/repo/.Git", "/Users/x"), PathClass::GitRoot);
+        assert_eq!(class("/a/repo/.GIT/hooks", "/Users/x"), PathClass::GitRoot);
+        assert_eq!(class("/a/repo/.gitx", "/Users/x"), PathClass::Source);
+        assert_eq!(class("/a/repo/x.GIT", "/Users/x"), PathClass::Source);
     }
 
     #[test]

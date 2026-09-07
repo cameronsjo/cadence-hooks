@@ -77,6 +77,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-changelog-entry",
+        description: "Nudge to add a CHANGELOG.md entry when shipping code changes",
+        plugin: "cadence",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "warn-overshare",
         description: "Nudge to audit about-to-ship content for personal-context overshare",
         plugin: "cadence",
@@ -146,12 +152,6 @@ pub const HOOKS: &[HookEntry] = &[
     HookEntry {
         name: "warn-subagent-worktree",
         description: "Warn when dispatching a subagent from main while a sibling worktree exists",
-        plugin: "guardrails",
-        event: Some(HookEvent::PreToolUse),
-    },
-    HookEntry {
-        name: "warn-subagent-concurrency",
-        description: "Nudge when live subagents reach the concurrency cap on an Agent/Task spawn",
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
@@ -228,6 +228,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PostToolUse),
     },
     HookEntry {
+        name: "guard-sops-decrypt",
+        description: "Block a sops decrypt whose plaintext is not consumed by an allowed tool",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "guard-op-vault-scan",
         description: "Block uninvited 1Password vault enumeration (op item list)",
         plugin: "guardrails",
@@ -246,8 +252,8 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
-        name: "warn-coderabbit-retrigger",
-        description: "Warn that CodeRabbit re-trigger comments are no-ops on reviewed content",
+        name: "warn-unreviewed-ready-flip",
+        description: "Warn on gh pr ready/merge when the PR head has no reviewed signal (human APPROVED or a clean cadence-review marker)",
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
     },
@@ -262,12 +268,6 @@ pub const HOOKS: &[HookEntry] = &[
         description: "Block the first Claude-in-Chrome action per session until the device is confirmed",
         plugin: "guardrails",
         event: Some(HookEvent::PreToolUse),
-    },
-    HookEntry {
-        name: "inject-gh-context",
-        description: "Inject the gh-write allowlist + `-R` rule on SessionStart",
-        plugin: "guardrails",
-        event: Some(HookEvent::SessionStart),
     },
     HookEntry {
         name: "inject-gh-write-context",
@@ -418,16 +418,28 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::SessionStart),
     },
     HookEntry {
-        name: "persist-plan",
-        description: "Persist an approved plan whose post-approval turn was wiped (UserPromptSubmit)",
-        plugin: "session",
-        event: Some(HookEvent::UserPromptSubmit),
-    },
-    HookEntry {
         name: "persist-plan-approval",
-        description: "Persist an approved plan on same-session approval (PostToolUse:ExitPlanMode)",
+        description: "Persist an approved plan at approval, merging into its own frontmatter and nudging when it carries no settled Panel: line; CADENCE_NO_PERSIST_PLAN opts out (PostToolUse:ExitPlanMode)",
         plugin: "session",
         event: Some(HookEvent::PostToolUse),
+    },
+    HookEntry {
+        name: "nudge-plan-tick",
+        description: "Nudge once per session when successful commits keep skipping the branch's in-flight plan doc (PostToolUse:Bash)",
+        plugin: "session",
+        event: Some(HookEvent::PostToolUse),
+    },
+    HookEntry {
+        name: "warn-plan-ready-flip",
+        description: "Warn on gh pr ready/merge while the branch's plan is still in-flight or carries unticked boxes (PreToolUse:Bash)",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
+        name: "lint-plan-shape",
+        description: "Block ExitPlanMode when the plan carries no settled Panel: line (escape: `Panel: none — <reason>`); nudge when other template stanzas are missing; every outcome carries the presentation reminders (subagents stopped, operator asked to see the plan); subagent calls and unreadable plans allow (PreToolUse:ExitPlanMode)",
+        plugin: "session",
+        event: Some(HookEvent::PreToolUse),
     },
 ];
 
@@ -452,6 +464,7 @@ const SECURITY_CRITICAL_HOOKS: &[&str] = &[
     "guard-gh-dangerous",
     "guard-gh-write",
     "guard-op-vault-scan",
+    "guard-sops-decrypt",
     "guard-browser-device",
     "guard-dotfiles",
     "guard-rm",
@@ -515,6 +528,14 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("metrics", "log-skill") => Some(
             r#"{"session_id":"test","hook_event_name":"PostToolUse","tool_name":"Skill","cwd":"/tmp","tool_input":{"skill":"cadence:attune","args":"execute C8"}}"#,
         ),
+        // warn-unreviewed-ready-flip gates on `gh pr ready`/`gh pr merge`;
+        // the generic PreToolUse sample carries neither the command nor a
+        // real git remote, so the try run exercises the matcher then fails
+        // open on the git-remote lookup (no origin in a sample cwd) —
+        // useful signal without a live gh call.
+        ("guardrails", "warn-unreviewed-ready-flip") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr merge 5 --squash"}}"#,
+        ),
         // warn-branch-drift early-exits unless the command is a git commit —
         // the generic PreToolUse sample (`git status`) would never reach the
         // drift comparison.
@@ -557,29 +578,22 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         ("session", "backstop-warn") => {
             Some(r#"{"session_id":"test","source":"startup","cwd":"/tmp"}"#)
         }
-        // persist-plan gates on an exact "Implement the following plan:"
-        // prefix; the generic UserPromptSubmit sample carries no cwd/session_id
-        // so `try` would fail open before ever reaching the write path.
+        // persist-plan-approval gates on tool_name == "ExitPlanMode" and a
+        // non-empty tool_response.plan; the generic PostToolUse sample carries
+        // neither, so `try` would fail open before ever reaching the write
+        // path.
         //
         // `cwd` is a deliberately NONEXISTENT path, and `try_hook`'s
         // `CWD_OVERRIDE_REFUSED` list keeps it that way — this hook has a
         // genuine filesystem WRITE side effect, and `try`'s normal behavior
         // (inject the REAL current_dir(), so most checks exercise real repo
         // detection) would otherwise let a bare `cadence-hooks try session
-        // persist-plan` actually create a plan doc in whatever repo the user
-        // ran it from (cameronsjo/cadence-hooks#396 review: verified end to
-        // end — a real plan doc landed in a real repo during review). A
+        // persist-plan-approval` actually create a plan doc in whatever repo
+        // the user ran it from (cameronsjo/cadence-hooks#396 review: verified
+        // end to end — a real plan doc landed in a real repo during review). A
         // nonexistent directory makes `repo_root`'s `git -C <cwd> …` spawn
         // fail deterministically, so the check reaches (and exercises) its
         // "not a git repo" fail-open arm instead of ever writing.
-        ("session", "persist-plan") => Some(
-            r#"{"session_id":"test","prompt":"Implement the following plan:\n\n# Try Sample\n\nbody text","cwd":"/nonexistent-cadence-hooks-try-sandbox","transcript_path":"/tmp/test.jsonl"}"#,
-        ),
-        // persist-plan-approval gates on tool_name == "ExitPlanMode" and a
-        // non-empty tool_response.plan; the generic PostToolUse sample carries
-        // neither, so `try` would fail open before ever reaching the write
-        // path. Same nonexistent-`cwd` discipline as `persist-plan` above —
-        // see that entry's comment.
         ("session", "persist-plan-approval") => Some(
             // Extra `#` in the raw-string delimiter: the payload's own plan
             // text embeds a literal `"#` (a quote immediately followed by an
@@ -587,15 +601,18 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
             // raw string early.
             r##"{"session_id":"test","tool_name":"ExitPlanMode","cwd":"/nonexistent-cadence-hooks-try-sandbox","transcript_path":"/tmp/test.jsonl","tool_response":{"plan":"# Try Sample\n\nbody text","isAgent":false}}"##,
         ),
+        // lint-plan-shape gates on tool_name == "ExitPlanMode" and a plan text;
+        // the generic PreToolUse sample carries neither, so `try` would fail
+        // open before ever judging a plan. The sample is the harness's own
+        // Context/Changes/Verification shape — the artifact the gate exists to
+        // stop — so `try session lint-plan-shape` demonstrates the block.
+        ("session", "lint-plan-shape") => Some(
+            r##"{"session_id":"test","tool_name":"ExitPlanMode","cwd":"/tmp","permission_mode":"plan","tool_input":{"plan":"# Try Sample\n\n## Context\n\nprose\n\n## Changes\n\n1. do a thing\n","planFilePath":"/nonexistent/plans/try.md"}}"##,
+        ),
         // warn-subagent-worktree only engages on an Agent/Task spawn; the generic
         // Bash PreToolUse sample would no-op. Carry a cwd so the git checks have a
         // directory to resolve against.
         ("guardrails", "warn-subagent-worktree") => Some(
-            r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
-        ),
-        // warn-subagent-concurrency only engages on an Agent/Task spawn; the
-        // generic Bash PreToolUse sample would no-op before the log read.
-        ("guardrails", "warn-subagent-concurrency") => Some(
             r#"{"tool_name":"Agent","tool_input":{"subagent_type":"general-purpose"},"cwd":"/tmp"}"#,
         ),
         // enforce-worktree only engages on a file mutation or git commit; the

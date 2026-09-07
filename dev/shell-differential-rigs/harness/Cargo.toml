@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "shparse-harness"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+cadence-hooks-core = { path = "$HOME/wt/shellcluster/crates/core" }

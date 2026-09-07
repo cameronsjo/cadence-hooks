@@ -5,6 +5,8 @@
 
 /// Require `MARKER(#issue):` format for TODO, FIXME, HACK, and other code markers.
 pub mod block_orphaned_todos;
+/// The `forgectl env` line the secret guards append to an env-file block.
+mod forgectl_hint;
 /// Block dangerous git operations (force-push main, reset --hard, etc.).
 pub mod git_safety;
 /// Run markdownlint on markdown files being written.
@@ -32,6 +34,8 @@ pub mod terminology;
 pub mod validate_env_vars;
 /// Block CRLF line endings in shell scripts.
 pub mod validate_line_endings;
+/// Nudge to add a CHANGELOG.md entry when shipping code changes.
+pub mod warn_changelog_entry;
 /// Nudge to review documentation when creating a pull request.
 pub mod warn_docs_update;
 /// Nudge to audit about-to-ship content for personal-context overshare.

@@ -451,10 +451,11 @@ fn spawn_log(count_file: &std::path::Path) -> String {
 /// blocked-path and allow-path tests below, so the differential is exact.
 /// Nudge/denial logging is left at its default (ON) rather than special-cased
 /// off: the shim recording full argv lets each test assert on exactly which
-/// commands ran, so the metrics layer's own git spawn (found while writing
-/// this test — `repo_basename`'s `rev-parse --show-toplevel`, fired by the
-/// nudge/denial logger, cadence-hooks#292 review) is pinned by name rather
-/// than suppressed by a knob that could silently grow.
+/// commands ran, so any git spawn the metrics layer adds in the future is
+/// pinned by name rather than suppressed by a knob that could silently grow.
+/// As of cameronsjo/cadence#857, the metrics layer's `repo_basename` no
+/// longer spawns `git` at all (it resolves through `GitState::resolve`, a
+/// pure filesystem walk) — see the test below for the corrected spawn count.
 fn run_mutation_nudge(tag: &str, allow_main: bool) -> (String, String) {
     let scratch = Scratch::new(&scratch_root(), tag);
     init_mutation_nudge_repo(scratch.path());
@@ -511,12 +512,15 @@ fn enforce_worktree_mutation_nudge_blocked_path_spawns_one_git() {
     // exactly one `git` spawn from enforce-worktree itself (the `rev-list
     // --count -n1 --all` bootstrap-exemption probe on the would-block path).
     //
-    // A second, separate spawn is real and expected here: the nudge/denial
-    // logger resolves its own `repo` field via `repo_basename`'s `rev-parse
-    // --show-toplevel` on every guard's Nudge outcome — the metrics layer's
-    // cost, not enforce-worktree's, but genuinely on PATH in the DEFAULT
-    // (nudge-logging-on) configuration. Asserting on both by name, in order,
-    // pins the full default-config cost rather than hiding one behind a knob.
+    // A second spawn used to be real here too: the nudge/denial logger
+    // resolved its own `repo` field via `repo_basename`'s `rev-parse
+    // --show-toplevel`, fired on every guard's Nudge outcome. As of
+    // cameronsjo/cadence#857, `repo_basename` resolves through
+    // `GitState::resolve` instead (a pure filesystem walk — the linked-worktree
+    // regression that motivated the change: `--show-toplevel` named a linked
+    // worktree's own checkout, not the repo it belongs to), so the metrics
+    // layer no longer spawns `git` here at all. Total: exactly one, from
+    // enforce-worktree itself.
     let (stdout, log) = run_mutation_nudge("blocked", false);
 
     assert!(
@@ -527,20 +531,15 @@ fn enforce_worktree_mutation_nudge_blocked_path_spawns_one_git() {
     let lines: Vec<&str> = log.lines().collect();
     assert_eq!(
         lines.len(),
-        2,
-        "expected exactly 2 git invocations (enforce-worktree's is_commitless \
-         + the metrics logger's repo_basename); got: {lines:?}"
+        1,
+        "expected exactly 1 git invocation (enforce-worktree's is_commitless; \
+         the metrics logger's repo_basename is git-free since cameronsjo/cadence#857); \
+         got: {lines:?}"
     );
     assert!(
         lines[0].contains("rev-list") && lines[0].contains("--count") && lines[0].contains("-n1"),
-        "first spawn should be enforce-worktree's is_commitless bootstrap-exemption probe: {}",
+        "the one spawn should be enforce-worktree's is_commitless bootstrap-exemption probe: {}",
         lines[0]
-    );
-    assert_eq!(
-        lines[1].trim(),
-        "rev-parse --show-toplevel",
-        "second spawn should be the metrics logger's repo_basename lookup: {}",
-        lines[1]
     );
 }
 

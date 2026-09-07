@@ -13,6 +13,10 @@
 //!   `rm`/`unlink` removes the link, so it classifies as scratch — but only
 //!   when the operand names the link ITSELF. A trailing slash, a glob, a bare
 //!   cwd sweep, and a literal `.git` component each keep the BLOCK (#402).
+//! - **NUDGE** ([`Outcome::Nudge`], exit 0 with context) — a flat, file-scoped
+//!   sweep whose pattern names secret-bearing files (`rm -f *.pem`) in a
+//!   directory that would otherwise ALLOW. The delete proceeds; it just stops
+//!   being silent (#344). This tier blocks nothing new and prompts nothing new.
 //! - **ASK** ([`Outcome::Ask`], the prompt) — an unexpanded variable, a command
 //!   substitution, a `..`-bearing path, a brace list, durable `.claude` state,
 //!   or anything else not proven safe. This is the default, so nothing that
@@ -316,6 +320,27 @@ enum TargetClass {
     /// single-file softening lifts `Unknown` to ALLOW, and one session
     /// transcript is still the only copy of that transcript.
     ClaudeState,
+    /// A flat, file-scoped sweep of secret-shaped names (`rm -f *.pem`) in a
+    /// directory that would otherwise ALLOW. NUDGE — the delete proceeds, with
+    /// one line of context in the transcript (#344).
+    ///
+    /// The tier exists because the alternative verdicts are both wrong here.
+    /// ALLOW is right about the *directory* and silent about what the sweep is
+    /// named after: a private key deleted from a scratch checkout may be the
+    /// only copy. ASK would put a prompt on routine cleanup that has never
+    /// prompted, which is friction the deviation does not earn. So this blocks
+    /// nothing new and asks nothing new — it only stops being silent.
+    ///
+    /// **What the tier does NOT see**, recorded so the scope is on the record
+    /// rather than discovered: a single *named* secret file (`rm -f key.pem`)
+    /// is a [`SingleFile`](TargetToken::SingleFile), never a glob, so it takes
+    /// the existing single-file verdict; a leading-dot pattern (`.env*`) is not
+    /// file-scoped and keeps the whole directory's stricter verdict; and a
+    /// `find . -name '*.pem' -delete` is judged on its *search roots*, so the
+    /// pattern never reaches this predicate at all. Each of the three is at
+    /// least as strict as a nudge, so none is a hole — but none is a nudge
+    /// either.
+    SecretSweep,
     /// Unexpanded variable, command substitution, or a `..`-bearing path that
     /// cannot be confidently resolved. ASK.
     Unresolvable,
@@ -332,6 +357,7 @@ impl TargetClass {
             | TargetClass::HomeChild
             | TargetClass::Vault
             | TargetClass::GitRepo => Outcome::Block,
+            TargetClass::SecretSweep => Outcome::Nudge,
             TargetClass::ClaudeState | TargetClass::Unresolvable | TargetClass::Unknown => {
                 Outcome::Ask
             }
@@ -367,7 +393,16 @@ enum TargetToken {
     /// *within* `dir` rather than the directory itself. `recursive` records
     /// whether the invocation carried `-r`/`-R` — a recursive sweep is judged
     /// more conservatively than a flat one.
-    FileGlob { dir: String, recursive: bool },
+    ///
+    /// `secret_shaped` records that the glob's PATTERN TEXT names
+    /// secret-bearing files (`*.pem`, `*.key`, `*.env.local`) — see
+    /// [`is_secret_shaped_glob`]. Computed here at parse time and carried as a
+    /// bool so the judge stays allocation-free.
+    FileGlob {
+        dir: String,
+        recursive: bool,
+        secret_shaped: bool,
+    },
     /// A non-recursive `rm`/`unlink` naming one concrete path — no glob, so
     /// exactly one filesystem entry. Without `-r` the shell **refuses** to
     /// remove a directory, so this can only ever delete a single file; that is
@@ -404,6 +439,14 @@ fn collect_targets(
     let mut dir_known = cwd_known;
 
     for (segment, _next_op) in split_segments_with_ops(script) {
+        // Drop empty substitutions BEFORE any other parsing touches the
+        // segment. `strip_group_wrappers` trims trailing `)` unconditionally,
+        // so a segment ending in `$()` reached the tokenizer as a dangling
+        // `$(` — and `tokenize` splits `$( )` into two words the shell joins
+        // into one. Either way the operand arrived carrying a `$`, and
+        // `resolve_target` answered ASK for a target whose contract is BLOCK
+        // (cadence-hooks#541).
+        let segment = strip_empty_substitutions(&segment);
         let segment = strip_group_wrappers(&segment);
         let tokens = tokenize(segment);
         let argv = skip_transparent_prefixes(&tokens);
@@ -707,6 +750,17 @@ fn resolve_target(
     single_file: bool,
     caller_dereferences: bool,
 ) -> TargetToken {
+    // An EMPTY operand is not a target. `rm -rf ''` deletes nothing — the shell
+    // errors on it — and an operand left empty by `strip_empty_substitutions`
+    // was entirely an empty expansion. Neither means "the current directory",
+    // but both reach the `literal.is_empty()` bare-cwd reading below and would
+    // carry the effective directory's verdict, which from a temp cwd is a
+    // silent ALLOW. The genuine bare-cwd spellings — `*` and a literal `.` —
+    // arrive non-empty and reach that reading through `glob_literal_prefix`,
+    // so they are unaffected.
+    if operand.is_empty() {
+        return TargetToken::Unresolvable;
+    }
     // Unexpanded variable / command substitution — can't prove anything. This
     // guard (with the `..` checks below) runs AHEAD of glob detection, so an
     // unresolvable operand never masquerades as a clean file-scoped sweep.
@@ -785,6 +839,10 @@ fn resolve_target(
         return TargetToken::FileGlob {
             dir: resolved,
             recursive,
+            // Read from the RAW operand, not `resolved` — `resolved` is the
+            // directory the sweep runs in and has had the pattern stripped off
+            // it, so the only place the secret shape survives is the operand.
+            secret_shaped: is_secret_shaped_glob(operand),
         };
     }
     // A glob-free operand under a non-recursive `rm`/`unlink` names exactly one
@@ -803,6 +861,94 @@ fn resolve_target(
     }
 }
 
+/// Remove every **lexically empty** substitution from `segment`: `$()`, `$( )`,
+/// and a backtick pair enclosing nothing but whitespace.
+///
+/// An empty body expands to the empty string in every shell, so `~/Documents$()`
+/// deletes exactly `~/Documents`. Without this, the operand reached
+/// [`resolve_target`] still carrying a `$`, which answered ASK for a target
+/// whose contract is BLOCK — a downgrade bought by appending two characters
+/// (cadence-hooks#541).
+///
+/// Deleting the span reproduces what the shell does, joining included:
+/// `a$( )b` is one word `ab` there too, because field splitting applies to the
+/// (empty) expansion, not to the literal text around it.
+///
+/// **Lexically** empty is the whole rule. `$(cat f)` and `${EMPTY}` are left
+/// verbatim so they keep their `Unresolvable` verdict: resolving those would
+/// mean modelling what a command prints or what a variable holds, which this
+/// parser cannot know. Only ASCII whitespace counts as an empty body — the same
+/// characters the shell's own word splitting treats as blank.
+///
+/// Stripping can never *create* a resolvable operand out of a real
+/// substitution: only a complete empty pair is removed, delimiters included, so
+/// any surviving substitution keeps the `$` or backtick that routes it to
+/// `Unresolvable`. It removes only `$`, `(`, `)`, backticks, and whitespace, so
+/// it cannot synthesize a `/`, cannot erase a `..`, and cannot move a target
+/// into a temp root or out of a `.git` component.
+///
+/// **Quote-blind, deliberately.** This scans the raw segment with no quote
+/// state, while the shell keeps `$()` as literal filename characters inside
+/// `'…'` or after a backslash. The divergence runs strict — the guard sees a
+/// SHORTER name, which lands in the same or a more protected class
+/// (`rm -rf ~/'$()'` reads as `~/` → Block) — with one narrow exception: a
+/// shortened name can end in a transient-scratch suffix the real one does not,
+/// so `rm ~/'notes.tmp$()'` reads as `~/notes.tmp` and allows. Accepted rather
+/// than fixed: the operand has to be a hand-typed file literally named
+/// `notes.tmp$()`, and threading quote state in here would duplicate
+/// `core::shell`'s tokenizer for that one case.
+fn strip_empty_substitutions(segment: &str) -> Cow<'_, str> {
+    let mut out: Option<String> = None;
+    // Bytes already flushed into `out`, and where the next delimiter hunt
+    // starts — they diverge because a non-empty body is scanned past, not copied.
+    let mut copied = 0;
+    let mut scan = 0;
+    while let Some(rel) = segment[scan..].find(['$', '`']) {
+        let at = scan + rel;
+        if let Some(len) = empty_substitution_len(&segment[at..]) {
+            let buf = out.get_or_insert_with(|| String::with_capacity(segment.len()));
+            buf.push_str(&segment[copied..at]);
+            copied = at + len;
+            scan = copied;
+        } else {
+            scan = at + 1;
+        }
+    }
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&segment[copied..]);
+            Cow::Owned(buf)
+        }
+        None => Cow::Borrowed(segment),
+    }
+}
+
+/// Byte length of the empty substitution starting at the head of `s`, if one
+/// starts there: `$(` + ASCII whitespace + `)`, or a backtick pair around the
+/// same. `None` for anything else, including a non-empty body — a
+/// conservative answer, because `None` means the operand stays unresolvable.
+fn empty_substitution_len(s: &str) -> Option<usize> {
+    let (open_len, closer) = if s.starts_with("$(") {
+        (2usize, ')')
+    } else if s.starts_with('`') {
+        (1usize, '`')
+    } else {
+        return None;
+    };
+    let body = &s[open_len..];
+    // `trim_start_matches` returns a suffix OF `body`, so the length difference
+    // is exactly that suffix's byte offset — always in range and always on a
+    // char boundary, however the operand is spelled. The slice below cannot
+    // panic on hostile input.
+    let blank = body.len()
+        - body
+            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+            .len();
+    body[blank..]
+        .starts_with(closer)
+        .then_some(open_len + blank + closer.len_utf8())
+}
+
 /// True when `operand`'s final path segment is a glob that scopes to files
 /// *within* a directory rather than naming the directory itself: it contains a
 /// glob metachar (`*`/`?`/`[`), does NOT start with `.` (so `.*` — which matches
@@ -814,6 +960,55 @@ fn is_file_scoped_glob(operand: &str) -> bool {
         return false;
     }
     !last.chars().all(|c| c == '*' || c == '?')
+}
+
+/// Filename suffixes that mark a file as carrying a secret: a private key, a
+/// certificate bundle, a keystore. `.env` is handled separately by
+/// [`names_dotenv`], because it appears mid-name as often as at the end
+/// (`*.env.local`).
+///
+/// Kept deliberately short and high-signal. Every entry drives a NUDGE and
+/// nothing else, so an over-broad entry costs a line of context on a routine
+/// cleanup — but a nudge nobody believes is worth less than no nudge at all.
+const SECRET_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".crt", ".jks"];
+
+/// True when `operand`'s final segment is a glob whose **pattern text** names
+/// secret-bearing files: `*.pem`, `*.key`, `*.env.local`, `.env*`.
+///
+/// Matched against the pattern, never against the filesystem. This guard is
+/// pure by contract — it performs no I/O beyond the two injected probes — so
+/// the question asked here is "does this command *say* it sweeps secrets?",
+/// not "would it hit one?". A pattern matching nothing on disk still nudges,
+/// which is the cheap direction: the operand is what the operator typed.
+///
+/// Callers reach this only for an operand [`is_file_scoped_glob`] already
+/// accepted, so a bare `*` (which means "everything here" and carries the
+/// directory's own verdict) never arrives.
+fn is_secret_shaped_glob(operand: &str) -> bool {
+    let last = operand.rsplit('/').next().unwrap_or(operand);
+    // One lowercase copy at parse time, so the suffix scan and the `.env` scan
+    // share it. The judge sees only the resulting bool.
+    let lower = last.to_ascii_lowercase();
+    SECRET_SUFFIXES.iter().any(|s| lower.ends_with(s)) || names_dotenv(&lower)
+}
+
+/// True when the already-lowercased filename pattern `last` names a dotenv
+/// file: `.env` at the end of the name (`*.env`), or followed by a `.` or a
+/// glob metachar (`*.env.local`, `.env*`).
+///
+/// The trailing-character test is what keeps `*.environment` out — a bare
+/// `contains(".env")` would call that a secret sweep.
+fn names_dotenv(last: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = last[from..].find(".env") {
+        let end = from + rel + ".env".len();
+        let after = &last[end..];
+        if after.is_empty() || after.starts_with(['.', '*', '?', '[']) {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// The literal directory prefix of a (possibly globbed) operand: everything up
@@ -845,6 +1040,15 @@ fn has_parent_segment(path: &str) -> bool {
 /// (`.tmp`, `.swp`, `.swo`) — an editor swap file or a temp-write artifact.
 /// `.bak`/`.orig`/`.old` are deliberately excluded: those can be intentional
 /// backups a user means to keep, so they stay BLOCK under home.
+///
+/// **The suffix compare stays byte-exact (#732)**, and it is the third
+/// predicate in that group, beside `pathclass::under_claude_scratch` and
+/// `worktree::path_under_temp_root`. All three grant a silent ALLOW — this one
+/// demotes a home child to [`TargetClass::Scratch`] — so folding would widen an
+/// allow rather than narrow one, which is the direction guard-rm never moves.
+/// `~/notes.TMP` therefore keeps the home-child BLOCK. See `pathclass`'s module
+/// doc for the governing rule: a compare folds only when folding can move a
+/// path into a stricter class.
 fn is_transient_scratch(norm: &str) -> bool {
     let last = norm.rsplit('/').next().unwrap_or(norm);
     last.ends_with(".tmp") || last.ends_with(".swp") || last.ends_with(".swo")
@@ -875,6 +1079,23 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
     };
     let shared = pathclass::classify(&norm, &pc_ctx, is_git_root);
 
+    // #576: `Temp` is a claim about where the target LIVES; a `.git` is an
+    // explicit protection the user put there. A repo checked out under `/tmp`
+    // is still a repo — the location claim loses to the marker, so the temp
+    // ALLOW does not apply and the git-repo BLOCK stands.
+    //
+    // `.claude` scratch stays ABOVE this rule: a `.claude/worktrees/` checkout
+    // is cadence's own managed scratch and its `.git` is exactly why cleanup
+    // must stay allowed. The predicate is asked directly rather than read off
+    // `shared`, because `pathclass::classify` tests temp BEFORE claude-scratch
+    // — a worktree that lives under `/tmp` arrives here reported as `Temp`.
+    if shared == PathClass::Temp
+        && !pathclass::under_claude_scratch(&norm)
+        && (has_git_component(&norm) || is_git_root(&norm))
+    {
+        return TargetClass::GitRepo;
+    }
+
     // ALLOW rules first — the shared classifier owns Temp and ClaudeScratch.
     match shared {
         PathClass::Temp => return TargetClass::Temp,
@@ -887,7 +1108,12 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
     if norm.is_empty() || norm == "/" {
         return TargetClass::Root;
     }
-    if norm == ctx.home {
+    // #732: the home compare folds ASCII case, like the shared home-child and
+    // `.git` predicates and for the same reason — on a case-insensitive volume
+    // `/USERS/x` IS `$HOME`, and a byte-exact compare let `rm -rf /USERS/x`
+    // walk past the BLOCK the canonical spelling gets. Folding a
+    // protective compare can only add a block, never remove one.
+    if norm.eq_ignore_ascii_case(ctx.home) {
         return TargetClass::Home;
     }
     if shared == PathClass::HomeChild {
@@ -900,8 +1126,16 @@ fn classify_path(path: &str, ctx: &RmContext, is_git_root: &dyn Fn(&str) -> bool
     }
     // Vault is guard-rm-local (deferred from pathclass v1); checked ahead of the
     // shared git-root so a vault that is also a repo reports the vault.
+    //
+    // Both compares fold ASCII case (#732), the same protective direction as
+    // home above: the vault is a BLOCK class, so folding can only widen the
+    // block. The prefix test goes through the shared
+    // `is_under_dir_ignoring_ascii_case` rather than a `format!`-built prefix —
+    // a `$OBSIDIAN_VAULT` carrying a non-ASCII character can put `vault.len()`
+    // mid-UTF-8-sequence, where byte indexing panics.
     if let Some(vault) = ctx.vault
-        && (norm == vault || norm.starts_with(&format!("{vault}/")))
+        && (norm.eq_ignore_ascii_case(vault)
+            || pathclass::is_under_dir_ignoring_ascii_case(&norm, vault))
     {
         return TargetClass::Vault;
     }
@@ -976,7 +1210,12 @@ fn classify_operand(
     }
 }
 
-/// True when any `/`-separated segment of `norm` is exactly `.git`.
+/// True when any `/`-separated segment of `norm` is `.git`, compared
+/// case-insensitively.
+///
+/// Case-insensitive volumes (the APFS default) resolve `.GIT` to the real
+/// `.git`, so a case-sensitive match let `.GIT` walk past GitRoot protection.
+/// Folding only ever promotes a path *into* GitRoot, never out of it.
 ///
 /// Deliberately duplicates `pathclass`'s private predicate of the same name
 /// (this module's reuse ledger: promote when cheap, else duplicate with
@@ -984,7 +1223,7 @@ fn classify_operand(
 /// apart, and the shared classifier answers only the union — exposing its
 /// internals to serve one consumer would couple the two without real reuse.
 fn has_git_component(norm: &str) -> bool {
-    norm.split('/').any(|seg| seg == ".git")
+    norm.split('/').any(|seg| seg.eq_ignore_ascii_case(".git"))
 }
 
 /// The decision core: collect targets, classify each, and keep the most severe
@@ -1131,13 +1370,39 @@ fn judge_targets(
             // DEREFERENCES. `link/*` is resolved by pathname expansion, so the
             // artifacts it names live in the target — the symlink demotion
             // would soften a sweep that really does reach the repo.
-            TargetToken::FileGlob { dir, recursive } => {
+            TargetToken::FileGlob {
+                dir,
+                recursive,
+                secret_shaped,
+            } => {
                 match classify_path(dir, ctx, is_git_root) {
                     // A flat artifact sweep in a git repo (`rm *.tgz`) is routine
                     // cleanup — soften to Scratch (Allow). A recursive one
                     // (`rm -rf project-*`) could dredge tracked directories → Ask.
-                    TargetClass::GitRepo if !*recursive => TargetClass::Scratch,
+                    //
+                    // #344's nudge tier substitutes only on an arm that would
+                    // otherwise land on a silent Allow, and only on two of
+                    // them: the non-recursive git-repo softening here, and
+                    // `Temp` below. Every Block stays Block and every Ask stays
+                    // Ask, so the tier blocks nothing new and prompts nothing
+                    // new.
+                    //
+                    // `ClaudeScratch` and `Scratch` also Allow and are
+                    // deliberately NOT covered: both name cadence's own managed
+                    // scratch (a worktree checkout, an editor swap file), where
+                    // a secret-shaped name is a checkout's own committed
+                    // fixture rather than the operator's only copy. Widening to
+                    // them is a scope call, not an oversight — it wants its own
+                    // measured trigger.
+                    TargetClass::GitRepo if !*recursive => {
+                        if *secret_shaped {
+                            TargetClass::SecretSweep
+                        } else {
+                            TargetClass::Scratch
+                        }
+                    }
                     TargetClass::GitRepo => TargetClass::Unknown,
+                    TargetClass::Temp if *secret_shaped => TargetClass::SecretSweep,
                     // Every other dir class keeps its own verdict: Temp Allow,
                     // Home/HomeChild/Vault/Root Block, Unknown Ask.
                     other => other,
@@ -1160,10 +1425,21 @@ fn judge_targets(
             CheckResult::block(block_message(block_class.unwrap_or(TargetClass::Unknown)))
         }
         Outcome::Ask => CheckResult::ask(ASK_MESSAGE),
-        // Allow (and the impossible Nudge/LoopBlock) → defer to normal flow.
+        Outcome::Nudge => CheckResult::nudge(NUDGE_MESSAGE),
+        // Allow → defer to normal flow.
         _ => CheckResult::allow(),
     }
 }
+
+/// The NUDGE context injected on a secret-shaped sweep ([`TargetClass::SecretSweep`]).
+///
+/// Deliberately not phrased as a question: the delete has already been allowed,
+/// so this is a note for the transcript, not a decision to make. It names the
+/// one fact the operator may not have (these files are often the only copy) and
+/// the one cheap alternative, and stops.
+const NUDGE_MESSAGE: &str = "guard-rm: this sweep is named after secret-bearing files (a key, certificate, or \
+     .env). The delete is allowed — but these are commonly the only copy, and no \
+     trash step catches them. If you may want them back, `mv` them aside first.";
 
 /// The ASK reason shown in the permission prompt.
 const ASK_MESSAGE: &str = "guard-rm: this delete target could not be proven safe (an unexpanded variable, \
@@ -1321,6 +1597,24 @@ mod tests {
     fn judge(command: &str, cwd: &str) -> Outcome {
         judge_with(command, cwd, &[])
     }
+
+    /// Judge with an explicitly pinned home, for cases whose whole point is how
+    /// the home path is SPELLED. `~` cannot express a case variant — it expands
+    /// to the runner's real home — so those cases need a home the test controls.
+    /// Never use `~` in a command handed to this helper.
+    fn judge_with_home(command: &str, cwd: &str, home: &str, git_roots: &[&str]) -> Outcome {
+        let ctx = RmContext {
+            home,
+            vault: Some(VAULT),
+            tmpdir: None,
+        };
+        let git_probe = |p: &str| git_roots.contains(&p);
+        let nothing = |_: &str| false;
+        judge_rm(command, cwd, &ctx, &git_probe, &nothing).outcome
+    }
+
+    /// A pinned home for the case-variant cases, independent of the runner's.
+    const PINNED_HOME: &str = "/Users/x";
 
     // --- #426: a transparent prefix carrying a flag ---
 
@@ -1580,6 +1874,81 @@ mod tests {
         )
         .outcome;
         assert_eq!(out, Outcome::Allow);
+    }
+
+    // --- #569: a `$TMPDIR` that swallows home cannot disarm the home block ---
+
+    /// The end-to-end shape of the defect: point `$TMPDIR` at home and every
+    /// home child read as disposable temp. The protection now outlives the
+    /// widened root.
+    #[test]
+    fn home_child_blocks_under_a_widened_tmpdir() {
+        let home = home();
+        let ctx = RmContext {
+            home: &home,
+            vault: Some(VAULT),
+            tmpdir: Some(&home),
+        };
+        let out = judge_rm("rm -rf ~/Documents", "/home", &ctx, &|_| false, &|_| false).outcome;
+        assert_eq!(out, Outcome::Block);
+    }
+
+    // --- #576: an explicit protection outranks the temp carve-out ---
+
+    /// A repo checked out under `/tmp` is still a repo — the `.git` the user
+    /// put there outranks the claim that the location makes it disposable.
+    #[test]
+    fn git_repo_under_temp_blocks() {
+        assert_eq!(
+            judge_with("rm -rf /tmp/repo", "/home", &["/tmp/repo"]),
+            Outcome::Block
+        );
+    }
+
+    /// The carve-out itself is untouched: plain temp scratch with no `.git`
+    /// anywhere still allows.
+    #[test]
+    fn plain_temp_scratch_still_allows() {
+        assert_eq!(
+            judge_with("rm -rf /tmp/scratch", "/home", &[]),
+            Outcome::Allow
+        );
+    }
+
+    /// cadence's own managed scratch keeps its ALLOW even under a temp root,
+    /// where `pathclass::classify` reports it as `Temp` rather than
+    /// `ClaudeScratch` — the case a `shared != ClaudeScratch` guard would miss.
+    #[test]
+    fn claude_worktree_under_temp_still_allows() {
+        assert_eq!(
+            judge_with(
+                "rm -rf /tmp/x/.claude/worktrees/y",
+                "/home",
+                &["/tmp/x/.claude/worktrees/y"]
+            ),
+            Outcome::Allow
+        );
+    }
+
+    /// The literal-`.git`-component half of the git-root fact, which needs no
+    /// filesystem probe at all.
+    #[test]
+    fn dot_git_component_under_temp_blocks() {
+        assert_eq!(
+            judge_with("rm -rf /tmp/repo/.git", "/home", &[]),
+            Outcome::Block
+        );
+    }
+
+    /// #657: on a case-insensitive volume `.GIT` *is* the repo's `.git`, so the
+    /// temp carve-out must not release it either. No probe fires here — the
+    /// verdict comes from the literal segment alone.
+    #[test]
+    fn dot_git_case_variant_under_temp_blocks() {
+        assert_eq!(
+            judge_with("rm -rf /tmp/repo/.GIT", "/home", &[]),
+            Outcome::Block
+        );
     }
 
     #[test]
@@ -1865,6 +2234,20 @@ mod tests {
         );
     }
 
+    /// #657's twin of the symlink case: the same probe-free literal path, spelled
+    /// in the case a case-insensitive volume also resolves to the real `.git`.
+    #[test]
+    fn a_symlinked_git_component_case_variant_still_blocks() {
+        assert_eq!(
+            judge_with_symlinks("rm -rf /srv/repo/.GIT", "/home", &[], &["/srv/repo/.GIT"]),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge_with_symlinks("rm /srv/repo/.GIT", "/home", &[], &["/srv/repo/.GIT"]),
+            Outcome::Block
+        );
+    }
+
     /// `find -L` follows every symlink; `find -H` follows the ones in its
     /// arguments — and a search root IS an argument. Both walk the real tree
     /// behind a symlinked root, so both must keep the BLOCK. The plain and
@@ -1937,6 +2320,101 @@ mod tests {
     #[test]
     fn command_substitution_target_asks() {
         assert_eq!(judge("rm -rf $(mktemp -d)", "/home"), Outcome::Ask);
+    }
+
+    // --- #541: an empty substitution must not downgrade a protected target ---
+
+    /// `$()` and an empty backtick pair expand to nothing, so the operand still
+    /// names the protected home child — appending them was a free Block→Ask
+    /// downgrade.
+    #[test]
+    fn empty_substitution_suffix_still_blocks() {
+        for command in [
+            "rm -rf ~/Documents$()",
+            "rm -rf ~/Documents$( )",
+            "rm -rf ~/Documents``",
+            "rm -rf ~/Documents` `",
+            "rm -rf ~/$()Documents",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Block,
+                "an empty substitution expands to nothing: {command}"
+            );
+        }
+    }
+
+    /// The narrowness of the rule: a body with content resolves to a value this
+    /// parser cannot know, so it keeps its Ask verbatim.
+    #[test]
+    fn unknown_substitution_suffix_still_asks() {
+        assert_eq!(
+            judge("rm -rf ~/`cat which_dir`", "/private/tmp"),
+            Outcome::Ask
+        );
+        assert_eq!(judge("rm -rf $(mktemp -d)", "/private/tmp"), Outcome::Ask);
+    }
+
+    /// A variable is not a substitution — `${EMPTY}` names a value, and
+    /// modelling variable contents is out of scope.
+    #[test]
+    fn variable_suffix_still_asks() {
+        assert_eq!(
+            judge("rm -rf ~/Documents${EMPTY}", "/private/tmp"),
+            Outcome::Ask
+        );
+    }
+
+    /// The rail: an operand that is ALL empty substitution leaves the recursive
+    /// delete with no readable operand, which asks. It must NOT read as a bare
+    /// cwd reference and carry the effective directory's verdict.
+    #[test]
+    fn substitution_stripping_to_nothing_is_unresolvable() {
+        // `/private/tmp` is a temp root, so a cwd fall-through would ALLOW.
+        assert_eq!(judge("rm -rf $()", "/private/tmp"), Outcome::Ask);
+        assert_eq!(judge("rm -rf ``", "/private/tmp"), Outcome::Ask);
+    }
+
+    /// A QUOTED `$()` is a literal filename to the shell, not an expansion —
+    /// stripping it leaves an empty operand, which must not read as a bare cwd
+    /// reference and inherit the working directory's verdict. `/private/tmp`
+    /// is a temp root, so that fall-through would have been a silent ALLOW.
+    #[test]
+    fn an_operand_left_empty_by_stripping_is_unresolvable() {
+        for command in [
+            "rm -rf '$()'",
+            "rm -rf \"$()\"",
+            "rm -rf ''",
+            "rm -rf ``",
+            "rm -rf $()",
+        ] {
+            assert_eq!(
+                judge(command, "/private/tmp"),
+                Outcome::Ask,
+                "an empty operand names no target: {command}"
+            );
+        }
+    }
+
+    /// The genuine bare-cwd spellings still resolve to the effective directory
+    /// — they arrive non-empty and empty out via `glob_literal_prefix`, which
+    /// the empty-operand rail deliberately sits ahead of.
+    #[test]
+    fn bare_cwd_globs_still_carry_the_directorys_verdict() {
+        assert_eq!(judge("rm -rf *", "/private/tmp"), Outcome::Allow);
+        assert_eq!(judge("rm -rf .", "/private/tmp"), Outcome::Allow);
+        assert_eq!(
+            judge("cd ~/Documents && rm -rf *", "/private/tmp"),
+            Outcome::Block
+        );
+    }
+
+    /// `guard_rm_liveness`'s command-substitution probe asserts Ask by
+    /// contract — a stripping rule that widened past empty bodies would fire a
+    /// false nudge every SessionStart.
+    #[test]
+    fn liveness_probe_contract_holds() {
+        assert_eq!(judge("rm -rf $(printf %s x)", "/private/tmp"), Outcome::Ask);
     }
 
     #[test]
@@ -2051,6 +2529,139 @@ mod tests {
     fn root_glob_still_blocks_under_file_glob_path() {
         // `/*` reduces to the root — the bare-glob path, never softened.
         assert_eq!(judge("rm -rf /*", "/home"), Outcome::Block);
+    }
+
+    // --- #344: a secret-shaped file sweep nudges instead of allowing silently ---
+
+    /// The tier's whole job: a flat sweep whose PATTERN names secret-bearing
+    /// files stops being silent. It was — and stays — allowed; only the silence
+    /// changes.
+    #[test]
+    fn secret_shaped_glob_in_git_repo_nudges() {
+        for command in [
+            "rm -f *.pem",
+            "rm -f *.key",
+            "shred *.key",
+            "rm -f *.env.local",
+            "rm -f server-*.p12",
+            "rm -f *.crt",
+        ] {
+            assert_eq!(
+                judge_with(command, "/srv/repo", &["/srv/repo"]),
+                Outcome::Nudge,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_shaped_glob_in_temp_nudges() {
+        // Temp is the other arm that would otherwise land on a silent Allow.
+        assert_eq!(judge("rm -f /tmp/build/*.pem", "/home"), Outcome::Nudge);
+    }
+
+    /// The tier blocks nothing new and prompts nothing new: every neighbouring
+    /// verdict is unchanged. These are the controls that prove it.
+    #[test]
+    fn secret_nudge_changes_no_other_verdict() {
+        // An ordinary artifact sweep is still a silent Allow.
+        assert_eq!(
+            judge_with("rm -f *.tgz", "/srv/repo", &["/srv/repo"]),
+            Outcome::Allow
+        );
+        // A RECURSIVE secret sweep keeps its Ask — the nudge never softens one.
+        assert_eq!(
+            judge_with("rm -rf *.pem", "/srv/repo", &["/srv/repo"]),
+            Outcome::Ask
+        );
+        // A protected directory keeps its Block — the nudge never softens one.
+        assert_eq!(judge("rm -f /vaults/main/*.pem", "/home"), Outcome::Block);
+        assert_eq!(judge("rm -f /*.pem", "/home"), Outcome::Block);
+    }
+
+    /// Merge ordering, asserted rather than assumed: `Ask` outranks `Nudge`, so
+    /// a mixed command still prompts. A nudge must never mask a prompt.
+    #[test]
+    fn a_nudging_sweep_beside_an_asking_target_still_asks() {
+        assert_eq!(
+            judge_with("rm -f *.pem $BUILD_DIR", "/srv/repo", &["/srv/repo"]),
+            Outcome::Ask
+        );
+    }
+
+    /// The cross-issue interaction, locked as a test rather than left to be
+    /// discovered: #732 promotes a case-variant home child to `HomeChild`, and
+    /// `Block` outranks `Nudge`. A secret sweep in a case-varied protected
+    /// directory blocks — the #344 tier cannot soften it.
+    #[test]
+    fn a_secret_sweep_in_a_case_variant_home_child_still_blocks() {
+        assert_eq!(
+            judge_with_home("rm -f *.pem", "/USERS/x/Documents", PINNED_HOME, &[]),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge_with_home("rm -f *.pem", "/USERS/x/proj", PINNED_HOME, &[]),
+            Outcome::Block
+        );
+        // The canonical spelling agrees, so the two are not diverging.
+        assert_eq!(
+            judge_with_home("rm -f *.pem", "/Users/x/Documents", PINNED_HOME, &[]),
+            Outcome::Block
+        );
+    }
+
+    /// The predicate reads the PATTERN, not the filesystem — and the pattern
+    /// test is narrow. `.env` must be followed by end-of-name, a `.`, or a glob
+    /// metachar, so a name that merely starts with those letters is not a
+    /// secret sweep.
+    #[test]
+    fn secret_shape_is_matched_narrowly() {
+        assert!(is_secret_shaped_glob("*.pem"));
+        assert!(is_secret_shaped_glob("*.PEM"));
+        assert!(is_secret_shaped_glob("dir/*.env"));
+        assert!(is_secret_shaped_glob("*.env.local"));
+        // Not secret-shaped: the suffix is not in the set, and `.env` here is a
+        // prefix of a longer word.
+        assert!(!is_secret_shaped_glob("*.tgz"));
+        assert!(!is_secret_shaped_glob("*.environment"));
+        assert!(!is_secret_shaped_glob("*.keystore"));
+        assert!(!is_secret_shaped_glob("build-*"));
+        // A directory segment cannot arm it — only the final segment is read.
+        assert!(!is_secret_shaped_glob("keys.pem/*.tgz"));
+    }
+
+    /// A leading-dot pattern (`.env*`) never reaches the nudge tier at all:
+    /// `is_file_scoped_glob` excludes it, so the operand keeps the whole
+    /// directory's verdict. That is stricter than a nudge, and unchanged by
+    /// #344 — worth pinning, because the tier's suffix set names `.env` and a
+    /// reader could reasonably expect a nudge here.
+    #[test]
+    fn a_leading_dot_secret_pattern_keeps_the_directorys_verdict() {
+        assert_eq!(
+            judge_with("rm -f .env*", "/srv/repo", &["/srv/repo"]),
+            Outcome::Block
+        );
+    }
+
+    /// The nudge carries a reason (an empty one would render an empty
+    /// `additionalContext` and land as no context at all).
+    #[test]
+    fn the_secret_nudge_carries_a_reason() {
+        let ctx = RmContext {
+            home: PINNED_HOME,
+            vault: Some(VAULT),
+            tmpdir: None,
+        };
+        let nothing = |_: &str| false;
+        let result = judge_rm("rm -f /tmp/build/*.pem", "/home", &ctx, &nothing, &nothing);
+        assert_eq!(result.outcome, Outcome::Nudge);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .expect("a nudge carries context")
+                .contains("guard-rm")
+        );
     }
 
     // --- non-deletions & look-alikes → ALLOW (nothing to judge) ---
@@ -2497,6 +3108,149 @@ mod tests {
             judge("rm ~/.claude/docs/plans/2026-07-25-x.md", "/home"),
             Outcome::Ask
         );
+    }
+
+    /// #726, the measured probe: on a case-insensitive volume (the APFS default)
+    /// `~/.CLAUDE/projects/t.jsonl` IS `~/.claude/projects/t.jsonl`, but the
+    /// byte-exact `.claude` compare missed the variant, which then rode the
+    /// single-file softening to a silent ALLOW. Both spellings must ASK.
+    #[test]
+    fn claude_state_case_variants_still_ask() {
+        assert_eq!(
+            judge("rm ~/.CLAUDE/projects/t.jsonl", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm ~/.Claude/projects/t.jsonl", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm ~/.claude/projects/t.jsonl", "/home"),
+            Outcome::Ask
+        );
+        // Negative controls: the fold did not widen into substring matching.
+        assert_eq!(
+            judge("rm /srv/repo/.claudex/t.jsonl", "/home"),
+            Outcome::Allow
+        );
+        assert_eq!(
+            judge("rm /srv/repo/x.CLAUDE/t.jsonl", "/home"),
+            Outcome::Allow
+        );
+    }
+
+    /// #726's asymmetry, end to end: `under_claude_dir` folds case (protective),
+    /// `under_claude_scratch` does not (folding would widen a silent ALLOW). A
+    /// case-variant scratch path must therefore lose the ALLOW carve-out and
+    /// ASK, not inherit worktree cleanup's exemption. A consistency sweep that
+    /// folds both breaks this test rather than shipping.
+    #[test]
+    fn claude_scratch_carve_out_does_not_fold_case() {
+        assert_eq!(
+            judge("rm -rf /srv/repo/.CLAUDE/worktrees/x", "/home"),
+            Outcome::Ask
+        );
+        assert_eq!(
+            judge("rm -rf /srv/repo/.claude/WORKTREES/x", "/home"),
+            Outcome::Ask
+        );
+        // The canonical spelling keeps its ALLOW.
+        assert_eq!(
+            judge("rm -rf /srv/repo/.claude/worktrees/x", "/home"),
+            Outcome::Allow
+        );
+    }
+
+    /// #732: on a case-insensitive volume `/USERS/x` IS `$HOME`, and
+    /// `/USERS/x/Documents` IS the protected home child — but the byte-exact
+    /// compares missed both, so the case variants walked past a BLOCK the
+    /// canonical spellings get. All three protective compares now fold.
+    #[test]
+    fn home_and_home_child_case_variants_block() {
+        // Home itself.
+        assert_eq!(
+            judge_with_home("rm -rf /USERS/x", "/home", PINNED_HOME, &[]),
+            Outcome::Block
+        );
+        assert_eq!(
+            judge_with_home("rm -rf /users/X", "/home", PINNED_HOME, &[]),
+            Outcome::Block
+        );
+        // A first-level home child.
+        assert_eq!(
+            judge_with_home("rm -rf /USERS/x/Documents", "/home", PINNED_HOME, &[]),
+            Outcome::Block
+        );
+        // …including through the single-file softening, which is the route the
+        // variant previously rode to a silent ALLOW.
+        assert_eq!(
+            judge_with_home("rm -f /USERS/x/.zshrc", "/home", PINNED_HOME, &[]),
+            Outcome::Block
+        );
+    }
+
+    /// The vault's two compares fold too (equality and the `{vault}/` prefix),
+    /// for the same protective reason — the vault is a BLOCK class.
+    #[test]
+    fn vault_case_variants_block() {
+        assert_eq!(judge("rm -rf /VAULTS/MAIN", "/home"), Outcome::Block);
+        assert_eq!(judge("rm -rf /Vaults/Main", "/home"), Outcome::Block);
+        assert_eq!(
+            judge("rm -rf /VAULTS/main/notes/x.md", "/home"),
+            Outcome::Block
+        );
+        // Single-file route too.
+        assert_eq!(judge("rm -f /vaults/MAIN/x.md", "/home"), Outcome::Block);
+    }
+
+    /// The byte-exact verdicts are unchanged — the controls that prove the fold
+    /// did not widen into a prefix or substring match, and did not disturb the
+    /// canonical spellings.
+    #[test]
+    fn case_fold_does_not_widen_home_or_vault() {
+        // The canonical spellings still block (nothing regressed).
+        assert_eq!(
+            judge_with_home("rm -rf /Users/x/Documents", "/home", PINNED_HOME, &[]),
+            Outcome::Block
+        );
+        // A genuinely different home is not this home, however it is spelled.
+        assert_eq!(
+            judge_with_home("rm -rf /USERS/y/Documents", "/home", PINNED_HOME, &[]),
+            Outcome::Ask
+        );
+        // `/Users/xx` must not be swallowed by a home at `/Users/x`.
+        assert_eq!(
+            judge_with_home("rm -rf /USERS/xx/Documents", "/home", PINNED_HOME, &[]),
+            Outcome::Ask
+        );
+        // A vault look-alike is still not the vault (`vault_lookalike_does_not_block`'s
+        // case, case-varied).
+        assert_eq!(judge("rm -rf /VAULTS/MAIN-backup/x", "/home"), Outcome::Ask);
+    }
+
+    /// #732's invariant lock: the two ALLOW-granting predicates did NOT fold.
+    /// Folding a protective compare adds a block; folding an allow-granting one
+    /// would widen a silent ALLOW, which is the direction this guard must never
+    /// move. A consistency sweep folding everything breaks this test.
+    /// (`claude_scratch_carve_out_does_not_fold_case` locks the other half.)
+    #[test]
+    fn allow_granting_predicates_stay_byte_exact() {
+        // `/TMP` is not the temp root — it falls to the ambiguous middle.
+        assert_eq!(judge("rm -rf /TMP/scratch/build", "/home"), Outcome::Ask);
+        assert_eq!(judge("rm -rf /Private/TMP/y/build", "/home"), Outcome::Ask);
+        // The canonical spelling keeps its ALLOW.
+        assert_eq!(judge("rm -rf /tmp/scratch/build", "/home"), Outcome::Allow);
+        // The scratch carve-out likewise stays byte-exact.
+        assert!(!pathclass::under_claude_scratch(
+            "/srv/repo/.CLAUDE/worktrees/x"
+        ));
+        // …and so does the transient-suffix demotion, the third member of the
+        // group: `~/notes.TMP` keeps the home-child Block rather than riding a
+        // folded suffix to the Scratch ALLOW.
+        assert_eq!(judge("rm -f ~/notes.TMP", "/home"), Outcome::Block);
+        assert_eq!(judge("rm -f ~/notes.SWP", "/home"), Outcome::Block);
+        // The canonical spellings keep their ALLOW.
+        assert_eq!(judge("rm -f ~/notes.tmp", "/home"), Outcome::Allow);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! read that would never see EOF.
 
 pub mod branch_diff;
+pub mod capability;
 pub mod config;
 pub mod deadline;
 pub mod display;
@@ -87,9 +88,7 @@ impl HookEvent {
                 r#"{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"},"tool_response":{"stdout":"ok"}}"#
             }
             HookEvent::SessionStart => r#"{"session_id":"test","source":"startup"}"#,
-            // Exercises the persist-plan prefix gate — a prompt shaped like the
-            // approve-and-clear re-injection (see `session persist-plan`).
-            HookEvent::UserPromptSubmit => r#"{"prompt":"Implement the following plan:\n\ntest"}"#,
+            HookEvent::UserPromptSubmit => r#"{"prompt":"test prompt"}"#,
         }
     }
 }
@@ -111,12 +110,6 @@ pub enum Outcome {
     Nudge,
     /// Operation blocked, error message shown (exit 2, stderr).
     Block,
-    /// Re-prompt loop (exit 0). The tool already ran, so the write stands, but
-    /// Claude Code's `{"decision":"block","reason":...}` convention feeds the
-    /// reason back so the model self-corrects with a fresh write. Used by
-    /// PostToolUse feedback loops (e.g. validate-then-rewrite gates) where a
-    /// hard `Block` (exit 2) cannot un-run the tool.
-    LoopBlock,
     /// Surface the interactive permission prompt (exit 0). Emits a PreToolUse
     /// `permissionDecision: "ask"` envelope on stdout. Per Claude Code's
     /// precedence (`deny` > `defer` > `ask` > `allow`, most-restrictive-wins),
@@ -132,7 +125,6 @@ impl Outcome {
         match self {
             Outcome::Allow => 0,
             Outcome::Nudge => 0,
-            Outcome::LoopBlock => 0,
             Outcome::Ask => 0,
             Outcome::Block => 2,
         }
@@ -140,109 +132,17 @@ impl Outcome {
 
     /// Merge two outcomes, keeping the more severe one.
     ///
-    /// Severity, most-to-least: `Block` > `Ask` > `LoopBlock` > `Nudge` >
-    /// `Allow`. `Ask` outranks `Nudge` (a prompt is a stronger intervention
-    /// than a silent context line) but yields to `Block`. `Ask` (PreToolUse)
-    /// and `LoopBlock` (PostToolUse) are emitted on disjoint events and never
-    /// actually co-occur, so their relative order is a convention, not
-    /// observable behavior.
+    /// Severity, most-to-least: `Block` > `Ask` > `Nudge` > `Allow`. `Ask`
+    /// outranks `Nudge` (a prompt is a stronger intervention than a silent
+    /// context line) but yields to `Block`.
     pub fn merge(self, other: Outcome) -> Outcome {
         match (self, other) {
             (Outcome::Block, _) | (_, Outcome::Block) => Outcome::Block,
             (Outcome::Ask, _) | (_, Outcome::Ask) => Outcome::Ask,
-            (Outcome::LoopBlock, _) | (_, Outcome::LoopBlock) => Outcome::LoopBlock,
             (Outcome::Nudge, _) | (_, Outcome::Nudge) => Outcome::Nudge,
             _ => Outcome::Allow,
         }
     }
-}
-
-/// Set once this process parses a payload only the Codex harness produces.
-/// See [`is_codex_payload_shape`] for the sniff and [`is_codex_harness`] for why
-/// it exists.
-static CODEX_PAYLOAD_SEEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Tool names no Claude Code build sends and every Codex build does.
-///
-/// `spawn_agents_on_csv`/`multi_agents` are deliberately absent: they alias to
-/// `Agent` like `spawn_agent` does, but they are variant spellings this repo has
-/// not measured, and a sniff list is a place to be conservative rather than
-/// exhaustive — a name that turns out to exist on some other harness would start
-/// applying Codex strictness there.
-const CODEX_ONLY_TOOLS: &[&str] = &["apply_patch", "exec_command", "unified_exec", "spawn_agent"];
-
-/// Does this raw payload carry a shape only Codex produces?
-///
-/// Two signals, OR'd: a [`CODEX_ONLY_TOOLS`] tool name, or a string-valued
-/// `tool_input` (Codex's freeform-body form; Claude Code sends an object).
-///
-/// Pure, and public so the rule is testable without mutating process state.
-#[must_use]
-pub fn is_codex_payload_shape(value: &serde_json::Value) -> bool {
-    let codex_only_tool = value
-        .get("tool_name")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|name| CODEX_ONLY_TOOLS.contains(&name));
-    let freeform_tool_input = value
-        .get("tool_input")
-        .is_some_and(serde_json::Value::is_string);
-    codex_only_tool || freeform_tool_input
-}
-
-/// Whether this process is running under the Codex harness.
-///
-/// The single source of truth for the harness question. Security behaviour keys
-/// off this (fail-closed parse denial, the `Ask` → `Block` conversion) and so
-/// does metrics tagging, so all callers must agree — a site that compared
-/// case-sensitively while another compared case-insensitively would fail **open**
-/// on `CADENCE_HARNESS=Codex` at exactly the moment metrics recorded the run as
-/// Codex.
-///
-/// Two independent signals, OR'd:
-///
-/// 1. `CADENCE_HARNESS` — set by the Codex wrapper. Matching is case-insensitive:
-///    the value is set by shell wrappers, and a harness that announces itself at
-///    all should be honoured however it cased it.
-/// 2. A Codex-shaped payload already parsed by this process
-///    ([`is_codex_payload_shape`]).
-///
-/// The second exists because the *normalization* is unconditional while the
-/// *hardening* was conditional, which is the worst-shaped failure available: on a
-/// Codex session where the wrapper did not export the variable, payloads still
-/// normalize and guards still fire, so the integration looks healthy — while a
-/// malformed payload on a security-critical hook exits 0 instead of 2, and a
-/// guard returning `Ask` exits 0 with an envelope Codex cannot render, so the
-/// operation proceeds unconfirmed. The wrapper does export it today; this is the
-/// belt to that suspenders, and it is derivable from data the normalizer already
-/// inspects.
-///
-/// **The sniff can only ever ADD strictness, never subtract it.** Both directions
-/// were checked rather than assumed:
-///
-/// - A false *positive* under Claude Code costs nothing reachable. The only
-///   `Outcome::Ask` producer in the tree is `guard-rm`, and both of its routes
-///   need an object `tool_input` (a `command`, or a `file_path` plus
-///   `operation: "delete"`); a string-valued `tool_input` degrades to `None`, so
-///   such a payload returns Allow and there is no Ask to convert to a Block. The
-///   fail-closed parse arm is likewise unreachable — if stdin failed to parse,
-///   no payload was sniffed.
-/// - A false *negative* leaves exactly today's behaviour: the env check alone.
-///
-/// Spoofing is safe in the same direction: an attacker-set
-/// `CADENCE_HARNESS=codex`, or a payload crafted to look Codex-shaped, only makes
-/// this binary stricter. The danger was always *absence*.
-#[must_use]
-pub fn is_codex_harness() -> bool {
-    is_codex_harness_value(std::env::var("CADENCE_HARNESS").ok().as_deref())
-        || CODEX_PAYLOAD_SEEN.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Pure resolver behind [`is_codex_harness`], so the matching rule is testable
-/// without mutating process environment shared by every parallel test.
-#[must_use]
-pub fn is_codex_harness_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| value.eq_ignore_ascii_case("codex"))
 }
 
 /// Normalize a file path for consistent matching:
@@ -331,7 +231,12 @@ pub struct HookInput {
 }
 
 /// Tool-specific fields from the hook input.
-#[derive(Debug, Default, Clone, Deserialize)]
+///
+/// `Serialize` is derived so the dedupe gate can fingerprint a whole tool
+/// payload rather than a hand-maintained field list — a modeled field added
+/// here is then part of the key for free, and [`Self::extra`] covers the
+/// unmodeled rest.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ToolInput {
     pub file_path: Option<String>,
     pub path: Option<String>,
@@ -370,10 +275,36 @@ pub struct ToolInput {
     /// Skill tool: the skill's argument string. NEVER logged raw — only a
     /// non-reversible hash of it is recorded (see `log_skill`).
     pub args: Option<String>,
+    /// ExitPlanMode tool: the plan's markdown body as carried on the CALL
+    /// side. The current harness fills this at call time (live-verified
+    /// 2026-08-11, claude-code 2.1.227 — cadence-hooks#672), where the
+    /// 2.1.220-era probe found it EMPTY with the plan only in
+    /// `tool_response.plan`. Both sources stay modeled; consumers try the
+    /// response first (the historically reliable field), then this.
+    pub plan: Option<String>,
+    /// ExitPlanMode tool: path to the harness's own plan-store copy
+    /// (`~/.claude/plans/<slug>.md`), carried on the call side alongside
+    /// `plan` (cadence-hooks#672). Last-resort plan source when both inline
+    /// fields are absent.
+    #[serde(rename = "planFilePath")]
+    pub plan_file_path: Option<String>,
+    /// Every `tool_input` key this struct does not model, captured verbatim.
+    ///
+    /// Guards never read it. It exists so a *whole-payload* fingerprint — the
+    /// dedupe gate's key (`markers::claim_tool_event_nudge`) — cannot collapse
+    /// two genuinely different tool calls that happen to differ only in a field
+    /// the parser has not modeled yet. `BTreeMap` (not `HashMap`) because that
+    /// key must be byte-stable across the separate hook processes of one
+    /// fan-out, and only an ordered map serializes deterministically.
+    ///
+    /// NEVER logged, and never a guard input: an attacker-supplied key here
+    /// would otherwise be a free channel into whatever read it.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// A single edit operation within a MultiEdit tool call.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct EditOperation {
     pub old_string: Option<String>,
     pub new_string: Option<String>,
@@ -381,7 +312,7 @@ pub struct EditOperation {
 }
 
 /// A single AskUserQuestion question and its answer options.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskQuestion {
     pub question: Option<String>,
@@ -391,7 +322,7 @@ pub struct AskQuestion {
 }
 
 /// A single answer option within an AskUserQuestion question.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct AskOption {
     pub label: Option<String>,
     pub description: Option<String>,
@@ -464,45 +395,113 @@ where
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
+/// Resolve every supported `apply_patch` body envelope without letting one
+/// recognized field shadow another. `patch` is the already-normalized internal
+/// form; retaining it here preserves existing compatibility while subjecting it
+/// to the same conflict check as external harness envelopes.
+fn resolve_apply_patch_body(value: &serde_json::Value) -> Result<Option<&str>, &'static str> {
+    let tool_input = value.get("tool_input");
+    let candidates = [
+        tool_input.and_then(serde_json::Value::as_str),
+        tool_input
+            .and_then(|input| input.get("command"))
+            .and_then(serde_json::Value::as_str),
+        tool_input
+            .and_then(|input| input.get("input"))
+            .and_then(serde_json::Value::as_str),
+        tool_input
+            .and_then(|input| input.get("patch"))
+            .and_then(serde_json::Value::as_str),
+        value.get("input").and_then(serde_json::Value::as_str),
+    ];
+    let mut candidates = candidates.into_iter().flatten();
+    let Some(first) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.any(|candidate| candidate != first) {
+        return Err("apply_patch payload contains conflicting patch bodies");
+    }
+    Ok(Some(first))
+}
+
+/// Why a hook payload failed to parse, and whether the failure was specifically
+/// an `apply_patch` body whose targets could not be enumerated.
+///
+/// The distinction is load-bearing, not cosmetic: an unenumerable patch on a
+/// security-critical hook fails **closed** (the guard cannot prove the operation
+/// safe), while ordinary malformed JSON fails **open** per ADR-0001. Carrying it
+/// as a typed field rather than by matching on `message` is deliberate — this
+/// binary already has one war story about a stderr substring match deciding a
+/// verdict (see `stale_signature` in the hook launcher).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseFailure {
+    /// This binary's own diagnostic. Never contains payload or patch content.
+    pub message: String,
+    /// True when an `apply_patch` body was present but could not be resolved to
+    /// a set of targets.
+    pub patch_targets_unenumerable: bool,
+}
+
+impl std::fmt::Display for ParseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseFailure {}
+
 impl HookInput {
     /// Read and parse hook input from stdin.
     pub fn from_stdin() -> Result<Self, String> {
+        Self::from_stdin_detailed().map_err(|e| e.message)
+    }
+
+    /// [`HookInput::from_stdin`], keeping the [`ParseFailure`] classification.
+    pub fn from_stdin_detailed() -> Result<Self, ParseFailure> {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
-            .map_err(|e| format!("Failed to read stdin: {e}"))?;
-        Self::from_json(&buf)
+            .map_err(|e| ParseFailure {
+                message: format!("Failed to read stdin: {e}"),
+                patch_targets_unenumerable: false,
+            })?;
+        Self::from_json_detailed(&buf)
     }
 
-    /// Parse a Claude or Codex hook payload and normalize harness aliases.
+    /// Parse a hook payload and normalize harness aliases.
     ///
     /// Raw inputs are never retained beyond this value. In particular, a patch
     /// body is parsed in memory and is not included in parse diagnostics.
     pub fn from_json(raw: &str) -> Result<Self, String> {
-        let mut value: serde_json::Value =
-            serde_json::from_str(raw).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
-        // Sniffed on the RAW value, before the `apply_patch` rewrite below turns
-        // a string `tool_input` into an object and erases the second signal.
-        if is_codex_payload_shape(&value) {
-            CODEX_PAYLOAD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        Self::from_json_detailed(raw).map_err(|e| e.message)
+    }
+
+    /// [`HookInput::from_json`], keeping the [`ParseFailure`] classification.
+    pub fn from_json_detailed(raw: &str) -> Result<Self, ParseFailure> {
+        let plain = |message: String| ParseFailure {
+            message,
+            patch_targets_unenumerable: false,
+        };
+        let mut value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|e| plain(format!("Failed to parse hook JSON: {e}")))?;
         let tool_name = value
             .get("tool_name")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
         if tool_name == "apply_patch" {
-            let patch = value
-                .get("tool_input")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| value.get("input").and_then(serde_json::Value::as_str))
+            let patch = resolve_apply_patch_body(&value)
+                .map_err(|e| ParseFailure {
+                    message: e.to_string(),
+                    patch_targets_unenumerable: true,
+                })?
                 .map(str::to_string);
             if let Some(patch) = patch {
                 value["tool_input"] = serde_json::json!({"patch": patch});
             }
         }
-        let mut input: HookInput =
-            serde_json::from_value(value).map_err(|e| format!("Failed to parse hook JSON: {e}"))?;
+        let mut input: HookInput = serde_json::from_value(value)
+            .map_err(|e| plain(format!("Failed to parse hook JSON: {e}")))?;
         if let Some(tool_input) = input.tool_input.as_mut()
             && tool_input.command.is_none()
         {
@@ -885,6 +884,29 @@ impl HookInput {
             .and_then(|tr| tr.plan.as_deref())
     }
 
+    /// The `ExitPlanMode` plan text from the CALL side (`tool_input.plan`) —
+    /// filled by the current harness at call time (cadence-hooks#672), empty
+    /// in the 2.1.220-era payloads. Fallback source after
+    /// [`Self::tool_response_plan`].
+    pub fn tool_input_plan(&self) -> Option<&str> {
+        self.tool_input.as_ref().and_then(|ti| ti.plan.as_deref())
+    }
+
+    /// The harness plan-store path for an `ExitPlanMode` call, preferring the
+    /// response-side `filePath` over the call-side `planFilePath`
+    /// (cadence-hooks#672). Last-resort plan source when both inline plan
+    /// fields are absent.
+    pub fn plan_file_path(&self) -> Option<&str> {
+        self.tool_response
+            .as_ref()
+            .and_then(|tr| tr.file_path.as_deref())
+            .or_else(|| {
+                self.tool_input
+                    .as_ref()
+                    .and_then(|ti| ti.plan_file_path.as_deref())
+            })
+    }
+
     /// The AskUserQuestion questions carried by this tool call, if any.
     pub fn ask_questions(&self) -> Option<&[AskQuestion]> {
         self.tool_input
@@ -1056,8 +1078,8 @@ pub struct CheckResult {
     pub outcome: Outcome,
     pub message: Option<String>,
     /// Structured payload attached to hard blocks. Always `None` for
-    /// `Allow`, `Nudge`, `LoopBlock`, and `Ask` (their delivery shapes don't
-    /// carry it). When `Some`, its `fix` is folded into the block's stderr
+    /// `Allow`, `Nudge`, and `Ask` (their delivery shapes don't carry it).
+    /// When `Some`, its `fix` is folded into the block's stderr
     /// message (exit 2 surfaces stderr only — see [`render_output`]).
     pub block_metadata: Option<BlockMetadata>,
     /// Attribution when the guard allowed *because a bypass was active* — a
@@ -1107,17 +1129,6 @@ impl CheckResult {
         }
     }
 
-    /// Re-prompt loop result (exit 0). The message is fed back via Claude Code's
-    /// `{"decision":"block","reason":...}` convention so the model rewrites.
-    pub fn loop_block(message: impl Into<String>) -> Self {
-        Self {
-            outcome: Outcome::LoopBlock,
-            message: Some(message.into()),
-            block_metadata: None,
-            bypass: None,
-        }
-    }
-
     /// Force the interactive permission prompt (exit 0). The `message` becomes
     /// the `permissionDecisionReason` shown to the user. Use when a guard can
     /// neither prove an operation safe (allow) nor prove it dangerous (block),
@@ -1142,6 +1153,24 @@ impl CheckResult {
             block_metadata: None,
             bypass: Some(bypass),
         }
+    }
+
+    /// Attach [`BypassProvenance`] to a result that is **not** a plain allow.
+    ///
+    /// [`allow_bypassed`](Self::allow_bypassed) covers the common shape — a
+    /// bypass turns a block into a silent allow. It does not cover a guard with
+    /// more than one severity tier, where a bypass downgrades the hard tier but
+    /// the soft tier still has something to say: dropping to `allow_bypassed`
+    /// would silently discard that message, and returning a bare `nudge` would
+    /// lose the provenance row in `bypasses.jsonl`.
+    ///
+    /// `redact-external-content` is the first such guard: with the identity
+    /// bypass armed and both an identity and a shaped hit present, the honest
+    /// result is a nudge carrying the shaped finding *and* the attribution that
+    /// a bypass suppressed the block.
+    pub fn with_bypass(mut self, bypass: BypassProvenance) -> Self {
+        self.bypass = Some(bypass);
+        self
     }
 }
 
@@ -1196,8 +1225,8 @@ fn feedback_footer() -> Option<String> {
 }
 
 /// Compose the message body emitted for an outcome, appending the feedback
-/// footer to **hard blocks only** (never Nudge/LoopBlock/Allow — they aren't
-/// errors the user needs a feedback channel for).
+/// footer to **hard blocks only** (never Nudge/Allow — they aren't errors the
+/// user needs a feedback channel for).
 ///
 /// `footer` is the resolved footer ([`feedback_footer`]); passing it in keeps
 /// this pure and unit-testable without mutating process-global env.
@@ -1223,7 +1252,7 @@ struct RenderedOutput {
 /// Code's exit-code contract.
 ///
 /// The contract (code.claude.com/docs/en/hooks):
-/// - **Exit 0** (Allow/Nudge/LoopBlock): stdout JSON is parsed for control
+/// - **Exit 0** (Allow/Nudge/Ask): stdout JSON is parsed for control
 ///   (`hookSpecificOutput`, `decision`); stderr is ignored.
 /// - **Exit 2** (Block): stdout is **ignored entirely** — only stderr is fed
 ///   back to Claude. So a block emits *no* stdout: a JSON envelope there is
@@ -1254,23 +1283,6 @@ fn render_output(
         Outcome::Nudge => RenderedOutput {
             stdout: Some(
                 serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": event_name,
-                        "additionalContext": msg,
-                    }
-                })
-                .to_string(),
-            ),
-            stderr: None,
-        },
-        Outcome::LoopBlock => RenderedOutput {
-            // PostToolUse re-prompt: the tool already ran, so exit 0 and use the
-            // `decision: block` convention to feed the reason back. Mirror it
-            // into additionalContext for clients that read that.
-            stdout: Some(
-                serde_json::json!({
-                    "decision": "block",
-                    "reason": msg,
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
                         "additionalContext": msg,
@@ -1328,7 +1340,7 @@ fn render_output(
 /// Routing (delegated to the pure [`render_output`], then written and exited):
 /// - `skip_at_effort()` matches `$CLAUDE_EFFORT` → silent Allow (exit 0),
 ///   `check.run()` is not called.
-/// - Nudge / LoopBlock → JSON to stdout (exit 0). Claude Code parses this and
+/// - Nudge / Ask → JSON to stdout (exit 0). Claude Code parses this and
 ///   injects the message into Claude's context.
 /// - Block → text to stderr **only** (exit 2). Claude Code ignores stdout on a
 ///   block, so no JSON envelope is emitted there; the structured [`BlockMetadata`]
@@ -1364,15 +1376,6 @@ pub fn decide_check(check: &dyn Check, input: &HookInput) -> Option<CheckResult>
 /// Behaviourally identical to the tail of the pre-split [`run_check`], so the
 /// `render_output` matrix tests remain the safety net for the output shape.
 pub fn emit_and_exit(result: &CheckResult, event: HookEvent) -> ! {
-    if result.outcome == Outcome::Ask && is_codex_harness() {
-        let reason = result.message.as_deref().unwrap_or("confirmation required");
-        eprintln!(
-            "{reason}\n\nBlocked because Codex hooks cannot hand an Ask decision to the user. \
-             Review the target, then use the documented scoped bypass or run the operation \
-             yourself outside the agent session."
-        );
-        process::exit(Outcome::Block.code());
-    }
     let rendered = render_output(
         result.outcome,
         result.message.as_deref(),
@@ -1488,9 +1491,11 @@ pub fn guard_interactive_terminal(
 /// silently got less enforcement.
 ///
 /// What it deliberately does NOT gain is the dispatch wrapper's telemetry tail
-/// (denial ledger, timing, panic guard) or its Codex fail-closed parse arm: those
-/// need the canonical registry hook name, which lives in the binary. So this
-/// stays the *unlogged* path, not a weaker one.
+/// (denial ledger, timing, panic guard) or its fail-closed arm for an
+/// unenumerable patch on a security-critical hook: both need the canonical
+/// registry hook name, which lives in the binary. So this stays the *unlogged*
+/// path — and, for that one arm, a genuinely weaker one; every shipped hook goes
+/// through the dispatch wrapper.
 pub fn run_check_from_stdin(check: &dyn Check, event: HookEvent) -> ! {
     guard_interactive_terminal(check.name(), Some(event), None);
     let input = match HookInput::from_stdin() {
@@ -1579,67 +1584,7 @@ mod tests {
     fn outcome_codes() {
         assert_eq!(Outcome::Allow.code(), 0);
         assert_eq!(Outcome::Nudge.code(), 0);
-        assert_eq!(Outcome::LoopBlock.code(), 0);
         assert_eq!(Outcome::Block.code(), 2);
-    }
-
-    // --- the payload-shape harness sniff (C3) ---
-
-    /// Both Codex signals are recognized. Asserted on the pure predicate so the
-    /// test says nothing about process-global state other tests may have set.
-    #[test]
-    fn codex_payload_shapes_are_recognized() {
-        for raw in [
-            r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\n*** End Patch"}"#,
-            r#"{"tool_name":"exec_command","tool_input":{"cmd":"ls"}}"#,
-            r#"{"tool_name":"unified_exec","tool_input":{"cmd":"ls"}}"#,
-            r#"{"tool_name":"spawn_agent","tool_input":{}}"#,
-            // The freeform-body signal on its own, with no Codex-only name.
-            r#"{"tool_name":"Read","tool_input":"/etc/hosts"}"#,
-        ] {
-            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
-            assert!(
-                is_codex_payload_shape(&value),
-                "should sniff as Codex: {raw}"
-            );
-        }
-    }
-
-    /// The other direction, which is the one that matters: an ordinary Claude
-    /// Code payload must NOT trip the sniff, or every session would silently
-    /// take the Codex hardening path.
-    #[test]
-    fn claude_payload_shapes_are_not_sniffed_as_codex() {
-        for raw in [
-            r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#,
-            r#"{"tool_name":"Edit","tool_input":{"file_path":"a","old_string":"x","new_string":"y"}}"#,
-            r#"{"tool_name":"Agent","tool_input":{"subagent_type":"explorer"}}"#,
-            r#"{"tool_name":"mcp__claude-in-chrome__read_page","tool_input":{}}"#,
-            r#"{"session_id":"s","source":"startup"}"#,
-            // Not a substring match: a Claude tool whose name merely contains a
-            // Codex-only name must not sniff.
-            r#"{"tool_name":"apply_patch_helper","tool_input":{}}"#,
-        ] {
-            let value: serde_json::Value = serde_json::from_str(raw).unwrap();
-            assert!(
-                !is_codex_payload_shape(&value),
-                "should NOT sniff as Codex: {raw}"
-            );
-        }
-    }
-
-    /// End to end: parsing a Codex payload makes `is_codex_harness()` true with
-    /// `CADENCE_HARNESS` unset — the whole point of the fallback. Deliberately
-    /// one-directional: the flag is process-global and sticky by design, so a
-    /// "stays false" assertion here would be a race against every other test in
-    /// this binary. That direction is covered above, on the pure predicate.
-    #[test]
-    fn parsing_a_codex_payload_arms_the_harness_fallback() {
-        HookInput::from_json(r#"{"tool_name":"exec_command","tool_input":{"cmd":"ls"}}"#).unwrap();
-        assert!(
-            is_codex_harness(),
-            "a parsed Codex payload must arm the harness fallback without the env var"
-        );
     }
 
     #[test]
@@ -1765,6 +1710,111 @@ mod tests {
     }
 
     #[test]
+    fn codex_patch_command_object_expands_target() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Add File: command.txt\n+ok\n*** End Patch"}}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("command.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_input_object_expands_target() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":{"input":"*** Begin Patch\n*** Add File: input.txt\n+ok\n*** End Patch"}}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("input.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_top_level_input_expands_target() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","input":"*** Begin Patch\n*** Add File: top-level.txt\n+ok\n*** End Patch"}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("top-level.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_normalized_patch_field_expands_target() {
+        let input = HookInput::from_json(
+            r#"{"tool_name":"apply_patch","tool_input":{"patch":"*** Begin Patch\n*** Add File: normalized.txt\n+ok\n*** End Patch"}}"#,
+        )
+        .unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("normalized.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_identical_duplicate_bodies_expand_target() {
+        let patch = "*** Begin Patch\n*** Add File: duplicate.txt\n+ok\n*** End Patch";
+        let payload = serde_json::json!({
+            "tool_name": "apply_patch",
+            "tool_input": {"command": patch, "input": patch, "patch": patch},
+            "input": patch,
+        });
+        let input = HookInput::from_json(&payload.to_string()).unwrap();
+        let targets = input.normalized_inputs().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].file_path().as_deref(), Some("duplicate.txt"));
+        assert_eq!(targets[0].content(), Some("ok"));
+    }
+
+    #[test]
+    fn codex_patch_conflicting_bodies_fail_without_echoing_them() {
+        let benign = "*** Begin Patch\n*** Add File: benign.txt\n+ok\n*** End Patch";
+        let secret = "*** Begin Patch\n*** Add File: secret.env\n+TOP_SECRET\n*** End Patch";
+        let payloads = [
+            serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_input": {"command": benign, "input": secret},
+            }),
+            serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_input": {"command": benign},
+                "input": secret,
+            }),
+            serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_input": {"command": benign, "patch": secret},
+            }),
+        ];
+        for payload in payloads {
+            let error = HookInput::from_json(&payload.to_string()).unwrap_err();
+            assert!(error.contains("conflicting patch bodies"), "{error}");
+            assert!(!error.contains("benign.txt"), "{error}");
+            assert!(!error.contains("secret.env"), "{error}");
+            assert!(!error.contains("TOP_SECRET"), "{error}");
+        }
+    }
+
+    #[test]
+    fn malformed_object_wrapped_patch_diagnostic_does_not_echo_body() {
+        for field in ["command", "input"] {
+            let payload = serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_input": {field: "*** Begin Patch\nTOP_SECRET\n*** End Patch"},
+            });
+            let input = HookInput::from_json(&payload.to_string()).unwrap();
+            let error = input.normalized_inputs().unwrap_err();
+            assert!(error.contains("schema rejected"), "{field}: {error}");
+            assert!(!error.contains("TOP_SECRET"), "{field}: {error}");
+        }
+    }
+
+    #[test]
     fn malformed_codex_patch_diagnostic_does_not_echo_body() {
         let input = HookInput::from_json(
             r#"{"tool_name":"apply_patch","tool_input":"*** Begin Patch\nTOP_SECRET\n*** End Patch"}"#,
@@ -1786,16 +1836,12 @@ mod tests {
     }
 
     #[test]
-    fn feedback_footer_skips_nudge_loop_block_and_allow() {
-        // The footer is a block-only affordance — nudges and loop-blocks are not
-        // errors the user needs a feedback channel for, so they pass through.
+    fn feedback_footer_skips_nudge_and_allow() {
+        // The footer is a block-only affordance — nudges are not errors the
+        // user needs a feedback channel for, so they pass through.
         assert_eq!(
             apply_feedback_footer(Outcome::Nudge, "heads up", Some(FEEDBACK_FOOTER)),
             "heads up"
-        );
-        assert_eq!(
-            apply_feedback_footer(Outcome::LoopBlock, "rewrite", Some(FEEDBACK_FOOTER)),
-            "rewrite"
         );
         assert_eq!(
             apply_feedback_footer(Outcome::Allow, "", Some(FEEDBACK_FOOTER)),
@@ -1868,13 +1914,12 @@ mod tests {
     }
 
     #[test]
-    fn allow_nudge_loop_block_have_no_metadata() {
+    fn allow_nudge_have_no_metadata() {
         // Only hard blocks carry structured metadata. The other outcomes
-        // serialize through different envelopes (additionalContext for
-        // Nudge; decision:block for LoopBlock) where it has no place.
+        // serialize through a different envelope (additionalContext for
+        // Nudge) where it has no place.
         assert!(CheckResult::allow().block_metadata.is_none());
         assert!(CheckResult::nudge("x").block_metadata.is_none());
-        assert!(CheckResult::loop_block("y").block_metadata.is_none());
     }
 
     #[test]
@@ -2029,27 +2074,6 @@ mod tests {
     }
 
     #[test]
-    fn render_loop_block_shape() {
-        // Documents/guards the PostToolUse re-prompt shape: top-level decision +
-        // reason, plus the nested hookSpecificOutput mirror (string context).
-        let rendered = render_output(
-            Outcome::LoopBlock,
-            Some("rewrite this"),
-            None,
-            HookEvent::PostToolUse,
-            None,
-        );
-        assert_eq!(rendered.stderr, None);
-        let json: serde_json::Value =
-            serde_json::from_str(&rendered.stdout.expect("loop_block writes stdout"))
-                .expect("valid JSON");
-        assert_eq!(json["decision"], "block");
-        assert_eq!(json["reason"], "rewrite this");
-        assert!(json["hookSpecificOutput"]["additionalContext"].is_string());
-        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PostToolUse");
-    }
-
-    #[test]
     fn render_allow_and_empty_message_emit_nothing() {
         assert_eq!(
             render_output(Outcome::Allow, None, None, HookEvent::PreToolUse, None),
@@ -2148,22 +2172,6 @@ mod tests {
     }
 
     #[test]
-    fn outcome_merge_loop_block_below_block_above_nudge() {
-        assert_eq!(Outcome::LoopBlock.merge(Outcome::Nudge), Outcome::LoopBlock);
-        assert_eq!(Outcome::Nudge.merge(Outcome::LoopBlock), Outcome::LoopBlock);
-        assert_eq!(Outcome::Block.merge(Outcome::LoopBlock), Outcome::Block);
-        assert_eq!(Outcome::LoopBlock.merge(Outcome::Block), Outcome::Block);
-        assert_eq!(Outcome::LoopBlock.merge(Outcome::Allow), Outcome::LoopBlock);
-    }
-
-    #[test]
-    fn check_result_loop_block() {
-        let r = CheckResult::loop_block("rewrite");
-        assert_eq!(r.outcome, Outcome::LoopBlock);
-        assert_eq!(r.message.as_deref(), Some("rewrite"));
-    }
-
-    #[test]
     fn session_start_fields_deserialize() {
         let json = r#"{"session_id":"s1","source":"startup","model":"claude-opus-4-8"}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
@@ -2200,32 +2208,6 @@ mod tests {
         // synthetic test inputs) deserialize to None, never an error.
         let input: HookInput = serde_json::from_str(r#"{"tool_name":"Bash"}"#).unwrap();
         assert_eq!(input.transcript_path(), None);
-    }
-
-    #[test]
-    fn codex_harness_match_is_case_insensitive() {
-        // The security paths (fail-closed parse denial, Ask -> Block) and the
-        // metrics harness tag all read this one rule. When they disagreed, a
-        // non-lowercase value tagged the run "codex" in metrics while both
-        // security paths silently treated it as Claude — failing open exactly
-        // when the ledger said Codex was driving.
-        for value in ["codex", "Codex", "CODEX", "cOdEx"] {
-            assert!(
-                is_codex_harness_value(Some(value)),
-                "{value} should be recognized as the Codex harness"
-            );
-        }
-    }
-
-    #[test]
-    fn codex_harness_match_rejects_non_codex_values() {
-        for value in ["claude", "", "codexx", "co dex", "codex-cli"] {
-            assert!(
-                !is_codex_harness_value(Some(value)),
-                "{value} should not be recognized as the Codex harness"
-            );
-        }
-        assert!(!is_codex_harness_value(None));
     }
 
     #[test]
@@ -2596,7 +2578,6 @@ mod tests {
         assert!(CheckResult::allow().bypass.is_none());
         assert!(CheckResult::nudge("x").bypass.is_none());
         assert!(CheckResult::block("y").bypass.is_none());
-        assert!(CheckResult::loop_block("z").bypass.is_none());
     }
 
     #[test]
@@ -2923,15 +2904,10 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_submit_sample_exercises_the_persist_plan_prefix_gate() {
+    fn user_prompt_submit_sample_carries_a_prompt() {
         let input: HookInput =
             serde_json::from_str(HookEvent::UserPromptSubmit.sample_payload()).unwrap();
-        assert!(
-            input
-                .prompt()
-                .is_some_and(|p| p.starts_with("Implement the following plan:")),
-            "sample should exercise the persist-plan prefix gate"
-        );
+        assert!(input.prompt().is_some_and(|p| !p.is_empty()));
     }
 
     #[test]

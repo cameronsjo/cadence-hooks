@@ -14,8 +14,8 @@ pub(crate) static CADENCE_ALLOW_MAIN_TEST_LOCK: std::sync::Mutex<()> = std::sync
 /// Shared test lock serializing every test in this crate that mutates a
 /// process-global env var OUTSIDE the `CADENCE_ALLOW_MAIN` family above
 /// (`guard_push_remote`, `guard_gh_write`, `warn_issue_tracker`,
-/// `warn_subagent_worktree`, `warn_going_public`, `warn_subagent_concurrency`,
-/// `guard_read_model` — seven modules, seven different var sets). Each used
+/// `warn_subagent_worktree`, `warn_going_public`, `guard_read_model` —
+/// six modules, six different var sets). Each used
 /// to mint its own module-local `ENV_LOCK`, on the theory that disjoint var
 /// sets need no shared exclusion — but that theory lives only in a doc
 /// comment, and the moment two modules' vars overlap (or a future edit adds
@@ -97,6 +97,8 @@ pub mod dismiss_enforce_worktree;
 pub mod dismiss_main_branch_warn;
 /// Block mutations in a primary checkout of a branch-mode repo.
 pub mod enforce_worktree;
+/// Shared renderer for the gh-write allowlist + `-R` rule context line.
+pub mod gh_context;
 /// Block the first Claude-in-Chrome action per session until the device is confirmed.
 pub mod guard_browser_device;
 /// Block direct edits to production dotfiles; redirect to chezmoi source.
@@ -117,8 +119,8 @@ pub mod guard_read_model;
 pub mod guard_rm;
 /// SessionStart assertion that `guard-rm` is present and classifying correctly.
 pub mod guard_rm_liveness;
-/// Inject the gh-write allowlist + `-R` rule on SessionStart.
-pub mod inject_gh_context;
+/// Block a `sops` decrypt whose plaintext would reach the transcript.
+pub mod guard_sops_decrypt;
 /// Re-inject the gh-write allowlist + `-R` rule just before an untargeted gh write.
 pub mod inject_gh_write_context;
 /// Shared closing-keyword detection for GitHub issue references.
@@ -135,8 +137,6 @@ pub mod verify_pr_autoclose;
 pub mod warn_alias_parsing;
 /// Warn when creating a branch from a non-main base.
 pub mod warn_branch_base;
-/// Warn that CodeRabbit re-trigger comments are no-ops on already-reviewed content.
-pub mod warn_coderabbit_retrigger;
 /// Remind to check datetime before scheduling cron jobs.
 pub mod warn_cron_datetime;
 /// Warn when bare `curl` (aliased to curlie) is used with custom headers.
@@ -151,9 +151,9 @@ pub mod warn_issue_tracker;
 pub mod warn_main_branch;
 /// Remind on `gh pr create` when the PR body has no closing keyword linking to an issue.
 pub mod warn_pr_issue_link;
-/// Nudge when the live subagent count is at or over the configured cap.
-pub mod warn_subagent_concurrency;
 /// Warn when dispatching a subagent from main while a sibling worktree exists.
 pub mod warn_subagent_worktree;
+/// Warn on `gh pr ready`/`gh pr merge` when the PR's head SHA has no reviewed signal.
+pub mod warn_unreviewed_ready_flip;
 /// Warn about untracked files during git commit operations.
 pub mod warn_untracked;
