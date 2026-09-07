@@ -100,11 +100,12 @@ consolidation, not churn, and directionally aligned with #268.
    Also inherited from `core::shell` and shared by every sibling guard: a push inside a
    heredoc-fed shell body (`bash <<EOF … git push … EOF`) is unseen, because
    `split_segments_with_ops` strips heredoc bodies as data; `eval 'git push origin main'`
-   is unseen, because `eval` is not in `COMMAND_RUNNERS` and its argument is never treated
-   as a child script; and the walk stops at `MAX_WRAPPER_DEPTH` (3) levels of nesting.
-   The `eval` fix belongs in `core::shell::child_scripts`, so every sibling guard gains it
-   at once — closing it in the push walk alone would make push detection the only gate
-   that sees through `eval`, and that divergence is the shape these misses come from.
+   is unseen (tracked as **cameronsjo/cadence-hooks#886**), because `eval` is not in
+   `COMMAND_RUNNERS` and its argument is never treated as a child script; and the walk stops
+   at `MAX_WRAPPER_DEPTH` (3) levels of nesting. The `eval` fix belongs in
+   `core::shell::child_scripts`, so every sibling guard gains it at once — closing it in the
+   push walk alone would make push detection the only gate that sees through `eval`, and
+   that divergence is the shape these misses come from.
 
 2. **Range — from the refspec, not HEAD, correct ordering.** For each pushed source ref,
    outbound set = **`git rev-list <src-ref> --not --remotes`** — positive ref **before**
@@ -198,7 +199,7 @@ The headings are left as written — they are frozen contract text — so read t
 correction.
 
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
-  error-distinguishing `shell::git_output_detailed`, with 53 core unit tests.
+  error-distinguishing `shell::git_output_detailed`, with 57 core unit tests.
   Built on `feat/237-pre-push-secret-scan`.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
 - [ ] **Task B** — mandatory adversarial security review of the guard.

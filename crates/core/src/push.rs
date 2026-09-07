@@ -231,19 +231,18 @@ fn collect_push_invocations(
 /// about a push git performs under the injected setting, so the only honest
 /// answer is to refuse.
 ///
-/// `GIT_CONFIG_COUNT` is the switch that arms `GIT_CONFIG_KEY_n`/`_VALUE_n`, so
-/// matching it alone covers that spelling; the `KEY_`/`VALUE_` names are listed
-/// anyway, since an `export` of one without the count is still a redirect being
-/// staged and refusing costs only a false block.
-const GIT_REDIRECT_ENV_PREFIXES: &[&str] = &[
-    "GIT_DIR=",
-    "GIT_WORK_TREE=",
-    "GIT_CONFIG_COUNT=",
-    "GIT_CONFIG_KEY_",
-    "GIT_CONFIG_VALUE_",
-    "GIT_CONFIG_GLOBAL=",
-    "GIT_CONFIG_SYSTEM=",
-];
+/// **The `GIT_CONFIG` family is matched as a family, not enumerated.** An
+/// earlier cut listed `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_`, `GIT_CONFIG_VALUE_`,
+/// `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` — and a review found
+/// `GIT_CONFIG_PARAMETERS`, a sixth spelling git honours standalone with no
+/// `GIT_CONFIG_COUNT` at all (`GIT_CONFIG_PARAMETERS="'push.default=matching'"`
+/// measured setting it). That is the second round in which one more member of
+/// the same channel turned up, which is the tell that the list is the wrong
+/// shape: it enumerates someone else's surface, and that surface grows without
+/// telling us. Matching the prefix admits only what can be vouched for and
+/// refuses the rest, unknown spellings included; over-refusing costs a caller an
+/// explainable refusal.
+const GIT_REDIRECT_ENV_PREFIXES: &[&str] = &["GIT_DIR=", "GIT_WORK_TREE=", "GIT_CONFIG"];
 
 /// Is this word an assignment from [`GIT_REDIRECT_ENV_PREFIXES`]?
 fn names_git_redirect(word: &str) -> bool {
@@ -330,9 +329,15 @@ fn implicit_push_config_unresolvable(work_dir: &str) -> bool {
 /// bash leaves put — inventing exactly the wrong-repository answer this arm was
 /// rewritten to stop producing.
 ///
-/// The verb itself goes through [`command_word`] for the same reason the push
-/// side does: a literal `tokens.first() == "cd"` test missed `\cd`, the standard
-/// way to sidestep an alias.
+/// **The verb is matched EXACTLY, not through [`command_word`].** That helper
+/// case-folds and strips a path and a `.exe`, which is right for `git` — an
+/// executable file, found on `PATH`, spelled however the filesystem allows.
+/// `cd` is a shell BUILTIN, and neither transformation applies to one. Measured:
+/// `CD /usr` and `/usr/bin/cd /usr` both leave bash in the ORIGINAL directory,
+/// so folding either into `cd` would move the tracked directory for a command
+/// the shell never honoured — the same wrong-repository answer from the
+/// opposite direction. Only a leading backslash is stripped, because `\cd` is
+/// alias suppression and really does run the builtin.
 ///
 /// Returns the slice starting at the verb, so the caller's target walk sees the
 /// same words bash would.
@@ -344,7 +349,7 @@ fn directory_verb_tokens(tokens: &[String]) -> Option<&[String]> {
             start += 1;
             continue;
         }
-        if matches!(command_word(word).as_ref(), "command" | "builtin") {
+        if matches!(strip_alias_escape(word), "command" | "builtin") {
             start += 1;
             // `command`'s own flags (`-p`, `-v`, `-V`) sit before the verb.
             // `command -v cd` only PRINTS, but it also carries no path, so it
@@ -357,11 +362,13 @@ fn directory_verb_tokens(tokens: &[String]) -> Option<&[String]> {
         break;
     }
     let rest = tokens.get(start..)?;
-    matches!(
-        command_word(rest.first()?).as_ref(),
-        "cd" | "pushd" | "popd"
-    )
-    .then_some(rest)
+    matches!(strip_alias_escape(rest.first()?), "cd" | "pushd" | "popd").then_some(rest)
+}
+
+/// A word with its alias-suppressing leading backslash removed, and nothing
+/// else changed — the only normalization a shell builtin admits.
+fn strip_alias_escape(word: &str) -> &str {
+    word.strip_prefix('\\').unwrap_or(word)
 }
 
 /// Where a directory verb leaves the shell, or `None` when this walk cannot
@@ -383,38 +390,53 @@ fn directory_verb_tokens(tokens: &[String]) -> Option<&[String]> {
 /// composed posture blocks. Only the `cd` arm degraded to a *plausible wrong
 /// answer*.
 ///
-/// Unreadable targets: a bare `cd`, `-` (`$OLDPWD`), any target carrying an
-/// unexpanded `$` or a backtick, `popd`, a `pushd` with no literal path, and a
-/// `pushd +N`/`-N` stack rotation. `$` is tested anywhere in the token, not just
-/// at the front — `cd "$HOME/x"` and `cd /a/$B` are equally unknowable, and
-/// over-refusing costs a caller a refusal it can explain rather than a wrong
-/// repository.
+/// Unreadable: `popd`; ANY flagged `pushd`; a bare verb; `-` (`$OLDPWD`); a
+/// target carrying an unexpanded `$` or a backtick; and more than one operand.
+///
+/// **`pushd` refuses on any flag rather than on a list of flags.** `-n` pushes
+/// onto the stack *without moving* (measured: `pushd -n /b` from `/a` leaves
+/// `pwd` at `/a`) and `+N`/`-N` rotate the stack, so the flags that change the
+/// verb's meaning outnumber the ones that do not. Enumerating them is the wrong
+/// side of that problem — a flag this walk has not heard of would silently take
+/// the literal-path arm. A refusal for `-n` is a deliberate over-refusal: the
+/// provable answer there is "does not move", and over-refusing costs an
+/// explainable refusal while under-refusing costs a wrong repository.
+///
+/// **Two operands is bash's substitute form**, not a move: `cd repo other`
+/// replaces `repo` with `other` inside `$PWD`, and measured it errors with
+/// `too many arguments` and does not move at all. Taking the first operand
+/// reported `<cwd>/repo` for a shell that never left `<cwd>`.
+///
+/// `$` is tested anywhere in the token, not just at the front — `cd "$HOME/x"`
+/// and `cd /a/$B` are equally unknowable.
 ///
 /// `tokens` begins at the verb ([`directory_verb_tokens`] did the peel).
 fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<String> {
-    let verb = command_word(tokens.first()?);
+    let verb = strip_alias_escape(tokens.first()?);
     if verb == "popd" {
         return None;
     }
-    // `pushd +N` / `pushd -N` rotate the directory stack, which this walk never
-    // modelled — measured moving the shell after two prior `pushd`s. The `-N`
-    // spelling is consumed by the flag skip below and lands on the no-target
-    // arm; `+N` reaches the match looking exactly like a relative path, and was
-    // resolving to a nonexistent `<dir>/+1` with `unresolved: false`.
-    let rotates_a_stack = verb == "pushd";
+    let stack_verb = verb == "pushd";
     let mut idx = 1;
     while tokens
         .get(idx)
         .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
     {
+        if stack_verb {
+            return None;
+        }
         idx += 1;
+    }
+    let operands = tokens.len() - idx;
+    if operands != 1 {
+        return None;
     }
     match tokens.get(idx) {
         Some(target)
             if target != "-"
                 && !target.contains('$')
                 && !target.contains('`')
-                && !(rotates_a_stack && target.starts_with('+')) =>
+                && !(stack_verb && target.starts_with('+')) =>
         {
             Some(resolve_cd_target(target, effective_dir))
         }
@@ -1176,6 +1198,51 @@ mod tests {
         let invocation = only("env cd /other && git push origin main", "/repo");
         assert_eq!(invocation.work_dir, "/repo");
         assert!(!invocation.unresolved);
+    }
+
+    #[test]
+    fn an_uppercase_or_path_qualified_cd_is_not_a_directory_verb() {
+        // `cd` is a shell BUILTIN, so neither case-folding nor basename
+        // stripping applies to it. Measured: `CD /usr` and `/usr/bin/cd /usr`
+        // both leave bash in the original directory. Treating either as a move
+        // would report a directory the shell never entered.
+        for command in [
+            "CD /other && git push origin main",
+            "/usr/bin/cd /other && git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert_eq!(invocation.work_dir, "/repo", "for {command}");
+            assert!(!invocation.unresolved, "for {command}");
+        }
+    }
+
+    #[test]
+    fn pushd_with_any_flag_marks_every_later_push_unresolved() {
+        // `pushd -n /b` pushes onto the stack WITHOUT moving (measured: `pwd`
+        // stays at `/a`). Enumerating which pushd flags move is the wrong side
+        // of that problem, so any flag refuses.
+        assert!(only("pushd -n /other && git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_two_operand_cd_marks_every_later_push_unresolved() {
+        // `cd <old> <new>` is bash's substitute form, not a move to `<old>`.
+        // Measured: `cd repo other` errors and does not move.
+        assert!(only("cd repo other && git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn git_config_parameters_env_marks_the_invocation_unresolved() {
+        // git honours this one standalone — no GIT_CONFIG_COUNT needed:
+        // `GIT_CONFIG_PARAMETERS="'push.default=matching'" git config --get
+        // push.default` prints `matching`.
+        assert!(
+            only(
+                "GIT_CONFIG_PARAMETERS='push.default=matching' git push origin",
+                "/repo"
+            )
+            .unresolved
+        );
     }
 
     #[test]
