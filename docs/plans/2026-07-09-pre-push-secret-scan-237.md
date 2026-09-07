@@ -99,8 +99,12 @@ consolidation, not churn, and directionally aligned with #268.
    don't imply): dashed `git-push`, user aliases (`git pu`) — same limit as sibling guards.
    Also inherited from `core::shell` and shared by every sibling guard: a push inside a
    heredoc-fed shell body (`bash <<EOF … git push … EOF`) is unseen, because
-   `split_segments_with_ops` strips heredoc bodies as data; and the walk stops at
-   `MAX_WRAPPER_DEPTH` (3) levels of nesting.
+   `split_segments_with_ops` strips heredoc bodies as data; `eval 'git push origin main'`
+   is unseen, because `eval` is not in `COMMAND_RUNNERS` and its argument is never treated
+   as a child script; and the walk stops at `MAX_WRAPPER_DEPTH` (3) levels of nesting.
+   The `eval` fix belongs in `core::shell::child_scripts`, so every sibling guard gains it
+   at once — closing it in the push walk alone would make push detection the only gate
+   that sees through `eval`, and that divergence is the shape these misses come from.
 
 2. **Range — from the refspec, not HEAD, correct ordering.** For each pushed source ref,
    outbound set = **`git rev-list <src-ref> --not --remotes`** — positive ref **before**
@@ -188,7 +192,7 @@ Third independent plan in the Step-0 queue.
 ## Progress
 
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
-  error-distinguishing `shell::git_output_detailed`, with 41 core unit tests.
+  error-distinguishing `shell::git_output_detailed`, with 49 core unit tests.
   Built on `feat/237-pre-push-secret-scan`.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
 - [ ] **Task B** — mandatory adversarial security review of the guard.
@@ -219,6 +223,13 @@ MUST be applied **before** buffering: `outbound_commits` holds the whole `rev-li
 which on a first push is the entire history, with no size bound of its own. Task A must also
 treat `PushInvocation::tags` exactly like `all_or_mirror` for range purposes — a tag can
 point at a commit no branch reaches, so widening to "every local branch" still misses it.
+
+**Deadline budget.** An implicit-refspec push now costs **three** bounded git subprocesses
+on the detection path, not one: two `git config` probes (`push.default` and the
+`remote.*.push` regexp) before `outbound_commits` runs. Size the hook deadline for three,
+and treat `GitOutput::TimedOut` exactly like `OutboundRange::Unavailable` — block or nudge
+loudly, never allow. `TimedOut` is the module's one fail-open arm, and a timeout is now
+three times as reachable as it was.
 
 - module export;
 - `CadenceCommands::PreventSecretPush` + `hook_name()` arm + dispatch arm (`src/main.rs`);

@@ -93,17 +93,27 @@ pub struct PushInvocation {
     pub dry_run: bool,
     /// This walk saw something it cannot model well enough to scan a COMPLETE
     /// range, so a caller must refuse rather than scan a subset — the plan's
-    /// "never silently scan a subset and exit 0". Three causes:
+    /// "never silently scan a subset and exit 0".
     ///
-    /// - a `--git-dir`/`--work-tree` flag, or the `GIT_DIR=`/`GIT_WORK_TREE=`
-    ///   env equivalent, redirecting the push at a repository this walk would
-    ///   have to model git's setup rules to name correctly;
-    /// - `push.default=matching`, which publishes every same-named local
-    ///   branch rather than the current one;
-    /// - any configured `remote.<name>.push` refspec, which replaces the
-    ///   `push.default` computation outright.
+    /// **Which repository** — the push may not run where this walk thinks:
     ///
-    /// The last two are read only when the refspecs are implicit — a named
+    /// - a `--git-dir`/`--work-tree` flag, or a `GIT_DIR=`/`GIT_WORK_TREE=` env
+    ///   assignment, pointing git at a repository this walk would have to model
+    ///   git's setup rules to name correctly;
+    /// - a directory change this walk could not follow — a bare `cd`, `cd -`, a
+    ///   `$`-bearing target, `popd`, a bare `pushd`. Every later push in that
+    ///   scope is marked, because the tracked directory is now a guess.
+    ///
+    /// **Which refs** — a bare push may publish more than the current branch:
+    ///
+    /// - `push.default=matching`, or any configured `remote.<name>.push`
+    ///   refspec, read from the repository;
+    /// - the same two keys arriving on the command line via `-c` /
+    ///   `--config-env`, which the repository probe cannot see;
+    /// - any `GIT_CONFIG_*` env assignment, which can inject either key and
+    ///   which that probe reports "not configured" about.
+    ///
+    /// The ref causes apply only when the refspecs are implicit — a named
     /// refspec replaces that computation anyway.
     pub unresolved: bool,
 }
@@ -128,25 +138,28 @@ pub fn push_invocations(command: &str, cwd: &str) -> Vec<PushInvocation> {
 /// `enforce_worktree::collect_targets`: one `effective_dir` per script scope,
 /// children recursed on the directory in effect where they appear.
 ///
-/// `inherited_redirect` is the env half of that mirror, and it is the reason
+/// `inherited_unresolved` is the env half of that mirror, and it is the reason
 /// this parameter exists rather than a local: a `GIT_DIR=`/`GIT_WORK_TREE=`
 /// prefix on a WRAPPER segment is exported into the shell it spawns, so the
 /// push inside `GIT_WORK_TREE=/x sh -c 'git push origin main'` really does run
 /// redirected. Computing the flag on the wrapper and dropping it at the
 /// recursion boundary handed the caller a resolvable-looking `work_dir` with
 /// `unresolved: false` — the #228/#378 miss `collect_targets` threads
-/// `inherited_env` to close, reopened here until this parameter landed.
+/// `inherited_env` to close, reopened here until this parameter landed. It
+/// carries an unfollowable directory change for the same reason: a child starts
+/// in the parent's cwd, so a cwd the parent lost is lost for the child too.
 fn collect_push_invocations(
     script: &str,
     cwd: &str,
     depth: usize,
-    inherited_redirect: bool,
+    inherited_unresolved: bool,
     out: &mut Vec<PushInvocation>,
 ) {
     let mut effective_dir = cwd.to_string();
-    // A redirect set by an EARLIER segment of this same scope, which outlives
-    // the segment that set it — unlike a command prefix, which does not.
-    let mut scope_redirect = inherited_redirect;
+    // Set by an EARLIER segment of this scope, and outliving it: a persistent
+    // env redirect, or a directory change this walk could not follow. Either
+    // way every later push in the scope is one this walk cannot vouch for.
+    let mut scope_unresolved = inherited_unresolved;
 
     for (segment, _next_op) in split_segments_with_ops(script) {
         let segment = strip_group_wrappers(&segment);
@@ -161,27 +174,39 @@ fn collect_push_invocations(
         let prefix_redirect = prefix.iter().map(String::as_str).any(names_git_redirect);
 
         if segment_persists_git_redirect(argv, &tokens) {
-            scope_redirect = true;
+            scope_unresolved = true;
         }
-        let segment_redirect = scope_redirect || prefix_redirect;
+        let segment_unresolved = scope_unresolved || prefix_redirect;
 
         // Children run with the directory in effect HERE — a substitution is
         // evaluated before its own segment runs — and in their OWN scope, so
-        // their `cd`s die with the subshell. The env redirect is the opposite:
-        // it crosses into the child, so it is passed down.
+        // their `cd`s die with the subshell. What this walk cannot vouch for is
+        // the opposite: an env redirect crosses into the child, and a directory
+        // this walk has lost track of is lost for the child too.
         if depth < MAX_WRAPPER_DEPTH {
             for child in child_scripts(argv, segment) {
-                collect_push_invocations(&child, &effective_dir, depth + 1, segment_redirect, out);
+                collect_push_invocations(
+                    &child,
+                    &effective_dir,
+                    depth + 1,
+                    segment_unresolved,
+                    out,
+                );
             }
         }
 
-        if tokens.first().map(String::as_str) == Some("cd") {
-            effective_dir = apply_cd(&tokens, &effective_dir);
+        if is_directory_verb(&tokens) {
+            match resolve_directory_verb(&tokens, &effective_dir) {
+                Some(moved) => effective_dir = moved,
+                // The target could not be read. Keeping the pre-`cd` directory
+                // and saying nothing is the trap — see [`resolve_directory_verb`].
+                None => scope_unresolved = true,
+            }
             continue;
         }
 
         if let Some(mut invocation) = push_invocation_of(argv, &effective_dir) {
-            invocation.unresolved |= segment_redirect;
+            invocation.unresolved |= segment_unresolved;
             // Only an implicit refspec stands on the `push.default`
             // computation; a named one replaces it, so the config question does
             // not arise and no git call is made.
@@ -193,10 +218,38 @@ fn collect_push_invocations(
     }
 }
 
-/// Is this word a `GIT_DIR=`/`GIT_WORK_TREE=` assignment — the env spelling of
-/// the `--git-dir`/`--work-tree` redirect?
+/// Env-variable assignments that redirect a push somewhere this walk cannot
+/// follow — the environment spelling of the flags that set `unresolved`.
+///
+/// Two families. `GIT_DIR`/`GIT_WORK_TREE` point git at another repository, the
+/// env form of `--git-dir`/`--work-tree`. The `GIT_CONFIG_*` family injects
+/// arbitrary configuration, which reaches `push.default` and
+/// `remote.<name>.push` — and it is worse than the flag form for the probe in
+/// [`implicit_push_config_unresolvable`], because after `GIT_CONFIG_COUNT` runs,
+/// `git config --get push.default` (exactly what that probe reads) still answers
+/// the repository's value. The probe's own instrument reports "not configured"
+/// about a push git performs under the injected setting, so the only honest
+/// answer is to refuse.
+///
+/// `GIT_CONFIG_COUNT` is the switch that arms `GIT_CONFIG_KEY_n`/`_VALUE_n`, so
+/// matching it alone covers that spelling; the `KEY_`/`VALUE_` names are listed
+/// anyway, since an `export` of one without the count is still a redirect being
+/// staged and refusing costs only a false block.
+const GIT_REDIRECT_ENV_PREFIXES: &[&str] = &[
+    "GIT_DIR=",
+    "GIT_WORK_TREE=",
+    "GIT_CONFIG_COUNT=",
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+    "GIT_CONFIG_GLOBAL=",
+    "GIT_CONFIG_SYSTEM=",
+];
+
+/// Is this word an assignment from [`GIT_REDIRECT_ENV_PREFIXES`]?
 fn names_git_redirect(word: &str) -> bool {
-    word.starts_with("GIT_DIR=") || word.starts_with("GIT_WORK_TREE=")
+    GIT_REDIRECT_ENV_PREFIXES
+        .iter()
+        .any(|prefix| word.starts_with(prefix))
 }
 
 /// Does this segment set a git redirect that OUTLIVES it?
@@ -259,14 +312,48 @@ fn implicit_push_config_unresolvable(work_dir: &str) -> bool {
     push_default_matches_every_branch || remote_push_refspec_configured
 }
 
-/// Apply a `cd` segment to the tracked directory, or leave it alone when the
-/// target is one this resolver cannot read.
+/// Does this segment change the shell's working directory?
 ///
-/// Same refusal set as `enforce_worktree`'s `cd` arm, for the same reason: a
-/// bare `cd`, a `-` (`$OLDPWD`), or an unexpanded `$VAR` yields a path string
-/// that names no repository, and a directory that resolves to nothing fails
-/// open downstream. Keeping the pre-`cd` directory is the honest answer.
-fn apply_cd(tokens: &[String], effective_dir: &str) -> String {
+/// `pushd`/`popd` are here because leaving them out is not a *safe* omission:
+/// the walk keeps its old directory and reports it with full confidence, so an
+/// unmodelled directory verb produces a wrong answer rather than a refusal.
+/// `pushd` with a literal path moves exactly like `cd`; `popd` returns to a
+/// directory this walk never recorded.
+fn is_directory_verb(tokens: &[String]) -> bool {
+    matches!(
+        tokens.first().map(String::as_str),
+        Some("cd" | "pushd" | "popd")
+    )
+}
+
+/// Where a directory verb leaves the shell, or `None` when this walk cannot
+/// tell.
+///
+/// **`None` is a refusal, not a no-op, and that is the whole point.** The
+/// earlier form returned the pre-`cd` directory on an unreadable target and set
+/// nothing, on the reasoning that an unresolvable path fails open downstream.
+/// That reasoning was wrong in this module's direction: the pre-`cd` directory
+/// is not "nothing", it is the session's own checkout — a real repository that
+/// answers `rev-list` confidently for a push that ran somewhere else. Measured
+/// with `cd "$BUILD" && git push origin main`: the walk reported the session's
+/// repo, `unresolved: false`, and `Commits([])` — allow — while the push
+/// published a commit from another repository. The caller now gets
+/// `unresolved` and can refuse.
+///
+/// Note the asymmetry that made this the one bad arm: `git -C $D push` resolves
+/// to `<cwd>/$D`, a path that does not exist, so `rev-list` fails and the
+/// composed posture blocks. Only the `cd` arm degraded to a *plausible wrong
+/// answer*.
+///
+/// Unreadable targets: a bare `cd`, `-` (`$OLDPWD`), any target carrying an
+/// unexpanded `$` or a backtick, `popd`, and a `pushd` with no literal path.
+/// `$` is tested anywhere in the token, not just at the front — `cd "$HOME/x"`
+/// and `cd /a/$B` are equally unknowable, and over-refusing costs a caller a
+/// refusal it can explain rather than a wrong repository.
+fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<String> {
+    if tokens.first().map(String::as_str) == Some("popd") {
+        return None;
+    }
     let mut idx = 1;
     while tokens
         .get(idx)
@@ -275,10 +362,10 @@ fn apply_cd(tokens: &[String], effective_dir: &str) -> String {
         idx += 1;
     }
     match tokens.get(idx) {
-        Some(target) if target != "-" && !target.starts_with('$') => {
-            resolve_cd_target(target, effective_dir)
+        Some(target) if target != "-" && !target.contains('$') && !target.contains('`') => {
+            Some(resolve_cd_target(target, effective_dir))
         }
-        _ => effective_dir.to_string(),
+        _ => None,
     }
 }
 
@@ -299,9 +386,22 @@ const VALUE_GLOBALS: &[&str] = &[
     "--git-dir",
 ];
 
-/// Walk git's globals, returning the effective work dir after any `-C`
-/// redirect, whether a `--git-dir`/`--work-tree` redirect was seen, and the
-/// slice beginning at git's SUBCOMMAND.
+/// What a walk of git's global options found, plus the slice beginning at git's
+/// SUBCOMMAND.
+struct GitGlobals<'a> {
+    /// The effective work dir after any `-C` redirect.
+    work_dir: String,
+    /// `--git-dir`/`--work-tree` was seen — the push points at a repository
+    /// this walk cannot name correctly.
+    foreign_redirect: bool,
+    /// A `-c`/`--config-env` global carried a key that replaces the bare-push
+    /// ref computation (`push.default`, or a `remote.<name>.push` refspec).
+    push_config_override: bool,
+    /// The words from git's subcommand onward.
+    rest: &'a [String],
+}
+
+/// Walk git's globals.
 ///
 /// `argv` is the words AFTER the `git` verb.
 ///
@@ -313,9 +413,20 @@ const VALUE_GLOBALS: &[&str] = &[
 /// to name correctly, and naming it *wrongly* means scanning the wrong history —
 /// the miss this module exists to prevent. Reporting them as unresolved hands
 /// the caller a refusal it can explain.
-fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> (String, bool, &'a [String]) {
+///
+/// **`-c`/`--config-env` are reported by KEY, never interpreted.** The config
+/// that decides what a bare push publishes can arrive on the command line, and
+/// [`implicit_push_config_unresolvable`] cannot see it: that probe runs its own
+/// `git config` subprocess, which reads the repository and inherits the hook
+/// process's environment, not the command's. Measured — with
+/// `git -c push.default=matching push origin`, the probe answers `simple` about
+/// a push git performs under `matching`. Only the key is examined, and any
+/// value marks the invocation unresolved, because reading the value would mean
+/// re-implementing git's config parsing to decide a safety question.
+fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> GitGlobals<'a> {
     let mut redirect: Option<String> = None;
     let mut foreign_redirect = false;
+    let mut push_config_override = false;
     let mut idx = 0;
 
     while idx < argv.len() {
@@ -341,6 +452,13 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> (String, bool, &'
                     }
                 }
                 "--work-tree" | "--git-dir" => foreign_redirect = true,
+                "-c" | "--config-env"
+                    if argv
+                        .get(idx + 1)
+                        .is_some_and(|value| sets_push_ref_computation(value)) =>
+                {
+                    push_config_override = true;
+                }
                 _ => {}
             }
             idx += 2;
@@ -350,17 +468,42 @@ fn git_globals<'a>(argv: &'a [String], effective_dir: &str) -> (String, bool, &'
         if token.starts_with("--work-tree=") || token.starts_with("--git-dir=") {
             foreign_redirect = true;
         }
+        if let Some(setting) = token.strip_prefix("--config-env=")
+            && sets_push_ref_computation(setting)
+        {
+            push_config_override = true;
+        }
         idx += 1;
     }
     // A trailing value-taking global with no value (`git -C`) leaves `idx` past
     // the end; git errors on that command, and an empty slice reports no push.
     let idx = idx.min(argv.len());
 
-    (
-        redirect.unwrap_or_else(|| effective_dir.to_string()),
+    GitGlobals {
+        work_dir: redirect.unwrap_or_else(|| effective_dir.to_string()),
         foreign_redirect,
-        &argv[idx..],
-    )
+        push_config_override,
+        rest: &argv[idx..],
+    }
+}
+
+/// Does this `-c`/`--config-env` setting name a key that decides which refs a
+/// bare `git push` publishes?
+///
+/// `setting` is git's `key=value` (or `key=ENVVAR`) word; only the KEY matters.
+/// Two keys qualify, the same two [`implicit_push_config_unresolvable`] reads
+/// from the repository: `push.default`, and any `remote.<name>.push` refspec.
+///
+/// Section and variable names are case-insensitive to git, so the comparison is
+/// too. `remote.<name>.pushurl` deliberately does NOT match — it changes where
+/// the push goes, not which refs it carries.
+fn sets_push_ref_computation(setting: &str) -> bool {
+    let key = setting.split_once('=').map_or(setting, |(key, _)| key);
+    let key = key.to_ascii_lowercase();
+    key == "push.default"
+        || (key.starts_with("remote.")
+            && key.ends_with(".push")
+            && key.len() > "remote..push".len())
 }
 
 /// Read one segment's argv as a `git push`, or `None` when it is not one.
@@ -373,8 +516,8 @@ fn push_invocation_of(argv: &[String], effective_dir: &str) -> Option<PushInvoca
     if command_word(argv.first()?) != "git" {
         return None;
     }
-    let (work_dir, foreign_redirect, rest) = git_globals(&argv[1..], effective_dir);
-    let (subcommand, words) = rest.split_first()?;
+    let globals = git_globals(&argv[1..], effective_dir);
+    let (subcommand, words) = globals.rest.split_first()?;
     if subcommand != "push" {
         return None;
     }
@@ -385,10 +528,17 @@ fn push_invocation_of(argv: &[String], effective_dir: &str) -> Option<PushInvoca
         .iter()
         .map(|raw| parse_refspec(raw, scan.delete_flag))
         .collect();
-    if refspecs.is_empty() {
-        // A bare `git push` (or `git push origin`) publishes the current branch
-        // under every `push.default` mode this tool ships into. Named implicit
-        // so a caller can say so rather than quoting a refspec nobody typed.
+    let implicit = refspecs.is_empty();
+    if implicit {
+        // What a bare `git push` (or `git push origin`) publishes is decided by
+        // `push.default` and by any `remote.<name>.push` refspec, NOT by this
+        // module. `HEAD` is the answer under `simple`, `current` and `upstream`
+        // — the default and the modes anything ships with — and it is WRONG
+        // under `matching`, which publishes every same-named local branch.
+        // So `HEAD` is recorded as the assumption, flagged `implicit`, and the
+        // two settings that break it mark the invocation `unresolved`: the
+        // repository's, read by [`implicit_push_config_unresolvable`], and the
+        // command's own `-c`/`--config-env`, which that probe cannot see.
         refspecs.push(Refspec {
             raw: "HEAD".to_string(),
             source: Some("HEAD".to_string()),
@@ -399,12 +549,12 @@ fn push_invocation_of(argv: &[String], effective_dir: &str) -> Option<PushInvoca
     }
 
     Some(PushInvocation {
-        work_dir,
+        work_dir: globals.work_dir,
         refspecs,
         all_or_mirror: scan.all_or_mirror,
         tags: scan.tags,
         dry_run: scan.dry_run,
-        unresolved: foreign_redirect,
+        unresolved: globals.foreign_redirect || (implicit && globals.push_config_override),
     })
 }
 
@@ -878,6 +1028,90 @@ mod tests {
         let found = push_invocations("GIT_DIR=/x/.git git status; git push origin main", "/repo");
         assert_eq!(found.len(), 1);
         assert!(!found[0].unresolved);
+    }
+
+    #[test]
+    fn a_command_line_config_override_marks_an_implicit_refspec_unresolved() {
+        // The walk's own `git config` subprocess reads the REPOSITORY, so a
+        // setting the command supplies is structurally invisible to it.
+        assert!(only("git -c push.default=matching push origin", "/repo").unresolved);
+        assert!(only("git --config-env=push.default=V push origin", "/repo").unresolved);
+        assert!(only("git --config-env push.default=V push origin", "/repo").unresolved);
+        assert!(
+            only(
+                "git -c remote.origin.push=refs/heads/*:refs/heads/* push origin",
+                "/repo"
+            )
+            .unresolved
+        );
+    }
+
+    #[test]
+    fn an_unrelated_command_line_config_leaves_an_implicit_refspec_resolved() {
+        assert!(!only("git -c color.ui=never push origin", "/repo").unresolved);
+        // `remote.<name>.pushurl` changes the destination, not the ref set.
+        assert!(!only("git -c remote.origin.pushurl=/x push origin", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_command_line_config_override_does_not_mark_an_explicit_refspec() {
+        // A named refspec replaces the `push.default` computation outright, so
+        // the override cannot change what is published.
+        assert!(!only("git -c push.default=matching push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_git_config_env_prefix_marks_the_invocation_unresolved() {
+        assert!(
+            only(
+                "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=matching git push",
+                "/repo"
+            )
+            .unresolved
+        );
+        assert!(only("GIT_CONFIG_GLOBAL=/x git push origin main", "/repo").unresolved);
+        assert!(only("GIT_CONFIG_SYSTEM=/x git push origin main", "/repo").unresolved);
+        assert!(only("export GIT_CONFIG_COUNT=1 && git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn an_unresolvable_cd_target_marks_every_later_push_unresolved() {
+        // The pre-`cd` directory is not "nothing" — it is the session's own
+        // checkout, which answers rev-list confidently for a push that ran
+        // somewhere else.
+        for command in [
+            "cd \"$BUILD\" && git push origin main",
+            "cd \"$HOME/other\" && git push origin main",
+            "cd \"$(git rev-parse --show-toplevel)\" && git push origin main",
+            "cd -; git push origin main",
+            "cd; git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert!(invocation.unresolved, "should be unresolved: {command}");
+        }
+    }
+
+    #[test]
+    fn pushd_with_a_literal_path_moves_the_work_dir() {
+        let invocation = only("pushd /x && git push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/x");
+        assert!(!invocation.unresolved);
+    }
+
+    #[test]
+    fn popd_marks_every_later_push_unresolved() {
+        // `popd` returns to a directory this walk never recorded.
+        assert!(only("popd && git push origin main", "/repo").unresolved);
+        assert!(only("pushd && git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_resolvable_cd_still_leaves_a_later_push_resolved() {
+        // The control for the two tests above: a literal target must not start
+        // marking pushes unresolved.
+        let invocation = only("cd /other && git push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/other");
+        assert!(!invocation.unresolved);
     }
 
     #[test]
