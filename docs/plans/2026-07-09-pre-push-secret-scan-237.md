@@ -112,6 +112,18 @@ consolidation, not churn, and directionally aligned with #268.
    `core::shell::child_scripts`, so every sibling guard gains it at once — closing it in the
    push walk alone would make push detection the only gate that sees through `eval`, and
    that divergence is the shape these misses come from.
+   Two `eval` rows, kept apart: **`eval 'git push origin main'` is the MISS above** (#886, the
+   push is never seen); **`eval cd /other ; git push` was a WRONG ANSWER** (the push was seen
+   and reported against the session's own checkout with `unresolved: false`), and round 11
+   closed it by making an `eval` in command position refuse the directory. Closing the wrong
+   answer does not close the miss, and #886 stays open for the miss.
+   Still open after round 11, and none of them a wrong answer — each fails toward seeing less,
+   which a caller reads as a refusal only where an invocation is emitted at all: `sudo -u me rm …`
+   reaches no delete verb in `guard_rm` (inherited, unrelated to this branch — `-u`'s value
+   ends the runner peel; reported for its own issue, not fixed here); the heredoc, dashed
+   `git-push`, alias and `MAX_WRAPPER_DEPTH` rows above; and any prefix outside both
+   `TRANSPARENT` and `COMMAND_RUNNERS` other than `eval`, which the round-11 fallback does not
+   cover.
 
 2. **Range — from the refspec, not HEAD, correct ordering.** For each pushed source ref,
    outbound set = **`git rev-list <src-ref> --not --remotes`** — positive ref **before**
@@ -205,12 +217,16 @@ The headings are left as written — they are frozen contract text — so read t
 correction.
 
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
-  error-distinguishing `shell::git_output_detailed`, with 71 core unit tests
-  (69 in `push.rs`, 2 pinning `shell::unescape_word` directly).
-  Built on `feat/237-pre-push-secret-scan`, hardened over ten adversarial
-  review rounds. Round 10 closed the last escape-walk gaps: push options,
-  `command`/`builtin` flags, env-redirect operands after a runner, and the
-  shared `shell::skip_transparent_prefixes`, which every guard consumes.
+  error-distinguishing `shell::git_output_detailed`, with 77 core unit tests
+  (75 in `push.rs`, 2 pinning `shell::unescape_word` directly).
+  Built on `feat/237-pre-push-secret-scan`, hardened over eleven adversarial
+  review rounds. Round 11 closed the escape-walk gaps in `skip_runner_flags`,
+  `shell_c_argument_tokens`, `export`'s operands and `cd -`; added a refusal
+  for a segment the peel cannot get past (`command -p git push`, which needs no
+  escape at all); made `eval` refuse the directory; and moved
+  `enforce_worktree`'s drifted prefix predicate onto core's single definition.
+  The open rows are listed in the documented-misses paragraph above — read that,
+  not this line, for what is still unseen.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
 - [ ] **Task B** — mandatory adversarial security review of the guard.
 - [ ] **Task C** — plugin `hooks.json` companion (release-gated).

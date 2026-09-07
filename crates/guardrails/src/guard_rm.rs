@@ -2536,6 +2536,47 @@ mod tests {
     }
 
     #[test]
+    fn an_escaped_runner_flag_still_reaches_the_delete_verb() {
+        // The direction check on the `skip_transparent_prefixes` narrowing
+        // (cadence-hooks#237 security review, F17). The flag half of that
+        // predicate now reads the UNESCAPED next token, so a prefix followed by
+        // an escaped flag is no longer skipped as if unflagged.
+        //
+        // That sounds like a subtraction and is not. Before: `\-n` did not start
+        // with `-`, so `nice` was skipped, the peel broke on the flag, and
+        // `argv[0]` was the flag itself — matching no delete verb and no
+        // transparent prefix, so this guard saw NOTHING. After: `nice` survives
+        // the skip, `peel_command_runners` applies its real flag grammar, and
+        // the delete verb behind it is reached. Every row runs under bash, zsh
+        // and sh (measured).
+        // Each escaped row is paired with its unescaped control, and the control
+        // runs first: an escaped row failing where its control also fails would
+        // be inherited state, not this change. (`sudo -u me rm -rf …` is exactly
+        // that case — it reads `Allow` in BOTH spellings at this head, so it is
+        // deliberately not asserted here. Reported separately rather than fixed
+        // in place: it is a guard finding, and it predates this diff.)
+        for command in [
+            "nice -n 5 rm -rf ~/Documents",
+            "nice \\-n 5 rm -rf ~/Documents",
+            "env -i rm -rf ~/Documents",
+            "env \\-i rm -rf ~/Documents",
+        ] {
+            assert_ne!(
+                judge(command, "/home"),
+                Outcome::Allow,
+                "{command} must not be a silent allow"
+            );
+        }
+        // And where no runner grammar exists, the prefix survives into `argv[0]`
+        // so the transparent-prefix fallback can refuse instead of seeing
+        // nothing.
+        assert_ne!(
+            judge("exec \\-a x rm -rf ~/Documents", "/home"),
+            Outcome::Allow
+        );
+    }
+
+    #[test]
     fn a_doubled_backslash_delete_verb_is_not_a_false_block() {
         // `\\rm` is an ESCAPED backslash then `rm` — the word is a literal
         // `\rm`, a command name no shell finds (measured: `bash: \rm: command

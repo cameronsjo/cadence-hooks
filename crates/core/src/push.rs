@@ -33,8 +33,9 @@
 
 use crate::shell::{
     COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, child_scripts, command_word, executable_tokens,
-    git_output_detailed, is_assignment_word, is_redirect_token, peel_command_runners,
-    resolve_cd_target, split_segments_with_ops, strip_group_wrappers, unescape_word,
+    git_output_detailed, is_assignment_word, is_redirect_token, names_transparent_prefix,
+    peel_command_runners, resolve_cd_target, split_segments_with_ops, strip_group_wrappers,
+    unescape_word,
 };
 
 /// One refspec a `git push` names, with the local side a range resolver needs.
@@ -211,7 +212,13 @@ fn collect_push_invocations(
             }
             Some(DirectoryVerb::Unknowable) => {
                 scope_unresolved = true;
-                continue;
+                // Deliberately NOT a `continue`. `eval` is both a directory-verb
+                // refusal (F20) and a prefix a push can hide behind (F16), and
+                // `continue`ing here would drop `eval git push origin main`
+                // entirely — trading one silent allow for another. Falling
+                // through costs nothing on the other rows: a `cd`-shaped segment
+                // names no git verb, so both the push read and the fallback
+                // below decline it.
             }
             None => {}
         }
@@ -225,8 +232,60 @@ fn collect_push_invocations(
                 invocation.unresolved |= implicit_push_config_unresolvable(&invocation.work_dir);
             }
             out.push(invocation);
+        } else if hides_a_push_behind_a_prefix(argv, &tokens) {
+            out.push(PushInvocation {
+                work_dir: effective_dir.clone(),
+                refspecs: Vec::new(),
+                all_or_mirror: false,
+                tags: false,
+                dry_run: false,
+                unresolved: true,
+            });
         }
     }
+}
+
+/// Does this segment run a push through a prefix the peel could not get past?
+///
+/// **A segment the walk cannot peel was being DROPPED, and absence is the
+/// strongest allow shape there is.** [`crate::shell::skip_transparent_prefixes`]
+/// refuses to skip a prefix whose next token is a flag — deliberately, so a
+/// prefix's own option grammar is never parsed — and `command`, `exec`, `time`
+/// and `nohup` have no `COMMAND_RUNNERS` second path the way `env` and `nice` do.
+/// So `command -p git push origin main` and `exec -a x git push origin main`,
+/// ordinary spellings with no escape anywhere, ran under bash, zsh and sh
+/// (measured) while this module reported nothing at all.
+///
+/// This is `guard_rm`'s fallback (`guard_rm.rs`, cadence-hooks#426/#443) at the
+/// push position: when `argv` still leads with a prefix and the segment names a
+/// push anywhere in its token stream, emit an **unresolvable** push rather than
+/// nothing. An unresolvable push is a refusal a caller can explain; an absent one
+/// is a silent allow. Parsing each prefix's flag grammar instead would mean
+/// enumerating someone else's surface, which grows without telling us.
+///
+/// `builtin -p git push` is over-refused — it fails in all three shells, so
+/// nothing is published — and that is the safe side of this trade.
+fn hides_a_push_behind_a_prefix(argv: &[String], tokens: &[String]) -> bool {
+    let leads_with_a_prefix = argv.first().is_some_and(|first| {
+        let word = command_word(first);
+        // `eval` joins the prefix set for the same reason `guard_rm` admits it:
+        // it is in neither `TRANSPARENT` nor `COMMAND_RUNNERS`, so nothing else
+        // in this walk will ever get past it.
+        names_transparent_prefix(first) || word == "eval"
+    });
+    leads_with_a_prefix && names_a_push(tokens)
+}
+
+/// Does this token stream name `git` followed by `push`, at any position?
+///
+/// Deliberately coarse — it runs only after the structured read has already
+/// declined the segment, so its job is to decide between *refuse* and *say
+/// nothing*, never to describe the push. Both words are read the way the shell
+/// hands them over, since `\git pu\sh` really does push.
+fn names_a_push(tokens: &[String]) -> bool {
+    tokens
+        .windows(2)
+        .any(|pair| command_word(&pair[0]) == "git" && unescape_word(&pair[1]).as_ref() == "push")
 }
 
 /// Env-variable assignments that redirect a push somewhere this walk cannot
@@ -273,10 +332,19 @@ const GIT_REDIRECT_ENV_PREFIXES: &[&str] = &["GIT_DIR=", "GIT_WORK_TREE=", "GIT_
 /// spelling. Gated on a runner actually having been peeled, for the same
 /// reason.
 fn skip_runner_assignments<'a>(tokens: &'a [String], argv: &'a [String]) -> &'a [String] {
-    let peeled_a_runner = argv.len() < tokens.len()
-        && tokens
-            .first()
-            .is_some_and(|word| COMMAND_RUNNERS.contains(&command_word(word).as_ref()));
+    // **Keyed on the region the peel consumed, not on `tokens[0]`.** The runner
+    // is not always first: any transparent prefix in front of it turned the gate
+    // off while the peel still happened, so `exec env GIT_\DIR=/x git push` left
+    // `argv[0]` as the assignment word and the whole segment went unseen — for a
+    // command that publishes from `/x` (measured: `exec env GIT_\DIR=/nope git
+    // rev-parse --git-dir` reports `not a git repository: '/nope'` under bash,
+    // zsh and sh). Requiring SOME peeled word to be a runner keeps the
+    // bare-prefix refusal below intact (cadence-hooks#237 security review, F19).
+    let peeled = &tokens[..tokens.len().saturating_sub(argv.len())];
+    let peeled_a_runner = !peeled.is_empty()
+        && peeled
+            .iter()
+            .any(|word| COMMAND_RUNNERS.contains(&command_word(word).as_ref()));
     if !peeled_a_runner {
         return argv;
     }
@@ -319,11 +387,17 @@ fn segment_persists_git_redirect(argv: &[String], tokens: &[String]) -> bool {
             command_word(word).as_ref(),
             "export" | "declare" | "typeset"
         )
-    }) && argv
-        .iter()
-        .skip(1)
-        .map(String::as_str)
-        .any(names_git_redirect);
+    }) && argv.iter().skip(1).any(|word| {
+        // Both spellings, exactly as `prefix_redirect` does. `export`,
+        // `declare` and `typeset` are BUILTINS, so the shell unescapes their
+        // operands before they see them — measured, `export GIT_\DIR=/nope`
+        // then `git rev-parse --git-dir` answers `not a git repository:
+        // '/nope'` under bash, zsh and sh. Testing them raw left the redirect
+        // invisible, and this one is worse than the `env` prefix form because
+        // an `export` persists for EVERY later segment in the scope
+        // (cadence-hooks#237 security review, F18).
+        names_git_redirect(word) || names_git_redirect(unescape_word(word).as_ref())
+    });
 
     let assignment_only = !tokens.is_empty() && tokens.iter().all(|t| is_assignment_word(t));
 
@@ -505,6 +579,19 @@ fn directory_verb(tokens: &[String]) -> Option<DirectoryVerb<'_>> {
     let rest = tokens.get(start..)?;
     let candidate = rest.first()?;
 
+    // `eval` in command position refuses outright. It is peeled by nothing — in
+    // neither `TRANSPARENT` nor `COMMAND_RUNNERS` — so `eval cd /other` made
+    // `eval` the candidate, `names_directory_verb` said no, and this returned
+    // `None`, which the caller reads as "not a directory verb at all": it kept
+    // the STALE directory and the later push reported `unresolved: false`
+    // against the session's own checkout, while bash, zsh and sh had all moved
+    // (measured). Over-refuses `eval echo hi`, which is explainable; the
+    // structural fix is `child_scripts` learning `eval`, tracked as
+    // cameronsjo/cadence-hooks#886 (cadence-hooks#237 security review, F20).
+    if unescape_word(candidate).as_ref() == "eval" {
+        return Some(DirectoryVerb::Unknowable);
+    }
+
     if candidate.contains('\\') {
         // It could be a directory verb once the shell removes the escapes, and
         // the token cannot say whether it was quoted. Refuse if it might be
@@ -586,10 +673,17 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
     }
     let stack_verb = verb == "pushd";
     let mut idx = 1;
-    while tokens
-        .get(idx)
-        .is_some_and(|t| t == "--" || (t.starts_with('-') && t != "-"))
-    {
+    // The flag skip reads the UNESCAPED word. Compared raw, `cd \-` was not
+    // recognised as the bare `-` that means `$OLDPWD`; it fell through to
+    // `resolve_cd_target`, which JOINED it, and the walk answered `/repo/\-`
+    // for a shell sitting in `$OLDPWD`. It failed closed downstream — that path
+    // does not exist, so `git -C` fails and the range is `Unresolved` — but an
+    // invented directory is not an answer (cadence-hooks#237 security review,
+    // N23).
+    while tokens.get(idx).is_some_and(|t| {
+        let t = unescape_word(t);
+        t.as_ref() == "--" || (t.starts_with('-') && t.as_ref() != "-")
+    }) {
         if stack_verb {
             return None;
         }
@@ -603,11 +697,17 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
         return None;
     }
     match operands.first() {
+        // The `-`/`+N` tests read the UNESCAPED operand for N23's reason: `cd
+        // \-` is the shell's `$OLDPWD` spelling, and comparing it raw let it
+        // fall through to `resolve_cd_target`, which joined it into a directory
+        // that never existed. The TARGET itself is still resolved from the RAW
+        // operand — unescaping it would invent a path that may exist and answer
+        // `rev-list` confidently, where the raw spelling fails closed.
         Some(target)
-            if *target != "-"
+            if unescape_word(target).as_ref() != "-"
                 && !target.contains('$')
                 && !target.contains('`')
-                && !(stack_verb && target.starts_with('+')) =>
+                && !(stack_verb && unescape_word(target).starts_with('+')) =>
         {
             Some(resolve_cd_target(target, effective_dir))
         }
@@ -906,10 +1006,18 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
         }
 
         if !options_ended && let Some(rest) = word.strip_prefix("--") {
-            let (name, inline) = match rest.split_once('=') {
-                Some((n, v)) => (n, Some(v)),
-                None => (rest, None),
-            };
+            fn split_name(long: &str) -> (&str, Option<&str>) {
+                match long.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (long, None),
+                }
+            }
+            let (name, inline) = split_name(rest);
+            // The same derivation over the RAW word, computed HERE beside its
+            // unescaped twin rather than re-spelled at the `--dry-run` test
+            // below. Two spellings of one derivation drift, and one edit to the
+            // option grammar would change only one of them.
+            let raw_name = raw.strip_prefix("--").map(|long| split_name(long).0);
             // `--all`/`--mirror` matched by PREFIX, the way git's parse-options
             // resolves an unambiguous abbreviation. Over-matching here only
             // widens the range a caller scans, so an ambiguous prefix git would
@@ -931,7 +1039,7 @@ fn scan_push_words(words: &[String]) -> PushWordScan {
             // other test here fires more often once unescaped, which widens what
             // is scanned, while this one would license an allow. Under-matching
             // `--dry-\run` costs a false block on a harmless command.
-            if raw.strip_prefix("--").and_then(|r| r.split('=').next()) == Some("dry-run") {
+            if raw_name == Some("dry-run") {
                 scan.dry_run = true;
             }
             if name == "delete" {
@@ -1628,6 +1736,166 @@ mod tests {
         // no push is the RIGHT answer and must stay that way.
         assert!(push_invocations("GIT_\\DIR=/x git push origin main", "/repo").is_empty());
         assert!(push_invocations("GIT_CONFIG_\\COUNT=1 git push origin main", "/repo").is_empty());
+    }
+
+    #[test]
+    fn a_flagged_transparent_prefix_reports_an_unresolved_push() {
+        // No escape involved at all. `skip_transparent_prefixes` refuses to skip
+        // a prefix whose next token is a flag — deliberately, so a prefix's own
+        // option grammar is never parsed — and `command`/`exec`/`time`/`nohup`
+        // have no `COMMAND_RUNNERS` second path the way `env`/`nice` do. The
+        // segment therefore yielded NOTHING, which is the strongest allow shape
+        // there is. Every row below runs under bash, zsh and sh (measured).
+        for command in [
+            "command -p git push origin main",
+            "exec -a name git push origin main",
+            "exec -c git push origin main",
+            "exec -l git push origin main",
+            "nohup -- git push origin main",
+            "time -p git push origin main",
+            // Over-refused on purpose: `builtin -p git push` fails in all three
+            // shells, so nothing is published. An unresolvable push a caller can
+            // explain beats an absent one it cannot see.
+            "builtin -p git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert!(invocation.unresolved, "{command:?} must refuse, not vanish");
+            assert_eq!(invocation.work_dir, "/repo", "{command:?}");
+            assert!(invocation.refspecs.is_empty(), "{command:?}");
+        }
+        // `eval` joins the same fallback: it is in neither TRANSPARENT nor
+        // COMMAND_RUNNERS, so the whole segment was invisible.
+        assert!(only("eval git push origin main", "/repo").unresolved);
+        // Controls: `env`/`nice` are ALSO command runners, whose peel has a real
+        // flag grammar, so these resolve fully and must keep doing so.
+        for command in [
+            "env -i git push origin main",
+            "nice -n 5 git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert!(!invocation.unresolved, "{command:?}");
+            assert_eq!(
+                invocation
+                    .refspecs
+                    .iter()
+                    .filter_map(|r| r.source.clone())
+                    .collect::<Vec<_>>(),
+                ["main"],
+                "{command:?}"
+            );
+        }
+        // Control: a prefix with no push behind it stays absent, so the fallback
+        // cannot invent an invocation out of any transparent prefix at all.
+        assert!(push_invocations("command -p git status", "/repo").is_empty());
+        assert!(push_invocations("exec -a name ls", "/repo").is_empty());
+    }
+
+    #[test]
+    fn an_escaped_runner_flag_still_sees_the_push() {
+        // `skip_runner_flags` and `shell_c_argument_tokens` both compared raw
+        // tokens, so an escaped flag was read as the command word and the peel
+        // stopped there. Every row runs under bash, zsh and sh (measured); the
+        // `env \-i GIT_DIR=/x` row is F14's own scenario one backslash to the
+        // left, landing on the NO-PUSH-SEEN side F14 was raised to close.
+        assert_eq!(
+            sources("sh \\-c 'git push origin main'", "/repo"),
+            ["main"],
+            "an escaped -c must still surface the child script"
+        );
+        for command in [
+            "nice \\-n 5 git push origin main",
+            "sudo \\-u me git push origin main",
+            "xargs \\-I{} git push origin main",
+            "env \\-i git push origin main",
+        ] {
+            assert_eq!(sources(command, "/repo"), ["main"], "{command:?}");
+        }
+        // The redirect is still read through the escaped flag.
+        assert!(only("env \\-i GIT_DIR=/x git push origin main", "/repo").unresolved);
+        assert!(only("env \\-i GIT_\\DIR=/x git push origin main", "/repo").unresolved);
+        // Control: the unescaped spelling, unchanged.
+        assert_eq!(sources("sh -c 'git push origin main'", "/repo"), ["main"]);
+    }
+
+    #[test]
+    fn an_escaped_cd_dash_refuses_rather_than_inventing_a_directory() {
+        // `resolve_directory_verb` skipped flags on the raw token, so `\-` was
+        // not recognised as the bare `-` meaning $OLDPWD; it fell through to
+        // `resolve_cd_target`, which joined it into `/repo/\-`. It failed closed
+        // downstream, but an invented directory is not an answer.
+        assert!(only("cd \\- ; git push origin main", "/repo").unresolved);
+        // Control: the unescaped spelling already refused.
+        assert!(only("cd - ; git push origin main", "/repo").unresolved);
+    }
+
+    #[test]
+    fn an_escaped_exported_redirect_marks_the_whole_scope() {
+        // `export`/`declare`/`typeset` are builtins whose OPERANDS the shell
+        // unescapes before they see them — measured, `export GIT_\DIR=/nope`
+        // then `git rev-parse --git-dir` answers `not a git repository:
+        // '/nope'` under bash, zsh and sh. The `exported` arm tested them raw,
+        // so the redirect was invisible and every later push in the scope
+        // reported `unresolved: false` against the session's own checkout.
+        for command in [
+            "export GIT_DIR=/x ; git push origin main",
+            "export GIT_\\DIR=/x ; git push origin main",
+            "typeset GIT_\\DIR=/x ; git push origin main",
+            "declare -x GIT_\\DIR=/x ; git push origin main",
+            "declare -x GIT_DIR=/x ; git push origin main",
+        ] {
+            assert!(only(command, "/repo").unresolved, "{command:?}");
+        }
+        // Control, and it is why `assignment_only` stays RAW: a bare escaped
+        // assignment segment is honoured by no shell, so seeing no push is the
+        // right answer.
+        assert!(push_invocations("GIT_\\DIR=/x git push origin main", "/repo").is_empty());
+    }
+
+    #[test]
+    fn a_runner_behind_a_prefix_still_skips_its_assignments() {
+        // The gate read `tokens[0]`, but the runner is not always first: any
+        // transparent prefix in front of it turned the gate off while the peel
+        // still happened, leaving `argv[0]` as the assignment word itself.
+        // Measured: `exec env GIT_\DIR=/nope git rev-parse --git-dir` answers
+        // `not a git repository: '/nope'` under bash, zsh and sh.
+        for command in [
+            "exec env GIT_\\DIR=/x git push origin main",
+            "command env GIT_\\DIR=/x git push origin main",
+            "nohup env GIT_\\DIR=/x git push origin main",
+        ] {
+            assert!(only(command, "/repo").unresolved, "{command:?}");
+        }
+        // Controls: with no runner anywhere in the peeled region the bare-prefix
+        // refusal must survive — no shell honours an escaped assignment prefix.
+        assert!(push_invocations("GIT_\\DIR=/x git push origin main", "/repo").is_empty());
+        assert!(push_invocations("GIT_CONFIG_\\COUNT=1 git push origin main", "/repo").is_empty());
+    }
+
+    #[test]
+    fn an_eval_in_command_position_refuses_the_directory() {
+        // `eval cd /other` moves bash, zsh and sh (measured), and `eval` is
+        // peeled by nothing — so `directory_verb` answered `None`, meaning "not
+        // a directory verb at all", the caller kept the STALE directory, and the
+        // later push reported `/repo` with `unresolved: false`. That is the one
+        // combination this module exists to prevent.
+        let invocation = only("eval cd /other ; git push origin main", "/repo");
+        assert!(invocation.unresolved);
+        // Controls, all measured: these do NOT move the shell, so the walk is
+        // right to keep the directory and stay resolved.
+        for command in [
+            "exec cd /other ; git push origin main",
+            "env cd /other ; git push origin main",
+            "nice cd /other ; git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert_eq!(invocation.work_dir, "/repo", "{command:?}");
+            assert!(!invocation.unresolved, "{command:?}");
+        }
+        // `builtin builtin cd` DOES move, and still resolves.
+        assert_eq!(
+            only("builtin builtin cd /other ; git push origin main", "/repo").work_dir,
+            "/other"
+        );
     }
 
     #[test]

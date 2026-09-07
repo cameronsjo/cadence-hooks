@@ -774,48 +774,81 @@ fn strip_case_arm(tokens: &[String]) -> &[String] {
 /// adding a word to it.
 pub const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
 
+/// Does this word name a [`TRANSPARENT`] prefix, read the way the SHELL reads
+/// it — escapes removed, then case-folded?
+///
+/// `fold_verb` alone only lowercases, so every backslash spelling of a
+/// `TRANSPARENT` verb used to fail this: `\exec git push`, `\command git push`,
+/// `ti\me git push` and `\nohup git push` all run in bash, zsh and sh, and all
+/// four broke the peel, left the prefix as the command word, and went unseen by
+/// every gate downstream. `env` and `nice` escaped that only because they are
+/// ALSO in [`COMMAND_RUNNERS`], whose peel resolves through [`command_word`],
+/// which does unescape (cadence-hooks#237 security review, F13).
+pub fn names_transparent_prefix(word: &str) -> bool {
+    TRANSPARENT.contains(&fold_verb(unescape_word(word).as_ref()).as_ref())
+}
+
+/// Is `tokens[idx]` a leading word the real command runs *through* — a
+/// transparent prefix whose next token is not the prefix's own flag, or an
+/// assignment word?
+///
+/// **This is the single definition, and it is public because a second copy is
+/// what it exists to prevent.** Three walks cross this same leading region:
+/// [`skip_transparent_prefixes`], which skips it, and — in `enforce_worktree` —
+/// that module's own peel and its `git_env_overrides`, which reads
+/// `GIT_DIR=`/`GIT_WORK_TREE=` out of it first. `enforce_worktree` kept a local
+/// `is_prefix_word` asserting in its own doc comment that the predicate was
+/// shared; it was a copy, testing `TRANSPARENT.contains(&tok)` on the raw,
+/// unfolded token. Core's copy then learned to fold (cadence-hooks#488) and to
+/// unescape (cadence-hooks#237), and each widening moved the two apart in
+/// silence. The second was the costly one: `\exec GIT_DIR=/other git commit`
+/// went from *never inspected* to *inspected with the redirect invisible* — the
+/// leading-word gate reached the commit while the env walk stopped at index 0 —
+/// so the commit was judged against the session cwd, a false BLOCK from a
+/// primary checkout on a commit git performs elsewhere.
+///
+/// **Both halves read the unescaped word, and the flag half is the narrowing
+/// one.** `nice \-n 5 git push` is the row that forced it: the raw `\-n` does
+/// not start with `-`, so `nice` was skipped as if unflagged, the peel broke on
+/// the flag, and [`peel_command_runners`] never got to apply `nice`'s real flag
+/// grammar — the command went entirely unseen. Reading the flag unescaped stops
+/// the skip, which hands the segment to the runner peel that can parse it. Where
+/// no runner grammar exists (`command`, `exec`, `time`, `nohup`), the prefix now
+/// survives into `argv[0]`, which is what a caller's transparent-prefix fallback
+/// needs in order to refuse rather than see nothing.
+///
+/// Total over any index: an out-of-range `idx` is `false`, and a trailing prefix
+/// with nothing after it is not a prefix word — there is no command for it to
+/// run through. A panic in a guard is a hard block by another name, which
+/// ADR-0001's fail-open posture forbids.
+pub fn is_transparent_prefix_word(tokens: &[String], idx: usize) -> bool {
+    let Some(tok) = tokens.get(idx).map(String::as_str) else {
+        return false;
+    };
+    let runs_the_next_word = tokens
+        .get(idx + 1)
+        .is_some_and(|next| !unescape_word(next).starts_with('-'));
+    (names_transparent_prefix(tok) && runs_the_next_word) || is_assignment_word(tok)
+}
+
 /// Skip transparent command prefixes that run their argument as the command, so
 /// `command git commit` / `time git commit` still surface `git` as the leading
 /// word. Only skips a prefix when the following token is not an option, so a
-/// prefix's own flags are never misparsed (`nice -n 10 git commit` and
-/// `env -i git commit` stay documented misses rather than risking a wrong
-/// resolution). Leading `VAR=value` assignment words are skipped too — bash
-/// runs `VAR=value git commit` (and `env VAR=value git commit`) with the rest
-/// as the command, so an assignment word must not eat the leading-word gate
-/// (issue #228).
+/// prefix's own flags are never misparsed — `nice -n 10 git commit` and
+/// `env -i git commit` are resolved by [`peel_command_runners`]'s real flag
+/// grammar instead, and a prefix with no such grammar survives into `argv[0]`
+/// where a caller can refuse on it. Leading `VAR=value` assignment words are
+/// skipped too — bash runs `VAR=value git commit` (and
+/// `env VAR=value git commit`) with the rest as the command, so an assignment
+/// word must not eat the leading-word gate (issue #228).
+///
+/// The predicate is [`is_transparent_prefix_word`], shared with
+/// `enforce_worktree`'s env-override walk so the two cannot disagree about
+/// where this region ends.
 pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
     let mut start = 0;
-    while start + 1 < tokens.len() {
-        let tok = tokens[start].as_str();
-        // Membership is tested on the FOLDED word (cadence-hooks#488). `guard_rm`
-        // already folded before its own `TRANSPARENT` test, so a raw test here
-        // made the two disagree: `COMMAND rm -rf ~` kept `COMMAND` as the
-        // leading word and the delete verb behind it was never reached.
-        // Detector direction — skipping more prefixes only exposes more verbs
-        // to the gates downstream, so this can add blocks and never subtract.
-        // The flag refusal below is unchanged, so a prefix's own options are
-        // still never parsed.
-        // The membership test reads the word the SHELL runs — unescaped, then
-        // folded. `fold_verb` alone only lowercases, so every backslash
-        // spelling of a `TRANSPARENT` verb failed it: `\exec git push`,
-        // `\command git push`, `ti\me git push` and `\nohup git push` all run
-        // in bash, zsh and sh, and all four broke the loop, left the prefix as
-        // the command word, and went unseen by every gate downstream. `env` and
-        // `nice` escaped that only because they are ALSO in `COMMAND_RUNNERS`,
-        // whose peel resolves through `command_word`, which does unescape.
-        //
-        // The #488 direction argument above covers this verbatim: skipping more
-        // prefixes only exposes more verbs to the gates, so it can add blocks
-        // and never subtract. The flag refusal beside it is unchanged, so a
-        // prefix's own options are still never parsed.
-        if (TRANSPARENT.contains(&fold_verb(unescape_word(tok).as_ref()).as_ref())
-            && !tokens[start + 1].starts_with('-'))
-            || is_assignment_word(tok)
-        {
-            start += 1;
-        } else {
-            break;
-        }
+    while start + 1 < tokens.len() && is_transparent_prefix_word(tokens, start) {
+        start += 1;
     }
     &tokens[start..]
 }
@@ -3514,8 +3547,20 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
 
     let mut i = 0;
     let rest = loop {
-        let tok = argv.get(i)?;
-        // The first word that is not an option is the command being run.
+        // **Read the word the SHELL hands the runner, not the raw token.** The
+        // comparisons below all tested the raw spelling, so an escaped flag was
+        // read as the command word and the peel stopped dead there: `env \-i
+        // GIT_DIR=/x git push`, `nice \-n 5 git push`, `sudo \-u me git push`
+        // and `xargs \-I{} git push` all run under bash, zsh and sh (measured)
+        // and every one of them left `argv[0]` as the flag, so no verb gate ever
+        // saw the command behind it. Direction: unescaping only consumes MORE
+        // flag words, and the function already returns `None` — refusing to
+        // guess — on a grammar it cannot parse, so it can add blocks and never
+        // subtract (cadence-hooks#237 security review, F17).
+        let tok = unescape_word(argv.get(i)?);
+        let tok = tok.as_ref();
+        // The first word that is not an option is the command being run. The
+        // slice returned is of RAW tokens — only the comparison is unescaped.
         if !tok.starts_with('-') {
             break &argv[i..];
         }
@@ -3544,11 +3589,11 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
                 i += 1;
                 continue;
             }
-            if grammar.no_arg_long.contains(&tok.as_str()) {
+            if grammar.no_arg_long.contains(&tok) {
                 i += 1;
                 continue;
             }
-            if grammar.value_long.contains(&tok.as_str()) {
+            if grammar.value_long.contains(&tok) {
                 i += 2;
                 continue;
             }
@@ -3872,7 +3917,16 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
     ) {
         return None;
     }
-    for (i, tok) in tokens.iter().enumerate().skip(1) {
+    for (i, raw) in tokens.iter().enumerate().skip(1) {
+        // **The `-c` test reads the word the SHELL hands the wrapper.** Compared
+        // raw, `sh \-c 'git push origin main'` matched no `-c` spelling, fell to
+        // the non-flag arm below, and returned `None` — so the inline script was
+        // never surfaced as a child script to ANY guard, while the command runs
+        // under bash, zsh and sh (measured). Direction: unescaping only surfaces
+        // MORE child scripts, so it can add blocks and never subtract
+        // (cadence-hooks#237 security review, F17).
+        let tok = unescape_word(raw);
+        let tok = tok.as_ref();
         let carries_c =
             tok == "-c" || (tok.starts_with('-') && !tok.starts_with("--") && tok.contains('c'));
         if carries_c {
@@ -3882,7 +3936,10 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
             // single whitespace-bearing token — the shape `prevent-secret-leaks`
             // skips by design — so `bash -c -- 'cat .env'` reached no guard at
             // all while the plain spelling blocked (#496).
-            if tokens.get(i + 1).is_some_and(|t| t == "--") {
+            if tokens
+                .get(i + 1)
+                .is_some_and(|t| unescape_word(t).as_ref() == "--")
+            {
                 return tokens.get(i + 2).cloned();
             }
             return tokens.get(i + 1).cloned();
