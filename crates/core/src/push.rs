@@ -909,24 +909,38 @@ fn strip_unquoted_redirections<'a>(
 /// neither can move this count.
 ///
 /// Undercounting is the safe direction: it can only leave a brace looking like a
-/// word byte, which refuses. Overcounting would silently un-refuse a real one,
-/// and only a literal `${` in the same segment could cause it.
+/// word byte, which refuses. Overcounting silently un-refuses a real one, and a
+/// **quoted** `${` is exactly what caused it — `'${'` is a literal two-character
+/// string, not an opener, so
+/// `git push origin --push-option='${' secret}` and
+/// `X='${' cd /other} && git push origin main` disarmed the trailing-`}` refusal
+/// and reopened both wrong-answer faces with `unresolved: false`.
+///
+/// **The quote check is what closes that**: a candidate opener only counts when
+/// no `'` or `"` sits between it and the brace under test. Every legitimate
+/// spelling has none (`echo ${HOME}`, `mkdir -p ${OUT}`, `echo ${A} ${B}`,
+/// `export PATH=${PATH}:/x`); every disarming one has a quote in that span. The
+/// test is deliberately coarser than tracking quote state — it can only refuse
+/// an exemption, never grant one, so its error direction is the safe one
+/// (cadence-hooks#237 security review, I3).
 fn closes_parameter_expansion(prefix: &str) -> bool {
     let bytes = prefix.as_bytes();
-    let mut depth = 0usize;
+    let mut openers: Vec<usize> = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'{') {
-            depth += 1;
+            openers.push(index);
             index += 2;
             continue;
         }
         if bytes[index] == b'}' {
-            depth = depth.saturating_sub(1);
+            openers.pop();
         }
         index += 1;
     }
-    depth > 0
+    openers
+        .last()
+        .is_some_and(|opener| !prefix[*opener..].contains(['\'', '"']))
 }
 
 /// The leading `&`/digits/`>`-`<` run that makes a word a redirection.
@@ -2320,6 +2334,21 @@ mod tests {
         }
         // Refuses, and rightly: bash rejects `{ …}` outright, so nothing runs.
         assert!(only("( { git push origin main} )", "/repo").unresolved);
+        // **A quoted `${` is a literal, not an opener.** Without the quote check
+        // the expansion carve-out is a disarm: a single-quoted `'${'` anywhere
+        // earlier in the segment makes the trailing `}` look like an expansion's
+        // own, and both wrong-answer faces reopen with `unresolved: false`.
+        for command in [
+            "git push origin --push-option='${' secret}",
+            "X='${' git push origin secret}",
+            "X='${' cd /other} && git push origin main",
+            "git push origin --push-option=\"${\" secret}",
+        ] {
+            assert!(
+                only(command, "/repo").unresolved,
+                "{command:?} must refuse — the quoted `${{` opens nothing"
+            );
+        }
         // **An expansion as the LAST token still loses its brace, and the
         // carve-out above cannot reach it.** `executable_tokens` re-applies
         // `strip_group_wrappers` internally, so the trim happens a second time
