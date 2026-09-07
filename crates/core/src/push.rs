@@ -209,17 +209,35 @@ fn collect_push_invocations(
         // security review, F28/F29/F30).
         let trailing_trim_run =
             trimmed.len() - trimmed.trim_end_matches([')', '}', ';', ' ', '\t']).len();
-        let glued_brace = trimmed
+        //
+        // **A `}` that closes a `${` is a parameter expansion, not a word byte.**
+        // `${BRANCH}`, `${HOME}`, `${OUT}` — the recommended spelling — end a
+        // segment with a `}` glued to a letter, which is this predicate's exact
+        // shape. Without the carve-out `echo ${HOME}; git push origin main`
+        // refused every later push in the scope while `echo $HOME; …` resolved:
+        // one character apart, on the spelling CI scripts are written in. Such a
+        // brace does not flag, which is what stops the scope poisoning.
+        //
+        // It does **not** keep the brace byte, and that half was tried and
+        // removed rather than left in as a comment-deep promise:
+        // `executable_tokens` re-applies `strip_group_wrappers` internally, so
+        // the trim lands a second time below this walk and only a `core::shell`
+        // change would stop it. `git push origin ${BRANCH}` therefore records
+        // `${BRANCH` and refuses on `is_safe_ref` rejecting the `$` — a refusal
+        // either way, with a truncated refspec in the record. Named in the
+        // plan's open list (cadence-hooks#237 security review, F28/F29/F30, I1).
+        let tail_start = trimmed.len() - trailing_trim_run;
+        let unbalanced_closer = trimmed
             .char_indices()
-            .skip_while(|(index, _)| *index < trimmed.len() - trailing_trim_run)
+            .skip_while(|(index, _)| *index < tail_start)
             .any(|(index, c)| {
                 c == '}'
+                    && !closes_parameter_expansion(&trimmed[..index])
                     && trimmed[..index]
                         .chars()
                         .next_back()
                         .is_some_and(|before| !before.is_whitespace() && before != ';')
             });
-        let unbalanced_closer = glued_brace;
         // Marks ride alongside the tokens because quote removal has already
         // happened by the time anything downstream sees them, and a redirect
         // decision cannot be made without knowing what was quoted (F25).
@@ -881,6 +899,34 @@ fn strip_unquoted_redirections<'a>(
         idx += 1;
     }
     operands
+}
+
+/// Does a `}` appearing right after `prefix` close a `${` opened in it?
+///
+/// A single backward-counting scan: `${` opens, `}` closes, and a positive depth
+/// at the end of the prefix means the next brace is the expansion's own. `$(…)`
+/// and `((…))` are deliberately not tracked — neither is closed by `}`, so
+/// neither can move this count.
+///
+/// Undercounting is the safe direction: it can only leave a brace looking like a
+/// word byte, which refuses. Overcounting would silently un-refuse a real one,
+/// and only a literal `${` in the same segment could cause it.
+fn closes_parameter_expansion(prefix: &str) -> bool {
+    let bytes = prefix.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'{') {
+            depth += 1;
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'}' {
+            depth = depth.saturating_sub(1);
+        }
+        index += 1;
+    }
+    depth > 0
 }
 
 /// The leading `&`/digits/`>`-`<` run that makes a word a redirection.
@@ -2237,31 +2283,66 @@ mod tests {
         // **Controls the count broke.** `split_segments_with_ops` cuts on `&&`,
         // `;` and `|`, so a wrapper's opener and closer land in DIFFERENT
         // segments and a per-segment count sees an unmatched closer in ordinary,
-        // correct commands. Every row here must resolve.
+        // correct commands.
+        //
+        // **Asserted on RESOLVE, not on `is_empty()`.** The weaker form was green
+        // at the head that carried the defect: the count never suppressed these
+        // invocations, it set `unresolved` on them — so a presence check could
+        // not have gone red for the bug it was written to pin.
         for command in [
             "(cd /other && git push origin main)",
             "(cd /other; git push origin main)",
             "$(git push origin main)",
             "f() ( git push origin main )",
-            "( { git push origin main} )",
             "(git push origin main)",
             "{ git push origin main; }",
             "git push origin main;",
             "git push origin main",
+            // An unquoted `${VAR}` ends a segment with a `}` glued to a letter —
+            // the predicate's exact shape — so the scan has to step over a brace
+            // that closes a `${`. `echo $HOME` versus `echo ${HOME}` is the whole
+            // finding: one character, and every later push in the scope refused.
+            "echo ${HOME}; git push origin main",
+            "mkdir -p ${OUT}; git push origin main",
+            "echo $HOME; git push origin main",
+            "export PATH=${PATH}:/x && git push origin main",
+            "awk '{print $1}'; git push origin main",
+            "echo ${A} ${B}; git push origin main",
+            "echo ${DIR}/sub && git push origin main",
+            // NOT a row for this predicate: `cd ${DIR}/sub && git push` refuses,
+            // but for the older and correct reason that a `$` in a `cd` target
+            // is unknowable — nothing to do with a trailing brace.
         ] {
             assert!(
-                !push_invocations(command, "/repo").is_empty(),
-                "{command:?} must be seen"
+                !only(command, "/repo").unresolved,
+                "{command:?} must RESOLVE, not merely be seen"
             );
         }
+        // Refuses, and rightly: bash rejects `{ …}` outright, so nothing runs.
+        assert!(only("( { git push origin main} )", "/repo").unresolved);
+        // **An expansion as the LAST token still loses its brace, and the
+        // carve-out above cannot reach it.** `executable_tokens` re-applies
+        // `strip_group_wrappers` internally, so the trim happens a second time
+        // below this walk; keeping the byte needs a `core::shell` change this
+        // branch has deferred throughout. It refuses either way — the `$` fails
+        // `is_safe_ref`, so the range is `Unresolved` and a caller must refuse —
+        // but the refspec is recorded truncated, so the row is named in the
+        // plan's open list rather than claimed closed.
+        assert_eq!(sources("git push origin ${BRANCH}", "/repo"), ["${BRANCH"]);
+        assert!(!is_safe_ref("${BRANCH"));
+        // Quoting was always the shape that survived, and still is.
+        assert_eq!(
+            sources("git push origin \"${BRANCH}\"", "/repo"),
+            ["${BRANCH}"]
+        );
         assert_eq!(
             sources("(cd /other && git push origin main)", "/repo"),
             ["main"]
         );
-        assert!(!only("(cd /other && git push origin main)", "/repo").unresolved);
         assert_eq!(sources("(git push origin main)", "/repo"), ["main"]);
         assert_eq!(sources("{ git push origin main; }", "/repo"), ["main"]);
         assert_eq!(sources("git push origin main;", "/repo"), ["main"]);
+        assert_eq!(sources("git push origin main", "/repo"), ["main"]);
     }
 
     #[test]

@@ -121,9 +121,18 @@ consolidation, not churn, and directionally aligned with #268.
    top of a script — the form actually met in the wild, far more than `eval echo hi` — makes
    every later push in that script report `unresolved`, so a caller refuses them. The trade was
    taken knowingly; a refusal a reader can explain beats a stale directory reported as fact.
-   **Still open after round 15** — measured rows, not a description. Every one fails toward
-   seeing less or toward refusing; **none reports a wrong answer**, and that sentence was
-   re-checked against the trailing-brace rows this round rather than carried forward. Six rows
+   **Still open after round 16** — measured rows, not a description. Every one fails toward
+   seeing less or toward refusing, **with two named exceptions below**, and that claim was
+   re-checked against the trailing-brace rows this round rather than carried forward.
+   The exceptions: `git push origin main }` reports one refspec where bash passes two
+   (a standalone `}` is an ordinary argument — `bash -c 'set -x; : hi }'` renders `+ : hi '}'`
+   — but the walk reads a whitespace-preceded brace as a group closer and trims it), and
+   `git push origin ${BRANCH}` records the refspec `${BRANCH` with the brace trimmed. Both are
+   incomplete answers rather than confident wrong ones: the first needs a local ref literally
+   named `}` to publish anything, and the second refuses anyway because `is_safe_ref` rejects
+   the `$`. Neither is fixable without teaching `core::shell` that a trailing `}` can be a word
+   byte — `executable_tokens` re-applies `strip_group_wrappers` internally, so a decision made
+   in this walk is re-made below it — which is **cameronsjo/cadence-hooks#889**. Six rows
    that once did are closed: a quoted redirect-shaped refspec silently dropped and a redirect
    standing before the subcommand hiding the push (round 13); both faces of the trailing-`}`
    trim — a refspec and a work dir each reported as fact after `strip_group_wrappers` ate the
@@ -146,8 +155,9 @@ consolidation, not churn, and directionally aligned with #268.
    position — telling it from a real push needs the per-prefix flag grammar the fallback exists
    to avoid parsing), and a redirect glued straight onto an operand, `git push origin main>log`
    — the whitespace tokenizer sees one token, `is_safe_ref` rejects the `>`, and the caller
-   refuses a push the shell really performs. Both fail on the safe side and are accepted as
-   designed. Plus the heredoc, dashed
+   refuses a push the shell really performs. A third joins them: an assignment whose value ends
+   in a brace, `x=}; git push origin main`, is valid bash and refuses the whole scope. All three
+   fail on the safe side and are accepted as designed. Plus the heredoc, dashed
    `git-push`, alias and `MAX_WRAPPER_DEPTH` rows above, and `sudo rm -rf …` reaching no delete
    verb in `guard_rm` in every spelling including bare `sudo` — inherited,
    **cameronsjo/cadence-hooks#887**, not this branch's to fix.
@@ -266,6 +276,9 @@ correction.
   opener/closer count — the wrong grain, since segments split on `&&`/`;`/`|` —
   with the predicate that actually decides: a `}` glued to a non-space,
   non-`;` byte is a real word byte, and `)` is never a word byte at all.
+  Round 16 exempted a brace that closes a `${` — an unquoted `${VAR}` has the
+  predicate's exact shape, and without the carve-out one of them anywhere in a
+  command refused every push after it.
   The open rows are listed in the documented-misses paragraph above — read that,
   not this line, for what is still unseen.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
