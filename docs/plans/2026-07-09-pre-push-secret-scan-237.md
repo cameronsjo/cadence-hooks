@@ -199,7 +199,8 @@ The headings are left as written — they are frozen contract text — so read t
 correction.
 
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
-  error-distinguishing `shell::git_output_detailed`, with 62 core unit tests.
+  error-distinguishing `shell::git_output_detailed`, with 64 core unit tests
+  (62 in `push.rs`, 2 pinning `shell::unescape_word` directly).
   Built on `feat/237-pre-push-secret-scan`.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
 - [ ] **Task B** — mandatory adversarial security review of the guard.

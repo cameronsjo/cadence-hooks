@@ -4182,6 +4182,46 @@ mod tests {
     }
 
     #[test]
+    fn unescape_word_applies_the_shells_quote_removal() {
+        // Pins the escape WALK directly, rather than only through
+        // `command_word`. The two spellings that matter sit one backslash
+        // apart: `g\it` runs git (measured under bash, zsh and sh), while
+        // `\\git` is a literal `\git` no shell can find — so a strip and a walk
+        // agree on the first and disagree on the second, and only the walk is
+        // right.
+        for (word, want) in [
+            // No backslash: identity.
+            ("git", "git"),
+            ("cd", "cd"),
+            // The escape is dropped and the next character kept.
+            ("g\\it", "git"),
+            ("gi\\t", "git"),
+            ("\\cd", "cd"),
+            ("\\c\\d", "cd"),
+            // `\\` is an ESCAPED backslash — one survives, and the word is a
+            // command name the shell cannot resolve.
+            ("\\\\git", "\\git"),
+            ("\\\\ls", "\\ls"),
+            // A backslash before a non-letter escapes it just the same.
+            ("a\\-b", "a-b"),
+            ("a\\\\-b", "a\\-b"),
+            // A trailing lone backslash is a line continuation: dropped, with
+            // nothing after it to keep.
+            ("git\\", "git"),
+        ] {
+            assert_eq!(unescape_word(word), want, "unescape_word({word:?})");
+        }
+    }
+
+    #[test]
+    fn unescape_word_borrows_when_there_is_nothing_to_unescape() {
+        // The common case must not allocate.
+        assert!(matches!(unescape_word("git"), Cow::Borrowed(_)));
+        assert!(matches!(unescape_word(""), Cow::Borrowed(_)));
+        assert!(matches!(unescape_word("g\\it"), Cow::Owned(_)));
+    }
+
+    #[test]
     fn command_word_keeps_distinct_verbs_apart() {
         // `\\git` is NOT git: the shell removes exactly one backslash and looks
         // up `\git`, which is not a command. A repeating strip would collapse
