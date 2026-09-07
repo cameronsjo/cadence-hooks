@@ -1,7 +1,9 @@
 ---
 name: guard-design-decisions
 date: 2026-07-28
-status: partially-ruled
+status: planned
+updated: 2026-09-07
+next: Build #452 per section 1(c); then #282 per 2(c); #275's doctor-side verification slice first per 3(c)
 ---
 
 # Three guard design decisions before build (#452, #282, #275)
@@ -526,7 +528,7 @@ not appear again below.
 
 ---
 
-## Still open — 7 of the original 12
+## Rulings on the seven open questions
 
 Each phrased so a sentence answers it. One question (Q9) is new, opened by the
 ruling above; the rest carry over unresolved from the original plan.
@@ -536,21 +538,36 @@ ruling above; the rest carry over unresolved from the original plan.
 1. For `gh pr create`/`gh pr ready`, should an inline `GH_REPO=`/`GH_HOST=`
    prefix suppress the nudge while a `--repo`/`-R` flag keeps nudging?
    *(Recommend yes — Option 2.)*
+   Ruled 2026-08-09: no split — an inline GH_REPO=/GH_HOST= prefix keeps
+   nudging, same as --repo/-R. Declines the plan's Option 2: no observed
+   incident either way, over-nudging is visible and cheap, under-nudging
+   silently deflates the #409 adherence denominator. Revisit only on
+   nudge-ledger evidence.
 2. Should `--repo`/`-R` be resolved against the cwd's remote so only a genuine
    mismatch suppresses, or is that more machinery than a nudge-only guard
    deserves? *(Recommend defer.)*
+   Ruled 2026-09-07: defer. Leave as is; revisit if the nudge ledger shows
+   real noise from correct flags.
 3. `gh pr merge -R <the cwd's own repo>` is suppressed today even though the
    branch is correct — fix it in a separate issue, or leave it?
+   Ruled 2026-09-07: fix separately — filed as cameronsjo/cadence-hooks#881.
 4. `gh pr ready <n>` from an unrelated branch resolves the marker on the wrong
    branch: accept as a documented miss, or suppress numbered-ready only when it
    is also env-retargeted?
+   Ruled 2026-09-07: accept as a documented miss. The worktree and gambit
+   guidance already say to run gh pr ready from the branch's own worktree.
 
 **#282 — plugin-root guard**
 
 5. Scope the guard by marketplace manifest, repo identity, bare structure, or
    an opt-in env var? *(Recommend manifest, with a segment-test pre-filter.)*
+   Ruled 2026-08-09: by marketplace manifest, behind a cheap
+   directory-segment pre-filter. Rejected folder-shape matching, hardcoded
+   repo names, and opt-in.
 7. Is the plugin cache (`~/.claude/plugins/cache/`) in scope for this guard, a
    separate one, or out of scope?
+   Ruled 2026-08-09: out of scope for this guard; the cache question can
+   return on its own.
 
 **#275 — configure identity**
 
@@ -567,3 +584,5 @@ ruling above; the rest carry over unresolved from the original plan.
    of that subcommand doesn't reopen human-only; it centralizes the one
    owning implementation in the CLI and lets the CLI's existing refusal do
    the enforcement instead of duplicating it in skill prose.)*
+   Ruled: thin, not retire — per the cadence#360 owner ruling of 2026-07-27,
+   unchanged by the human-only decision.
