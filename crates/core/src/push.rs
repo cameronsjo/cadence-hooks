@@ -33,7 +33,7 @@
 
 use crate::shell::{
     COMMAND_RUNNERS, GitOutput, MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts, command_word,
-    executable_tokens, git_output_detailed, is_assignment_word, is_redirect_token,
+    executable_tokens_marked, git_output_detailed, is_assignment_word, is_redirect_token,
     peel_command_runners, resolve_cd_target, split_segments_with_ops, strip_group_wrappers,
     unescape_word,
 };
@@ -164,8 +164,13 @@ fn collect_push_invocations(
 
     for (segment, _next_op) in split_segments_with_ops(script) {
         let segment = strip_group_wrappers(&segment);
-        let tokens = executable_tokens(segment);
+        // Marks ride alongside the tokens because quote removal has already
+        // happened by the time anything downstream sees them, and a redirect
+        // decision cannot be made without knowing what was quoted (F25).
+        let (tokens, quoted) = executable_tokens_marked(segment);
         let argv = skip_runner_assignments(&tokens, peel_command_runners(&tokens));
+        // `argv` is a tail subslice of `tokens`, so its marks are the same tail.
+        let argv_quoted = &quoted[tokens.len().saturating_sub(argv.len())..];
 
         // The prefix words the peel removed. A `GIT_DIR=` assignment lives
         // there, and it redirects the push exactly as the flag does — checked
@@ -223,7 +228,7 @@ fn collect_push_invocations(
             None => {}
         }
 
-        if let Some(mut invocation) = push_invocation_of(argv, &effective_dir) {
+        if let Some(mut invocation) = push_invocation_of(argv, argv_quoted, &effective_dir) {
             invocation.unresolved |= segment_unresolved;
             // Only an implicit refspec stands on the `push.default`
             // computation; a named one replaces it, so the config question does
@@ -232,7 +237,7 @@ fn collect_push_invocations(
                 invocation.unresolved |= implicit_push_config_unresolvable(&invocation.work_dir);
             }
             out.push(invocation);
-        } else if hides_a_push_behind_a_prefix(argv, &tokens, &effective_dir) {
+        } else if hides_a_push_behind_a_prefix(argv, &tokens, &quoted, &effective_dir) {
             out.push(PushInvocation {
                 work_dir: effective_dir.clone(),
                 refspecs: Vec::new(),
@@ -265,7 +270,12 @@ fn collect_push_invocations(
 ///
 /// `builtin -p git push` is over-refused — it fails in all three shells, so
 /// nothing is published — and that is the safe side of this trade.
-fn hides_a_push_behind_a_prefix(argv: &[String], tokens: &[String], effective_dir: &str) -> bool {
+fn hides_a_push_behind_a_prefix(
+    argv: &[String],
+    tokens: &[String],
+    quoted: &[bool],
+    effective_dir: &str,
+) -> bool {
     let leads_with_a_prefix = argv.first().is_some_and(|first| {
         // **`command_word`, not `names_transparent_prefix` — the membership test
         // has to BASENAME here.** Every sibling asking this question already
@@ -288,7 +298,7 @@ fn hides_a_push_behind_a_prefix(argv: &[String], tokens: &[String], effective_di
         // in this walk will ever get past it.
         TRANSPARENT.contains(&word.as_ref()) || word == "eval"
     });
-    leads_with_a_prefix && names_a_push(tokens, effective_dir)
+    leads_with_a_prefix && names_a_push(tokens, quoted, effective_dir)
 }
 
 /// Does this token stream run `git push`, at any position?
@@ -315,10 +325,18 @@ fn hides_a_push_behind_a_prefix(argv: &[String], tokens: &[String], effective_di
 /// to avoid parsing. It is an over-refusal on a contrived command, pinned by a
 /// test so it cannot drift unnoticed (cadence-hooks#237 security review, F23;
 /// N26 stays open).
-fn names_a_push(tokens: &[String], effective_dir: &str) -> bool {
-    tokens.iter().enumerate().any(|(index, word)| {
+fn names_a_push(tokens: &[String], quoted: &[bool], effective_dir: &str) -> bool {
+    // Redirections come out FIRST, for the same reason `push_invocation_of`
+    // strips before its verb test: a redirect standing between `git` and its
+    // subcommand stopped the globals walk dead, so `command -p git >log push`
+    // reached neither the structured read nor this fallback (F26).
+    let stripped: Vec<String> = strip_unquoted_redirections(tokens, quoted)
+        .into_iter()
+        .cloned()
+        .collect();
+    stripped.iter().enumerate().any(|(index, word)| {
         command_word(word) == "git"
-            && tokens.get(index + 1..).is_some_and(|after_verb| {
+            && stripped.get(index + 1..).is_some_and(|after_verb| {
                 git_globals(after_verb, effective_dir)
                     .rest
                     .first()
@@ -760,11 +778,25 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
 /// `2>&1`) and as two when the operator stands alone (`> log`), so the standalone
 /// form consumes the word after it. [`is_redirect_token`] is core's own test for
 /// the operator, shared rather than re-spelled.
-fn strip_redirections(words: &[String]) -> Vec<&String> {
+/// [`strip_redirections`], but a token the shell QUOTED is never a redirection.
+///
+/// **Quote removal is what makes this necessary.** `tokenize` strips quotes, so
+/// `'>leak'` and `>leak` arrive byte-identical and a strip judging the text
+/// alone silently discards a legal refspec (`git check-ref-format
+/// refs/heads/'>b'` answers OK) as if it were a redirection — the fail-open
+/// direction this module exists to refuse. The marks come from
+/// [`crate::shell::executable_tokens_marked`], which carries the one fact quote
+/// removal destroys.
+///
+/// `quoted` is indexed in lockstep with `words`; a short mark slice reads as
+/// **quoted**, so a missing mark keeps its operand rather than dropping it
+/// (cadence-hooks#237 security review, F25).
+fn strip_unquoted_redirections<'a>(words: &'a [String], quoted: &[bool]) -> Vec<&'a String> {
     let mut operands = Vec::new();
     let mut idx = 0;
     while let Some(word) = words.get(idx) {
-        if is_redirect_token(word) {
+        let is_quoted = quoted.get(idx).copied().unwrap_or(true);
+        if !is_quoted && is_redirect_token(word) {
             // Standalone operator: the next word is its target, not an operand.
             let operator_only = word
                 .trim_start_matches('&')
@@ -778,6 +810,12 @@ fn strip_redirections(words: &[String]) -> Vec<&String> {
         idx += 1;
     }
     operands
+}
+
+fn strip_redirections(words: &[String]) -> Vec<&String> {
+    // One implementation, marks all clear. A second body here is exactly the
+    // drift this branch already paid for once at `is_prefix_word`.
+    strip_unquoted_redirections(words, &vec![false; words.len()])
 }
 
 /// git's global options that take a SEPARATE value word.
@@ -946,7 +984,34 @@ fn sets_push_ref_computation(setting: &str) -> bool {
 /// [`command_word`], so `/usr/bin/git push` and the alias-escaping `\git push`
 /// resolve as the pushes they are; `push` stays case-sensitive because git's
 /// subcommands are.
-fn push_invocation_of(argv: &[String], effective_dir: &str) -> Option<PushInvocation> {
+fn push_invocation_of(
+    argv: &[String],
+    argv_quoted: &[bool],
+    effective_dir: &str,
+) -> Option<PushInvocation> {
+    // **Redirections come out FIRST — before the verb, the globals and the
+    // subcommand are read.** A redirection is legal anywhere in a simple
+    // command, so all three of those reads could be handed a redirect token
+    // where they expect a word, and each failed by returning `None`:
+    // `git >log push origin main`, `git 2>/dev/null push origin main` and
+    // `>log git push origin main` all run under bash, zsh and sh (measured — a
+    // redirect between the command word and its arguments is transparent to
+    // git) and every one of them was NO PUSH SEEN. Stripping only at the operand
+    // scan, as the first cut did, left that whole surface untouched.
+    //
+    // Reading a redirect as a refspec was the other half, and this module's
+    // first FALSE-REFUSAL class: `git push origin main > /dev/null` collected
+    // `main`, `>` and `/dev/null`, `is_safe_ref` rejected `>`, and the range came
+    // back `Unresolved` for the spelling every script uses.
+    // `git push > log origin main` was worse — `>` was read as the REPOSITORY.
+    //
+    // The strip is quote-aware, and moving it earlier is exactly why it has to
+    // be: a wider surface would otherwise mean a wider misread of a quoted
+    // operand (cadence-hooks#237 security review, F24 and F26).
+    let argv: Vec<String> = strip_unquoted_redirections(argv, argv_quoted)
+        .into_iter()
+        .cloned()
+        .collect();
     if command_word(argv.first()?) != "git" {
         return None;
     }
@@ -960,22 +1025,8 @@ fn push_invocation_of(argv: &[String], effective_dir: &str) -> Option<PushInvoca
         return None;
     }
 
-    // **Redirections are not operands, and reading them as refspecs was this
-    // module's first FALSE-REFUSAL class.** `strip_redirections` already existed
-    // and was called at exactly one site, the directory-verb operand read, while
-    // `scan_push_words` was handed the words with the redirect tokens still in
-    // them. So `git push origin main > /dev/null` collected `main`, `>` and
-    // `/dev/null` as refspecs; `is_safe_ref` rejects `>`, the range comes back
-    // `Unresolved`, and a caller refuses a push that is entirely routine — the
-    // spelling scripts use. `git push > log origin main` was worse: `>` was read
-    // as the REPOSITORY, so `log` and `origin` both became refspecs.
-    //
-    // The direction was safe (every phantom is an extra scan or a refusal, never
-    // a lost refspec — a redirect only shifts positionals right), but this
-    // module's own doctrine puts a false block on the expensive side
-    // (cadence-hooks#237 security review, F24).
-    let operands: Vec<String> = strip_redirections(words).into_iter().cloned().collect();
-    let scan = scan_push_words(&operands);
+    // Already stripped, at the top of this function — see the note there.
+    let scan = scan_push_words(words);
     let mut refspecs: Vec<Refspec> = scan
         .refspecs
         .iter()
@@ -1916,6 +1967,96 @@ mod tests {
         // flag grammar F16 declined to parse. Kept as a pinned over-refusal
         // rather than silently drifting.
         assert!(only("command -p grep git push file", "/repo").unresolved);
+    }
+
+    #[test]
+    fn a_quoted_redirect_shaped_refspec_is_not_stripped() {
+        // The fail-open the redirect strip introduced. `tokenize` performs quote
+        // REMOVAL, so `'>leak'` and `>leak` arrive byte-identical, and a strip
+        // judging the text alone discards the ambiguous case silently — the one
+        // direction this module's doctrine forbids. `git check-ref-format
+        // refs/heads/'>b'` answers OK, so these are legal refs.
+        //
+        // Every row must refuse. `is_safe_ref` rejects the `>` either way, so a
+        // surviving token means `OutboundRange::Unresolved`, which a caller
+        // cannot read as empty.
+        for command in [
+            "git push origin '>leak'",
+            "git push origin '<leak'",
+            "git push origin '2>x'",
+            "git push origin '>' leak",
+            "git push origin '>leak' main",
+            "git push origin main '>leak'",
+            "git push --delete origin '>leak'",
+        ] {
+            let invocation = only(command, "/repo");
+            // Asserted on `raw`, not `source`: a `--delete` refspec has no
+            // source by construction, so a source-only assertion would have
+            // reported a kept operand as lost.
+            assert!(
+                invocation
+                    .refspecs
+                    .iter()
+                    .any(|refspec| refspec.raw.contains('>') || refspec.raw.contains('<')),
+                "{command:?} must keep the quoted operand, got {:?}",
+                invocation.refspecs
+            );
+        }
+        // The quoted operand in REPOSITORY position must not be read as a
+        // redirect either — the refspec that follows is the real one.
+        assert_eq!(sources("git push '>origin' main", "/repo"), ["main"]);
+        // Control: the backslash spelling already refused, and must keep doing so
+        // — the token keeps its backslash byte, so the strip never saw it.
+        assert!(
+            sources("git push origin \\>leak main", "/repo")
+                .iter()
+                .any(|s| s.contains('>'))
+        );
+        // Control: an ordinary UNQUOTED redirect is still stripped.
+        assert_eq!(
+            sources("git push origin main > /dev/null", "/repo"),
+            ["main"]
+        );
+        assert_eq!(
+            sources("git push origin main >/dev/null", "/repo"),
+            ["main"]
+        );
+        // Control: a `>` inside a ref, not leading it, was never redirect-shaped.
+        assert_eq!(
+            sources("git push origin refs/heads/a>b", "/repo"),
+            ["refs/heads/a>b"]
+        );
+    }
+
+    #[test]
+    fn a_redirection_before_the_subcommand_still_sees_the_push() {
+        // A redirection is legal anywhere in a simple command, and the strip ran
+        // AFTER the verb, globals and subcommand reads — so each of those was
+        // handed a redirect token where it expected a word and returned None.
+        // Every row runs under bash, zsh and sh (measured: a redirect between
+        // the command word and its arguments is transparent to git).
+        for command in [
+            "git >log push origin main",
+            "git 2>/dev/null push origin main",
+            "git >/dev/null push origin secret-branch",
+            ">log git push origin main",
+        ] {
+            assert!(
+                !push_invocations(command, "/repo").is_empty(),
+                "{command:?} must not vanish"
+            );
+        }
+        assert_eq!(sources("git >log push origin main", "/repo"), ["main"]);
+        assert_eq!(
+            sources("git 2>/dev/null push origin main", "/repo"),
+            ["main"]
+        );
+        assert!(only("git >log push --all", "/repo").all_or_mirror);
+        // The prefix-wrapped spellings reach the fallback, which strips too.
+        assert!(only("command -p git >log push origin main", "/repo").unresolved);
+        assert!(only("nohup -- git 2>/dev/null push origin main", "/repo").unresolved);
+        // Control: the trailing spelling, unchanged.
+        assert_eq!(sources("git push origin main >log", "/repo"), ["main"]);
     }
 
     #[test]

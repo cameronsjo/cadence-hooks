@@ -121,9 +121,12 @@ consolidation, not churn, and directionally aligned with #268.
    top of a script — the form actually met in the wild, far more than `eval echo hi` — makes
    every later push in that script report `unresolved`, so a caller refuses them. The trade was
    taken knowingly; a refusal a reader can explain beats a stale directory reported as fact.
-   **Still open after round 12** — measured rows, not a description. None is a wrong answer;
-   each fails toward seeing less, which a caller reads as a refusal only where an invocation is
-   emitted at all. `/usr/bin/nohup -- git push origin main` and every other path-spelled
+   **Still open after round 13** — measured rows, not a description. Every one fails toward
+   seeing less or toward refusing; none reports a *wrong* answer, and the two that once did are
+   closed (a quoted redirect-shaped refspec silently dropped, and a redirect standing before the
+   subcommand hiding the push entirely — both round 13). A row that fails toward seeing less is
+   a refusal to the caller only where an invocation is emitted at all; where nothing is emitted
+   it is a silent miss, which is what the rows below are. `/usr/bin/nohup -- git push origin main` and every other path-spelled
    `TRANSPARENT` prefix reach `skip_transparent_prefixes` and `enforce_worktree`'s env walk
    unbasenamed — round 12 fixed the push fallback locally, but the shared
    `shell::names_transparent_prefix` still does not basename, which also leaves
@@ -132,8 +135,13 @@ consolidation, not churn, and directionally aligned with #268.
    member, so the earlier "outside both tables" wording never reached it; runs under bash, zsh
    and sh). `find . -exec git push \;` is unseen — `find` is not a prefix at all, and `guard_rm`
    has a dedicated `find` branch for exactly this shape that the push walk has no equivalent of.
-   `coproc git push origin main` is unseen, bash-only. `command -p grep git push file`
-   **over-refuses** and is the one row in the other direction. Plus the heredoc, dashed
+   `coproc git push origin main` is unseen, bash-only. Two rows go the other way and
+   **over-refuse, deliberately**: `command -p grep git push file` (the phrase in argument
+   position — telling it from a real push needs the per-prefix flag grammar the fallback exists
+   to avoid parsing), and a redirect glued straight onto an operand, `git push origin main>log`
+   — the whitespace tokenizer sees one token, `is_safe_ref` rejects the `>`, and the caller
+   refuses a push the shell really performs. Both fail on the safe side and are accepted as
+   designed. Plus the heredoc, dashed
    `git-push`, alias and `MAX_WRAPPER_DEPTH` rows above, and `sudo rm -rf …` reaching no delete
    verb in `guard_rm` in every spelling including bare `sudo` — inherited, filed as its own
    issue, not this branch's to fix.
@@ -241,6 +249,10 @@ correction.
   Round 12 hardened that new fallback — it now basenames the prefix and reads
   git's globals instead of scanning adjacent word pairs — and fixed the branch's
   first false refusal, where a shell redirection was collected as a refspec.
+  Round 13 made the redirect strip quote-aware (a new `shell::tokenize_marked`
+  carries the one fact quote removal destroys) and moved it ahead of the verb,
+  globals and subcommand reads, so a redirect standing anywhere in a simple
+  command no longer hides the push.
   The open rows are listed in the documented-misses paragraph above — read that,
   not this line, for what is still unseen.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).

@@ -189,9 +189,44 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
 /// rest of the command, `-R evil/target` included. `$'…'` is therefore its own
 /// mode where a backslash consumes the character after it.
 pub fn tokenize(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
+    tokenize_marked(command)
+        .into_iter()
+        .map(|token| token.text)
+        .collect()
+}
+
+/// One token, plus whether any of it was quoted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkedToken {
+    /// The token exactly as [`tokenize`] produces it — quotes removed.
+    pub text: String,
+    /// Any character in this token came from inside `'…'`, `"…"`, `$'…'`, or an
+    /// escaped quote outside quoting.
+    ///
+    /// **This is the only thing quote removal destroys that a redirect decision
+    /// needs.** `is_redirect_token` judges a token's text, and `'>leak'` and
+    /// `>leak` arrive byte-identical — so a redirect strip reading text alone
+    /// discards a legal, quoted refspec as if it were a redirection
+    /// (`git check-ref-format refs/heads/'>b'` answers OK).
+    ///
+    /// Marking the WHOLE token rather than the redirect-shaped prefix is
+    /// deliberate and monotonically safe: a mark can only stop a strip, so it
+    /// can only leave more operands in view. `>'log'` — a real redirect whose
+    /// target is quoted — is therefore over-refused rather than resolved, which
+    /// is the direction this module trades toward.
+    pub quoted: bool,
+}
+
+/// [`tokenize`], additionally reporting which tokens carried quoting.
+///
+/// The single implementation; `tokenize` is a projection of it, so the two can
+/// never disagree about where a token ends (cadence-hooks#237 security review,
+/// F25).
+pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
+    let mut tokens: Vec<MarkedToken> = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
+    let mut token_quoted = false;
     let mut quote: Option<Quote> = None;
     let mut chars = command.chars().peekable();
 
@@ -239,6 +274,7 @@ pub fn tokenize(command: &str) -> Vec<String> {
                 '\\' if matches!(chars.peek(), Some('"' | '\'')) => {
                     current.push(chars.next().expect("peeked"));
                     in_token = true;
+                    token_quoted = true;
                 }
                 // `$'` opens ANSI-C quoting; the `$` is part of the syntax, not
                 // the word, so it is consumed like the quote itself. A `$`
@@ -247,19 +283,26 @@ pub fn tokenize(command: &str) -> Vec<String> {
                     chars.next();
                     quote = Some(Quote::AnsiC);
                     in_token = true;
+                    token_quoted = true;
                 }
                 '\'' => {
                     quote = Some(Quote::Single);
                     in_token = true;
+                    token_quoted = true;
                 }
                 '"' => {
                     quote = Some(Quote::Double);
                     in_token = true;
+                    token_quoted = true;
                 }
                 c if c.is_whitespace() => {
                     if in_token {
-                        tokens.push(std::mem::take(&mut current));
+                        tokens.push(MarkedToken {
+                            text: std::mem::take(&mut current),
+                            quoted: token_quoted,
+                        });
                         in_token = false;
+                        token_quoted = false;
                     }
                 }
                 _ => {
@@ -270,7 +313,10 @@ pub fn tokenize(command: &str) -> Vec<String> {
         }
     }
     if in_token {
-        tokens.push(current);
+        tokens.push(MarkedToken {
+            text: current,
+            quoted: token_quoted,
+        });
     }
     tokens
 }
@@ -665,6 +711,32 @@ pub fn executable_tokens(segment: &str) -> Vec<String> {
         }
         tokens = window.to_vec();
     }
+}
+
+/// [`executable_tokens`], plus a quoted flag per returned token.
+///
+/// **Additive by construction: the token strings come from `executable_tokens`
+/// itself**, unchanged, so no caller of that function or of the compound-head
+/// pipeline is touched. Only the flags are new.
+///
+/// The flags are aligned from the TAIL, which is sound because the pipeline
+/// only ever drops tokens from the FRONT (keywords, group openers, a function
+/// header, a `case` arm) or rewrites the head token's leading `(`/`{`. The last
+/// N marked tokens are therefore the N executable ones.
+///
+/// **Any misalignment fails closed.** If the two lists cannot be lined up, every
+/// flag reads `true` — "treat all of it as quoted" — which can only stop a
+/// redirect strip, leaving more operands in view rather than fewer. A wrong
+/// answer here would be a dropped operand, and that is the one outcome this is
+/// not allowed to produce.
+pub fn executable_tokens_marked(segment: &str) -> (Vec<String>, Vec<bool>) {
+    let tokens = executable_tokens(segment);
+    let marked = tokenize_marked(strip_group_wrappers(segment));
+    let quoted = match marked.len().checked_sub(tokens.len()) {
+        Some(offset) => marked[offset..].iter().map(|token| token.quoted).collect(),
+        None => vec![true; tokens.len()],
+    };
+    (tokens, quoted)
 }
 
 /// A group opener (or an empty parameter list) standing as its own token, left
@@ -4259,6 +4331,72 @@ mod tests {
             ("\\git.exe", "git"),
         ] {
             assert_eq!(command_word(token), want, "command_word({token:?})");
+        }
+    }
+
+    #[test]
+    fn tokenize_marked_reports_which_tokens_were_quoted() {
+        // The one fact quote removal destroys. `'>leak'` and `>leak` come out
+        // byte-identical, so nothing downstream can tell a redirection from an
+        // operand the shell quoted without this flag.
+        for (command, want_text, want_quoted) in [
+            ("git push origin '>leak'", ">leak", true),
+            ("git push origin \">leak\"", ">leak", true),
+            ("git push origin $'>leak'", ">leak", true),
+            ("git push origin >leak", ">leak", false),
+            ("git push origin main", "main", false),
+        ] {
+            let marked = tokenize_marked(command);
+            let last = marked.last().expect("a token");
+            assert_eq!(last.text, want_text, "{command:?}");
+            assert_eq!(last.quoted, want_quoted, "{command:?}");
+        }
+        // The mark does not leak across a token boundary.
+        let marked = tokenize_marked("'a' b");
+        assert!(marked[0].quoted);
+        assert!(!marked[1].quoted);
+    }
+
+    #[test]
+    fn tokenize_is_the_text_projection_of_tokenize_marked() {
+        // `tokenize` delegates, so the two can never disagree about where a
+        // token ends — the drift this branch already paid for once.
+        for command in [
+            "git push origin '>leak' main",
+            "sh -c 'git push origin main'",
+            "( cd /x && git push ) > log",
+            "f() { rm note.md; }",
+            "git commit -m \"a 'b' c\"",
+            "",
+        ] {
+            let projected: Vec<String> = tokenize_marked(command)
+                .into_iter()
+                .map(|token| token.text)
+                .collect();
+            assert_eq!(tokenize(command), projected, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn executable_tokens_marked_aligns_its_flags_with_its_tokens() {
+        // The flags are aligned from the TAIL because the compound-head pipeline
+        // only drops from the front. A misalignment would silently mark the
+        // wrong token, so the lengths and the values are both pinned.
+        for (segment, want_last_quoted) in [
+            ("git push origin '>leak'", true),
+            ("git push origin >leak", false),
+            ("{ git push origin '>leak'", true),
+            ("do git push origin '>leak'", true),
+            ("if true; then git push origin '>leak'", true),
+        ] {
+            let (tokens, quoted) = executable_tokens_marked(segment);
+            assert_eq!(tokens.len(), quoted.len(), "{segment:?}");
+            assert_eq!(
+                *quoted.last().expect("a flag"),
+                want_last_quoted,
+                "{segment:?} tokens={tokens:?}"
+            );
+            assert_eq!(tokens, executable_tokens(segment), "{segment:?}");
         }
     }
 
