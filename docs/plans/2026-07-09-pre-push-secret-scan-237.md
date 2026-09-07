@@ -121,19 +121,23 @@ consolidation, not churn, and directionally aligned with #268.
    top of a script — the form actually met in the wild, far more than `eval echo hi` — makes
    every later push in that script report `unresolved`, so a caller refuses them. The trade was
    taken knowingly; a refusal a reader can explain beats a stale directory reported as fact.
-   **Still open after round 14** — measured rows, not a description. Every one fails toward
-   seeing less or toward refusing; none reports a *wrong* answer. Four rows that once did are
-   closed: a quoted redirect-shaped refspec silently dropped and a redirect standing before the
-   subcommand hiding the push (round 13), and both faces of the unbalanced-closer trim — a
-   refspec and a work dir each reported as fact after `strip_group_wrappers` ate a trailing `}`
-   (round 14). A row that fails toward seeing less is a refusal to the caller only where an
+   **Still open after round 15** — measured rows, not a description. Every one fails toward
+   seeing less or toward refusing; **none reports a wrong answer**, and that sentence was
+   re-checked against the trailing-brace rows this round rather than carried forward. Six rows
+   that once did are closed: a quoted redirect-shaped refspec silently dropped and a redirect
+   standing before the subcommand hiding the push (round 13); both faces of the trailing-`}`
+   trim — a refspec and a work dir each reported as fact after `strip_group_wrappers` ate the
+   brace (round 14); and the two brace rows a matched opener used to pay for,
+   `{ git push origin secret}; }` and `{ cd /other}; git push origin main; }`, which round 15
+   closed by asking what the trim ate instead of counting closers. A row that fails toward seeing less is a refusal to the caller only where an
    invocation is emitted at all; where nothing is emitted it is a silent miss, which is what the
    rows below are. `/usr/bin/nohup -- git push origin main` and every other path-spelled
    `TRANSPARENT` prefix reach `skip_transparent_prefixes` and `enforce_worktree`'s env walk
    unbasenamed — round 12 fixed the push fallback locally, but the shared
    `shell::names_transparent_prefix` still does not basename, which also leaves
    `guard_sops_decrypt` allowing `/usr/bin/nohup -- sops -d secrets.yaml`; that primitive is
-   filed separately. `env -S "git push origin main"` is unseen (`env` **is** a `COMMAND_RUNNERS`
+   **cameronsjo/cadence-hooks#888**, and the trailing-`}` tokenizer fix is
+   **cameronsjo/cadence-hooks#889**. `env -S "git push origin main"` is unseen (`env` **is** a `COMMAND_RUNNERS`
    member, so the earlier "outside both tables" wording never reached it; runs under bash, zsh
    and sh). `find . -exec git push \;` is unseen — `find` is not a prefix at all, and `guard_rm`
    has a dedicated `find` branch for exactly this shape that the push walk has no equivalent of.
@@ -145,8 +149,8 @@ consolidation, not churn, and directionally aligned with #268.
    refuses a push the shell really performs. Both fail on the safe side and are accepted as
    designed. Plus the heredoc, dashed
    `git-push`, alias and `MAX_WRAPPER_DEPTH` rows above, and `sudo rm -rf …` reaching no delete
-   verb in `guard_rm` in every spelling including bare `sudo` — inherited, filed as its own
-   issue, not this branch's to fix.
+   verb in `guard_rm` in every spelling including bare `sudo` — inherited,
+   **cameronsjo/cadence-hooks#887**, not this branch's to fix.
 
 2. **Range — from the refspec, not HEAD, correct ordering.** For each pushed source ref,
    outbound set = **`git rev-list <src-ref> --not --remotes`** — positive ref **before**
@@ -240,8 +244,9 @@ The headings are left as written — they are frozen contract text — so read t
 correction.
 
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
-  error-distinguishing `shell::git_output_detailed`, with 77 core unit tests
-  (75 in `push.rs`, 2 pinning `shell::unescape_word` directly).
+  error-distinguishing `shell::git_output_detailed`, with 88 core unit tests
+  (83 in `push.rs`, 5 in `shell.rs` pinning `unescape_word` and the marked
+  tokenizer directly).
   Built on `feat/237-pre-push-secret-scan`, hardened over twelve adversarial
   review rounds. Round 11 closed the escape-walk gaps in `skip_runner_flags`,
   `shell_c_argument_tokens`, `export`'s operands and `cd -`; added a refusal
@@ -257,7 +262,10 @@ correction.
   command no longer hides the push. Round 14 corrected that mark from a
   whole-token flag to an offset — only the redirect OPERATOR decides, so
   `>"$LOG"` strips again — and made an unbalanced trailing `}`/`)` refuse
-  rather than report a trimmed word as fact.
+  rather than report a trimmed word as fact. Round 15 replaced that round's
+  opener/closer count — the wrong grain, since segments split on `&&`/`;`/`|` —
+  with the predicate that actually decides: a `}` glued to a non-space,
+  non-`;` byte is a real word byte, and `)` is never a word byte at all.
   The open rows are listed in the documented-misses paragraph above — read that,
   not this line, for what is still unseen.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).

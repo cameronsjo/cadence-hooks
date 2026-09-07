@@ -178,24 +178,48 @@ fn collect_push_invocations(
         // in `/other}`. The second is the F9 mechanism reached through a path
         // that marked nothing.
         //
-        // Counted rather than fixed in the shared primitive: that trim is
+        // **The question is what the trim ATE, not how many closers there
+        // were.** An opener/closer count was tried first and was the wrong
+        // grain twice over. `split_segments_with_ops` cuts on `&&`, `;` and
+        // `|`, so a wrapper's opener and closer land in different segments:
+        // `(cd /other && git push origin main)` and `$(git push origin main)`
+        // are ordinary, correct commands whose closing segment carries a closer
+        // and no opener, and the count refused every one of them. In the other
+        // direction a matched opener PAID for a closer that was a real word
+        // byte, so `{ git push origin secret}; }` kept its wrong answer.
+        //
+        // Two measured shell facts settle it without any bookkeeping:
+        //
+        // 1. `bash -c 'echo hi)'` is a syntax error. Outside a `case` label an
+        //    unquoted `)` is always an operator, so a segment-trailing `)` glued
+        //    to a word cannot occur in a command that runs — trimming `)` is
+        //    always safe, and `)` is never counted here.
+        // 2. `bash -c '{ echo hi }'` is a syntax error while
+        //    `bash -c '{ echo hi;}'` runs. A `}` closer is a reserved word, so
+        //    it must be preceded by `;` or a newline — and this walk splits on
+        //    both. Inside a segment, a trailing `}` glued to anything else is
+        //    never a group closer.
+        //
+        // So: a `}` in the trailing trim run whose preceding character is
+        // neither whitespace nor `;` is a real word byte the trim is about to
+        // eat. Fixed locally rather than in the shared primitive, which is
         // byte-identical to `origin/main` and shared with `guard_rm` and
-        // `enforce_worktree`, so teaching the tokenizer that a trailing `}` is a
-        // word character belongs behind its own issue. A balanced
-        // `(git push …)` or `{ git push …; }` is untouched, and a trailing `;`
-        // or whitespace trim is not a closer (cadence-hooks#237 security
-        // review, F28).
-        let openers = trimmed
-            .chars()
-            .take_while(|c| matches!(c, '(' | '{'))
-            .count();
-        let closers = trimmed
-            .chars()
-            .rev()
-            .take_while(|c| matches!(c, ')' | '}' | ';' | ' ' | '\t'))
-            .filter(|c| matches!(c, ')' | '}'))
-            .count();
-        let unbalanced_closer = closers > openers;
+        // `enforce_worktree` — teaching the tokenizer that a trailing `}` is a
+        // word character belongs behind its own issue (cadence-hooks#237
+        // security review, F28/F29/F30).
+        let trailing_trim_run =
+            trimmed.len() - trimmed.trim_end_matches([')', '}', ';', ' ', '\t']).len();
+        let glued_brace = trimmed
+            .char_indices()
+            .skip_while(|(index, _)| *index < trimmed.len() - trailing_trim_run)
+            .any(|(index, c)| {
+                c == '}'
+                    && trimmed[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|before| !before.is_whitespace() && before != ';')
+            });
+        let unbalanced_closer = glued_brace;
         // Marks ride alongside the tokens because quote removal has already
         // happened by the time anything downstream sees them, and a redirect
         // decision cannot be made without knowing what was quoted (F25).
@@ -870,8 +894,14 @@ struct RedirectOperator {
 /// Measure the redirect operator prefix, or `None` when the word is not
 /// redirect-shaped.
 ///
-/// Reads exactly what [`crate::shell::is_redirect_token`] reads, in the same
-/// order, so the two cannot disagree about what counts as a redirection.
+/// **It does not re-derive that predicate; it is gated on it.** The first line
+/// asks `is_redirect_token`, and the measurement below only runs once that has
+/// said yes — so a disagreement between the two trims is unreachable rather
+/// than merely unlikely. The trims are deliberately near-identical anyway
+/// (`&`, then digits, then the `>`/`<` run), but the gate is what makes the
+/// parity claim true, not the resemblance: `is_redirect_token` strips a single
+/// leading `&` where this strips every one, and only the gate keeps that from
+/// mattering.
 fn redirect_operator(word: &str) -> Option<RedirectOperator> {
     if !is_redirect_token(word) {
         return None;
@@ -2190,12 +2220,48 @@ mod tests {
                 "{command:?} must refuse, not answer"
             );
         }
-        // Controls: a BALANCED wrapper is the shape the trim exists for, and
-        // must keep resolving.
+        // A `}` glued to a word is the tell, wherever the opener landed. These
+        // four kept their wrong answer under an opener/closer COUNT, because a
+        // matched opener paid for a closer that was a real word byte.
+        for command in [
+            "{ git push origin secret}; }",
+            "{ cd /other}; git push origin main; }",
+            "( git push origin secret} )",
+            "(cd /other} && git push origin main)",
+        ] {
+            assert!(
+                only(command, "/repo").unresolved,
+                "{command:?} must refuse, not answer"
+            );
+        }
+        // **Controls the count broke.** `split_segments_with_ops` cuts on `&&`,
+        // `;` and `|`, so a wrapper's opener and closer land in DIFFERENT
+        // segments and a per-segment count sees an unmatched closer in ordinary,
+        // correct commands. Every row here must resolve.
+        for command in [
+            "(cd /other && git push origin main)",
+            "(cd /other; git push origin main)",
+            "$(git push origin main)",
+            "f() ( git push origin main )",
+            "( { git push origin main} )",
+            "(git push origin main)",
+            "{ git push origin main; }",
+            "git push origin main;",
+            "git push origin main",
+        ] {
+            assert!(
+                !push_invocations(command, "/repo").is_empty(),
+                "{command:?} must be seen"
+            );
+        }
+        assert_eq!(
+            sources("(cd /other && git push origin main)", "/repo"),
+            ["main"]
+        );
+        assert!(!only("(cd /other && git push origin main)", "/repo").unresolved);
         assert_eq!(sources("(git push origin main)", "/repo"), ["main"]);
         assert_eq!(sources("{ git push origin main; }", "/repo"), ["main"]);
         assert_eq!(sources("git push origin main;", "/repo"), ["main"]);
-        assert_eq!(sources("git push origin main", "/repo"), ["main"]);
     }
 
     #[test]
