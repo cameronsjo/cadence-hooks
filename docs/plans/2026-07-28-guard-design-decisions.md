@@ -28,8 +28,11 @@ next: "Build #452 per the Q1-Q4 rulings (no split, no remote resolution; merge o
 > three guards (nudge first, block is a separate later step — see Shared tier
 > policy below). Four of the original twelve open questions are resolved
 > outright by that ruling, one more is resolved by the shared tier policy, and
-> one new question opens in its place. **Seven questions remain genuinely
+> one new question opens in its place. **Seven questions remained genuinely
 > open** — see Still open at the end.
+>
+> **Rulings landed 2026-08-09 and 2026-09-07** on all seven; each carries a
+> `Ruled:` line under Still open, and none is open any more.
 
 ---
 
@@ -535,7 +538,7 @@ not appear again below.
 
 ---
 
-## Rulings on the seven open questions
+## Still open — 7 of the original 12, now all ruled
 
 Each phrased so a sentence answers it. One question (Q9) is new, opened by the
 ruling above; the rest carry over unresolved from the original plan.
