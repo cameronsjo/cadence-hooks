@@ -1,3 +1,12 @@
+---
+name: pre-push-secret-scan-237
+date: 2026-07-09
+status: in-flight
+updated: 2026-09-07
+branch: feat/237-pre-push-secret-scan
+next: "Task 0 built on this branch; Task A (the guard) follows as its own PR after Task 0 merges"
+---
+
 # Pre-push secret scan for the outbound push range — implementation plan
 
 > Draft plan PR. Per-issue references use `Refs cameronsjo/cadence-hooks#237` — this
@@ -130,10 +139,15 @@ wrongly assumed it). Fix: Task 0 adds an **error-distinguishing** core call; a g
 **with a push detected** must **nudge-loud or block**, never silently allow. Genuine "0
 commits to push" allows.
 
+**Drift since planning:** `git_command_detailed` DOES exist now
+(`crates/core/src/shell.rs`, added 2026-07-10), but it splits out only `TimedOut` — its
+`Failed` variant still conflates a subprocess or exit-code error with genuine empty stdout,
+so Task 0 still owes the split and ships it as `git_output_detailed` → `GitOutput`.
+
 ## Fail posture + override — **Decision Point (Cameron rules at Step-0)**
 
-**Recommend BLOCK (exit 2), ack-only override.** Panel converged: the
-#164/#151/#152/#155/#158 FP history was **trigger-scoping** FPs, not value-pattern FPs; the
+**Recommend BLOCK (exit 2), ack-only override.** Panel converged: the FP history in
+issues #164/#151/#152/#155/#158 was **trigger-scoping** FPs, not value-pattern FPs; the
 write-time sibling already blocks on the identical corpus and is trusted; a warn-only secret
 gate is a prose boundary that "loses to momentum." So Task B's adversarial energy goes at
 **trigger + range**, not the value patterns.
@@ -166,6 +180,15 @@ covers it.
 - **#267 (enforce-worktree subprocess nudge)** — independent; unrelated command taxonomy.
 
 Third independent plan in the Step-0 queue.
+
+## Progress
+
+- [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
+  error-distinguishing `shell::git_output_detailed`, with 30 core unit tests.
+  Built on `feat/237-pre-push-secret-scan`.
+- [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
+- [ ] **Task B** — mandatory adversarial security review of the guard.
+- [ ] **Task C** — plugin `hooks.json` companion (release-gated).
 
 ## Task breakdown (all Opus; strict order; each its own PR)
 
@@ -243,8 +266,8 @@ plugin's** `hooks.json` (beside the sibling secret guards). Binary-first/plugin-
 
 A 3-lens panel (plan-reviewer, red-team, cameron-review) ran against v1. What changed:
 
-- **CRITICAL** `rev-list --not --remotes HEAD` scans zero (negates HEAD) → corrected ordering
-  + non-empty first-push test. *(all 3 lenses + probe)*
+- **CRITICAL** `rev-list --not --remotes HEAD` scans zero (negates HEAD) → corrected
+  ordering plus a non-empty first-push test. *(all 3 lenses + probe)*
 - **CRITICAL** reuse of the hardened parser is impossible cross-crate (private to guardrails)
   → Task 0 builds it in `core::shell`; plan reframed as guard+primitive. *(plan-reviewer)*
 - **CRITICAL** range from HEAD misses non-HEAD refspecs (`branchB`, `local:remote`, `--all`)

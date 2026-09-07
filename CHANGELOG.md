@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **A push-detection primitive in `core` — `push::push_invocations`, `push::outbound_commits`, and the error-distinguishing `shell::git_output_detailed`** (cadence-hooks#237, Task 0). The precursor a push-time content guard stands on; no guard is wired yet, so nothing changes for a user of this release. `push_invocations` answers which pushes a command runs, from which directory, publishing which refs — the three things `shell::git_push_segments` does not: it walks **non-flat** (a `$(cd /x)` cannot re-point the parent's push, the miss `enforce_worktree`'s walk was built to reject), it captures a **`-C` redirect** into the work dir, and it collects **per-refspec** sources so `git push origin :dead newbranch` still reports `newbranch`.
+  - **`outbound_commits` writes `git rev-list <ref> --not --remotes`, positive ref FIRST.** The reversed spelling puts the ref on the negated side too, so the set is always empty and every push is allowed — a guard built on it could not have gone red. A fixture test pins the first-push case (no `refs/remotes/*` at all, so the range is the whole history) as NON-EMPTY.
+  - **The ref reaching git's argv is charset-allowlisted, not denylisted.** It comes off a command line this tool did not write, and a leading `-` makes it an option: `git rev-list --output=/tmp/x …` writes a file. Only `[A-Za-z0-9._/-]` passes, with git-check-ref-format's shape rules; everything else — unknown spellings included — reads as unresolved, which blocks.
+  - **`GitOutput::Ok("")` is the point of the new call.** `GitQuery` folds "git exited 0 with nothing to say" into `Failed`, so a caller cannot tell a successful empty answer from a failed query — and for "which commits would this push publish?" that conflation is a silent allow. `GitOutput` also splits git *answering badly* (block-worthy) from git *never answering* (ADR-0001 fail-open). `git_command_detailed` and `git_command` are now thin readings of the one spawn path, with behavior unchanged.
+  - **Ambiguity resolves toward seeing more, with one deliberate exception.** An unclassifiable option leaves its value visible as a candidate refspec, an abbreviated `--all` still widens the range, and a `--git-dir`/`--work-tree` redirect (flag or env prefix) marks the invocation unresolved so a caller refuses rather than scanning a subset. `--dry-run` is matched EXACTLY, because it is the only flag whose detection licenses an allow: `-ono` is `-o` carrying the value `no`, and reading that `n` as a dry run would let a real push through unscanned.
+
 ## [0.97.0] - 2026-09-06
 
 ### Fixed

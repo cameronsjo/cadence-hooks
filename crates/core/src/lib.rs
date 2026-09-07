@@ -20,6 +20,7 @@ pub mod markers;
 pub mod patch;
 pub mod pathclass;
 pub mod paths;
+pub mod push;
 pub mod shell;
 pub mod time;
 pub mod transcript;

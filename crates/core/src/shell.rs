@@ -1360,22 +1360,64 @@ pub fn run_git_bounded(cmd: &mut Command) -> GitSpawn {
     run_bounded_with(cmd, timeout)
 }
 
-/// Run a git command in a specific working directory, with the tri-state
-/// outcome fail-closed guard arms need.
-pub fn git_command_detailed(work_dir: &str, args: &[&str]) -> GitQuery {
+/// Outcome of [`git_output_detailed`] — the four states that are genuinely
+/// different to a caller, kept apart.
+///
+/// **`Ok("")` is the one this exists for.** [`GitQuery`] folds "git exited 0
+/// with nothing to say" into [`GitQuery::Failed`], so a caller cannot tell a
+/// *successful empty answer* from a *failed query*. For a question whose empty
+/// answer is meaningful — "which commits would this push publish?" — that
+/// conflation is a silent allow: a git error and "nothing to push" arrive
+/// identically, and the natural reading of the pair (empty means fine) lets the
+/// error through. A guard that sees less of what it protects has already lost.
+///
+/// The other split is the ADR-0001 one [`GitSpawn`] already draws and
+/// [`GitQuery`] half-keeps: git *answering badly* ([`GitOutput::Failed`]) is a
+/// resolution failure a fail-closed arm should still block on, while git never
+/// answering at all ([`GitOutput::Unavailable`], [`GitOutput::TimedOut`]) is the
+/// guard's own infrastructure failing and must not manufacture a block.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GitOutput {
+    /// git exited 0. The trimmed stdout MAY be empty — that is a real answer.
+    Ok(String),
+    /// git ran and exited non-zero.
+    Failed,
+    /// git could not be spawned (no `git` on PATH, or the spawn errored).
+    Unavailable,
+    /// The deadline expired before git answered.
+    TimedOut,
+}
+
+/// Run a git command in a specific working directory, distinguishing a
+/// successful EMPTY answer from a failure.
+///
+/// The single spawn path — [`git_command_detailed`] and [`git_command`] are
+/// thin readings of this one, so the three cannot drift about what a git error
+/// looks like.
+pub fn git_output_detailed(work_dir: &str, args: &[&str]) -> GitOutput {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(work_dir).args(args);
     match run_git_bounded(&mut cmd) {
         GitSpawn::Completed(output) if output.status.success() => {
-            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if value.is_empty() {
-                GitQuery::Failed
-            } else {
-                GitQuery::Value(value)
-            }
+            GitOutput::Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
-        GitSpawn::Completed(_) | GitSpawn::SpawnFailed => GitQuery::Failed,
-        GitSpawn::TimedOut => GitQuery::TimedOut,
+        GitSpawn::Completed(_) => GitOutput::Failed,
+        GitSpawn::SpawnFailed => GitOutput::Unavailable,
+        GitSpawn::TimedOut => GitOutput::TimedOut,
+    }
+}
+
+/// Run a git command in a specific working directory, with the tri-state
+/// outcome fail-closed guard arms need.
+///
+/// Empty stdout reads as [`GitQuery::Failed`] here — unchanged, long-standing
+/// behavior every current caller is written against. A caller for whom an empty
+/// answer is meaningful wants [`git_output_detailed`] instead.
+pub fn git_command_detailed(work_dir: &str, args: &[&str]) -> GitQuery {
+    match git_output_detailed(work_dir, args) {
+        GitOutput::Ok(value) if !value.is_empty() => GitQuery::Value(value),
+        GitOutput::Ok(_) | GitOutput::Failed | GitOutput::Unavailable => GitQuery::Failed,
+        GitOutput::TimedOut => GitQuery::TimedOut,
     }
 }
 
@@ -3508,7 +3550,7 @@ const PUSH_SEPARATE_VALUE_LONG_OPTS: &[&str] = &[
 /// No `git push` BOOLEAN shares a prefix with any of these five, so this cannot
 /// swallow the real target of an ordinary push: `--force`, `--follow-tags`,
 /// `--signed` and `--force-with-lease` all fail the test.
-fn long_option_takes_separate_value(name: &str) -> bool {
+pub(crate) fn long_option_takes_separate_value(name: &str) -> bool {
     !name.is_empty()
         && PUSH_SEPARATE_VALUE_LONG_OPTS
             .iter()
@@ -3633,6 +3675,16 @@ pub fn push_repository_argument(words: &[String]) -> PushDestinations {
 
     found
 }
+
+/// The push-detection primitive lives in [`crate::push`], not here, because it
+/// is a WALK over this module's building blocks rather than another building
+/// block. Re-exported so a caller reaching for push handling at the obvious
+/// address finds it, and so [`git_push_segments`] sits beside the richer answer.
+///
+/// Reach for [`push_invocations`] over [`git_push_segments`] whenever the
+/// question is *what does this push publish* rather than *where does it point*:
+/// the segment helper tracks no working directory and collects no refspecs.
+pub use crate::push::{OutboundRange, PushInvocation, Refspec, outbound_commits, push_invocations};
 
 /// Every `git push` the command runs, as the words that FOLLOW the `push`
 /// subcommand — one entry per push, in command order.
