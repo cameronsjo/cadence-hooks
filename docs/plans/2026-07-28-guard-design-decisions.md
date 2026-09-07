@@ -3,7 +3,7 @@ name: guard-design-decisions
 date: 2026-07-28
 status: planned
 updated: 2026-09-07
-next: Build #452 per section 1(c); then #282 per 2(c); #275's doctor-side verification slice first per 3(c)
+next: "Build #452 per the Q1-Q4 rulings (no split, no remote resolution; merge over-suppression is #881; numbered ready is a documented miss); then #282 per 2(c) and the Q5/Q7 rulings; #275 doctor-side verification slice first per 3(c)"
 ---
 
 # Three guard design decisions before build (#452, #282, #275)
@@ -216,6 +216,13 @@ carries a positional *and* is env-retargeted. Catches
 Composable with Option 2.
 
 ### (c) Recommendation
+
+> **Superseded 2026-08-09 by the Q1 ruling** (see "Rulings on the seven open
+> questions"): no split — the env-prefix form keeps nudging, same as the flag
+> form, so Option 2 is declined. What survives of this section for the build:
+> the `merge` over-suppression is its own issue (now cameronsjo/cadence-hooks#881),
+> and Q4 rules the numbered-`ready` case a documented miss. The original
+> recommendation is kept below for the record.
 
 **Option 2 now; Option 3 only if the ledger justifies it.** (Consistent with
 the shared tier policy above: this guard is nudge-only by construction, so no
