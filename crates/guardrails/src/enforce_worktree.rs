@@ -165,9 +165,9 @@ use crate::messages::WORKTREE_CREATE_RECIPE;
 use cadence_hooks_core::display::{MAX_PATH_DISPLAY, sanitize_field};
 use cadence_hooks_core::gitstate::GitState;
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, command_word, looks_absolute,
-    redirect_targets, resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops,
-    tokenize,
+    MAX_WRAPPER_DEPTH, basename, child_scripts, command_word, is_transparent_prefix_word,
+    looks_absolute, redirect_targets, resolve_cd_target, skip_transparent_prefixes,
+    split_segments_with_ops, tokenize,
 };
 // Carve-out predicates and `git_dir_for_input` come straight from
 // `core::worktree` — no longer borrowed from `warn_main_branch` (cadence-hooks#164).
@@ -413,17 +413,25 @@ enum MutationTarget {
 /// them disagree about where the region ends, and a walk that stopped early
 /// would silently miss an override — so they share one definition.
 ///
+/// **The membership half now really is one definition.** It was a local
+/// `TRANSPARENT.contains(&tok)` on the raw, unfolded token while core's copy
+/// learned to fold (#488) and then to unescape (#237) — so the claim above was
+/// false in exactly the way it warns about, twice. `\exec GIT_DIR=/other git
+/// commit` moved from *never inspected* to *inspected with the redirect
+/// invisible*: the leading-word gate reached the commit while this walk stopped
+/// at index 0 and returned `(None, None)`, judging the commit against the
+/// session cwd. From a primary checkout that is a false BLOCK on a commit git
+/// performs elsewhere. Both sides call
+/// [`cadence_hooks_core::shell::names_transparent_prefix`] now, and a test pins
+/// that the two walks stop at the same index.
+///
 /// Total over any index: an out-of-range `idx` is `false`, and a trailing prefix
 /// with nothing after it is not a prefix word (there is no command for it to run
 /// through). Both callers already bound `idx + 1`, so this is belt-and-braces —
 /// but a panic in a guard is a hard block by another name, which ADR-0001's
 /// fail-open posture forbids.
 fn is_prefix_word(tokens: &[String], idx: usize) -> bool {
-    let Some(tok) = tokens.get(idx).map(String::as_str) else {
-        return false;
-    };
-    let runs_the_next_word = tokens.get(idx + 1).is_some_and(|n| !n.starts_with('-'));
-    (TRANSPARENT.contains(&tok) && runs_the_next_word) || is_assignment_word(tok)
+    is_transparent_prefix_word(tokens, idx)
 }
 
 /// Read `GIT_WORK_TREE=`/`GIT_DIR=` out of the leading assignment words that
@@ -605,19 +613,12 @@ fn is_linked_worktree_admin_dir(path: &str) -> bool {
         .any(|w| w[0] == ".git" && w[1] == "worktrees")
 }
 
-/// A leading `NAME=value` shell assignment word: a valid variable name
-/// (`[A-Za-z_][A-Za-z0-9_]*`) followed by `=`. Anything else — paths, flags,
-/// `==` comparisons — is not skipped, so this can only widen the leading-word
-/// gate past words the shell itself treats as environment prefixes.
-///
-/// Re-exported from `cadence_hooks_core::shell` rather than duplicated. It was
-/// a local copy while core's was private; core made it `pub` so the
-/// `prevent-secret-leaks` `env`-operand peel could share one definition (#411),
-/// which retires the duplicate here. [`is_prefix_word`] needs exactly the
-/// predicate `skip_transparent_prefixes` uses, so the two agreeing by
-/// construction is the point — a drifted copy would let this guard and core
-/// disagree about what the shell treats as an environment prefix.
-use cadence_hooks_core::shell::is_assignment_word;
+// `is_assignment_word` is no longer imported here. `is_prefix_word` needed
+// exactly the predicate `skip_transparent_prefixes` uses, and assembling it
+// locally out of shared parts still left room to drift — which it did, twice, at
+// the membership half (cadence-hooks#488, then #237). The whole predicate now
+// lives in core as `is_transparent_prefix_word`, so there is nothing left here
+// to assemble.
 
 /// `strip_group_wrappers`, along with `skip_transparent_prefixes` and
 /// `TRANSPARENT`, now lives in [`cadence_hooks_core::shell`] (cadence-hooks#419)
@@ -1740,6 +1741,48 @@ mod tests {
     /// `Scratch::new(&scratch_root(), "tag")` at each of them.
     fn scratch(tag: &str) -> Scratch {
         Scratch::new(&scratch_root(), tag)
+    }
+
+    /// The two walks that cross the leading prefix region MUST stop at the same
+    /// index — the property [`is_prefix_word`]'s own doc comment asserts, and
+    /// the one nothing pinned.
+    ///
+    /// `is_prefix_word` was a local copy of core's `TRANSPARENT` membership test
+    /// on the RAW, unfolded token. Core's copy learned to fold (#488) and then
+    /// to unescape (#237), and each widening moved the two apart silently:
+    /// `\exec GIT_DIR=/other git commit` went from *never inspected* (the
+    /// leading-word gate stopped at `\exec`) to *inspected with the redirect
+    /// invisible* — `git_env_overrides` stopped at index 0 and returned
+    /// `(None, None)`, so the commit was judged against the session cwd. From a
+    /// primary checkout that is a false BLOCK on a commit git sends elsewhere.
+    #[test]
+    fn both_prefix_walks_stop_at_the_same_index() {
+        for command in [
+            "exec GIT_DIR=/other git commit -m x",
+            "\\exec GIT_DIR=/other git commit -m x",
+            "\\env GIT_DIR=/other git commit -m x",
+            "EXEC GIT_DIR=/other git commit -m x",
+            "\\time GIT_WORK_TREE=/other git commit -m x",
+        ] {
+            let tokens: Vec<String> =
+                cadence_hooks_core::shell::executable_tokens(command).to_vec();
+            let argv = skip_transparent_prefixes(&tokens);
+            let peeled = tokens.len() - argv.len();
+            let mut idx = 0;
+            while idx + 1 < tokens.len() && is_prefix_word(&tokens, idx) {
+                idx += 1;
+            }
+            assert_eq!(
+                idx, peeled,
+                "{command:?}: the two walks disagree about where the prefix region ends"
+            );
+            // And the override the env walk exists to read must be in hand.
+            let (work_tree, git_dir) = git_env_overrides(&tokens);
+            assert!(
+                work_tree.is_some() || git_dir.is_some(),
+                "{command:?}: the redirect went unseen"
+            );
+        }
     }
 
     /// An empty `home` disables the #569 swallowed-home rule, which is what

@@ -85,9 +85,8 @@
 
 use cadence_hooks_core::pathclass::{self, PathClass, PathClassContext};
 use cadence_hooks_core::shell::{
-    MAX_WRAPPER_DEPTH, TRANSPARENT, basename, child_scripts, fold_verb, looks_absolute,
-    resolve_cd_target, skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers,
-    tokenize,
+    MAX_WRAPPER_DEPTH, TRANSPARENT, child_scripts, command_word, looks_absolute, resolve_cd_target,
+    skip_transparent_prefixes, split_segments_with_ops, strip_group_wrappers, tokenize,
 };
 use cadence_hooks_core::{Check, CheckResult, HookInput, Outcome, normalize_path};
 use std::borrow::Cow;
@@ -100,40 +99,30 @@ use std::path::Path;
 /// path class), so a shared const would couple them without real reuse.
 const DELETE_VERBS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 
-/// The command word `token` names, stripped to what the shell will actually
-/// run: `basename` so `/bin/rm` matches, a leading `\` removed so the
-/// alias-bypass form `\rm` is still seen as `rm`, and ASCII case folded so `RM`
-/// is too.
+/// `token` names one of the [`DELETE_VERBS`], read through the shared
+/// [`cadence_hooks_core::shell::command_word`]: `basename` so `/bin/rm`
+/// matches, the shell's own quote removal so `\rm` and `r\m` are seen as `rm`,
+/// and ASCII case folding so `RM` is too.
 ///
-/// The fold is cadence-hooks#488, and it tracks the shared
-/// [`cadence_hooks_core::shell::command_word`] deliberately — the same reason
-/// for the same measured hole. On a case-insensitive volume the shell resolves
-/// `RM` to the `rm` binary and deletes; this guard collected no target and
-/// returned a silent Allow. Every consumer of this function is a DETECTOR — the
-/// delete-verb set, the `find` arm, the shell-wrapper arm, and the
-/// transparent-prefix `Unresolvable` gate — so folding can only ADD an ask or a
-/// block, never subtract one. The old mitigation note (a settings
-/// `allow Bash(rm:*)` rule keys on the leading word, so the guard defers rather
-/// than auto-approving) applied to the *lowercase* spelling only; it never
-/// covered `RM`, which is why the miss was real rather than merely theoretical.
+/// **This used to run a LOCAL `command_word` that trimmed only leading
+/// backslashes, and the divergence was a live miss** (cadence-hooks#237 security
+/// review, F8). `r\m -rf <path>` really runs `rm` — measured under bash, zsh and
+/// sh — but resolved to `r\m` and passed the guard untouched. Converging also
+/// *drops* one block: the local trim repeated, so it called `\\rm` a deletion,
+/// where the shell removes one backslash and finds no command named `\rm`. That
+/// was a false block on a command nobody runs, and losing it is the correct
+/// direction. Two guard tests pin both halves.
 ///
-/// **Deliberately NOT the shared [`cadence_hooks_core::shell::command_word`],
-/// which the enforce-worktree verb gates moved onto (#450 review).** The two
-/// differ on one input: the shared one strips exactly ONE backslash, so `\\rm`
-/// normalizes to `\rm` and is not a delete verb — which is what the shell does,
-/// since it removes one backslash and then finds no command named `\rm`. The
-/// repeating strip here calls `\\rm` a deletion and blocks it. Converging would
-/// therefore *loosen* a block-capable guard on a spelling nobody has measured
-/// in the wild, so it is left alone and tracked separately rather than ridden
-/// in on a PR about three other issues. The two are consistent in the direction
-/// that matters: every spelling the shell really runs as `rm` is caught by both.
-fn command_word(token: &str) -> Cow<'_, str> {
-    fold_verb(basename(token).trim_start_matches('\\'))
-}
-
-/// `token` names one of the [`DELETE_VERBS`]. Shared by every site that has to
-/// recognize a delete verb, so the `\`-strip above lives in exactly one place —
-/// forgetting it at a new call site would silently re-open the alias bypass.
+/// The case fold is cadence-hooks#488, the same measured hole for the same
+/// reason: on a case-insensitive volume the shell resolves `RM` to the `rm`
+/// binary and deletes, while this guard collected no target and returned a
+/// silent Allow. Every consumer here is a DETECTOR — the delete-verb set, the
+/// `find` arm, the shell-wrapper arm, and the transparent-prefix `Unresolvable`
+/// gate — so normalizing can only ADD an ask or a block, never subtract one. The
+/// old mitigation note (a settings `allow Bash(rm:*)` rule keys on the leading
+/// word, so the guard defers rather than auto-approving) applied to the
+/// *lowercase* spelling only; it never covered `RM`, which is why that miss was
+/// real rather than merely theoretical.
 fn is_delete_verb(token: &str) -> bool {
     DELETE_VERBS.contains(&command_word(token).as_ref())
 }
@@ -2529,6 +2518,71 @@ mod tests {
     fn root_glob_still_blocks_under_file_glob_path() {
         // `/*` reduces to the root — the bare-glob path, never softened.
         assert_eq!(judge("rm -rf /*", "/home"), Outcome::Block);
+    }
+
+    #[test]
+    fn an_inner_backslash_in_the_delete_verb_still_blocks() {
+        // `r\m -rf <protected>` really runs rm — measured under bash, zsh and
+        // sh. A local `command_word` that trimmed only LEADING backslashes
+        // resolved it to `r\m` and let it through (cadence-hooks#237 security
+        // review, F8); the shared one applies the shell's whole quote removal.
+        for command in [
+            "r\\m -rf ~/Documents",
+            "\\r\\m -rf ~/Documents",
+            "r\\m -rf /",
+        ] {
+            assert_eq!(judge(command, "/home"), Outcome::Block, "for {command}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_runner_flag_still_reaches_the_delete_verb() {
+        // The direction check on the `skip_transparent_prefixes` narrowing
+        // (cadence-hooks#237 security review, F17). The flag half of that
+        // predicate now reads the UNESCAPED next token, so a prefix followed by
+        // an escaped flag is no longer skipped as if unflagged.
+        //
+        // That sounds like a subtraction and is not. Before: `\-n` did not start
+        // with `-`, so `nice` was skipped, the peel broke on the flag, and
+        // `argv[0]` was the flag itself — matching no delete verb and no
+        // transparent prefix, so this guard saw NOTHING. After: `nice` survives
+        // the skip, `peel_command_runners` applies its real flag grammar, and
+        // the delete verb behind it is reached. Every row runs under bash, zsh
+        // and sh (measured).
+        // Each escaped row is paired with its unescaped control, and the control
+        // runs first: an escaped row failing where its control also fails would
+        // be inherited state, not this change. (`sudo -u me rm -rf …` is exactly
+        // that case — it reads `Allow` in BOTH spellings at this head, so it is
+        // deliberately not asserted here. Reported separately rather than fixed
+        // in place: it is a guard finding, and it predates this diff.)
+        for command in [
+            "nice -n 5 rm -rf ~/Documents",
+            "nice \\-n 5 rm -rf ~/Documents",
+            "env -i rm -rf ~/Documents",
+            "env \\-i rm -rf ~/Documents",
+        ] {
+            assert_ne!(
+                judge(command, "/home"),
+                Outcome::Allow,
+                "{command} must not be a silent allow"
+            );
+        }
+        // And where no runner grammar exists, the prefix survives into `argv[0]`
+        // so the transparent-prefix fallback can refuse instead of seeing
+        // nothing.
+        assert_ne!(
+            judge("exec \\-a x rm -rf ~/Documents", "/home"),
+            Outcome::Allow
+        );
+    }
+
+    #[test]
+    fn a_doubled_backslash_delete_verb_is_not_a_false_block() {
+        // `\\rm` is an ESCAPED backslash then `rm` — the word is a literal
+        // `\rm`, a command name no shell finds (measured: `bash: \rm: command
+        // not found`). The old local trim collapsed it and blocked; converging
+        // on the shared word correctly stops judging a command nobody runs.
+        assert_ne!(judge("\\\\rm -rf ~/Documents", "/home"), Outcome::Block);
     }
 
     // --- #344: a secret-shaped file sweep nudges instead of allowing silently ---

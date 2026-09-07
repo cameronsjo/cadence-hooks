@@ -1,3 +1,12 @@
+---
+name: pre-push-secret-scan-237
+date: 2026-07-09
+status: in-flight
+updated: 2026-09-07
+branch: feat/237-pre-push-secret-scan
+next: "Task 0 built on this branch; Task A (the guard) follows as its own PR after Task 0 merges"
+---
+
 # Pre-push secret scan for the outbound push range — implementation plan
 
 > Draft plan PR. Per-issue references use `Refs cameronsjo/cadence-hooks#237` — this
@@ -88,6 +97,70 @@ consolidation, not churn, and directionally aligned with #268.
    (`--delete`, leading-`:` `:dead`) — never skip the whole command, so
    `git push origin :dead newbranch` still scans `newbranch`. Documented misses (state them,
    don't imply): dashed `git-push`, user aliases (`git pu`) — same limit as sibling guards.
+   Also inherited from `core::shell` and shared by every sibling guard: a push inside a
+   heredoc-fed shell body (`bash <<EOF … git push … EOF`) is unseen, because
+   `split_segments_with_ops` strips heredoc bodies as data; `eval 'git push origin main'`
+   is unseen (tracked as **cameronsjo/cadence-hooks#886**), because `eval` is not in
+   `COMMAND_RUNNERS` and its argument is never treated as a child script; and the walk stops
+   at `MAX_WRAPPER_DEPTH` (3) levels of nesting. Known **false block**, not a miss:
+   `shell::unescape_word` drops a trailing lone backslash as a line continuation, so
+   `rm\ -rf x` — one command word `rm -rf`, with `x` as its argument, which no shell can
+   run (`bash: rm -rf: command not found`, rc 127, same under zsh and sh) — resolves to
+   `rm` and reaches the delete guard. Left unfixed here deliberately: the fix is in `core::shell` and its
+   blast radius is every guard, which is the wrong thing to ride in on this branch.
+   The `eval` fix belongs in
+   `core::shell::child_scripts`, so every sibling guard gains it at once — closing it in the
+   push walk alone would make push detection the only gate that sees through `eval`, and
+   that divergence is the shape these misses come from.
+   Two `eval` rows, kept apart: **`eval 'git push origin main'` is the MISS above** (#886, the
+   push is never seen); **`eval cd /other ; git push` was a WRONG ANSWER** (the push was seen
+   and reported against the session's own checkout with `unresolved: false`), and round 11
+   closed it by making an `eval` in command position refuse the directory. Closing the wrong
+   answer does not close the miss, and #886 stays open for the miss.
+   **The `eval` refusal is scope-wide, and that is deliberate**: `eval "$(ssh-agent -s)"` at the
+   top of a script — the form actually met in the wild, far more than `eval echo hi` — makes
+   every later push in that script report `unresolved`, so a caller refuses them. The trade was
+   taken knowingly; a refusal a reader can explain beats a stale directory reported as fact.
+   **Still open after round 16** — measured rows, not a description. Every one fails toward
+   seeing less or toward refusing, **with two named exceptions below**, and that claim was
+   re-checked against the trailing-brace rows this round rather than carried forward.
+   The exceptions: `git push origin main }` reports one refspec where bash passes two
+   (a standalone `}` is an ordinary argument — `bash -c 'set -x; : hi }'` renders `+ : hi '}'`
+   — but the walk reads a whitespace-preceded brace as a group closer and trims it), and
+   `git push origin ${BRANCH}` records the refspec `${BRANCH` with the brace trimmed. Both are
+   incomplete answers rather than confident wrong ones: the first needs a local ref literally
+   named `}` to publish anything, and the second refuses anyway because `is_safe_ref` rejects
+   the `$`. Neither is fixable without teaching `core::shell` that a trailing `}` can be a word
+   byte — `executable_tokens` re-applies `strip_group_wrappers` internally, so a decision made
+   in this walk is re-made below it — which is **cameronsjo/cadence-hooks#889**. Six rows
+   that once did are closed: a quoted redirect-shaped refspec silently dropped and a redirect
+   standing before the subcommand hiding the push (round 13); both faces of the trailing-`}`
+   trim — a refspec and a work dir each reported as fact after `strip_group_wrappers` ate the
+   brace (round 14); and the two brace rows a matched opener used to pay for,
+   `{ git push origin secret}; }` and `{ cd /other}; git push origin main; }`, which round 15
+   closed by asking what the trim ate instead of counting closers. A row that fails toward seeing less is a refusal to the caller only where an
+   invocation is emitted at all; where nothing is emitted it is a silent miss, which is what the
+   rows below are. `/usr/bin/nohup -- git push origin main` and every other path-spelled
+   `TRANSPARENT` prefix reach `skip_transparent_prefixes` and `enforce_worktree`'s env walk
+   unbasenamed — round 12 fixed the push fallback locally, but the shared
+   `shell::names_transparent_prefix` still does not basename, which also leaves
+   `guard_sops_decrypt` allowing `/usr/bin/nohup -- sops -d secrets.yaml`; that primitive is
+   **cameronsjo/cadence-hooks#888**, and the trailing-`}` tokenizer fix is
+   **cameronsjo/cadence-hooks#889**. `env -S "git push origin main"` is unseen (`env` **is** a `COMMAND_RUNNERS`
+   member, so the earlier "outside both tables" wording never reached it; runs under bash, zsh
+   and sh). `find . -exec git push \;` is unseen — `find` is not a prefix at all, and `guard_rm`
+   has a dedicated `find` branch for exactly this shape that the push walk has no equivalent of.
+   `coproc git push origin main` is unseen, bash-only. Two rows go the other way and
+   **over-refuse, deliberately**: `command -p grep git push file` (the phrase in argument
+   position — telling it from a real push needs the per-prefix flag grammar the fallback exists
+   to avoid parsing), and a redirect glued straight onto an operand, `git push origin main>log`
+   — the whitespace tokenizer sees one token, `is_safe_ref` rejects the `>`, and the caller
+   refuses a push the shell really performs. A third joins them: an assignment whose value ends
+   in a brace, `x=}; git push origin main`, is valid bash and refuses the whole scope. All three
+   fail on the safe side and are accepted as designed. Plus the heredoc, dashed
+   `git-push`, alias and `MAX_WRAPPER_DEPTH` rows above, and `sudo rm -rf …` reaching no delete
+   verb in `guard_rm` in every spelling including bare `sudo` — inherited,
+   **cameronsjo/cadence-hooks#887**, not this branch's to fix.
 
 2. **Range — from the refspec, not HEAD, correct ordering.** For each pushed source ref,
    outbound set = **`git rev-list <src-ref> --not --remotes`** — positive ref **before**
@@ -130,10 +203,15 @@ wrongly assumed it). Fix: Task 0 adds an **error-distinguishing** core call; a g
 **with a push detected** must **nudge-loud or block**, never silently allow. Genuine "0
 commits to push" allows.
 
+**Drift since planning:** `git_command_detailed` DOES exist now
+(`crates/core/src/shell.rs`, added 2026-07-10), but it splits out only `TimedOut` — its
+`Failed` variant still conflates a subprocess or exit-code error with genuine empty stdout,
+so Task 0 still owes the split and ships it as `git_output_detailed` → `GitOutput`.
+
 ## Fail posture + override — **Decision Point (Cameron rules at Step-0)**
 
-**Recommend BLOCK (exit 2), ack-only override.** Panel converged: the
-#164/#151/#152/#155/#158 FP history was **trigger-scoping** FPs, not value-pattern FPs; the
+**Recommend BLOCK (exit 2), ack-only override.** Panel converged: the FP history in
+issues #164/#151/#152/#155/#158 was **trigger-scoping** FPs, not value-pattern FPs; the
 write-time sibling already blocks on the identical corpus and is trusted; a warn-only secret
 gate is a prose boundary that "loses to momentum." So Task B's adversarial energy goes at
 **trigger + range**, not the value patterns.
@@ -167,6 +245,46 @@ covers it.
 
 Third independent plan in the Step-0 queue.
 
+## Progress
+
+**Canonical path note.** The contract-zone headings below (and the "Detection & range design"
+section) name `core::shell::push_invocations`; the shipped path is
+**`core::push::push_invocations`**, re-exported from `core::shell` so both spellings resolve.
+The headings are left as written — they are frozen contract text — so read this line as the
+correction.
+
+- [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
+  error-distinguishing `shell::git_output_detailed`, with 88 core unit tests
+  (83 in `push.rs`, 5 in `shell.rs` pinning `unescape_word` and the marked
+  tokenizer directly).
+  Built on `feat/237-pre-push-secret-scan`, hardened over twelve adversarial
+  review rounds. Round 11 closed the escape-walk gaps in `skip_runner_flags`,
+  `shell_c_argument_tokens`, `export`'s operands and `cd -`; added a refusal
+  for a segment the peel cannot get past (`command -p git push`, which needs no
+  escape at all); made `eval` refuse the directory; and moved
+  `enforce_worktree`'s drifted prefix predicate onto core's single definition.
+  Round 12 hardened that new fallback — it now basenames the prefix and reads
+  git's globals instead of scanning adjacent word pairs — and fixed the branch's
+  first false refusal, where a shell redirection was collected as a refspec.
+  Round 13 made the redirect strip quote-aware (a new `shell::tokenize_marked`
+  carries the one fact quote removal destroys) and moved it ahead of the verb,
+  globals and subcommand reads, so a redirect standing anywhere in a simple
+  command no longer hides the push. Round 14 corrected that mark from a
+  whole-token flag to an offset — only the redirect OPERATOR decides, so
+  `>"$LOG"` strips again — and made an unbalanced trailing `}`/`)` refuse
+  rather than report a trimmed word as fact. Round 15 replaced that round's
+  opener/closer count — the wrong grain, since segments split on `&&`/`;`/`|` —
+  with the predicate that actually decides: a `}` glued to a non-space,
+  non-`;` byte is a real word byte, and `)` is never a word byte at all.
+  Round 16 exempted a brace that closes a `${` — an unquoted `${VAR}` has the
+  predicate's exact shape, and without the carve-out one of them anywhere in a
+  command refused every push after it.
+  The open rows are listed in the documented-misses paragraph above — read that,
+  not this line, for what is still unseen.
+- [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
+- [ ] **Task B** — mandatory adversarial security review of the guard.
+- [ ] **Task C** — plugin `hooks.json` companion (release-gated).
+
 ## Task breakdown (all Opus; strict order; each its own PR)
 
 ### Task 0 — `core::shell::push_invocations` (precursor)
@@ -184,6 +302,21 @@ New `crates/cadence/src/prevent_secret_push.rs` + `impl Check for PreventSecretP
 consuming Task 0 + `scan_secret_values`. Range via corrected per-refspec `rev-list`;
 absolute-resolved exemption + `is_safe_template`; overflow scan-N-then-block; ack override;
 git-error → loud, not allow. Four-place wiring (template `guard_op_vault_scan.rs`):
+
+**Two obligations Task 0 hands to Task A explicitly.** An `OutboundRange::Unavailable` on a
+detected push MUST block or nudge loudly, never allow — history size alone can drive a first
+push into the deadline, so that arm is reachable without an adversary. And the commit cap
+MUST be applied **before** buffering: `outbound_commits` holds the whole `rev-list` stdout,
+which on a first push is the entire history, with no size bound of its own. Task A must also
+treat `PushInvocation::tags` exactly like `all_or_mirror` for range purposes — a tag can
+point at a commit no branch reaches, so widening to "every local branch" still misses it.
+
+**Deadline budget.** An implicit-refspec push now costs **three** bounded git subprocesses
+on the detection path, not one: two `git config` probes (`push.default` and the
+`remote.*.push` regexp) before `outbound_commits` runs. Size the hook deadline for three,
+and treat `GitOutput::TimedOut` exactly like `OutboundRange::Unavailable` — block or nudge
+loudly, never allow. `TimedOut` is the module's one fail-open arm, and a timeout is now
+three times as reachable as it was.
 
 - module export;
 - `CadenceCommands::PreventSecretPush` + `hook_name()` arm + dispatch arm (`src/main.rs`);
@@ -243,8 +376,8 @@ plugin's** `hooks.json` (beside the sibling secret guards). Binary-first/plugin-
 
 A 3-lens panel (plan-reviewer, red-team, cameron-review) ran against v1. What changed:
 
-- **CRITICAL** `rev-list --not --remotes HEAD` scans zero (negates HEAD) → corrected ordering
-  + non-empty first-push test. *(all 3 lenses + probe)*
+- **CRITICAL** `rev-list --not --remotes HEAD` scans zero (negates HEAD) → corrected
+  ordering plus a non-empty first-push test. *(all 3 lenses + probe)*
 - **CRITICAL** reuse of the hardened parser is impossible cross-crate (private to guardrails)
   → Task 0 builds it in `core::shell`; plan reframed as guard+primitive. *(plan-reviewer)*
 - **CRITICAL** range from HEAD misses non-HEAD refspecs (`branchB`, `local:remote`, `--all`)

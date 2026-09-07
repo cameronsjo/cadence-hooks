@@ -189,9 +189,58 @@ fn take_quoted_run(chars: &[char], i: usize, out: &mut String) -> Option<usize> 
 /// rest of the command, `-R evil/target` included. `$'…'` is therefore its own
 /// mode where a backslash consumes the character after it.
 pub fn tokenize(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
+    tokenize_marked(command)
+        .into_iter()
+        .map(|token| token.text)
+        .collect()
+}
+
+/// One token, plus where its quoting starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkedToken {
+    /// The token exactly as [`tokenize`] produces it — quotes removed.
+    pub text: String,
+    /// How many bytes of `text` were emitted **before** this token's first
+    /// quoting construct — `'…'`, `"…"`, `$'…'`, or an escaped quote outside
+    /// quoting. A token with no quoting anywhere reports its full length.
+    ///
+    /// **This is the only thing quote removal destroys that a redirect decision
+    /// needs.** `is_redirect_token` judges a token's text, and `'>leak'` and
+    /// `>leak` arrive byte-identical — so a redirect strip reading text alone
+    /// discards a legal, quoted refspec as if it were a redirection
+    /// (`git check-ref-format refs/heads/'>b'` answers OK).
+    ///
+    /// **An OFFSET, not a boolean, because the operator and its target are one
+    /// token and only the operator decides.** A whole-token mark refused to
+    /// strip `>"$LOG"`, `2>"/dev/null"` and `>>"$LOG"` — the spellings scripts
+    /// are actually written in — turning every one into a phantom refspec and a
+    /// false block. The operator there is unquoted; only the target is. Reading
+    /// the offset lets a consumer ask the real question: was the redirect
+    /// *operator prefix* entirely unquoted?
+    ///
+    /// The offset advances only while no quote has been seen, so a quote that
+    /// emits nothing still marks the position after it: `''>log` reports `0`,
+    /// like `'>log'` and unlike `>log`. That matters because bash treats the
+    /// empty quote as starting a word.
+    ///
+    /// Safety direction is unchanged from the boolean: a smaller offset can only
+    /// stop a strip, never cause one, so it can only leave more operands in
+    /// view.
+    pub unquoted_prefix_len: usize,
+}
+
+/// [`tokenize`], additionally reporting which tokens carried quoting.
+///
+/// The single implementation; `tokenize` is a projection of it, so the two can
+/// never disagree about where a token ends (cadence-hooks#237 security review,
+/// F25).
+pub fn tokenize_marked(command: &str) -> Vec<MarkedToken> {
+    let mut tokens: Vec<MarkedToken> = Vec::new();
     let mut current = String::new();
     let mut in_token = false;
+    // `None` until this token's first quoting construct; then the byte length
+    // `current` had reached at that moment.
+    let mut unquoted_prefix: Option<usize> = None;
     let mut quote: Option<Quote> = None;
     let mut chars = command.chars().peekable();
 
@@ -237,8 +286,9 @@ pub fn tokenize(command: &str) -> Vec<String> {
                 // An escaped quote outside quoting is a literal character; it
                 // opens no string.
                 '\\' if matches!(chars.peek(), Some('"' | '\'')) => {
-                    current.push(chars.next().expect("peeked"));
                     in_token = true;
+                    unquoted_prefix.get_or_insert(current.len());
+                    current.push(chars.next().expect("peeked"));
                 }
                 // `$'` opens ANSI-C quoting; the `$` is part of the syntax, not
                 // the word, so it is consumed like the quote itself. A `$`
@@ -247,18 +297,26 @@ pub fn tokenize(command: &str) -> Vec<String> {
                     chars.next();
                     quote = Some(Quote::AnsiC);
                     in_token = true;
+                    unquoted_prefix.get_or_insert(current.len());
                 }
                 '\'' => {
                     quote = Some(Quote::Single);
                     in_token = true;
+                    unquoted_prefix.get_or_insert(current.len());
                 }
                 '"' => {
                     quote = Some(Quote::Double);
                     in_token = true;
+                    unquoted_prefix.get_or_insert(current.len());
                 }
                 c if c.is_whitespace() => {
                     if in_token {
-                        tokens.push(std::mem::take(&mut current));
+                        let text = std::mem::take(&mut current);
+                        let unquoted_prefix_len = unquoted_prefix.take().unwrap_or(text.len());
+                        tokens.push(MarkedToken {
+                            text,
+                            unquoted_prefix_len,
+                        });
                         in_token = false;
                     }
                 }
@@ -270,7 +328,11 @@ pub fn tokenize(command: &str) -> Vec<String> {
         }
     }
     if in_token {
-        tokens.push(current);
+        let unquoted_prefix_len = unquoted_prefix.unwrap_or(current.len());
+        tokens.push(MarkedToken {
+            text: current,
+            unquoted_prefix_len,
+        });
     }
     tokens
 }
@@ -289,14 +351,16 @@ pub fn basename(token: &str) -> &str {
 /// (cadence-hooks#488). Borrows unless the fold changes something, so the
 /// common already-lowercase verb costs no allocation.
 ///
-/// **The one place the verb fold is spelled**, shared by
-/// [`command_word`] and by the two guards that keep a deliberately divergent
-/// local command word (`guard_rm`, which repeats the backslash strip;
-/// `warn_going_public`, which is basename-only). Those divergences are about
-/// the *path/escape* handling and are documented where they live — the fold is
-/// not one of them, and three hand-rolled copies of it would be four
-/// normalizations of "which verb is this?" all over again, which is exactly
-/// what #450 consolidated away.
+/// **The one place the verb fold is spelled**, shared by [`command_word`] and
+/// by the one guard that still keeps a deliberately divergent local command
+/// word (`warn_going_public`, which is basename-only). `guard_rm` used to be
+/// the second, repeating the backslash strip; its shadow was a measured miss
+/// (`r\m` passed the guard) and is gone — it uses [`command_word`] now
+/// (cadence-hooks#237 security review, F8). That divergence is about the
+/// *path/escape* handling and is documented where it lives — the fold is not
+/// one of them, and hand-rolled copies of it would be more normalizations of
+/// "which verb is this?" all over again, which is exactly what #450
+/// consolidated away.
 ///
 /// ASCII, never [`str::to_lowercase`]: every verb a guard gates on is ASCII,
 /// while Unicode folding maps the dotted-I family and assorted homoglyphs onto
@@ -415,9 +479,41 @@ pub fn contains_ignoring_ascii_case(haystack: &str, needle: &str) -> bool {
 /// programs that receive them, and path operands are case-sensitive in content
 /// even on a case-insensitive volume.
 ///
+/// **The whole word goes through [`unescape_word`], not just a leading-backslash
+/// strip.** The old strip left the escape usable one character in: `g\it push
+/// origin main` runs git under bash, zsh and sh alike, and `basename` splits on
+/// `\` for the Windows branch, so `g\it` resolved to `it` and `gi\t` to `t`.
+/// Neither folded to `git`, so the segment was dropped and every guard that
+/// gates on a verb — push-remote, `guard_rm`, `enforce_worktree` — saw nothing
+/// at all. An empty result is the strongest allow shape there is
+/// (cadence-hooks#237 security review, F6).
+///
+/// **`\\git` still does NOT resolve to `git`, and that is load-bearing.** The
+/// first backslash escapes the second, so the word is a literal `\git` — a
+/// command name no shell finds (measured: `bash: \git: command not found`).
+/// A blunt "remove every backslash" collapses it to `git` and judges a command
+/// that never runs; four sibling guard tests pin exactly that case, and they
+/// caught the blunt version.
+///
+/// The unescape runs AFTER the path split, so a Windows path keeps its
+/// separators: `C:\Program Files\Git\cmd\git.exe` still resolves to `git`.
+///
+/// Direction check, because this widens a shared seam. An unescape can only make
+/// MORE tokens resolve to a gated verb, which is the safe direction for the
+/// callers here — they are all detectors, where seeing more of what the shell
+/// runs is the point, and the cost is a false block on a command word whose real
+/// filename contains a literal backslash and whose de-escaped form spells a
+/// gated verb.
+///
+/// **That direction does not generalize, and one caller takes the opposite
+/// one.** [`crate::push::directory_verb`] refuses a backslash-bearing word
+/// instead of unescaping it, because a directory verb decides *where* a later
+/// command runs rather than *whether* one is inspected: seeing more there means
+/// moving a tracked directory, and a wrong move is a wrong repository. Ask which
+/// of the two a new caller is before reusing this.
+///
 /// Deliberate misses, shared by every caller: a command word behind a
-/// substitution (`$(which git)`) or a variable, and a mid-path escape
-/// (`/usr/bin/\git`).
+/// substitution (`$(which git)`) or a variable.
 pub fn command_word(token: &str) -> Cow<'_, str> {
     let has_drive_prefix = {
         let mut chars = token.chars();
@@ -428,12 +524,53 @@ pub fn command_word(token: &str) -> Cow<'_, str> {
     } else {
         basename(token)
     };
-    let segment = segment.strip_prefix('\\').unwrap_or(segment);
-    let segment = match segment.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => stem,
-        _ => segment,
-    };
-    fold_verb(segment)
+    match unescape_word(segment) {
+        Cow::Owned(unescaped) => {
+            let stem = match unescaped.rsplit_once('.') {
+                Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => {
+                    stem.to_string()
+                }
+                _ => unescaped,
+            };
+            Cow::Owned(fold_verb(&stem).into_owned())
+        }
+        Cow::Borrowed(segment) => {
+            let segment = match segment.rsplit_once('.') {
+                Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") && !stem.is_empty() => stem,
+                _ => segment,
+            };
+            fold_verb(segment)
+        }
+    }
+}
+
+/// Apply the shell's quote removal to one unquoted word: each backslash is
+/// dropped and the character after it is taken literally.
+///
+/// This is an escape WALK, not a strip, and the difference is the whole point.
+/// `g\it` and `gi\t` both become `git` — the shell runs git for each (measured
+/// under bash, zsh and sh). `\\git` becomes `\git`, because the first backslash
+/// escapes the second: a literal-backslash command name the shell cannot find.
+/// A strip would collapse both to `git` and judge a command that never runs.
+///
+/// A trailing lone backslash is a line continuation and is dropped. Borrows when
+/// the word carries no backslash, so the common case costs no allocation.
+pub fn unescape_word(word: &str) -> Cow<'_, str> {
+    if !word.contains('\\') {
+        return Cow::Borrowed(word);
+    }
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(escaped) = chars.next() {
+                out.push(escaped);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
 }
 
 /// True when `p` is absolute — POSIX (`/foo`) or a Windows drive-absolute path
@@ -592,6 +729,43 @@ pub fn executable_tokens(segment: &str) -> Vec<String> {
     }
 }
 
+/// [`executable_tokens`], plus a quoted flag per returned token.
+///
+/// **Additive by construction: the token strings come from `executable_tokens`
+/// itself**, unchanged, so no caller of that function or of the compound-head
+/// pipeline is touched. Only the flags are new.
+///
+/// The flags are aligned from the TAIL, which is sound because the pipeline
+/// only ever drops tokens from the FRONT (keywords, group openers, a function
+/// header, a `case` arm) or rewrites the head token's leading `(`/`{`. The last
+/// N marked tokens are therefore the N executable ones.
+///
+/// **The misalignment arm is a belt on an invariant, not a live safeguard.**
+/// `marked.len() >= tokens.len()` always holds: both start from the same
+/// `tokenize(strip_group_wrappers(segment))`, and every step after it either
+/// drops a prefix of the slice or rewrites the head token in place — the
+/// pipeline is **prefix-drop only**, and nothing in it lengthens. So the `None`
+/// arm is unreachable today and no test can exercise it. It is kept because
+/// that invariant lives in four helpers (`strip_leading_keywords`,
+/// `strip_group_tokens`, `strip_function_header`, `strip_case_arm`) plus the
+/// head rewrite, and an edit to any of them is what would break it. When it
+/// does fire, every prefix length reads `0` — "quoted from the first byte" —
+/// which can only stop a redirect strip, leaving more operands in view rather
+/// than fewer. A dropped operand is the one outcome this is not allowed to
+/// produce.
+pub fn executable_tokens_marked(segment: &str) -> (Vec<String>, Vec<usize>) {
+    let tokens = executable_tokens(segment);
+    let marked = tokenize_marked(strip_group_wrappers(segment));
+    let unquoted_prefix_lens = match marked.len().checked_sub(tokens.len()) {
+        Some(offset) => marked[offset..]
+            .iter()
+            .map(|token| token.unquoted_prefix_len)
+            .collect(),
+        None => vec![0; tokens.len()],
+    };
+    (tokens, unquoted_prefix_lens)
+}
+
 /// A group opener (or an empty parameter list) standing as its own token, left
 /// behind by `{ cmd; }`, `( cmd )`, and `function f () { … }`.
 fn strip_group_tokens(tokens: &[String]) -> &[String] {
@@ -699,34 +873,81 @@ fn strip_case_arm(tokens: &[String]) -> &[String] {
 /// adding a word to it.
 pub const TRANSPARENT: &[&str] = &["command", "builtin", "exec", "time", "nice", "nohup", "env"];
 
+/// Does this word name a [`TRANSPARENT`] prefix, read the way the SHELL reads
+/// it — escapes removed, then case-folded?
+///
+/// `fold_verb` alone only lowercases, so every backslash spelling of a
+/// `TRANSPARENT` verb used to fail this: `\exec git push`, `\command git push`,
+/// `ti\me git push` and `\nohup git push` all run in bash, zsh and sh, and all
+/// four broke the peel, left the prefix as the command word, and went unseen by
+/// every gate downstream. `env` and `nice` escaped that only because they are
+/// ALSO in [`COMMAND_RUNNERS`], whose peel resolves through [`command_word`],
+/// which does unescape (cadence-hooks#237 security review, F13).
+pub fn names_transparent_prefix(word: &str) -> bool {
+    TRANSPARENT.contains(&fold_verb(unescape_word(word).as_ref()).as_ref())
+}
+
+/// Is `tokens[idx]` a leading word the real command runs *through* — a
+/// transparent prefix whose next token is not the prefix's own flag, or an
+/// assignment word?
+///
+/// **This is the single definition, and it is public because a second copy is
+/// what it exists to prevent.** Three walks cross this same leading region:
+/// [`skip_transparent_prefixes`], which skips it, and — in `enforce_worktree` —
+/// that module's own peel and its `git_env_overrides`, which reads
+/// `GIT_DIR=`/`GIT_WORK_TREE=` out of it first. `enforce_worktree` kept a local
+/// `is_prefix_word` asserting in its own doc comment that the predicate was
+/// shared; it was a copy, testing `TRANSPARENT.contains(&tok)` on the raw,
+/// unfolded token. Core's copy then learned to fold (cadence-hooks#488) and to
+/// unescape (cadence-hooks#237), and each widening moved the two apart in
+/// silence. The second was the costly one: `\exec GIT_DIR=/other git commit`
+/// went from *never inspected* to *inspected with the redirect invisible* — the
+/// leading-word gate reached the commit while the env walk stopped at index 0 —
+/// so the commit was judged against the session cwd, a false BLOCK from a
+/// primary checkout on a commit git performs elsewhere.
+///
+/// **Both halves read the unescaped word, and the flag half is the narrowing
+/// one.** `nice \-n 5 git push` is the row that forced it: the raw `\-n` does
+/// not start with `-`, so `nice` was skipped as if unflagged, the peel broke on
+/// the flag, and [`peel_command_runners`] never got to apply `nice`'s real flag
+/// grammar — the command went entirely unseen. Reading the flag unescaped stops
+/// the skip, which hands the segment to the runner peel that can parse it. Where
+/// no runner grammar exists (`command`, `exec`, `time`, `nohup`), the prefix now
+/// survives into `argv[0]`, which is what a caller's transparent-prefix fallback
+/// needs in order to refuse rather than see nothing.
+///
+/// Total over any index: an out-of-range `idx` is `false`, and a trailing prefix
+/// with nothing after it is not a prefix word — there is no command for it to
+/// run through. A panic in a guard is a hard block by another name, which
+/// ADR-0001's fail-open posture forbids.
+pub fn is_transparent_prefix_word(tokens: &[String], idx: usize) -> bool {
+    let Some(tok) = tokens.get(idx).map(String::as_str) else {
+        return false;
+    };
+    let runs_the_next_word = tokens
+        .get(idx + 1)
+        .is_some_and(|next| !unescape_word(next).starts_with('-'));
+    (names_transparent_prefix(tok) && runs_the_next_word) || is_assignment_word(tok)
+}
+
 /// Skip transparent command prefixes that run their argument as the command, so
 /// `command git commit` / `time git commit` still surface `git` as the leading
 /// word. Only skips a prefix when the following token is not an option, so a
-/// prefix's own flags are never misparsed (`nice -n 10 git commit` and
-/// `env -i git commit` stay documented misses rather than risking a wrong
-/// resolution). Leading `VAR=value` assignment words are skipped too — bash
-/// runs `VAR=value git commit` (and `env VAR=value git commit`) with the rest
-/// as the command, so an assignment word must not eat the leading-word gate
-/// (issue #228).
+/// prefix's own flags are never misparsed — `nice -n 10 git commit` and
+/// `env -i git commit` are resolved by [`peel_command_runners`]'s real flag
+/// grammar instead, and a prefix with no such grammar survives into `argv[0]`
+/// where a caller can refuse on it. Leading `VAR=value` assignment words are
+/// skipped too — bash runs `VAR=value git commit` (and
+/// `env VAR=value git commit`) with the rest as the command, so an assignment
+/// word must not eat the leading-word gate (issue #228).
+///
+/// The predicate is [`is_transparent_prefix_word`], shared with
+/// `enforce_worktree`'s env-override walk so the two cannot disagree about
+/// where this region ends.
 pub fn skip_transparent_prefixes(tokens: &[String]) -> &[String] {
     let mut start = 0;
-    while start + 1 < tokens.len() {
-        let tok = tokens[start].as_str();
-        // Membership is tested on the FOLDED word (cadence-hooks#488). `guard_rm`
-        // already folded before its own `TRANSPARENT` test, so a raw test here
-        // made the two disagree: `COMMAND rm -rf ~` kept `COMMAND` as the
-        // leading word and the delete verb behind it was never reached.
-        // Detector direction — skipping more prefixes only exposes more verbs
-        // to the gates downstream, so this can add blocks and never subtract.
-        // The flag refusal below is unchanged, so a prefix's own options are
-        // still never parsed.
-        if (TRANSPARENT.contains(&fold_verb(tok).as_ref()) && !tokens[start + 1].starts_with('-'))
-            || is_assignment_word(tok)
-        {
-            start += 1;
-        } else {
-            break;
-        }
+    while start + 1 < tokens.len() && is_transparent_prefix_word(tokens, start) {
+        start += 1;
     }
     &tokens[start..]
 }
@@ -1005,7 +1226,7 @@ pub fn carries_undo_flag(operands: &[String]) -> bool {
 /// `>`, `>>`, `<`, `2>`, `2>&1`, `&>`, and the attached-target forms (`>log`,
 /// `2>/dev/null`). Leading `&` and file-descriptor digits are stripped before
 /// the test, which is what distinguishes these from an ordinary operand.
-fn is_redirect_token(token: &str) -> bool {
+pub(crate) fn is_redirect_token(token: &str) -> bool {
     let rest = token.strip_prefix('&').unwrap_or(token);
     let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     rest.starts_with('>') || rest.starts_with('<')
@@ -1360,22 +1581,64 @@ pub fn run_git_bounded(cmd: &mut Command) -> GitSpawn {
     run_bounded_with(cmd, timeout)
 }
 
-/// Run a git command in a specific working directory, with the tri-state
-/// outcome fail-closed guard arms need.
-pub fn git_command_detailed(work_dir: &str, args: &[&str]) -> GitQuery {
+/// Outcome of [`git_output_detailed`] — the four states that are genuinely
+/// different to a caller, kept apart.
+///
+/// **`Ok("")` is the one this exists for.** [`GitQuery`] folds "git exited 0
+/// with nothing to say" into [`GitQuery::Failed`], so a caller cannot tell a
+/// *successful empty answer* from a *failed query*. For a question whose empty
+/// answer is meaningful — "which commits would this push publish?" — that
+/// conflation is a silent allow: a git error and "nothing to push" arrive
+/// identically, and the natural reading of the pair (empty means fine) lets the
+/// error through. A guard that sees less of what it protects has already lost.
+///
+/// The other split is the ADR-0001 one [`GitSpawn`] already draws and
+/// [`GitQuery`] half-keeps: git *answering badly* ([`GitOutput::Failed`]) is a
+/// resolution failure a fail-closed arm should still block on, while git never
+/// answering at all ([`GitOutput::Unavailable`], [`GitOutput::TimedOut`]) is the
+/// guard's own infrastructure failing and must not manufacture a block.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GitOutput {
+    /// git exited 0. The trimmed stdout MAY be empty — that is a real answer.
+    Ok(String),
+    /// git ran and exited non-zero.
+    Failed,
+    /// git could not be spawned (no `git` on PATH, or the spawn errored).
+    Unavailable,
+    /// The deadline expired before git answered.
+    TimedOut,
+}
+
+/// Run a git command in a specific working directory, distinguishing a
+/// successful EMPTY answer from a failure.
+///
+/// The single spawn path — [`git_command_detailed`] and [`git_command`] are
+/// thin readings of this one, so the three cannot drift about what a git error
+/// looks like.
+pub fn git_output_detailed(work_dir: &str, args: &[&str]) -> GitOutput {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(work_dir).args(args);
     match run_git_bounded(&mut cmd) {
         GitSpawn::Completed(output) if output.status.success() => {
-            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if value.is_empty() {
-                GitQuery::Failed
-            } else {
-                GitQuery::Value(value)
-            }
+            GitOutput::Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
         }
-        GitSpawn::Completed(_) | GitSpawn::SpawnFailed => GitQuery::Failed,
-        GitSpawn::TimedOut => GitQuery::TimedOut,
+        GitSpawn::Completed(_) => GitOutput::Failed,
+        GitSpawn::SpawnFailed => GitOutput::Unavailable,
+        GitSpawn::TimedOut => GitOutput::TimedOut,
+    }
+}
+
+/// Run a git command in a specific working directory, with the tri-state
+/// outcome fail-closed guard arms need.
+///
+/// Empty stdout reads as [`GitQuery::Failed`] here — unchanged, long-standing
+/// behavior every current caller is written against. A caller for whom an empty
+/// answer is meaningful wants [`git_output_detailed`] instead.
+pub fn git_command_detailed(work_dir: &str, args: &[&str]) -> GitQuery {
+    match git_output_detailed(work_dir, args) {
+        GitOutput::Ok(value) if !value.is_empty() => GitQuery::Value(value),
+        GitOutput::Ok(_) | GitOutput::Failed | GitOutput::Unavailable => GitQuery::Failed,
+        GitOutput::TimedOut => GitQuery::TimedOut,
     }
 }
 
@@ -3383,8 +3646,20 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
 
     let mut i = 0;
     let rest = loop {
-        let tok = argv.get(i)?;
-        // The first word that is not an option is the command being run.
+        // **Read the word the SHELL hands the runner, not the raw token.** The
+        // comparisons below all tested the raw spelling, so an escaped flag was
+        // read as the command word and the peel stopped dead there: `env \-i
+        // GIT_DIR=/x git push`, `nice \-n 5 git push`, `sudo \-u me git push`
+        // and `xargs \-I{} git push` all run under bash, zsh and sh (measured)
+        // and every one of them left `argv[0]` as the flag, so no verb gate ever
+        // saw the command behind it. Direction: unescaping only consumes MORE
+        // flag words, and the function already returns `None` — refusing to
+        // guess — on a grammar it cannot parse, so it can add blocks and never
+        // subtract (cadence-hooks#237 security review, F17).
+        let tok = unescape_word(argv.get(i)?);
+        let tok = tok.as_ref();
+        // The first word that is not an option is the command being run. The
+        // slice returned is of RAW tokens — only the comparison is unescaped.
         if !tok.starts_with('-') {
             break &argv[i..];
         }
@@ -3413,11 +3688,11 @@ pub fn skip_runner_flags<'a>(verb: &str, argv: &'a [String]) -> Option<&'a [Stri
                 i += 1;
                 continue;
             }
-            if grammar.no_arg_long.contains(&tok.as_str()) {
+            if grammar.no_arg_long.contains(&tok) {
                 i += 1;
                 continue;
             }
-            if grammar.value_long.contains(&tok.as_str()) {
+            if grammar.value_long.contains(&tok) {
                 i += 2;
                 continue;
             }
@@ -3508,7 +3783,7 @@ const PUSH_SEPARATE_VALUE_LONG_OPTS: &[&str] = &[
 /// No `git push` BOOLEAN shares a prefix with any of these five, so this cannot
 /// swallow the real target of an ordinary push: `--force`, `--follow-tags`,
 /// `--signed` and `--force-with-lease` all fail the test.
-fn long_option_takes_separate_value(name: &str) -> bool {
+pub(crate) fn long_option_takes_separate_value(name: &str) -> bool {
     !name.is_empty()
         && PUSH_SEPARATE_VALUE_LONG_OPTS
             .iter()
@@ -3634,6 +3909,16 @@ pub fn push_repository_argument(words: &[String]) -> PushDestinations {
     found
 }
 
+/// The push-detection primitive lives in [`crate::push`], not here, because it
+/// is a WALK over this module's building blocks rather than another building
+/// block. Re-exported so a caller reaching for push handling at the obvious
+/// address finds it, and so [`git_push_segments`] sits beside the richer answer.
+///
+/// Reach for [`push_invocations`] over [`git_push_segments`] whenever the
+/// question is *what does this push publish* rather than *where does it point*:
+/// the segment helper tracks no working directory and collects no refspecs.
+pub use crate::push::{OutboundRange, PushInvocation, Refspec, outbound_commits, push_invocations};
+
 /// Every `git push` the command runs, as the words that FOLLOW the `push`
 /// subcommand — one entry per push, in command order.
 ///
@@ -3731,7 +4016,16 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
     ) {
         return None;
     }
-    for (i, tok) in tokens.iter().enumerate().skip(1) {
+    for (i, raw) in tokens.iter().enumerate().skip(1) {
+        // **The `-c` test reads the word the SHELL hands the wrapper.** Compared
+        // raw, `sh \-c 'git push origin main'` matched no `-c` spelling, fell to
+        // the non-flag arm below, and returned `None` — so the inline script was
+        // never surfaced as a child script to ANY guard, while the command runs
+        // under bash, zsh and sh (measured). Direction: unescaping only surfaces
+        // MORE child scripts, so it can add blocks and never subtract
+        // (cadence-hooks#237 security review, F17).
+        let tok = unescape_word(raw);
+        let tok = tok.as_ref();
         let carries_c =
             tok == "-c" || (tok.starts_with('-') && !tok.starts_with("--") && tok.contains('c'));
         if carries_c {
@@ -3741,7 +4035,10 @@ fn shell_c_argument_tokens(tokens: &[String]) -> Option<String> {
             // single whitespace-bearing token — the shape `prevent-secret-leaks`
             // skips by design — so `bash -c -- 'cat .env'` reached no guard at
             // all while the plain spelling blocked (#496).
-            if tokens.get(i + 1).is_some_and(|t| t == "--") {
+            if tokens
+                .get(i + 1)
+                .is_some_and(|t| unescape_word(t).as_ref() == "--")
+            {
                 return tokens.get(i + 2).cloned();
             }
             return tokens.get(i + 1).cloned();
@@ -4062,6 +4359,124 @@ mod tests {
         ] {
             assert_eq!(command_word(token), want, "command_word({token:?})");
         }
+    }
+
+    #[test]
+    fn tokenize_marked_reports_which_tokens_were_quoted() {
+        // The one fact quote removal destroys. `'>leak'` and `>leak` come out
+        // byte-identical, so nothing downstream can tell a redirection from an
+        // operand the shell quoted without this flag.
+        // The offset is where quoting STARTS, in bytes of the produced text.
+        for (command, want_text, want_len) in [
+            ("git push origin '>leak'", ">leak", 0),
+            ("git push origin \">leak\"", ">leak", 0),
+            ("git push origin $'>leak'", ">leak", 0),
+            ("git push origin >leak", ">leak", 5),
+            ("git push origin main", "main", 4),
+            // The operator is unquoted and only the target is quoted — the
+            // distinction a boolean could not carry.
+            ("git push origin >\"$LOG\"", ">$LOG", 1),
+            ("git push origin 2>\"/dev/null\"", "2>/dev/null", 2),
+            ("git push origin >>\"$LOG\"", ">>$LOG", 2),
+            // Mid-operator quoting, and a quote that emits nothing at all.
+            ("git push origin 2'>'x", "2>x", 1),
+            ("git push origin '2'>x", "2>x", 0),
+            ("git push origin ''>log", ">log", 0),
+            ("git push origin '>'log", ">log", 0),
+        ] {
+            let marked = tokenize_marked(command);
+            let last = marked.last().expect("a token");
+            assert_eq!(last.text, want_text, "{command:?}");
+            assert_eq!(last.unquoted_prefix_len, want_len, "{command:?}");
+        }
+        // The mark does not leak across a token boundary.
+        let marked = tokenize_marked("'a' b");
+        assert_eq!(marked[0].unquoted_prefix_len, 0);
+        assert_eq!(marked[1].unquoted_prefix_len, 1);
+    }
+
+    #[test]
+    fn tokenize_is_the_text_projection_of_tokenize_marked() {
+        // `tokenize` delegates, so the two can never disagree about where a
+        // token ends — the drift this branch already paid for once.
+        for command in [
+            "git push origin '>leak' main",
+            "sh -c 'git push origin main'",
+            "( cd /x && git push ) > log",
+            "f() { rm note.md; }",
+            "git commit -m \"a 'b' c\"",
+            "",
+        ] {
+            let projected: Vec<String> = tokenize_marked(command)
+                .into_iter()
+                .map(|token| token.text)
+                .collect();
+            assert_eq!(tokenize(command), projected, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn executable_tokens_marked_aligns_its_flags_with_its_tokens() {
+        // The flags are aligned from the TAIL because the compound-head pipeline
+        // only drops from the front. A misalignment would silently mark the
+        // wrong token, so the lengths and the values are both pinned.
+        for (segment, want_last_len) in [
+            ("git push origin '>leak'", 0),
+            ("git push origin >leak", 5),
+            ("{ git push origin '>leak'", 0),
+            ("do git push origin '>leak'", 0),
+            ("if true; then git push origin '>leak'", 0),
+            ("{ git push origin >\"$LOG\"", 1),
+        ] {
+            let (tokens, unquoted_prefix_lens) = executable_tokens_marked(segment);
+            assert_eq!(tokens.len(), unquoted_prefix_lens.len(), "{segment:?}");
+            assert_eq!(
+                *unquoted_prefix_lens.last().expect("a mark"),
+                want_last_len,
+                "{segment:?} tokens={tokens:?}"
+            );
+            assert_eq!(tokens, executable_tokens(segment), "{segment:?}");
+        }
+    }
+
+    #[test]
+    fn unescape_word_applies_the_shells_quote_removal() {
+        // Pins the escape WALK directly, rather than only through
+        // `command_word`. The two spellings that matter sit one backslash
+        // apart: `g\it` runs git (measured under bash, zsh and sh), while
+        // `\\git` is a literal `\git` no shell can find — so a strip and a walk
+        // agree on the first and disagree on the second, and only the walk is
+        // right.
+        for (word, want) in [
+            // No backslash: identity.
+            ("git", "git"),
+            ("cd", "cd"),
+            // The escape is dropped and the next character kept.
+            ("g\\it", "git"),
+            ("gi\\t", "git"),
+            ("\\cd", "cd"),
+            ("\\c\\d", "cd"),
+            // `\\` is an ESCAPED backslash — one survives, and the word is a
+            // command name the shell cannot resolve.
+            ("\\\\git", "\\git"),
+            ("\\\\ls", "\\ls"),
+            // A backslash before a non-letter escapes it just the same.
+            ("a\\-b", "a-b"),
+            ("a\\\\-b", "a\\-b"),
+            // A trailing lone backslash is a line continuation: dropped, with
+            // nothing after it to keep.
+            ("git\\", "git"),
+        ] {
+            assert_eq!(unescape_word(word), want, "unescape_word({word:?})");
+        }
+    }
+
+    #[test]
+    fn unescape_word_borrows_when_there_is_nothing_to_unescape() {
+        // The common case must not allocate.
+        assert!(matches!(unescape_word("git"), Cow::Borrowed(_)));
+        assert!(matches!(unescape_word(""), Cow::Borrowed(_)));
+        assert!(matches!(unescape_word("g\\it"), Cow::Owned(_)));
     }
 
     #[test]
