@@ -195,8 +195,8 @@ fn collect_push_invocations(
             }
         }
 
-        if is_directory_verb(&tokens) {
-            match resolve_directory_verb(&tokens, &effective_dir) {
+        if let Some(verb_tokens) = directory_verb_tokens(&tokens) {
+            match resolve_directory_verb(verb_tokens, &effective_dir) {
                 Some(moved) => effective_dir = moved,
                 // The target could not be read. Keeping the pre-`cd` directory
                 // and saying nothing is the trap — see [`resolve_directory_verb`].
@@ -319,11 +319,49 @@ fn implicit_push_config_unresolvable(work_dir: &str) -> bool {
 /// unmodelled directory verb produces a wrong answer rather than a refusal.
 /// `pushd` with a literal path moves exactly like `cd`; `popd` returns to a
 /// directory this walk never recorded.
-fn is_directory_verb(tokens: &[String]) -> bool {
+///
+/// **The peel here is deliberately NARROWER than [`peel_command_runners`], which
+/// the push side uses.** That asymmetry is the point, not an oversight: a
+/// directory verb only moves THIS shell when it runs as a builtin of it.
+/// Measured against bash — `command cd /usr`, `builtin cd /usr`, `command -p cd
+/// /usr` and `\cd /usr` all print `/usr`, while `env cd /usr` and `nice cd /usr`
+/// print the ORIGINAL directory, because those exec a child that exits. Reusing
+/// the push side's peel would therefore move the tracked directory for commands
+/// bash leaves put — inventing exactly the wrong-repository answer this arm was
+/// rewritten to stop producing.
+///
+/// The verb itself goes through [`command_word`] for the same reason the push
+/// side does: a literal `tokens.first() == "cd"` test missed `\cd`, the standard
+/// way to sidestep an alias.
+///
+/// Returns the slice starting at the verb, so the caller's target walk sees the
+/// same words bash would.
+fn directory_verb_tokens(tokens: &[String]) -> Option<&[String]> {
+    let mut start = 0;
+    while start < tokens.len() {
+        let word = tokens[start].as_str();
+        if is_assignment_word(word) {
+            start += 1;
+            continue;
+        }
+        if matches!(command_word(word).as_ref(), "command" | "builtin") {
+            start += 1;
+            // `command`'s own flags (`-p`, `-v`, `-V`) sit before the verb.
+            // `command -v cd` only PRINTS, but it also carries no path, so it
+            // resolves to `None` and over-refuses rather than moving anywhere.
+            while start < tokens.len() && tokens[start].starts_with('-') && tokens[start] != "-" {
+                start += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    let rest = tokens.get(start..)?;
     matches!(
-        tokens.first().map(String::as_str),
-        Some("cd" | "pushd" | "popd")
+        command_word(rest.first()?).as_ref(),
+        "cd" | "pushd" | "popd"
     )
+    .then_some(rest)
 }
 
 /// Where a directory verb leaves the shell, or `None` when this walk cannot
@@ -346,14 +384,24 @@ fn is_directory_verb(tokens: &[String]) -> bool {
 /// answer*.
 ///
 /// Unreadable targets: a bare `cd`, `-` (`$OLDPWD`), any target carrying an
-/// unexpanded `$` or a backtick, `popd`, and a `pushd` with no literal path.
-/// `$` is tested anywhere in the token, not just at the front — `cd "$HOME/x"`
-/// and `cd /a/$B` are equally unknowable, and over-refusing costs a caller a
-/// refusal it can explain rather than a wrong repository.
+/// unexpanded `$` or a backtick, `popd`, a `pushd` with no literal path, and a
+/// `pushd +N`/`-N` stack rotation. `$` is tested anywhere in the token, not just
+/// at the front — `cd "$HOME/x"` and `cd /a/$B` are equally unknowable, and
+/// over-refusing costs a caller a refusal it can explain rather than a wrong
+/// repository.
+///
+/// `tokens` begins at the verb ([`directory_verb_tokens`] did the peel).
 fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<String> {
-    if tokens.first().map(String::as_str) == Some("popd") {
+    let verb = command_word(tokens.first()?);
+    if verb == "popd" {
         return None;
     }
+    // `pushd +N` / `pushd -N` rotate the directory stack, which this walk never
+    // modelled — measured moving the shell after two prior `pushd`s. The `-N`
+    // spelling is consumed by the flag skip below and lands on the no-target
+    // arm; `+N` reaches the match looking exactly like a relative path, and was
+    // resolving to a nonexistent `<dir>/+1` with `unresolved: false`.
+    let rotates_a_stack = verb == "pushd";
     let mut idx = 1;
     while tokens
         .get(idx)
@@ -362,7 +410,12 @@ fn resolve_directory_verb(tokens: &[String], effective_dir: &str) -> Option<Stri
         idx += 1;
     }
     match tokens.get(idx) {
-        Some(target) if target != "-" && !target.contains('$') && !target.contains('`') => {
+        Some(target)
+            if target != "-"
+                && !target.contains('$')
+                && !target.contains('`')
+                && !(rotates_a_stack && target.starts_with('+')) =>
+        {
             Some(resolve_cd_target(target, effective_dir))
         }
         _ => None,
@@ -1089,6 +1142,48 @@ mod tests {
             let invocation = only(command, "/repo");
             assert!(invocation.unresolved, "should be unresolved: {command}");
         }
+    }
+
+    #[test]
+    fn a_backslash_escaped_cd_moves_the_work_dir() {
+        // Measured: `bash -c 'cd /tmp; \cd /usr && pwd'` prints `/usr`. The
+        // backslash suppresses alias lookup and still runs the builtin.
+        let invocation = only("\\cd /other && git push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/other");
+        assert!(!invocation.unresolved);
+    }
+
+    #[test]
+    fn command_and_builtin_prefixed_cd_move_the_work_dir() {
+        // Measured: `command cd /usr`, `builtin cd /usr` and `command -p cd
+        // /usr` all print `/usr` — each runs the builtin in THIS shell.
+        for command in [
+            "command cd /other && git push origin main",
+            "builtin cd /other && git push origin main",
+            "command -p cd /other && git push origin main",
+        ] {
+            let invocation = only(command, "/repo");
+            assert_eq!(invocation.work_dir, "/other", "for {command}");
+            assert!(!invocation.unresolved, "for {command}");
+        }
+    }
+
+    #[test]
+    fn env_prefixed_cd_does_not_move_the_work_dir() {
+        // Measured: `bash -c 'cd /tmp; env cd /usr; pwd'` prints `/tmp`. `env`
+        // execs a CHILD, so the parent shell never moves — the push after it
+        // runs in the original directory, and saying so is the correct answer.
+        let invocation = only("env cd /other && git push origin main", "/repo");
+        assert_eq!(invocation.work_dir, "/repo");
+        assert!(!invocation.unresolved);
+    }
+
+    #[test]
+    fn pushd_stack_rotation_marks_every_later_push_unresolved() {
+        // `pushd +N`/`-N` rotate the directory stack, which this walk never
+        // modelled. Measured: after two pushds, `pushd +1` really does move.
+        assert!(only("pushd +1 && git push origin main", "/repo").unresolved);
+        assert!(only("pushd -0 && git push origin main", "/repo").unresolved);
     }
 
     #[test]

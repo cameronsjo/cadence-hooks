@@ -191,8 +191,14 @@ Third independent plan in the Step-0 queue.
 
 ## Progress
 
+**Canonical path note.** The contract-zone headings below (and the "Detection & range design"
+section) name `core::shell::push_invocations`; the shipped path is
+**`core::push::push_invocations`**, re-exported from `core::shell` so both spellings resolve.
+The headings are left as written — they are frozen contract text — so read this line as the
+correction.
+
 - [x] **Task 0** — `core::push::push_invocations` + `outbound_commits` + the
-  error-distinguishing `shell::git_output_detailed`, with 49 core unit tests.
+  error-distinguishing `shell::git_output_detailed`, with 53 core unit tests.
   Built on `feat/237-pre-push-secret-scan`.
 - [ ] **Task A** — the `prevent-secret-push` guard (its own PR, after Task 0 merges).
 - [ ] **Task B** — mandatory adversarial security review of the guard.
