@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The hooks-registration audit (`tests/hook_registration_audit.rs`) reads the `session` hook wiring from the `cadence` plugin, not `cadence-canon`.** `cadence-canon` is retired (cadence-ecosystem ADR-0030 Phase 2); its nine `session` hooks now ride the always-on `cadence` plugin. Docs (`docs/hooks.md`, `README.md`) and in-code comments updated to match. No behaviour change.
+
 ### Fixed
 
 - **`command_word` now applies the shell's quote removal to the whole verb, so a backslash INSIDE it no longer hides the command from every guard** (cadence-hooks#237 security review). It stripped only a leading backslash, and `basename` splits on `\` for the Windows branch — so `g\it` resolved to `it` and `gi\t` to `t`, neither folding to `git`. Every one of those spellings runs git under bash, zsh and sh (measured), and the segment was dropped instead: push-remote, `guard_rm` and `enforce_worktree` all saw nothing, and an empty result is the strongest allow shape there is. The unescape runs after the path split, so `C:\Program Files\Git\cmd\git.exe` still resolves to `git`.

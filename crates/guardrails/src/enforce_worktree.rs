@@ -3,9 +3,10 @@
 //! The invariant this enforces: **every session works in its own worktree on its
 //! own branch, or in a repo where `main` is the working branch by design**
 //! (dotfiles, vaults — marked with `CADENCE_ALLOW_MAIN`). Sessions in separate
-//! worktrees cannot collide on checkout state, which is what lets the advisory
-//! multi-session coordination layer (cadence-canon) retire — see
-//! claude-configurations ADR-0030.
+//! worktrees cannot collide on checkout state, which is what let the advisory
+//! multi-session coordination layer retire as a separate plugin in 2026-09
+//! (cadence-ecosystem ADR-0030 Phase 2 executed) — its hooks now ride the
+//! always-on `cadence` plugin. See claude-configurations ADR-0030.
 //!
 //! Blocks (exit 2) when a file mutation (`Edit`/`Write`/`MultiEdit`) or a Bash
 //! `git commit` targets the **primary checkout** (`.git` is a directory) of a
