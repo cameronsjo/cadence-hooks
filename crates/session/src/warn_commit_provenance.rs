@@ -274,15 +274,14 @@ fn resolve_message_path(path: &str, cwd: Option<&str>) -> Option<PathBuf> {
 /// The transcript is read AT MOST ONCE per run (not once for `Model:` and
 /// again for `Harness:`) — its content is threaded to both resolvers.
 /// `Model:`/`Harness:` are transcript- or env-sourced text, not the
-/// hardened Session-Id/Name/Machine fields, so each is passed through
+/// hardened Session-Id/Machine fields, so each is passed through
 /// `identity::sanitize_field` before interpolation: a crafted transcript
 /// `model`/`version` value, or an `AI_AGENT` env value, could otherwise
 /// smuggle newlines (serde decodes `\n` escapes to real control bytes) or
 /// oversized text into the nudge Claude reads as context.
 fn build_nudge(input: &HookInput, host: &str) -> String {
     let mut lines = Vec::new();
-    if let Some((name, session_id)) = resolve_session_name_and_id(input) {
-        lines.push(format!("Session-Name: {name}"));
+    if let Some(session_id) = resolve_session_id(input) {
         lines.push(format!("Session-Id: {session_id}"));
     }
     let transcript_content = input
@@ -309,16 +308,15 @@ fn build_nudge(input: &HookInput, host: &str) -> String {
     )
 }
 
-/// The session's display name and id, when the payload's `session_id` is
-/// present and safe to render. A missing or unsafe id omits both the
-/// `Session-Name:` and `Session-Id:` lines rather than rendering an untrusted
-/// value into the nudge Claude reads as context — same discipline as
+/// The session's id, when the payload carries one that is safe to render. A
+/// missing or unsafe id omits the `Session-Id:` line rather than rendering an
+/// untrusted value into the nudge Claude reads as context — same discipline as
 /// `persist_plan`'s and `branch_drift`'s session-id handling.
-fn resolve_session_name_and_id(input: &HookInput) -> Option<(String, String)> {
-    let session_id = input
+fn resolve_session_id(input: &HookInput) -> Option<String> {
+    input
         .session_id()
-        .filter(|s| identity::is_safe_session_id(s))?;
-    Some((identity::generate_name(session_id), session_id.to_string()))
+        .filter(|s| identity::is_safe_session_id(s))
+        .map(str::to_string)
 }
 
 /// The current session model, resolved from the transcript tail — same call
@@ -696,13 +694,13 @@ mod tests {
             let msg = result.message.unwrap();
 
             assert!(
-                msg.contains(&format!(
-                    "Session-Name: {}",
-                    identity::generate_name("cedar-session-id")
-                )),
-                "computed session name present: {msg}"
+                !msg.contains("Session-Name"),
+                "the name half of the tuple is retired: {msg}"
             );
-            assert!(msg.contains("Session-Id: cedar-session-id"), "{msg}");
+            assert!(
+                msg.lines().any(|l| l == "Session-Id: cedar-session-id"),
+                "Session-Id leads the suggested block: {msg}"
+            );
             assert!(msg.contains("Model: claude-fable-5"), "{msg}");
             assert!(msg.contains("Harness: claude-code 2.1.214"), "{msg}");
             assert!(

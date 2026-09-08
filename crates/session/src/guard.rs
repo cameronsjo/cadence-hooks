@@ -47,10 +47,14 @@ pub fn run_guard(input: &HookInput, peers: &[Peer]) -> CheckResult {
     if peers.is_empty() {
         return CheckResult::allow();
     }
-    // Names come from peer-written files — sanitize before interpolation.
+    // Short ids come from peer-written files, and `short_id` truncates without
+    // filtering — 8 bytes is room for a `\r` plus forged text. Sanitize before
+    // interpolation, same discipline as every other peer-supplied value.
     let peer_names: Vec<String> = peers
         .iter()
-        .map(|p| crate::identity::sanitize_field(&p.record.name, 40))
+        .map(|p| {
+            crate::identity::sanitize_field(crate::identity::short_id(&p.record.session_id), 8)
+        })
         .collect();
     let names = peer_names.join(", ");
 
@@ -89,9 +93,10 @@ pub fn run_guard(input: &HookInput, peers: &[Peer]) -> CheckResult {
             let Some(path) = input.file_path() else {
                 return CheckResult::allow();
             };
-            if let Some((peer_name, lane)) = path_in_peer_lane(&path, peers) {
+            if let Some((peer_session_id, lane)) = path_in_peer_lane(&path, peers) {
                 // Both values come from a peer-written file — sanitize.
-                let peer_name = crate::identity::sanitize_field(peer_name, 40);
+                let peer_name =
+                    crate::identity::sanitize_field(crate::identity::short_id(peer_session_id), 8);
                 let lane =
                     crate::identity::sanitize_field(lane, crate::identity::MAX_FIELD_DISPLAY);
                 return CheckResult::nudge(format!(
@@ -253,7 +258,9 @@ pub fn is_blanket_add(command: &str) -> bool {
 }
 
 /// If `path` falls inside any live peer's declared `touching` paths, return
-/// the peer's name and the matching lane prefix.
+/// the peer's FULL `session_id` and the matching lane prefix. The caller
+/// shortens and sanitizes the id for display; the full value is returned so
+/// nothing downstream has to re-derive identity from a truncated one.
 ///
 /// Lane entries per peer are capped at [`crate::identity::MAX_LANES`] so a
 /// crafted registry file with thousands of entries cannot force unbounded
@@ -273,7 +280,7 @@ pub fn path_in_peer_lane<'a>(path: &str, peers: &'a [Peer]) -> Option<(&'a str, 
                 || path == lane_trimmed
                 || path.ends_with(&format!("/{lane_trimmed}"))
             {
-                return Some((peer.record.name.as_str(), lane.as_str()));
+                return Some((peer.record.session_id.as_str(), lane.as_str()));
             }
         }
     }
@@ -287,11 +294,13 @@ mod tests {
     use cadence_hooks_core::Outcome;
     use cadence_hooks_core::test_builders::{make_bash, make_edit, make_multi_edit};
 
-    fn peer(name: &str, touching: &[&str]) -> Peer {
+    /// `session_id` IS the identity now, and the guard renders its first 8
+    /// chars — so the fixture's id is what the assertions below match on.
+    fn peer(session_id: &str, touching: &[&str]) -> Peer {
         Peer {
             record: SessionRecord {
-                name: name.into(),
-                session_id: format!("{name}-id"),
+                name: crate::identity::short_id(session_id).into(),
+                session_id: session_id.into(),
                 branch: Some("feat/peer-branch".into()),
                 touching: touching.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
@@ -340,7 +349,7 @@ mod tests {
         let r = run_guard(&input, &peers);
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
-        assert!(msg.contains("quiet-loom"));
+        assert!(msg.contains("quiet-lo"), "peer named by short id: {msg}");
         assert!(msg.contains("gh api"), "escape hatch suggested: {msg}");
     }
 
@@ -446,7 +455,7 @@ mod tests {
         let r = run_guard(&input, &peers);
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
-        assert!(msg.contains("quiet-loom"));
+        assert!(msg.contains("quiet-lo"), "peer named by short id: {msg}");
         assert!(msg.contains("crates/guardrails/"));
     }
 
@@ -462,7 +471,7 @@ mod tests {
         let r = run_guard(&input, &peers);
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
-        assert!(msg.contains("quiet-loom"));
+        assert!(msg.contains("quiet-lo"), "peer named by short id: {msg}");
         assert!(msg.contains("crates/guardrails/"));
     }
 
@@ -624,10 +633,10 @@ mod tests {
         let r = run_guard(&input, &peers);
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
-        assert!(!msg.contains("evil\nSYSTEM"), "newline flattened: {msg}");
+        assert!(!msg.contains("evil\nSYS"), "newline flattened: {msg}");
         assert!(
-            msg.contains("evil SYSTEM"),
-            "content preserved as inert text"
+            msg.contains("evil SYS"),
+            "content preserved as inert text, truncated to the short id: {msg}"
         );
     }
 }

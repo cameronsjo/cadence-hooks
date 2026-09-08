@@ -169,12 +169,14 @@ still counted — it simply bills at the 5-minute rate.
 Multi-session coordination for the **cadence** plugin (issue #54). Concurrent
 Claude Code sessions sharing one repo checkout cannot see each other — these hooks
 give sessions *identity* within a repo via a registry at `<repo>/.claude/sessions/`
-(one file per session, mtime is the liveness heartbeat, auto-excluded from git via
-`.git/info/exclude`).
+(one `<session-id>.json` per session, mtime is the liveness heartbeat, auto-excluded
+from git via `.git/info/exclude`). Sessions are displayed by the first 8 characters
+of that id, which is a display convenience — ownership is always decided on the full
+id.
 
 | Hook | Event | What it does |
 |------|-------|--------------|
-| `start` | SessionStart | Register this session, sweep stale entries, and disclose live peers with a lane assessment + the multi-session protocol |
+| `start` | SessionStart | Register this session, sweep stale entries, and disclose the live-peer count in one line (`cadence-hooks session status` for the detail) |
 | `heartbeat` | PostToolUse | Touch this session's registry file; refresh the recorded branch so peers see branch drift |
 | `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths |
 | `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time |

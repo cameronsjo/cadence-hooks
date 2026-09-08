@@ -42,9 +42,8 @@ use std::path::{Path, PathBuf};
 /// `SessionRecord`. A `.json` marker would be swept once it aged past the
 /// staleness window (default 30 min) — defeating the deferred design exactly
 /// for the "repo reopened later" case it exists to serve. With no extension,
-/// `sweep_stale`/`read_peers`/`find_own` all skip it (they filter on
-/// `.json`/`.<short-id>.json`), while the dir-level git exclusion still keeps it
-/// out of `git status`.
+/// `sweep_stale`/`read_peers`/`find_own` all skip it (they filter on `.json`),
+/// while the dir-level git exclusion still keeps it out of `git status`.
 const MARKER_FILENAME: &str = ".loose-ends";
 
 /// The loose-end signals a session left behind, mirroring outro Phase 1.
@@ -63,9 +62,6 @@ pub struct LooseEndMarker {
     pub unpushed: usize,
     /// Entries in the stash (`git stash list` line count).
     pub stashes: usize,
-    /// Deterministic name of the session that left the work (diagnostic).
-    #[serde(default)]
-    pub session_name: String,
     /// Session id that left the work (diagnostic).
     #[serde(default)]
     pub session_id: String,
@@ -185,7 +181,6 @@ impl Logger for BackstopRecord {
 
         let mut marker = detect_loose_ends(&root);
         if !sid.is_empty() {
-            marker.session_name = identity::generate_name(sid);
             marker.session_id = sid.to_string();
         }
         marker.ended = identity::utc_timestamp();
@@ -309,7 +304,6 @@ mod tests {
             uncommitted,
             unpushed,
             stashes,
-            session_name: "quiet-loom".into(),
             session_id: "self-session".into(),
             ended: "2026-06-19T00:00:00Z".into(),
         }
