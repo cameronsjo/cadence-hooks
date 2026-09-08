@@ -2119,7 +2119,15 @@ fn prune_liveness_gate(
     let mut unreadable: Vec<String> = Vec::new();
 
     for dir in sessions_dir.into_iter().chain(global_dir) {
-        unreadable.extend(session_registry::unreadable_records(dir));
+        // Deduped: the local registry and the shared mirror hold records for
+        // the same sessions, so the same base name can appear in both and the
+        // refusal would otherwise read "2 unreadable session records (x.json,
+        // x.json)".
+        for name in session_registry::unreadable_records(dir) {
+            if !unreadable.contains(&name) {
+                unreadable.push(name);
+            }
+        }
         for peer in session_registry::live_peers(dir, "", stale_secs) {
             let short = session_identity::short_id(&peer.record.session_id).to_string();
             let entry = by_session

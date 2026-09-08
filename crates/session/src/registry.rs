@@ -326,11 +326,21 @@ pub fn find_own(dir: &Path, session_id: &str) -> Option<PathBuf> {
 /// `find_own` uses it only for content equality and as a filename-suffix string
 /// match against `read_dir` entries, never as a path component — so the deleted
 /// path is always one already inside `dir`.
+///
+/// Removes EVERY verified-own file, not just the one `find_own` resolves. With
+/// both filename forms present — a SessionEnd firing before any 0.98.0 write
+/// migrated the record — deleting only the canonical one would leave the legacy
+/// file behind as a phantom peer until the age sweep reaches it, which is
+/// exactly the lingering-lane bug deregistration exists to prevent (#97).
 pub fn remove_own(dir: &Path, session_id: &str) -> std::io::Result<()> {
-    match find_own(dir, session_id) {
+    let first = match find_own(dir, session_id) {
         Some(path) => fs::remove_file(path),
         None => Ok(()),
-    }
+    };
+    // `canonical` is already gone (or was never there), so passing it as the
+    // "keep" name simply means "remove any remaining own file".
+    remove_legacy_duplicates(dir, session_id, &identity::filename(session_id));
+    first
 }
 
 /// Write `contents` to `path` atomically: stage to a uniquely-named temp file
@@ -444,7 +454,9 @@ pub fn write_record(dir: &Path, record: &SessionRecord) -> std::io::Result<()> {
 /// — the `<= 0.97.0` shape. Content-verified per file; a peer's record is never
 /// a candidate for deletion however its filename reads.
 ///
-// debt: two-form legacy filename match, remove at 0.99.0 — cadence-hooks#899
+// debt: two-form legacy filename match, remove at 0.99.0 — cadence-hooks#899;
+// costs a read_dir + parse of the registry on every heartbeat (local dir AND
+// the shared mirror) to find nothing once a machine has migrated
 fn remove_legacy_duplicates(dir: &Path, session_id: &str, canonical: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -915,6 +927,17 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         write_record(&dir, &record("session-", "session-1")).unwrap();
         write_record(&dir, &record("session-", "session-2")).unwrap();
+        // A canonical filename is exact-id, so the two records above alone
+        // would let `find_own` resolve on the FILENAME and the content check
+        // would never be load-bearing — the property this test names could not
+        // go red. This third file makes the two disagree: its name claims
+        // session-1, its record says session-2.
+        let liar = dir.join("session-1.decoy.json");
+        fs::write(
+            &liar,
+            serde_json::to_string_pretty(&record("session-", "session-2")).unwrap() + "\n",
+        )
+        .unwrap();
 
         let p1 = find_own(&dir, "session-1").expect("session-1 resolves");
         assert_eq!(
@@ -926,7 +949,38 @@ mod tests {
         assert_eq!(
             p2.file_name().unwrap().to_string_lossy(),
             "session-2.json",
-            "find_own(session-2) returned the wrong file: {p2:?}"
+            "find_own(session-2) resolved by filename, not by content: {p2:?}"
+        );
+        assert!(
+            liar.exists(),
+            "fixture precondition: the decoy still exists"
+        );
+    }
+
+    /// The canonical-vs-canonical arm of #90. Both files carry exact-id names,
+    /// so only the content check can tell them apart — plant a record whose
+    /// filename claims one id and whose body claims another, and `find_own`
+    /// must believe the body.
+    #[test]
+    fn find_own_believes_the_record_over_a_lying_canonical_filename() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("session-1.json"),
+            serde_json::to_string_pretty(&record("session-", "session-2")).unwrap() + "\n",
+        )
+        .unwrap();
+        assert!(
+            find_own(&dir, "session-1").is_none(),
+            "a filename claiming session-1 over a session-2 record resolves to nothing"
+        );
+        // And session-2 does not adopt it either: the prefilter requires a
+        // plausible NAME as well as matching content, so a record is only ever
+        // found under a filename that claims it. Both halves must agree.
+        assert!(
+            find_own(&dir, "session-2").is_none(),
+            "content alone does not resolve a record under a foreign filename"
         );
     }
 
@@ -1528,13 +1582,31 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         write_record(&dir, &record("session-", "session-1")).unwrap();
-        let peer = write_legacy(&dir, "beta-anvil", &record("beta-anvil", "session-2"));
+        let legacy_peer = write_legacy(&dir, "beta-anvil", &record("beta-anvil", "session-2"));
+        // A CANONICAL peer whose filename claims our id and whose record does
+        // not. Without this the delete resolves by exact filename and the
+        // content check is never the discriminator — the arm that matters,
+        // since this is a delete on state a live peer depends on.
+        let canonical_liar = dir.join("session-1.decoy.json");
+        fs::write(
+            &canonical_liar,
+            serde_json::to_string_pretty(&record("session-", "session-2")).unwrap() + "\n",
+        )
+        .unwrap();
+
         remove_own(&dir, "session-1").unwrap();
         assert!(
             !dir.join("session-1.json").exists(),
             "session-1 lane removed"
         );
-        assert!(peer.exists(), "colliding session-2 lane NOT cross-deleted");
+        assert!(
+            legacy_peer.exists(),
+            "colliding session-2 legacy lane NOT cross-deleted"
+        );
+        assert!(
+            canonical_liar.exists(),
+            "a file naming us but recording a peer is NOT cross-deleted"
+        );
     }
 
     #[test]

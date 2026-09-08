@@ -514,8 +514,13 @@ fn persist_plan_body(
         session_id,
         &machine_digest,
         &repo_root,
+        // NOT "an earlier session (<id>)" — `approving` is this session's own
+        // id on the same-session path, and naming that "earlier" tells a plan
+        // approved in the turn you are reading that it came from a previous
+        // one. "an earlier session" stays reserved for the unknown case, which
+        // is the only case where it is true.
         &approving
-            .map(|id| format!("an earlier session ({})", identity::short_id(id)))
+            .map(|id| format!("session {}", identity::short_id(id)))
             .unwrap_or_else(|| "an earlier session".to_string()),
         body,
         recommended_tier(body),
@@ -3011,7 +3016,7 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
         assert!(
-            msg.contains("approved in an earlier session (own-sess)"),
+            msg.contains("approved in session own-sess"),
             "the nudge names the approving session by short id: {msg}"
         );
 

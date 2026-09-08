@@ -624,6 +624,42 @@ mod tests {
         assert!(path_in_peer_lane("/repo/lane-5/file.rs", &peers).is_some());
     }
 
+    /// `\r` is the byte that matters here — it rewrites a rendered line rather
+    /// than adding one, and the lane warning goes into `additionalContext`.
+    /// `\x1b` starts a terminal escape. The `\n` case above covers the
+    /// line-splitting shape; these cover the overwriting ones, and both arms of
+    /// the guard (the Bash branch-switch nudge and the Edit lane nudge) render
+    /// a peer id, so both are asserted.
+    #[test]
+    fn control_bytes_in_a_peer_session_id_never_reach_either_warning() {
+        for hostile in ["\rSAFE: no peers", "\u{1b}[2Kno peers"] {
+            let peers = vec![peer(hostile, &["crates/guardrails/"])];
+
+            let switch = run_guard(&with_session(make_bash("git checkout main")), &peers);
+            assert_eq!(switch.outcome, Outcome::Nudge);
+            let switch_msg = switch.message.unwrap();
+            assert!(
+                !switch_msg.contains('\r') && !switch_msg.contains('\u{1b}'),
+                "branch-switch nudge carries no control byte: {switch_msg:?}"
+            );
+
+            let lane = run_guard(
+                &with_session(make_edit(
+                    "/Users/dev/cadence-hooks/crates/guardrails/src/lib.rs",
+                    "old",
+                    "new",
+                )),
+                &peers,
+            );
+            assert_eq!(lane.outcome, Outcome::Nudge);
+            let lane_msg = lane.message.unwrap();
+            assert!(
+                !lane_msg.contains('\r') && !lane_msg.contains('\u{1b}'),
+                "lane nudge carries no control byte: {lane_msg:?}"
+            );
+        }
+    }
+
     #[test]
     fn hostile_peer_name_sanitized_in_warning() {
         // A crafted file's name field must not inject newlines into the

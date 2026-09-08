@@ -2,8 +2,15 @@
 //!
 //! These are user/skill-facing commands, not hooks — they read no stdin
 //! payload and are exempt from hooks.json wiring (like
-//! `guardrails dismiss-main-branch-warn`). Both always exit successfully:
-//! a coordination convenience must never fail a script that calls it.
+//! `guardrails dismiss-main-branch-warn`). A coordination convenience must not
+//! fail a script that calls it, so both succeed on every answer they can give
+//! — including "no sessions registered", which is a real answer.
+//!
+//! The one exception is `session status` outside a git repository: there is no
+//! registry to read, so the question could not be asked at all. That exits 1
+//! with the message on stderr, because a parser needs to tell it apart from an
+//! empty registry. `session declare` keeps its exit-0 contract — it is a
+//! fire-and-forget write whose failure a caller has nothing to do about.
 
 use crate::identity;
 use crate::registry;
