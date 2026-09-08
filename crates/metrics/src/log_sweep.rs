@@ -20,20 +20,20 @@ use std::time::{Duration, SystemTime};
 
 /// Schema version stamped on every `sweeps.jsonl` row. A new stream (cadence#238
 /// convention) — does not share `common`'s existing version constants.
-const SWEEP_SCHEMA_VERSION: u32 = 1;
+///
+/// **2** drops the `name` field: session records no longer carry a word-pair
+/// name, and `sessionId` already identifies the reaped record.
+const SWEEP_SCHEMA_VERSION: u32 = 2;
+
+/// Schema version stamped on every `registry-parse-skips.jsonl` row.
+const PARSE_SKIP_SCHEMA_VERSION: u32 = 1;
 
 /// Build the `sweeps.jsonl` record. Pure — no I/O.
-fn build_sweep_record(
-    trigger: &str,
-    session_id: Option<&str>,
-    name: Option<&str>,
-    age_secs: u64,
-) -> Value {
+fn build_sweep_record(trigger: &str, session_id: Option<&str>, age_secs: u64) -> Value {
     json!({
         "schemaVersion": SWEEP_SCHEMA_VERSION,
         "trigger": trigger,
         "sessionId": session_id,
-        "name": name,
         "ageSecs": age_secs,
         "ts": common::utc_timestamp(),
     })
@@ -41,33 +41,60 @@ fn build_sweep_record(
 
 /// Append one sweep event to `<metrics_dir>/sweeps.jsonl`.
 ///
-/// `trigger` names the call site (`"heartbeat"` | `"start"`), `session_id` /
-/// `name` are the reaped record's identity when it could be parsed (`None`
-/// when the file was garbage or unreadable — the parse is best-effort and
-/// must never gate the delete it's recording), and `age_secs` is the file's
-/// mtime age at reap time.
+/// `trigger` names the call site (`"heartbeat"` | `"start"`), `session_id` is
+/// the reaped record's identity when it could be parsed (`None` when the file
+/// was garbage or unreadable — the parse is best-effort and must never gate the
+/// delete it's recording), and `age_secs` is the file's mtime age at reap time.
 ///
 /// Fully fail-open (ADR-0001): a missing dir it can't create, or a failed open
 /// / write, degrades to a no-op — the caller's delete is untouched.
-pub fn log_sweep(trigger: &str, session_id: Option<&str>, name: Option<&str>, age_secs: u64) {
-    let record = build_sweep_record(trigger, session_id, name, age_secs);
+pub fn log_sweep(trigger: &str, session_id: Option<&str>, age_secs: u64) {
+    append_row(
+        "sweeps.jsonl",
+        &build_sweep_record(trigger, session_id, age_secs),
+    );
+}
 
+/// Build the `registry-parse-skips.jsonl` record. Pure — no I/O.
+///
+/// `file` is the registry entry's BASE NAME, sanitized: it is attacker-chosen
+/// (anyone who can write the registry dir chooses it) and this row is read back
+/// by humans and by `doctor`.
+fn build_parse_skip_record(file: &str) -> Value {
+    json!({
+        "schemaVersion": PARSE_SKIP_SCHEMA_VERSION,
+        "file": cadence_hooks_core::display::sanitize_field(file, 120),
+        "ts": common::utc_timestamp(),
+    })
+}
+
+/// Append one row to `<metrics_dir>/registry-parse-skips.jsonl` — a session
+/// registry file that did not parse as a record.
+///
+/// Such a file is invisible to peer discovery, and `doctor --prune`'s liveness
+/// gate reads that invisibility as one fewer live session. The gate now counts
+/// it explicitly; this row is what makes the condition diagnosable afterwards.
+/// Fail-open (ADR-0001), like every writer in this crate.
+pub fn log_registry_parse_skip(file: &str) {
+    append_row("registry-parse-skips.jsonl", &build_parse_skip_record(file));
+}
+
+/// Append one JSON row to `<metrics_dir>/<file>`. Fail-open at every step.
+fn append_row(file: &str, record: &Value) {
     let dir = common::metrics_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let path = dir.join("sweeps.jsonl");
-
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    if let Ok(mut handle) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(dir.join(file))
     {
         // One `write_all` of the record + newline, so a concurrent append from
         // another session can't interleave a record with its trailing newline.
         let mut line = record.to_string();
         line.push('\n');
-        let _ = file.write_all(line.as_bytes());
+        let _ = handle.write_all(line.as_bytes());
     }
 }
 
@@ -115,21 +142,20 @@ mod tests {
 
     #[test]
     fn record_has_expected_fields_with_identity() {
-        let rec = build_sweep_record("heartbeat", Some("sess-1"), Some("quiet-loom"), 1800);
-        assert_eq!(rec["schemaVersion"], 1);
+        let rec = build_sweep_record("heartbeat", Some("sess-1"), 1800);
+        assert_eq!(rec["schemaVersion"], 2);
         assert_eq!(rec["trigger"], "heartbeat");
         assert_eq!(rec["sessionId"], "sess-1");
-        assert_eq!(rec["name"], "quiet-loom");
+        assert!(rec.get("name").is_none(), "schema 2 drops name: {rec}");
         assert_eq!(rec["ageSecs"], 1800);
         assert!(rec["ts"].is_string());
     }
 
     #[test]
     fn record_nulls_identity_when_unparsable() {
-        let rec = build_sweep_record("start", None, None, 42);
+        let rec = build_sweep_record("start", None, 42);
         assert_eq!(rec["trigger"], "start");
         assert!(rec["sessionId"].is_null());
-        assert!(rec["name"].is_null());
         assert_eq!(rec["ageSecs"], 42);
     }
 
@@ -164,13 +190,12 @@ mod tests {
     fn log_sweep_writes_one_line() {
         let tmp = tempfile::tempdir().unwrap();
         with_metrics_dir(tmp.path(), || {
-            log_sweep("heartbeat", Some("sess-1"), Some("quiet-loom"), 1800);
+            log_sweep("heartbeat", Some("sess-1"), 1800);
         });
         let rows = read_lines(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["trigger"], "heartbeat");
         assert_eq!(rows[0]["sessionId"], "sess-1");
-        assert_eq!(rows[0]["name"], "quiet-loom");
         assert_eq!(rows[0]["ageSecs"], 1800);
     }
 
@@ -178,13 +203,42 @@ mod tests {
     fn log_sweep_writes_null_identity_when_none() {
         let tmp = tempfile::tempdir().unwrap();
         with_metrics_dir(tmp.path(), || {
-            log_sweep("start", None, None, 99);
+            log_sweep("start", None, 99);
         });
         let rows = read_lines(tmp.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["trigger"], "start");
         assert!(rows[0]["sessionId"].is_null());
-        assert!(rows[0]["name"].is_null());
+    }
+
+    // --- registry parse skips ---
+
+    #[test]
+    fn parse_skip_row_sanitizes_the_filename() {
+        // The filename is chosen by whoever can write the registry dir.
+        let rec = build_parse_skip_record("evil\r\n0 live sessions.json");
+        assert_eq!(rec["schemaVersion"], 1);
+        assert!(
+            !rec["file"].as_str().unwrap().contains('\r'),
+            "no control bytes survive: {rec}"
+        );
+        assert!(rec["ts"].is_string());
+    }
+
+    #[test]
+    fn log_registry_parse_skip_writes_its_own_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_metrics_dir(tmp.path(), || {
+            log_registry_parse_skip("garbage.json");
+        });
+        let contents =
+            std::fs::read_to_string(tmp.path().join("registry-parse-skips.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(row["file"], "garbage.json");
+        assert!(
+            !tmp.path().join("sweeps.jsonl").exists(),
+            "a parse skip is not a reap — separate stream"
+        );
     }
 
     // --- count_recent (pure) ---
@@ -224,8 +278,8 @@ mod tests {
     fn recent_sweep_count_counts_within_window() {
         let tmp = tempfile::tempdir().unwrap();
         with_metrics_dir(tmp.path(), || {
-            log_sweep("heartbeat", Some("sess-1"), Some("quiet-loom"), 1800);
-            log_sweep("start", None, None, 42);
+            log_sweep("heartbeat", Some("sess-1"), 1800);
+            log_sweep("start", None, 42);
         });
         let count = recent_sweep_count(
             tmp.path(),
@@ -238,7 +292,7 @@ mod tests {
     #[test]
     fn recent_sweep_count_excludes_outside_window() {
         let tmp = tempfile::tempdir().unwrap();
-        let old_row = r#"{"schemaVersion":1,"trigger":"start","sessionId":null,"name":null,"ageSecs":1,"ts":"2000-01-01T00:00:00Z"}"#;
+        let old_row = r#"{"schemaVersion":2,"trigger":"start","sessionId":null,"ageSecs":1,"ts":"2000-01-01T00:00:00Z"}"#;
         std::fs::write(tmp.path().join("sweeps.jsonl"), format!("{old_row}\n")).unwrap();
         let count = recent_sweep_count(
             tmp.path(),

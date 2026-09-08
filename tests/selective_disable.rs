@@ -399,14 +399,21 @@ fn session_status_works_during_bypass() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(0));
+    // Exit 1 with the message on STDERR: "no registry to read" is a failure to
+    // answer the question, not an answer of "no sessions", and a shell parser
+    // needs to tell the two apart.
+    assert_eq!(output.status.code(), Some(1));
     assert!(
         !stderr.contains("all enforcement bypassed"),
         "status must not be swallowed by the bypass: {stderr}"
     );
     assert!(
-        stdout.contains("not inside a git repository"),
-        "status ran and reported the non-repo cwd: {stdout}"
+        stderr.contains("not inside a git repository"),
+        "status ran and reported the non-repo cwd on stderr: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "nothing on stdout for a question that could not be asked: {stdout}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

@@ -1,17 +1,35 @@
-//! Pure domain logic for session identity: deterministic naming, the record
-//! schema, and relative-age rendering. No I/O — everything here is testable
-//! without a filesystem.
+//! Pure domain logic for session identity: the record schema, short-id
+//! derivation, and relative-age rendering. No I/O — everything here is
+//! testable without a filesystem.
 
 use serde::{Deserialize, Serialize};
 
 /// A session's identity record — the contents of its registry file.
 ///
-/// The filename carries the identity claim (`<name>.<short-id>.json`); the
-/// record carries the lane declaration. `intent` and `touching` are
-/// best-effort, declared by Claude via `session declare` when it knows them.
+/// The filename carries the identity claim (`<session-id>.json`); the record
+/// carries the lane declaration. `intent` and `touching` are best-effort,
+/// declared by Claude via `session declare` when it knows them.
+///
+/// `#[serde(default)]` on the CONTAINER, not per field: a registry record is
+/// read by binaries of other versions on the same machine, and a missing key
+/// must degrade to a default rather than fail the whole parse. An unparsable
+/// record makes `doctor --prune`'s liveness gate see one fewer live session,
+/// which is the direction that deletes plugin dirs a live session is using.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct SessionRecord {
-    /// Human-readable deterministic name (e.g. `forge-warden`).
+    /// The session's 8-char short id, duplicating `session_id`'s prefix.
+    ///
+    /// Retained for exactly one release (0.98.0) and always written as
+    /// [`short_id`]. A 0.97.0 binary declares this field WITHOUT a serde
+    /// default, so a record lacking it fails to parse there — and a registry
+    /// of unparsable records makes 0.97.0's `doctor --prune` liveness gate
+    /// count zero live sessions and prune dirs they are pinned to.
+    ///
+    /// Removal rides cadence-hooks#899, gated on a check rather than a date:
+    /// no `<= 0.97.0` binary on any machine (`brew list --versions
+    /// cadence-hooks` plus a sweep of `target/` and `.claude/worktrees/`
+    /// builds).
     pub name: String,
     /// Full Claude Code session id.
     pub session_id: String,
@@ -50,73 +68,12 @@ pub struct SessionRecord {
     pub repo: Option<String>,
 }
 
-/// Workshop tools and instruments — the Artificer's bench.
-const ADJECTIVES: [&str; 32] = [
-    "amber",
-    "brisk",
-    "calm",
-    "cedar",
-    "copper",
-    "deft",
-    "dusk",
-    "ember",
-    "fern",
-    "frost",
-    "gilded",
-    "golden",
-    "hazel",
-    "hollow",
-    "iron",
-    "keen",
-    "marble",
-    "misty",
-    "oaken",
-    "pale",
-    "quiet",
-    "russet",
-    "silver",
-    "sober",
-    "steady",
-    "stone",
-    "swift",
-    "tidal",
-    "umber",
-    "velvet",
-    "wandering",
-    "woven",
-];
-
-/// Workshop tools and musical forms — what the voices play and build with.
-const NOUNS: [&str; 32] = [
-    "anthem", "anvil", "ballad", "bellows", "chisel", "chord", "fugue", "garden", "hammer", "kiln",
-    "lathe", "loom", "lyre", "mallet", "motif", "quill", "reed", "refrain", "rondo", "scale",
-    "sonata", "spindle", "tempo", "tongs", "verse", "viola", "vise", "wheel", "anchor", "beacon",
-    "compass", "lantern",
-];
-
-/// FNV-1a 64-bit hash. Stable across processes and Rust versions, unlike
-/// `DefaultHasher` whose parameters are unspecified — the same session id
-/// must map to the same name forever.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-/// Deterministic adjective-noun name for a session id (e.g. `quiet-loom`).
-pub fn generate_name(session_id: &str) -> String {
-    let hash = fnv1a(session_id.as_bytes());
-    let adjective = ADJECTIVES[(hash % ADJECTIVES.len() as u64) as usize];
-    let noun = NOUNS[((hash / ADJECTIVES.len() as u64) % NOUNS.len() as u64) as usize];
-    format!("{adjective}-{noun}")
-}
-
-/// The short id used in filenames: the first 8 characters of the session id.
+/// The short id a session is displayed by: the first 8 characters of the
+/// session id.
+///
+/// DISPLAY ONLY, and ambiguous by construction — two ids sharing a prefix
+/// share a short id (cadence-hooks#90). Ownership is always decided on the
+/// full `session_id`.
 pub fn short_id(session_id: &str) -> &str {
     let end = session_id
         .char_indices()
@@ -125,16 +82,38 @@ pub fn short_id(session_id: &str) -> &str {
     &session_id[..end]
 }
 
-/// Registry filename for a session: `<name>.<short-id>.json`.
-pub fn filename(name: &str, session_id: &str) -> String {
-    format!("{name}.{}.json", short_id(session_id))
+/// Registry filename for a session: `<session-id>.json`.
+///
+/// The FULL id, never [`short_id`]: two sessions sharing an 8-char prefix
+/// would otherwise overwrite each other's record (cadence-hooks#90).
+/// [`is_safe_session_id`] is what makes the raw id filename-safe, and
+/// `registry::write_record` refuses any id that fails it.
+pub fn filename(session_id: &str) -> String {
+    format!("{session_id}.json")
 }
 
-/// True when `session_id` is safe to embed in a filename — non-empty and only
-/// ASCII alphanumerics, `-`, or `_`. Rejects path separators and `..` so a
-/// hostile payload can never steer a write outside the registry directory.
+/// The longest `session_id` accepted. A Claude Code session id is a 36-char
+/// UUID; 200 leaves generous room for a hand-passed `--session-id` while
+/// staying under every filesystem's `NAME_MAX` for the derived names.
+///
+/// The BINDING constraint is `atomic_write`'s staging name
+/// (`.{session_id}.json.{pid}.tmp`), which overflows before the canonical one
+/// does: measured, a 240-char id passes the charset check and then fails the
+/// write with `File name too long (os error 63)`. `run_start` discards that
+/// error by design (ADR-0001 — a read-only filesystem must not break a session
+/// start), so the session runs LIVE AND UNREGISTERED, invisible to peer
+/// disclosure, to the lane guards, and to `doctor --prune`'s liveness gate.
+/// Refusing the id up front makes the failure deterministic and keeps the
+/// length out of the filesystem's hands (security review, cadence-hooks#899).
+pub const MAX_SESSION_ID_LEN: usize = 200;
+
+/// True when `session_id` is safe to embed in a filename — non-empty, at most
+/// [`MAX_SESSION_ID_LEN`] bytes, and only ASCII alphanumerics, `-`, or `_`.
+/// Rejects path separators and `..` so a hostile payload can never steer a
+/// write outside the registry directory.
 pub fn is_safe_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
+        && session_id.len() <= MAX_SESSION_ID_LEN
         && session_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -196,48 +175,6 @@ pub fn utc_timestamp() -> String {
 mod tests {
     use super::*;
 
-    // --- name generation ---
-
-    #[test]
-    fn name_is_deterministic() {
-        let a = generate_name("7b30411a-c0bf-4ab5-9ac6-95afe54ea53d");
-        let b = generate_name("7b30411a-c0bf-4ab5-9ac6-95afe54ea53d");
-        assert_eq!(a, b, "same session id must always map to the same name");
-    }
-
-    #[test]
-    fn name_differs_for_different_ids() {
-        let a = generate_name("7b30411a-c0bf-4ab5-9ac6-95afe54ea53d");
-        let b = generate_name("e4739a12-1111-2222-3333-444455556666");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn name_is_adjective_noun_shaped() {
-        let name = generate_name("any-session-id");
-        let parts: Vec<&str> = name.split('-').collect();
-        assert_eq!(parts.len(), 2, "name should be adjective-noun: {name}");
-        assert!(ADJECTIVES.contains(&parts[0]));
-        assert!(NOUNS.contains(&parts[1]));
-    }
-
-    #[test]
-    fn name_stable_across_versions_pin() {
-        // Pin known hash → name mappings. If this test fails, the hash
-        // function or wordlists changed, and every existing registry
-        // filename breaks on upgrade — that's a breaking change, not a
-        // test to update casually.
-        assert_eq!(generate_name("7b30411a-self-test"), "swift-tempo");
-        assert_eq!(generate_name("7b30411a"), "wandering-lyre");
-    }
-
-    #[test]
-    fn empty_session_id_still_produces_name() {
-        // Degenerate input — should not panic.
-        let name = generate_name("");
-        assert!(name.contains('-'));
-    }
-
     // --- short id / filename ---
 
     #[test]
@@ -252,11 +189,10 @@ mod tests {
     }
 
     #[test]
-    fn filename_combines_name_and_short_id() {
-        assert_eq!(
-            filename("quiet-loom", "e4739a12-1111-2222"),
-            "quiet-loom.e4739a12.json"
-        );
+    fn filename_is_the_full_session_id() {
+        // Never the 8-char short id: two ids sharing a prefix would overwrite
+        // each other (cadence-hooks#90).
+        assert_eq!(filename("e4739a12-1111-2222"), "e4739a12-1111-2222.json");
     }
 
     // --- session id safety ---
@@ -265,6 +201,17 @@ mod tests {
     fn safe_session_id_accepts_uuids() {
         assert!(is_safe_session_id("7b30411a-c0bf-4ab5-9ac6-95afe54ea53d"));
         assert!(is_safe_session_id("abc_123"));
+    }
+
+    #[test]
+    fn safe_session_id_rejects_an_overlong_id() {
+        // `atomic_write`'s `.{id}.json.{pid}.tmp` staging name overflows
+        // NAME_MAX before the canonical name does — measured at 240 chars,
+        // `File name too long (os error 63)`. `run_start` discards that error
+        // by design, so the session would run live and unregistered.
+        assert!(is_safe_session_id(&"a".repeat(MAX_SESSION_ID_LEN)));
+        assert!(!is_safe_session_id(&"a".repeat(MAX_SESSION_ID_LEN + 1)));
+        assert!(!is_safe_session_id(&"a".repeat(240)));
     }
 
     #[test]
@@ -336,7 +283,7 @@ mod tests {
     #[test]
     fn record_round_trips_json() {
         let record = SessionRecord {
-            name: "quiet-loom".into(),
+            name: "e4739a12".into(),
             session_id: "e4739a12".into(),
             branch: Some("feat/issue-52".into()),
             declared_branch: Some("feat/issue-52".into()),
@@ -354,7 +301,7 @@ mod tests {
     #[test]
     fn record_omits_empty_optional_fields() {
         let record = SessionRecord {
-            name: "quiet-loom".into(),
+            name: "e4739a12".into(),
             session_id: "e4739a12".into(),
             ..Default::default()
         };
@@ -370,12 +317,31 @@ mod tests {
         // the identity fields must still parse.
         let record: SessionRecord =
             serde_json::from_str(r#"{"name":"a-b","session_id":"s1"}"#).unwrap();
-        assert_eq!(record.name, "a-b");
+        assert_eq!(record.session_id, "s1");
         assert!(record.branch.is_none());
         // A pre-upgrade record (no declared_branch key) parses to None — no
         // migration needed; it self-heals on the next `session start` back-fill.
         assert!(record.declared_branch.is_none());
         assert!(record.touching.is_empty());
+    }
+
+    #[test]
+    fn record_parses_json_without_a_name() {
+        // `name` is retained for one release only (cadence-hooks#899). A
+        // record written after its removal — or hand-written without it — must
+        // still parse, or `doctor --prune`'s liveness gate reads a registry of
+        // live sessions as empty and prunes dirs they are pinned to.
+        let record: SessionRecord = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert_eq!(record.session_id, "s1");
+        assert!(record.name.is_empty());
+    }
+
+    #[test]
+    fn record_parses_json_with_no_fields_at_all() {
+        // `#[serde(default)]` on the container: no future field addition can
+        // make an older record unparsable.
+        let record: SessionRecord = serde_json::from_str("{}").unwrap();
+        assert!(record.session_id.is_empty());
     }
 
     // --- timestamps ---

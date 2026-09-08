@@ -1471,7 +1471,7 @@ fn main() {
                 cadence_hooks_session::cli::run_declare(intent, touching, session_id);
             }
             SessionCommands::Status => {
-                cadence_hooks_session::cli::run_status();
+                process::exit(cadence_hooks_session::cli::run_status().into());
             }
         },
     }

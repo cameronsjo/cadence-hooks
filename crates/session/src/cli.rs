@@ -2,8 +2,15 @@
 //!
 //! These are user/skill-facing commands, not hooks — they read no stdin
 //! payload and are exempt from hooks.json wiring (like
-//! `guardrails dismiss-main-branch-warn`). Both always exit successfully:
-//! a coordination convenience must never fail a script that calls it.
+//! `guardrails dismiss-main-branch-warn`). A coordination convenience must not
+//! fail a script that calls it, so both succeed on every answer they can give
+//! — including "no sessions registered", which is a real answer.
+//!
+//! The one exception is `session status` outside a git repository: there is no
+//! registry to read, so the question could not be asked at all. That exits 1
+//! with the message on stderr, because a parser needs to tell it apart from an
+//! empty registry. `session declare` keeps its exit-0 contract — it is a
+//! fire-and-forget write whose failure a caller has nothing to do about.
 
 use crate::identity;
 use crate::registry;
@@ -93,7 +100,7 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
 
     // Upsert: keep existing fields, apply the declaration.
     let mut record = registry::read_own(&dir, &sid).unwrap_or_else(|| identity::SessionRecord {
-        name: identity::generate_name(&sid),
+        name: identity::short_id(&sid).to_string(),
         session_id: sid.clone(),
         started: identity::utc_timestamp(),
         started_epoch: identity::now_epoch(),
@@ -123,7 +130,7 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
                 .collect();
             println!(
                 "Declared: {} working on {}{}",
-                identity::sanitize_field(&record.name, 40),
+                identity::sanitize_field(identity::short_id(&record.session_id), 8),
                 record
                     .intent
                     .as_deref()
@@ -140,56 +147,76 @@ pub fn run_declare(intent: Option<String>, touching: Vec<String>, session_id: Op
     }
 }
 
+/// Render one `session status` row for `peer`, marking it ` (you)` when its
+/// record is the caller's. Pure — the whole display contract in one testable
+/// function.
+///
+/// The short id leads the row and is SANITIZED: `session_id` is peer-written
+/// JSON and [`identity::short_id`] truncates without filtering, so 8 bytes is
+/// room for a `\r` plus forged text on a terminal line a human acts on.
+/// Ownership is decided on the FULL id — a peer sharing this session's 8-char
+/// prefix must not wear the ` (you)` marker.
+fn status_row(peer: &registry::Peer, own_session_id: Option<&str>) -> String {
+    let r = &peer.record;
+    let mine = own_session_id.is_some_and(|own| own == r.session_id);
+    let mut out = format!(
+        "  {:<10} branch={:<30} active {}{}{}",
+        identity::sanitize_field(identity::short_id(&r.session_id), 8),
+        r.branch
+            .as_deref()
+            .map(|b| identity::sanitize_field(b, identity::MAX_FIELD_DISPLAY))
+            .unwrap_or_else(|| "-".to_string()),
+        identity::relative_age(peer.idle_secs),
+        if peer.stale { "  [STALE]" } else { "" },
+        if mine { "  (you)" } else { "" }
+    );
+    if let Some(intent) = &r.intent {
+        out.push_str(&format!(
+            "\n  {:<10} intent: {}",
+            "",
+            identity::sanitize_field(intent, identity::MAX_FIELD_DISPLAY)
+        ));
+    }
+    if !r.touching.is_empty() {
+        let lanes: Vec<String> = r
+            .touching
+            .iter()
+            .take(identity::MAX_LANES)
+            .map(|t| identity::sanitize_field(t, identity::MAX_FIELD_DISPLAY))
+            .collect();
+        out.push_str(&format!("\n  {:<10} touching: {}", "", lanes.join(", ")));
+    }
+    out
+}
+
 /// `session status` — list live and stale sessions in this repo's registry.
-pub fn run_status() {
+/// Returns the process exit code.
+///
+/// Exit 1 with the message on STDERR when there is no registry to read (not a
+/// git repository): a caller that pipes this into a parser needs to tell "no
+/// sessions" from "the question could not be asked". An empty registry is a
+/// real answer and stays on stdout at exit 0.
+pub fn run_status() -> u8 {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
     let Some(dir) = registry::sessions_dir(&cwd) else {
-        println!("session status: not inside a git repository.");
-        return;
+        eprintln!("session status: not inside a git repository.");
+        return 1;
     };
     let stale_secs = registry::stale_minutes() * 60;
     // Pass an id no real session can have so every entry is listed.
     let all = registry::read_peers(&dir, "", stale_secs);
     if all.is_empty() {
         println!("No sessions registered in {}", dir.display());
-        return;
+        return 0;
     }
+    let own = resolve_session_id(None);
     println!("Sessions in {}:\n", dir.display());
-    // Every displayed field comes from peer-written files — sanitize, same
-    // discipline as the hook paths (garbled terminal output is lower stakes
-    // than context injection, but the rule is one rule).
     for peer in &all {
-        let r = &peer.record;
-        println!(
-            "  {:<20} {:<10} branch={:<30} active {}{}",
-            identity::sanitize_field(&r.name, 40),
-            identity::short_id(&r.session_id),
-            r.branch
-                .as_deref()
-                .map(|b| identity::sanitize_field(b, identity::MAX_FIELD_DISPLAY))
-                .unwrap_or_else(|| "-".to_string()),
-            identity::relative_age(peer.idle_secs),
-            if peer.stale { "  [STALE]" } else { "" }
-        );
-        if let Some(intent) = &r.intent {
-            println!(
-                "  {:<20} intent: {}",
-                "",
-                identity::sanitize_field(intent, identity::MAX_FIELD_DISPLAY)
-            );
-        }
-        if !r.touching.is_empty() {
-            let lanes: Vec<String> = r
-                .touching
-                .iter()
-                .take(identity::MAX_LANES)
-                .map(|t| identity::sanitize_field(t, identity::MAX_FIELD_DISPLAY))
-                .collect();
-            println!("  {:<20} touching: {}", "", lanes.join(", "));
-        }
+        println!("{}", status_row(peer, own.as_deref()));
     }
+    0
 }
 
 #[cfg(test)]
@@ -278,6 +305,58 @@ mod tests {
             None,
         );
         assert_eq!(resolved.as_deref(), Some("from-claude-session-id"));
+    }
+
+    // --- status rows ---
+
+    fn status_peer(session_id: &str, branch: Option<&str>) -> registry::Peer {
+        registry::Peer {
+            record: identity::SessionRecord {
+                name: identity::short_id(session_id).into(),
+                session_id: session_id.into(),
+                branch: branch.map(str::to_string),
+                ..Default::default()
+            },
+            idle_secs: 120,
+            age_secs: 2400,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn status_row_leads_with_the_short_id_and_no_name_column() {
+        let row = status_row(&status_peer("e4739a12-1111", Some("feat/x")), None);
+        assert!(row.trim_start().starts_with("e4739a12"), "{row}");
+        assert!(row.contains("branch=feat/x"), "{row}");
+        assert!(!row.contains("(you)"), "another session is not you: {row}");
+    }
+
+    #[test]
+    fn status_row_marks_the_callers_own_row() {
+        let peer = status_peer("e4739a12-1111", None);
+        assert!(
+            status_row(&peer, Some("e4739a12-1111")).contains("(you)"),
+            "the caller's own row is marked"
+        );
+        // #90: a peer sharing the 8-char prefix is a DIFFERENT session.
+        assert!(
+            !status_row(&peer, Some("e4739a12-2222")).contains("(you)"),
+            "ownership is the full id, never the short one"
+        );
+    }
+
+    #[test]
+    fn status_row_renders_no_control_byte_from_a_crafted_session_id() {
+        // A hand-planted registry file chooses `session_id` freely, and
+        // `short_id` truncates without filtering — 8 bytes is room for a \r
+        // plus forged text on a line a human reads and acts on.
+        for hostile in ["\rSAFE: 0 live sessions", "\u{1b}[2K0 live sessions"] {
+            let row = status_row(&status_peer(hostile, None), None);
+            assert!(
+                !row.contains('\r') && !row.contains('\u{1b}'),
+                "no control byte survives: {row:?}"
+            );
+        }
     }
 
     // --- declaration semantics ---

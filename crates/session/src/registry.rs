@@ -154,10 +154,22 @@ pub fn read_peers(dir: &Path, own_session_id: &str, stale_secs: u64) -> Vec<Peer
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
+        // Fail open for discovery: a corrupt record must not break peer
+        // discovery for everyone else. `unreadable_records` is the fail-CLOSED
+        // companion the `doctor --prune` gate consults, so the two together
+        // never let such a file simply vanish.
         let Ok(record) = serde_json::from_str::<SessionRecord>(&text) else {
             continue;
         };
-        if record.session_id == own_session_id {
+        // `!own.is_empty()` FIRST. Callers that want every entry listed pass
+        // `""` (the CLI, and `doctor --prune`'s gate), and a record carrying no
+        // `session_id` deserializes to `""` under the container-level
+        // `#[serde(default)]` — so a bare `{"branch":"main"}` planted in the
+        // shared registry would match `""` and be skipped as "self" by the one
+        // caller whose whole job is to see everything. That is the prune gate
+        // proceeding against a directory it was just told to distrust
+        // (security review, cadence-hooks#899).
+        if !own_session_id.is_empty() && record.session_id == own_session_id {
             continue;
         }
         // Unreadable or future mtime => maximally stale, per `mtime_age_secs`.
@@ -175,6 +187,54 @@ pub fn read_peers(dir: &Path, own_session_id: &str, stale_secs: u64) -> Vec<Peer
     // Most recently active first — the liveliest peer is the most relevant.
     peers.sort_by_key(|p| p.idle_secs);
     peers
+}
+
+/// The base names of `.json` files in `dir` that do NOT parse as a
+/// [`SessionRecord`], sanitized for display.
+///
+/// [`read_peers`] fails open on such a file, which is right for disclosure and
+/// wrong for a liveness GATE: an unreadable record may be a live session, and a
+/// gate that cannot see it proceeds with a destructive operation. `doctor
+/// --prune` counts these alongside its live peers so an unreadable record
+/// blocks rather than disappears, and NAMES them — `1 unreadable session
+/// record` with no path leaves the operator only the blunt
+/// `CADENCE_DOCTOR_PRUNE_FORCE=1`, which disables the gate for real live peers
+/// too.
+///
+/// Each name is emitted to `registry-parse-skips.jsonl`. The telemetry lives
+/// HERE rather than in [`read_peers`] deliberately: `read_peers` runs on every
+/// wired Edit/Write and every heartbeat, so one persistently-fresh garbage file
+/// would make every tool call in every session on the machine append a row to
+/// an unrotated log. This function runs on the `doctor` path, which is bounded
+/// and is exactly when the condition matters.
+///
+/// A missing or unreadable directory yields nothing — there is nothing there to
+/// be wrong about, and the caller already handles "no registry" as "no
+/// sessions".
+pub fn unreadable_records(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter(|p| {
+            fs::read_to_string(p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<SessionRecord>(&t).ok())
+                .is_none()
+        })
+        .map(|p| {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            cadence_hooks_metrics::log_registry_parse_skip(&name);
+            identity::sanitize_field(&name, identity::MAX_FIELD_DISPLAY)
+        })
+        .collect()
 }
 
 /// Live (non-stale) peers only.
@@ -200,25 +260,57 @@ fn matches_own(path: &Path, session_id: &str) -> bool {
         .is_some_and(|r| r.session_id == session_id)
 }
 
-/// Find a session's own registry file. The `.<short-id>.json` suffix narrows
-/// the candidates cheaply; [`matches_own`] then verifies the full `session_id`,
-/// so a peer that merely shares this session's 8-char prefix is never mistaken
-/// for it (#90). Returns `None` when no candidate verifies — or when more than
-/// one does (ambiguous; reachable only via crafted/duplicate records, since
-/// production naming is deterministic), refusing to guess which is ours.
+/// Cheap filename PRE-FILTER for a session's own registry file — never the
+/// authority. Two shapes qualify:
+///
+/// - `<session-id>.json`, the canonical name 0.98.0 writes; and
+/// - `<name>.<short-id>.json`, the legacy name `<= 0.97.0` wrote.
+///
+/// Every caller conjoins this with [`matches_own`], which compares the FULL
+/// `session_id` stored in the record. The legacy suffix is ambiguous by
+/// construction (#90) and the canonical name is not, but the content check is
+/// what makes both safe — a filename is a hint, a record's `session_id` is the
+/// claim.
+///
+// debt: two-form legacy filename match, remove at 0.99.0 — cadence-hooks#899
+fn is_own_candidate(file_name: &str, session_id: &str) -> bool {
+    file_name == identity::filename(session_id)
+        || file_name.ends_with(&format!(".{}.json", identity::short_id(session_id)))
+}
+
+/// Find a session's own registry file. [`is_own_candidate`] narrows the
+/// candidates cheaply; [`matches_own`] then verifies the full `session_id`, so
+/// a peer that merely shares this session's 8-char prefix is never mistaken for
+/// it (#90).
+///
+/// When both filename forms are present for the same id — the state between a
+/// `<= 0.97.0` write and this session's first heartbeat — the CANONICAL file
+/// wins rather than the pair reading as ambiguous; `write_record` collapses the
+/// two on the next write anyway. Beyond that pair, more than one verified
+/// candidate is genuinely ambiguous (crafted or duplicated legacy records) and
+/// resolves to `None` rather than a guess.
 pub fn find_own(dir: &Path, session_id: &str) -> Option<PathBuf> {
-    let suffix = format!(".{}.json", identity::short_id(session_id));
     let entries = fs::read_dir(dir).ok()?;
-    let mut matches = entries.flatten().map(|e| e.path()).filter(|p| {
-        p.file_name()
-            .is_some_and(|n| n.to_string_lossy().ends_with(&suffix))
-            && matches_own(p, session_id)
-    });
-    let first = matches.next()?;
-    if matches.next().is_some() {
-        return None;
+    let mut matches: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| is_own_candidate(&n.to_string_lossy(), session_id))
+                && matches_own(p, session_id)
+        })
+        .collect();
+    let canonical = identity::filename(session_id);
+    if let Some(i) = matches
+        .iter()
+        .position(|p| p.file_name().is_some_and(|n| n == canonical.as_str()))
+    {
+        return Some(matches.swap_remove(i));
     }
-    Some(first)
+    match matches.len() {
+        1 => matches.pop(),
+        _ => None,
+    }
 }
 
 /// Deregister a session: remove its own registry file so it stops appearing as
@@ -234,11 +326,21 @@ pub fn find_own(dir: &Path, session_id: &str) -> Option<PathBuf> {
 /// `find_own` uses it only for content equality and as a filename-suffix string
 /// match against `read_dir` entries, never as a path component — so the deleted
 /// path is always one already inside `dir`.
+///
+/// Removes EVERY verified-own file, not just the one `find_own` resolves. With
+/// both filename forms present — a SessionEnd firing before any 0.98.0 write
+/// migrated the record — deleting only the canonical one would leave the legacy
+/// file behind as a phantom peer until the age sweep reaches it, which is
+/// exactly the lingering-lane bug deregistration exists to prevent (#97).
 pub fn remove_own(dir: &Path, session_id: &str) -> std::io::Result<()> {
-    match find_own(dir, session_id) {
+    let first = match find_own(dir, session_id) {
         Some(path) => fs::remove_file(path),
         None => Ok(()),
-    }
+    };
+    // `canonical` is already gone (or was never there), so passing it as the
+    // "keep" name simply means "remove any remaining own file".
+    remove_legacy_duplicates(dir, session_id, &identity::filename(session_id));
+    first
 }
 
 /// Write `contents` to `path` atomically: stage to a uniquely-named temp file
@@ -304,11 +406,79 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 /// Write (or overwrite) a record's file in the registry. Creates the
 /// directory if needed. Writing refreshes mtime — this *is* the heartbeat.
+///
+/// **Refuses an unsafe `session_id`.** The filename is now the raw id, so
+/// [`identity::is_safe_session_id`] is what keeps the write inside `dir`;
+/// guarding it here rather than in each caller means a future call site cannot
+/// forget. `InvalidInput` rather than a silent no-op: a caller that cannot
+/// register wants to know, and every current caller already discards the
+/// result on the mirror path.
+///
+/// After the canonical file lands, any OTHER file in `dir` that is this
+/// session's record under the legacy `<name>.<short-id>.json` name is removed,
+/// so a machine upgrading from `<= 0.97.0` converges to one file per session on
+/// the first heartbeat instead of carrying a permanent duplicate that reads as
+/// a second live peer. The removal arm is content-verified by [`matches_own`],
+/// exactly like [`find_own`]: a peer sharing this session's 8-char prefix
+/// passes the filename pre-filter and MUST NOT be deleted (#90). A removal
+/// error is logged as a diagnostic and never fails the write — the record is
+/// already on disk and the duplicate is cosmetic (ADR-0001).
+///
+/// The retained `name` field (cadence-hooks#899) is NORMALIZED here rather than
+/// trusted from the caller, so it is a pure derivation of `session_id` at every
+/// write. Trusting the caller left a `<= 0.97.0` word-pair name riding along
+/// forever, because the upsert paths carry an existing record forward field by
+/// field and none of them rewrote it.
 pub fn write_record(dir: &Path, record: &SessionRecord) -> std::io::Result<()> {
+    if !identity::is_safe_session_id(&record.session_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to write a registry record: session_id is not filename-safe \
+             (expected ASCII alphanumerics, '-', or '_')",
+        ));
+    }
+    let record = &SessionRecord {
+        name: identity::short_id(&record.session_id).to_string(),
+        ..record.clone()
+    };
     fs::create_dir_all(dir)?;
-    let path = dir.join(identity::filename(&record.name, &record.session_id));
+    let canonical = identity::filename(&record.session_id);
+    let path = dir.join(&canonical);
     let json = serde_json::to_string_pretty(record).unwrap_or_else(|_| "{}".to_string());
-    atomic_write(&path, (json + "\n").as_bytes())
+    atomic_write(&path, (json + "\n").as_bytes())?;
+    remove_legacy_duplicates(dir, &record.session_id, &canonical);
+    Ok(())
+}
+
+/// Remove this session's own records under any filename OTHER than `canonical`
+/// — the `<= 0.97.0` shape. Content-verified per file; a peer's record is never
+/// a candidate for deletion however its filename reads.
+///
+// debt: two-form legacy filename match, remove at 0.99.0 — cadence-hooks#899;
+// costs a read_dir + parse of the registry on every heartbeat (local dir AND
+// the shared mirror) to find nothing once a machine has migrated
+fn remove_legacy_duplicates(dir: &Path, session_id: &str, canonical: &str) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if name == canonical || !is_own_candidate(&name, session_id) {
+            continue;
+        }
+        if !matches_own(&path, session_id) {
+            continue;
+        }
+        if let Err(e) = fs::remove_file(&path) {
+            eprintln!(
+                "cadence-hooks session: could not remove the superseded registry file {}: {e}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Read a session's own record, if registered.
@@ -347,7 +517,7 @@ pub fn touch_own(
             existing
         }
         None => SessionRecord {
-            name: identity::generate_name(session_id),
+            name: identity::short_id(session_id).to_string(),
             session_id: session_id.to_string(),
             branch: branch.clone(),
             declared_branch: branch,
@@ -382,9 +552,10 @@ pub fn touch_own(
 /// Delete registry files whose mtime is older than `stale_secs`, never the
 /// caller's own file.
 ///
-/// `own_session_id` is matched the same way [`find_own`] resolves it — the
-/// `.<short-id>.json` suffix narrows candidates, then the full `session_id` is
-/// verified ([`matches_own`]) — and excluded from the sweep even when aged. A
+/// `own_session_id` is matched the same way [`find_own`] resolves it —
+/// [`is_own_candidate`] narrows candidates (both filename forms), then the full
+/// `session_id` is verified ([`matches_own`]) — and excluded from the sweep even
+/// when aged. A
 /// peer that merely shares the 8-char prefix is NOT spared (#90). A quiet
 /// session (read/think phase, or paused) still owns its lane; callers
 /// (`session start` and the PostToolUse heartbeat) refresh their own mtime
@@ -395,24 +566,22 @@ pub fn touch_own(
 /// through to [`cadence_hooks_metrics::log_sweep`] for every reaped file, so
 /// cross-machine/cross-session liveness sweeps become observable (#259). Each
 /// reaped file is best-effort re-parsed as a [`SessionRecord`] to recover its
-/// `name`/`session_id` for the log row — this parse is ONLY for telemetry and
-/// never gates or blocks the delete; an unparsable file still logs (with
-/// `None`/`None`) and still gets reaped.
+/// `session_id` for the log row — this parse is ONLY for telemetry and never
+/// gates or blocks the delete; an unparsable file still logs (with `None`) and
+/// still gets reaped.
 pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str, trigger: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    let own_suffix = (!own_session_id.is_empty())
-        .then(|| format!(".{}.json", identity::short_id(own_session_id)));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if let Some(suffix) = &own_suffix
+        if !own_session_id.is_empty()
             && path
                 .file_name()
-                .is_some_and(|n| n.to_string_lossy().ends_with(suffix.as_str()))
+                .is_some_and(|n| is_own_candidate(&n.to_string_lossy(), own_session_id))
             && matches_own(&path, own_session_id)
         {
             continue;
@@ -430,7 +599,6 @@ pub fn sweep_stale(dir: &Path, stale_secs: u64, own_session_id: &str, trigger: &
             cadence_hooks_metrics::log_sweep(
                 trigger,
                 record.as_ref().map(|r| r.session_id.as_str()),
-                record.as_ref().map(|r| r.name.as_str()),
                 age,
             );
             let _ = fs::remove_file(&path);
@@ -547,9 +715,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn record(name: &str, session_id: &str) -> SessionRecord {
+    /// `name` is ignored by every write (`write_record` normalizes it to
+    /// `short_id`); the argument stays so legacy-filename fixtures can name the
+    /// file they hand-write.
+    fn record(_name: &str, session_id: &str) -> SessionRecord {
         SessionRecord {
-            name: name.into(),
+            name: identity::short_id(session_id).into(),
             session_id: session_id.into(),
             branch: Some("main".into()),
             // Mirror the production path (run_start / touch_own set branch and
@@ -568,8 +739,8 @@ mod tests {
     fn write_creates_directory_and_file() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".claude/sessions");
-        write_record(&dir, &record("quiet-loom", "e4739a12-full")).unwrap();
-        assert!(dir.join("quiet-loom.e4739a12.json").exists());
+        write_record(&dir, &record("e4739a12", "e4739a12-full")).unwrap();
+        assert!(dir.join("e4739a12-full.json").exists());
     }
 
     #[test]
@@ -583,13 +754,161 @@ mod tests {
     }
 
     #[test]
-    fn find_own_matches_by_short_id() {
+    fn find_own_picks_its_own_record_among_several() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        write_record(&dir, &record("quiet-loom", "e4739a12-full")).unwrap();
-        write_record(&dir, &record("forge-anvil", "7b30411a-full")).unwrap();
+        write_record(&dir, &record("e4739a12", "e4739a12-full")).unwrap();
+        write_record(&dir, &record("7b30411a", "7b30411a-full")).unwrap();
         let own = find_own(&dir, "e4739a12-full").unwrap();
-        assert!(own.to_string_lossy().contains("quiet-loom"));
+        assert_eq!(
+            own.file_name().unwrap().to_string_lossy(),
+            "e4739a12-full.json"
+        );
+    }
+
+    // --- full-id filenames + the one-release legacy arm (cadence-hooks#899) ---
+
+    /// Write a legacy `<name>.<short-id>.json` file by hand — the shape a
+    /// <= 0.97.0 binary produced. `write_record` no longer emits it, so the
+    /// migration arm needs a fixture that does.
+    fn write_legacy(dir: &Path, name: &str, rec: &SessionRecord) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!(
+            "{name}.{}.json",
+            identity::short_id(&rec.session_id)
+        ));
+        fs::write(&path, serde_json::to_string_pretty(rec).unwrap() + "\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn find_own_resolves_the_canonical_full_id_filename() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("ignored", "e4739a12-full")).unwrap();
+        let own = find_own(&dir, "e4739a12-full").expect("canonical file resolves");
+        assert_eq!(
+            own.file_name().unwrap().to_string_lossy(),
+            "e4739a12-full.json"
+        );
+    }
+
+    #[test]
+    fn find_own_resolves_a_legacy_named_filename() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let legacy = write_legacy(&dir, "quiet-loom", &record("quiet-loom", "e4739a12-full"));
+        let own = find_own(&dir, "e4739a12-full").expect("legacy file still resolves");
+        assert_eq!(own, legacy);
+    }
+
+    #[test]
+    fn find_own_prefers_the_canonical_file_when_both_exist() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let rec = record("quiet-loom", "e4739a12-full");
+        write_legacy(&dir, "quiet-loom", &rec);
+        let canonical = dir.join("e4739a12-full.json");
+        fs::write(
+            &canonical,
+            serde_json::to_string_pretty(&rec).unwrap() + "\n",
+        )
+        .unwrap();
+        let own = find_own(&dir, "e4739a12-full").expect("resolves without ambiguity");
+        assert_eq!(own, canonical, "the canonical file wins, never a refusal");
+    }
+
+    #[test]
+    fn write_record_migrates_a_legacy_file_to_the_canonical_name() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let rec = record("quiet-loom", "e4739a12-full");
+        let legacy = write_legacy(&dir, "quiet-loom", &rec);
+        write_record(&dir, &rec).unwrap();
+        assert!(!legacy.exists(), "legacy filename removed after migration");
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["e4739a12-full.json".to_string()]);
+    }
+
+    #[test]
+    fn write_record_never_removes_a_peers_file_matching_the_prefilter() {
+        // The peer's legacy filename carries OUR 8-char short id ("session-"),
+        // so it passes the filename prefilter — only the content check keeps it
+        // alive. A literal reading of "remove every other matching file" here
+        // would delete a live peer's lane.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let peer = write_legacy(&dir, "beta-anvil", &record("beta-anvil", "session-2"));
+        write_record(&dir, &record("alpha-loom", "session-1")).unwrap();
+        assert!(peer.exists(), "a peer's record is never collateral");
+        assert!(dir.join("session-1.json").exists(), "own record written");
+    }
+
+    #[test]
+    fn write_record_refuses_an_unsafe_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let err = write_record(&dir, &record("evil", "../../evil"))
+            .expect_err("an unsafe session id must be refused at the sink");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !tmp.path().join("evil.json").exists() && !tmp.path().join("../../evil.json").exists(),
+            "nothing lands outside the registry dir"
+        );
+        assert!(
+            fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) == 0,
+            "and nothing lands inside it either"
+        );
+    }
+
+    #[test]
+    fn sweep_spares_the_caller_in_both_filename_forms() {
+        // One dir per arm: a sweep spares exactly ONE session, so running both
+        // arms against a shared dir would have the second reap the first's
+        // record and prove nothing about the filename form.
+        let canonical_tmp = TempDir::new().unwrap();
+        let canonical_dir = canonical_tmp.path().to_path_buf();
+        write_record(&canonical_dir, &record("x", "own-canonical")).unwrap();
+
+        let legacy_tmp = TempDir::new().unwrap();
+        let legacy_dir = legacy_tmp.path().to_path_buf();
+        let legacy = write_legacy(
+            &legacy_dir,
+            "quiet-loom",
+            &record("quiet-loom", "own-legacy"),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        test_metrics_env::with_scratch_metrics_dir(|| {
+            sweep_stale(&canonical_dir, 0, "own-canonical", "test");
+            sweep_stale(&legacy_dir, 0, "own-legacy", "test");
+        });
+        assert!(
+            canonical_dir.join("own-canonical.json").exists(),
+            "canonical own file spared even when aged"
+        );
+        assert!(legacy.exists(), "legacy own file spared even when aged");
+    }
+
+    #[test]
+    fn write_record_normalizes_a_legacy_name_to_the_short_id() {
+        // The upsert paths carry an existing record forward field by field, so
+        // without normalization at the sink a <= 0.97.0 word-pair name would
+        // ride every future heartbeat.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut rec = record("x", "e4739a12-full");
+        rec.name = "quiet-loom".into();
+        write_record(&dir, &rec).unwrap();
+        assert_eq!(
+            read_own(&dir, "e4739a12-full").unwrap().name,
+            "e4739a12",
+            "name is a derivation of session_id, never caller-supplied"
+        );
     }
 
     #[test]
@@ -606,18 +925,62 @@ mod tests {
         // each session's own file — never whichever read_dir yields first.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        write_record(&dir, &record("alpha-loom", "session-1")).unwrap();
-        write_record(&dir, &record("beta-anvil", "session-2")).unwrap();
+        write_record(&dir, &record("session-", "session-1")).unwrap();
+        write_record(&dir, &record("session-", "session-2")).unwrap();
+        // A canonical filename is exact-id, so the two records above alone
+        // would let `find_own` resolve on the FILENAME and the content check
+        // would never be load-bearing — the property this test names could not
+        // go red. This third file makes the two disagree: its name claims
+        // session-1, its record says session-2.
+        let liar = dir.join("session-1.decoy.json");
+        fs::write(
+            &liar,
+            serde_json::to_string_pretty(&record("session-", "session-2")).unwrap() + "\n",
+        )
+        .unwrap();
 
         let p1 = find_own(&dir, "session-1").expect("session-1 resolves");
-        assert!(
-            p1.to_string_lossy().contains("alpha-loom"),
+        assert_eq!(
+            p1.file_name().unwrap().to_string_lossy(),
+            "session-1.json",
             "find_own(session-1) returned the wrong file: {p1:?}"
         );
         let p2 = find_own(&dir, "session-2").expect("session-2 resolves");
+        assert_eq!(
+            p2.file_name().unwrap().to_string_lossy(),
+            "session-2.json",
+            "find_own(session-2) resolved by filename, not by content: {p2:?}"
+        );
         assert!(
-            p2.to_string_lossy().contains("beta-anvil"),
-            "find_own(session-2) returned the wrong file: {p2:?}"
+            liar.exists(),
+            "fixture precondition: the decoy still exists"
+        );
+    }
+
+    /// The canonical-vs-canonical arm of #90. Both files carry exact-id names,
+    /// so only the content check can tell them apart — plant a record whose
+    /// filename claims one id and whose body claims another, and `find_own`
+    /// must believe the body.
+    #[test]
+    fn find_own_believes_the_record_over_a_lying_canonical_filename() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("session-1.json"),
+            serde_json::to_string_pretty(&record("session-", "session-2")).unwrap() + "\n",
+        )
+        .unwrap();
+        assert!(
+            find_own(&dir, "session-1").is_none(),
+            "a filename claiming session-1 over a session-2 record resolves to nothing"
+        );
+        // And session-2 does not adopt it either: the prefilter requires a
+        // plausible NAME as well as matching content, so a record is only ever
+        // found under a filename that claims it. Both halves must agree.
+        assert!(
+            find_own(&dir, "session-2").is_none(),
+            "content alone does not resolve a record under a foreign filename"
         );
     }
 
@@ -628,7 +991,7 @@ mod tests {
         // than resolve by suffix alone.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        write_record(&dir, &record("beta-anvil", "session-2")).unwrap();
+        write_legacy(&dir, "beta-anvil", &record("beta-anvil", "session-2"));
         assert!(
             find_own(&dir, "session-1").is_none(),
             "suffix-only match must not resolve a different session"
@@ -651,13 +1014,13 @@ mod tests {
         // .json record remains, never a stray .tmp.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        write_record(&dir, &record("quiet-loom", "e4739a12-full")).unwrap();
+        write_record(&dir, &record("e4739a12", "e4739a12-full")).unwrap();
         let names: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["quiet-loom.e4739a12.json".to_string()]);
+        assert_eq!(names, vec!["e4739a12-full.json".to_string()]);
     }
 
     #[test]
@@ -710,7 +1073,7 @@ mod tests {
         fs::write(&victim, "precious\n").unwrap();
 
         let rec = record("quiet-loom", "e4739a12-full");
-        let target_name = identity::filename(&rec.name, &rec.session_id);
+        let target_name = identity::filename(&rec.session_id);
         let temp_path = dir.join(format!(".{target_name}.{}.tmp", std::process::id()));
         symlink(&victim, &temp_path).unwrap();
 
@@ -736,7 +1099,41 @@ mod tests {
         write_record(&dir, &record("forge-anvil", "peer-session")).unwrap();
         let peers = read_peers(&dir, "self-session", 600);
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].record.name, "forge-anvil");
+        assert_eq!(peers[0].record.session_id, "peer-session");
+    }
+
+    /// A record with no `session_id` key deserializes to `""` under the
+    /// container-level serde default. `""` is exactly what a caller passes when
+    /// it wants EVERY entry listed, so a self-match on it made such a record
+    /// invisible to the one reader whose job is completeness — including
+    /// `doctor --prune`'s liveness gate.
+    #[test]
+    fn read_peers_listing_everything_still_sees_a_record_with_no_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::write(dir.join("planted.json"), r#"{"name":"x","branch":"main"}"#).unwrap();
+        assert_eq!(
+            read_peers(&dir, "", 600).len(),
+            1,
+            "an unidentifiable record is a peer, never silently 'self'"
+        );
+        // And a real session still excludes its own record.
+        write_record(&dir, &record("x", "self-session")).unwrap();
+        let mine = read_peers(&dir, "self-session", 600);
+        assert_eq!(mine.len(), 1, "own record excluded, planted one still seen");
+        assert!(mine[0].record.session_id.is_empty());
+    }
+
+    #[test]
+    fn unreadable_records_names_only_the_unparsable_ones() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        write_record(&dir, &record("x", "good-session")).unwrap();
+        fs::write(dir.join("garbage.json"), "not json {{").unwrap();
+        fs::write(dir.join("notes.txt"), "not a record").unwrap();
+        test_metrics_env::with_scratch_metrics_dir(|| {
+            assert_eq!(unreadable_records(&dir), vec!["garbage.json".to_string()]);
+        });
     }
 
     #[test]
@@ -1033,10 +1430,12 @@ mod tests {
         // ("session-") must still be swept — only OUR exact session_id is spared.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        write_record(&dir, &record("alpha-loom", "session-1")).unwrap(); // own
-        write_record(&dir, &record("beta-anvil", "session-2")).unwrap(); // colliding peer
-        let own_file = dir.join("alpha-loom.session-.json");
-        let peer_file = dir.join("beta-anvil.session-.json");
+        // The PEER carries the legacy filename, which ends in our own
+        // `.session-.json` suffix — the exact shape the prefilter alone would
+        // spare, and the content check must not.
+        write_record(&dir, &record("session-", "session-1")).unwrap(); // own
+        let peer_file = write_legacy(&dir, "beta-anvil", &record("beta-anvil", "session-2"));
+        let own_file = dir.join("session-1.json");
         std::thread::sleep(std::time::Duration::from_millis(1100));
         // stale_secs = 0: both files have aged ≥ 1s; own is spared by session_id.
         test_metrics_env::with_scratch_metrics_dir(|| sweep_stale(&dir, 0, "session-1", "test"));
@@ -1095,7 +1494,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["trigger"], "heartbeat");
         assert_eq!(rows[0]["sessionId"], "old-session");
-        assert_eq!(rows[0]["name"], "old-timer");
+        assert!(rows[0].get("name").is_none(), "schema 2 drops name");
     }
 
     #[test]
@@ -1140,7 +1539,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["trigger"], "start");
         assert!(rows[0]["sessionId"].is_null());
-        assert!(rows[0]["name"].is_null());
     }
 
     // --- deregister (remove_own, #97) ---
@@ -1183,16 +1581,31 @@ mod tests {
         // session-1 leaves session-2's lane intact.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
-        write_record(&dir, &record("alpha-loom", "session-1")).unwrap();
-        write_record(&dir, &record("beta-anvil", "session-2")).unwrap();
+        write_record(&dir, &record("session-", "session-1")).unwrap();
+        let legacy_peer = write_legacy(&dir, "beta-anvil", &record("beta-anvil", "session-2"));
+        // A CANONICAL peer whose filename claims our id and whose record does
+        // not. Without this the delete resolves by exact filename and the
+        // content check is never the discriminator — the arm that matters,
+        // since this is a delete on state a live peer depends on.
+        let canonical_liar = dir.join("session-1.decoy.json");
+        fs::write(
+            &canonical_liar,
+            serde_json::to_string_pretty(&record("session-", "session-2")).unwrap() + "\n",
+        )
+        .unwrap();
+
         remove_own(&dir, "session-1").unwrap();
         assert!(
-            !dir.join("alpha-loom.session-.json").exists(),
+            !dir.join("session-1.json").exists(),
             "session-1 lane removed"
         );
         assert!(
-            dir.join("beta-anvil.session-.json").exists(),
-            "colliding session-2 lane NOT cross-deleted"
+            legacy_peer.exists(),
+            "colliding session-2 legacy lane NOT cross-deleted"
+        );
+        assert!(
+            canonical_liar.exists(),
+            "a file naming us but recording a peer is NOT cross-deleted"
         );
     }
 

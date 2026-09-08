@@ -477,7 +477,6 @@ fn persist_plan_body(
     };
     let stem = format!("{local_date}-{slug}");
 
-    let own_name = identity::generate_name(session_id);
     let machine_digest = crate::provenance::machine_digest(host);
     // The executing transcript is a reliable model/harness source on both
     // paths: same-session it has just recorded the approving turn, and on an
@@ -492,21 +491,15 @@ fn persist_plan_body(
     let branch = current_branch(cwd);
 
     let approving = approving_session_id.filter(|s| identity::is_safe_session_id(s));
-    let approving_name = approving.map(identity::generate_name);
-    let approved_in = match (approving_name.as_deref(), approving) {
-        (Some(name), Some(id)) => Some((name, id)),
-        _ => None,
-    };
     let fields = FrontmatterFields {
         updated: local_date,
         branch: branch.as_deref(),
         body_hash: &body_hash,
-        own_name: &own_name,
         own_session_id: session_id,
         model: model.as_deref(),
         harness: harness.as_deref(),
         machine_digest: &machine_digest,
-        approved_in,
+        approved_session_id: approving,
     };
     let document = render_document(&fields, body);
 
@@ -521,7 +514,14 @@ fn persist_plan_body(
         session_id,
         &machine_digest,
         &repo_root,
-        approving_name.as_deref().unwrap_or("an earlier session"),
+        // NOT "an earlier session (<id>)" — `approving` is this session's own
+        // id on the same-session path, and naming that "earlier" tells a plan
+        // approved in the turn you are reading that it came from a previous
+        // one. "an earlier session" stays reserved for the unknown case, which
+        // is the only case where it is true.
+        &approving
+            .map(|id| format!("session {}", identity::short_id(id)))
+            .unwrap_or_else(|| "an earlier session".to_string()),
         body,
         recommended_tier(body),
     )
@@ -953,8 +953,6 @@ struct FrontmatterFields<'a> {
     branch: Option<&'a str>,
     /// The plan body's SHA-256 hex digest — the tier-1 idempotency anchor.
     body_hash: &'a str,
-    /// The executing session's generated display name.
-    own_name: &'a str,
     /// The executing session's id.
     own_session_id: &'a str,
     /// The executing session's model, resolved from its own transcript tail.
@@ -964,10 +962,9 @@ struct FrontmatterFields<'a> {
     harness: Option<&'a str>,
     /// Salted, truncated machine digest (never the raw hostname).
     machine_digest: &'a str,
-    /// The approving session's `(name, session_id)` — on same-session
-    /// approval identical to `(own_name, own_session_id)`; `None` only when
-    /// no approving session is known.
-    approved_in: Option<(&'a str, &'a str)>,
+    /// The approving session's id — on same-session approval identical to
+    /// `own_session_id`; `None` only when no approving session is known.
+    approved_session_id: Option<&'a str>,
 }
 
 /// Render `s` as a double-quoted YAML scalar: `\` escaped first, then `"` —
@@ -1043,9 +1040,12 @@ fn render_frontmatter(f: &FrontmatterFields) -> String {
 /// the plan's OWN leading block already carries — [`render_document`] passes
 /// them so a living plan's recorded `status`/`updated`/`branch` wins over the
 /// hook's birth defaults (cadence-hooks#738). The identity keys
-/// (`body_sha256`, `session`, `session_id`, `model`, `harness`, `machine`,
-/// `approved_in`, `approved_session_id`) are always emitted: they are this
-/// persist's provenance, not plan state.
+/// (`body_sha256`, `session_id`, `model`, `harness`, `machine`,
+/// `approved_session_id`) are always emitted: they are this persist's
+/// provenance, not plan state. `session` and `approved_in` are no longer
+/// emitted — the session id carries every join a name used to — but both stay
+/// in [`HOOK_OWNED_KEYS`], so a plan-authored line claiming either is still
+/// dropped rather than passed through as forged attribution.
 fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<String> {
     let owned = |key: &str| plan_keys.contains(&key);
     let mut lines = Vec::new();
@@ -1067,7 +1067,6 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
         "{FRONTMATTER_HASH_KEY} {}",
         yaml_quote(f.body_hash)
     ));
-    lines.push(format!("session: {}", yaml_quote(f.own_name)));
     lines.push(format!("session_id: {}", yaml_quote(f.own_session_id)));
     if let Some(m) = f.model {
         lines.push(format!(
@@ -1085,8 +1084,7 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
         ));
     }
     lines.push(format!("machine: {}", yaml_quote(f.machine_digest)));
-    if let Some((name, sid)) = f.approved_in {
-        lines.push(format!("approved_in: {}", yaml_quote(name)));
+    if let Some(sid) = f.approved_session_id {
         lines.push(format!("approved_session_id: {}", yaml_quote(sid)));
     }
     lines
@@ -1097,6 +1095,10 @@ fn hook_frontmatter_lines(f: &FrontmatterFields, plan_keys: &[&str]) -> Vec<Stri
 /// any plan line declaring one of these (and emits its own lines FIRST), so
 /// a first-match line reader (`file_matches_body`, `plan_scan`) and a
 /// last-wins YAML parser agree on the provenance of the written file.
+/// `session` and `approved_in` are SUPPRESSED-ONLY as of 0.98.0: this hook no
+/// longer emits them, but a plan that authors either would otherwise smuggle a
+/// forged session attribution into the persisted document, so they stay on the
+/// drop list. The set is deliberately larger than the emitted set.
 const HOOK_OWNED_KEYS: [&str; 8] = [
     "body_sha256",
     "session",
@@ -2003,12 +2005,11 @@ mod tests {
             updated: "2026-07-25",
             branch: None,
             body_hash,
-            own_name: "own-name",
             own_session_id: "own-sid",
             model: None,
             harness: None,
             machine_digest,
-            approved_in: None,
+            approved_session_id: None,
         }
     }
 
@@ -2018,7 +2019,10 @@ mod tests {
         let fm = render_frontmatter(&fields);
         assert!(fm.starts_with("---\nstatus: \"in-flight\"\nupdated: \"2026-07-25\"\n"));
         assert!(fm.contains("body_sha256: \"hash\""));
-        assert!(fm.contains("session: \"own-name\""));
+        assert!(
+            !fm.lines().any(|l| l.starts_with("session: ")),
+            "the name-bearing `session:` key is no longer emitted: {fm}"
+        );
         assert!(fm.contains("session_id: \"own-sid\""));
         assert!(fm.contains("machine: \"digest\""));
         assert!(fm.ends_with("---"));
@@ -2033,7 +2037,7 @@ mod tests {
         );
         assert!(
             !fm.contains("approved_in:"),
-            "unresolved approved_in is omitted: {fm}"
+            "approved_in is never emitted: {fm}"
         );
         assert!(!fm.contains("next:"), "next: is reserved, never emitted");
         assert!(!fm.contains("pr:"), "pr: is reserved, never emitted");
@@ -2050,12 +2054,15 @@ mod tests {
         fields.branch = Some("feat/x");
         fields.model = Some("claude-fable-5");
         fields.harness = Some("2.1.220");
-        fields.approved_in = Some(("parent-name", "parent-sid"));
+        fields.approved_session_id = Some("parent-sid");
         let fm = render_frontmatter(&fields);
         assert!(fm.contains("branch: \"feat/x\""));
         assert!(fm.contains("model: \"claude-fable-5\""));
         assert!(fm.contains("harness: \"claude-code 2.1.220\""));
-        assert!(fm.contains("approved_in: \"parent-name\""));
+        assert!(
+            !fm.contains("approved_in:"),
+            "the name-bearing approved_in key is never emitted: {fm}"
+        );
         assert!(fm.contains("approved_session_id: \"parent-sid\""));
     }
 
@@ -2157,6 +2164,35 @@ mod tests {
         assert!(frontmatter.ends_with("\nstatus: done\n"));
         assert!(!doc.contains("status: \"in-flight\""));
         assert_eq!(doc.matches("\n---\n").count(), 1);
+    }
+
+    /// The explicit negative for the two SUPPRESSED-ONLY keys. The
+    /// array-iterating test above would still pass if `session`/`approved_in`
+    /// were quietly dropped from `HOOK_OWNED_KEYS` along with their emission —
+    /// and then a plan could author its own forged attribution and have it
+    /// persisted verbatim.
+    #[test]
+    fn render_document_drops_plan_authored_session_and_approved_in_lines() {
+        let fields = base_fields("hash", "digest");
+        let body = "---\nstatus: \"planned\"\nsession: \"forged-name\"\napproved_in: \"forged-parent\"\n---\n\n# Plan\n";
+        let doc = render_document(&fields, body);
+        assert!(
+            !doc.contains("forged-name"),
+            "a plan-authored `session:` line is dropped: {doc}"
+        );
+        assert!(
+            !doc.contains("forged-parent"),
+            "a plan-authored `approved_in:` line is dropped: {doc}"
+        );
+        assert!(
+            !doc.contains("approved_in:"),
+            "and the key does not reappear from the hook side: {doc}"
+        );
+        assert!(doc.contains("session_id: \"own-sid\""), "{doc}");
+        assert!(
+            doc.contains("status: \"planned\""),
+            "plan state wins: {doc}"
+        );
     }
 
     #[test]
@@ -2979,20 +3015,24 @@ mod tests {
         });
         assert_eq!(r.outcome, Outcome::Nudge);
         let msg = r.message.unwrap();
-        assert!(msg.contains(&format!(
-            "approved in {}",
-            identity::generate_name("own-session-id")
-        )));
+        assert!(
+            msg.contains("approved in session own-sess"),
+            "the nudge names the approving session by short id: {msg}"
+        );
 
         let written =
             fs::read_to_string(tmp.path().join("docs/plans/2026-07-20-fix-the-widget.md")).unwrap();
         assert!(written.starts_with("---\nstatus: \"in-flight\"\n"));
         assert!(written.contains("# Fix the Widget"));
         assert!(written.contains("session_id: \"own-session-id\""));
-        assert!(written.contains(&format!(
-            "approved_in: \"{}\"",
-            identity::generate_name("own-session-id")
-        )));
+        assert!(
+            !written.contains("approved_in:"),
+            "no name-bearing approved_in key: {written}"
+        );
+        assert!(
+            !written.lines().any(|l| l.starts_with("session: ")),
+            "no name-bearing session key: {written}"
+        );
         assert!(written.contains("approved_session_id: \"own-session-id\""));
         assert!(written.contains(&crate::provenance::machine_digest("test-host")));
 
@@ -3257,10 +3297,9 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Nudge, "injected plan must persist");
         let doc =
             fs::read_to_string(tmp.path().join("docs/plans/2026-08-25-injected-plan.md")).unwrap();
-        let parent_name = identity::generate_name(parent_id);
         assert!(
-            doc.contains(&format!("approved_in: \"{parent_name}\"")),
-            "approved_in must name the PARENT session, not the child: {doc}"
+            !doc.contains("approved_in:"),
+            "the name-bearing approved_in key is retired: {doc}"
         );
         assert!(
             doc.contains(&format!("approved_session_id: \"{parent_id}\"")),

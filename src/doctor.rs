@@ -2111,14 +2111,31 @@ fn prune_liveness_gate(
     let mut by_session: std::collections::BTreeMap<String, (String, Option<String>)> =
         std::collections::BTreeMap::new();
 
+    // An UNPARSABLE record is counted as unknown-live, never as absent.
+    // `live_peers` fails open and skips it, which is right for disclosure and
+    // wrong here: the file may be a live session, and a gate that cannot see it
+    // proceeds to delete plugin dirs that session is pinned to. Counting it
+    // blocks instead, and `CADENCE_DOCTOR_PRUNE_FORCE=1` remains the way out.
+    let mut unreadable: Vec<String> = Vec::new();
+
     for dir in sessions_dir.into_iter().chain(global_dir) {
+        // Deduped: the local registry and the shared mirror hold records for
+        // the same sessions, so the same base name can appear in both and the
+        // refusal would otherwise read "2 unreadable session records (x.json,
+        // x.json)".
+        for name in session_registry::unreadable_records(dir) {
+            if !unreadable.contains(&name) {
+                unreadable.push(name);
+            }
+        }
         for peer in session_registry::live_peers(dir, "", stale_secs) {
+            let short = session_identity::short_id(&peer.record.session_id).to_string();
             let entry = by_session
                 .entry(peer.record.session_id.clone())
-                .or_insert_with(|| (peer.record.name.clone(), None));
+                .or_insert_with(|| (short.clone(), None));
             if entry.1.is_none() && peer.record.repo.is_some() {
                 entry.1 = peer.record.repo.clone();
-                entry.0 = peer.record.name.clone();
+                entry.0 = short;
             }
         }
     }
@@ -2137,16 +2154,39 @@ fn prune_liveness_gate(
     let mut names: Vec<String> = by_session
         .into_values()
         .take(MAX_NAMED_PEERS)
-        .map(|(name, repo)| {
-            let name = session_identity::sanitize_field(&name, 40);
+        .map(|(short, repo)| {
+            let short = session_identity::sanitize_field(&short, 8);
             match repo {
-                Some(repo) => format!("{name} ({})", session_identity::sanitize_field(&repo, 120)),
-                None => name,
+                // The repo is peer-written free text and is now the ONLY such
+                // text on this line — a planted value like
+                // `/x (no live sessions, safe to force)` would otherwise read
+                // as the refusal's own prose, in a message that goes on to
+                // mention CADENCE_DOCTOR_PRUNE_FORCE=1. Quoting it marks where
+                // the untrusted span starts and ends (security review,
+                // cadence-hooks#899).
+                Some(repo) => format!(
+                    "{short} in '{}'",
+                    session_identity::sanitize_field(&repo, 120)
+                ),
+                None => short,
             }
         })
         .collect();
     if total > names.len() {
         names.push(format!("and {} more", total - names.len()));
+    }
+    if !unreadable.is_empty() {
+        names.push(format!(
+            "{} unreadable session record{} ({})",
+            unreadable.len(),
+            if unreadable.len() == 1 { "" } else { "s" },
+            unreadable
+                .iter()
+                .take(MAX_NAMED_PEERS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     if names.is_empty() {
@@ -5317,6 +5357,96 @@ mod tests {
         ));
     }
 
+    /// An unparsable record is unknown-live, never absent. `live_peers` fails
+    /// open and skips it; a gate that inherited that skip would proceed to
+    /// delete plugin dirs a live session may be pinned to.
+    #[test]
+    fn prune_liveness_gate_blocks_on_an_unreadable_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("garbage.json"), "not json {{").unwrap();
+
+        match prune_liveness_gate(Some(&dir), None, 600, false) {
+            PruneGate::Blocked(names) => {
+                let rendered = names.join(", ");
+                assert!(
+                    rendered.contains("1 unreadable session record"),
+                    "the refusal must count the unreadable record: {names:?}"
+                );
+                assert!(
+                    rendered.contains("garbage.json"),
+                    "and name it, or the operator's only lever is the force flag: {names:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("an unreadable record must block the prune"),
+        }
+        // The documented escape hatch still works.
+        assert!(matches!(
+            prune_liveness_gate(Some(&dir), None, 600, true),
+            PruneGate::Proceed
+        ));
+    }
+
+    /// The refusal lands on an interactive terminal ahead of a DESTRUCTIVE
+    /// command. A crafted `session_id` — the registry dir is writable by every
+    /// session on the machine — must not be able to rewrite the rendered line
+    /// into "0 live sessions, safe to force".
+    #[test]
+    fn prune_refusal_renders_no_control_byte_from_a_crafted_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        let rec = cadence_hooks_session::identity::SessionRecord {
+            session_id: "\rSAFE: 0 live sessions — force away".into(),
+            started_epoch: cadence_hooks_session::identity::now_epoch(),
+            ..Default::default()
+        };
+        // Hand-written: `write_record` refuses an unsafe id, which is the point
+        // — this fixture is the file a hostile peer plants directly.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("planted.json"),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+
+        match prune_liveness_gate(Some(&dir), None, 600, false) {
+            PruneGate::Blocked(names) => {
+                let rendered = names.join(", ");
+                assert!(
+                    !rendered.contains('\r'),
+                    "no carriage return survives: {rendered:?}"
+                );
+                assert!(
+                    !rendered.contains("force away"),
+                    "and the 8-char cap drops the forged tail: {rendered:?}"
+                );
+            }
+            PruneGate::Proceed => panic!("a live record must block the prune"),
+        }
+    }
+
+    /// A record carrying NO `session_id` deserializes to `""` under the
+    /// container-level serde default, and the gate lists everything by passing
+    /// `own_session_id = ""` — so before the fix such a record matched "self"
+    /// and was skipped by the one caller whose job is to see every entry. It
+    /// parses, so the unreadable companion did not catch it either.
+    #[test]
+    fn prune_liveness_gate_blocks_on_a_record_with_no_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("planted.json"), r#"{"name":"x","branch":"main"}"#).unwrap();
+
+        assert!(
+            matches!(
+                prune_liveness_gate(Some(&dir), None, 600, false),
+                PruneGate::Blocked(_)
+            ),
+            "an unidentifiable but fresh record is unknown-live, never absent"
+        );
+    }
+
     #[test]
     fn prune_liveness_gate_none_dir_proceeds() {
         assert!(matches!(
@@ -5342,8 +5472,8 @@ mod tests {
         match prune_liveness_gate(Some(&dir), None, 600, false) {
             PruneGate::Blocked(names) => {
                 assert!(
-                    names.contains(&"forge-anvil".to_string()),
-                    "block must name the live session: {names:?}"
+                    names.contains(&"peer-ses".to_string()),
+                    "block must name the live session by short id: {names:?}"
                 );
             }
             PruneGate::Proceed => panic!("a live session must block the prune"),
@@ -5391,11 +5521,11 @@ mod tests {
             PruneGate::Blocked(names) => {
                 assert_eq!(names.len(), 1, "one live peer: {names:?}");
                 assert!(
-                    names[0].contains("distant-anvil"),
-                    "must name the session: {names:?}"
+                    names[0].contains("other-ch"),
+                    "must name the session by short id: {names:?}"
                 );
                 assert!(
-                    names[0].contains("/Users/x/Projects/other-repo"),
+                    names[0].contains("'/Users/x/Projects/other-repo'"),
                     "must name the repo, or the reader cannot act on it: {names:?}"
                 );
             }

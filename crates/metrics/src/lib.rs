@@ -73,7 +73,7 @@ pub use log_session::LogSession;
 pub use log_session_start::LogSessionStart;
 pub use log_skill::LogSkill;
 pub use log_subagent::LogSubagent;
-pub use log_sweep::log_sweep;
+pub use log_sweep::{log_registry_parse_skip, log_sweep};
 pub use log_timing::log_timing;
 pub use snapshot::Snapshot;
 pub use warn_stale::WarnStale;
