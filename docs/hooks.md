@@ -164,9 +164,9 @@ Cache writes are priced **per TTL**: a 1-hour write costs 2x base input against
 grand total of all cache writes, so a TTL bucket the scanner does not name is
 still counted — it simply bills at the 5-minute rate.
 
-## session (cadence-canon)
+## session (cadence)
 
-Multi-session coordination for the **cadence-canon** plugin (issue #54). Concurrent
+Multi-session coordination for the **cadence** plugin (issue #54). Concurrent
 Claude Code sessions sharing one repo checkout cannot see each other — these hooks
 give sessions *identity* within a repo via a registry at `<repo>/.claude/sessions/`
 (one file per session, mtime is the liveness heartbeat, auto-excluded from git via
@@ -174,21 +174,21 @@ give sessions *identity* within a repo via a registry at `<repo>/.claude/session
 
 | Hook | Event | What it does |
 |------|-------|--------------|
-| `start` | SessionStart | Register this session (deterministic adjective-noun name), sweep stale entries, and disclose live peers with a lane assessment + the multi-session protocol |
+| `start` | SessionStart | Register this session, sweep stale entries, and disclose live peers with a lane assessment + the multi-session protocol |
 | `heartbeat` | PostToolUse | Touch this session's registry file; refresh the recorded branch so peers see branch drift |
 | `guard` | PreToolUse (Bash, Edit, Write) | Warn — never block — on branch switches, blanket staging (`git add -A`, `git commit -a`), and writes inside a peer's declared paths |
 | `warn-branch-drift` | PreToolUse (Bash, `git commit`) | Warn when HEAD drifted from the session's recorded branch at commit time |
 | `warn-commit-provenance` | PreToolUse (Bash, `git commit`) | Nudge with a computed `Session-Id:` trailer block when a Claude-composed commit message lacks one |
 
 Liveness is mtime-based: a session that crashes or closes simply stops heartbeating
-and is presumed dead after 10 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
+and is presumed dead after 30 minutes (`CADENCE_SESSION_STALE_MINUTES`). No
 deregistration ceremony. Stale entries are swept on the next `session start`.
 
 ### Living-plan guards
 
 Three more `session` hooks serve the living-plan lifecycle (ADR-0038) rather than
-multi-session identity. They are wired by the **cadence** plugin, not cadence-canon,
-and all three bind to the plan doc for the current branch.
+multi-session identity. They are wired by the **cadence** plugin, and all three
+bind to the plan doc for the current branch.
 
 | Hook | Event | What it does |
 |------|-------|--------------|

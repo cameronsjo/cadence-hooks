@@ -14,7 +14,7 @@
 //! - A PreToolUse guard warns — never blocks (ADR-0001) — when an action
 //!   intersects a live peer's lane.
 //!
-//! Consumed by the `cadence-canon` plugin (same voice entering at offset
+//! Consumed by the `cadence` plugin (same voice entering at offset
 //! times, harmonious by construction). Hook surface: issue #54.
 //!
 //! | Subcommand          | Event        | Module          |

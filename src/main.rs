@@ -139,7 +139,7 @@ enum Commands {
     #[command(subcommand)]
     Metrics(MetricsCommands),
 
-    /// Multi-session coordination hooks (cadence-canon; hooks read JSON on stdin)
+    /// Multi-session coordination hooks (cadence; hooks read JSON on stdin)
     #[command(subcommand)]
     Session(SessionCommands),
 

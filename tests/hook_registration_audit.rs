@@ -230,7 +230,6 @@ const STALE_CHECKOUT_HINT: &str = "This audit reads the sibling cadence checkout
 /// (dir_name, expected_plugin_group)
 const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
     ("cadence", "cadence"),
-    ("cadence-canon", "session"),
     ("cadence-guardrails", "guardrails"),
     ("cadence-metrics", "metrics"),
     ("cadence-rules", "rules"),
@@ -245,7 +244,9 @@ const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("cadence-obsidian", "obsidian")];
 /// remove the entry in the plugin's wiring PR.
 /// (group, tracking_reference)
 ///
-/// Currently empty: cadence-canon landed and wires the `session` group.
+/// Currently empty: the `session` group is now wired entirely from the
+/// always-on `cadence` plugin (see INTENTIONAL_CROSS_PLUGIN_HOOKS below);
+/// cadence-canon, which used to own it, is retired.
 const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 
 /// Individual hooks whose plugin group *is* wired but whose own hooks.json entry
@@ -303,6 +304,54 @@ const INTENTIONAL_CROSS_PLUGIN_HOOKS: &[(&str, &str, &str)] = &[
         "cadence",
         "session lint-plan-shape",
         "must ride the always-on cadence plugin; `session` is its clap namespace",
+    ),
+    // The nine multi-session registry hooks moved off the retired cadence-canon
+    // plugin onto the always-on cadence plugin (cadence-ecosystem ADR-0030
+    // Phase 2); `session` remains their clap namespace.
+    (
+        "cadence",
+        "session start",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session backstop-warn",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session guard",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session warn-branch-drift",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session warn-commit-provenance",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session warn-branch-intent",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session heartbeat",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session end",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
+    ),
+    (
+        "cadence",
+        "session backstop-record",
+        "multi-session registry hook; moved from the retired cadence-canon plugin (cadence-ecosystem ADR-0030 Phase 2), `session` is its clap namespace",
     ),
 ];
 
@@ -386,8 +435,8 @@ const KNOWN_DISTINCT_SETTINGS_SCRIPTS: &[&str] = &[
     // prevent-secret-writes`), but duplicates neither.
     "block-vault-git-writes.sh",
     // Emits date/machine/vault/git facts as SessionStart context. Shares the
-    // tokens "session" and "start" with cadence-canon's `session start`, which
-    // is a lane-registry declaration. Unrelated jobs.
+    // tokens "session" and "start" with the cadence plugin's `session start`,
+    // which is a lane-registry declaration. Unrelated jobs.
     "session-start.sh",
     // Fires only when cwd is exactly the user config dir, to redirect edits to
     // the chezmoi source. Shares "warn" and "user" with the warn-* family; no
