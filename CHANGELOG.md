@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.98.0] - 2026-09-08
+
 ### Changed
 
 - **BREAKING: deterministic word-pair session names are gone.** `identity::generate_name` and its wordlists are deleted; nothing in cadence generates, stores, displays, or documents a name like `quiet-loom`. The session id already carried every join the name did (`session_id:`, `approved_session_id:`, `Session-Id:`, `plan-links.jsonl`), and a second naming system nobody read was a second thing to keep consistent. Sessions are displayed by the first 8 characters of their id — a display convenience; ownership is decided on the full id at every site.
