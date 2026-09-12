@@ -65,6 +65,8 @@ pub mod provenance;
 pub mod registry;
 /// SessionStart hook: register self, sweep stale, disclose live peers.
 pub mod start;
+/// Per-worktree unpushed-commit counts, feeding the outro backstop.
+pub mod unpushed_worktrees;
 /// PreToolUse commit-time provenance nudge: warn when a Claude-composed
 /// commit message lacks a `Session-Id:` trailer (cadence#473).
 pub mod warn_commit_provenance;
