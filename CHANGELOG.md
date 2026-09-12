@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`guardrails warn-amend-pushed` — an advisory on amending a commit the remote-tracking refs already carry** (cadence-hooks#610). A PreToolUse Bash check: when the command amends (`git commit --amend`, including `-a --amend` and git's `--am` abbreviation), it reads the remote-tracking refs containing `HEAD` in the directory the amend would run in and, when one carries the commit, names those refs and points at the follow-up-commit alternative. Silent on the ordinary unpublished amend, and silent on every resolution failure — no repository, an unborn `HEAD`, no `git` on `PATH`, a deadline timeout. It never blocks. Distinct from `cadence git-safety`, which nudges on *every* amend without looking at remote state; the two are wired independently. **The hooks.json entry lands in a follow-up monorepo PR**, so the subcommand reaches no event until then.
+  - The probed directory follows the shell: only a `cd` that is a top-level segment's own command and ordered **before** the amend moves it, plus that segment's `-C` chain. A `cd` written inside a quoted commit message, and a `cd` after the amend, both move nothing — reading the whole command for `cd`s pointed the probe at a different repository and produced a confident nudge about a commit the amend never touches (caught by this PR's security and code reviews before it shipped).
+  - Amend detection runs over every executable segment, so a `sh -c '…'` wrapper, a command substitution, and a loop or conditional body are all seen. A `--git-dir`/`--work-tree` amend is skipped: its repository is not the segment's directory, and answering about the wrong repo is worse than silence.
+  - Ref names are read with `git for-each-ref`, not `git branch -r`. `branch` is porcelain — under `color.ui = always` the names come back wrapped in terminal escapes, and under `column.ui = always` several refs share a line, which pasted four names into one and silently dropped a fifth.
+
+### Changed
+
+- **`sanitize_field` now flattens bidi and zero-width characters, not only controls.** Every hook message that interpolates an untrusted value (a peer's branch, a path, a remote ref) goes through it, and the text lands in the `additionalContext` Claude reads. Bidi overrides and zero-width joiners are Unicode category `Cf`, so `char::is_control` never saw them — yet a single U+202E reverses the rest of the rendered line, letting a crafted value display as a value it does not contain. U+200E/U+200F, U+202A–U+202E, U+2066–U+2069, U+200B–U+200D and U+FEFF now become spaces alongside the controls; ordinary non-ASCII text is untouched.
+
 ### Fixed
 
 - **Test-only: `bounded_process_timeout_kills_and_reports_output` no longer races process-spawn scheduling.** The deadline it passed to `run_bounded` (25ms) doubled as the window the child had to run two `printf`s before being killed; on a loaded runner the child could be descheduled past that window, killing it before stdout/stderr were populated and failing the test with no real regression (cadence-hooks#912). Raised to 250ms, measured against 80 runs (20 solo, 60 concurrent with a full `cargo test --workspace`) whose worst observed wall time was ~47.6ms.

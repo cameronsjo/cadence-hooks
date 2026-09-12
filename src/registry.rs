@@ -180,6 +180,12 @@ pub const HOOKS: &[HookEntry] = &[
         event: Some(HookEvent::PreToolUse),
     },
     HookEntry {
+        name: "warn-amend-pushed",
+        description: "Warn when git commit --amend rewrites a commit a remote already has",
+        plugin: "guardrails",
+        event: Some(HookEvent::PreToolUse),
+    },
+    HookEntry {
         name: "guard-dotfiles",
         description: "Block direct edits to production dotfiles (opt-in)",
         plugin: "guardrails",
@@ -535,6 +541,12 @@ pub fn sample_for(namespace: &str, subcommand: &str) -> Option<&'static str> {
         // useful signal without a live gh call.
         ("guardrails", "warn-unreviewed-ready-flip") => Some(
             r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"gh pr merge 5 --squash"}}"#,
+        ),
+        // warn-amend-pushed only engages on an amending `git commit`; the
+        // generic PreToolUse sample (`git status`) would never reach the probe.
+        // `try` substitutes the process cwd, so this smoke-tests live state.
+        ("guardrails", "warn-amend-pushed") => Some(
+            r#"{"session_id":"test","tool_name":"Bash","tool_input":{"command":"git commit --amend --no-edit"}}"#,
         ),
         // warn-branch-drift early-exits unless the command is a git commit —
         // the generic PreToolUse sample (`git status`) would never reach the

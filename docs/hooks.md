@@ -46,6 +46,7 @@ judgment to the model. It exempts writes under `$OBSIDIAN_VAULT`
 | `warn-branch-base` | PreToolUse (Bash) | Warn when creating a branch from a non-main base |
 | `warn-cron-datetime` | PreToolUse (CronCreate) | Inject current datetime before scheduling cron jobs |
 | `warn-untracked` | PreToolUse (Bash) | Warn about untracked files during git commit |
+| `warn-amend-pushed` | PreToolUse (Bash) | Warn when `git commit --amend` rewrites a commit the remote-tracking refs already carry |
 | `nudge-upgrade-after-push` | PostToolUse (Bash) | Nudge to schedule a brew upgrade after pushing cadence-hooks to main |
 | `guard-dotfiles` | PreToolUse (Edit, Write) | Block direct edits to production dotfiles (opt-in via `CADENCE_GUARD_DOTFILES=1`) |
 | `warn-pr-issue-link` | PreToolUse (Bash) | Nudge when `gh pr create` has no closing issue keyword (`Closes #N`) in the body |

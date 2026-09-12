@@ -299,6 +299,13 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
     // retires this entry either way — by rewiring the hook, or by removing the
     // subcommand.
     ("session heartbeat", "cameronsjo/cadence-hooks#902"),
+    // The `cadence-guardrails` hooks.json entry lands in the monorepo wiring PR
+    // that follows this one; the fixture refresh + this entry's removal ride the
+    // follow-up PR named in cameronsjo/cadence-hooks#610.
+    (
+        "guardrails warn-amend-pushed",
+        "cameronsjo/cadence-hooks#610",
+    ),
 ];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
