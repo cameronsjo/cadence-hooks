@@ -7,7 +7,9 @@
 //! the known ecosystem trackers. Since the 2026-06-30 decentralization, issues
 //! route by the component that owns the defect, so the guard checks the target
 //! against a *set* of trackers (`cadence`, `cadence-hooks`, `forgectl`,
-//! `claude-configurations`) rather than a single canonical repo. Override the
+//! `cadence-ecosystem`) rather than a single canonical repo. The meta tracker's
+//! pre-rename slug `claude-configurations` stays in the accepted set so a stale
+//! reference still files silently, but it is never recommended. Override the
 //! set with `CADENCE_ISSUE_TRACKERS` (plural, comma-separated) or the legacy
 //! singular `CADENCE_ISSUE_TRACKER`. The nudge is scoped to owners that host a
 //! known tracker: an owned repo under an owner with no tracker at all, unowned
@@ -29,7 +31,8 @@ const DEFAULT_TRACKERS: &[&str] = &[
     "cameronsjo/cadence",               // 12 cadence plugins
     "cameronsjo/cadence-hooks",         // this binary
     "cameronsjo/forgectl",              // forgectl + claunch
-    "cameronsjo/claude-configurations", // meta / orchestration
+    "cameronsjo/cadence-ecosystem",     // meta / orchestration
+    "cameronsjo/claude-configurations", // accepted alias of the line above; never recommended
 ];
 
 /// Return the effective set of known ecosystem issue trackers (lowercased).
@@ -235,7 +238,7 @@ fn nudge_message(target: &str) -> String {
         "warn-issue-tracker: {target} isn't a known cadence ecosystem issue tracker.\n\
          Issues route by the component that owns the defect:\n\
          cadence plugins → cameronsjo/cadence · cadence-hooks → cameronsjo/cadence-hooks ·\n\
-         forgectl/claunch → cameronsjo/forgectl · meta/orchestration → cameronsjo/claude-configurations.\n\
+         forgectl/claunch → cameronsjo/forgectl · meta/orchestration → cameronsjo/cadence-ecosystem.\n\
          If this filing is deliberate — a genuinely external or new tracker — carry on."
     )
 }
@@ -483,7 +486,8 @@ mod tests {
 
     // ---- edge tests ----
 
-    // Filing to the canonical tracker should be silent.
+    // Filing to the meta tracker's pre-rename slug should stay silent — the
+    // alias is accepted so a stale reference still routes (#910).
     #[test]
     fn canonical_tracker_not_nudged() {
         with_env(
@@ -617,6 +621,48 @@ mod tests {
         );
     }
 
+    // `cameronsjo/cadence-ecosystem` (meta / orchestration, renamed from
+    // `claude-configurations`) is a known tracker — no nudge (#910).
+    #[test]
+    fn cadence_ecosystem_repo_not_nudged() {
+        with_env(
+            &[
+                ("CADENCE_ALLOWED_OWNERS", Some("cameronsjo")),
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let result = judge_issue_target(
+                    "gh issue create --repo cameronsjo/cadence-ecosystem --title x",
+                    &workdir("/tmp"),
+                );
+                assert!(
+                    result.is_none(),
+                    "cadence-ecosystem is the meta tracker: {result:?}"
+                );
+            },
+        );
+    }
+
+    // The pre-rename slug stays accepted so a stale reference still routes,
+    // but it must never be recommended back to the operator (#910).
+    #[test]
+    fn nudge_message_omits_the_pre_rename_slug() {
+        with_env(
+            &[
+                ("CADENCE_ISSUE_TRACKER", None),
+                ("CADENCE_ISSUE_TRACKERS", None),
+            ],
+            || {
+                let msg = nudge_message("cameronsjo/workbench");
+                assert!(
+                    !msg.contains("claude-configurations"),
+                    "routing text must not name the pre-rename meta tracker: {msg}"
+                );
+            },
+        );
+    }
+
     // `CADENCE_ISSUE_TRACKERS` (plural) REPLACES the default set: the listed
     // repos go silent and the former defaults (e.g. cadence) now nudge.
     #[test]
@@ -736,9 +782,10 @@ mod tests {
     }
 
     // ---- nudge message format ----
-    // These tests call canonical() which reads CADENCE_ISSUE_TRACKER — serialize
-    // with CADENCE_ENV_TEST_LOCK (via with_env) and clear the var so
-    // concurrent env-mutating tests don't race.
+    // `nudge_message` is a pure `format!` and reads no env — the `canonical()`
+    // helper these wrappers were written for is gone. The `with_env` calls are
+    // kept because they are harmless and still serialize these tests against
+    // env-mutating neighbours via CADENCE_ENV_TEST_LOCK.
 
     #[test]
     fn nudge_message_names_the_check() {
@@ -767,7 +814,7 @@ mod tests {
         with_env(&[("CADENCE_ISSUE_TRACKER", None)], || {
             let msg = nudge_message("cameronsjo/workbench");
             assert!(
-                msg.contains("cameronsjo/claude-configurations"),
+                msg.contains("cameronsjo/cadence-ecosystem"),
                 "message should name the canonical tracker: {msg}"
             );
         });
@@ -802,7 +849,7 @@ mod tests {
                     "nudge message should name target"
                 );
                 assert!(
-                    msg.contains("cameronsjo/claude-configurations"),
+                    msg.contains("cameronsjo/cadence-ecosystem"),
                     "nudge message should name canonical"
                 );
             },
