@@ -24,13 +24,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 from collections import Counter
 from pathlib import Path
 
-NUDGE_LOG = Path.home() / ".claude" / "cadence" / "metrics" / "polish_nudges.jsonl"
-COMMITS_LOG = Path.home() / ".claude" / "cadence" / "metrics" / "commits.jsonl"
+
+def claude_config_dir() -> Path:
+    """The Claude config root: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+
+    Mirrors `cadence_hooks_core::paths::claude_config_dir` (Rust) so this
+    read-only analysis script honors the same second-subscription profile
+    relocation every shipped resolver does, rather than always reading the
+    default profile's metrics (cadence-hooks#599). Takes the first non-empty
+    comma-separated entry, `~`-expanded, matching the Rust resolver's
+    fallback-list handling.
+    """
+    raw = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    for candidate in raw.split(","):
+        candidate = candidate.strip()
+        if candidate:
+            return Path(candidate).expanduser()
+    return Path.home() / ".claude"
+
+
+NUDGE_LOG = claude_config_dir() / "cadence" / "metrics" / "polish_nudges.jsonl"
+COMMITS_LOG = claude_config_dir() / "cadence" / "metrics" / "commits.jsonl"
 BOUNDARY_TS = "2026-06-19T20:24:00-05:00"  # cadence v0.33.0, ~20:24 CDT
 
 

@@ -1840,9 +1840,12 @@ mod tests {
 /// [`cadence_hooks_core::paths::claude_config_dir`] — this crate must not
 /// carry its own second copy of the `CLAUDE_CONFIG_DIR` fallback logic
 /// (cadence-hooks#599). Returns `None` only when neither `CLAUDE_CONFIG_DIR`
-/// nor a resolvable home directory is set, matching the prior HOME-only
-/// gate; the actual path construction (tilde expansion, comma-list) always
-/// runs through the shared resolver.
+/// nor a resolvable home directory is set — the same "nothing to resolve
+/// against" gate as before, though [`cadence_hooks_core::paths::user_home`]
+/// now also honors `USERPROFILE`/`HOMEDRIVE`+`HOMEPATH`, so this recognizes
+/// a home on Windows where the old bare-`HOME`-env check would not. The
+/// actual path construction (tilde expansion, comma-list) always runs
+/// through the shared resolver.
 pub fn claude_config_root() -> Option<std::path::PathBuf> {
     let has_config_dir = std::env::var("CLAUDE_CONFIG_DIR")
         .ok()
