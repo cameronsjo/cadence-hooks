@@ -29,19 +29,37 @@ use std::process::Command;
 /// 3. `CARGO_MANIFEST_DIR`'s parent — the pre-existing behavior, kept so CI
 ///    checkouts and non-git tarball builds (where step 2 has no answer) still
 ///    resolve to something and skip cleanly.
+/// Which tier answered. Recorded because only tier 2 has actually *looked* for
+/// the workspace: tier 1 was asserted by an operator and tier 3 is a guess, so
+/// neither may quietly license a skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootSource {
+    Override,
+    GitCommonDir,
+    ManifestParent,
+}
+
 fn workspace_root() -> PathBuf {
+    resolved_workspace_root().0
+}
+
+fn resolved_workspace_root() -> (PathBuf, RootSource) {
     if let Some(root) = std::env::var_os("CADENCE_AUDIT_WORKSPACE_ROOT") {
-        return PathBuf::from(root);
+        return (PathBuf::from(root), RootSource::Override);
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    git_common_dir_workspace_root(&manifest_dir).unwrap_or_else(|| {
-        manifest_dir
-            .parent()
-            .expect("cadence-hooks should be inside claude-configurations")
-            .to_path_buf()
-    })
+    match git_common_dir_workspace_root(&manifest_dir) {
+        Some(root) => (root, RootSource::GitCommonDir),
+        None => (
+            manifest_dir
+                .parent()
+                .expect("cadence-hooks should be inside its workspace")
+                .to_path_buf(),
+            RootSource::ManifestParent,
+        ),
+    }
 }
 
 /// `<primary checkout>/.git` -> `<primary checkout>` -> `<workspace root>`.
@@ -283,11 +301,26 @@ const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
+///
+/// "Bash matcher" means the matcher *fires on* a Bash call — see
+/// [`matcher_matches_bash`]. It used to mean the literal string `"Bash"`, which
+/// is why the last two entries are new: a regex alternation and a `*` wildcard
+/// both spawn a process on every Bash command while reading as "not a Bash
+/// matcher" to the old predicate.
 const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     "cadence git-safety",            // catches force-push, reset --hard, etc.
     "cadence prevent-secret-writes", // catches writes to .env, credentials, etc.
     "cadence prevent-secret-leaks",  // catches reads of secrets
     "cadence warn-docs-update",      // catches gh pr create
+    // Wired on a PostToolUse `*` matcher: it reacts to plan approval, which it
+    // recognizes from the payload rather than the tool name, and a PostToolUse
+    // `if:` cannot carry the alternation that would narrow it.
+    "session persist-plan-approval",
+    // Wired on `^Bash$|^Edit$|^mcp__.*(delete|remove|move|rename).*`: it blocks
+    // destructive operations inside an Obsidian vault, which means inspecting
+    // the command itself — no single glob expresses "an rm whose target is
+    // under a vault".
+    "obsidian trash-guard",
 ];
 
 /// Hooks a plugin dispatches from *another* plugin's CLI group on purpose.
@@ -527,21 +560,41 @@ struct PluginScan {
     /// different facts that produce the identical empty map — and only the
     /// first one may skip.
     monorepo_present: bool,
+    /// Which resolution tier produced the root that was searched.
+    root_source: RootSource,
+    /// The root that was searched, for the report.
+    workspace_root: PathBuf,
 }
 
 impl PluginScan {
     fn verdict(&self) -> ScanVerdict {
-        if !self.missing.is_empty() {
-            // Nothing resolved AND the monorepo checkout is confirmed absent
-            // is the only shape that earns a skip. Nothing resolved while the
-            // checkout IS present means the layout drifted — every path this
-            // audit knows is wrong — which is a finding, not a bare CI run.
-            if self.resolved.is_empty() && !self.monorepo_present {
-                return ScanVerdict::Skip;
-            }
+        if self.missing.is_empty() {
+            return ScanVerdict::Run;
+        }
+        if !self.resolved.is_empty() || self.monorepo_present {
+            // A partial resolve, or nothing resolved while a checkout IS
+            // present — the layout drifted and every path this audit knows is
+            // wrong. Both are findings, not bare CI runs.
             return ScanVerdict::Fail;
         }
-        ScanVerdict::Run
+
+        // Nothing resolved and no checkout found. Whether that earns a skip
+        // depends on who chose the root that was searched:
+        //
+        // - `Override` — an operator named this root. Naming a workspace with
+        //   no checkout in it is an operator error, not a bare-CI run: one
+        //   stale shell export would otherwise disable every assertion here.
+        // - `ManifestParent` — nothing looked. It is the tier that answers
+        //   when `git` is missing or errors, and from a linked worktree it
+        //   resolves to `.claude/worktrees`, which has no siblings by
+        //   construction. Letting it skip reinstates exactly the blindness
+        //   tier 2 was added to remove.
+        // - `GitCommonDir` — git located the primary checkout and the search
+        //   came up empty. That is the real "no sibling checkout" answer.
+        match self.root_source {
+            RootSource::GitCommonDir => ScanVerdict::Skip,
+            RootSource::Override | RootSource::ManifestParent => ScanVerdict::Fail,
+        }
     }
 
     /// One line per unresolved manifest: the plugin dir name and every path
@@ -593,11 +646,21 @@ impl PluginScan {
              sibling cadence checkout is stale or half-migrated (`git -C \
              <workspace-root>/cadence status -sb`), or a BINARY_PLUGIN_DIRS \
              entry names a plugin that no longer exists and must be removed \
-             from this file.\n\
-             monorepo checkout present at the resolved workspace root: {}",
+             from this file.\n\n\
+             workspace root searched: {} (resolved via {:?})\n\
+             a plugin monorepo was found there: {}\n\
+             Nothing resolving while a monorepo IS present means every path this \
+             audit knows is stale. A root resolved via Override means \
+             CADENCE_AUDIT_WORKSPACE_ROOT names a workspace with no checkout in it \
+             — unset it or point it at one. A root resolved via ManifestParent \
+             means `git rev-parse --git-common-dir` did not answer, so nothing \
+             actually looked for the workspace; that is never grounds to call the \
+             audit clean.",
             self.resolved.len(),
             BINARY_PLUGIN_DIRS.len(),
             self.missing_lines().join("\n"),
+            self.workspace_root.display(),
+            self.root_source,
             self.monorepo_present,
         )
     }
@@ -629,20 +692,7 @@ fn hooks_json_references() -> PluginScan {
          every assertion. Removing the last entry is never the right fix."
     );
 
-    let workspace_root = workspace_root();
-
-    // An explicit override that points nowhere resolves nothing, which would
-    // otherwise read as "no sibling checkout" and disable the whole file from
-    // one stale shell export. A bad override is an operator error and says so.
-    if let Some(root) = std::env::var_os("CADENCE_AUDIT_WORKSPACE_ROOT") {
-        assert!(
-            workspace_root.is_dir(),
-            "CADENCE_AUDIT_WORKSPACE_ROOT is set to {:?}, which is not a directory. \
-             Unset it or point it at a workspace containing a cadence monorepo checkout — \
-             leaving it stale silently skips every assertion in this file.",
-            root
-        );
-    }
+    let (workspace_root, root_source) = resolved_workspace_root();
 
     let mut resolved = BTreeMap::new();
     let mut missing = Vec::new();
@@ -677,18 +727,50 @@ fn hooks_json_references() -> PluginScan {
         resolved.insert(dir_name.to_string(), refs);
     }
 
-    // Observed, not inferred: `plugin_hooks_json` walks two layouts, so the
-    // monorepo can be present while every path this audit knows is stale.
-    let monorepo_present = workspace_root.join(MONOREPO_PLUGINS_PREFIX).is_dir()
-        || BINARY_PLUGIN_DIRS
-            .iter()
-            .any(|(dir, _)| plugin_dir(&workspace_root, dir).is_some());
-
     PluginScan {
         resolved,
         missing,
-        monorepo_present,
+        monorepo_present: monorepo_present(&workspace_root),
+        root_source,
+        workspace_root,
     }
+}
+
+/// Is *a* plugin monorepo present at this root?
+///
+/// Observed, not inferred: `plugin_hooks_json` walks two named layouts, so the
+/// monorepo can be present while every path this audit knows is stale — and
+/// that case must fail rather than skip.
+///
+/// The last arm is the one that matters: a checkout under any directory name
+/// (`cadence-monorepo`, a rename, a second clone) still carries
+/// `<dir>/plugins/<plugin>/hooks/hooks.json`, and hard-coding the name
+/// `cadence` would call it absent and hand back a green skip. "Confirmed
+/// absent" has to cost a real look.
+fn monorepo_present(root: &Path) -> bool {
+    if root.join(MONOREPO_PLUGINS_PREFIX).is_dir() {
+        return true;
+    }
+    if BINARY_PLUGIN_DIRS
+        .iter()
+        .any(|(dir, _)| plugin_dir(root, dir).is_some())
+    {
+        return true;
+    }
+
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        BINARY_PLUGIN_DIRS.iter().any(|(dir, _)| {
+            entry
+                .path()
+                .join("plugins")
+                .join(dir)
+                .join("hooks/hooks.json")
+                .is_file()
+        })
+    })
 }
 
 fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> Vec<HookRef> {
@@ -710,7 +792,7 @@ fn parse_hooks_json(content: &str, _source_dir: &str, expected_plugin: &str) -> 
                 .get("matcher")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            let is_bash = matcher_str == "Bash";
+            let is_bash = matcher_matches_bash(matcher_str);
 
             let Some(hooks) = matcher_block
                 .get("hooks")
@@ -1230,6 +1312,20 @@ fn no_duplicate_command_registrations_per_matcher() {
 }
 
 fn scan_fixture(resolved: &[&str], missing: &[&'static str], monorepo_present: bool) -> PluginScan {
+    scan_fixture_from(
+        resolved,
+        missing,
+        monorepo_present,
+        RootSource::GitCommonDir,
+    )
+}
+
+fn scan_fixture_from(
+    resolved: &[&str],
+    missing: &[&'static str],
+    monorepo_present: bool,
+    root_source: RootSource,
+) -> PluginScan {
     PluginScan {
         resolved: resolved
             .iter()
@@ -1248,6 +1344,58 @@ fn scan_fixture(resolved: &[&str], missing: &[&'static str], monorepo_present: b
             })
             .collect(),
         monorepo_present,
+        root_source,
+        workspace_root: PathBuf::from("/ws"),
+    }
+}
+
+/// An operator-named root with no checkout in it is an operator error, and a
+/// root nothing actually looked for cannot license a clean verdict. Only the
+/// tier that searched — git's own answer for where the workspace is — may skip.
+#[test]
+fn only_a_searched_root_may_skip() {
+    for source in [RootSource::Override, RootSource::ManifestParent] {
+        let scan = scan_fixture_from(&[], &["cadence"], false, source);
+        assert_eq!(
+            scan.verdict(),
+            ScanVerdict::Fail,
+            "{source:?} must not reach a skip"
+        );
+        assert!(
+            scan.partial_resolve_report()
+                .contains(&format!("{source:?}"))
+        );
+    }
+
+    assert_eq!(
+        scan_fixture_from(&[], &["cadence"], false, RootSource::GitCommonDir).verdict(),
+        ScanVerdict::Skip
+    );
+}
+
+/// The matcher predicate behind `bash_hooks_have_if_filter`: a hook spawns on
+/// every Bash call whether the matcher is the bare name, an alternation, or a
+/// wildcard, so all three must read as Bash.
+#[test]
+fn bash_matchers_are_recognized_beyond_the_literal_name() {
+    for matcher in [
+        "Bash",
+        "*",
+        "^Bash$|^Edit$",
+        "Bash|Edit|Write",
+        "^Bash$|^mcp__.*(delete|remove).*",
+    ] {
+        assert!(
+            matcher_matches_bash(matcher),
+            "{matcher:?} fires on Bash and must be seen as a Bash matcher"
+        );
+    }
+
+    for matcher in ["Edit|Write", "AskUserQuestion", "Read|Grep", "", "Skill"] {
+        assert!(
+            !matcher_matches_bash(matcher),
+            "{matcher:?} does not fire on Bash"
+        );
     }
 }
 
@@ -1409,16 +1557,17 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
         // when the call is split across multiple lines. Collapse whitespace so
         // `,\n                pre,` becomes `, pre,`.
         //
-        // The window stops at the next match arm. A fixed 3-line window spills
-        // into the following arm when rustfmt collapses a short one onto a
-        // single line, and since `post` and `session` are tested before `pre`,
-        // the neighbour's event wins — the same "asserts a falsehood about
-        // production code" failure the backwards scan used to produce, from
-        // the other direction.
-        let window_end = std::cmp::min(i + 3, lines.len());
-        let arm_end = ((i + 1)..window_end)
-            .find(|k| lines[*k].contains("=>"))
-            .unwrap_or(window_end);
+        // The window runs to the *arm boundary*, not a fixed line count. A
+        // fixed 3-line window failed in both directions: it spilled into the
+        // following arm when rustfmt collapsed a short one onto a single line
+        // (and since `post`/`session` are tested before `pre`, the neighbour's
+        // event won), and it fell short of a struct-variant arm whose event
+        // argument lands four lines down — which is how `cadence
+        // platform-drift` dropped out of this map entirely, unnoticed because
+        // the consuming assertion skips any command it cannot find.
+        let arm_end = ((i + 1)..lines.len())
+            .find(|k| is_command_arm_line(lines[*k]) || lines[*k].contains("=> match"))
+            .unwrap_or(lines.len());
         let window: String = lines[i..arm_end]
             .join(" ")
             .split_whitespace()
@@ -1504,35 +1653,94 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
         }
     }
 
-    // A mass-drop tripwire, not an exact count. The scan maps ~57 commands; a
-    // floor of 10 sits far enough below that a refactor silently dropping 80%
-    // of the mappings would still clear it, leaving the event-type check
-    // comparing a handful of survivors and reporting `ok`. Raise this when the
-    // real count grows; never lower it to make a drop pass.
-    const MIN_EVENT_MAPPINGS: usize = 40;
+    // Exact coverage, not a floor. The old floor was a constant (10) against a
+    // real count of 58, so it could not see a single dropped hook — and a
+    // single dropped hook is precisely what went wrong: `cadence
+    // platform-drift` fell outside a fixed window and vanished from this map,
+    // silently exempting it from the event-type check because the consumer
+    // skips any command it cannot find. Counting the dispatch sites in the
+    // file and demanding a mapping for each closes that by construction, and
+    // needs no maintenance as hooks land.
+    let dispatch_sites = lines
+        .iter()
+        .filter(|line| line.contains("run_logged_check") || line.contains("run_check_from_stdin"))
+        .count();
+    assert_eq!(
+        result.len(),
+        dispatch_sites,
+        "src/main.rs has {dispatch_sites} Check dispatch sites but only {} produced an \
+         event mapping. A dispatch this scanner cannot read is silently exempt from \
+         hook_event_types_match_hooks_json, which skips any command absent from this \
+         map. Mapped: {result:?}",
+        result.len()
+    );
     assert!(
-        result.len() >= MIN_EVENT_MAPPINGS,
-        "expected at least {MIN_EVENT_MAPPINGS} event type mappings, found {}. \
-         A drop this large means the dispatch layout in src/main.rs moved and this \
-         scanner no longer reads it — not that the hooks went away: {result:?}",
+        result.len() > 10,
+        "expected more than 10 event type mappings, found {}: {result:?}",
         result.len()
     );
     result
 }
 
-/// Is this line a `<Group>Commands::<Variant>` **match arm**, as opposed to the
-/// `Commands::<Plugin>(cmd) => match cmd {` dispatcher above the arms?
+/// Does this `matcher` fire on a Bash tool call?
 ///
-/// The discriminator is the character immediately before `Commands::`: an arm
-/// carries the tail of its group identifier there, the dispatcher carries
-/// whitespace or `(`.
-fn is_command_arm_line(line: &str) -> bool {
-    line.match_indices("Commands::").any(|(idx, _)| {
-        line[..idx]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+/// Claude Code treats a matcher as a regex, so exact equality with `"Bash"`
+/// sees only the simplest spelling. `bash_hooks_have_if_filter` exists to
+/// catch a hook that spawns a process on *every* Bash command, and that cost
+/// is identical whether the matcher reads `Bash`, `^Bash$|^Edit$|…`, or `*` —
+/// so the check has to see all three. `cadence-obsidian` was the case that
+/// made this material: its regex alternation matched Bash while reading as
+/// "not a Bash matcher" here.
+///
+/// Deliberately conservative — it recognizes the alternation and wildcard
+/// forms the estate's manifests actually use rather than interpreting regex.
+/// A matcher it cannot classify is treated as not-Bash, which under-reports;
+/// over-reporting would block legitimate wiring on a guess.
+fn matcher_matches_bash(matcher: &str) -> bool {
+    if matcher == "*" {
+        return true;
+    }
+    matcher.split('|').any(|alt| {
+        alt.trim()
+            .trim_start_matches('^')
+            .trim_end_matches('$')
+            .eq_ignore_ascii_case("bash")
     })
+}
+
+/// Is this line a **match arm** naming a command variant, as opposed to the
+/// `Commands::<Plugin>(cmd) => match cmd {` dispatcher that introduces a group?
+///
+/// Three shapes carry `Commands::` in `src/main.rs`:
+///
+/// - `GuardrailsCommands::WarnUntracked => …` — a group arm. The character
+///   before `Commands::` is the tail of the group identifier.
+/// - `Commands::Doctor => …` — a **top-level** arm. Nothing precedes
+///   `Commands::`, same as the dispatcher, so the preceding character alone
+///   cannot tell them apart. Today no top-level arm dispatches a check, but
+///   one that did would be skipped by the backwards scan, which would then
+///   walk into the previous group's last arm and overwrite that hook's event —
+///   the falsehood-about-production-code failure again, and silent whenever
+///   the overwritten value happens to match.
+/// - `Commands::Guardrails(cmd) => match cmd {` — the dispatcher. It is the
+///   only shape that binds a variable and delegates, so a trailing `=> match`
+///   identifies it positively.
+fn is_command_arm_line(line: &str) -> bool {
+    let Some(idx) = line.find("Commands::") else {
+        return false;
+    };
+
+    // A group arm: the identifier tail is right there.
+    if line[..idx]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return true;
+    }
+
+    // Bare `Commands::` — an arm unless it is the delegating dispatcher.
+    !line.contains("=> match")
 }
 
 /// Convert PascalCase to kebab-case (e.g., "WarnMainBranch" -> "warn-main-branch").
