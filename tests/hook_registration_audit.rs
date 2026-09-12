@@ -1084,15 +1084,38 @@ fn fixture_manifests_match_the_monorepo_default_branch() {
     let live_root = workspace_root();
     let fixture_root = fixture_workspace_root();
 
+    // `CADENCE_AUDIT_WORKSPACE_ROOT` pointed at the fixture is a DOCUMENTED way
+    // to exercise the wiring assertions against a known tree — but it would
+    // make this check compare the fixture to itself. `default_branch_manifest`
+    // runs git in the manifest's own directory, so a live path inside this
+    // checkout resolves `origin/main` against THIS repository and returns the
+    // committed fixture: five comparisons, zero drift, a confident green, and
+    // the monorepo never consulted. A verdict produced by comparing a file to
+    // itself is worth less than no verdict, so say so and decline.
+    if under(&live_root, &PathBuf::from(env!("CARGO_MANIFEST_DIR"))) {
+        eprintln!(
+            "SKIPPED: the workspace root ({}) is inside this checkout, so the only \
+             manifests reachable are the fixture's own. Freshness was NOT verified \
+             on this run — unset CADENCE_AUDIT_WORKSPACE_ROOT and re-run beside a \
+             cadence monorepo checkout to check it. The fixture's own assertions \
+             still ran.",
+            live_root.display()
+        );
+        return;
+    }
+
     let mut compared = 0usize;
     let mut drifted = Vec::new();
     let mut unreadable = Vec::new();
+    let mut absent = 0usize;
 
     for (dir_name, _) in BINARY_PLUGIN_DIRS {
-        let (Some(live_path), Some(fixture_path)) = (
-            plugin_hooks_json(&live_root, dir_name),
-            plugin_hooks_json(&fixture_root, dir_name),
-        ) else {
+        let Some(fixture_path) = plugin_hooks_json(&fixture_root, dir_name) else {
+            // `fixture_subject()` already failed the run for this; nothing to add.
+            continue;
+        };
+        let Some(live_path) = plugin_hooks_json(&live_root, dir_name) else {
+            absent += 1;
             continue;
         };
 
@@ -1107,7 +1130,7 @@ fn fixture_manifests_match_the_monorepo_default_branch() {
         }
     }
 
-    if compared == 0 && unreadable.is_empty() {
+    if absent == BINARY_PLUGIN_DIRS.len() {
         eprintln!(
             "SKIPPED: no sibling cadence monorepo at {}, so the fixture has nothing \
              to be compared against. The fixture's own assertions still ran.",
@@ -1115,6 +1138,22 @@ fn fixture_manifests_match_the_monorepo_default_branch() {
         );
         return;
     }
+
+    // A manifest present for some plugins and absent for others is the same
+    // partial-scan shape the `unreadable` assertion below refuses, one step
+    // earlier: `continue`-ing past it would drop that plugin from the
+    // comparison while the remaining ones still produced a green.
+    assert_eq!(
+        absent,
+        0,
+        "the sibling checkout has some plugin manifests and not others, so the \
+         fixture can be confirmed current for only part of the wiring. All \
+         expected manifests live in ONE monorepo checkout, so this is a broken \
+         or half-migrated environment (`git -C <workspace-root>/cadence status -sb`), \
+         never a clean run. {} of {} plugins resolved.",
+        BINARY_PLUGIN_DIRS.len() - absent,
+        BINARY_PLUGIN_DIRS.len(),
+    );
 
     // Fail closed on a PARTIAL comparison, the same criterion `enforce_complete_scan`
     // applies one layer up. Collecting the unreadable manifests and then reporting
@@ -1131,6 +1170,19 @@ fn fixture_manifests_match_the_monorepo_default_branch() {
          Run `git -C <workspace-root>/cadence fetch origin` — an absent \
          origin/main is the usual cause — and re-run.",
         unreadable.join("\n")
+    );
+
+    // Every plugin is present (`absent == 0`) and every one was readable
+    // (`unreadable` empty), so the loop must have compared all of them. Binding
+    // the count keeps this from reporting a clean freshness verdict off a loop
+    // that compared nothing — the failure mode the whole file exists to refuse.
+    assert_eq!(
+        compared,
+        BINARY_PLUGIN_DIRS.len(),
+        "the freshness check passed its own preconditions but compared {compared} of \
+         {} manifests — it would be reporting the fixture current without having \
+         looked at all of it",
+        BINARY_PLUGIN_DIRS.len(),
     );
 
     assert!(
@@ -1210,7 +1262,16 @@ fn redact_prefilters(mut manifest: serde_json::Value) -> serde_json::Value {
                 continue;
             };
             for hook in hooks {
-                if let Some(filter) = hook.get_mut("if") {
+                // Strings only. Rewriting ANY value to a string would make a
+                // live `"if": ["a","b"]` and a fixture `"if": "x"` compare
+                // equal — while `parse_hooks_json` reads the array as *no*
+                // filter (it takes `as_str`) and the string as one, so the two
+                // subjects would disagree about `has_if_filter` with the drift
+                // check silent. Preserving the type keeps that divergence
+                // visible.
+                if let Some(filter) = hook.get_mut("if")
+                    && filter.is_string()
+                {
                     *filter = serde_json::Value::String(String::new());
                 }
             }
@@ -1227,7 +1288,8 @@ fn redaction_keeps_the_if_key_that_the_filter_check_reads() {
     let manifest: serde_json::Value = serde_json::from_str(
         r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
              {"command":"x/run-cadence-hooks.sh cadence a","if":"Bash(*secret*)"},
-             {"command":"x/run-cadence-hooks.sh cadence b"}]}]}}"#,
+             {"command":"x/run-cadence-hooks.sh cadence b"},
+             {"command":"x/run-cadence-hooks.sh cadence c","if":["a","b"]}]}]}}"#,
     )
     .unwrap();
 
@@ -1241,6 +1303,13 @@ fn redaction_keeps_the_if_key_that_the_filter_check_reads() {
         hooks[1].get("if").is_none(),
         "a hook with no filter gains none"
     );
+    // A non-string `if` keeps its type. Coercing it to a string would make it
+    // compare equal to a redacted string filter while `parse_hooks_json` still
+    // read the two as differently filtered — drift the check could not see.
+    assert!(
+        hooks[2]["if"].is_array(),
+        "a non-string filter keeps its type through redaction"
+    );
 
     let refs = parse_hooks_json(&redacted.to_string(), "cadence", "cadence");
     assert!(
@@ -1248,6 +1317,22 @@ fn redaction_keeps_the_if_key_that_the_filter_check_reads() {
         "the filtered hook must still read as filtered"
     );
     assert!(!refs[1].has_if_filter);
+    assert!(
+        !refs[2].has_if_filter,
+        "an array filter reads as unfiltered before and after redaction alike"
+    );
+}
+
+/// Is `path` inside `ancestor`?
+///
+/// Canonicalizes both first: on macOS `/tmp` is a symlink to `/private/tmp`, so
+/// a raw `starts_with` answers `false` for two spellings of the same directory —
+/// and this predicate guards a fail-open, so a false negative is the costly
+/// direction. Falls back to the uncanonicalized path when a component does not
+/// exist, which still answers correctly for the case that matters.
+fn under(path: &Path, ancestor: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    real(path).starts_with(real(ancestor))
 }
 
 fn read_json(path: &Path) -> serde_json::Value {

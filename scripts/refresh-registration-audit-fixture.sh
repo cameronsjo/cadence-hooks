@@ -61,6 +61,12 @@ for dir in "$fixture_root"/*/; do
     exit 1
   fi
 
+  # Produce into a temp file and move it into place only on success. A direct
+  # `> "$dir/hooks/hooks.json"` truncates the fixture before python runs, so a
+  # malformed blob upstream would leave an empty manifest behind — and the next
+  # test run panics reading it rather than reporting the real problem.
+  tmp="$(mktemp)"
+
   # shellcheck disable=SC2016  # single quotes are required: this is Python
   # source, and shell expansion inside it would corrupt the program.
   git -C "$monorepo" show "origin/main:$src" \
@@ -75,8 +81,9 @@ for blocks in doc.get("hooks", {}).values():
                 hook["if"] = PLACEHOLDER
 json.dump(doc, sys.stdout, indent=2)
 sys.stdout.write("\n")
-' > "$dir/hooks/hooks.json"
+' > "$tmp"
 
+  mv "$tmp" "$dir/hooks/hooks.json"
   echo "  refreshed $plugin"
 done
 
