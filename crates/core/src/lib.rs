@@ -10,6 +10,7 @@
 //! read that would never see EOF.
 
 pub mod branch_diff;
+pub mod bypass;
 pub mod capability;
 pub mod config;
 pub mod deadline;
