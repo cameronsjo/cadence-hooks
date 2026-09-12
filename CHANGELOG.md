@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The hook-registration audit no longer passes by skipping.** `require_plugin_refs!` returned early whenever *any* expected plugin manifest failed to resolve, so a single stale entry in `BINARY_PLUGIN_DIRS` — `cadence-canon`, retired in cadence-ecosystem ADR-0030 Phase 2 — made every assertion body return before it ran while `cargo test --test hook_registration_audit` still reported 20 passing tests. The skip now applies only when **nothing** resolves (the bare-CI case, where there is no sibling `cadence` checkout and no wiring to audit); a **partial** resolve fails and names the unresolved plugin plus every path tried. Consumer-visible: CI behavior changes — a broken or half-migrated workspace, and any future retired-plugin entry, now goes red instead of green. Two unit tests cover the classification, and `hooks_json_references` refuses an empty `BINARY_PLUGIN_DIRS` rather than degrading into the same silent no-op.
+- **`cadence-obsidian` is audited.** It sat in `SHELL_PLUGIN_DIRS` long after its `hooks.json` started dispatching `obsidian trash-guard` through `run-cadence-hooks.sh` like every other plugin, so its manifest was never scanned. With it in `BINARY_PLUGIN_DIRS` the audit immediately caught a real defect in its own event-type scanner (below), and confirmed `obsidian trash-guard` is registered exactly once — the fan-out an allowlist row was drafted for does not exist.
+- **The `main.rs` event-type scanner no longer attributes one hook's event to another.** When it met a match arm whose `*Commands::` group it did not recognize, it kept walking backwards and adopted the *previous* arm's variant: `metrics warn-stale` (SessionStart) overwrote `obsidian trash-guard`'s entry, so `hook_event_types_match_hooks_json` asserted a `PreToolUse`/`SessionStart` mismatch that does not exist in the binary. `MetricsCommands` is now mapped, and an unknown group stops the scan instead of stealing a mapping.
+- **`session heartbeat` is recorded as deliberately unwired** in `PENDING_WIRING_HOOKS`, citing cadence-hooks#902 — its `PostToolUse: *` registration was removed as a trial, which left `all_binary_subcommands_are_registered` failing against a current sibling checkout.
+
 ## [0.98.0] - 2026-09-08
 
 ### Changed

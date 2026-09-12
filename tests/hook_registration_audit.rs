@@ -232,12 +232,24 @@ const BINARY_PLUGIN_DIRS: &[(&str, &str)] = &[
     ("cadence", "cadence"),
     ("cadence-guardrails", "guardrails"),
     ("cadence-metrics", "metrics"),
+    // Its single hook, `obsidian trash-guard`, dispatches through
+    // `run-cadence-hooks.sh` exactly like every other entry here. It sat in
+    // SHELL_PLUGIN_DIRS long after that stopped being true, so its hooks.json
+    // was never scanned — which is why an allowlist row for a supposed
+    // "obsidian trash-guard" fan-out could never have taken effect
+    // (cameronsjo/cadence-hooks#794).
+    ("cadence-obsidian", "obsidian"),
     ("cadence-rules", "rules"),
 ];
 
 /// Plugin directories that still use shell script wrappers (not yet migrated to binary).
 /// These are tracked so the "all subcommands registered" test knows they exist.
-const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[("cadence-obsidian", "obsidian")];
+///
+/// Empty since `cadence-obsidian` moved to [`BINARY_PLUGIN_DIRS`]: every plugin
+/// that wires a cadence-hooks subcommand now dispatches the binary. The const
+/// stays as the exemption mechanism for the next plugin that lands ahead of its
+/// binary migration.
+const SHELL_PLUGIN_DIRS: &[(&str, &str)] = &[];
 
 /// Plugin groups whose consuming plugin repo does not exist yet. Their hook
 /// subcommands are expected to be unregistered until the plugin lands —
@@ -259,7 +271,15 @@ const PENDING_PLUGIN_GROUPS: &[(&str, &str)] = &[];
 /// binary so the wiring PR has something to point at, and reaching no event
 /// until that PR lands.
 /// (`<plugin> <subcommand>`, tracking_reference)
-const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[];
+const PENDING_WIRING_HOOKS: &[(&str, &str)] = &[
+    // Deliberately unwired, not awaiting a wiring PR: the per-tool-call
+    // `PostToolUse: *` registration was removed as a trial while the hook's
+    // cost is evaluated (cadence plugin CHANGELOG, cameronsjo/cadence-hooks#902).
+    // The subcommand stays in the binary so the trial is reversible. #902
+    // retires this entry either way — by rewiring the hook, or by removing the
+    // subcommand.
+    ("session heartbeat", "cameronsjo/cadence-hooks#902"),
+];
 
 /// Bash-matcher hooks that intentionally inspect every command (no `if` filter).
 /// These run broad pattern matching internally and can't be narrowed to a single glob.
@@ -492,32 +512,66 @@ struct PluginScan {
 }
 
 impl PluginScan {
-    /// A loud, specific account of a partial or empty scan, so the next layout
-    /// drift can't go dark the way the pre-monorepo paths did.
-    fn skip_report(&self) -> String {
-        let resolved: Vec<&str> = self.resolved.keys().map(String::as_str).collect();
-        let missing: Vec<String> = self
-            .missing
+    /// Nothing resolved — the sibling `cadence` monorepo checkout is absent
+    /// entirely. That is the bare-CI case: there is no manifest to audit, so
+    /// every cross-sibling assertion legitimately has nothing to say.
+    fn is_absent_environment(&self) -> bool {
+        self.resolved.is_empty()
+    }
+
+    /// One line per unresolved manifest: the plugin dir name and every path
+    /// tried for it.
+    fn missing_lines(&self) -> Vec<String> {
+        self.missing
             .iter()
             .map(|(dir, tried)| {
                 let tried: Vec<String> = tried.iter().map(|p| p.display().to_string()).collect();
                 format!("  {dir}: tried {}", tried.join(", "))
             })
-            .collect();
+            .collect()
+    }
+
+    /// The no-sibling-checkout skip. Loud and specific even here, so the next
+    /// layout drift can't go dark the way the pre-monorepo paths did.
+    fn skip_report(&self) -> String {
+        format!(
+            "SKIPPED: no plugin hooks.json resolved (0 of {}).\n\
+             unresolved:\n{}\n\
+             No sibling cadence monorepo checkout is present, so there is no \
+             wiring to audit. Clone it beside this repo, or point \
+             CADENCE_AUDIT_WORKSPACE_ROOT at a workspace that has it, to run \
+             these assertions locally.",
+            BINARY_PLUGIN_DIRS.len(),
+            self.missing_lines().join("\n"),
+        )
+    }
+
+    /// The **partial**-resolve failure.
+    ///
+    /// This is the fail-closed half of the all-or-none rule. A partial resolve
+    /// is a broken environment — but a broken environment silently *passing*
+    /// is how this audit spent its time as a false green: one retired plugin
+    /// left in [`BINARY_PLUGIN_DIRS`] made every assertion body return before
+    /// it ran, and the suite still reported `ok`. Skipping on partial resolve
+    /// hid the very drift the audit exists to catch, so a partial scan now
+    /// fails and names the plugin plus the paths tried.
+    fn partial_resolve_report(&self) -> String {
+        let resolved: Vec<&str> = self.resolved.keys().map(String::as_str).collect();
 
         format!(
-            "SKIPPED: {} of {} plugin hooks.json files resolved.\n\
-             resolved: {:?}\n\
-             unresolved:\n{}\n\
+            "plugin manifest scan resolved {} of {} expected plugins — \
+             refusing to audit a partial scan.\n\
+             resolved: {resolved:?}\n\
+             unresolved:\n{}\n\n\
              All expected manifests live in ONE monorepo checkout, so a partial \
-             resolve means a broken environment, not a finding — a single leftover \
-             standalone checkout would otherwise report every OTHER namespace's \
-             subcommands as unregistered. Verify the sibling cadence checkout is \
-             present and current (`git -C <workspace-root>/cadence status -sb`).",
+             resolve is a broken environment, never a clean run. Either the \
+             sibling cadence checkout is stale or half-migrated (`git -C \
+             <workspace-root>/cadence status -sb`), or a BINARY_PLUGIN_DIRS \
+             entry names a plugin that no longer exists and must be removed \
+             from this file.",
             self.resolved.len(),
             BINARY_PLUGIN_DIRS.len(),
-            resolved,
-            missing.join("\n"),
+            self.missing_lines().join("\n"),
         )
     }
 }
@@ -525,6 +579,15 @@ impl PluginScan {
 /// Scan every [`BINARY_PLUGIN_DIRS`] entry for its hooks.json, recording both
 /// what resolved and what didn't.
 fn hooks_json_references() -> PluginScan {
+    // An empty list would resolve nothing, look like "no sibling checkout",
+    // and skip every assertion forever — the same silent no-op this audit was
+    // just repaired for, one layer up.
+    assert!(
+        !BINARY_PLUGIN_DIRS.is_empty(),
+        "BINARY_PLUGIN_DIRS is empty — the audit would scan nothing and skip \
+         every assertion. Removing the last entry is never the right fix."
+    );
+
     let workspace_root = workspace_root();
 
     let mut resolved = BTreeMap::new();
@@ -706,23 +769,29 @@ fn registered_commands(all_refs: &BTreeMap<String, Vec<HookRef>>) -> BTreeSet<&s
 
 // ---------- Tests ----------
 
-/// Skip the test unless **every** expected plugin hooks.json resolved.
+/// Resolve every expected plugin hooks.json, or stop the test — skipping only
+/// when there is genuinely nothing to audit.
 ///
-/// All-or-none, deliberately. A bare CI checkout with no siblings resolves
-/// none and skips, as before. But a *partial* resolve is what turned one
-/// leftover pre-consolidation checkout into a ~60-entry false failure: the
-/// map was non-empty, so the old "skip only when completely empty" guard let
-/// the test run and report every namespace whose manifest hadn't resolved as
-/// unregistered. Post-consolidation all five manifests live in the same
-/// monorepo checkout — you either have `cadence/` or you don't — so a partial
-/// resolve is definitionally a broken environment, never a real finding.
+/// Three outcomes, all-or-none in both directions:
+///
+/// - **Nothing resolved** — no sibling monorepo checkout at all (bare CI,
+///   a tarball build). Skip: there is no wiring to assert against.
+/// - **Everything resolved** — run the assertions.
+/// - **Some resolved** — *fail*. A partial resolve is definitionally a broken
+///   environment (post-consolidation every manifest lives in the same
+///   checkout; you either have `cadence/` or you don't), and it used to skip.
+///   That is exactly how the audit became a false green: `cadence-canon` stayed
+///   in [`BINARY_PLUGIN_DIRS`] after the plugin was retired, so every
+///   assertion body returned before running while the suite reported 20
+///   passing tests. A broken environment now says so instead of passing.
 macro_rules! require_plugin_refs {
     ($refs:ident) => {
         let scan = hooks_json_references();
-        if !scan.missing.is_empty() {
+        if scan.is_absent_environment() {
             eprintln!("{}", scan.skip_report());
             return;
         }
+        assert!(scan.missing.is_empty(), "{}", scan.partial_resolve_report());
         let $refs = scan.resolved;
     };
 }
@@ -807,7 +876,8 @@ fn all_binary_subcommands_are_registered() {
     assert!(
         unregistered.is_empty(),
         "registered hooks not wired in any hooks.json:\n{}\n\n\
-         Note: {} plugin(s) still use shell wrappers and are excluded from this check.\n\
+         Note: {} plugin(s) in SHELL_PLUGIN_DIRS still use shell wrappers and are \
+         excluded from this check.\n\
          A hook whose wiring lands in a later PR goes in PENDING_WIRING_HOOKS with \
          its tracking reference, and comes back out in that PR.\n\
          {STALE_CHECKOUT_HINT}",
@@ -995,6 +1065,45 @@ fn no_duplicate_command_registrations_per_matcher() {
     );
 }
 
+/// A scan that resolved nothing is the bare-CI case and must stay skippable.
+#[test]
+fn empty_scan_is_an_absent_environment() {
+    let scan = PluginScan {
+        resolved: BTreeMap::new(),
+        missing: vec![("cadence", [PathBuf::from("/a"), PathBuf::from("/b")])],
+    };
+
+    assert!(scan.is_absent_environment());
+    assert!(scan.skip_report().contains("SKIPPED"));
+}
+
+/// A scan that resolved *some* manifests is a broken environment, and the
+/// macro must fail rather than skip. The report names the unresolved plugin
+/// and every path tried for it — the two facts the old silent skip withheld.
+#[test]
+fn partial_scan_is_not_an_absent_environment() {
+    let scan = PluginScan {
+        resolved: BTreeMap::from([("cadence".to_string(), Vec::new())]),
+        missing: vec![(
+            "cadence-retired",
+            [
+                PathBuf::from("/ws/cadence/plugins/cadence-retired/hooks/hooks.json"),
+                PathBuf::from("/ws/cadence-retired/hooks/hooks.json"),
+            ],
+        )],
+    };
+
+    assert!(!scan.is_absent_environment());
+
+    let report = scan.partial_resolve_report();
+    assert!(report.contains("cadence-retired"), "report: {report}");
+    assert!(
+        report.contains("/ws/cadence/plugins/cadence-retired/hooks/hooks.json"),
+        "report: {report}"
+    );
+    assert!(report.contains("refusing to audit"), "report: {report}");
+}
+
 #[test]
 fn no_plugin_hooks_duplicated_in_settings_json() {
     require_plugin_refs!(all_refs);
@@ -1134,10 +1243,10 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
 
                 // Determine plugin group from the Commands enum.
                 //
-                // Logger-dispatched hooks (metrics, session heartbeat) use
-                // run_logger_from_stdin and carry no HookEvent, so they
-                // never reach this scan — only Check-dispatched hooks are
-                // mapped here.
+                // Most metrics hooks are logger-dispatched (run_logged_logger)
+                // and carry no HookEvent, so they never reach this scan — but
+                // `metrics warn-stale` is a SessionStart *check* and does, so
+                // the group has to be mapped here like any other.
                 let plugin = if prev.contains("CadenceCommands") {
                     "cadence"
                 } else if prev.contains("GuardrailsCommands") {
@@ -1146,10 +1255,21 @@ fn main_rs_event_types() -> BTreeMap<String, String> {
                     "rules"
                 } else if prev.contains("ObsidianCommands") {
                     "obsidian"
+                } else if prev.contains("MetricsCommands") {
+                    "metrics"
                 } else if prev.contains("SessionCommands") {
                     "session"
                 } else {
-                    continue;
+                    // An arm line whose group this scan does not know: stop,
+                    // don't keep walking backwards. Continuing here made an
+                    // unmapped arm adopt the *previous* arm's variant and
+                    // overwrite its event — `metrics warn-stale` (SessionStart)
+                    // silently rewrote `obsidian trash-guard` as SessionStart,
+                    // and the mismatch only surfaced once the obsidian manifest
+                    // started being scanned at all. Dropping the mapping
+                    // under-reports; stealing another hook's mapping asserts a
+                    // falsehood about production code.
+                    break;
                 };
 
                 result.insert(format!("{plugin} {subcmd}"), event.to_string());
