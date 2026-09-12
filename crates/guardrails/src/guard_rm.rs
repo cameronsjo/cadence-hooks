@@ -73,6 +73,40 @@
 //!   shell moves a variable through more routes than a parser at this altitude
 //!   can enumerate, so an unexpanded variable stays ASK.
 //!
+//! **Wiring: the binary is the filter, the `if:` glob is not.** The plugin
+//! gates this guard behind `"if": "Bash(*rm*)"`, which is a substring glob over
+//! the whole command string with no word boundary, no command-head notion, and
+//! no case folding (measured — see `docs/hooks.md` § Wiring prefilters for the
+//! table). Two consequences, opposite in direction and both load-bearing here:
+//!
+//! - **It over-fires.** `echo confirm`, `git format-patch`, `terraform apply`,
+//!   `npm run warm-cache` and `./perform-migration.sh` all carry the letters
+//!   `rm` inside an ordinary word and all spawn this guard. That costs a
+//!   process and nothing else *only because* the verb test below is a
+//!   tokenized command-head match: an ordinary command must reach a silent
+//!   ALLOW. `prefilter_false_positives_stay_silent` pins the corpus
+//!   (cadence-hooks#597, whose own word list also named `chmod` — which
+//!   contains no `rm` and never matched anything).
+//! - **It under-fires.** `RM -rf …` does not match `Bash(*rm*)`, so the ASCII
+//!   case folding this guard performs is unreachable through that filter —
+//!   correct in the unit tests below and dead in production (cadence-hooks#577).
+//!   Character classes are not supported either, so no cleverer glob buys the
+//!   coverage back. The fix is wiring-side: drop the `if:` and let this binary
+//!   filter, the way `obsidian::trash_guard` already does.
+//!
+//! The fold itself lives in `shell::fold_verb`, reached through
+//! `shell::command_word`, and this guard reads it from **two** independent
+//! places — [`is_delete_verb`] and `collect_targets`'s own verb resolution. So
+//! a mutation of either one alone leaves `RM -rf …` judged; only neutering
+//! `fold_verb` flips it to ALLOW, which is the mutation
+//! `prefilter_true_positives_still_judge` was verified against. Worth knowing
+//! before reading a green case-fold test as proof that the call site you are
+//! looking at is the one carrying the behaviour.
+//!
+//! Neither the over-fire nor the under-fire is a verdict this guard produces.
+//! Read the prefilter as a cost hint; never as a statement about what reached
+//! the guard or what the guard decided.
+//!
 //! **Segment-aware parsing:** targets are collected by mirroring
 //! `enforce_worktree::collect_commit_targets` — walking `split_segments_with_ops`
 //! while tracking the effective cwd through `cd` chains, and recursing into each
@@ -3530,6 +3564,96 @@ mod tests {
                 "patch delete and `rm` disagree on {target}"
             );
         }
+    }
+
+    // --- #597 / #577: the wiring prefilter is coarse in both directions ---
+
+    /// Every command the shipped `Bash(*rm*)` glob drags in that is not a
+    /// deletion must reach a silent ALLOW, judged from `$HOME` — the strictest
+    /// cwd this guard has, so an accidental match here would be a BLOCK on an
+    /// ordinary command rather than a survivable prompt.
+    ///
+    /// This is the regression pin for dropping the prefilter entirely
+    /// (cadence-hooks#597): once the wiring stops filtering, an ordinary
+    /// command's cost is one process and one silent allow, and these rows are
+    /// what makes that true. The words are the ones that actually contain the
+    /// substring — `confi`**`rm`**, `fo`**`rm`**`at`, `terrafo`**`rm`**,
+    /// `wa`**`rm`**, `perfo`**`rm`** — plus a sample of commands carrying no
+    /// `rm` at all, which the prefilter never passed and the binary must still
+    /// handle once it does.
+    #[test]
+    fn prefilter_false_positives_stay_silent() {
+        for command in [
+            // Carry `rm` inside a word: matched `Bash(*rm*)` today.
+            "echo confirm",
+            "gh pr create --confirm",
+            "git format-patch -1 HEAD",
+            "terraform apply",
+            "npm run warm-cache",
+            "./perform-migration.sh",
+            "gh api repos/OWNER/REPO --jq .permissions.push",
+            "grep -inE 'alpha|thermal|gamma' notes.md",
+            // Carry no `rm` at all: reach the guard only once the `if:` is gone.
+            "chmod 644 notes.md",
+            "git status --short",
+            "cargo test --workspace",
+            "mv old.md new.md",
+            "cp -r src dest",
+            "mkdir -p build/out",
+            "docker compose up -d",
+            "kubectl get pods",
+        ] {
+            assert_eq!(
+                judge(command, &home()),
+                Outcome::Allow,
+                "must be a silent allow: {command}"
+            );
+        }
+    }
+
+    /// The other half of the pin: widening what reaches the guard must not cost
+    /// a single block. Each spelling names a real deletion of a protected path,
+    /// asserted at its EXACT outcome — `assert_ne!(Allow)` would pass for a
+    /// second reason (a parse that fell through to the ASK default looks
+    /// identical to a judged BLOCK), which is how a weakened detector hides.
+    ///
+    /// The case rows are the ones cadence-hooks#577 is about. `command_word`
+    /// folds ASCII case (`fold_verb`, cadence-hooks#488/#528), so the binary
+    /// has always judged `RM`; the shipped case-sensitive `Bash(*rm*)` glob is
+    /// the only reason production never saw one. Verified live by neutering
+    /// `fold_verb`, which flips exactly these two rows to ALLOW and leaves the
+    /// rest untouched.
+    #[test]
+    fn prefilter_true_positives_still_judge() {
+        for (command, expected) in [
+            ("rm -rf important", Outcome::Block),
+            ("rm important", Outcome::Block),
+            ("RM -rf important", Outcome::Block),
+            ("Rm -rf important", Outcome::Block),
+            ("true && rm important", Outcome::Block),
+            ("find . -delete", Outcome::Block),
+            ("/bin/rm -rf important", Outcome::Block),
+            // An `xargs` delete names no operand the parser can resolve, so it
+            // takes the ASK default rather than a guessed verdict.
+            ("xargs rm < list.txt", Outcome::Ask),
+        ] {
+            assert_eq!(
+                judge(command, &home()),
+                expected,
+                "wrong verdict: {command}"
+            );
+        }
+    }
+
+    /// `sudo rm …` is a DOCUMENTED miss here, not an oversight — see the
+    /// module's scope notes. Pinned so a future widening of the prefilter is
+    /// not misread as having changed it, and so removing this carve-out is a
+    /// deliberate edit to a red test rather than a silent behaviour change.
+    /// `obsidian::trash_guard` does block the same command; the two guards
+    /// judge different things.
+    #[test]
+    fn sudo_prefixed_delete_remains_a_documented_miss() {
+        assert_eq!(judge("sudo rm -rf important", &home()), Outcome::Allow);
     }
 
     /// A command-less input that is NOT a delete stays a silent allow — the new

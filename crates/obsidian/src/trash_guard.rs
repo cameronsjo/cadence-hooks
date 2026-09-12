@@ -975,6 +975,68 @@ mod tests {
         }
     }
 
+    /// The cadence-hooks#559 report table, verbatim, as a regression pin.
+    ///
+    /// Filed against 0.70.0 against a guard that scanned the whole command
+    /// string for `rm`, so `echo confirm`, `echo thermal` and a `gh` query
+    /// naming `viewerPermission` were all blocked as vault deletions. The
+    /// segment-head scan that shipped in 0.70.1 fixed it; this pins the whole
+    /// reported corpus rather than the two words that happened to get tests.
+    ///
+    /// It is also the safety pin for this guard's wiring, which carries no
+    /// `if:` filter at all — every Bash command in a vault session reaches it,
+    /// so a substring detector here costs a block on ordinary work, not a
+    /// wasted process (`docs/hooks.md` § Wiring prefilters).
+    #[test]
+    fn substring_rm_inside_an_ordinary_word_stays_allowed() {
+        for command in [
+            "echo confirm",
+            "echo confabulate",
+            "echo viewerPermission",
+            "echo viewerAccess",
+            "echo thermal",
+            "echo thespian",
+            "grep -inE 'alpha|thermal|gamma' notes.md",
+            "gh repo view OWNER/REPO --json visibility,viewerPermission",
+            "gh api repos/OWNER/REPO --jq .permissions.push",
+            "grep -c 'alpha' notes.md",
+            "gh label list --repo OWNER/REPO",
+            "chmod 644 note.md",
+            "git format-patch -1 HEAD",
+            "terraform apply",
+            "npm run warm-cache",
+            "./perform-migration.sh",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Allow,
+                "{command} deletes nothing and must stay allowed"
+            );
+        }
+    }
+
+    /// The other direction of the same pin: the shapes cadence-hooks#559
+    /// confirmed still fired, plus the runner and compound spellings, must
+    /// stay BLOCK. A fix for the false positives that quietly cost one of
+    /// these would be the worse trade.
+    #[test]
+    fn real_vault_deletions_still_block() {
+        for command in [
+            "rm -rf note.md",
+            "RM -rf note.md",
+            "sudo rm note.md",
+            "true && rm note.md",
+            "find . -delete",
+            "git rm note.md",
+        ] {
+            assert_eq!(
+                outcome_in_vault(command),
+                cadence_hooks_core::Outcome::Block,
+                "{command} deletes a vault file and must block"
+            );
+        }
+    }
+
     #[test]
     fn destructive_word_as_an_argument_is_allowed() {
         with_vault_env(|| {

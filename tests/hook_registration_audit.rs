@@ -323,6 +323,20 @@ const INTENTIONAL_UNFILTERED_BASH_HOOKS: &[&str] = &[
     // the command itself — no single glob expresses "an rm whose target is
     // under a vault".
     "obsidian trash-guard",
+    // Same reason as its vault-scoped sibling above, reached the other way
+    // round: `guard-rm` shipped behind five `if:` globs (`Bash(*rm*)` and
+    // friends) and they were measured wrong in BOTH directions on Claude Code
+    // 2.1.269 — the glob is a case-sensitive whole-string substring test, so it
+    // fires on `echo confirm` and `terraform apply` while `RM -rf <path>`
+    // matches nothing and reaches no guard at all. Character classes are not
+    // supported, so no single glob buys the case coverage back, and five globs
+    // also meant one command could spawn the guard twice. The binary already
+    // does the precise work (tokenized command head, case-folded), it is a
+    // measured silent no-op on ordinary commands, and one unfiltered
+    // registration costs strictly fewer processes than five filtered ones on
+    // any command they matched. See `docs/hooks.md` § Wiring prefilters
+    // (cameronsjo/cadence-hooks#597, #559, #577).
+    "guardrails guard-rm",
 ];
 
 /// Hooks a plugin dispatches from *another* plugin's CLI group on purpose.

@@ -9,6 +9,31 @@ try <namespace> <hook>` to see any hook run against a sample payload (see
 For how hooks communicate with Claude Code (stdin/stdout/exit codes), see
 [Hook Protocol](../README.md#hook-protocol) in the README.
 
+## Wiring prefilters — what a hooks.json `if:` actually does
+
+A plugin's `hooks.json` may gate a hook behind an `if:` filter (`"if": "Bash(*rm*)"`). It is a **cost filter, not a correctness filter**: it decides whether the binary spawns, never what the binary decides. Every precision claim in this catalog belongs to the binary; assume the prefilter is wrong in both directions and write the check so that is safe.
+
+Measured on Claude Code 2.1.269 (2026-09-11) with a throwaway `--settings` file whose hooks only logged which filters matched, against a catch-all hook that refused every command so nothing executed:
+
+| `if:` filter | `echo confirm` | `rm -rf <path>` | `RM -rf <path>` | `chmod 644 <path>` |
+|---|---|---|---|---|
+| `Bash(*)` — control | fires | fires | fires | fires |
+| `Bash(*zzqqxx*)` — control | - | - | - | - |
+| `Bash(*rm*)` — as shipped | **fires** | fires | - | - |
+| `Bash(*RM*)` | - | - | fires | - |
+| `Bash(*[rR][mM]*)` | - | - | - | - |
+| `Bash(rm:*)` | - | fires | - | - |
+| `Bash(*rm *)` | - | fires | - | - |
+
+Four properties follow, and each one has burned someone:
+
+1. **`*x*` is a substring glob over the whole command string**, with no word boundary and no notion of a command head. `Bash(*rm*)` fires on `echo confirm`, `git format-patch`, `terraform apply`, `npm run warm-cache`, and `./perform-migration.sh` — every one of which contains the letters `rm` inside an ordinary word. (`chmod` does *not*; it has no `rm` in it. The word list in cadence-hooks#597 was partly guessed rather than measured.) Each false match spawns a process that parses the command, finds no deletion, and allows.
+2. **It is ASCII case-sensitive.** `RM -rf <path>` never reaches a hook gated on `Bash(*rm*)`. Any case folding the binary performs on a verb is unreachable through such a filter — which is what cadence-hooks#577 asked and this table answers.
+3. **Character classes are not supported.** `Bash(*[rR][mM]*)` matched neither spelling, so case coverage cannot be bought with one cleverer glob. A two-letter verb would need four literal entries; a six-letter verb, sixty-four. The `matcher` field is a regex and does support classes — the two fields are different engines, and the regex spelling in a neighbouring `matcher` is not evidence about `if:`.
+4. **`Bash(cmd:*)` keys on the command head**, unlike `Bash(*cmd*)`. It is the precise form, and precisely why it is the wrong tool for a guard: it sees only the leading word, so `true && rm x`, `xargs rm`, and `find … -exec rm {} ;` all escape it.
+
+**The rule this leaves.** A guard whose job is to see every spelling of a dangerous command should carry **no `if:` at all** and let the binary filter — the pattern `trash-guard` has always used. A guard's binary must therefore stay a cheap, silent no-op on arbitrary input; `guard-rm` and `trash-guard` both pin that with table tests over ordinary commands. Reserve `if:` for hooks whose subject genuinely is a literal substring (`Bash(*gh pr create*)`), and never read one as a safety boundary.
+
 ## cadence
 
 | Hook | Event | What it does |
