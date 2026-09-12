@@ -782,9 +782,10 @@ mod tests {
     }
 
     // ---- nudge message format ----
-    // These tests call canonical() which reads CADENCE_ISSUE_TRACKER — serialize
-    // with CADENCE_ENV_TEST_LOCK (via with_env) and clear the var so
-    // concurrent env-mutating tests don't race.
+    // `nudge_message` is a pure `format!` and reads no env — the `canonical()`
+    // helper these wrappers were written for is gone. The `with_env` calls are
+    // kept because they are harmless and still serialize these tests against
+    // env-mutating neighbours via CADENCE_ENV_TEST_LOCK.
 
     #[test]
     fn nudge_message_names_the_check() {
