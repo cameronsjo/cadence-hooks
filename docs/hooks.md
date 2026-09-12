@@ -83,7 +83,7 @@ review, install the official `security-guidance` plugin
 
 | Hook | Event | What it does |
 |------|-------|--------------|
-| `trash-guard` | PreToolUse (Bash) | Block destructive vault operations (`rm`, `git rm`, `unlink`, `shred`, `truncate`, `find -delete`, and clobber redirects); use `.trash/` instead |
+| `trash-guard` | PreToolUse (Bash, Edit, destructive `mcp__*` tools) | Block destructive vault operations (`rm`, `git rm`, `unlink`, `shred`, `truncate`, `find -delete`, and clobber redirects); use `.trash/` instead |
 
 A verb counts only where the shell runs an executable, and there are two such
 positions: the head of a segment, and a `find` exec-family action
